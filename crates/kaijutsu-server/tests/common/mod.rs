@@ -52,6 +52,18 @@ pub async fn start_server() -> SocketAddr {
 /// row we write here alone.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn seed_mock_backend(data_dir: &std::path::Path) {
+    seed_mock_backend_with_model(data_dir, "mock-model");
+}
+
+/// Like `seed_mock_backend`, but with a caller-chosen `default_model`.
+///
+/// Needed to exercise rc scripts (like the coder stance) that branch on the
+/// bound model: setting the REGISTRY DEFAULT here (not a per-context
+/// override) is what lets a test prove a context inherited its model rather
+/// than had one stamped on its row — the distinction the S00-stance.kai
+/// `.resolved_model` fix depends on.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, default_model: &str) {
     use kaijutsu_kernel::kernel_db::{BackendRow, KernelDb, LlmDefaultsRow};
     use kaijutsu_types::{BackendId, PrincipalId};
 
@@ -72,7 +84,7 @@ pub fn seed_mock_backend(data_dir: &std::path::Path) {
     .expect("seed mock backend");
     db.set_llm_defaults(&LlmDefaultsRow {
         default_backend: "mock".to_string(),
-        default_model: "mock-model".to_string(),
+        default_model: default_model.to_string(),
         max_tokens: Some(16384),
         temperature: None,
         top_p: None,
@@ -89,12 +101,23 @@ pub fn seed_mock_backend(data_dir: &std::path::Path) {
 /// `KjDispatcher.summarize()` and other LLM-dependent paths work in tests.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn start_server_with_mock_llm() -> SocketAddr {
+    start_server_with_mock_llm_model("mock-model").await
+}
+
+/// Like `start_server_with_mock_llm`, but the mock backend's registry-default
+/// model is caller-chosen instead of hardcoded to `"mock-model"`.
+///
+/// The model must be in place before any context is created — rc create
+/// lifecycle scripts (e.g. the coder stance) read the resolved model during
+/// context creation, so setting it afterward is too late to affect them.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn start_server_with_mock_llm_model(default_model: &str) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let config = SshServerConfig::ephemeral(addr.port());
     if let Some(ref data_dir) = config.data_dir {
-        seed_mock_backend(data_dir);
+        seed_mock_backend_with_model(data_dir, default_model);
     }
 
     tokio::task::spawn_local(async move {

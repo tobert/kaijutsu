@@ -644,11 +644,221 @@ fn test_rpc_default_context_type_is_default() {
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
+        // "You are coding inside kaijutsu" was the coder stance's opening
+        // line at some point but the wording moved on (now "You are coding
+        // here...", S00-stance.kai) and this negative assertion went
+        // vacuous — it passed regardless of whether the coder stance leaked
+        // in, since that exact string appears nowhere in the repo anymore.
+        // Assert on the phrase the coder stance ACTUALLY opens with today so
+        // a real leak trips this.
         assert!(
-            !blocks
-                .iter()
-                .any(|b| b.content.contains("You are coding inside kaijutsu")),
-            "default context must not get the coder stance"
+            !blocks.iter().any(|b| b.content.contains("You are coding here")),
+            "default context must not get the coder stance; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+    });
+}
+
+// ============================================================================
+// Coder stance branch selection (S00-stance.kai) on the RPC creation path.
+//
+// NOTE what these two tests do and don't pin: `create_context_typed` goes
+// through the kernel RPC `create_context`, and that path STAMPS the
+// registry-default provider/model onto the new `ContextRow` itself
+// (`crates/kaijutsu-server/src/rpc.rs` `create_context_inner`, ~line
+// 2390-2412) whenever no per-context override is given. So on this path
+// `.model` is never actually null — it equals the registry default — which
+// means these two tests pass under BOTH the old buggy `.model` read and the
+// fixed `.resolved_model` read. They still pin something real (branch
+// selection follows the effective model when driven over RPC), just not the
+// `.model`-vs-`.resolved_model` regression itself — see
+// `test_coder_stance_crisp_for_null_row_model_via_kj_dispatch` below for the
+// test that actually distinguishes the two.
+// ============================================================================
+
+#[test]
+fn test_coder_stance_crisp_for_rpc_stamped_fast_model() {
+    run_local(async {
+        // Registry default only — no per-context model override.
+        let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let ctx = kernel
+            .create_context_typed("rc-coder-crisp", "coder")
+            .await
+            .expect("create_context_typed");
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+
+        // Trace block: precise signal of which branch fired and on what
+        // model read — the rc script echoes this specifically so a
+        // mis-routed branch is visible without a bisect.
+        let has_crisp_trace = blocks.iter().any(|b| {
+            b.kind == BlockKind::Trace
+                && b.content.contains("stance: crisp branch")
+                && b.content.contains("resolved_model=claude-haiku-4-5")
+        });
+        assert!(
+            has_crisp_trace,
+            "expected a 'stance: crisp branch (resolved_model=claude-haiku-4-5)' \
+             trace block for a context inheriting a fast-executor model from \
+             the registry default; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+
+        // Stance text: "not a survey" is the crisp branch's defining
+        // instruction (act, don't reconnoiter) and appears in no other
+        // branch.
+        let has_crisp_stance = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("not a survey")
+        });
+        assert!(
+            has_crisp_stance,
+            "expected the crisp coder stance (\"not a survey\") for a context \
+             inheriting a fast-executor model; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+    });
+}
+
+#[test]
+fn test_coder_stance_synth_for_rpc_stamped_non_matching_model() {
+    run_local(async {
+        let addr = start_server_with_mock_llm_model("kaijutsu-reflective-test-model").await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let ctx = kernel
+            .create_context_typed("rc-coder-synth", "coder")
+            .await
+            .expect("create_context_typed");
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+
+        let has_synth_trace = blocks.iter().any(|b| {
+            b.kind == BlockKind::Trace
+                && b.content.contains("stance: synth branch")
+                && b.content
+                    .contains("resolved_model=kaijutsu-reflective-test-model")
+        });
+        assert!(
+            has_synth_trace,
+            "expected a 'stance: synth branch \
+             (resolved_model=kaijutsu-reflective-test-model)' trace block for \
+             a context inheriting a non-matching model from the registry \
+             default; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+
+        // Stance text: "one hand in a cybernetic loop" is the synth branch's
+        // defining trait (equals in the loop, room to reflect) and appears
+        // in no other branch.
+        let has_synth_stance = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("one hand in a cybernetic loop")
+        });
+        assert!(
+            has_synth_stance,
+            "expected the synth coder stance (\"one hand in a cybernetic \
+             loop\") for a context inheriting a non-matching model; got {} \
+             blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+    });
+}
+
+// ============================================================================
+// The `.model`-vs-`.resolved_model` regression itself: a context whose
+// `ContextRow.model` column is genuinely NULL (not stamped with the
+// registry default, unlike the RPC creation path above).
+//
+// `kj context create <label> --type coder` — the kaish/kj dispatch path
+// (`crates/kaijutsu-kernel/src/kj/context.rs`, `context_create`) — writes
+// `model: None` on the row (line ~890) and only touches it if an explicit
+// `--model` was given (`apply_context_config`, ~line 292). No `--model` here,
+// so the row stays null and the rc create-lifecycle's
+// `kj context info --json | jq -r '.model'` reads `null` while
+// `.resolved_model` reads through to the registry default. This is the case
+// the old buggy script silently sent down the synth branch no matter what
+// model was actually bound (every ACP session, every default-resolved coder
+// context). Driven through `shell_execute` so it exercises kj dispatch
+// rather than the RPC `create_context` path, which stamps the row and would
+// pass under the old buggy code too (see the tests above).
+// ============================================================================
+
+#[test]
+fn test_coder_stance_crisp_for_null_row_model_via_kj_dispatch() {
+    run_local(async {
+        // Registry default only; kj-dispatch context creation never stamps
+        // it onto the row absent an explicit --model.
+        let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        // A bootstrap context to run the `kj` shell command from — its own
+        // type is irrelevant, it's just where the command executes.
+        let boot_ctx = kernel.create_context("boot-kj-dispatch").await.unwrap();
+        let _ = kernel.join_context(boot_ctx, "test").await.unwrap();
+
+        let (_, create_output, create_status) = shell_exec_wait(
+            &kernel,
+            "kj context create rc-coder-kjdispatch --type coder",
+            boot_ctx,
+        )
+        .await;
+        assert_eq!(
+            create_status,
+            Status::Done,
+            "kj context create failed: {create_output}"
+        );
+
+        let info = kernel
+            .resolve_context_label("rc-coder-kjdispatch")
+            .await
+            .unwrap()
+            .expect("rc-coder-kjdispatch should resolve after kj context create");
+        let ctx = info.id;
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+
+        let has_crisp_trace = blocks.iter().any(|b| {
+            b.kind == BlockKind::Trace
+                && b.content.contains("stance: crisp branch")
+                && b.content.contains("resolved_model=claude-haiku-4-5")
+        });
+        assert!(
+            has_crisp_trace,
+            "expected a 'stance: crisp branch (resolved_model=claude-haiku-4-5)' \
+             trace block for a kj-dispatch-created context with a null row \
+             model and a fast-executor registry default; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+
+        let has_crisp_stance = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("not a survey")
+        });
+        assert!(
+            has_crisp_stance,
+            "expected the crisp coder stance (\"not a survey\") for a \
+             kj-dispatch-created context with a null row model and a \
+             fast-executor registry default; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
         );
     });
 }
