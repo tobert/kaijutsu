@@ -6,6 +6,26 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## kaish-help and kaish-kernel must be bumped together (2026-08-07, adoption)
+
+Now that prompts are composed from `kaish-help`, the guidance kaijutsu ships
+describes the shell it *runs* — so the two pins have to move as a pair:
+
+- `kaish-kernel` (crates.io "0.13") is the shell that actually executes.
+- `kaish-help` (git rev, pending release) is the prose describing it.
+
+They agree today. They will not after kaish PR #300, which makes `,`
+significant only inside `[]`/`{}` — the composed tool description still
+carries the `comma-splits-word` rule (a `Concept::Foundations` fragment, and
+Foundations is exactly what the tool description selects). Bump `kaish-help`
+alone and models are told to quote commas the runtime now accepts; bump
+`kaish-kernel` alone and they are not told about a rule that still bites.
+
+Neither direction fails loudly — a prompt that mildly misdescribes the shell
+produces worse agent behavior, not an error — which is what makes it worth
+writing down. When the release lands, move both pins in one commit and drop
+the git dep TODO in `Cargo.toml` at the same time.
+
 ## `kj context info` human and `--json` renders disagree about cwd (2026-08-07)
 
 Human output shows `Cwd: /home/atobey/src/kaijutsu`; `--json` reports
