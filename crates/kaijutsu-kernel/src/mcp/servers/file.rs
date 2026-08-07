@@ -183,11 +183,26 @@ impl McpServerLike for FileToolsServer {
     ) -> McpResult<KernelToolResult> {
         let tool_ctx = to_exec_context(ctx);
 
+        // Every arm below resolves a path against `tool_ctx.cwd` — even the
+        // ones with an optional `path` param fall back to it. A `None` cwd
+        // used to be silently fabricated as `/` by `to_exec_context`
+        // (`CallContext::cwd`'s contract says `None` means filesystem tools
+        // must reject; nothing enforced it), which broke path resolution
+        // for the exact case it was meant to make safe: a relative
+        // `src/main.rs` resolved against a fake root instead of failing
+        // clean, landing on `/src/main.rs` and a confusing host permission
+        // error. Gate here, before any tool-specific logic runs, so every
+        // arm — current and future — inherits the refusal without anyone
+        // needing to remember to copy it in.
+        let Some(cwd) = tool_ctx.cwd.clone() else {
+            return Ok(from_exec_result(refuse_missing_cwd(&params.tool)));
+        };
+
         let exec = match params.tool.as_str() {
             "read" => {
                 let p: ReadParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
-                let path = resolve_str(&tool_ctx.cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
+                let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
                 if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_read(&tool_ctx, &path)
                 {
@@ -206,7 +221,7 @@ impl McpServerLike for FileToolsServer {
             "edit" => {
                 let p: EditParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
-                let path = resolve_str(&tool_ctx.cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
+                let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
                 if is_rc_path(&path) {
                     if !self.guard.as_ref().is_some_and(|g| g.context_allows_rc_write(&tool_ctx)) {
                         rc_write_denied(&path)
@@ -230,7 +245,7 @@ impl McpServerLike for FileToolsServer {
             "write" => {
                 let p: WriteParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
-                let path = resolve_str(&tool_ctx.cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
+                let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
                 if is_rc_path(&path) {
                     if !self.guard.as_ref().is_some_and(|g| g.context_allows_rc_write(&tool_ctx)) {
                         rc_write_denied(&path)
@@ -259,11 +274,11 @@ impl McpServerLike for FileToolsServer {
                     Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Invalid pattern: {}", e)))),
                 };
                 let base = match &p.path {
-                    Some(pp) => match resolve_str(&tool_ctx.cwd, pp) {
+                    Some(pp) => match resolve_str(&cwd, pp) {
                         Ok(s) => s,
                         Err(e) => return Ok(from_exec_result(ExecResult::failure(1, e.to_string()))),
                     },
-                    None => tool_ctx.cwd.to_string_lossy().into_owned(),
+                    None => cwd.to_string_lossy().into_owned(),
                 };
                 let search_root = match glob_path.static_prefix() {
                     Some(prefix) => {
@@ -328,11 +343,11 @@ impl McpServerLike for FileToolsServer {
                     Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Invalid regex pattern: {}", e)))),
                 };
                 let search_root = match &p.path {
-                    Some(pp) => match resolve_str(&tool_ctx.cwd, pp) {
+                    Some(pp) => match resolve_str(&cwd, pp) {
                         Ok(s) => s,
                         Err(e) => return Ok(from_exec_result(ExecResult::failure(1, e.to_string()))),
                     },
-                    None => tool_ctx.cwd.to_string_lossy().into_owned(),
+                    None => cwd.to_string_lossy().into_owned(),
                 };
                 if let Some(refusal) = refuse_filesystem_root_walk("grep", &search_root) {
                     return Ok(from_exec_result(refusal));
@@ -877,17 +892,45 @@ fn extract_context(content: &str, pos: usize, match_len: usize) -> String {
         .join("\n")
 }
 
+/// Refuse a filesystem tool call whose context has no working directory.
+///
+/// `call_tool` checks this before any tool-specific logic, for every arm in
+/// the match below — the whole reason `ExecContext::cwd` (and
+/// `CallContext::cwd` beneath it) is `Option<PathBuf>` rather than a bare
+/// path is to make a missing cwd unrepresentable as `/` and reject it
+/// structurally instead of relying on each tool author to remember a guard.
+/// Before this, `to_exec_context` silently defaulted `None` to `/`, so a
+/// relative `src/main.rs` resolved to `/src/main.rs` and failed as a
+/// confusing host permission error rather than a clean refusal. This
+/// message is deliberately worded differently from
+/// `refuse_filesystem_root_walk` below: that one fires when the model asked
+/// to search a tree that resolves to the root — this one fires when the
+/// model asked for nothing of the sort and the system had no cwd to give it
+/// in the first place.
+fn refuse_missing_cwd(tool: &str) -> ExecResult {
+    ExecResult::failure(
+        1,
+        format!(
+            "{tool}: this context has no working directory set, so it cannot \
+             resolve any path — relative or otherwise. `cd` to a directory \
+             (e.g. from the interactive shell) to give this context a cwd, \
+             then retry.",
+        ),
+    )
+}
+
 /// Refuse a tree walk rooted at the filesystem root.
 ///
-/// `glob`/`grep` without an explicit `path` walk from the caller's cwd, and a
-/// cwd of `/` is never a real working directory — it is the shape a missing
-/// cwd takes by the time it reaches here (`CallContext::cwd`'s contract is
-/// that `None` must be rejected, and every synthesized `ExecContext` that
-/// can't resolve one lands on `/`). Servicing it means descending the entire
-/// filesystem: above any repository, so `.gitignore` never applies and the
-/// walk falls into build-output trees until the 120s tool timeout fires. That
-/// cost a wasted agentic iteration every time an autonomous turn tried to
-/// orient itself (see `docs/issues.md`, the 2026-08-07 cwd entry).
+/// `glob`/`grep` without an explicit `path` walk from the caller's cwd. A
+/// context with NO cwd is caught earlier by `refuse_missing_cwd` above — so
+/// by the time a search root reaches here, the context has a real cwd and
+/// still ended up at `/`, which only happens by climbing out via `..`
+/// (`resolve_str` folds `../../..` etc. against a concrete base). Servicing
+/// that walk means descending the entire filesystem: above any repository,
+/// so `.gitignore` never applies and the walk falls into build-output trees
+/// until the 120s tool timeout fires. That cost a wasted agentic iteration
+/// every time an autonomous turn tried to orient itself (see
+/// `docs/issues.md`, the 2026-08-07 cwd entry).
 ///
 /// A refusal that names the fix is strictly better than a walk that cannot
 /// finish: the model can retry with a real `path` on the next tool call
@@ -968,7 +1011,25 @@ mod tests {
         (broker, cache)
     }
 
+    /// The default test context: a concrete cwd under the mounted `/tmp`
+    /// backend. Most tests pass absolute paths and don't care what this is,
+    /// but it must be `Some` — a `None` cwd is refused up front by every
+    /// tool now (`refuse_missing_cwd`), so tests that aren't specifically
+    /// exercising that refusal need a real one to get past it.
+    fn default_ctx() -> CallContext {
+        CallContext::test().with_cwd(std::path::PathBuf::from("/tmp"))
+    }
+
     async fn call(broker: &Broker, tool: &str, args: serde_json::Value) -> KernelToolResult {
+        call_with_ctx(broker, tool, args, &default_ctx()).await
+    }
+
+    async fn call_with_ctx(
+        broker: &Broker,
+        tool: &str,
+        args: serde_json::Value,
+        ctx: &CallContext,
+    ) -> KernelToolResult {
         broker
             .call_tool(
                 KernelCallParams {
@@ -976,7 +1037,7 @@ mod tests {
                     tool: tool.to_string(),
                     arguments: args,
                 },
-                &CallContext::test(),
+                ctx,
                 CancellationToken::new(),
             )
             .await
@@ -990,17 +1051,73 @@ mod tests {
         }
     }
 
-    /// A pathless `glob` from a context with no cwd must refuse, not walk.
-    ///
-    /// `CallContext::test()` carries no cwd — the same shape an autonomous
-    /// turn had before 2026-08-07 — which `to_exec_context` renders as `/`.
-    /// Servicing that walks the entire filesystem and times out after 120s;
-    /// every fresh coder context paid it on its first orientation move.
+    /// Every tool in this server must refuse a context with no cwd, up
+    /// front — before parsing its own params, let alone resolving a path.
+    /// `CallContext::test()` carries no cwd; previously `to_exec_context`
+    /// fabricated `/` for it, which both violated `CallContext::cwd`'s own
+    /// documented contract ("`None` means filesystem tools must reject")
+    /// and, concretely, sent autonomous turns walking the entire filesystem
+    /// on a pathless `glob`/`grep` until the 120s tool timeout fired (see
+    /// `docs/issues.md`, the 2026-08-07 cwd entry). Empty `{}` args are
+    /// enough: the check runs before any arg is even deserialized, so a
+    /// tool that would otherwise reject missing-required-field input must
+    /// still surface the cwd refusal first.
+    #[tokio::test]
+    async fn every_tool_rejects_a_context_with_no_cwd() {
+        let (broker, _cache) = broker_with_file("/tmp/a.rs", "fn main() {}\n").await;
+
+        for tool in ["read", "edit", "write", "glob", "grep"] {
+            let res = call_with_ctx(&broker, tool, serde_json::json!({}), &CallContext::test()).await;
+            assert!(res.is_error, "{tool}: expected refusal, got: {}", text_of(&res));
+            let msg = text_of(&res);
+            assert!(
+                msg.contains("no working directory set"),
+                "{tool}: refusal must name the actual problem, not the root-walk wording \
+                 (a context with no cwd never asked to search anything): {msg}"
+            );
+        }
+    }
+
+    /// The concrete case gemini's review flagged: a relative path on a
+    /// cwd-less context must be refused, not silently resolved against a
+    /// fabricated `/` (which would turn `src/main.rs` into `/src/main.rs`
+    /// and fail as a confusing host permission error instead of a clean
+    /// refusal naming the real problem).
+    #[tokio::test]
+    async fn relative_path_with_no_cwd_is_refused_not_resolved_against_root() {
+        let (broker, _cache) = broker_with_file("/tmp/a.rs", "fn main() {}\n").await;
+
+        let res = call_with_ctx(
+            &broker,
+            "read",
+            serde_json::json!({ "path": "src/main.rs" }),
+            &CallContext::test(),
+        )
+        .await;
+
+        assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
+        let msg = text_of(&res);
+        assert!(
+            msg.contains("no working directory set"),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains("/src/main.rs"),
+            "must refuse before resolving against a fabricated root, not after: {msg}"
+        );
+    }
+
+    /// A pathless `glob` from a context whose cwd genuinely IS the
+    /// filesystem root must still refuse, not walk. Unlike the cwd-less
+    /// case above (caught earlier by `refuse_missing_cwd`), this context has
+    /// a real, concrete cwd — it just happens to be `/` — so it reaches
+    /// `refuse_filesystem_root_walk` instead.
     #[tokio::test]
     async fn glob_without_path_refuses_a_filesystem_root_walk() {
         let (broker, _cache) = broker_with_file("/tmp/a.rs", "fn main() {}\n").await;
+        let ctx = CallContext::test().with_cwd(std::path::PathBuf::from("/"));
 
-        let res = call(&broker, "glob", serde_json::json!({ "pattern": "**/Cargo.toml" })).await;
+        let res = call_with_ctx(&broker, "glob", serde_json::json!({ "pattern": "**/Cargo.toml" }), &ctx).await;
 
         assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
         let msg = text_of(&res);
@@ -1018,8 +1135,9 @@ mod tests {
     #[tokio::test]
     async fn grep_without_path_refuses_a_filesystem_root_walk() {
         let (broker, _cache) = broker_with_file("/tmp/b.rs", "fn main() {}\n").await;
+        let ctx = CallContext::test().with_cwd(std::path::PathBuf::from("/"));
 
-        let res = call(&broker, "grep", serde_json::json!({ "pattern": "fn" })).await;
+        let res = call_with_ctx(&broker, "grep", serde_json::json!({ "pattern": "fn" }), &ctx).await;
 
         assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
         assert!(
@@ -1030,8 +1148,9 @@ mod tests {
     }
 
     /// A path that CLIMBS OUT of its workspace reaches the root walk the
-    /// guard exists to stop. `Path` equality misses this: `..` is not folded
-    /// by `Components`, so `/tmp/..` compares unequal to `/` while the walker
+    /// guard exists to stop, even from a context with a perfectly ordinary
+    /// cwd (`/tmp`). `Path` equality misses this: `..` is not folded by
+    /// `Components`, so `/tmp/..` compares unequal to `/` while the walker
     /// descends from the root all the same.
     #[tokio::test]
     async fn glob_refuses_a_path_that_climbs_out_to_the_root() {
@@ -1223,12 +1342,12 @@ mod tests {
             .await
             .unwrap();
 
-        // `CallContext::test()` carries no cwd, so this needs an explicit
-        // `path`: a pathless walk from a cwd-less context is now refused
-        // rather than serviced from `/` (see
-        // `glob_without_path_refuses_a_filesystem_root_walk`). The point of
-        // this test is the broker→tool plumbing, not the walk root.
-        let ctx = CallContext::test();
+        // `CallContext::test()` carries no cwd, and every tool now refuses
+        // that up front (`refuse_missing_cwd`), so this needs a concrete
+        // one to reach the broker→tool plumbing this test actually checks.
+        // The `path` param stays explicit too — a pathless walk would still
+        // hit the root-walk guard, see `glob_without_path_refuses_a_filesystem_root_walk`.
+        let ctx = CallContext::test().with_cwd(std::path::PathBuf::from("/tmp"));
         let result = broker
             .call_tool(
                 KernelCallParams {

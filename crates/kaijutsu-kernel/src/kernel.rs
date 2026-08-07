@@ -487,14 +487,16 @@ impl Kernel {
             serde_json::from_str(params_json).map_err(McpError::InvalidParams)?
         };
 
-        let call_ctx = CallContext::new(
+        let mut call_ctx = CallContext::new(
             tool_ctx.principal_id,
             tool_ctx.context_id,
             tool_ctx.session_id,
             tool_ctx.kernel_id,
         )
-        .with_cwd(tool_ctx.cwd.clone())
         .with_trace(TraceContext::from_current_span());
+        if let Some(cwd) = tool_ctx.cwd.clone() {
+            call_ctx = call_ctx.with_cwd(cwd);
+        }
 
         let result = broker
             .call_tool(

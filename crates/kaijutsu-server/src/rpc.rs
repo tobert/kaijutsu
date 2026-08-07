@@ -590,20 +590,26 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                 // turn (kj drive, ACP prompts, the musician's OODA loop)
                 // walking the whole filesystem — above any repo, so
                 // .gitignore could not apply and the walk fell into
-                // build-output trees until the 120s tool timeout fired.
-                // A context with no durable cwd still yields `/` here, matching
-                // the other call sites — but that is now a refusal, not a
-                // license: the file tools reject a filesystem-root walk root
-                // instead of servicing it (`servers/file.rs`).
-                let cwd =
-                    context_cwd(kernel, context_id).unwrap_or_else(|| std::path::PathBuf::from("/"));
-                let tool_ctx = kaijutsu_kernel::ExecContext::new(
-                    principal_id,
-                    context_id,
-                    cwd,
-                    kaijutsu_types::SessionId::new(),
-                    kernel.kernel.id(),
-                );
+                // build-output trees until the 120s tool timeout fired. A
+                // context with no durable cwd now stays `None` all the way
+                // through: the file tools reject a missing cwd outright
+                // instead of resolving relative paths against a fabricated
+                // root (`servers/file.rs`'s up-front rejection).
+                let tool_ctx = match context_cwd(kernel, context_id) {
+                    Some(cwd) => kaijutsu_kernel::ExecContext::new(
+                        principal_id,
+                        context_id,
+                        cwd,
+                        kaijutsu_types::SessionId::new(),
+                        kernel.kernel.id(),
+                    ),
+                    None => kaijutsu_kernel::ExecContext::new_without_cwd(
+                        principal_id,
+                        context_id,
+                        kaijutsu_types::SessionId::new(),
+                        kernel.kernel.id(),
+                    ),
+                };
                 match spawn_llm_for_prompt(
                     kernel,
                     context_id,
@@ -2858,21 +2864,28 @@ impl kernel::Server for KernelImpl {
                 conn.session_id,
             )
         };
-        let cwd = context_cwd(&self.kernel, context_id)
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let cwd = context_cwd(&self.kernel, context_id);
 
         Promise::from_future(
             async move {
                 let mut result = results.get().init_result();
                 result.set_request_id(&request_id);
 
-                let tool_ctx = kaijutsu_kernel::ExecContext::new(
-                    principal_id,
-                    context_id,
-                    cwd,
-                    session_id,
-                    kernel_arc.id(),
-                );
+                let tool_ctx = match cwd {
+                    Some(cwd) => kaijutsu_kernel::ExecContext::new(
+                        principal_id,
+                        context_id,
+                        cwd,
+                        session_id,
+                        kernel_arc.id(),
+                    ),
+                    None => kaijutsu_kernel::ExecContext::new_without_cwd(
+                        principal_id,
+                        context_id,
+                        session_id,
+                        kernel_arc.id(),
+                    ),
+                };
 
                 // Phase 5 D-54: tool filter retired. Visibility is now
                 // enforced by the broker's `ContextToolBinding` +
@@ -3535,15 +3548,21 @@ impl kernel::Server for KernelImpl {
                 log::debug!("prompt future started for context_id={}", context_id);
 
                 // Resolve cwd from the context's durable L1 state.
-                let cwd = context_cwd(&kernel, context_id)
-                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                let tool_ctx = kaijutsu_kernel::ExecContext::new(
-                    user_principal_id,
-                    context_id,
-                    cwd,
-                    session_id,
-                    kernel.id,
-                );
+                let tool_ctx = match context_cwd(&kernel, context_id) {
+                    Some(cwd) => kaijutsu_kernel::ExecContext::new(
+                        user_principal_id,
+                        context_id,
+                        cwd,
+                        session_id,
+                        kernel.id,
+                    ),
+                    None => kaijutsu_kernel::ExecContext::new_without_cwd(
+                        user_principal_id,
+                        context_id,
+                        session_id,
+                        kernel.id,
+                    ),
+                };
 
                 let documents = kernel.documents.clone();
 
@@ -4044,12 +4063,25 @@ impl kernel::Server for KernelImpl {
                         "no context joined — call joinContext first".into(),
                     )
                 })?;
-            let exec_ctx = kaijutsu_kernel::ExecContext {
-                principal_id,
-                context_id,
-                cwd: std::path::PathBuf::from("/"),
-                session_id,
-                kernel_id: kernel.kernel.id(),
+            // Sibling call sites (`execute_tool`, `prompt`) resolve this from
+            // the context's durable L1 state; this one used to hardcode `/`
+            // unconditionally instead — worse than the others, since it
+            // never even looked. Bring it in line: a real cwd if the context
+            // has one, `None` (not a fabricated root) if it doesn't.
+            let exec_ctx = match context_cwd(&kernel, context_id) {
+                Some(cwd) => kaijutsu_kernel::ExecContext::new(
+                    principal_id,
+                    context_id,
+                    cwd,
+                    session_id,
+                    kernel.kernel.id(),
+                ),
+                None => kaijutsu_kernel::ExecContext::new_without_cwd(
+                    principal_id,
+                    context_id,
+                    session_id,
+                    kernel.kernel.id(),
+                ),
             };
             let exec = kernel
                 .kernel
@@ -5838,15 +5870,21 @@ impl kernel::Server for KernelImpl {
                     // Build ToolContext from connection state; cwd is durable
                     // context-scoped state (L1).
                     let session_id = connection.borrow().session_id;
-                    let cwd = context_cwd(&kernel, context_id)
-                        .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                    let tool_ctx = kaijutsu_kernel::ExecContext::new(
-                        user_principal_id,
-                        context_id,
-                        cwd,
-                        session_id,
-                        kernel.id,
-                    );
+                    let tool_ctx = match context_cwd(&kernel, context_id) {
+                        Some(cwd) => kaijutsu_kernel::ExecContext::new(
+                            user_principal_id,
+                            context_id,
+                            cwd,
+                            session_id,
+                            kernel.id,
+                        ),
+                        None => kaijutsu_kernel::ExecContext::new_without_cwd(
+                            user_principal_id,
+                            context_id,
+                            session_id,
+                            kernel.id,
+                        ),
+                    };
 
                     // Create user message block at the end of the document
                     let last_block = documents.last_block_id(context_id);
@@ -7692,8 +7730,12 @@ fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
 }
 
 /// Read a context's durable cwd from L1 (`context_shell.cwd`). Returns `None`
-/// when unset or unreadable — callers apply their own default (the interactive
-/// shell lands in `/docs`; tool-context resolution defaults to `/`).
+/// when unset or unreadable. `get_cwd` (the interactive shell's `kj cwd`)
+/// still applies its own `/docs` landing-dir default for display purposes;
+/// every `ExecContext`-constructing call site instead passes the `Option`
+/// straight through to `ExecContext::new`/`new_without_cwd` — a tool
+/// context with no cwd is `None`, not a fabricated `/` (`servers/file.rs`
+/// rejects it outright rather than resolving paths against a fake root).
 fn context_cwd(kernel: &SharedKernelState, context_id: ContextId) -> Option<std::path::PathBuf> {
     kernel
         .kernel_db

@@ -17,19 +17,24 @@ use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 /// The subset of `mcp::CallContext` that existing engine bodies read.
 ///
-/// `cwd` is a required path (defaults to `/` in the adapter when
-/// `CallContext::cwd` is `None`). Engines that care about virtual-filesystem
-/// paths or workspace guard enforcement pull from here.
+/// `cwd` mirrors `CallContext::cwd`'s contract: `None` means the context has
+/// no working directory, and filesystem tools must reject rather than
+/// resolve relative paths against a fabricated root (see
+/// `mcp::servers::file`). Engines that care about virtual-filesystem paths
+/// or workspace guard enforcement pull from here.
 #[derive(Debug, Clone)]
 pub struct ExecContext {
     pub principal_id: PrincipalId,
     pub context_id: ContextId,
-    pub cwd: PathBuf,
+    pub cwd: Option<PathBuf>,
     pub session_id: SessionId,
     pub kernel_id: KernelId,
 }
 
 impl ExecContext {
+    /// A context with a concrete working directory — the common case (most
+    /// callers genuinely have one: a live kaish shell, a persisted context
+    /// cwd, a test fixture).
     pub fn new(
         principal_id: PrincipalId,
         context_id: ContextId,
@@ -40,7 +45,26 @@ impl ExecContext {
         Self {
             principal_id,
             context_id,
-            cwd: cwd.into(),
+            cwd: Some(cwd.into()),
+            session_id,
+            kernel_id,
+        }
+    }
+
+    /// A context with no working directory. Use only when there genuinely is
+    /// none to give — e.g. a synthesized turn whose context has never `cd`'d
+    /// anywhere. Do NOT reach for this as a way to avoid picking a real cwd;
+    /// filesystem tools reject `None` outright (that's the point).
+    pub fn new_without_cwd(
+        principal_id: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        kernel_id: KernelId,
+    ) -> Self {
+        Self {
+            principal_id,
+            context_id,
+            cwd: None,
             session_id,
             kernel_id,
         }
@@ -50,7 +74,7 @@ impl ExecContext {
         Self {
             principal_id: PrincipalId::new(),
             context_id: ContextId::new(),
-            cwd: PathBuf::from("/"),
+            cwd: Some(PathBuf::from("/")),
             session_id: SessionId::new(),
             kernel_id: KernelId::new(),
         }
