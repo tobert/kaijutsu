@@ -28,6 +28,7 @@ pub mod drift;
 pub mod drive;
 pub mod fork;
 pub mod format;
+pub mod kaish;
 pub mod mcp;
 pub mod midi;
 pub mod parse;
@@ -481,6 +482,12 @@ impl KjDispatcher {
         if cmd == "model" {
             return self.dispatch_model(&argv[1..], caller).await;
         }
+        // `kj kaish primer` composes audience-general kaish guidance
+        // (kaish-help) — no context needed, same exemption rationale as
+        // `kj models`.
+        if cmd == "kaish" {
+            return self.dispatch_kaish(&argv[1..]);
+        }
 
         // Everything else requires an active context
         if caller.context_id.is_none() {
@@ -772,6 +779,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(transport::TransportArgs::command())
         .subcommand(model::ModelsArgs::command())
         .subcommand(model::ModelArgs::command())
+        .subcommand(kaish::KaishArgs::command())
         .subcommand(fork::ForkArgs::command())
         .subcommand(drive::DriveArgs::command())
         .subcommand(stage::StageArgs::command())

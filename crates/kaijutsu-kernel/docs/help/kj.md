@@ -81,6 +81,8 @@ drive           Clock one autonomous turn on a context (--prompt)
 editor          open, keys, state, save, quit, list — kernel-owned vi editor sessions
 fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
+kaish           primer — composed kaish agent-onboarding guidance (kaish-help);
+                what S05-kaish.kai turns into a per-context system block
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
                 bevy_brp, …); configured-vs-actually-running visibility + reconcile
 midi            list, show — CRDT-owned MIDI device profiles at

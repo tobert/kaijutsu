@@ -69,6 +69,10 @@ usvg = "0.46"
 # File pattern matching
 kaish-glob.workspace = true
 kaish-kernel.workspace = true
+# Composable kaish guidance (see the TODO at its workspace pin) — the shell
+# tool description and the `kj kaish primer` verb compose from this instead
+# of hand-writing kaish-language prose.
+kaish-help.workspace = true
 
 # gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
 ignore.workspace = true

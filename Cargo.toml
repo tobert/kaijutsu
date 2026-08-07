@@ -50,6 +50,14 @@ kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 kaish-kernel = { version = "0.13", features = ["subprocess"] }
 kaish-glob = "0.13"
 kaish-types = "0.13"
+# TODO(amy): kaish-help pinned to an open PR branch (not crates.io) because
+# published 0.13 forces an "Overlay mode" paragraph into every composed
+# recipe and kaijutsu never enables overlay mode — shipping it would tell
+# our models to run `kaish-vfs commit` for a mode that isn't on. This rev
+# makes overlay opt-in (`Selector::without_overlay`) and adds the four
+# verified syntax gaps. Flip to a version string once Amy cuts the release
+# that carries this (docs/composable-help.md step 4).
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28" }
 
 # Cap'n Proto
 capnp = "0.25"

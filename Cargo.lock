@@ -6135,6 +6135,7 @@ dependencies = [
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "kaish-glob",
+ "kaish-help 0.13.0 (git+https://github.com/tobert/kaish?rev=ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28)",
  "kaish-kernel",
  "notify",
  "parking_lot",
@@ -6253,7 +6254,7 @@ name = "kaijutsu-types"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "kaish-types",
+ "kaish-types 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "strum 0.26.3",
@@ -6290,7 +6291,15 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6237b6de41c07f23a2d182f9321131f00dce98240d1d37e8294b269158b9b1d"
 dependencies = [
- "kaish-types",
+ "kaish-types 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "kaish-help"
+version = "0.13.0"
+source = "git+https://github.com/tobert/kaish?rev=ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28#ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28"
+dependencies = [
+ "kaish-types 0.13.0 (git+https://github.com/tobert/kaish?rev=ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28)",
 ]
 
 [[package]]
@@ -6318,9 +6327,9 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "kaish-glob",
- "kaish-help",
+ "kaish-help 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "kaish-tool-api",
- "kaish-types",
+ "kaish-types 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "kaish-vfs",
  "logos",
  "md-5",
@@ -6349,7 +6358,7 @@ checksum = "a1d1852d1bb674446c6d80f7d8d8615d16fbac2adb6b4a5c6b1791081e242826"
 dependencies = [
  "async-trait",
  "clap",
- "kaish-types",
+ "kaish-types 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -6367,6 +6376,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaish-types"
+version = "0.13.0"
+source = "git+https://github.com/tobert/kaish?rev=ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28#ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio-util",
+ "web-time",
+]
+
+[[package]]
 name = "kaish-vfs"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6374,7 +6396,7 @@ checksum = "acfd478a3979372cecd0416a78a0e8de99da4bb3774b6e683f97281c82351791"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
- "kaish-types",
+ "kaish-types 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
 ]
 

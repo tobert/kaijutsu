@@ -20,7 +20,7 @@
 //! (default/coder/mcp via `facade:*`, director/musician explicitly) gets the
 //! tool; `toolie` (no facade) stays excluded.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -61,11 +61,69 @@ pub struct ShellParams {
     pub background: bool,
 }
 
-const DESCRIPTION: &str =
-    include_str!("../../../../../assets/defaults/prompts/shell-tool.md");
+// The kaish-language guidance (word-splitting, globs, `case`/`esac`,
+// pre-validation, …) is composed from `kaish-help` at process start instead of
+// hand-maintained here — that crate exists so a kaish release updates this
+// text everywhere (kaijutsu, kaibo) instead of every embedder re-drifting its
+// own prose (kaish's `docs/composable-help.md` step 4). `without_overlay()`
+// drops the copy-on-write-overlay paragraph: kaijutsu materializes a fresh
+// context kaish per call and never turns overlay on, so that guidance would
+// be an active mixed signal ("run `kaish-vfs commit`" for a mode that isn't
+// enabled). `LazyLock`, not `const`, because composition is a runtime call
+// (`compose()`), not a `&'static str` kaish-help can hand us at compile time.
+static COMPOSED_TOOL_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    kaish_help::compose(
+        &kaish_help::Recipe::tool_description().without_overlay(),
+        &kaish_help::SchemaContent::new(&[]),
+    )
+});
 
-const DESCRIPTION_READ_ONLY: &str =
-    include_str!("../../../../../assets/defaults/prompts/shell-readonly-tool.md");
+/// The composed (kaish-sourced) half of the shell tool description, for the
+/// cross-slot duplication guard in `kj::kaish` — the primer must not repeat
+/// what already rides here. Exposed rather than duplicated so the guard reads
+/// the real bytes, not a second composition that could drift from this one.
+///
+/// `cfg(test)` rather than `allow(dead_code)`: it exists for the guard, and a
+/// production build has no caller.
+#[cfg(test)]
+pub(crate) fn composed_tool_description() -> &'static str {
+    &COMPOSED_TOOL_DESCRIPTION
+}
+
+// The kaijutsu-specific half kaish-help can't know: what this tool IS here
+// (runs in the caller's current kernel context), that `kj` is in scope for
+// context/drift/fork management, and the return contract (combined stdout,
+// stderr appended, nonzero exit reported as an error). Kept as an intro
+// paragraph, separated from the composed kaish-language rules by a blank
+// line, so the two sources stay visibly distinct rather than blurring into
+// one hand-tuned paragraph the way the old static file did.
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Run a command in your current kernel context using kaish (会sh). \
+         `kj` is in scope for context/drift/fork management. Returns \
+         combined stdout (stderr appended when present); a nonzero exit \
+         code is reported as an error.\n\n{}",
+        &*COMPOSED_TOOL_DESCRIPTION
+    )
+});
+
+// Read-only variant's kaijutsu-specific half: same return contract, plus what
+// makes it read-only (no mutation, no external commands) and the CRDT views
+// it can still read (`/v/docs`, `/v/input`) that a host-only read-only shell
+// wouldn't have.
+static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Run a READ-ONLY command in your current kernel context using kaish \
+         (会sh). This shell cannot mutate anything: every file write/delete/\
+         move and every external command is refused. Use it to inspect — \
+         read files, `grep`, `find`, walk the tree, and read the CRDT \
+         document/input views under `/v/docs` and `/v/input`; `kj` is in \
+         scope for read-only context introspection. Returns combined stdout \
+         (stderr appended when present); a nonzero exit code is reported as \
+         an error.\n\n{}",
+        &*COMPOSED_TOOL_DESCRIPTION
+    )
+});
 
 /// In-kernel broker server backing the `shell` / `read_only_shell` tool. Holds
 /// `Weak<Broker>` (the broker owns this instance's `Arc`) and reaches the
@@ -117,9 +175,9 @@ impl ShellServer {
 
     fn description(&self) -> &'static str {
         if self.read_only {
-            DESCRIPTION_READ_ONLY
+            &DESCRIPTION_READ_ONLY
         } else {
-            DESCRIPTION
+            &DESCRIPTION
         }
     }
 
@@ -443,6 +501,64 @@ mod tests {
     use crate::mcp::binding::{Capability, ContextToolBinding};
     use crate::mcp::{InstancePolicy, KernelCallParams};
     use kaijutsu_types::{PrincipalId, SessionId};
+
+    /// The composed half must carry real kaish-help content (a known rule)
+    /// and must NOT carry the overlay paragraph — the assertion that would
+    /// have caught shipping published kaish-help 0.13 (which forces overlay
+    /// guidance into every recipe) instead of the opt-in-overlay rev this
+    /// dependency is pinned to.
+    #[test]
+    fn composed_tool_description_has_a_known_rule_and_excludes_overlay() {
+        let text = DESCRIPTION.as_str();
+        assert!(
+            text.to_lowercase().contains("word splitting"),
+            "composed description should carry the no-word-splitting rule: {text}"
+        );
+        assert!(
+            !text.contains("Overlay mode") && !text.contains("kaish-vfs commit"),
+            "kaijutsu never enables overlay mode; the description must not tell \
+             the model to run `kaish-vfs commit`: {text}"
+        );
+
+        let ro_text = DESCRIPTION_READ_ONLY.as_str();
+        assert!(
+            ro_text.to_lowercase().contains("word splitting"),
+            "read-only description should carry the same composed rules: {ro_text}"
+        );
+        assert!(
+            !ro_text.contains("Overlay mode") && !ro_text.contains("kaish-vfs commit"),
+            "read-only description must not carry overlay guidance either: {ro_text}"
+        );
+    }
+
+    /// The kaijutsu-specific wrapper — what kaish-help can't know — must
+    /// survive composition: what the tool IS here (current kernel context),
+    /// `kj` in scope, and the return contract. The read-only variant also
+    /// names its mutation refusal and the CRDT views it can still read.
+    #[test]
+    fn kaijutsu_wrapper_survives_composition() {
+        let text = DESCRIPTION.as_str();
+        assert!(text.contains("current kernel context"), "{text}");
+        assert!(text.contains("`kj` is in scope"), "{text}");
+        assert!(
+            text.contains("combined stdout") && text.contains("nonzero exit"),
+            "return contract must survive: {text}"
+        );
+
+        let ro_text = DESCRIPTION_READ_ONLY.as_str();
+        assert!(
+            ro_text.contains("cannot mutate anything"),
+            "read-only contract must survive: {ro_text}"
+        );
+        assert!(
+            ro_text.contains("/v/docs") && ro_text.contains("/v/input"),
+            "read-only CRDT views must survive: {ro_text}"
+        );
+        assert!(
+            ro_text.contains("combined stdout") && ro_text.contains("nonzero exit"),
+            "return contract must survive on the read-only variant too: {ro_text}"
+        );
+    }
 
     /// An `Arc<KjDispatcher>` wired into a fresh broker with BOTH the writable
     /// and read-only `ShellServer`s registered — the runtime shape

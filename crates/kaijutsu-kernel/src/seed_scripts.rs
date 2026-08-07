@@ -257,6 +257,37 @@ mod tests {
         assert_eq!(parts.verb, "tick");
     }
 
+    /// `kj kaish primer` (composed kaish-help guidance) is wired into every
+    /// context_type whose `S10-binding.kai` actually grants a shell facade
+    /// (`facade:shell` or `facade:shell_readonly`) — coder/default/mcp via the
+    /// shared `lib/create/S10-binding.kai`, director explicitly, and toolie
+    /// via `facade:shell_readonly`. `musician` is deliberately excluded: its
+    /// binding grants no shell facade at all (Chameleon's tool-free player —
+    /// see `docs/chameleon.md`), so seeding it a primer for a tool it can
+    /// never call would be dead weight.
+    #[test]
+    fn kaish_primer_seeded_for_every_shell_seat_not_musician() {
+        for with_shell in ["coder", "default", "mcp", "director", "toolie"] {
+            let path = format!("/etc/rc/{with_shell}/create/S05-kaish.kai");
+            assert_eq!(
+                seed_body(&path).map(str::trim),
+                Some("/etc/rc/lib/create/S05-kaish.kai"),
+                "{with_shell} must symlink the shared kaish primer script"
+            );
+        }
+        assert!(
+            seed_body("/etc/rc/musician/create/S05-kaish.kai").is_none(),
+            "musician grants no shell facade — it must not seed a kaish primer"
+        );
+        // The canonical body itself: composes `kj kaish primer` into a
+        // Role::System/BlockKind::Text block, mirroring S00-stance.kai's
+        // `kj block create --role system --kind text` shape.
+        let canonical = seed_body("/etc/rc/lib/create/S05-kaish.kai")
+            .expect("lib kaish primer seed must exist");
+        assert!(canonical.contains("kj kaish primer"));
+        assert!(canonical.contains("kj block create --role system --kind text"));
+    }
+
     /// The musician seeds the hydration-window guard at create — `kj context
     /// hydrate` pins the prefix + sets the sliding tail so a self-driving
     /// musician doesn't re-hydrate its whole history every turn (the cost guard).

@@ -1,0 +1,14 @@
+# Composed kaish primer at every context create — the per-context half of
+# adopting kaish-help (docs/composable-help.md step 4: "kaijutsu/kaibo adopt
+# kaish-help"). `kj kaish primer` composes the model + operating contract +
+# builtins straight from the linked kaish-help crate
+# (crates/kaijutsu-kernel/src/kj/kaish.rs) — nothing here is hand-copied
+# prose, so a kaish release reaches every newly-created context without a
+# kaijutsu edit.
+#
+# No static copy lives in the CRDT to rot: this recomposes fresh on every
+# `create` and lands as an ordinary Role::System/BlockKind::Text block (folds
+# into the cached system prompt like S00-stance.kai — see that script's
+# comment for why S25-datetime.kai deliberately does NOT do this).
+primer="$(kj kaish primer)"
+kj block create --role system --kind text --content "$primer"
