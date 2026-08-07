@@ -79,6 +79,12 @@ enum ContextCommand {
     },
     /// Show a context's metadata (default: current).
     Info { context: Option<String> },
+    /// Render the system prompt this context actually gets: the exact
+    /// `base → rc sections → <situation>` assembly the LLM turn path
+    /// builds (`crate::llm::build_system_prompt`), so prompt/stance tuning
+    /// can be verified against live CRDT state instead of inferred from rc
+    /// scripts (default: current).
+    Prompt { context: Option<String> },
     /// Print the current context.
     #[command(alias = "show")]
     Current,
@@ -419,6 +425,9 @@ impl KjDispatcher {
             ContextCommand::List { tree } => self.context_list(tree, caller).await,
             ContextCommand::Info { context } => {
                 self.context_info(context.as_deref(), caller).await
+            }
+            ContextCommand::Prompt { context } => {
+                self.context_prompt(context.as_deref(), caller).await
             }
             ContextCommand::Current => self.context_current(caller).await,
             ContextCommand::Switch { context } => self.context_switch(&context, caller).await,
@@ -776,6 +785,172 @@ impl KjDispatcher {
         });
 
         KjResult::ok_with_data(info, record)
+    }
+
+    /// Render the system prompt this context actually gets: the exact
+    /// `base → rc sections → <situation>` assembly `spawn_llm_for_prompt`
+    /// builds for a real turn (`crates/kaijutsu-server/src/llm_stream.rs`),
+    /// reusing the same pure pieces (`build_system_prompt`,
+    /// `extract_system_prompt_sections`, `resolve_context_model`) so this
+    /// view cannot drift from what actually ships to the model — it is not
+    /// a second implementation of the assembly, only a read-only caller of
+    /// the same one.
+    ///
+    /// Deliberately more permissive than the turn path in one respect: an
+    /// unresolved model backend is not fatal here (`spawn_llm_for_prompt`
+    /// refuses to run a turn without one) — the `<model>` addendum fields
+    /// are simply omitted. Previewing a prompt is exactly the thing you
+    /// want to do while a context's model is still unconfigured.
+    async fn context_prompt(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
+        // Same !Send guard-scoping constraint as context_info: KernelDb's
+        // parking_lot::MutexGuard must not cross an `.await` below.
+        let (target_id, row, cast_label) = {
+            let db = self.kernel_db().lock();
+
+            // Resolve target context (default: current)
+            let target_id = match super::refs::resolve_context_arg(context, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context prompt: {e}")),
+            };
+
+            let row = match db.get_context(target_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => return KjResult::Err("kj context prompt: not found".to_string()),
+                Err(e) => return KjResult::Err(format!("kj context prompt: {e}")),
+            };
+
+            let cast_label = row
+                .cast_id
+                .and_then(|cid| db.get_cast(cid).ok().flatten())
+                .map(|c| c.label);
+
+            (target_id, row, cast_label)
+        };
+
+        // Situational label/state/provider come from the live DriftRouter
+        // handle, NOT the KernelDb row — mirroring exactly what
+        // `spawn_llm_for_prompt` reads for a real turn (llm_stream.rs). A
+        // resolved target_id with no drift handle renders all three absent,
+        // same as the turn path would — an honest gap, not a row fallback
+        // that would make this view lie about what the turn path sees.
+        let (ctx_label, ctx_state, ctx_provider_name) = {
+            let drift = self.drift_router().read();
+            match drift.get(target_id) {
+                Some(h) => (h.label.clone(), Some(h.state), h.provider.clone()),
+                None => (None, None, None),
+            }
+        };
+
+        // Resolved effective model — same ladder `context_info` and the
+        // turn path use (explicit override → cast slot → registry
+        // default). Unlike the turn path, an unresolved model does not
+        // error here; see the fn doc comment.
+        let resolved = {
+            let registry = self.kernel().llm().read().await;
+            crate::model_resolution::resolve_context_model(
+                &row.context_type,
+                row.provider.as_deref(),
+                row.model.as_deref(),
+                cast_label.as_deref(),
+                &registry,
+            )
+        };
+        let (resolved_backend, resolved_model) = match &resolved {
+            Some(r) => (Some(r.backend.clone()), Some(r.model.clone())),
+            None => (None, None),
+        };
+
+        // base: the CRDT-owned /etc/config/system.md — never a host file
+        // (docs/config-crdt-ownership.md). Fallback mirrors
+        // llm_stream.rs's `spawn_llm_for_prompt` exactly: a read/UTF-8
+        // failure falls back to the embedded default, loudly logged, never
+        // a silent empty prompt.
+        let base = {
+            use crate::vfs::VfsOps;
+            match self
+                .kernel()
+                .vfs()
+                .read_all(std::path::Path::new("/etc/config/system.md"))
+                .await
+            {
+                Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
+                    tracing::warn!("system.md in the CRDT is not UTF-8: {e}; using embedded default");
+                    crate::DEFAULT_SYSTEM_PROMPT.to_string()
+                }),
+                Err(e) => {
+                    tracing::warn!("read /etc/config/system.md failed: {e}; using embedded default");
+                    crate::DEFAULT_SYSTEM_PROMPT.to_string()
+                }
+            }
+        };
+
+        // rc sections: the (Role::System, BlockKind::Text) blocks the rc
+        // create/fork lifecycle dropped into this context's block store —
+        // the SAME extractor the turn path calls, so this can't drift from
+        // what's really sent.
+        let rc_sections = self
+            .block_store()
+            .block_snapshots(target_id)
+            .map(|b| crate::llm::extract_system_prompt_sections(&b))
+            .unwrap_or_default();
+
+        // tool_names: the current tool inventory via the same broker call
+        // the turn path uses, gated on the CALLING principal's own
+        // visibility — a preview should show what this caller's own turn
+        // would actually see, not an omniscient view.
+        let tool_names: Vec<String> = match self
+            .kernel()
+            .list_tool_defs_via_broker(target_id, caller.principal_id)
+            .await
+        {
+            Ok(defs) => defs.into_iter().map(|(name, _, _)| name).collect(),
+            Err(e) => return KjResult::Err(format!("kj context prompt: tool broker: {e}")),
+        };
+
+        let situational = crate::llm::SituationalContext {
+            context_id: Some(target_id),
+            context_label: ctx_label.clone(),
+            context_state: ctx_state,
+            provider: ctx_provider_name,
+            model: resolved_model.clone(),
+            tool_names,
+        };
+        let prompt = crate::llm::build_system_prompt(&base, &situational, &rc_sections);
+
+        // The <situation> tail, sliced out of the already-assembled prompt
+        // rather than re-derived from `situational` — guarantees
+        // `data.situation` can never disagree with what actually landed in
+        // `data.prompt` (empty when situational was empty and no
+        // <situation> block was emitted).
+        let situation = prompt
+            .find("<situation>")
+            .map(|idx| prompt[idx..].to_string())
+            .unwrap_or_default();
+
+        let label_display = ctx_label
+            .or(row.label.clone())
+            .unwrap_or_else(|| target_id.short());
+        let char_count = prompt.chars().count();
+        let message =
+            format!("Context: {label_display} ({})\nChars:   {char_count}\n\n{prompt}", target_id.short());
+
+        // Structured record: the assembled string plus the individual
+        // layers, so a caller can diff which layer changed (e.g. did the rc
+        // stance change, or just the live tool list) without re-running the
+        // assembly itself.
+        let record = serde_json::json!({
+            "context_id": target_id.to_hex(),
+            "label": label_display,
+            "char_count": char_count,
+            "resolved_backend": resolved_backend,
+            "resolved_model": resolved_model,
+            "prompt": prompt,
+            "base": base,
+            "rc_sections": rc_sections,
+            "situation": situation,
+        });
+
+        KjResult::ok_with_data(message, record)
     }
 
     async fn context_current(&self, caller: &KjCaller) -> KjResult {
@@ -3716,5 +3891,174 @@ mod tests {
             }
             other => panic!("expected Ok with array data, got {other:?}"),
         }
+    }
+
+    // ── kj context prompt ─────────────────────────────────────────────
+
+    /// The full A4 assembly, exercised through the REAL rc pipeline (not a
+    /// hand-seeded block): `context create --type coder` runs the actual
+    /// `assets/defaults/rc/coder/create/S00-stance.kai`, which drops a
+    /// `(Role::System, BlockKind::Text)` stance block via `kj block
+    /// create`. `kj context prompt` must show that block, the real
+    /// CRDT-owned base (`/etc/config/system.md` — `test_dispatcher_crdt_rc`
+    /// seeds it for real, unlike the plain `test_dispatcher`), and the
+    /// `<situation>` addendum, in that order — the order `build_system_prompt`
+    /// documents and the turn path relies on.
+    #[tokio::test]
+    async fn context_prompt_layers_base_rc_and_situation() {
+        let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let create_caller = caller_with_context(parent);
+
+        let create = d
+            .dispatch(
+                &[s("context"), s("create"), s("c1"), s("--type"), s("coder")],
+                &create_caller,
+            )
+            .await;
+        assert!(create.is_ok(), "create failed: {}", create.message());
+        let ctx = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("c1").expect("c1 should exist")
+        };
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("prompt")], &c).await;
+        assert!(result.is_ok(), "prompt failed: {}", result.message());
+        let msg = result.message();
+
+        // Base: the real CRDT-owned /etc/config/system.md content.
+        assert!(msg.contains("改善"), "base content missing from prompt: {msg}");
+        // rc: S00-stance.kai's real output — both branches (crisp/synth)
+        // share this opening line, so this holds regardless of which the
+        // `case` picked for the (unconfigured) resolved model.
+        assert!(
+            msg.contains("You are coding here"),
+            "rc-produced coder stance missing from prompt: {msg}"
+        );
+
+        // Order: base → rc → situation (byte offsets, same technique as
+        // system_prompt.rs's own `rc_md_content_reaches_system_prompt`).
+        let base_pos = msg.find("改善").expect("base present");
+        let rc_pos = msg.find("You are coding here").expect("rc present");
+        let situation_pos = msg.find("<situation>").expect("situation present");
+        assert!(
+            base_pos < rc_pos && rc_pos < situation_pos,
+            "expected base → rc → situation order; got base={base_pos}, rc={rc_pos}, \
+             situation={situation_pos}\nfull:\n{msg}"
+        );
+    }
+
+    /// `--json`'s `data.prompt` must be exactly the string rendered in the
+    /// human message (the header line precedes it) — no second assembly
+    /// path that could quietly drift from what the human sees. Also checks
+    /// the individual `base`/`rc_sections` pieces the spec asks for, so a
+    /// caller can diff which layer changed without re-running the assembly.
+    #[tokio::test]
+    async fn context_prompt_json_matches_human_render() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("promptctx"), None, principal);
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                kaijutsu_crdt::Role::System,
+                kaijutsu_crdt::BlockKind::Text,
+                "You are a terse test stance.".to_string(),
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Markdown,
+                Some(principal),
+            )
+            .unwrap();
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("prompt")], &c).await;
+        assert!(result.is_ok(), "prompt failed: {}", result.message());
+        let msg = result.message().to_string();
+        assert!(
+            msg.contains("promptctx"),
+            "header should show the context label: {msg}"
+        );
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let prompt = v["prompt"].as_str().expect("data.prompt is a string");
+                assert!(
+                    msg.contains(prompt),
+                    "human render must contain the exact data.prompt string;\nmsg={msg}\nprompt={prompt}"
+                );
+                assert_eq!(
+                    v["char_count"].as_u64(),
+                    Some(prompt.chars().count() as u64),
+                    "char_count must match the assembled prompt, not the wrapped message"
+                );
+
+                let base = v["base"].as_str().expect("data.base is a string");
+                assert!(
+                    prompt.starts_with(base.trim_end()),
+                    "prompt must start with base; base={base}\nprompt={prompt}"
+                );
+
+                let rc_sections = v["rc_sections"].as_array().expect("data.rc_sections is an array");
+                assert_eq!(
+                    rc_sections.as_slice(),
+                    &[serde_json::json!("You are a terse test stance.")],
+                    "rc_sections must carry the seeded rc block content verbatim"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// An explicit context ref must render THAT context's prompt, not the
+    /// caller's currently-joined one — the same default-to-current pattern
+    /// every other `context <verb> [<ctx>]` follows (see `context_info`).
+    #[tokio::test]
+    async fn context_prompt_resolves_explicit_ref_not_current() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let current = register_context(&d, Some("current-ctx"), None, principal);
+        let other = register_context(&d, Some("other-ctx"), None, principal);
+
+        for (ctx, marker) in [(current, "current marker"), (other, "other marker")] {
+            d.block_store()
+                .create_document(ctx, crate::DocumentKind::Conversation, None)
+                .unwrap();
+            d.block_store()
+                .insert_block_as(
+                    ctx,
+                    None,
+                    None,
+                    kaijutsu_crdt::Role::System,
+                    kaijutsu_crdt::BlockKind::Text,
+                    marker.to_string(),
+                    kaijutsu_crdt::Status::Done,
+                    kaijutsu_crdt::ContentType::Markdown,
+                    Some(principal),
+                )
+                .unwrap();
+        }
+
+        let c = caller_with_context(current);
+        let result = d
+            .dispatch(&[s("context"), s("prompt"), s("other-ctx")], &c)
+            .await;
+        assert!(result.is_ok(), "prompt failed: {}", result.message());
+        let msg = result.message();
+        assert!(
+            msg.contains("other marker"),
+            "explicit ref must render the target context's rc section: {msg}"
+        );
+        assert!(
+            !msg.contains("current marker"),
+            "explicit ref must NOT leak the caller's current context: {msg}"
+        );
     }
 }
