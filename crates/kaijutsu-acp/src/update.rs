@@ -639,6 +639,62 @@ mod tests {
         }
     }
 
+    /// A task that disappears from the block list must produce a NEW plan.
+    ///
+    /// The live pump's `BlockDeleted` arm used to `continue` before
+    /// `doc.apply_event`, so a deleted block survived in the mirror and the
+    /// plan kept listing it until a resync rebuilt the document. The pump now
+    /// applies the delete and rebuilds; this pins the half that decides
+    /// whether anything is sent — `build_plan` must notice the shorter list
+    /// rather than dedupe it away against the previous plan.
+    #[test]
+    fn build_plan_re_emits_when_a_task_disappears() {
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let t1 = task(ctx, 1, "first", TaskStatus::Open, None);
+        let t2 = task(ctx, 2, "second", TaskStatus::Open, None);
+
+        let both = m
+            .build_plan(&[t1.clone(), t2.clone()])
+            .expect("first plan must emit");
+        assert_eq!(plan_entries(&both).len(), 2);
+
+        // Same list again: nothing changed, so nothing is sent.
+        assert!(
+            m.build_plan(&[t1.clone(), t2.clone()]).is_none(),
+            "an unchanged plan must not be re-sent"
+        );
+
+        // t2 deleted — the plan is now shorter and MUST be re-emitted.
+        let after = m
+            .build_plan(&[t1.clone()])
+            .expect("a deleted task must produce a new plan");
+        let entries = plan_entries(&after);
+        assert_eq!(entries.len(), 1, "deleted task must leave the plan");
+        assert!(
+            entries.iter().all(|e| e.content != "second"),
+            "the deleted task must not still be listed: {entries:?}"
+        );
+    }
+
+    /// Deleting something that was never a task must NOT churn the plan —
+    /// the pump calls `build_plan` after every deletion and relies on this
+    /// dedupe to stay quiet for ordinary blocks.
+    #[test]
+    fn build_plan_stays_quiet_when_a_non_task_disappears() {
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let t1 = task(ctx, 1, "only", TaskStatus::Open, None);
+        let chatter = block(BlockKind::Text, Role::Model, "hello", 9);
+
+        assert!(m.build_plan(&[t1.clone(), chatter.clone()]).is_some());
+        assert!(
+            m.build_plan(&[t1.clone()]).is_none(),
+            "removing a non-Task block leaves the plan identical, so the pump \
+             must send nothing"
+        );
+    }
+
     fn chunk_text(u: &SessionUpdate) -> String {
         let c = match u {
             SessionUpdate::AgentMessageChunk(c)

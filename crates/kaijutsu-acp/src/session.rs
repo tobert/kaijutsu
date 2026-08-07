@@ -174,7 +174,40 @@ pub async fn run_pump(
                     }
                     dirty = true;
                     if let ServerEvent::BlockDeleted { block_id, .. } = &event {
-                        session.mapper.lock().forget(*block_id);
+                        let deleted = *block_id;
+                        // Apply to the mirror BEFORE returning. This arm used
+                        // to `continue` straight past `doc.apply_event`, so a
+                        // block deleted mid-session lived on in the live
+                        // `SyncedDocument` (and so in `doc.blocks()`, and so in
+                        // any rebuilt Task plan) until a resync threw the
+                        // mirror away — `apply_event_inner` has had a real
+                        // `BlockDeleted` handler the whole time, it was just
+                        // never reached. Affects every block kind's live
+                        // rendering, not only Task.
+                        let effect = doc.apply_event(&event);
+                        if matches!(effect, kaijutsu_client::SyncEffect::NeedsResync) {
+                            resync(&bridge, &session, &session_id, &cx, &mut doc, "sync reset").await;
+                            continue;
+                        }
+                        // Deleting a Task changes the plan. `build_plan`
+                        // returns `None` when the rebuilt entries match what
+                        // was last emitted, so calling it after any deletion
+                        // is self-deduplicating — a non-Task delete sends
+                        // nothing. One lock scope, deliberately: two chained
+                        // `.lock()` calls in a single `if` condition share a
+                        // temporary scope and self-deadlock (parking_lot is
+                        // not reentrant) — the bug fixed in 183eeaff.
+                        let plan = {
+                            let mut mapper = session.mapper.lock();
+                            mapper.forget(deleted);
+                            mapper.build_plan(&doc.blocks())
+                        };
+                        if let Some(update) = plan {
+                            let _ = cx.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                update,
+                            ));
+                        }
                         continue;
                     }
                     let effect = doc.apply_event(&event);
