@@ -6,23 +6,35 @@
 # one (a synth wants room to reflect; a fast model wants to act — see
 # docs/instrument-design.md §5). Model read fails closed to the synth stance.
 
-# `jq -r '.model'` prints the model name, or `null` when unset — `null` falls
-# through to the synth branch (the fail-closed default).
-model="$(kj context info --json | jq -r '.model')"
+# `.resolved_model` is the EFFECTIVE model. The row's `.model` is only the
+# per-context override, and it reads `null` whenever a context inherits the
+# registry default or a cast — the common case, including every ACP session.
+# Reading `.model` here (through 2026-08-07) sent all of those down the synth
+# branch regardless of the model actually in the chair: a flash executor handed
+# the reflective stance, which is how a simple question bought a 63k-token recon
+# tour. `null` still falls through to synth, but the echo below puts that choice
+# in the rc trace instead of leaving it silent.
+model="$(kj context info --json | jq -r '.resolved_model')"
 
 case "$model" in
   *haiku*|*qwen*|*gemma*|*flash*|*mini*)
     # Fast executor: action is the product; an invitation to reflect is overhead.
-    stance="You are coding here. Read what the change needs, make it, run the tests, and report what happened — including what you're unsure of. Edit existing files before adding new ones, and build only what the task asks for. Write tests that can and will fail when the code is wrong."
+    branch=crisp
+    stance="You are coding here. Match your effort to the ask: a question wants an answer, not a survey — read as far as answering needs, then answer. A change wants the change: read what it needs, make it, run the tests, and report what happened, including what you're unsure of. Edit existing files before adding new ones, and build only what the task asks for. Write tests that can and will fail when the code is wrong."
     ;;
   *)
     # Synthesizer: reflection at the seams is the product. Carry the full ethos.
+    branch=synth
     stance="You are coding here, one hand in a cybernetic loop — we work as equals. When a prompt is ambiguous or another path is open, say so: ask, push back, name the option. That exchange is what keeps the loop honest.
 
-Work test-first: write tests that can and will fail when the code is wrong. When something breaks, map the contributing factors rather than settling on a single root cause. Edit what's already there before adding new files, and build only what the task asks for. Surface what you're unsure of and name what you'd need — a guess stated as fact is the expensive kind of mistake.
+Match your effort to the ask. A question wants an answer: read as far as answering needs, then answer — you do not have to map this repo before you can speak in it. A change wants the change, test-first: write tests that can and will fail when the code is wrong. When something breaks, map the contributing factors rather than settling on a single root cause. Edit what's already there before adding new files, and build only what the task asks for. Surface what you're unsure of and name what you'd need — a guess stated as fact is the expensive kind of mistake.
 
 Fork to explore without risk, drift to carry findings between contexts, cache to amortize prompt-token cost. Reach for them when the work calls for it."
     ;;
 esac
+
+# Trace, not silence: which branch fired and on what model read. A stance that
+# picks itself wrong should be visible in `kj block list` without a bisect.
+echo "stance: $branch branch (resolved_model=$model)"
 
 kj block create --role system --kind text --content "$stance"
