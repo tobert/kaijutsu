@@ -30,6 +30,17 @@ trusted, and mistake-prevention is routed through the loadout, not through auth
 denials between players. Full reasoning: `docs/instrument-design.md` ("Many hands,
 one trust boundary") + `docs/chameleon.md`.
 
+**Host exec has one owner.** All host process execution routes through
+kaish — `EmbeddedKaish`'s `ExternalExec::Allow{path}|Deny` policy (set in
+`kj/context_shell.rs`, enum in `runtime/embedded_kaish.rs`) is the one place
+exec authority, ignore config, output limits, and VFS cwd resolution live.
+The sole sanctioned exception is MCP stdio server launches
+(`mcp/servers/external.rs`) — config-driven, spawned by `rmcp`, never
+agent-supplied. A new ad-hoc exec site (another `/bin/sh -c`, another bare
+`Command::new`) is a design conversation, not a patch: it re-derives policy
+kaish already owns, and the copy drifts — see `docs/issues.md` for one that
+did and is being retired.
+
 ## Crates
 
 `kaijutsu-types` first — the shared types every other crate depends on. Then

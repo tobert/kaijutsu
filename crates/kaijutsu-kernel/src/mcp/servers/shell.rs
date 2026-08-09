@@ -1101,4 +1101,249 @@ mod tests {
             .expect_err("read_only_shell must refuse background execution even with exec granted");
         assert!(matches!(err, McpError::Protocol(_)), "expected a Protocol refusal, got {err:?}");
     }
+
+    /// CHARACTERIZATION: block lifecycle, "created up front" half. The
+    /// output block's CRDT `Status` must already be `Running` the instant
+    /// `shell(background: true)` returns — not flipped to `Running` by some
+    /// later step. Distinct from the `"status": "running"` field in the tool
+    /// response (that's the background JOB's status, a different value from
+    /// the block's own CRDT status); this pins the block directly.
+    ///
+    /// Reaches into `d.block_store()` for the raw `Status` enum (the MCP tool
+    /// surface never exposes it) — expected to remain the shared CRDT
+    /// primitive across the background-engine swap, unlike
+    /// `background_exec`'s own types.
+    #[tokio::test]
+    async fn background_true_creates_a_running_block_before_the_process_finishes() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-runblock"), None, principal);
+        d.block_store()
+            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            // Long enough that it cannot have exited by the time we check.
+            arguments: serde_json::json!({"command": "sleep 2", "background": true}),
+        };
+        let result = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect("background start should succeed");
+        let structured = result.structured.unwrap();
+        let block_key = structured["block_id"].as_str().unwrap().to_string();
+        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+        let bg_id = crate::background_exec::BackgroundId::parse(structured["background_id"].as_str().unwrap())
+            .expect("valid background id");
+
+        let snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
+        assert_eq!(
+            snap.status,
+            kaijutsu_crdt::Status::Running,
+            "the output block must be Running immediately after shell(background: true) returns"
+        );
+
+        // Clean up the still-running sleep.
+        d.kernel().background_processes().cancel(bg_id, ctx_id);
+    }
+
+    /// CHARACTERIZATION: block lifecycle, nonzero-exit case. A Running block
+    /// must transition to CRDT `Status::Error` (never silently `Done`, never
+    /// stuck `Running`) when the backgrounded command exits nonzero, and the
+    /// real exit code must survive into `list_background_processes`.
+    /// Complements
+    /// `background_exec::tests::spawn_background_nonzero_exit_marks_block_error_and_records_code`
+    /// (same contract, pinned directly against the internal `spawn_background`
+    /// API) with the MCP-tool-surface view expected to survive the engine
+    /// swap. Reaches into `d.block_store()` for the CRDT `Status` only.
+    #[tokio::test]
+    async fn background_true_nonzero_exit_marks_the_block_error() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-nonzero"), None, principal);
+        d.block_store()
+            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({"command": "exit 5", "background": true}),
+        };
+        let result = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect("background start should succeed");
+        let bg_id = result.structured.as_ref().unwrap()["background_id"].as_str().unwrap().to_string();
+        let block_key = result.structured.unwrap()["block_id"].as_str().unwrap().to_string();
+        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+
+        let registry = d.kernel().background_processes();
+        let parsed_id = crate::background_exec::BackgroundId::parse(&bg_id).unwrap();
+        let start = std::time::Instant::now();
+        let snap = loop {
+            if let Some(s) = registry.get_for_context(parsed_id, ctx_id).filter(|s| s.status == "exited") {
+                break s;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for exit");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(snap.exit_code, Some(5), "exit status must never be lost");
+
+        let block_snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
+        assert_eq!(
+            block_snap.status,
+            kaijutsu_crdt::Status::Error,
+            "a nonzero-exit background process must leave the block Error, not Done"
+        );
+        assert_eq!(block_snap.exit_code, Some(5));
+    }
+
+    /// CHARACTERIZATION: refusal guard. `background: true` must refuse a
+    /// persisted context cwd that isn't a REAL host directory — a background
+    /// spawn goes straight to the host (bypassing kaish's VFS), so a
+    /// virtual-only cwd like `/v/docs` can't be honored. Assert both the
+    /// refusal AND that it names the offending cwd, per Amy's "assert on the
+    /// behavior and the reason, not exact prose" standard.
+    #[tokio::test]
+    async fn background_true_refuses_a_non_host_real_cwd() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-badcwd"), None, principal);
+        d.block_store()
+            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: ctx_id,
+                cwd: Some("/v/docs".to_string()),
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({"command": "echo nope", "background": true}),
+        };
+        let err = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect_err("a non-host-real cwd must refuse background execution");
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(msg.contains("/v/docs"), "refusal should name the offending cwd: {msg}");
+                assert!(
+                    msg.to_lowercase().contains("cwd") || msg.to_lowercase().contains("host"),
+                    "refusal should explain it's a host-realness problem, not a generic error: {msg}"
+                );
+            }
+            other => panic!("expected a Protocol refusal, got {other:?}"),
+        }
+    }
+
+    /// CHARACTERIZATION: hermetic env. `background_exec.rs` docs promise the
+    /// child's environment is the caller's EXPLICIT set (HOME, PATH from
+    /// `Kernel::host_path`, and the context's durable env vars) — never this
+    /// kernel process's own ambient OS environment. Proven two ways at once:
+    /// a var real in this test process's OS env but never threaded through
+    /// `start_background` must NOT reach the child, while a context-scoped
+    /// env var explicitly set via `kernel_db::set_context_env` — which IS
+    /// part of the documented hermetic set — must.
+    #[tokio::test]
+    async fn background_true_env_is_hermetic_not_inherited() {
+        let leak_key = "KAIJUTSU_TEST_BG_ENV_LEAK_MARKER";
+        // SAFETY: unique var name avoids cross-test collisions; this crate's
+        // test suite already accepts this pattern (see llm/config.rs).
+        unsafe {
+            std::env::set_var(leak_key, "should-not-leak-into-the-child");
+        }
+
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-env"), None, principal);
+        d.block_store()
+            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        {
+            let db = d.kernel_db().lock();
+            db.set_context_env(ctx_id, "KJ_CONTEXT_VAR", "context-value").unwrap();
+        }
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({"command": "env", "background": true}),
+        };
+        let result = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect("background start should succeed");
+        let block_key = result.structured.unwrap()["block_id"].as_str().unwrap().to_string();
+        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+
+        let start = std::time::Instant::now();
+        let content = loop {
+            let snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
+            if snap.status != kaijutsu_crdt::Status::Running {
+                break snap.content;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for `env` to finish");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        // SAFETY: matches the set_var above.
+        unsafe {
+            std::env::remove_var(leak_key);
+        }
+
+        assert!(
+            !content.contains(leak_key),
+            "the child must not see this kernel process's own OS env, got: {content:?}"
+        );
+        assert!(
+            content.contains("KJ_CONTEXT_VAR=context-value"),
+            "the context's durable env var must reach the child, got: {content:?}"
+        );
+        assert!(
+            content.contains(&format!("HOME={}", kaish_kernel::home_dir().to_string_lossy())),
+            "HOME must be seeded from kaish_kernel::home_dir(), got: {content:?}"
+        );
+        if let Some(path) = d.kernel().host_path() {
+            assert!(
+                content.contains(&format!("PATH={path}")),
+                "PATH must be the kernel's startup capture, got: {content:?}"
+            );
+        }
+    }
 }

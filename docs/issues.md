@@ -6,6 +6,46 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Background exec → kaish's job system (2026-08-07, Amy: "we should do the work and set the rule")
+
+An audit of every spawn site found exactly one ad-hoc host exec left in
+production: `spawn_background` (`background_exec.rs:552`) runs an
+agent-supplied string as `/bin/sh -c`, called from `shell.rs:200`
+(`start_background`, the `shell` tool's `background: true`). MCP stdio
+launches (`mcp/servers/external.rs`) are the sanctioned exception; the rule
+itself now lives in `CLAUDE.md` ("Host exec has one owner").
+
+The defect is not the bypass — it's that `shell.rs:206-283` hand-mirrors
+three policies kaish derives structurally (read-only refusal ←
+`ExternalExec::Deny`; exec-authority gate ← `allow_external_commands`;
+hermetic cwd/env ← `apply_context_config`), plus an `is_dir()` check
+(`:255`) needed only because kaish's VFS resolution isn't in play. One
+canonical owner, one silent copy, no mechanism keeping them in sync.
+
+**Preserve across the swap** (all in `background_exec.rs`): live output into
+the CRDT block (not buffered to completion); `Running`→`Done`/`Error` tied to
+exit; `kill_all_for_context` (`:486`); process-group kill (`:583`); the
+PDEATHSIG orphan guard (`:586` — `kill_on_drop` only covers a clean unwind);
+output cap with a loud marker. Characterization tests come first.
+
+**Blocked on three kaish changes** (worktree PR in flight,
+`~/src/wt/kaish-jobs-embedder`):
+1. A `JobManager` injection point — `Kernel::new`/`with_backend` hardcode
+   `JobManager::new()`, so the per-call `EmbeddedKaish` loses every job.
+2. `execute_background` must *forward* output it already captures.
+   `try_execute_external` drains stdout per 8 KiB via `drain_to_stream`
+   (`scheduler/stream.rs:223`); `execute_background` writes only the
+   aggregate at exit, so `/v/jobs/{id}/stdout` reads empty mid-run.
+3. PDEATHSIG — kaish has none anywhere (`setpgid` + pidfd + `kill_on_drop`
+   only), so migrating as-is would silently drop the guard that covers
+   `kill -9` and the `kaijutsu-runner.sh` restart loop.
+
+**Multi-tenancy stays ours.** `Job.session_id` is per-`JobManager`
+(construction-time, output-file naming) — not a tenant key — so a shared
+manager doesn't partition by context. Kaijutsu keeps a `ContextId`→`JobId`
+index rather than asking kaish to enforce ownership; consistent with the
+shared-trust model and with how `BackgroundRegistry` already works.
+
 ## `kj context prompt` diverges from the turn path in two ways (2026-08-07, kaibo/deepseek review)
 
 The verb exists so prompt tuning is verifiable rather than inferred, so

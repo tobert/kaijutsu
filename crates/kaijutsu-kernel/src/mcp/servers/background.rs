@@ -869,4 +869,302 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// CHARACTERIZATION: the whole point of `background: true` is that
+    /// output is observable in the CRDT block WHILE the process is still
+    /// running — not only after it exits. A test that only checked the final
+    /// block content would pass even under a regression that buffered
+    /// everything and only wrote to the block at process exit; this is the
+    /// test that would catch that regression, by requiring a snapshot where
+    /// the job is STILL `running` AND already carries the pre-sleep output.
+    ///
+    /// Entirely through the public MCP tool surface (`shell`,
+    /// `list_background_processes`, `read_background_output`) — no internals
+    /// reached — so it should survive the kaish-job-system swap unchanged.
+    #[tokio::test]
+    async fn read_background_output_is_observable_while_still_running() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-live"), None, principal);
+        d.block_store().create_document(ctx_id, DocKind::Conversation, None).unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let start = broker
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(ShellServer::INSTANCE),
+                    tool: ShellServer::TOOL.to_string(),
+                    arguments: serde_json::json!({
+                        "command": "echo before-sleep; sleep 1; echo after-sleep",
+                        "background": true,
+                    }),
+                },
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("background start should succeed");
+        let bg_id = start.structured.unwrap()["background_id"].as_str().unwrap().to_string();
+
+        // Poll for a moment where the job is STILL `running` and the block
+        // already carries the pre-sleep output. The command sleeps a full
+        // second between the two echoes, so this window is generous — a
+        // slow CI host has ample room; if liveness were broken, this loop
+        // spins until the timeout instead of ever seeing both conditions
+        // hold at once.
+        let poll_start = std::time::Instant::now();
+        let mid_read = loop {
+            let list = broker
+                .call_tool(call(BackgroundServer::TOOL_LIST, serde_json::json!({})), &cc, CancellationToken::new())
+                .await
+                .unwrap();
+            let structured = list.structured.unwrap();
+            let is_running = structured
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"].as_str() == Some(bg_id.as_str()))
+                .and_then(|e| e["status"].as_str())
+                == Some("running");
+
+            let read = broker
+                .call_tool(
+                    call(BackgroundServer::TOOL_READ, serde_json::json!({"id": bg_id})),
+                    &cc,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let text = match read.content.first().unwrap() {
+                ToolContent::Text(s) => s.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+
+            if is_running && text.contains("before-sleep") {
+                break text;
+            }
+            assert!(
+                poll_start.elapsed() < std::time::Duration::from_secs(5),
+                "never observed the process both `running` AND carrying its pre-sleep \
+                 output — liveness appears broken (output only surfaces at exit)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            !mid_read.contains("after-sleep"),
+            "the captured mid-run snapshot already had the post-sleep output — the process \
+             finished faster than expected, which weakens this test's liveness claim; got: {mid_read:?}"
+        );
+
+        wait_for_status(&broker, &cc, &bg_id, "exited", std::time::Duration::from_secs(10)).await;
+        let final_read = broker
+            .call_tool(
+                call(BackgroundServer::TOOL_READ, serde_json::json!({"id": bg_id})),
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match final_read.content.first().unwrap() {
+            ToolContent::Text(s) => assert!(
+                s.contains("before-sleep") && s.contains("after-sleep"),
+                "final output must carry both halves, got: {s:?}"
+            ),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// CHARACTERIZATION: output bounding, at the MCP tool surface.
+    /// `background_exec.rs`'s module docs ("Output bounding") promise a
+    /// bounded, loudly-marked cap on combined stdout+stderr — this is the
+    /// public-surface twin of
+    /// `background_exec::tests::output_cap_truncates_with_a_loud_marker_and_still_records_exit`,
+    /// which pins the same contract directly against `spawn_background`.
+    /// `DEFAULT_OUTPUT_CAP` (an internal constant, unlikely to survive the
+    /// kaish-job-system swap as-is) is reached ONLY to size the test's input
+    /// past whatever cap the replacement uses; every assertion below is on
+    /// `read_background_output`'s returned text and the job's terminal
+    /// status, both public.
+    #[tokio::test]
+    async fn background_output_cap_is_observable_via_read_background_output() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-cap"), None, principal);
+        d.block_store().create_document(ctx_id, DocKind::Conversation, None).unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let cap = crate::background_exec::DEFAULT_OUTPUT_CAP;
+        let start = broker
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(ShellServer::INSTANCE),
+                    tool: ShellServer::TOOL.to_string(),
+                    arguments: serde_json::json!({
+                        "command": format!("yes x | head -c {}", cap * 3),
+                        "background": true,
+                    }),
+                },
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("background start should succeed");
+        let bg_id = start.structured.unwrap()["background_id"].as_str().unwrap().to_string();
+
+        wait_for_status(&broker, &cc, &bg_id, "exited", std::time::Duration::from_secs(15)).await;
+
+        // Drain the whole (capped) buffer via the same offset-polling
+        // contract `read_background_output_polls_losslessly_past_one_read_bound`
+        // exercises, to assert on the reassembled text as a caller would see it.
+        let mut offset = 0u64;
+        let mut assembled = String::new();
+        loop {
+            let read = broker
+                .call_tool(
+                    call(BackgroundServer::TOOL_READ, serde_json::json!({"id": bg_id, "offset": offset})),
+                    &cc,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let chunk = match read.content.first().unwrap() {
+                ToolContent::Text(s) => s.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let structured = read.structured.unwrap();
+            let next = structured["next_offset"].as_u64().unwrap();
+            assembled.push_str(&chunk);
+            offset = next;
+            if !structured["has_more"].as_bool().unwrap() {
+                break;
+            }
+        }
+
+        assert!(
+            assembled.contains("capped"),
+            "reassembled output must carry the loud truncation marker, got len={}",
+            assembled.len()
+        );
+        assert!(
+            assembled.len() < cap * 2,
+            "reassembled output must not grow unbounded past the cap, got {} bytes",
+            assembled.len()
+        );
+
+        // Exit status must still be recorded even though most output was
+        // discarded — the cap must never starve the pipe reader.
+        let entry = wait_for_status(&broker, &cc, &bg_id, "exited", std::time::Duration::from_secs(1)).await;
+        assert_eq!(entry["exit_code"], serde_json::json!(0), "exit status must survive the cap");
+    }
+
+    /// CHARACTERIZATION: process-group kill. `background_exec.rs` spawns the
+    /// backgrounded `/bin/sh -c <command>` as the leader of its own new
+    /// process group specifically so that killing it reaches the WHOLE tree,
+    /// not just the direct child — a command that forks a grandchild (e.g.
+    /// `cmd &` inside the backgrounded shell) must have that grandchild
+    /// killed too when `kill_background_process` fires.
+    ///
+    /// Verified via a live heartbeat file the grandchild rewrites every
+    /// ~50ms, rather than checking process existence — a killed process
+    /// briefly remains visible as a zombie until reaped, which would make an
+    /// existence check flaky. A heartbeat that stops advancing is
+    /// unambiguous proof the grandchild actually stopped running.
+    #[tokio::test]
+    async fn kill_background_process_kills_the_whole_process_tree_not_just_the_direct_child() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-tree"), None, principal);
+        d.block_store().create_document(ctx_id, DocKind::Conversation, None).unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let heartbeat = std::env::temp_dir().join(format!("kaijutsu-bg-tree-hb-{}", uuid::Uuid::new_v4()));
+        let hb_path = heartbeat.display().to_string();
+
+        // The grandchild (`while true; do ...; done`) is backgrounded with
+        // `&` INSIDE the shell `spawn_background` starts — it never calls
+        // setpgid itself, so it inherits the parent shell's process group.
+        // The top-level shell then blocks on `sleep 30` so the whole tree is
+        // still alive when we issue the kill.
+        let start = broker
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(ShellServer::INSTANCE),
+                    tool: ShellServer::TOOL.to_string(),
+                    arguments: serde_json::json!({
+                        "command": format!(
+                            "(while true; do date +%s%N > {hb_path}; sleep 0.05; done) & sleep 30"
+                        ),
+                        "background": true,
+                    }),
+                },
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("background start should succeed");
+        let bg_id = start.structured.unwrap()["background_id"].as_str().unwrap().to_string();
+
+        // Wait for the heartbeat to actually be advancing (two distinct
+        // reads) before we trust it's live.
+        let poll_start = std::time::Instant::now();
+        let mut last = None;
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&heartbeat) {
+                if !content.is_empty() {
+                    match &last {
+                        Some(prev) if prev != &content => break,
+                        Some(_) => {}
+                        None => last = Some(content),
+                    }
+                }
+            }
+            assert!(
+                poll_start.elapsed() < std::time::Duration::from_secs(5),
+                "grandchild heartbeat file never started advancing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+
+        let killed = broker
+            .call_tool(
+                call(BackgroundServer::TOOL_KILL, serde_json::json!({"id": bg_id})),
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("kill should succeed");
+        assert!(!killed.is_error);
+        wait_for_status(&broker, &cc, &bg_id, "killed", std::time::Duration::from_secs(5)).await;
+
+        // Give the grandchild a moment to actually receive and act on the
+        // signal (should be near-instant), then confirm the heartbeat has
+        // genuinely stopped advancing over a real window — not just that we
+        // caught it between writes.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let after_kill = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let still_after = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        assert_eq!(
+            after_kill, still_after,
+            "the grandchild kept writing its heartbeat after the top-level process was \
+             killed — process-group kill did not reach it"
+        );
+
+        let _ = std::fs::remove_file(&heartbeat);
+    }
 }

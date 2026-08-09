@@ -18,14 +18,21 @@
 //!    `kaish_kernel::Kernel` (and thus a fresh `JobManager`) per call
 //!    (`kj/context_shell.rs`). A job started with `cmd &` would be invisible
 //!    to the *next* `shell` call — its `JobManager` is gone.
-//! 2. **No true live streaming.** kaish's `execute_background`
-//!    (`kaish-kernel-0.13.0/src/kernel.rs`) runs the whole pipeline to
-//!    completion inside the spawned task and only writes the aggregate
-//!    `ExecResult` into the job's `BoundedStream` *after* it finishes —
+//! 2. **The job layer discards liveness.** kaish's `execute_background`
+//!    (`kaish-kernel-0.13.0/src/kernel.rs`) awaits `runner.run(...)` to
+//!    completion inside the spawned task and only then writes the aggregate
+//!    `result.text_out()` into the job's `BoundedStream` — so
 //!    `/v/jobs/{id}/stdout` reads empty while a command is still running.
-//!    There is no per-chunk write anywhere in kaish's external-command spawn
-//!    path (`kernel.rs::try_execute_external`); stdout is captured into an
-//!    in-memory ring and returned whole, once, at exit.
+//!
+//!    NOT because the bytes are unavailable: `try_execute_external`'s capture
+//!    path spawns `drain_to_stream(child.stdout, …)`
+//!    (`kaish-kernel-0.13.0/src/scheduler/stream.rs:223`), which appends to a
+//!    `BoundedStream` per 8 KiB chunk *as the child emits it*. The live bytes
+//!    exist one layer down; `execute_background` just doesn't forward them.
+//!    (An earlier revision of this comment claimed "no per-chunk write
+//!    anywhere in kaish's external-command spawn path" — that was wrong for
+//!    0.13 and is corrected here, because it undersold how small the upstream
+//!    fix is.)
 //!
 //! Both are load-bearing for what a "poll a still-running build" tool needs:
 //! a registry that outlives a single call, and output visible before exit.

@@ -2920,6 +2920,96 @@ mod tests {
         assert!(!result.is_ok(), "should not allow removing current context");
     }
 
+    /// CHARACTERIZATION: `kj context remove` (once confirmed) kills any
+    /// background host processes the removed context still owns
+    /// (`background_exec.rs`'s `kill_all_for_context`, wired at the tail of
+    /// `context_remove` above) — a removed context's processes are killed,
+    /// not orphaned into invisibility. Goes through the REAL `kj context
+    /// remove` verb (not a direct `kill_all_for_context` call, which
+    /// `background_exec::tests::kill_all_for_context_only_touches_that_context`
+    /// already pins) so this test proves the wiring, not just the primitive.
+    ///
+    /// Reaches into `crate::background_exec::spawn_background` directly
+    /// (crate-internal API, not the `shell` MCP tool) to keep this test
+    /// decoupled from broker/binding setup — if `spawn_background`'s
+    /// signature disappears in the kaish-job-system swap, THIS call site is
+    /// what needs rewriting, not the `kj context remove` behavior under test.
+    #[tokio::test]
+    async fn context_remove_kills_owned_background_processes() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("victim"), Some(parent), principal);
+        d.block_store()
+            .create_document(target, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        let block_id = d
+            .block_store()
+            .insert_block_as(
+                target,
+                None,
+                None,
+                kaijutsu_crdt::Role::Tool,
+                kaijutsu_crdt::BlockKind::ToolResult,
+                String::new(),
+                kaijutsu_crdt::Status::Running,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap();
+
+        let registry = d.kernel().background_processes();
+        let bg_id = crate::background_exec::spawn_background(
+            registry,
+            d.block_store(),
+            crate::background_exec::SpawnBackgroundParams {
+                command: "sleep 30".to_string(),
+                cwd: std::env::temp_dir(),
+                env: vec![(
+                    "PATH".to_string(),
+                    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+                )],
+                context_id: target,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .unwrap();
+
+        // Confirm it's actually running before we remove its context.
+        let wait_start = std::time::Instant::now();
+        loop {
+            if registry.get_for_context(bg_id, target).filter(|s| s.status == "running").is_some() {
+                break;
+            }
+            assert!(wait_start.elapsed() < std::time::Duration::from_secs(2), "background process never reported running");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let c = confirmed_caller(parent);
+        let result = d
+            .dispatch(&[s("context"), s("remove"), s("victim")], &c)
+            .await;
+        assert!(result.is_ok(), "context remove should succeed: {}", result.message());
+
+        // The background process must be killed as a side effect of removing
+        // its owning context — never left `running` with an orphaned entry.
+        let wait_start = std::time::Instant::now();
+        loop {
+            match registry.get_for_context(bg_id, target) {
+                Some(snap) if snap.status == "killed" => break,
+                Some(_) => {}
+                None => panic!("entry vanished from the registry instead of being marked killed"),
+            }
+            assert!(
+                wait_start.elapsed() < std::time::Duration::from_secs(5),
+                "background process was never killed after its owning context was removed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn context_set_cwd() {
         let d = test_dispatcher().await;
