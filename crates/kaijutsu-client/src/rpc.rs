@@ -827,7 +827,7 @@ impl KernelHandle {
     // Block-based CRDT sync methods
     // =========================================================================
 
-    // Blocks sync via pushOps (SerializedOps). See BlockDocument::ops_since()
+    // Blocks sync via pushOps (SerializedOps). See BlockStore::ops_since()
     // and apply_ops().
 
     /// Push CRDT operations to the server for bidirectional sync.

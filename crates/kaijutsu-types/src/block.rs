@@ -43,7 +43,7 @@ pub struct BlockId {
     /// Agent-local sequence number.
     ///
     /// Callers must ensure monotonically increasing values per (context_id, principal_id)
-    /// pair. The types crate does not enforce this — that's BlockDocument's job.
+    /// pair. The types crate does not enforce this — that's BlockStore's job.
     /// Violations won't cause incorrect equality, but will confuse debugging
     /// and may break compaction heuristics.
     pub seq: u64,
