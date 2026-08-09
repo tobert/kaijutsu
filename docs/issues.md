@@ -52,6 +52,23 @@ manager doesn't partition by context. Kaijutsu keeps a `ContextId`→`JobId`
 index rather than asking kaish to enforce ownership; consistent with the
 shared-trust model and with how `BackgroundRegistry` already works.
 
+## Pythonic player: kaijutsu-py wheel (2026-08-09, Amy: "shape B — the pythonic player")
+
+New crate `crates/kaijutsu-py`: cdylib built by maturin, pyo3 isolated to this
+one crate, wrapping `kaijutsu-client`'s ActorHandle into a `kaijutsu` Python
+package — any Python process becomes a first-class player. Serves three
+lanes: (1) vendor agent harnesses client-side under their own subscriptions
+(Claude Agent SDK under Amy's own login first — per 2026-08-09 policy read,
+personal SDK-under-own-login is the sanctioned subscription lane and OAuth
+extraction is banned; GPT/Gemini harnesses later, each gets its own policy
+read); (2) notebook/science/MIDI players; (3) an experiment space for python
+sandboxes / uv venvs for agent-callable execution — containment via the
+isotest podman harness, and it must compose with the kaish exec-ownership
+rule, never bypass it. Design principle: players fat in capability, thin in
+derived state (the kernel is the head). Second voices in flight: gemini-pro
+deliberate (batch, durable handle `gemini/batches/pn8p3vcg5faecoeekb8a95s50cm9cb7mkrh8`)
++ deepseek consult; melt results into a design doc before building.
+
 ## `kj context prompt` diverges from the turn path in two ways (2026-08-07, kaibo/deepseek review)
 
 The verb exists so prompt tuning is verifiable rather than inferred, so
