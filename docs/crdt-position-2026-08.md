@@ -87,3 +87,72 @@ One reframe to close, in the project's own language: the instrument philosophy s
 ---
 
 *Verification notes: dossier claims 1–5 all checked against main, with two corrections — (i) lib.rs's "BlockDocument still used by downstream crates" is stale (only comments and one test remain); (ii) the input-doc's "concurrent edits merge automatically" describes an unexercised capability — all input writers use positional RPC.*
+
+---
+
+# Part 2 — The Lean-In Question (same day)
+
+Amy, after reading Part 1: *"what if we actually leaned in to CRDT more — we
+have that sftp plumbing, but what if clients could say 'I allow kaijutsu
+kernel to edit ~/src/kaish via CRDT', flowing over the ssh connections —
+does that change the game?"* Deliberated by gpt-5.6-sol (kaibo batch lane,
+max thinking; dossier by gemini after the gpt explorer TPM-starved — see
+kaibo's hybrid-cast backlog entry). Verdict summary; full text preserved
+below the fold in git history of this commit.
+
+**Verdict: it changes the CRDT argument, but does not justify a general
+distributed filesystem.** The idea introduces the first workload with
+genuinely independent writers and partitions (laptop offline + kernel both
+editing from a shared causal base, merging on reconnect) — exactly where
+CRDT merge earns its keep. The revised doctrine:
+
+- **Keep option 2 for conversations and ordinary clients** (projected
+  streams; every Part-1 migration step stands, including the BlockDocument
+  demolition — merged 75e31b60 the same evening).
+- **Amend "never build client replication"** to: *do not make general
+  clients replicas; permit replication only for an explicitly
+  partition-tolerant WORKSPACE surface, through one shared
+  WorkspaceReplica implementation with its own protocol and product
+  boundary.* Do NOT reuse conversation SyncedDocument for it.
+- **Git is the make-or-break issue**: git stays authority for history and
+  baselines; the CRDT is a live uncommitted text overlay keyed to a
+  workspace epoch (base commit + generation). Checkout/rebase/stash PAUSE
+  or DETACH the replica — never replicate as bulk edits (the
+  publish-your-checkout-into-everyone's-tree failure). Dedicated git
+  worktrees are the first environment. brak/git carry baselines; CRDT
+  carries the overlay; sftp/CAS carry snapshots and binaries. Complements,
+  not competitors.
+- **Smallest honest probe**: one kernel, one grant, one throwaway git
+  worktree, pre-existing UTF-8 source files only, no tree mutations, ops
+  over the existing capnp channel, persistent oplogs both sides. Test the
+  real partition: disconnect, edit both sides (different lines / adjacent /
+  same token), reconnect, verify convergence; crash both sides mid-flow;
+  then a deliberate checkout experiment to validate the epoch boundary.
+  Go/no-go: (1) no-loss convergence through offline+crashes+editor
+  atomic-save patterns, AND (2) repeated workflows where live sync beats
+  "agent commits, human cherry-picks". If either fails: STOP before any
+  tree layer; sftp becomes explicit staging/import/export + artifact
+  hydration instead.
+- **First host**: a small Rust `kj-workspace` sidecar reusing
+  kaijutsu-client + the existing diamond-types dep; the Python player is
+  the launch/UX surface (grant, preview, pause, status), NOT the
+  replication engine.
+- **Safety floor** (shared-trust ergonomics, but the OS boundary is real):
+  exact root+pattern scoping; .git/secrets/build-output excluded by
+  default; no symlink following; mass-change circuit breaker;
+  live/preview/paused modes; atomic writes + deletion quarantine;
+  immediate revoke; per-machine materialization status; audit identifying
+  kernel/agent/machine/transaction. CRDT history does not give free undo —
+  "restore this content" as a compensating edit is the honest v1.
+- **Evidence gaps named**: capnp server→client callback ergonomics, sftp
+  upload support, DTE python-binding maturity, the brak protocol, and —
+  most important — whether humans and agents actually edit the same dirty
+  files concurrently in practice, vs exchanging commits. If real workflows
+  are commit-shaped, this is a seductive scope trap and the economics say
+  stop.
+
+Fleet-planning note (same evening, zorak session): brak-as-kernel is ONE
+kernel with many tailnet clients — it feeds Part 1's one-body verdict and
+does not itself require this workspace surface; but if the workspace probe
+succeeds, kernel-on-brak materializing agent edits across the fleet is the
+natural deployment.
