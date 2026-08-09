@@ -52,6 +52,19 @@ manager doesn't partition by context. Kaijutsu keeps a `ContextId`→`JobId`
 index rather than asking kaish to enforce ownership; consistent with the
 shared-trust model and with how `BackgroundRegistry` already works.
 
+## opencode support — shared lane with kaibo (2026-08-09, via kaibo session relay)
+
+Amy (later this week): "easy opencode go support and some testing" — she's
+picking up an account — and it "might be shared with kaijutsu, both tools
+could use it well." Contract with the kaibo session: the opencode-as-MCP-host
+measurements (instruction/description truncation limits, deferred-schema
+behavior, resource ambience — the numbers kaibo already has for Claude
+Code/Desktop) and the mcp-add config pattern get done ONCE and shared;
+coordinate at pickup so nobody measures twice. Kaijutsu angle: opencode is
+another vendor harness for the code-enabled-player pattern
+(docs/python-player.md) — same per-vendor policy read applies before wiring
+its subscription. Recorded in kaibo's signoff open threads as shared work.
+
 ## Pythonic player: kaijutsu-py wheel (2026-08-09, Amy: "shape B — the pythonic player")
 
 New crate `crates/kaijutsu-py`: cdylib built by maturin, pyo3 isolated to this
