@@ -68,6 +68,13 @@ add-key provisioning and no host state; contrib/install-systemd.sh +
 kaijutsu-server.service are the unit story. Jam doc:
 ~/src/zorak/docs/plans/cybernetic-infra.md (Q2).
 
+Amendments (same evening, zorak session): fleet binary distribution goes
+through **halfremembered-launcher** (zorak + github; Amy: "may need
+sprucing") — superseding Gitea-Actions-registry and distcc/sccache ideas —
+so kaijutsu-server binaries reach brak via launcher sync from zorak's
+builds. And brak is dropping MinIO (license): assume NO object storage on
+the fleet coordinator.
+
 **CRDT-record note**: this plan is ONE kernel with many tailnet clients —
 the one-body model stretched across machines, not multi-kernel
 federation. It therefore *supports* the option-2 verdict in
