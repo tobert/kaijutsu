@@ -156,3 +156,33 @@ kernel with many tailnet clients — it feeds Part 1's one-body verdict and
 does not itself require this workspace surface; but if the workspace probe
 succeeds, kernel-on-brak materializing agent edits across the fleet is the
 natural deployment.
+
+---
+
+# Amy's Ruling (2026-08-09, evening)
+
+*"Code will probably go via git and sftp. So ok yeah, we can release
+clients from participating. Is that the figma model?"*
+
+- **Option 2 is DECIDED.** Clients are released from replication: they
+  consume the kernel's sequenced projected stream and author via RPC;
+  no client links diamond-types. The kernel keeps the CRDT as its private
+  at-rest engine (journal, fork, per-block text merge).
+- **The workspace probe is SHELVED, not deleted.** Amy answered sol's
+  decisive behavioral unknown from the source: her code workflow is
+  commit-shaped (git + sftp/brak/launcher). The Part-2 design (epochs,
+  grants, pause-on-checkout, WorkspaceReplica boundary) stays here as the
+  drawer plan, revived only if observed workflows (e.g. via the sessions
+  lens) ever turn genuinely co-edit-shaped.
+- **The Figma analogy is apt and adopted as shorthand**: central sequencer
+  wins, fractional indexing for order (their child ordering ≈ our
+  order_key), clients as optimistic views, CRDT-inspired parts kept where
+  cheap, peer merge rejected because a server exists. Kaijutsu differs by
+  keeping a true text CRDT + journaled oplog kernel-side (no LWW text
+  loss; replay + fork), i.e. Figma's client contract with a stronger
+  engine behind it.
+
+Migration steps now unblocked as scheduled work: plain-projection stream
+variant (with wheel slice 1), MCP doc-task migration to RPC authoring,
+merge_ops concurrency counter (instrumentation), BlockDocument demolition
+(already merged, 75e31b60).
