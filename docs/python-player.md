@@ -1,9 +1,12 @@
-# The Pythonic Player — kaijutsu-py
+# The Code-Enabled Player — kaijutsu-py
 
-Amy's framing (2026-08-09): *"reverse ACP"* — instead of kaijutsu hosting
-agent runtimes, the agent runtime is the host and kaijutsu is the instrument
-it plays. We ship a `kaijutsu` Python wheel; any Python process becomes a
-first-class player. Design reviewed by gemini-pro (batch deliberate) and
+Amy's framing (2026-08-09): this is a **code-enabled player**, not "the
+Python integration" — a player that computes locally and reaches into the
+shared world through kaish, which remains the one instrument surface.
+*"Reverse ACP"*: the agent runtime is the host and kaijutsu is the
+instrument it plays. Python is the first binding (a `kaijutsu` wheel; any
+Python process becomes a first-class player); the concept admits other
+languages later. Design reviewed by gemini-pro (batch deliberate) and
 deepseek-v4-pro (consult) on 2026-08-09; both verdicts converged and are
 melted into this doc.
 
@@ -77,6 +80,32 @@ never silently dropped (mirror the MCP's `EventsLagged` handling).
 task is ~1000 lines of hard-won concurrency control — do not port it until
 the connection layer is proven), MIDI capture, VFS surfaces, input-document
 compose, invoke_peer. `shell "kj …"` covers the gaps meanwhile.
+
+## kaish data plumbing (audited 2026-08-09)
+
+Player code calls through kaish for shared-world operations, so the value
+of the whole design rides on structured data surviving the round trip.
+Audit result: the promises hold, with one gap.
+
+- **Wire**: `ShellExecResult` carries `data: ShellValue` — a typed union
+  (null/bool/int/float/string/json/bytes) — plus `outputData` for
+  tables/trees; the streaming path has a `structured` OutputEvent variant.
+  `bytes` means binary (images) round-trips.
+- **Client**: `read_shell_value` parses the `json` variant into
+  `serde_json::Value`. Shell variables carry `ShellValue` both directions
+  (`get/set/list_shell_vars`, durable per-context) — a code-enabled player
+  and a kaish script share a typed variable namespace. The wheel maps
+  these straight to Python objects; `player.vars["x"] = {...}` is visible
+  to scripts as `$x`.
+- **Producers**: `kj` is the structured producer (list verbs → arrays of
+  full IDs, inspect → objects; full ids only). Unix-shaped commands remain
+  text. The MCP `shell` tool already delivers `data` to CC agents today.
+- **GAP (slice-1 item)**: `getLastResult` exists in the capnp schema but
+  has NO client implementation — nothing in `KernelHandle` or
+  `ActorHandle` calls it. The MCP reads `data` indirectly off block
+  replication (hence its "null until replicated" caveat). The wheel gets
+  the direct fetch: wrap `getLastResult` through KernelHandle + the actor
+  so `sh()` returns lag-free structured results.
 
 ## Exec ownership (the kaish rule, applied)
 
