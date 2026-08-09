@@ -186,3 +186,23 @@ Migration steps now unblocked as scheduled work: plain-projection stream
 variant (with wheel slice 1), MCP doc-task migration to RPC authoring,
 merge_ops concurrency counter (instrumentation), BlockDocument demolition
 (already merged, 75e31b60).
+
+---
+
+# Coda — DTE Doctrine (Amy, same evening)
+
+- **No new DTE integration.** No new surface may depend on DTE op
+  encoding; the kernel's projected stream is the client contract. CRDT-
+  based features are admitted deliberately, on merit ("let the CRDT
+  things we want in") — never by default coupling.
+- **Refine, don't shed.** DTE's path is refine-in-place rather than
+  scheduled removal: Amy owns diamond-types-extended and is effectively
+  its only consumer (kaijutsu, plus ~/src/wringer — an older project she
+  may revive). Ownership means the fork can be pruned and shaped to
+  kaijutsu's exact kernel-internal needs (rope + journal + replay) on our
+  own schedule, with wringer kept in mind. The shed-vs-keep question from
+  the session dialogue dissolves: vendoring-by-ownership already
+  happened; refinement is the lazy gentle ramp.
+- Instrumentation still wanted before any refinement pass: merge_ops
+  concurrency counter + kernel-internal "did merge do non-trivial work"
+  twin.
