@@ -940,13 +940,14 @@ mod tests {
         assert_eq!(effect, SyncEffect::Ignored);
     }
 
-    /// End-to-end test: SyncedDocument → snapshot → BlockDocument.
+    /// End-to-end test: SyncedDocument → snapshot → BlockStore.
     ///
     /// Simulates the rendering pipeline path: events arrive via apply_event,
-    /// then sync_main_cell_to_conversation takes a snapshot and rebuilds
-    /// a BlockDocument for display. Verifies block count, order, and content.
+    /// then sync_main_cell_to_conversation takes a snapshot and rebuilds the
+    /// editor's BlockStore via `from_snapshot`. Verifies block count, order,
+    /// and content.
     #[test]
-    fn test_synced_document_to_block_document_rendering_chain() {
+    fn test_synced_document_to_block_store_rendering_chain() {
         let ctx = test_context_id();
         let server_agent = test_principal_id();
         let client_agent = test_principal_id();
@@ -1024,15 +1025,10 @@ mod tests {
         });
         assert!(matches!(effect, SyncEffect::Updated { block_count: 4 }));
 
-        // Simulate sync_main_cell_to_conversation: snapshot → BlockDocument
+        // Simulate sync_main_cell_to_conversation: snapshot → BlockStore
         let store_snap = sd.snapshot();
-        let doc_snap = kaijutsu_crdt::DocumentSnapshot {
-            context_id: store_snap.context_id,
-            blocks: store_snap.blocks,
-            version: sd.version(),
-        };
-        let doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, client_agent);
-        let blocks = doc.blocks_ordered();
+        let restored = CrdtBlockStore::from_snapshot(store_snap, client_agent).unwrap();
+        let blocks = restored.blocks_ordered();
 
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].content, "Hello");

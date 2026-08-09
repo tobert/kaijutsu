@@ -1,8 +1,9 @@
 //! Block store — collection of per-block DTE instances.
 //!
-//! Replaces the old `BlockDocument` (single shared DTE Document) with a
-//! collection of `BlockContent` instances, each owning its own DTE Document.
-//! Metadata lives in `BlockHeader` (plain data), content in per-block CRDTs.
+//! A collection of `BlockContent` instances, each owning its own DTE
+//! Document. Metadata lives in `BlockHeader` (plain data), content in
+//! per-block CRDTs. (Superseded the single-shared-Document `BlockDocument`
+//! model, removed 2026-08-09 — see `docs/crdt-position-2026-08.md`.)
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -3219,16 +3220,15 @@ mod tests {
         assert_eq!(restored.blocks[0].signature.as_deref(), Some("sig_xyz"));
     }
 
-    /// Verify that CrdtBlockStore → snapshot → BlockDocument preserves block ordering.
+    /// Verify that CrdtBlockStore → snapshot → BlockStore (round-trip) preserves
+    /// block ordering.
     ///
     /// This is the exact path used by the rendering pipeline:
-    /// sync_main_cell_to_conversation takes a store snapshot and rebuilds a
-    /// BlockDocument via from_snapshot. If ordering diverges, blocks appear
-    /// out of order on screen.
+    /// sync_main_cell_to_conversation takes a store snapshot and rebuilds the
+    /// editor's BlockStore via `from_snapshot`. If ordering diverges, blocks
+    /// appear out of order on screen.
     #[test]
-    fn test_store_to_document_ordering_consistency() {
-        use crate::document::BlockDocument;
-
+    fn test_store_snapshot_roundtrip_ordering_consistency() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
         let mut store = BlockStore::new(ctx, agent);
@@ -3294,19 +3294,14 @@ mod tests {
         let store_snap = store.snapshot();
         let store_ids: Vec<BlockId> = store_snap.blocks.iter().map(|b| b.id).collect();
 
-        // Convert to DocumentSnapshot and rebuild BlockDocument (the rendering path)
-        let doc_snap = crate::DocumentSnapshot {
-            context_id: store_snap.context_id,
-            blocks: store_snap.blocks,
-            version: 1,
-        };
-        let doc = BlockDocument::from_snapshot(doc_snap, agent);
-        let doc_ids: Vec<BlockId> = doc.blocks_ordered().iter().map(|b| b.id).collect();
+        // Rebuild via from_snapshot — the exact rendering-path round-trip.
+        let restored = BlockStore::from_snapshot(store_snap, agent).unwrap();
+        let restored_ids: Vec<BlockId> = restored.blocks_ordered().iter().map(|b| b.id).collect();
 
         // Ordering must match
         assert_eq!(
-            store_ids, doc_ids,
-            "Store and Document block ordering diverged"
+            store_ids, restored_ids,
+            "Store ordering diverged across a snapshot round-trip"
         );
         assert_eq!(store_ids, vec![b1, b2, b3, b4, b5]);
     }

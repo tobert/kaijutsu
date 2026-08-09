@@ -2334,7 +2334,7 @@ mod tests {
 
     // ── block edit × multibyte content (byte-vs-char offset regression) ──
     //
-    // The CRDT text layer is CHAR-indexed (`BlockDocument::edit_text`
+    // The CRDT text layer is CHAR-indexed (`BlockStore::edit_text`
     // validates against `chars().count()` and splices at char positions;
     // `TextContent::edit_text` likewise). Feeding it BYTE offsets computed
     // from content with multibyte UTF-8 (改善, →, ✅ — our docs are full of

@@ -44,7 +44,7 @@ did and is being retired.
 ## Crates
 
 `kaijutsu-types` first — the shared types every other crate depends on. Then
-`kaijutsu-crdt` (BlockStore/BlockDocument), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
+`kaijutsu-crdt` (BlockStore), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
 LLM, drift, `kj` builtin), `kaijutsu-server` (SSH server, EmbeddedKaish),
 `kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.18 GUI;
 inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, editor,

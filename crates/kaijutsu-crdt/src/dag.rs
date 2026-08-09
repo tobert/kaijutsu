@@ -1,15 +1,15 @@
 //! Computed DAG index from CRDT data.
 //!
 //! The ConversationDAG provides efficient tree traversal operations
-//! computed from the flat block list in BlockDocument.
+//! computed from the flat block list in a BlockStore.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{BlockDocument, BlockId, BlockSnapshot, BlockStore, MAX_DAG_DEPTH};
+use crate::{BlockId, BlockSnapshot, BlockStore, MAX_DAG_DEPTH};
 
 /// Computed DAG index from CRDT data.
 ///
-/// This is an ephemeral structure computed from BlockDocument data.
+/// This is an ephemeral structure computed from BlockStore data.
 /// It provides efficient traversal without modifying the underlying CRDT.
 #[derive(Debug, Clone)]
 pub struct ConversationDAG {
@@ -22,11 +22,6 @@ pub struct ConversationDAG {
 }
 
 impl ConversationDAG {
-    /// Build a DAG from a BlockDocument (legacy).
-    pub fn from_document(doc: &BlockDocument) -> Self {
-        Self::from_snapshots(doc.blocks_ordered())
-    }
-
     /// Build a DAG from a BlockStore.
     pub fn from_store(store: &BlockStore) -> Self {
         Self::from_snapshots(store.blocks_ordered())
@@ -272,15 +267,15 @@ mod tests {
     use super::*;
     use crate::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, TaskStatus};
 
-    fn test_doc() -> BlockDocument {
-        BlockDocument::new(ContextId::new(), PrincipalId::new())
+    fn test_store() -> BlockStore {
+        BlockStore::new(ContextId::new(), PrincipalId::new())
     }
 
     #[test]
-    fn test_dag_from_flat_document() {
-        let mut doc = test_doc();
+    fn test_dag_from_flat_store() {
+        let mut store = test_store();
 
-        let id1 = doc
+        let id1 = store
             .insert_block(
                 None,
                 None,
@@ -288,9 +283,10 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let id2 = doc
+        let id2 = store
             .insert_block(
                 None,
                 Some(&id1),
@@ -298,10 +294,11 @@ mod tests {
                 BlockKind::Text,
                 "Second",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
-        let dag = ConversationDAG::from_document(&doc);
+        let dag = ConversationDAG::from_store(&store);
 
         assert_eq!(dag.roots.len(), 2);
         assert!(dag.get(&id1).is_some());
@@ -310,9 +307,9 @@ mod tests {
 
     #[test]
     fn test_dag_with_parent_child() {
-        let mut doc = test_doc();
+        let mut store = test_store();
 
-        let parent = doc
+        let parent = store
             .insert_block(
                 None,
                 None,
@@ -320,9 +317,10 @@ mod tests {
                 BlockKind::Text,
                 "Question",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let child1 = doc
+        let child1 = store
             .insert_block(
                 Some(&parent),
                 Some(&parent),
@@ -330,9 +328,10 @@ mod tests {
                 BlockKind::Thinking,
                 "Thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let child2 = doc
+        let child2 = store
             .insert_block(
                 Some(&parent),
                 Some(&child1),
@@ -340,10 +339,11 @@ mod tests {
                 BlockKind::Text,
                 "Answer",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
-        let dag = ConversationDAG::from_document(&doc);
+        let dag = ConversationDAG::from_store(&store);
 
         assert_eq!(dag.roots.len(), 1);
         assert_eq!(dag.roots[0], parent);
@@ -360,9 +360,9 @@ mod tests {
 
     #[test]
     fn test_dfs_iteration() {
-        let mut doc = test_doc();
+        let mut store = test_store();
 
-        let root = doc
+        let root = store
             .insert_block(
                 None,
                 None,
@@ -370,9 +370,10 @@ mod tests {
                 BlockKind::Text,
                 "Root",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let child1 = doc
+        let child1 = store
             .insert_block(
                 Some(&root),
                 Some(&root),
@@ -380,9 +381,10 @@ mod tests {
                 BlockKind::Text,
                 "Child1",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let grandchild = doc
+        let grandchild = store
             .insert_block(
                 Some(&child1),
                 Some(&child1),
@@ -390,10 +392,11 @@ mod tests {
                 BlockKind::Text,
                 "Grandchild",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
-        let dag = ConversationDAG::from_document(&doc);
+        let dag = ConversationDAG::from_store(&store);
 
         let dfs: Vec<_> = dag.iter_dfs().collect();
         assert_eq!(dfs.len(), 3);
@@ -500,7 +503,7 @@ mod tests {
             tool_meta_at: 0,
         };
 
-        // Build DAG manually (from_document would not create cycles)
+        // Build DAG manually (from_store would not create cycles)
         let mut blocks = HashMap::new();
         let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         blocks.insert(id_a, snap_a);
@@ -539,9 +542,9 @@ mod tests {
 
     #[test]
     fn test_subtree() {
-        let mut doc = test_doc();
+        let mut store = test_store();
 
-        let root = doc
+        let root = store
             .insert_block(
                 None,
                 None,
@@ -549,9 +552,10 @@ mod tests {
                 BlockKind::Text,
                 "Root",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let child = doc
+        let child = store
             .insert_block(
                 Some(&root),
                 Some(&root),
@@ -559,9 +563,10 @@ mod tests {
                 BlockKind::Text,
                 "Child",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
-        let _other_root = doc
+        let _other_root = store
             .insert_block(
                 None,
                 Some(&child),
@@ -569,10 +574,11 @@ mod tests {
                 BlockKind::Text,
                 "Other",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
-        let dag = ConversationDAG::from_document(&doc);
+        let dag = ConversationDAG::from_store(&store);
 
         let subtree = dag.subtree(&root);
         assert_eq!(subtree.len(), 2);

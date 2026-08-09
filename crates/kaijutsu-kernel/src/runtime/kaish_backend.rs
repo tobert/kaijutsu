@@ -775,7 +775,7 @@ fn apply_read_range(content: &str, range: ReadRange) -> String {
 /// consumes. `PatchOp::Insert`/`Delete`/`Replace` offsets are BYTES by the
 /// kaish-types contract ("Insert content at byte offset", "Delete bytes …"),
 /// and this function is the single seam where that byte domain meets the
-/// char-indexed `edit_text` (`BlockDocument::edit_text` bounds-checks against
+/// char-indexed `edit_text` (`BlockStore::edit_text` bounds-checks against
 /// `chars().count()` and splices at char positions).
 ///
 /// A mid-char or out-of-range byte offset fails LOUD here, before any splice

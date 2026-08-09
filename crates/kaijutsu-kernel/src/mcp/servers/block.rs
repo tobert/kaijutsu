@@ -1778,7 +1778,7 @@ mod tests {
     // ── block_edit × multibyte content (byte-vs-char offset regression) ──
     //
     // Same disease as the kj `block edit` fix (kj/block.rs): the CRDT text
-    // layer is CHAR-indexed (`BlockDocument::edit_text` bounds-checks against
+    // layer is CHAR-indexed (`BlockStore::edit_text` bounds-checks against
     // `chars().count()` and splices at char positions), so byte offsets from
     // the translate helpers corrupt any block with multibyte UTF-8 before the
     // edit site — silent wrong-splice or spurious PositionOutOfBounds.

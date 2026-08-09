@@ -91,7 +91,7 @@ pub fn line_range_to_byte_range(
 }
 
 /// Convert a byte offset that lies on a char boundary into a CHAR offset —
-/// the unit the CRDT text layer actually consumes (`BlockDocument::edit_text`
+/// the unit the CRDT text layer actually consumes (`BlockStore::edit_text`
 /// bounds-checks against `chars().count()` and `TextContent::edit_text`
 /// splices at char positions). Same conversion as `byte_to_char` in
 /// `mcp/servers/file.rs` (the June file-tools corruption fix — the prior art
