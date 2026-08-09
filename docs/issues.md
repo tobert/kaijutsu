@@ -52,6 +52,28 @@ manager doesn't partition by context. Kaijutsu keeps a `ContextId`→`JobId`
 index rather than asking kaish to enforce ownership; consistent with the
 shared-trust model and with how `BackgroundRegistry` already works.
 
+## kaijutsu on brak: fleet coordination service (2026-08-09, via zorak session, Amy aware)
+
+Fleet direction from tonight's planning: brak (always-on N100 on UPS,
+tailnet 100.113.35.53) should eventually run the kaijutsu kernel as the
+fleet's coordination service — machine sessions on zorak/brak/moltar talk
+via shared CRDT docs + invoke_peer instead of the current
+sftp-handoff-mail protocol. brak is NOT a build box: zorak builds and
+syncs binaries. What kaijutsu owes when this gets picked up: a server
+build/config profile for a small x86_64 box (release build, modest
+memory, no GPU/local-model assumptions), reachable over tailnet from
+Claude Code sessions on all three machines. Groundwork that already
+exists: isotest proved fresh-$HOME boot with generated host keys +
+add-key provisioning and no host state; contrib/install-systemd.sh +
+kaijutsu-server.service are the unit story. Jam doc:
+~/src/zorak/docs/plans/cybernetic-infra.md (Q2).
+
+**CRDT-record note**: this plan is ONE kernel with many tailnet clients —
+the one-body model stretched across machines, not multi-kernel
+federation. It therefore *supports* the option-2 verdict in
+docs/crdt-position-2026-08.md rather than triggering its federation
+escape hatch; empirical question 2 should be read with this in evidence.
+
 ## opencode support — shared lane with kaibo (2026-08-09, via kaibo session relay)
 
 Amy (later this week): "easy opencode go support and some testing" — she's
