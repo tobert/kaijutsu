@@ -4276,6 +4276,11 @@ impl kernel::Server for KernelImpl {
         params: kernel::PushOpsParams,
         mut results: kernel::PushOpsResults,
     ) -> Promise<(), capnp::Error> {
+        /// Log a per-context `merge_stats()` summary every this-many
+        /// `push_ops` applications (fast-forwards + concurrent merges
+        /// combined) — a cheap modulo check, not a log line per call.
+        const MERGE_STATS_LOG_EVERY: u64 = 100;
+
         let params_reader = pry!(params.get());
         let _trace_guard = extract_rpc_trace(params_reader.get_trace(), "push_ops").entered();
         let context_id_bytes = pry!(params_reader.get_context_id());
@@ -4322,6 +4327,25 @@ impl kernel::Server for KernelImpl {
         };
 
         log::debug!("push_ops merged successfully, new version: {}", ack_version);
+
+        // Wire-merge classifier summary — docs/crdt-position-2026-08.md Part 1,
+        // empirical question 1. Fast-forwards/concurrent-merges are already
+        // logged/counted inside `BlockStore::merge_ops`; this is just a cheap
+        // periodic reminder of the running per-context totals so `push_ops`
+        // traffic shows up in logs without a log line on every call.
+        if let Some(entry) = documents.get(context_id) {
+            let stats = entry.doc.merge_stats();
+            let total = stats.fast_forwards + stats.concurrent_merges;
+            if total > 0 && total % MERGE_STATS_LOG_EVERY == 0 {
+                log::debug!(
+                    "push_ops merge_stats for context {}: {} fast-forwards, {} concurrent merges ({} applications)",
+                    context_id,
+                    stats.fast_forwards,
+                    stats.concurrent_merges,
+                    total
+                );
+            }
+        }
         results.get().set_ack_version(ack_version);
         Promise::ok(())
     }

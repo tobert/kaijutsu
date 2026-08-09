@@ -6,6 +6,7 @@
 //! model, removed 2026-08-09 — see `docs/crdt-position-2026-08.md`.)
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use diamond_types_extended::{Frontier, SerializedOpsOwned};
 
@@ -105,6 +106,14 @@ pub struct BlockStore {
     /// stamped on every inserted block (distinct from the Lamport clock, which
     /// bumps on many metadata ops). The append `order_key` is derived from it.
     next_tick: i64,
+
+    /// Wire-merge classifier counters — see `merge_stats()` and
+    /// `docs/crdt-position-2026-08.md` Part 1, empirical question 1.
+    /// Atomics (not plain u64) so a future read-only accessor never needs
+    /// `&mut self`; the store itself is single-writer, this is just cheap
+    /// insurance against that changing under an observer.
+    merge_fast_forwards: AtomicU64,
+    merge_concurrent_merges: AtomicU64,
 }
 
 impl BlockStore {
@@ -118,6 +127,8 @@ impl BlockStore {
             version: 0,
             lamport_clock: 0,
             next_tick: 0,
+            merge_fast_forwards: AtomicU64::new(0),
+            merge_concurrent_merges: AtomicU64::new(0),
         }
     }
 
@@ -171,6 +182,15 @@ impl BlockStore {
     /// version`) correctly detect that content needs re-rendering.
     pub fn set_version(&mut self, v: u64) {
         self.version = v;
+    }
+
+    /// Snapshot the wire-merge classifier counters (see [`MergeStats`]).
+    /// Cheap: two atomic loads, no lock.
+    pub fn merge_stats(&self) -> MergeStats {
+        MergeStats {
+            fast_forwards: self.merge_fast_forwards.load(Ordering::Relaxed),
+            concurrent_merges: self.merge_concurrent_merges.load(Ordering::Relaxed),
+        }
     }
 
     /// Get the number of live (non-deleted) blocks.
@@ -1314,14 +1334,24 @@ impl BlockStore {
             }
         }
 
-        // Merge per-block incremental DTE ops
+        // Merge per-block incremental DTE ops, classifying each as a
+        // fast-forward or a genuine concurrent merge (see
+        // `frontier_shows_concurrency` — docs/crdt-position-2026-08.md Part 1,
+        // empirical question 1). One payload can touch several blocks; if any
+        // of them show diamond-types reconciling a real concurrent branch,
+        // the whole application counts as one concurrent merge.
         let mut had_dte_merges = false;
+        let mut saw_concurrent_merge = false;
         for (id, ops) in payload.block_ops {
             if let Some(block) = self.blocks.get_mut(&id) {
                 if !ops.is_empty() {
                     had_dte_merges = true;
                 }
+                let before = block.frontier();
                 block.merge_ops(ops)?;
+                if frontier_shows_concurrency(&before, &block.frontier()) {
+                    saw_concurrent_merge = true;
+                }
             } else {
                 tracing::warn!("sync payload has ops for unknown block {id}, skipping");
             }
@@ -1342,6 +1372,25 @@ impl BlockStore {
         // DTE ops were merged (even without header/new-block timestamps)
         if max_remote_ts > 0 || had_dte_merges {
             self.merge_clock(max_remote_ts);
+        }
+
+        // Wire-merge classifier totals. Fast-forwards are the expected hot
+        // path (no per-event log — see below); a genuine concurrent merge is
+        // rare-expected and gets a loud info! per house rule (silent
+        // anything is a bug).
+        if had_dte_merges {
+            if saw_concurrent_merge {
+                let concurrent_merges = self.merge_concurrent_merges.fetch_add(1, Ordering::Relaxed) + 1;
+                let fast_forwards = self.merge_fast_forwards.load(Ordering::Relaxed);
+                tracing::info!(
+                    context_id = %self.context_id,
+                    fast_forwards,
+                    concurrent_merges,
+                    "merge_ops: genuine concurrent merge — diamond-types reconciled a diverged frontier"
+                );
+            } else {
+                self.merge_fast_forwards.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         self.version += 1;
@@ -1671,6 +1720,32 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// The wire-merge classifier: did applying a block's incoming DTE ops
+/// require diamond-types to reconcile a genuine concurrent branch?
+///
+/// `before`/`after` are one block's local `Frontier` immediately before and
+/// after `BlockContent::merge_ops`. This reads off diamond-types' own
+/// dominator bookkeeping rather than guessing from op metadata, so it can't
+/// lie: `Frontier::advance_by_known_run` (diamond-types-extended
+/// `src/frontier.rs`) only *removes* a pre-existing frontier entry when the
+/// newly-merged causal-graph entry names it as a parent — i.e. when the
+/// incoming history already knew about it and is a strict continuation. If
+/// the incoming ops were authored without knowledge of `before` (a
+/// concurrent edit), `advance_by_known_run` retains `before`'s entries
+/// alongside the new one, widening the frontier — the mechanical signature
+/// of a real diamond. See docs/crdt-position-2026-08.md Part 1, empirical
+/// question 1.
+///
+/// `before == after` (a duplicate/no-op payload — every op already known)
+/// is fast-forward by definition: nothing new was merged, so nothing was
+/// reconciled.
+fn frontier_shows_concurrency(before: &Frontier, after: &Frontier) -> bool {
+    if before.as_ref() == after.as_ref() {
+        return false;
+    }
+    before.as_ref().iter().any(|lv| after.as_ref().contains(lv))
+}
+
 // =========================================================================
 // Sync + Snapshot types
 // =========================================================================
@@ -1722,6 +1797,25 @@ impl SyncPayload {
             && self.updated_headers.is_empty()
             && self.deleted_blocks.is_empty()
     }
+}
+
+/// Snapshot of `BlockStore::merge_ops`'s wire-merge classification.
+///
+/// docs/crdt-position-2026-08.md Part 1, empirical question 1: how often
+/// does a merged `SyncPayload` see a genuinely concurrent frontier vs. a
+/// fast-forward? Read via [`BlockStore::merge_stats`]. A `kj` verb or an
+/// OTel gauge can consume this later — today it's counters plus logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeStats {
+    /// Applications where the incoming ops were a pure continuation of
+    /// every touched block's local frontier — no concurrent branch existed
+    /// for diamond-types to reconcile.
+    pub fast_forwards: u64,
+    /// Applications where at least one touched block's local frontier had
+    /// diverged from the incoming ops' causal history — diamond-types
+    /// actually widened the frontier to represent, then reconcile, two
+    /// independent branches.
+    pub concurrent_merges: u64,
 }
 
 // =========================================================================
@@ -2917,6 +3011,116 @@ mod tests {
             "merge should advance Lamport clock past remote: {} > {}",
             store2.lamport_clock,
             store1_clock
+        );
+    }
+
+    // ── Wire-merge classifier (merge_stats) ─────────────────────────────
+    //
+    // docs/crdt-position-2026-08.md Part 1, empirical question 1: does
+    // `merge_ops` see a genuinely concurrent frontier, or a fast-forward?
+    // These are the TDD-first tests for the classifier: written and
+    // confirmed failing (accessor didn't exist) before `merge_stats()` and
+    // the atomics were added.
+
+    #[test]
+    fn test_merge_stats_fast_forward_no_divergence() {
+        // store1 writes, store2 has never diverged from the common (empty)
+        // base — applying store1's ops is a pure continuation, not a merge
+        // of two independently-advanced frontiers.
+        let ctx = ContextId::new();
+        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+
+        let id = store1
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        store1.edit_text(&id, 5, ", world", 0).unwrap();
+
+        let payload = store1.ops_since(&HashMap::new());
+        store2.merge_ops(payload).unwrap();
+
+        let stats = store2.merge_stats();
+        assert_eq!(
+            stats.fast_forwards, 1,
+            "a payload with no local divergence must classify as a fast-forward"
+        );
+        assert_eq!(
+            stats.concurrent_merges, 0,
+            "no concurrent branch existed — nothing for DTE to reconcile"
+        );
+
+        // A second, purely-incremental sync is still a fast-forward.
+        store1.edit_text(&id, 12, "!", 0).unwrap();
+        let frontiers = store2.frontier();
+        let payload = store1.ops_since(&frontiers);
+        store2.merge_ops(payload).unwrap();
+
+        let stats = store2.merge_stats();
+        assert_eq!(stats.fast_forwards, 2);
+        assert_eq!(stats.concurrent_merges, 0);
+    }
+
+    #[test]
+    fn test_merge_stats_concurrent_merge_on_true_divergence() {
+        // Both stores start from a common synced frontier, then BOTH edit
+        // the same block independently before either sees the other's
+        // change — a genuine diamond that diamond-types has to reconcile.
+        let ctx = ContextId::new();
+        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+
+        let id = store1
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        // Common base: store2 has exactly what store1 has right now.
+        let payload = store1.ops_since(&HashMap::new());
+        store2.merge_ops(payload).unwrap();
+        assert_eq!(
+            store2.merge_stats().fast_forwards,
+            1,
+            "the initial sync to a common base is itself a fast-forward"
+        );
+
+        // Diverge BOTH sides from that common frontier.
+        store1.edit_text(&id, 5, " store1", 0).unwrap();
+        store2.edit_text(&id, 5, " store2", 0).unwrap();
+
+        // Bring store1's ops into store2. Deliberately send full history
+        // from root (`ops_since(&HashMap::new())`) rather than an
+        // incremental frontier: a DTE `Frontier` is local-LV-numbered and
+        // not portable across independently-diverged replicas (see
+        // `Document::remote_frontier()`'s doc comment) — `merge_ops`
+        // dedups the already-known prefix, so sending the full history is
+        // the safe way to bring two diverged replicas together, and is the
+        // same pattern `test_concurrent_inserts_no_interleaving` uses above.
+        let payload = store1.ops_since(&HashMap::new());
+        store2.merge_ops(payload).unwrap();
+
+        let stats = store2.merge_stats();
+        assert_eq!(
+            stats.concurrent_merges, 1,
+            "two independently-diverged frontiers must classify as a genuine concurrent merge"
+        );
+        assert_eq!(
+            stats.fast_forwards, 1,
+            "the earlier common-base sync stays the only fast-forward — it must not be double-counted"
         );
     }
 

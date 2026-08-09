@@ -40,7 +40,7 @@ pub use kaijutsu_types::{
 };
 
 // New architecture
-pub use block_store::{BlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload};
+pub use block_store::{BlockStore, ForkBlockFilter, MergeStats, StoreSnapshot, SyncPayload};
 pub use selection::{
     IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
 };
