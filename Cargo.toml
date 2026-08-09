@@ -19,6 +19,7 @@ members = [
     "crates/kaijutsu-audio",
     "crates/kaijutsu-hyoushigi",
     "crates/kaijutsu-viz",
+    "crates/kaijutsu-isotest",
 ]
 
 [workspace.package]

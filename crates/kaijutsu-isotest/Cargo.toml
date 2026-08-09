@@ -1,0 +1,22 @@
+[package]
+name = "kaijutsu-isotest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Isolation/functional suite run inside a podman container by contrib/isotest.
+# Everything lives in tests/; the lib target is empty. Tests self-skip unless
+# KAIJUTSU_ISOTEST=1 so a bare host `cargo test` stays fast and green.
+
+[dependencies]
+
+[dev-dependencies]
+kaijutsu-client = { workspace = true }
+kaijutsu-types = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "process", "macros"] }
+serde_json = { workspace = true }
+russh = { workspace = true }
+rand_v10 = { package = "rand", version = "0.10" }
+libc = "0.2"

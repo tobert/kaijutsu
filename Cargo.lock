@@ -6106,6 +6106,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-isotest"
+version = "0.1.0"
+dependencies = [
+ "kaijutsu-client",
+ "kaijutsu-types",
+ "libc",
+ "rand 0.10.1",
+ "russh",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kaijutsu-kernel"
 version = "0.1.0"
 dependencies = [

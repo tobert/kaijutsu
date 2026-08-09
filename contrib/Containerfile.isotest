@@ -1,0 +1,26 @@
+# Containerfile.isotest — the isolation-test image for contrib/isotest.
+#
+# Deliberately near-empty: the kernel and test binaries are built on the
+# host and bind-mounted in at run time, so this image only has to supply a
+# userland whose glibc is >= the host's. Both dev machines (moltar, zorak)
+# run Arch, so an Arch base tracks close enough; contrib/isotest runs an
+# `ldd` preflight inside the container and fails loudly on skew rather
+# than letting a stale image produce confusing link errors.
+#
+# Rebuild happens automatically via `podman build` layer caching; force a
+# base refresh with `contrib/isotest --pull`.
+
+FROM docker.io/library/archlinux:latest
+
+# The suite reads /proc directly and the background jobs under test only
+# need sh + coreutils, all present in the base image. Keep the package list
+# minimal: every addition here is something the tests silently start
+# depending on. openssl/sqlite are present in base and cover the server's
+# dynamic links; the ldd preflight is the honest gate if that drifts.
+#
+# openssh: supplies ssh-agent for agent_auth_production_path — the suite
+# pins the KeySource::Agent auth lane that kaijutsu-mcp/kaijutsu-acp use in
+# the field, with an ephemeral in-agent key that never touches disk.
+RUN pacman -Sy --noconfirm --needed openssh && rm -rf /var/cache/pacman/pkg
+
+RUN mkdir -p /opt/kaijutsu /work

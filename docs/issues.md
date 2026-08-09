@@ -40,6 +40,12 @@ output cap with a loud marker. Characterization tests come first.
    only), so migrating as-is would silently drop the guard that covers
    `kill -9` and the `kaijutsu-runner.sh` restart loop.
 
+**Functional gate exists (2026-08-09):** `contrib/isotest` (docs/isotest.md)
+runs the PDEATHSIG orphan guard, process-group kill, restart hygiene, and
+client-disconnect contract against the real binary in a podman PID
+namespace — mutation-verified RED without PDEATHSIG. The swap must keep this
+suite green; "PDEATHSIG isn't testable" is no longer true.
+
 **Multi-tenancy stays ours.** `Job.session_id` is per-`JobManager`
 (construction-time, output-file naming) — not a tenant key — so a shared
 manager doesn't partition by context. Kaijutsu keeps a `ContextId`→`JobId`

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# contrib/isotest — run isolation/functional tests in a podman container.
+#
+# Builds kaijutsu-server plus a test binary on the host, then runs the test
+# binary inside a fresh container namespace where it spawns the server as a
+# real child process, kills it for real, and asserts on /proc. The empty PID
+# namespace is the point: after teardown, any surviving process is
+# attributable, so "no orphans" is a provable invariant instead of a grep
+# against host noise. See docs/isotest.md.
+#
+# Usage:
+#   contrib/isotest                       # run the kaijutsu-isotest suite
+#   contrib/isotest orphan               # filter to tests matching "orphan"
+#   contrib/isotest -p kaijutsu-kernel --test broker_e2e
+#                                         # containerize any workspace test target
+#   contrib/isotest --keep               # keep the exited container for inspection
+#   contrib/isotest --pull               # refresh the base image first
+#   contrib/isotest --image <ref>        # override the image
+set -euo pipefail
+
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+IMAGE_TAG="localhost/kaijutsu-isotest"
+CONTAINERFILE="$REPO_ROOT/contrib/Containerfile.isotest"
+
+PACKAGE="kaijutsu-isotest"
+TEST_TARGET=""   # empty = all test targets in PACKAGE
+FILTER=()
+KEEP=0
+PULL=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--package) PACKAGE="$2"; shift 2 ;;
+        --test)       TEST_TARGET="$2"; shift 2 ;;
+        --keep)       KEEP=1; shift ;;
+        --pull)       PULL=1; shift ;;
+        --image)      IMAGE_TAG="$2"; shift 2 ;;
+        -h|--help)    grep '^#' "$0" | cut -c3-; exit 0 ;;
+        *)            FILTER+=("$1"); shift ;;
+    esac
+done
+
+cd "$REPO_ROOT"
+
+echo "==> building kaijutsu-server + test binaries ($PACKAGE)"
+cargo build -p kaijutsu-server
+SERVER_BIN="$REPO_ROOT/target/debug/kaijutsu-server"
+[[ -x $SERVER_BIN ]] || { echo "isotest: server binary missing at $SERVER_BIN" >&2; exit 1; }
+
+# Dynamic pickup: cargo names the freshly-built test executables in its JSON
+# stream; parsing that survives target renames and hash churn.
+build_cmd=(cargo test -p "$PACKAGE" --no-run --message-format=json)
+[[ -n $TEST_TARGET ]] && build_cmd+=(--test "$TEST_TARGET")
+mapfile -t TEST_BINS < <(
+    "${build_cmd[@]}" \
+    | jq -r 'select(.reason == "compiler-artifact")
+             | select(.profile.test == true)
+             | select(.target.kind | index("test"))
+             | .executable // empty'
+)
+if [[ ${#TEST_BINS[@]} -eq 0 ]]; then
+    echo "isotest: no test executables produced for $PACKAGE${TEST_TARGET:+ --test $TEST_TARGET}" >&2
+    exit 1
+fi
+
+echo "==> building image $IMAGE_TAG"
+build_args=(--file "$CONTAINERFILE" --tag "$IMAGE_TAG")
+[[ $PULL -eq 1 ]] && build_args+=(--pull=always)
+podman build "${build_args[@]}" "$REPO_ROOT/contrib" >/dev/null
+
+# Preflight: the image userland must satisfy every dynamic link in the
+# host-built binaries. A "not found" here means glibc/library skew — fail
+# loudly now instead of letting the suite die with a cryptic loader error.
+echo "==> ldd preflight"
+for bin in "$SERVER_BIN" "${TEST_BINS[@]}"; do
+    missing=$(podman run --rm --network=none \
+        -v "$bin:/preflight:ro" "$IMAGE_TAG" \
+        ldd /preflight 2>&1 | grep -F 'not found' || true)
+    if [[ -n $missing ]]; then
+        echo "isotest: $bin does not link against the image userland:" >&2
+        echo "$missing" >&2
+        echo "isotest: rebuild the image (contrib/isotest --pull) or add the library to Containerfile.isotest" >&2
+        exit 1
+    fi
+done
+
+status=0
+for bin in "${TEST_BINS[@]}"; do
+    name="isotest-$(basename "$bin")-$$"
+    echo "==> running $(basename "$bin") in $IMAGE_TAG"
+    run_args=(
+        --name "$name"
+        --init                 # catatonit as PID 1: reaping works, test binary stays PID 2
+        --network=none         # loopback only; the kernel listens on 127.0.0.1
+        --pids-limit=512       # a runaway fork storm fails the test, not the host
+        --tmpfs /work:rw,size=512m
+        -v "$SERVER_BIN:/opt/kaijutsu/kaijutsu-server:ro"
+        -v "$bin:/opt/kaijutsu/testbin:ro"
+        -e KAIJUTSU_ISOTEST=1
+        -e KAIJUTSU_SERVER_BIN=/opt/kaijutsu/kaijutsu-server
+        -e HOME=/work
+        -e TMPDIR=/work
+        -e RUST_BACKTRACE=1
+    )
+    [[ $KEEP -eq 0 ]] && run_args+=(--rm)
+    # Process-lifecycle assertions scan /proc; never let tests interleave.
+    if ! podman run "${run_args[@]}" "$IMAGE_TAG" \
+        /opt/kaijutsu/testbin --test-threads=1 "${FILTER[@]}"; then
+        status=1
+    fi
+    if [[ $KEEP -eq 1 ]]; then
+        echo "==> kept container: $name (podman logs/inspect/mount; rm when done)"
+    fi
+done
+exit $status
