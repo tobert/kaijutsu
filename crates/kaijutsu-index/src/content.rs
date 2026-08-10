@@ -106,6 +106,8 @@ mod tests {
             error: None,
             notification: None,
             resource: None,
+            task_status: kaijutsu_types::TaskStatus::default(),
+            task_status_at: 0,
         }
     }
 
