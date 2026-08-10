@@ -1471,4 +1471,187 @@ mod tests {
             "ctx_b never spawned anything — must be absent, not a fabricated default entry"
         );
     }
+
+    // --- Characterization tests for the kaish job-system swap ---------
+    //
+    // `docs/issues.md` ("Background exec → kaish's job system") lists five
+    // behaviors of this module that must survive the swap unchanged. Three
+    // are already pinned by tests above: Running→Done/Error tied to real
+    // exit (`spawn_background_streams_output_and_records_exit_code`,
+    // `spawn_background_nonzero_exit_marks_block_error_and_records_code`),
+    // `kill_all_for_context` scoping
+    // (`kill_all_for_context_only_touches_that_context`), and the output
+    // cap's loud marker (`output_cap_truncates_with_a_loud_marker_and_still_records_exit`).
+    // The two tests below close the remaining gap: live mid-run streaming
+    // and process-group kill reaching children, neither of which any
+    // existing test actually exercised (the existing kill test uses
+    // `sleep 30`, a single-process command with no child to lose).
+    //
+    // PDEATHSIG (the orphan guard in `spawn_background`'s `pre_exec`,
+    // module docs "Ownership and cleanup") is deliberately NOT tested
+    // here — it requires the kernel process itself to die and a real PID
+    // namespace to observe the reparenting, which no in-process
+    // `#[tokio::test]` can honestly simulate. `contrib/isotest`
+    // (docs/isotest.md) already covers it against the real binary in a
+    // podman PID namespace, mutation-verified RED without PDEATHSIG
+    // (docs/issues.md, "Functional gate exists (2026-08-09)") — that
+    // suite is the actual pin for this behavior.
+
+    /// Preserve-across-the-swap item: output must land in the CRDT block
+    /// WHILE the process is still running, not buffered until it exits.
+    /// This is exactly the defect the module docs call out in kaish 0.13's
+    /// own `execute_background` ("Why not kaish's own `&`/`JobManager`?",
+    /// point 2) — the swap must not reintroduce it here.
+    ///
+    /// Uses a file sentinel rather than a sleep so the assertion window is
+    /// deterministic: the child echoes a marker, then polls for the
+    /// sentinel file before echoing a second marker and exiting. While that
+    /// file is absent, the child CANNOT have progressed past its polling
+    /// loop — so "the marker is already visible in the block" and "the
+    /// process is still `Running`" are simultaneously guaranteed facts, not
+    /// a timing guess racing against process exit.
+    #[tokio::test]
+    async fn spawn_background_streams_output_while_still_running() {
+        let (blocks, ctx_id, principal) = setup();
+        let block_id = running_block(&blocks, ctx_id, principal);
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let continue_file = std::env::temp_dir().join(format!("bg-exec-test-continue-{}", Uuid::now_v7()));
+        let continue_path = continue_file.display();
+
+        let id = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: format!(
+                    "echo mid-run-marker; while [ ! -f {continue_path} ]; do sleep 0.05; done; echo done-marker"
+                ),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .expect("spawn");
+
+        // `continue_file` does not exist yet at this point — the child is
+        // physically unable to have exited the moment we observe its
+        // marker in the block.
+        wait_for(StdDuration::from_secs(5), || {
+            let content = blocks.get_block_snapshot(ctx_id, &block_id).unwrap().unwrap().content;
+            content.contains("mid-run-marker").then_some(())
+        })
+        .await;
+
+        let mid_run_status = registry.get_for_context(id, ctx_id).unwrap().status;
+        assert_eq!(
+            mid_run_status, "running",
+            "the continue-sentinel does not exist yet, so the process cannot have exited — \
+             if status is anything but running here, output was not actually streamed live"
+        );
+
+        // Let it finish.
+        std::fs::write(&continue_file, b"go").expect("write continue sentinel");
+
+        let snap = wait_for(StdDuration::from_secs(5), || {
+            let s = registry.get_for_context(id, ctx_id).unwrap();
+            (s.status == "exited").then_some(s)
+        })
+        .await;
+        assert_eq!(snap.exit_code, Some(0));
+
+        let final_content = blocks.get_block_snapshot(ctx_id, &block_id).unwrap().unwrap().content;
+        assert!(
+            final_content.contains("done-marker"),
+            "process should have completed after the sentinel appeared, got: {final_content:?}"
+        );
+
+        let _ = std::fs::remove_file(&continue_file);
+    }
+
+    /// Preserve-across-the-swap item: `spawn_background`'s process-group
+    /// kill (`setpgid` at spawn + `kill_process_group` on cancel, module
+    /// docs "Ownership and cleanup") must reach CHILDREN of the spawned
+    /// command, not just the top-level `/bin/sh -c` process.
+    /// `kill_background_process_stops_it_and_marks_killed` above only
+    /// exercises `sleep 30` — a single simple command most shells `exec`
+    /// into directly with no fork at all — so it never actually proves the
+    /// "whole tree" half of the contract. This test forces a real fork by
+    /// backgrounding a grandchild explicitly and waiting on it.
+    ///
+    /// Liveness is checked via `/proc/<pid>/stat` rather than `kill(pid,
+    /// 0)`: a just-killed-but-not-yet-reaped process is briefly a zombie
+    /// (`Z` state), and `kill(pid, 0)` reports success for a zombie — using
+    /// it would make this test flaky right after the kill. Reading state
+    /// out of `/proc` lets `Z` (or the pid disappearing entirely once
+    /// init reaps the orphan) count as "no longer running", which is the
+    /// actual claim under test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kill_background_process_reaches_process_group_children() {
+        fn proc_state(pid: u32) -> Option<char> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The command-name field (2nd) is parenthesized and may itself
+            // contain spaces/parens — split on the LAST ')' rather than on
+            // whitespace to stay correct regardless of argv[0].
+            let after_paren = stat.rsplit_once(')')?.1;
+            after_paren.trim_start().chars().next()
+        }
+        fn is_running(pid: u32) -> bool {
+            matches!(proc_state(pid), Some('R') | Some('S') | Some('D'))
+        }
+
+        let (blocks, ctx_id, principal) = setup();
+        let block_id = running_block(&blocks, ctx_id, principal);
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let pidfile = std::env::temp_dir().join(format!("bg-exec-test-childpid-{}", Uuid::now_v7()));
+        let pidfile_path = pidfile.display();
+
+        let id = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                // Force a real fork: `sleep 60` runs as a genuine
+                // grandchild of the `/bin/sh -c` process (backgrounded
+                // with `&`), whose pid we capture via `$!`; the parent
+                // shell then blocks on `wait` so the whole tree stays
+                // alive until cancelled.
+                command: format!("sleep 60 & echo $! > {pidfile_path}; wait"),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .expect("spawn");
+
+        let child_pid: u32 = wait_for(StdDuration::from_secs(5), || {
+            std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse().ok())
+        })
+        .await;
+
+        // Sanity: the grandchild really is running before we touch
+        // anything — otherwise "not running" later would be meaningless.
+        wait_for(StdDuration::from_secs(2), || is_running(child_pid).then_some(())).await;
+
+        assert!(registry.cancel(id, ctx_id), "cancel should find the running entry");
+
+        wait_for(StdDuration::from_secs(5), || {
+            let s = registry.get_for_context(id, ctx_id).unwrap();
+            (s.status == "killed").then_some(())
+        })
+        .await;
+
+        // The load-bearing assertion: the GRANDCHILD — never directly
+        // targeted, only the top-level `/bin/sh -c` pid is passed to
+        // `kill_process_group` — must also be dead. If process-group kill
+        // regressed to a single-pid kill, this child would still be
+        // sleeping and this wait would time out.
+        wait_for(StdDuration::from_secs(5), || (!is_running(child_pid)).then_some(())).await;
+
+        let _ = std::fs::remove_file(&pidfile);
+    }
 }
