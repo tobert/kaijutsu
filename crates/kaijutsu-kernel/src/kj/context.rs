@@ -3191,6 +3191,78 @@ mod tests {
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
     }
 
+    /// Repro/regression for `docs/issues.md` "`kj context info` human and
+    /// `--json` renders disagree about cwd" (2026-08-07). Filed against the
+    /// pre-kaish-0.13 `--json` envelope, which built a separate JSON shape
+    /// from the human-text render and could show `shell: null` for a
+    /// context whose human text showed a real `Cwd:` line. kaish 0.13
+    /// retired that separate envelope (`render_json_envelope` is gone —
+    /// `--json` now emits `data` verbatim, per `kj_builtin.rs`), and
+    /// `context_info` itself has always fed both renders from the SAME
+    /// `shell` binding (one `db.get_context_shell` read, destructured once,
+    /// used by both the `Cwd:` text line and the `data.cwd` field) — so a
+    /// disagreement is no longer structurally possible. This test pins
+    /// that: both renders must agree whether cwd is set, and its value,
+    /// covering the case that reproduced the original report (cwd IS set)
+    /// as well as the unset case.
+    #[tokio::test]
+    async fn context_info_json_cwd_matches_human_render() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+
+        // Case 1: cwd set — the exact shape of the original bug report.
+        let with_cwd = register_context(&d, Some("cwd-set"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: with_cwd,
+                cwd: Some("/home/atobey/kaijutsu".into()),
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+        let c = caller_with_context(with_cwd);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        let msg = result.message().to_string();
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(
+                    v["cwd"].as_str(),
+                    Some("/home/atobey/kaijutsu"),
+                    "data.cwd must carry the configured path, not null: {v:?}"
+                );
+                assert!(
+                    msg.contains("Cwd:     /home/atobey/kaijutsu"),
+                    "human text must show the same cwd data.cwd reports: {msg}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        // Case 2: no shell row at all — both renders must agree it's absent
+        // (omitted from text, null in JSON), not one showing stale data.
+        let no_cwd = register_context(&d, Some("cwd-unset"), None, principal);
+        let c2 = caller_with_context(no_cwd);
+        let result2 = d.dispatch(&[s("context"), s("info")], &c2).await;
+        assert!(result2.is_ok(), "info failed: {}", result2.message());
+        let msg2 = result2.message().to_string();
+        match result2 {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert!(
+                    v["cwd"].is_null(),
+                    "data.cwd must be null when no shell row exists: {v:?}"
+                );
+                assert!(
+                    !msg2.contains("Cwd:"),
+                    "human text must omit Cwd: when data.cwd is null: {msg2}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
     /// `kj context info --json`'s `usage` field is the token-usage gauge's
     /// public surface — an app-side gauge is built against this shape, so it
     /// needs to expose exactly the persisted `ContextUsageRow`, both in the

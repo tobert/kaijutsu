@@ -131,14 +131,6 @@ produces worse agent behavior, not an error — which is what makes it worth
 writing down. When the release lands, move both pins in one commit and drop
 the git dep TODO in `Cargo.toml` at the same time.
 
-## `kj context info` human and `--json` renders disagree about cwd (2026-08-07)
-
-Human output shows `Cwd: /home/atobey/src/kaijutsu`; `--json` reports
-`shell: null` for the same context. Found while chasing the turn-path cwd bug
-(fixed same day) — the disagreement cost real diagnosis time, because the
-JSON view suggested a context had no cwd when it did. One of the two renders
-is lying; make them share a source.
-
 ## Two context-creation paths disagree about stamping the model (2026-08-07, stance tuning)
 
 Found while fixing the coder stance's model dispatch. The RPC create path
