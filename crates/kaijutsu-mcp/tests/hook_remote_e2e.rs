@@ -296,3 +296,213 @@ fn tool_after_completes_the_call_block_remote_mode() {
         );
     });
 }
+
+/// docs/issues.md "cc-* hook re-registration mints a new context per MCP
+/// relaunch": an MCP process relaunch (process death + respawn, `/mcp
+/// reconnect`) within the SAME Claude Code session must reattach to the
+/// SAME context an earlier process already stabilized — not mint a fresh
+/// one under a new launch-timestamp label.
+///
+/// Simulates two MCP process incarnations for the same repo + Claude Code
+/// session: each auto-registers under its own timestamp-suffixed
+/// placeholder label (mirrors `main.rs::auto_register_label`), but shares
+/// the same stable base (`auto_register_base`) and, crucially, the SAME
+/// session id once a hook event reveals it. "Process A" stabilizes first
+/// (no prior context under the stable label — a plain rename). "Process B"
+/// stabilizes second and must SWITCH onto A's now-stably-labeled context
+/// instead of renaming its own placeholder onto a fresh row — proven by:
+/// same final context id, B's synced document carrying A's pre-relaunch
+/// content, and B's original placeholder ending up abandoned (not the
+/// context anyone is left pointing at).
+#[test]
+fn relaunch_reattaches_to_the_same_stable_context() {
+    run_local(async {
+        let addr = start_server().await;
+        let base = "cc-relaunch-e2e";
+
+        // -- Process A: first-ever launch for this session --
+        let mcp_a = connect_mcp(addr).await;
+        let placeholder_a = format!("{base}-0810-1339");
+        let reg_a = auto_register_with_retry(&mcp_a, &placeholder_a).await;
+        assert!(reg_a["success"].as_bool().unwrap_or(false), "A register failed: {reg_a}");
+        let placeholder_a_id =
+            kaijutsu_crdt::ContextId::parse(reg_a["context_id"].as_str().unwrap()).unwrap();
+
+        let Backend::Remote(remote_a) = mcp_a.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let listener_a = Arc::new(HookListener::remote(
+            remote_a.clone(),
+            Arc::clone(&remote_a.shared_context_id),
+            Arc::clone(mcp_a.session_id_arc()),
+            Some(base.to_string()),
+        ));
+        let socket_a = spawn_listener(listener_a, "relaunch-a").await;
+
+        let session_id = "11112222-3333-4444-5555-666677778888";
+        let session_start = serde_json::json!({
+            "event": "session.start",
+            "source": "claude-code",
+            "session_id": session_id,
+            "model": "claude-opus-4-8",
+        })
+        .to_string();
+        send_hook_event(&socket_a, &session_start).await.unwrap().unwrap();
+
+        // A's placeholder gets renamed IN PLACE (no prior context under the
+        // stable label yet) — same context id, new label.
+        let stable_label = format!("{base}-11112222");
+        let contexts = remote_a.actor.list_contexts().await.unwrap();
+        let stabilized = contexts
+            .iter()
+            .find(|c| c.label == stable_label)
+            .unwrap_or_else(|| panic!("A not stabilized onto {stable_label}: {contexts:?}"));
+        assert_eq!(
+            stabilized.id, placeholder_a_id,
+            "first stabilization must rename A's own context, not create another"
+        );
+
+        // Give A some content — this is what "reattach" must actually
+        // preserve, not just an id match.
+        let prompt_event = serde_json::json!({
+            "event": "prompt.submit",
+            "source": "claude-code",
+            "session_id": session_id,
+            "prompt": "hello from process A",
+        })
+        .to_string();
+        send_hook_event(&socket_a, &prompt_event).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // -- Process B: a relaunch (new MCP process, same session) --
+        let mcp_b = connect_mcp(addr).await;
+        let placeholder_b = format!("{base}-0810-1556"); // different launch timestamp
+        let reg_b = auto_register_with_retry(&mcp_b, &placeholder_b).await;
+        assert!(reg_b["success"].as_bool().unwrap_or(false), "B register failed: {reg_b}");
+        let placeholder_b_id =
+            kaijutsu_crdt::ContextId::parse(reg_b["context_id"].as_str().unwrap()).unwrap();
+        assert_ne!(
+            placeholder_b_id, placeholder_a_id,
+            "sanity: B's placeholder must be a distinct fresh context"
+        );
+
+        let Backend::Remote(remote_b) = mcp_b.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let listener_b = Arc::new(HookListener::remote(
+            remote_b.clone(),
+            Arc::clone(&remote_b.shared_context_id),
+            Arc::clone(mcp_b.session_id_arc()),
+            Some(base.to_string()),
+        ));
+        let socket_b = spawn_listener(listener_b, "relaunch-b").await;
+
+        // The relaunch never sees another session.start (Claude Code only
+        // fires it at genuine session start) — the next ordinary event
+        // (e.g. a tool call) is what must trigger stabilization instead.
+        let tool_event = serde_json::json!({
+            "event": "tool.after",
+            "source": "claude-code",
+            "session_id": session_id,
+            "tool": {"name": "Bash", "input": {"command": "ls"}, "output": "total 0"},
+        })
+        .to_string();
+        send_hook_event(&socket_b, &tool_event).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // B must now be joined to A's stabilized context, not its own
+        // placeholder and not a third context.
+        let b_context_id = remote_b.shared_context_id.lock().unwrap().unwrap();
+        assert_eq!(
+            b_context_id, placeholder_a_id,
+            "relaunch (process B) must reattach to process A's stabilized context, \
+             not stay on its own placeholder or create a new one"
+        );
+
+        // The stable label still resolves to exactly one live context (A's) —
+        // B's stabilization did not fork a second context under it.
+        let resolved = remote_b.actor.resolve_context_label(&stable_label).await.unwrap();
+        assert_eq!(resolved.unwrap().id, placeholder_a_id);
+
+        // B's synced document must carry A's pre-relaunch content — real
+        // reattachment, not a same-id coincidence.
+        let blocks = remote_b.synced.lock().as_ref().unwrap().blocks();
+        assert!(
+            blocks.iter().any(|b| b.content.contains("hello from process A")),
+            "B's synced document is missing A's history after reattach: {blocks:?}"
+        );
+
+        // B's own placeholder context is abandoned, not migrated — it still
+        // exists under its original label, distinct from the stable one.
+        let contexts = remote_b.actor.list_contexts().await.unwrap();
+        assert!(
+            contexts.iter().any(|c| c.id == placeholder_b_id && c.label == placeholder_b),
+            "B's placeholder should still exist (abandoned, not deleted): {contexts:?}"
+        );
+    });
+}
+
+/// The other half of the same fix: a genuinely NEW Claude Code session in
+/// the same repo (different session id) must NOT be folded into an
+/// existing session's stabilized context just because the repo-derived
+/// label base matches. Same base, different session id ⇒ different stable
+/// label ⇒ different context.
+#[test]
+fn new_session_same_repo_gets_a_distinct_context() {
+    run_local(async {
+        let addr = start_server().await;
+        let base = "cc-newsession-e2e";
+
+        let mcp_a = connect_mcp(addr).await;
+        let reg_a = auto_register_with_retry(&mcp_a, &format!("{base}-0810-1000")).await;
+        assert!(reg_a["success"].as_bool().unwrap_or(false));
+        let Backend::Remote(remote_a) = mcp_a.backend().clone() else { panic!("remote") };
+        let listener_a = Arc::new(HookListener::remote(
+            remote_a.clone(),
+            Arc::clone(&remote_a.shared_context_id),
+            Arc::clone(mcp_a.session_id_arc()),
+            Some(base.to_string()),
+        ));
+        let socket_a = spawn_listener(listener_a, "newsess-a").await;
+        let event_a = serde_json::json!({
+            "event": "session.start",
+            "source": "claude-code",
+            "session_id": "aaaaaaaa-0000-0000-0000-000000000000",
+            "model": "claude-opus-4-8",
+        })
+        .to_string();
+        send_hook_event(&socket_a, &event_a).await.unwrap().unwrap();
+        let a_context_id = remote_a.shared_context_id.lock().unwrap().unwrap();
+
+        let mcp_b = connect_mcp(addr).await;
+        let reg_b = auto_register_with_retry(&mcp_b, &format!("{base}-0810-1100")).await;
+        assert!(reg_b["success"].as_bool().unwrap_or(false));
+        let Backend::Remote(remote_b) = mcp_b.backend().clone() else { panic!("remote") };
+        let listener_b = Arc::new(HookListener::remote(
+            remote_b.clone(),
+            Arc::clone(&remote_b.shared_context_id),
+            Arc::clone(mcp_b.session_id_arc()),
+            Some(base.to_string()),
+        ));
+        let socket_b = spawn_listener(listener_b, "newsess-b").await;
+        let event_b = serde_json::json!({
+            "event": "session.start",
+            "source": "claude-code",
+            "session_id": "bbbbbbbb-0000-0000-0000-000000000000",
+            "model": "claude-opus-4-8",
+        })
+        .to_string();
+        send_hook_event(&socket_b, &event_b).await.unwrap().unwrap();
+        let b_context_id = remote_b.shared_context_id.lock().unwrap().unwrap();
+
+        assert_ne!(
+            a_context_id, b_context_id,
+            "distinct Claude Code sessions (different session ids) sharing a repo \
+             must not be folded into the same context"
+        );
+
+        let contexts = remote_a.actor.list_contexts().await.unwrap();
+        assert!(contexts.iter().any(|c| c.label == format!("{base}-aaaaaaaa")));
+        assert!(contexts.iter().any(|c| c.label == format!("{base}-bbbbbbbb")));
+    });
+}

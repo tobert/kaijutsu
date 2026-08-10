@@ -54,13 +54,20 @@ pub struct HookListener {
     max_block_size: usize,
     /// Shared session ID — updated from hook events when detected.
     session_id: Arc<Mutex<Option<String>>>,
-    /// Remote-only: the auto-register label, present only when it was
-    /// generated without a session-id suffix (session id wasn't known at
-    /// register time). `session.start`'s handler consumes it via
-    /// `Mutex::take` — `Some` means a rename is still pending, `None` means
-    /// it already happened or was never needed (manual `register_session`,
-    /// local mode).
-    pending_label_rename: Mutex<Option<String>>,
+    /// Remote-only: the auto-register label's stable prefix
+    /// (`auto_register_base` in `main.rs` — repo name, no launch
+    /// timestamp), present only when the initial join used a placeholder
+    /// label (session id wasn't known at register time). The first hook
+    /// event that carries a `session_id` consumes it via `Mutex::take` and
+    /// stabilizes onto `{base}-{sid8}` (`maybe_stabilize_label`) — `Some`
+    /// means stabilization is still pending, `None` means it already
+    /// happened or was never needed (manual `register_session`, local
+    /// mode). Deliberately NOT gated to `session.start`: that event never
+    /// fires again on a same-session MCP relaunch (`/mcp reconnect`, a
+    /// kernel restart that killed the process) — exactly the case this
+    /// exists to fix (docs/issues.md "cc-* hook re-registration mints a new
+    /// context per MCP relaunch").
+    pending_label_base: Mutex<Option<String>>,
     /// Guards `set_context_model` (from `session.start`'s `model` field) to
     /// at most one call per process.
     context_model_set: Mutex<bool>,
@@ -84,7 +91,7 @@ impl HookListener {
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             session_id: Arc::new(Mutex::new(None)),
-            pending_label_rename: Mutex::new(None),
+            pending_label_base: Mutex::new(None),
             context_model_set: Mutex::new(false),
         }
     }
@@ -93,16 +100,17 @@ impl HookListener {
     ///
     /// `shared_context_id` is updated by `register_session` when a context is joined.
     ///
-    /// `pending_label_rename`: `Some(label)` when the caller auto-registered
-    /// with a label that lacks a session-id suffix (session id unknown at
-    /// register time) — the first `session.start` with a session id renames
-    /// the context to `{label}-{first 8 chars}`. Pass `None` when the label
-    /// already carries a session id, or wasn't auto-generated.
+    /// `pending_label_base`: `Some(base)` when the caller auto-registered
+    /// with a placeholder label lacking a session-id suffix (session id
+    /// unknown at register time) — the first hook event carrying a session
+    /// id stabilizes the context onto `{base}-{first 8 chars}`
+    /// (`maybe_stabilize_label`). Pass `None` when the label already
+    /// carries a session id, or wasn't auto-generated.
     pub fn remote(
         remote: RemoteState,
         shared_context_id: Arc<Mutex<Option<ContextId>>>,
         session_id: Arc<Mutex<Option<String>>>,
-        pending_label_rename: Option<String>,
+        pending_label_base: Option<String>,
     ) -> Self {
         Self {
             local_store: None,
@@ -111,7 +119,7 @@ impl HookListener {
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             session_id,
-            pending_label_rename: Mutex::new(pending_label_rename),
+            pending_label_base: Mutex::new(pending_label_base),
             context_model_set: Mutex::new(false),
         }
     }
@@ -213,6 +221,16 @@ impl HookListener {
             }
         }
 
+        // Stabilize the placeholder label onto a Claude-Code-session-stable
+        // one now that we (may) know the true session id — BEFORE authoring
+        // this event's own block, so a relaunch-reattach switch lands it in
+        // the right context. One-shot per process (`pending_label_base`'s
+        // `Mutex::take`); a no-op on every event after the first that finds
+        // a session id.
+        if let Some(sid) = self.session_id.lock().ok().and_then(|g| g.clone()) {
+            self.maybe_stabilize_label(&sid).await;
+        }
+
         let response = self.process_event(&event).await;
 
         let json = serde_json::to_string(&response).unwrap_or_default();
@@ -263,57 +281,32 @@ impl HookListener {
                     author_error = Some(e);
                 }
 
-                // Remote-only follow-ups, each at most once per process: tell
-                // the kernel which model this context is talking to, and
-                // rename the auto-generated label once the session id is
-                // known (it wasn't yet when register_session ran).
+                // Remote-only follow-up, at most once per process: tell the
+                // kernel which model this context is talking to. Label
+                // stabilization now happens generally in `handle_connection`
+                // (`maybe_stabilize_label`), not gated to this event type —
+                // see that method's doc comment for why.
                 if let Some(ref remote) = self.remote
                     && let Some(ctx_id) = self.context_id()
+                    && let Some(model) = event.model.as_deref()
                 {
-                    if let Some(model) = event.model.as_deref() {
-                        // Recover a poisoned lock (rather than `.ok()`-skip
-                        // like `session_id` below) — this flag exists to
-                        // stop a *duplicate* RPC, so losing track of "already
-                        // called" under poisoning is the wrong failure mode.
-                        let already_set = {
-                            let mut guard =
-                                self.context_model_set.lock().unwrap_or_else(|e| e.into_inner());
-                            std::mem::replace(&mut *guard, true)
-                        };
-                        if !already_set {
-                            // Only adapter today is claude-code (docs/hooks.md) — its
-                            // models are always served by the "anthropic" provider.
-                            match remote.actor.set_context_model(ctx_id, "anthropic", model).await
-                            {
-                                Ok(_) => {
-                                    tracing::info!(model, "Set context model from session.start")
-                                }
-                                Err(e) => tracing::warn!("Failed to set context model: {e}"),
+                    // Recover a poisoned lock (rather than `.ok()`-skip like
+                    // `session_id` elsewhere) — this flag exists to stop a
+                    // *duplicate* RPC, so losing track of "already called"
+                    // under poisoning is the wrong failure mode.
+                    let already_set = {
+                        let mut guard =
+                            self.context_model_set.lock().unwrap_or_else(|e| e.into_inner());
+                        std::mem::replace(&mut *guard, true)
+                    };
+                    if !already_set {
+                        // Only adapter today is claude-code (docs/hooks.md) — its
+                        // models are always served by the "anthropic" provider.
+                        match remote.actor.set_context_model(ctx_id, "anthropic", model).await {
+                            Ok(_) => {
+                                tracing::info!(model, "Set context model from session.start")
                             }
-                        }
-                    }
-
-                    if let Some(session_id) = event.session_id.as_deref() {
-                        // Recover a poisoned lock like `context_model_set`
-                        // above: skipping here would leave the context's
-                        // auto-generated label permanently suffix-less.
-                        let pending = self
-                            .pending_label_rename
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take();
-                        if let Some(label) = pending {
-                            let suffix = short_session_suffix(session_id);
-                            let renamed = format!("{label}-{suffix}");
-                            match remote.actor.rename_context(ctx_id, &renamed).await {
-                                Ok(_) => tracing::info!(
-                                    label = %renamed,
-                                    "Renamed context with session suffix"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    "Failed to rename context with session suffix: {e}"
-                                ),
-                            }
+                            Err(e) => tracing::warn!("Failed to set context model: {e}"),
                         }
                     }
                 }
@@ -599,6 +592,59 @@ impl HookListener {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Stabilize the auto-registered placeholder context onto a label that's
+    /// stable for the whole Claude Code session, once a hook event reveals
+    /// the true session id. See `pending_label_base`'s doc comment for why
+    /// this isn't gated to `session.start`.
+    ///
+    /// Delegates the actual label resolution (rename in place vs. switch to
+    /// a prior process's context) to `crate::stabilize_context_label` — the
+    /// same upsert machinery `register_session` uses, so a relaunch that
+    /// lands here re-attaches to the SAME context an earlier process in
+    /// this session already stabilized, instead of minting another
+    /// placeholder (docs/issues.md "cc-* hook re-registration mints a new
+    /// context per MCP relaunch").
+    async fn maybe_stabilize_label(&self, session_id: &str) {
+        let Some(ref remote) = self.remote else { return };
+
+        // One-shot: `Mutex::take` leaves `None` behind, so every later call
+        // (from later events) is a no-op regardless of outcome below.
+        let base = {
+            let mut guard =
+                self.pending_label_base.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        let Some(base) = base else { return };
+
+        let Some(current_context_id) = self.context_id() else {
+            // Shouldn't happen — auto-register sets shared_context_id before
+            // the listener starts accepting connections. Put the base back
+            // rather than lose it silently; the next event with a session id
+            // retries.
+            let mut guard =
+                self.pending_label_base.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(base);
+            return;
+        };
+
+        let suffix = short_session_suffix(session_id);
+        let stable_label = format!("{base}-{suffix}");
+        match crate::stabilize_context_label(remote, current_context_id, stable_label.clone())
+            .await
+        {
+            Ok(outcome) => tracing::info!(
+                label = %outcome.label,
+                context_id = %outcome.context_id,
+                switched = outcome.context_id != current_context_id,
+                "Stabilized auto-registered context onto session-derived label",
+            ),
+            Err(e) => tracing::warn!(
+                label = %stable_label,
+                "Failed to stabilize context label: {e}"
+            ),
+        }
     }
 
     // -- Drift injection --

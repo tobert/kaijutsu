@@ -290,6 +290,11 @@ pub struct RemoteState {
     /// fallback send `DocCommand`s through this instead of touching
     /// `synced` directly; only reads still go straight through the mutex.
     pub doc_task: Arc<Mutex<Option<DocTaskHandle>>>,
+    /// Per-session principal for block authorship — mirrors
+    /// `KaijutsuMcp::session_principal`, duplicated here so `finish_join`
+    /// (a free function, no `&self`) can build a `SyncedDocument` without
+    /// threading an extra parameter through every caller. `Copy`.
+    pub session_principal: PrincipalId,
 }
 
 /// State for a joined context — created by `register_session`.
@@ -322,6 +327,254 @@ impl JoinedContext {
     /// production code never calls this.
     pub fn debug_kill_event_listener(&self) {
         self._bridge_task.0.abort();
+    }
+}
+
+/// Outcome of resolving a label to a context and (re)joining it — the
+/// `success` reply shape shared by `register_session` and, via
+/// `stabilize_context_label`, the hook listener's post-hoc label fixup.
+pub(crate) struct JoinOutcome {
+    pub context_id: ContextId,
+    pub label: String,
+    pub resumed: bool,
+    pub previous_context: Option<serde_json::Value>,
+}
+
+/// The tail of joining a context, shared by every caller that has already
+/// resolved (or created) a `context_id` to join: sync the server snapshot,
+/// build the `SyncedDocument`, spawn the sole-writer doc task + event
+/// bridge, and publish the result via `remote.joined` /
+/// `remote.shared_context_id`.
+///
+/// Writing a fresh `JoinedContext` into `remote.joined` drops whatever was
+/// there before, and `JoinedContext`'s fields are `AbortOnDrop` — so calling
+/// this a second time within the same process (as `stabilize_context_label`
+/// does when a hook event reveals this process should really be attached to
+/// an EARLIER process's context) safely tears down the first join's doc
+/// task and event bridge as a side effect of the overwrite. No separate
+/// cancellation dance needed.
+async fn finish_join(
+    remote: &RemoteState,
+    context_id: ContextId,
+    label: String,
+    resumed: bool,
+    previous_context: Option<serde_json::Value>,
+) -> Result<JoinOutcome, String> {
+    // 1. Sync initial state from server
+    let sync_state = remote
+        .actor
+        .get_context_sync(context_id)
+        .await
+        .map_err(|e| format!("Error syncing context: {e}"))?;
+
+    // 2. Build the synced document from the server snapshot. SyncedDocument
+    // owns the SyncManager and buffers out-of-order events (text ops /
+    // status changes that arrive before their BlockInserted), replaying
+    // them on insert — the fix for the dropped-stdout bug.
+    let synced_doc = SyncedDocument::from_sync_state(&sync_state, remote.session_principal)
+        .map_err(|e| format!("Error building synced document: {e}"))?;
+    {
+        let mut g = remote.synced.lock();
+        *g = Some(synced_doc);
+    }
+
+    // 3. Spawn the sole-writer doc task — the ONLY thing that ever
+    // mutates `remote.synced` from here on. Every mutation (apply,
+    // author, resync) arrives as a `DocCommand` on one mpsc channel;
+    // see `doc_task` module docs for why this replaces the old
+    // three-writer arrangement (background listener + HookListener +
+    // stall fallback, all racing under the same mutex).
+    let (doc_task_handle, doc_task_join) = spawn_doc_task(
+        remote.actor.clone(),
+        context_id,
+        Arc::clone(&remote.synced),
+        remote.change.clone(),
+    );
+    {
+        let mut g = remote.doc_task.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(doc_task_handle.clone());
+    }
+
+    // 4. Bridge the actor's block-events and connection-status broadcast
+    // streams into the doc task's command channel — a `NeedsResync`
+    // effect, a broadcast `Lagged`, or a reconnect (`Connected`) becomes
+    // a `Resync` command instead of running inline.
+    let bridge_join = spawn_event_bridge(remote.actor.clone(), doc_task_handle);
+    let bridge_abort = bridge_join.abort_handle();
+    let doc_task_abort = doc_task_join.abort_handle();
+
+    // Supervise both tasks. The doc task is the sole writer of
+    // SyncedDocument; if it panics or its channel closes (impossible in
+    // practice — the handle stored in `remote.doc_task` keeps a sender
+    // alive), the document stops updating. The bridge is delivery only —
+    // if IT dies, the doc task keeps running (the stall fallback can
+    // still reach it), just without live server events. Surface either
+    // loudly instead of a silent hang. Self-terminating: no separate
+    // cancellation needed, they resolve (including on teardown abort)
+    // and the supervisor just logs.
+    let sup_ctx = context_id;
+    tokio::spawn(async move {
+        match doc_task_join.await {
+            Ok(()) => tracing::warn!(
+                context_id = %sup_ctx,
+                "MCP doc task exited (command channel closed); \
+                 synced document will no longer update — reconnect needed",
+            ),
+            Err(e) if e.is_cancelled() => tracing::debug!(
+                context_id = %sup_ctx,
+                "MCP doc task cancelled (session teardown)",
+            ),
+            Err(e) => tracing::error!(
+                context_id = %sup_ctx,
+                "MCP doc task PANICKED: {e}; synced document frozen — reconnect needed",
+            ),
+        }
+    });
+    tokio::spawn(async move {
+        match bridge_join.await {
+            Ok(()) => tracing::warn!(
+                context_id = %sup_ctx,
+                "MCP event bridge exited (server event stream closed); \
+                 synced document will no longer receive live updates — reconnect needed",
+            ),
+            Err(e) if e.is_cancelled() => tracing::debug!(
+                context_id = %sup_ctx,
+                "MCP event bridge cancelled (session teardown)",
+            ),
+            Err(e) => tracing::error!(
+                context_id = %sup_ctx,
+                "MCP event bridge PANICKED: {e}; synced document will no longer receive \
+                 live updates — reconnect needed",
+            ),
+        }
+    });
+
+    // 5. Write JoinedContext — dropping whatever was joined before (see
+    // this function's doc comment).
+    {
+        let mut guard = remote.joined.write().await;
+        *guard = Some(JoinedContext {
+            context_id,
+            _bridge_task: Arc::new(AbortOnDrop(bridge_abort)),
+            _doc_task: Arc::new(AbortOnDrop(doc_task_abort)),
+        });
+    }
+
+    // 6. Update shared context_id for hook listener
+    if let Ok(mut ctx) = remote.shared_context_id.lock() {
+        *ctx = Some(context_id);
+    }
+
+    tracing::info!(
+        context_id = %context_id,
+        label = %label,
+        resumed,
+        "Session registered"
+    );
+
+    Ok(JoinOutcome { context_id, label, resumed, previous_context })
+}
+
+/// Stabilize this process's auto-registered context onto a label that's
+/// stable for the whole Claude Code session, once a hook event reveals the
+/// true session id (unknown at `register_session_auto` time — see
+/// `auto_register_label`'s doc comment in `main.rs`).
+///
+/// `current_context_id` is whatever this process is joined to right now
+/// (the placeholder, timestamp-labeled context from startup). `stable_label`
+/// is `{base}-{sid8}`, deterministic across every MCP process for the same
+/// Claude Code session. Three outcomes, mirroring `register_session`'s
+/// upsert semantics but starting from an EXISTING join instead of none:
+///
+/// - No context named `stable_label` yet → rename the current context onto
+///   it in place. First time this session id has been seen; today's
+///   behavior, content preserved.
+/// - `stable_label` already names a DIFFERENT live context → an earlier MCP
+///   process for this same Claude Code session already stabilized under it
+///   (a relaunch, e.g. `/mcp reconnect` or a kernel restart that killed the
+///   process). Switch this process's join to THAT context via `finish_join`
+///   — true reattachment, not a cosmetic rename. The placeholder this
+///   process created moments ago at startup is abandoned (at most a few
+///   hook-authored blocks) rather than migrated; no attempt to merge it.
+/// - `stable_label` names a concluded/archived context → never resurrect
+///   (mirrors `register_session`'s own rule); derive a fresh suffixed label
+///   and rename the current context onto that instead.
+pub(crate) async fn stabilize_context_label(
+    remote: &RemoteState,
+    current_context_id: ContextId,
+    stable_label: String,
+) -> Result<JoinOutcome, String> {
+    let existing = remote
+        .actor
+        .resolve_context_label(&stable_label)
+        .await
+        .map_err(|e| format!("Error resolving label '{stable_label}': {e}"))?;
+
+    match existing {
+        Some(ctx)
+            if ctx.concluded_at.is_none() && !ctx.archived && ctx.id != current_context_id =>
+        {
+            tracing::warn!(
+                context_id = %ctx.id,
+                placeholder_context_id = %current_context_id,
+                label = %stable_label,
+                created_at = ctx.created_at,
+                last_activity_at = ?ctx.last_activity_at,
+                "stabilize_context_label: label already names a live context from an \
+                 earlier MCP process for this session — reattaching instead of renaming \
+                 the placeholder (relaunch/reconnect upsert)",
+            );
+            finish_join(remote, ctx.id, stable_label, true, None).await
+        }
+        Some(ctx) if ctx.id == current_context_id => {
+            // Already stable — defensive no-op (shouldn't happen: this runs
+            // at most once per process, right after the placeholder join).
+            Ok(JoinOutcome {
+                context_id: ctx.id,
+                label: stable_label,
+                resumed: false,
+                previous_context: None,
+            })
+        }
+        Some(ctx) => {
+            // Concluded/archived at that label — never resurrect. Derive a
+            // fresh suffixed label and rename the CURRENT (already-joined)
+            // context onto it instead of abandoning it.
+            let fresh_label =
+                KaijutsuMcp::find_available_suffixed_label(&remote.actor, &stable_label)
+                    .await
+                    .map_err(|e| format!("Error deriving fresh label from '{stable_label}': {e}"))?;
+            remote
+                .actor
+                .rename_context(current_context_id, &fresh_label)
+                .await
+                .map_err(|e| format!("Error renaming context: {e}"))?;
+            Ok(JoinOutcome {
+                context_id: current_context_id,
+                label: fresh_label,
+                resumed: false,
+                previous_context: Some(serde_json::json!({
+                    "context_id": ctx.id.to_hex(),
+                    "context_short": ctx.id.short(),
+                    "label": stable_label,
+                    "concluded_at": ctx.concluded_at,
+                    "archived": ctx.archived,
+                })),
+            })
+        }
+        None => {
+            remote
+                .actor
+                .rename_context(current_context_id, &stable_label)
+                .await
+                .map_err(|e| format!("Error renaming context: {e}"))?;
+            Ok(JoinOutcome {
+                context_id: current_context_id,
+                label: stable_label,
+                resumed: false,
+                previous_context: None,
+            })
+        }
     }
 }
 
@@ -486,6 +739,7 @@ impl KaijutsuMcp {
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
                 doc_task: Arc::new(Mutex::new(None)),
+                session_principal,
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -1256,127 +1510,21 @@ impl KaijutsuMcp {
             }
         };
 
-        // 3. Sync initial state from server
-        let sync_state = match remote.actor.get_context_sync(context_id).await {
-            Ok(s) => s,
-            Err(e) => return format!("Error syncing context: {e}"),
-        };
-
-        // 4. Build the synced document from the server snapshot. SyncedDocument
-        // owns the SyncManager and buffers out-of-order events (text ops /
-        // status changes that arrive before their BlockInserted), replaying
-        // them on insert — the fix for the dropped-stdout bug.
-        let synced_doc = match SyncedDocument::from_sync_state(&sync_state, self.session_principal) {
-            Ok(d) => d,
-            Err(e) => return format!("Error building synced document: {e}"),
-        };
-        {
-            let mut g = remote.synced.lock();
-            *g = Some(synced_doc);
+        // 3-8: sync, build SyncedDocument, spawn doc task + event bridge,
+        // publish JoinedContext / shared_context_id — shared with
+        // `stabilize_context_label`'s reattach case (see `finish_join`).
+        match finish_join(remote, context_id, label, resumed, previous_context).await {
+            Ok(outcome) => serde_json::json!({
+                "success": true,
+                "context_id": outcome.context_id.to_hex(),
+                "context_short": outcome.context_id.short(),
+                "label": outcome.label,
+                "resumed": outcome.resumed,
+                "previous_context": outcome.previous_context,
+            })
+            .to_string(),
+            Err(e) => e,
         }
-
-        // 5. Spawn the sole-writer doc task — the ONLY thing that ever
-        // mutates `remote.synced` from here on. Every mutation (apply,
-        // author, resync) arrives as a `DocCommand` on one mpsc channel;
-        // see `doc_task` module docs for why this replaces the old
-        // three-writer arrangement (background listener + HookListener +
-        // stall fallback, all racing under the same mutex).
-        let (doc_task_handle, doc_task_join) = spawn_doc_task(
-            remote.actor.clone(),
-            context_id,
-            Arc::clone(&remote.synced),
-            remote.change.clone(),
-        );
-        {
-            let mut g = remote.doc_task.lock().unwrap_or_else(|e| e.into_inner());
-            *g = Some(doc_task_handle.clone());
-        }
-
-        // 6. Bridge the actor's block-events and connection-status broadcast
-        // streams into the doc task's command channel — a `NeedsResync`
-        // effect, a broadcast `Lagged`, or a reconnect (`Connected`) becomes
-        // a `Resync` command instead of running inline.
-        let bridge_join = spawn_event_bridge(remote.actor.clone(), doc_task_handle);
-        let bridge_abort = bridge_join.abort_handle();
-        let doc_task_abort = doc_task_join.abort_handle();
-
-        // Supervise both tasks. The doc task is the sole writer of
-        // SyncedDocument; if it panics or its channel closes (impossible in
-        // practice — the handle stored in `remote.doc_task` keeps a sender
-        // alive), the document stops updating. The bridge is delivery only —
-        // if IT dies, the doc task keeps running (the stall fallback can
-        // still reach it), just without live server events. Surface either
-        // loudly instead of a silent hang. Self-terminating: no separate
-        // cancellation needed, they resolve (including on teardown abort)
-        // and the supervisor just logs.
-        let sup_ctx = context_id;
-        tokio::spawn(async move {
-            match doc_task_join.await {
-                Ok(()) => tracing::warn!(
-                    context_id = %sup_ctx,
-                    "MCP doc task exited (command channel closed); \
-                     synced document will no longer update — reconnect needed",
-                ),
-                Err(e) if e.is_cancelled() => tracing::debug!(
-                    context_id = %sup_ctx,
-                    "MCP doc task cancelled (session teardown)",
-                ),
-                Err(e) => tracing::error!(
-                    context_id = %sup_ctx,
-                    "MCP doc task PANICKED: {e}; synced document frozen — reconnect needed",
-                ),
-            }
-        });
-        tokio::spawn(async move {
-            match bridge_join.await {
-                Ok(()) => tracing::warn!(
-                    context_id = %sup_ctx,
-                    "MCP event bridge exited (server event stream closed); \
-                     synced document will no longer receive live updates — reconnect needed",
-                ),
-                Err(e) if e.is_cancelled() => tracing::debug!(
-                    context_id = %sup_ctx,
-                    "MCP event bridge cancelled (session teardown)",
-                ),
-                Err(e) => tracing::error!(
-                    context_id = %sup_ctx,
-                    "MCP event bridge PANICKED: {e}; synced document will no longer receive \
-                     live updates — reconnect needed",
-                ),
-            }
-        });
-
-        // 7. Write JoinedContext
-        {
-            let mut guard = remote.joined.write().await;
-            *guard = Some(JoinedContext {
-                context_id,
-                _bridge_task: Arc::new(AbortOnDrop(bridge_abort)),
-                _doc_task: Arc::new(AbortOnDrop(doc_task_abort)),
-            });
-        }
-
-        // 8. Update shared context_id for hook listener
-        if let Ok(mut ctx) = remote.shared_context_id.lock() {
-            *ctx = Some(context_id);
-        }
-
-        tracing::info!(
-            context_id = %context_id,
-            label = %label,
-            resumed,
-            "Session registered"
-        );
-
-        serde_json::json!({
-            "success": true,
-            "context_id": context_id.to_hex(),
-            "context_short": context_id.short(),
-            "label": label,
-            "resumed": resumed,
-            "previous_context": previous_context,
-        })
-        .to_string()
     }
 
     // ========================================================================

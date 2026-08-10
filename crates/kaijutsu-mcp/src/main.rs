@@ -139,11 +139,16 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // Cap'n Proto RPC requires LocalSet for !Send types
     let local_set = tokio::task::LocalSet::new();
     local_set.run_until(async {
-        // `Some(label)` only when register_session_auto below succeeds
-        // *and* the session id wasn't known yet — that's the one case where
-        // the label needs a rename once a hook event tells us the session
-        // id (HookListener::remote, session.start handling).
-        let mut pending_label_rename: Option<String> = None;
+        // `Some(base)` only when register_session_auto below succeeds *and*
+        // the session id wasn't known yet — that's the one case where the
+        // label needs stabilizing once a hook event tells us the session id
+        // (HookListener::remote, `stabilize_context_label`). `base` is the
+        // repo-only prefix (`auto_register_base`), NOT the timestamped
+        // label used for the initial join — the stable label is
+        // `{base}-{sid8}`, deterministic across MCP relaunches within the
+        // same Claude Code session (docs/issues.md "cc-* hook
+        // re-registration mints a new context per MCP relaunch").
+        let mut pending_label_base: Option<String> = None;
 
         let mcp = if args.connect {
             tracing::info!(
@@ -172,8 +177,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             // detection scrapes the newest transcript file, and at MCP spawn
             // time the CURRENT session's transcript may not exist yet — the
             // detected id can belong to a previous session (observed live).
-            // The first session.start hook event carries the true id; its
-            // handler does the rename.
+            // The first hook event that carries a session_id (any event
+            // type — not just session.start, which never fires again on a
+            // same-session MCP relaunch) carries the true id;
+            // `stabilize_context_label` does the fixup.
             let label = auto_register_label(&cwd, unix_secs);
             // The actor connects in the background, so the first attempt can
             // race it ("not ready: connecting"). Retry briefly with backoff;
@@ -199,7 +206,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 }
             }
             if success {
-                pending_label_rename = Some(label.clone());
+                pending_label_base = Some(auto_register_base(&cwd));
                 tracing::info!(label = %label, "Auto-registered MCP session");
             } else {
                 tracing::warn!(
@@ -255,7 +262,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                     remote.clone(),
                     Arc::clone(&remote.shared_context_id),
                     Arc::clone(mcp.session_id_arc()),
-                    pending_label_rename.clone(),
+                    pending_label_base.clone(),
                 ))
             }
         };
@@ -380,14 +387,28 @@ fn normalize_hook_input(input: &str) -> Option<(String, Option<String>)> {
 ///
 /// Deliberately no session-id suffix — startup agent detection can report a
 /// PREVIOUS session's id (it scrapes the newest transcript file, which may
-/// predate this session). `HookListener`'s `session.start` handling appends
-/// `-{first 8 chars}` once a hook event reveals the true id.
+/// predate this session). `HookListener`'s label-stabilization handling
+/// (`stabilize_context_label`) appends `-{first 8 chars}` to
+/// `auto_register_base`'s prefix — NOT this timestamp — once a hook event
+/// reveals the true id, so the stabilized label stays the same across an
+/// MCP relaunch within the same Claude Code session even though this
+/// timestamped one differs every time.
 fn auto_register_label(cwd: &Path, unix_secs: u64) -> String {
+    format!("{}-{}", auto_register_base(cwd), format_stamp(unix_secs))
+}
+
+/// The label prefix stable for a whole Claude Code session: `cc-{cwd
+/// basename}`, with no launch timestamp. `auto_register_label`'s prefix
+/// before the timestamp suffix — `stabilize_context_label` appends
+/// `-{sid8}` to THIS (not to the timestamped label) once the true session
+/// id is known, so relaunches of the same session converge on the same
+/// stable label instead of minting a fresh one per process.
+fn auto_register_base(cwd: &Path) -> String {
     let dirname = cwd
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("kaijutsu");
-    format!("cc-{dirname}-{}", format_stamp(unix_secs))
+    format!("cc-{dirname}")
 }
 
 /// Format a Unix timestamp (seconds) as `MMDD-HHMM`, UTC.
@@ -474,5 +495,30 @@ mod tests {
         // "/" has no file_name() component — must not panic.
         let label = auto_register_label(Path::new("/"), 0);
         assert_eq!(label, "cc-kaijutsu-0101-0000");
+    }
+
+    // -- auto_register_base (stable label prefix) --
+
+    #[test]
+    fn auto_register_base_has_no_timestamp() {
+        // The stable prefix `stabilize_context_label` appends `-{sid8}` to —
+        // it must be identical across two calls at different times, unlike
+        // `auto_register_label`'s timestamped output.
+        assert_eq!(
+            auto_register_base(Path::new("/home/amy/src/kaijutsu")),
+            "cc-kaijutsu"
+        );
+    }
+
+    #[test]
+    fn auto_register_label_is_base_plus_stamp() {
+        // auto_register_label must derive from auto_register_base, not
+        // duplicate its own dirname logic — otherwise the two could drift
+        // and a relaunch's stable label would silently stop matching an
+        // earlier process's.
+        let cwd = Path::new("/home/amy/src/candle");
+        let base = auto_register_base(cwd);
+        let label = auto_register_label(cwd, 1_700_000_000);
+        assert_eq!(label, format!("{base}-{}", format_stamp(1_700_000_000)));
     }
 }
