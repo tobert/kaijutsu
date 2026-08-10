@@ -9,7 +9,8 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 ## Background exec → kaish's job system (2026-08-07, Amy: "we should do the work and set the rule")
 
 An audit of every spawn site found exactly one ad-hoc host exec left in
-production: `spawn_background` (`background_exec.rs:552`) runs an
+production: `spawn_background` (`crates/kaijutsu-kernel/src/background_exec.rs:552`,
+NOT under `mcp/servers/`) runs an
 agent-supplied string as `/bin/sh -c`, called from `shell.rs:200`
 (`start_background`, the `shell` tool's `background: true`). MCP stdio
 launches (`mcp/servers/external.rs`) are the sanctioned exception; the rule
