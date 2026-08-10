@@ -475,11 +475,56 @@ impl McpServerLike for FileToolsServer {
 
 impl FileToolsServer {
     async fn write_file(&self, path: String, content: String) -> ExecResult {
+        let vfs_path = std::path::Path::new(&path);
+
+        // Read-only / OS mounts never touch the CRDT cache: let the VFS
+        // reject the write cleanly instead of poisoning the cache with an
+        // un-flushable edit. Mirrors the gate `MountBackend::raw_write`
+        // already applies on the kaish surface (`runtime/mount_backend.rs`).
+        // Without it, `create_or_replace` below lands the new content in the
+        // CRDT block store *before* the flush is even attempted, and a
+        // failed flush is never undone: the cache entry's `dirty` flag has
+        // no path back to `false` on failure, and staleness detection keys
+        // off the VFS file's `generation` — which a failed write never
+        // advances — so every later `read` on this path would keep serving
+        // the phantom unwritten content forever, not the real (untouched)
+        // file. Live-verified before this fix: a write to a read-only mount
+        // failed with a clean error, but the very next read returned the
+        // tampered content while the on-disk file was still the original.
+        if !self.vfs.is_writable(vfs_path).await {
+            let existed = self.vfs.exists(vfs_path).await;
+            return match self.vfs.write_all(vfs_path, content.as_bytes()).await {
+                Ok(()) => ExecResult::success(format!(
+                    "{} {} ({} bytes)",
+                    if existed { "Updated" } else { "Created" },
+                    path,
+                    content.len(),
+                )),
+                Err(e) => ExecResult::failure(1, format!("{}: {}", path, e)),
+            };
+        }
+
         let existed = self.cache.exists(&path).await;
         match self.cache.create_or_replace(&path, &content).await {
             Ok(_) => {
                 self.cache.mark_dirty(&path);
                 if let Err(e) = self.cache.flush_one(&path).await {
+                    // Roll all the way back: a plain `invalidate` only drops
+                    // the in-memory map entry, but the persisted CRDT shadow
+                    // document still holds the phantom edit — the next
+                    // load's "document already exists" fallback would just
+                    // re-adopt that same phantom content instead of
+                    // rereading the (unchanged) disk bytes. `invalidate_document`
+                    // drops the shadow doc too, so a later read reloads fresh
+                    // from the VFS. A rollback failure is logged, never
+                    // swallowed — it means the poisoned entry survives.
+                    if let Err(inv_err) = self.cache.invalidate_document(&path) {
+                        tracing::warn!(
+                            "write {}: failed to roll back cache after flush failure: {}",
+                            path,
+                            inv_err
+                        );
+                    }
                     return ExecResult::failure(
                         1,
                         format!("wrote to CRDT but failed to flush {}: {}", path, e),
@@ -519,6 +564,18 @@ impl FileToolsServer {
             _ => {}
         }
 
+        // Same gate as `write_file`: a read-only/OS mount must refuse before
+        // anything touches the CRDT cache, not after a flush fails. `edit`
+        // has no raw-VFS fallback (it needs the current content to compute a
+        // diff against, and a read-only target can never accept the result
+        // anyway) — refuse outright.
+        if !self.vfs.is_writable(std::path::Path::new(&path)).await {
+            return ExecResult::failure(
+                1,
+                format!("{}: read-only mount (no writes)", path),
+            );
+        }
+
         let (ctx_id, block_id) = match self.cache.get_or_load(&path).await {
             Ok(ids) => ids,
             Err(e) => return ExecResult::failure(1, e),
@@ -551,6 +608,16 @@ impl FileToolsServer {
 
         self.cache.mark_dirty(&path);
         if let Err(e) = self.cache.flush_one(&path).await {
+            // See `write_file`'s matching rollback: a plain `invalidate`
+            // leaves the persisted shadow doc holding the phantom edit,
+            // which the next load would just re-adopt. Drop the doc too.
+            if let Err(inv_err) = self.cache.invalidate_document(&path) {
+                tracing::warn!(
+                    "edit {}: failed to roll back cache after flush failure: {}",
+                    path,
+                    inv_err
+                );
+            }
             return ExecResult::failure(
                 1,
                 format!("edited CRDT but failed to flush {}: {}", path, e),
@@ -1590,5 +1657,142 @@ mod tests {
         });
         let err = plan_anchor_edit(&content, &anchor, "x").unwrap_err();
         assert!(err.contains("after end"), "got: {err}");
+    }
+
+    // ── read-only mount: clean errors, never corruption ────────────────────
+
+    /// Build a broker over a *real* read-only `LocalBackend` mount (not
+    /// `MemoryBackend`) so `write`/`edit` hit the same `VfsError::ReadOnly`
+    /// path production's read-only root mount does
+    /// (`kernel.mount("/", LocalBackend::read_only("/"))` in
+    /// `kaijutsu-server/src/rpc.rs`). Returns the broker plus the real
+    /// on-disk file path and the `TempDir` (held so it isn't cleaned up
+    /// early).
+    async fn broker_with_readonly_file(
+        content: &str,
+    ) -> (Arc<Broker>, std::path::PathBuf, tempfile::TempDir) {
+        use crate::vfs::backends::LocalBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("ro.txt");
+        std::fs::write(&file_path, content).unwrap();
+
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount(tmp.path().to_str().unwrap(), LocalBackend::read_only(tmp.path()))
+            .await;
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone()));
+        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+
+        (broker, file_path, tmp)
+    }
+
+    /// Regression: `write` to a read-only mount must fail cleanly AND must
+    /// NOT leave the CRDT cache holding the rejected content — a later
+    /// `read` on the same path must still see the real (untouched) file, not
+    /// a phantom edit that never reached disk.
+    ///
+    /// Before the `is_writable` gate in `write_file`, `create_or_replace`
+    /// landed the new content in the CRDT block store unconditionally, and a
+    /// failed `flush_one` never rolled it back: `dirty` had no path back to
+    /// `false` on failure, and staleness detection is keyed on the VFS
+    /// file's `generation`, which a failed write never advances. Live
+    /// reproduction before the fix: `write` failed with a clean error, but
+    /// the immediately following `read` returned the tampered content while
+    /// the on-disk file was still the original bytes.
+    ///
+    /// The `is_writable` gate and the `invalidate_document` rollback are
+    /// deliberately redundant defenses on this path: mutation-verified
+    /// (2026-08-10) that disabling the gate alone still passes (the
+    /// rollback covers it) and disabling BOTH makes this test fail. Keep
+    /// both — the gate refuses before the cache is ever touched; the
+    /// rollback covers every *other* way a flush can fail.
+    #[tokio::test]
+    async fn write_to_readonly_mount_fails_clean_and_does_not_poison_later_reads() {
+        let (broker, file_path, _tmp) = broker_with_readonly_file("on-disk-original").await;
+        let path = file_path.to_str().unwrap().to_string();
+        let ctx = CallContext::test().with_cwd(file_path.parent().unwrap().to_path_buf());
+
+        let w = call_with_ctx(
+            &broker,
+            "write",
+            serde_json::json!({ "path": path, "content": "TAMPERED" }),
+            &ctx,
+        )
+        .await;
+        assert!(w.is_error, "write to a read-only mount must fail");
+        assert!(
+            text_of(&w).to_lowercase().contains("read-only") || text_of(&w).to_lowercase().contains("read only"),
+            "refusal must name the read-only mount, got: {}",
+            text_of(&w)
+        );
+
+        let r = call_with_ctx(&broker, "read", serde_json::json!({ "path": path }), &ctx).await;
+        assert!(!r.is_error, "read after a refused write must still succeed: {}", text_of(&r));
+        assert!(
+            text_of(&r).contains("on-disk-original"),
+            "read must return the real file content, not a phantom unflushed edit: {}",
+            text_of(&r)
+        );
+        assert!(
+            !text_of(&r).contains("TAMPERED"),
+            "read must NOT serve the rejected write's content: {}",
+            text_of(&r)
+        );
+
+        // The real file on disk was never touched either.
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "on-disk-original",
+            "the on-disk file must be byte-identical to before the refused write"
+        );
+    }
+
+    /// `edit` on a read-only mount must refuse up front, before it ever
+    /// touches the CRDT cache — there is no raw-VFS fallback for edit (it
+    /// needs the current content to diff against, and the result could never
+    /// be written anyway). A subsequent `read` must see the untouched file.
+    #[tokio::test]
+    async fn edit_to_readonly_mount_fails_clean_and_does_not_poison_later_reads() {
+        let (broker, file_path, _tmp) = broker_with_readonly_file("fn main() {}\n").await;
+        let path = file_path.to_str().unwrap().to_string();
+        let ctx = CallContext::test().with_cwd(file_path.parent().unwrap().to_path_buf());
+
+        let e = call_with_ctx(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "old_string": "fn main()",
+                "new_string": "fn tampered()",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(e.is_error, "edit on a read-only mount must fail");
+        assert!(
+            text_of(&e).to_lowercase().contains("read-only") || text_of(&e).to_lowercase().contains("read only"),
+            "refusal must name the read-only mount, got: {}",
+            text_of(&e)
+        );
+
+        let r = call_with_ctx(&broker, "read", serde_json::json!({ "path": path }), &ctx).await;
+        assert!(!r.is_error, "read after a refused edit must still succeed: {}", text_of(&r));
+        assert!(
+            text_of(&r).contains("fn main()"),
+            "read must return the real file content, not a phantom edit: {}",
+            text_of(&r)
+        );
+        assert!(
+            !text_of(&r).contains("tampered"),
+            "read must NOT serve the rejected edit's content: {}",
+            text_of(&r)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "fn main() {}\n",
+            "the on-disk file must be byte-identical to before the refused edit"
+        );
     }
 }

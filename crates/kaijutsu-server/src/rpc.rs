@@ -4088,8 +4088,23 @@ impl kernel::Server for KernelImpl {
                 .dispatch_tool_via_broker(&tool_name, &arguments, &exec_ctx)
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            // `ExecResult::failure` puts its message in `stderr` and leaves
+            // `stdout` empty (`execution.rs`) — a bare `exec.stdout` here
+            // silently dropped every failure's message on this wire method,
+            // which every RPC-only client (this isotest suite included)
+            // reaches through `call_mcp_tool` with no other way to recover
+            // the text. `execute_tool` (below) and the LLM tool-call path
+            // (`llm_stream.rs::map_tool_dispatch_result`) already fall back
+            // to `stderr` on failure; this brings `call_mcp_tool` in line
+            // with that established convention instead of being the one
+            // silent exception.
             let mut out = results.get().init_result();
-            out.set_content(&exec.stdout);
+            let content = if exec.success || exec.stderr.is_empty() {
+                &exec.stdout
+            } else {
+                &exec.stderr
+            };
+            out.set_content(content);
             out.set_is_error(!exec.success);
             Ok(())
         })

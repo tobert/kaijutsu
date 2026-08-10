@@ -437,6 +437,47 @@ fn test_call_mcp_tool_requires_joined_context() {
     });
 }
 
+/// Regression: `Kernel::dispatch_tool_via_broker`'s `ExecResult::failure`
+/// puts its message in `stderr` and leaves `stdout` empty
+/// (`kaijutsu-kernel/src/execution.rs`). The `call_mcp_tool` RPC handler
+/// used to build the wire response from `exec.stdout` alone, so EVERY
+/// failed `call_mcp_tool` call returned `is_error=true` with completely
+/// empty content — silently dropping the reason on the one MCP entry point
+/// with no separate error field to fall back to (`execute_tool` sets a
+/// dedicated `error` field; the LLM tool-call path already reads `stderr`).
+/// `write` on the genesis ROOT context is a reliable, always-available
+/// failure: ROOT has no durable cwd until `kj context set --cwd` runs, so
+/// every file tool refuses up front (`refuse_missing_cwd`).
+#[test]
+fn test_call_mcp_tool_failure_message_reaches_the_wire() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+        let root = kernel
+            .resolve_context_label("ROOT")
+            .await
+            .unwrap()
+            .expect("genesis ROOT context exists on a fresh kernel");
+        kernel.join_context(root.id, "test-mcp-error").await.unwrap();
+
+        let result = kernel
+            .call_mcp_tool("write", &serde_json::json!({"path": "/tmp/x.txt", "content": "y"}))
+            .await
+            .expect("call_mcp_tool over SSH");
+        assert!(result.is_error, "write on a cwd-less context must fail");
+        assert!(
+            !result.content.is_empty(),
+            "a failed call_mcp_tool must carry its message over the wire, not just is_error=true"
+        );
+        assert!(
+            result.content.contains("working directory"),
+            "expected the no-cwd refusal message, got: {}",
+            result.content
+        );
+    });
+}
+
 // ============================================================================
 // Async Execute Tests
 // ============================================================================
