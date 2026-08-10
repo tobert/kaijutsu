@@ -434,6 +434,55 @@ dir. Until then, verify with:
 
     strings -a target/debug/deps/<test-binary> | grep -o "<a distinctive string>"
 
+## Ambient command center — trace packets, switchboard follow-ups (2026-08-10)
+
+The arc: Amy runs the app all day on a side monitor; the room scene grows
+ambient signal surfaces (switchboard shipped, seats in flight). Backlog:
+
+- **Trace-packet / comet system (concepted, Amy liked it, not built).** Real
+  events inject traveling crests on the engraved floor routes — the
+  `ChordMaterial` trick (CPU writes ONE launch timestamp, shader derives
+  crest position from `globals.time` forever): extend `TraceGlowMaterial`
+  with a mode-2 pulse-slot array (4 slots/route, round-robin). Traffic map:
+  MIDI-in → crimson inbound W; DJ render → crimson outbound E; VfsActivity →
+  green N; PCM → cyan N; **TurnCompleted → gold comet** (bigger, tailed,
+  1.2–1.8s hash-jittered transit) seat/S → well, landing as a
+  `WellRingsMaterial` ripple at its arrival angle + throat bump;
+  **TurnFailed → red comet that lodges** at the terminal pad until the
+  context recovers. Token-bucket per route (~150ms min spacing, drop excess
+  — midi.md doctrine: missed is missed, never replay); crest position from
+  emission wallclock, back-dated, never chased. Needs a `RouteRegistry`
+  (bearing/hue → material handles; producers call `inject(bearing, class)`).
+- **Switchboard placement**: the south wall is BEHIND the default room
+  camera — invisible in exactly the ambient framing Amy watches. Decide:
+  move lamps to a visible diagonal (NE, where unbuilt Radiators sits),
+  mirror a compact strip into the north-facing frame, or change the default
+  camera. Amy's call.
+- **Switchboard polish**: recency dynamic range too narrow (stale lamps
+  still mid-khaki — widen so old falls near-dark; one constant, tune with
+  eyes on the real monitor). Panel lost its nameplate with the furniture
+  flip — if a label is wanted, engrave a title on the panel itself
+  (tracker transport-glyph style). Ember is unit-tested but not yet
+  live-verified (needs a real TurnFailed; stage one deliberately).
+- **Switchboard slow leak** (kaibo/deepseek): a context deleted from the
+  kernel while `sticky_error` is set leaks its `LampSignal` entry forever
+  (never polled again → never cleared; `retain_relevant` keeps active
+  signals). Rare; fix = drop signals for context ids absent from the poll.
+- **Turn-comet / seat-flare enabler**: `TurnCompleted` carries
+  `principal_id`, peers carry `nick` — no correlation exists. Wire a
+  principal↔peer mapping (kernel knows both) so turn events can flare the
+  right seat.
+- **Runner cargo-watch is DEAF on moltar** (even freshly restarted, inotify
+  limits fine): commits and touches under watched dirs trigger nothing;
+  every rebuild needs `./contrib/kj restart`. Diagnose cargo-watch vs the
+  kernel/watchexec version; consider watchexec-cli or a poll flag.
+- **Ambience agent (Amy's idea)**: an agent context that "plays the room" —
+  drifted-to like any context, modulating packet gain / route weather /
+  lighting mood. Needs the packet system first; keep in mind as its API
+  shapes up.
+
+---
+
 ## Peer-registry doctrine — ACP/headless clients still need to attach; `PeerInfo` lacks `instance` on the wire (2026-08-10, peers-plumbing)
 
 Every connected client is supposed to register in the kernel's peer registry
