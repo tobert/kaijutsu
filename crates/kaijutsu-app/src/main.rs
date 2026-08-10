@@ -15,7 +15,9 @@
 
 use bevy::picking::mesh_picking::{MeshPickingPlugin, MeshPickingSettings};
 use bevy::prelude::*;
-use bevy::window::{Monitor, MonitorSelection, PrimaryMonitor, PrimaryWindow, WindowPosition};
+use bevy::window::{
+    Monitor, MonitorSelection, PrimaryMonitor, PrimaryWindow, WindowMode, WindowPosition,
+};
 use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_brp_extras::BrpExtrasPlugin;
 use clap::Parser;
@@ -37,6 +39,14 @@ struct Cli {
     /// Skip SSH known_hosts verification (TOFU)
     #[arg(long)]
     insecure: bool,
+
+    /// Start borderless-fullscreen on the primary monitor (runner/gamescope)
+    #[arg(long, conflicts_with = "maximize")]
+    fullscreen: bool,
+
+    /// Start with the window maximized
+    #[arg(long)]
+    maximize: bool,
 
     /// Share a local directory into `/r/<client-id>/<name>` (repeatable).
     /// Format: `[name=]path[:rw]` — the name defaults to the path's
@@ -163,6 +173,11 @@ fn main() {
                         )
                             .into(),
                         position: WindowPosition::Centered(MonitorSelection::Primary),
+                        mode: if cli.fullscreen {
+                            WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
+                        } else {
+                            WindowMode::Windowed
+                        },
                         ..default()
                     }),
                     ..default()
@@ -285,6 +300,12 @@ fn main() {
         .init_resource::<view::scene_palette::ScenePalette>()
         // Startup config errors (drained into GlobalErrorQueue on first frame)
         .insert_resource(startup_errors)
+        // Startup window-geometry choice (--fullscreen / --maximize); read by
+        // adapt_window_to_monitor, which otherwise imposes its 75%×80% resize.
+        .insert_resource(StartupWindowArgs {
+            fullscreen: cli.fullscreen,
+            maximize: cli.maximize,
+        })
         // Power management — sleep between events instead of spinning every vsync tick.
         // Input events (keyboard, mouse, window) wake immediately with zero added latency.
         .insert_resource(WinitSettings {
@@ -361,17 +382,43 @@ fn setup_camera(
     ));
 }
 
+/// Startup window-geometry flags (`--fullscreen` / `--maximize`).
+///
+/// Fullscreen is applied at window construction (`WindowMode`); maximize has no
+/// `Window` field and must be requested post-creation via `set_maximized`.
+/// Either flag suppresses the default fit-to-monitor resize below.
+#[derive(Resource)]
+struct StartupWindowArgs {
+    fullscreen: bool,
+    maximize: bool,
+}
+
 /// Resize window to fit the primary monitor on the first frame.
 ///
 /// Bevy's `Monitor` entities aren't populated at `Startup` (winit hasn't pumped
 /// events yet), so this runs in `Update` with a `Local<bool>` guard. Computes
-/// 75%×80% of the monitor's logical resolution and resizes the window.
+/// 75%×80% of the monitor's logical resolution and resizes the window — unless
+/// `--fullscreen`/`--maximize` asked for the whole screen (runner, gamescope).
 fn adapt_window_to_monitor(
     mut window_q: Query<&mut Window, With<PrimaryWindow>>,
     monitor_q: Query<&Monitor, With<PrimaryMonitor>>,
+    args: Res<StartupWindowArgs>,
     mut done: Local<bool>,
 ) {
     if *done {
+        return;
+    }
+    if args.fullscreen {
+        // Mode was set at construction; nothing to adapt.
+        *done = true;
+        return;
+    }
+    if args.maximize {
+        // Doesn't need Monitor data — request as soon as the window exists.
+        if let Ok(mut window) = window_q.single_mut() {
+            window.set_maximized(true);
+            *done = true;
+        }
         return;
     }
     let Ok(monitor) = monitor_q.single() else {
@@ -460,4 +507,22 @@ fn setup_ui(mut commands: Commands) {
                 ));
             });
         });
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fullscreen_and_maximize_conflict() {
+        assert!(Cli::try_parse_from(["kaijutsu", "--fullscreen", "--maximize"]).is_err());
+        assert!(Cli::try_parse_from(["kaijutsu", "--fullscreen"]).is_ok());
+        assert!(Cli::try_parse_from(["kaijutsu", "--maximize"]).is_ok());
+    }
 }
