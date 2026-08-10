@@ -971,6 +971,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 cast_id: None,
+                origin_host: None,
             },
             ws_id,
         )
@@ -1073,6 +1074,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 cast_id: None,
+                origin_host: None,
             },
             ws_id,
         )

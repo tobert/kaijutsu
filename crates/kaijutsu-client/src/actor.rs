@@ -346,6 +346,11 @@ enum RpcCommand {
         paused: bool,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    SetContextOriginHost {
+        context_id: ContextId,
+        origin_host: String,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     ArchiveContext {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
@@ -671,6 +676,7 @@ impl RpcCommand {
             Self::PromoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextPaused { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetContextOriginHost { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ArchiveContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -927,6 +933,23 @@ impl ActorHandle {
         paused: bool,
     ) -> Result<(), CallError> {
         self.send(|reply| RpcCommand::SetContextPaused { context_id, paused, reply }).await
+    }
+
+    /// Set (or clear, on `""`) a context's advisory `origin_host` — the
+    /// registering client's own hostname, recorded once at creation. See
+    /// `RpcClient::set_context_origin_host`'s doc comment.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_context_origin_host(
+        &self,
+        context_id: ContextId,
+        origin_host: &str,
+    ) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::SetContextOriginHost {
+            context_id,
+            origin_host: origin_host.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// Archive a single context — the well's single-keystroke archive act.
@@ -2825,6 +2848,15 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::SetContextPaused { context_id, paused, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_paused(context_id, paused));
+        }
+        RpcCommand::SetContextOriginHost { context_id, origin_host, reply } => {
+            dispatch!(
+                kernel,
+                reply,
+                close_tx,
+                k,
+                k.set_context_origin_host(context_id, &origin_host)
+            );
         }
         RpcCommand::ArchiveContext { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.archive_context(context_id));

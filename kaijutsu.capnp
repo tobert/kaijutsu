@@ -757,6 +757,18 @@ struct ContextHandleInfo {
   # itself). Empty = no cast assigned (falls through to the registry default
   # at resolution time; see `kaijutsu-kernel`'s `model_resolution` module).
   castLabel @28 :Text;
+
+  # Advisory hostname the registering client self-reported (`gethostname` on
+  # the kaijutsu-mcp side today) — set ONCE at creation via
+  # `setContextOriginHost`, never overwritten on a later resume/attach from a
+  # different machine (mirrors `createdAt`/`createdBy`: an origin fact, not a
+  # "last seen from" one). Empty = unknown: an old client, a creation path
+  # with no client to ask (genesis bootstrap, fork), or a pre-migration row.
+  # Shared-trust model — this is observability, not auth; the server trusts
+  # the client's self-report (docs/issues.md "cc-* hook re-registration
+  # mints a new context per MCP relaunch"). `kj context info`/`list` render
+  # empty as "-".
+  originHost @29 :Text;
 }
 
 struct PresetInfo {
@@ -1844,6 +1856,17 @@ interface Kernel {
   #   drops the connection either way; this only decides whether it bothers to
   #   explain itself first.
   declareEventCapabilities @104 (textOpsBatch :Bool, subscriptionTerminated :Bool);
+
+  # Set (or clear, on empty `originHost`) a context's advisory `originHost` —
+  # see `ContextHandleInfo.originHost`'s doc comment. Called once, right
+  # after `createContext`, by a client that knows its own hostname
+  # (`register_session` on the kaijutsu-mcp side); NOT part of `createContext`
+  # itself, so every other creation path (genesis bootstrap, fork, the app)
+  # is unaffected and keeps shipping today's two-arg call. Shared-trust
+  # model: advisory metadata, not auth — the server trusts the client's
+  # self-report, and a failed call here is non-fatal to the caller's own
+  # registration (log-and-continue, never a hard failure over a hostname).
+  setContextOriginHost @105 (contextId :Data, originHost :Text, trace :TraceContext) -> (success :Bool, error :Text);
 }
 
 # ============================================================================
