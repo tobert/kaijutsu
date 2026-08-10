@@ -131,34 +131,6 @@ produces worse agent behavior, not an error — which is what makes it worth
 writing down. When the release lands, move both pins in one commit and drop
 the git dep TODO in `Cargo.toml` at the same time.
 
-## Two context-creation paths disagree about stamping the model (2026-08-07, stance tuning)
-
-Found while fixing the coder stance's model dispatch. The RPC create path
-reads the registry defaults and writes them onto the new `ContextRow`
-(`kaijutsu-server/src/rpc.rs:2390-2412`, `provider`/`model` fields) — so a
-context made by the GUI, `register_session`, or the ACP bridge carries a
-stamped model and `kj context info --json` reports `resolved_source:
-"context"`. `kj context create` does not stamp: the row's `model` stays
-`null` and resolution falls through to the registry default
-(`resolved_source: "default"`). Verified live both ways on zorak.
-
-Same divergent-creation-path family as the bug
-`test_rpc_created_context_runs_rc_create` (`e2e_kj_workflow.rs:596`) guards,
-and it has real consequences:
-
-- Anything reading `.model` gets a different answer depending on which door
-  the context came through. That is exactly what broke the stance dispatch.
-- A stamped row is a *snapshot*: change the registry default later and
-  RPC-created contexts keep the old model while kj-created ones follow. One
-  of those is probably wrong, and which one is a design decision nobody has
-  made on purpose.
-- It makes RPC-path tests structurally unable to catch null-model bugs —
-  the toothless-stance-test trap below.
-
-Decide the intent: either both paths stamp (creation freezes the model, and
-`resolved_source` mostly stops mattering) or neither does (the row means
-"override", inheritance stays live). Don't leave it split.
-
 ## rc seed assets have no rebuild tracking (2026-08-07)
 
 `assets/defaults/rc/` is embedded via `include_dir!`

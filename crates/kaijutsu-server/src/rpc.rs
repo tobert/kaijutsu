@@ -2370,12 +2370,13 @@ async fn ensure_context_joinable(
 /// The shared context-creation recipe, called by both the `createContext` RPC
 /// and the cold-start genesis bootstrap (`create_shared_kernel`).
 ///
-/// Does, in order: create the Conversation document + input doc, read LLM
-/// defaults, write the KernelDb row (rolling back the document on failure),
-/// register in the DriftRouter (rolling back the row + document on failure),
-/// run the `create` rc lifecycle for `context_type` (failure is logged, not
-/// fatal — it surfaces as Error blocks in the new context), and arm the beat
-/// for musician contexts. Hard failures (document / DB / drift) return `Err`;
+/// Does, in order: create the Conversation document + input doc, write the
+/// KernelDb row with `provider`/`model` left `None` (rolling back the
+/// document on failure — see the "neither path stamps" note inside), register
+/// in the DriftRouter (rolling back the row + document on failure), run the
+/// `create` rc lifecycle for `context_type` (failure is logged, not fatal —
+/// it surfaces as Error blocks in the new context), and arm the beat for
+/// musician contexts. Hard failures (document / DB / drift) return `Err`;
 /// everything downstream is best-effort. Wire-result writing is the caller's
 /// job — this never touches capnp results.
 #[allow(clippy::too_many_arguments)]
@@ -2409,18 +2410,18 @@ async fn create_context_inner(
         );
     }
 
-    // Read LLM defaults so new contexts start with a model set. If no provider
-    // is configured, leave both None so the user gets a clear error on use
-    // rather than a silently-injected hardcoded model.
-    let (default_provider, default_model) = {
-        let registry = state.kernel.llm().read().await;
-        let provider = registry.default_provider_name().map(|s| s.to_string());
-        let model = registry.default_model().map(|s| s.to_string());
-        if provider.is_none() && model.is_none() {
-            log::warn!("No LLM provider configured — new context will have no model set");
-        }
-        (provider, model)
-    };
+    // Neither creation path stamps provider/model onto the row (closed
+    // 2026-08-10; was `docs/issues.md` "Two context-creation paths disagree
+    // about stamping the model"). `row.provider`/`row.model` are the
+    // explicit per-context override only — leaving them `None` here matches
+    // `kj context create` and lets `resolve_context_model`'s ladder
+    // (explicit override → cast slot → registry default) do the one job it
+    // exists to do: resolve live, every call, so a later registry-default
+    // change reaches every context uniformly instead of stamped rows
+    // freezing whatever the default happened to be at creation time. A
+    // context with nothing configured anywhere still gets a clear "No LLM
+    // backend configured" error on use (llm_stream.rs) rather than a
+    // silently-injected hardcoded model.
 
     // Write-through: KernelDb first, then DriftRouter. Both must succeed or we
     // roll in-memory state back — never a ghost live-in-memory-but-missing-from-DB
@@ -2430,8 +2431,8 @@ async fn create_context_inner(
         let row = ContextRow {
             context_id,
             label: label.map(|s| s.to_string()),
-            provider: default_provider.clone(),
-            model: default_model.clone(),
+            provider: None,
+            model: None,
             system_prompt: None,
             consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
             context_state: kaijutsu_types::ContextState::Live,
@@ -2484,9 +2485,6 @@ async fn create_context_inner(
             let _ = state.kernel_db.lock().delete_context(context_id);
             let _ = state.documents.delete_document(context_id);
             return Err(capnp::Error::failed(format!("label conflict: {e}")));
-        }
-        if let (Some(p), Some(m)) = (&default_provider, &default_model) {
-            let _ = drift.configure_llm(context_id, p, m);
         }
         log::info!(
             "Created context {} (label={:?}) in kernel DriftRouter",
