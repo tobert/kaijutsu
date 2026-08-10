@@ -121,6 +121,17 @@ pub struct DockState {
     pub background_jobs: DockText,
     pub hints: DockText,
     pub contexts: ContextsState,
+    /// True while the active screen is a fleet/world view (`Room`, `Fsn`) —
+    /// the HUD *detaches from the active context*: renders skip every
+    /// context-bound widget (model badge, block/agent activity, background
+    /// jobs, context badges, context usage, the activity sparkline) so the
+    /// footer carries only mode/hints and the genuinely ambient app signals.
+    /// The room's own furniture (switchboard embers, radiators, seats) is
+    /// the fleet-level display; a one-context cockpit readout under it was
+    /// contradictory (Amy, 2026-08-10). Editor/Diff stay attached — they are
+    /// surfaces *of* the active context. Data-gathering systems keep
+    /// running; only rendering is gated, so reattaching is instant.
+    pub detached: bool,
 }
 
 impl Default for DockState {
@@ -184,6 +195,7 @@ impl Default for DockState {
                 font_size: 13.0,
             },
             contexts: ContextsState::default(),
+            detached: false,
         }
     }
 }
@@ -484,11 +496,17 @@ pub fn render_north_dock(
         font,
     );
 
-    // Sparkline dimensions
+    // Sparkline dimensions. The activity sparkline samples the ACTIVE
+    // context's running blocks, so it drops out while the HUD is detached
+    // (`DockState::detached`); the event sparkline is kernel-wide and stays.
     let spark_w = 80.0_f64;
     let spark_h = 20.0_f64;
     let spark_gap = 8.0_f64;
-    let sparks_total = spark_w + spark_gap + spark_w + gap;
+    let sparks_total = if dock_state.detached {
+        spark_w + gap
+    } else {
+        spark_w + spark_gap + spark_w + gap
+    };
 
     let right_total = sparks_total + pulse_w + gap + errors_w + gap + conn_w;
     let right_x = (width - pad_h - right_total).max(pad_h);
@@ -507,18 +525,20 @@ pub fn render_north_dock(
         theme.accent,
         0.15,
     );
-    spawn_dock_sparkline(
-        &mut commands,
-        entity,
-        &mut spawned,
-        &dock_state.activity_spark.data,
-        spark_w,
-        spark_h,
-        right_x + spark_w + spark_gap,
-        spark_y,
-        theme.fg_dim,
-        0.10,
-    );
+    if !dock_state.detached {
+        spawn_dock_sparkline(
+            &mut commands,
+            entity,
+            &mut spawned,
+            &dock_state.activity_spark.data,
+            spark_w,
+            spark_h,
+            right_x + spark_w + spark_gap,
+            spark_y,
+            theme.fg_dim,
+            0.10,
+        );
+    }
 
     let text_right_x = right_x + sparks_total;
 
@@ -630,7 +650,11 @@ pub fn render_south_dock(
     );
     x += mode_w + gap;
 
-    if !dock_state.model_badge.text.is_empty() {
+    // Context-bound widgets (model badge, activity counts, background jobs,
+    // context badges, context usage) all skip rendering while the HUD is
+    // detached (`DockState::detached`) — the footer carries only the mode
+    // slot and hints on the fleet/world screens.
+    if !dock_state.detached && !dock_state.model_badge.text.is_empty() {
         let model_brush = bevy_color_to_brush(dock_state.model_badge.color);
         let model_w = collect_dock_text_glyphs(
             &mut glyphs,
@@ -652,25 +676,27 @@ pub fn render_south_dock(
     let hints_x = (width - pad_h - hints_w).max(x + gap);
 
     // context_usage sits immediately left of hints, in the same right-aligned group.
-    let usage_brush = bevy_color_to_brush(dock_state.context_usage.color);
-    let usage_w = measure_text(
-        &dock_state.context_usage.text,
-        dock_state.context_usage.font_size,
-        font,
-    );
-    let usage_x = (hints_x - gap - usage_w).max(x + gap);
+    if !dock_state.detached {
+        let usage_brush = bevy_color_to_brush(dock_state.context_usage.color);
+        let usage_w = measure_text(
+            &dock_state.context_usage.text,
+            dock_state.context_usage.font_size,
+            font,
+        );
+        let usage_x = (hints_x - gap - usage_w).max(x + gap);
 
-    collect_dock_text_glyphs(
-        &mut glyphs,
-        &dock_state.context_usage.text,
-        usage_x,
-        pad_v,
-        dock_state.context_usage.font_size,
-        font,
-        &usage_brush,
-        atlas,
-        &mut font_data_map,
-    );
+        collect_dock_text_glyphs(
+            &mut glyphs,
+            &dock_state.context_usage.text,
+            usage_x,
+            pad_v,
+            dock_state.context_usage.font_size,
+            font,
+            &usage_brush,
+            atlas,
+            &mut font_data_map,
+        );
+    }
 
     collect_dock_text_glyphs(
         &mut glyphs,
@@ -686,7 +712,7 @@ pub fn render_south_dock(
 
     // === Middle area: activity + block_activity + contexts ===
     // Activity items go left-to-right from current x
-    if !dock_state.agent_activity.text.is_empty() {
+    if !dock_state.detached && !dock_state.agent_activity.text.is_empty() {
         let brush = bevy_color_to_brush(dock_state.agent_activity.color);
         let w = collect_dock_text_glyphs(
             &mut glyphs,
@@ -702,7 +728,7 @@ pub fn render_south_dock(
         x += w + gap;
     }
 
-    if !dock_state.block_activity.text.is_empty() {
+    if !dock_state.detached && !dock_state.block_activity.text.is_empty() {
         let brush = bevy_color_to_brush(dock_state.block_activity.color);
         let w = collect_dock_text_glyphs(
             &mut glyphs,
@@ -718,7 +744,7 @@ pub fn render_south_dock(
         x += w + gap;
     }
 
-    if !dock_state.background_jobs.text.is_empty() {
+    if !dock_state.detached && !dock_state.background_jobs.text.is_empty() {
         let brush = bevy_color_to_brush(dock_state.background_jobs.color);
         let w = collect_dock_text_glyphs(
             &mut glyphs,
@@ -736,7 +762,11 @@ pub fn render_south_dock(
 
     // Context badges — between activity and hints
     let ctx = &dock_state.contexts;
-    if let Some((ref source, ref preview)) = ctx.notification {
+    if dock_state.detached {
+        // No badges while detached — and `south_regions` stays cleared, so
+        // even if the click handler's Conversation gate ever loosened,
+        // there'd be nothing stale to hit.
+    } else if let Some((ref source, ref preview)) = ctx.notification {
         // Notification mode: single text
         let notif_text = format!("\u{2190} @{}: \"{}\"", source, preview);
         let brush = bevy_color_to_brush(theme.accent);
@@ -882,15 +912,50 @@ pub fn handle_dock_click(
 // DATA-GATHERING SYSTEMS (write to DockState)
 // ============================================================================
 
+/// Whether a screen detaches the HUD from the active context (see
+/// [`DockState::detached`]). `Room` and `Fsn` are fleet/world views — one
+/// context's cockpit readout contradicts their stance. `Editor` and `Diff`
+/// stay attached: both render content *of* the active context.
+pub(crate) fn hud_detached(screen: crate::ui::screen::Screen) -> bool {
+    use crate::ui::screen::Screen;
+    matches!(screen, Screen::Room | Screen::Fsn)
+}
+
+/// The mode slot's label while the room owns the viewport: where you are,
+/// not a vim mode — the zoomed station's engraved-nameplate label, or "ROOM"
+/// at the carousel level.
+pub(crate) fn room_slot_label(zoomed: Option<crate::view::room::nav::Station>) -> &'static str {
+    match zoomed {
+        Some(station) => station.label(),
+        None => "ROOM",
+    }
+}
+
+/// Keep [`DockState::detached`] in sync with the active screen. Writes only
+/// on a real transition so an idle frame never dirties `DockState` (both
+/// dock renders rebuild on its change detection).
+pub fn sync_hud_detach(
+    screen: Res<State<crate::ui::screen::Screen>>,
+    mut dock: ResMut<DockState>,
+) {
+    let want = hud_detached(*screen.get());
+    if dock.detached != want {
+        dock.detached = want;
+    }
+}
+
 /// Update mode widget text from vim state + focus area + screen.
 ///
 /// When the user is in a text-editing surface (Compose/Dialog), shows the vim
 /// editing mode (NORMAL/INSERT/VISUAL). Otherwise shows the app-level mode.
 /// All labels come from the `mode_label_*` fields of `theme.toml` (CRDT-owned,
-/// fetched over RPC from the kernel).
+/// fetched over RPC from the kernel) — except the detached screens (Room/Fsn),
+/// whose slot shows *where you are* ([`room_slot_label`]) instead of a vim
+/// mode that has no surface behind it there.
 pub fn update_mode(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
+    room: Res<crate::view::room::RoomState>,
     theme: Res<Theme>,
     mut dock: ResMut<DockState>,
     overlay_q: Query<&crate::view::components::InputOverlay>,
@@ -900,35 +965,30 @@ pub fn update_mode(
     // Resolve vim mode from the active overlay (if any).
     let vim_mode = overlay_q.iter().next().and_then(|o| o.vim_mode.clone());
 
-    let (color, label) = match screen.get() {
+    let (color, label): (Color, &str) = match screen.get() {
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose | FocusArea::Dialog => {
                 vim_mode_to_dock(&vim_mode, &theme)
             }
             FocusArea::Conversation => (theme.mode_normal, &theme.mode_label_normal),
         },
-        // The editor / room / fsn own the viewport; the conversation dock is
-        // hidden, but keep the mode indicator coherent rather than panicking.
-        // (The editor's own vim mode renders on its panel — docs/vi.md steps
-        // 4–5. `Room` covers a station zoom too now — including the well,
-        // which has no second screen left of its own since Slice D. `Fsn`
-        // reads raw keys like the room, same reasoning.)
-        // The diff viewer is a vi surface with a mode of its own; it draws
-        // that on its own status strip (like the editor), so the dock just
-        // stays coherent instead of guessing.
-        Screen::Editor | Screen::Diff | Screen::Room | Screen::Fsn => {
-            (theme.mode_normal, &theme.mode_label_normal)
-        }
+        // The editor / diff viewer own the viewport and draw their own vim
+        // mode on their own panels (docs/vi.md steps 4–5; the diff viewer's
+        // status strip) — the dock just stays coherent instead of guessing.
+        Screen::Editor | Screen::Diff => (theme.mode_normal, &theme.mode_label_normal),
+        // Detached screens: the slot names the place, not a mode.
+        Screen::Room => (theme.accent, room_slot_label(room.zoomed)),
+        Screen::Fsn => (theme.accent, crate::view::room::nav::Station::Vfs.label()),
     };
 
-    if dock.mode.text != *label || dock.mode.color != color {
-        dock.mode.text = label.clone();
+    if dock.mode.text != label || dock.mode.color != color {
+        dock.mode.text = label.to_string();
         dock.mode.color = color;
     }
 }
 
 /// Map a vim mode string from modalkit to a dock (color, label) pair.
-fn vim_mode_to_dock<'a>(vim_mode: &Option<String>, theme: &'a Theme) -> (Color, &'a String) {
+fn vim_mode_to_dock<'a>(vim_mode: &Option<String>, theme: &'a Theme) -> (Color, &'a str) {
     match vim_mode.as_deref() {
         Some(s) if s.contains("INSERT") => (theme.mode_insert, &theme.mode_label_insert),
         Some(s) if s.contains("VISUAL") => (theme.mode_visual, &theme.mode_label_visual),
@@ -1076,9 +1136,39 @@ mod tests {
     use super::{
         classify_connection_error, count_block_activity, format_background_activity,
         format_block_activity, format_context_usage, format_elapsed_ms, format_global_error_badge,
-        format_token_count, BackgroundActivityLevel,
+        format_token_count, hud_detached, room_slot_label, BackgroundActivityLevel,
     };
     use crate::ui::theme::Theme;
+
+    /// Room and Fsn are the fleet/world views — the HUD detaches from the
+    /// active context there. Everything else (Conversation, and the two
+    /// surfaces that render the active context's own content: Editor, Diff)
+    /// stays attached. Exhaustive over `Screen` so a future screen variant
+    /// forces a deliberate choice here.
+    #[test]
+    fn hud_detaches_on_fleet_views_only() {
+        use crate::ui::screen::Screen;
+        for screen in [
+            Screen::Conversation,
+            Screen::Editor,
+            Screen::Room,
+            Screen::Diff,
+            Screen::Fsn,
+        ] {
+            let expect = matches!(screen, Screen::Room | Screen::Fsn);
+            assert_eq!(hud_detached(screen), expect, "{screen:?}");
+        }
+    }
+
+    /// The detached mode slot names the place: the zoomed station's
+    /// engraved-nameplate label, or "ROOM" at the carousel level.
+    #[test]
+    fn room_slot_label_names_the_place() {
+        use crate::view::room::nav::Station;
+        assert_eq!(room_slot_label(None), "ROOM");
+        assert_eq!(room_slot_label(Some(Station::TimeWell)), "TIME WELL");
+        assert_eq!(room_slot_label(Some(Station::Switchboard)), "SWITCHBOARD");
+    }
 
     #[test]
     fn format_token_count_below_thousand_is_exact() {
@@ -2187,6 +2277,7 @@ impl Plugin for DockPlugin {
             .add_systems(
                 Update,
                 (
+                    sync_hud_detach,
                     update_mode,
                     update_connection,
                     update_global_errors_badge,
