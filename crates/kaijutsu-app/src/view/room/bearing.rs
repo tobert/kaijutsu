@@ -178,7 +178,14 @@ pub fn wall_placements() -> [WallPlacement; 4] {
 /// same gate. Pure — no Bevy types — so the gating is unit-testable without
 /// spawning anything (mirrors `super::wants_gold_cap`'s shape).
 pub fn station_is_room_furniture(station: Station) -> bool {
-    matches!(station, Station::PatchBay | Station::TimeWell | Station::Tracks | Station::Vfs)
+    matches!(
+        station,
+        Station::PatchBay
+            | Station::TimeWell
+            | Station::Tracks
+            | Station::Vfs
+            | Station::Switchboard
+    )
 }
 
 // ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
@@ -741,12 +748,14 @@ mod tests {
         // station's own furniture/signage (2026-07-13; the fn doc has the
         // story).
         (Station::Vfs, true),
-        // The switchboard's lamp grid mounts ON the wall panel like the
-        // wheel/tracker/portal do, but it still wants the generic marker
-        // pylon + nameplate treatment (`SWITCHBOARD`) the furniture stations
-        // skip — so it stays OUT of this gate, unlike its wall-mounted
-        // siblings above.
-        (Station::Switchboard, false),
+        // The switchboard's lamp grid mounts ON the wall panel — same as the
+        // wheel/tracker/portal. The lane that built it first kept the generic
+        // marker + nameplate, but the first live look (2026-08-10) showed the
+        // marker pylon planted dead-center in FRONT of the lamp grid,
+        // occluding the middle columns — the exact occlusion this gate exists
+        // to prevent. The grid is the station's face; furniture like its
+        // siblings.
+        (Station::Switchboard, true),
         (Station::Radiators, false),
     ];
 

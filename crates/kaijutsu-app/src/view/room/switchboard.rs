@@ -402,10 +402,15 @@ pub(crate) fn reconcile_switchboard(drift: Res<DriftState>, mut state: ResMut<Sw
             })
         })
         .collect();
+    // `entry().or_default()`, NOT `get_mut()`: a context whose FIRST sighting
+    // is already `Status::Error` (cold start while a context errors, or an
+    // error that happened while this app was down) has no signal entry yet —
+    // a bare `get_mut` would drop that error on the floor and the ember
+    // would never light (found by both kaibo review lanes). The transient
+    // entries this creates for healthy contexts are pruned immediately by
+    // `retain_relevant()` below, so the map stays bounded.
     for c in &drift.contexts {
-        if let Some(sig) = state.signals.get_mut(&c.id) {
-            sig.reconcile_status(c.live_status);
-        }
+        state.signals.entry(c.id).or_default().reconcile_status(c.live_status);
     }
     state.retain_relevant();
 }
@@ -507,6 +512,7 @@ mod tests {
             model: String::new(),
             created_at,
             trace_id: [0u8; 16],
+            origin_host: None,
             fork_kind: None,
             context_type: String::new(),
             archived,
@@ -803,5 +809,65 @@ mod tests {
                 "breathing_multiplier out of band at t={t}: {m}"
             );
         }
+    }
+
+    /// The defect both kaibo review lanes flagged: a context whose FIRST
+    /// sighting is already `Error` (cold start while a context errors) must
+    /// get its ember — `get_mut` instead of `entry().or_default()` in the
+    /// reconcile loop silently dropped it.
+    #[test]
+    fn reconcile_sets_ember_for_a_context_first_seen_in_error() {
+        let mut app = bevy::app::App::new();
+        app.init_resource::<SwitchboardState>();
+        app.add_systems(bevy::app::Update, reconcile_switchboard);
+
+        let mut drift = crate::connection::drift::DriftState::default();
+        let mut erroring = ctx(1, Some(1_000), 100, false);
+        erroring.live_status = Status::Error;
+        drift.contexts.push(erroring);
+        app.insert_resource(drift);
+
+        app.update();
+
+        let state = app.world().resource::<SwitchboardState>();
+        let sig = state
+            .signals
+            .get(&id_of(1))
+            .expect("first poll must create the signal entry");
+        assert!(
+            sig.sticky_error,
+            "an Error live_status on first sighting must light the ember"
+        );
+    }
+
+    /// Reconcile must not leak: healthy contexts polled but not seated get
+    /// transient signal entries that `retain_relevant` prunes in the same
+    /// pass, while an off-roster sticky ember survives.
+    #[test]
+    fn retain_relevant_keeps_offroster_embers_and_drops_idle_signals() {
+        let mut state = SwitchboardState::default();
+        // Only ctx 1 is seated.
+        state.order = vec![LampEntry {
+            context_id: id_of(1),
+            effective_activity_ms: 0,
+            running: false,
+        }];
+        state.signals.entry(id_of(1)).or_default();
+        // Off-roster with a sticky ember — must survive.
+        state.signals.entry(id_of(2)).or_default().on_turn_failed();
+        // Off-roster, idle — must be pruned.
+        state.signals.entry(id_of(3)).or_default();
+
+        state.retain_relevant();
+
+        assert!(state.signals.contains_key(&id_of(1)), "seated signal kept");
+        assert!(
+            state.signals.contains_key(&id_of(2)),
+            "off-roster sticky ember kept — it may scroll back on"
+        );
+        assert!(
+            !state.signals.contains_key(&id_of(3)),
+            "off-roster idle signal pruned — the map stays bounded"
+        );
     }
 }

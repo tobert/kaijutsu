@@ -529,9 +529,15 @@ impl Plugin for RoomPlugin {
             )
             // The lamp material sync only ever finds entities while the room
             // scene is alive, so it's gated the same as `sync_room_glow`.
+            // `.after(reconcile)`: it must see THIS frame's roster + embers —
+            // today insertion order already serializes the conflicting
+            // `SwitchboardState` accesses, but that's an accident of
+            // registration order, not a stated constraint (kaibo review).
             .add_systems(
                 Update,
-                switchboard::sync_switchboard_glow.run_if(in_state(Screen::Room)),
+                switchboard::sync_switchboard_glow
+                    .after(switchboard::reconcile_switchboard)
+                    .run_if(in_state(Screen::Room)),
             );
     }
 }
@@ -658,16 +664,13 @@ fn enter_room(
     crate::view::time_well::scene::arm_well(&mut well_state, &mut well_tracks);
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
-    // at every labeled one — every bearing is labeled now that the switchboard
-    // slice gave South a real station (`Station::Switchboard`, "SWITCHBOARD").
-    // A furnished bearing (`bearing::station_is_room_furniture` — PatchBay/W,
-    // "the wheel IS the west station", and since 2026-07-13 Vfs/N, whose
-    // panel-spanning FSN portal is the station) gets neither: no marker, no
-    // plate — the station's own wall-mounted face stands in for both. The
-    // switchboard's lamp grid ALSO mounts on its wall panel
-    // (`switchboard::spawn_switchboard`, called separately below) but is
-    // deliberately not in that furniture set — it still wants the generic
-    // marker + nameplate a furnished bearing skips.
+    // at every labeled one. A furnished bearing
+    // (`bearing::station_is_room_furniture` — PatchBay/W "the wheel IS the
+    // west station", Vfs/N's panel-spanning FSN portal, Tracks/E's pattern
+    // grid, and since 2026-08-10 Switchboard/S's lamp grid) gets neither: no
+    // marker, no plate — the station's own wall-mounted face stands in for
+    // both. (The switchboard briefly kept the generic marker; the first live
+    // look showed it planted dead-center in front of the lamp grid.)
     for wp in bearing::wall_placements() {
         if wp.station.is_some_and(bearing::station_is_room_furniture) {
             continue;
