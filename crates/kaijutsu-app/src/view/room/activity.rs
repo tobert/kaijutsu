@@ -110,9 +110,18 @@ impl BearingActivity {
 /// reader (`docs/issues.md`'s now-resolved "`BearingActivity(Center)` has no
 /// reader left" entry). [`Bearing::Center`] itself stays (room geometry still
 /// uses it) — only this event mapping stops feeding it.
+/// South (`Station::Switchboard`) joined 2026-08-10 (the switchboard slice):
+/// turn traffic — completions and failures alike — is exactly the "turn
+/// traffic feeding the south wall trim glow" the mission brief asked for.
+/// A failure weighs a little more than a clean completion (a bigger blip,
+/// the rarer/more salient event), same relative-weight idiom `BeatSync`'s
+/// East arm below already established (this used to be the ONE producer;
+/// South was `BearingActivity`'s one bearing with no feed at all).
 pub fn event_bearing(ev: &ServerEvent) -> Option<(Bearing, f32)> {
     match ev {
         ServerEvent::BeatSync { .. } => Some((Bearing::East, 1.0)),
+        ServerEvent::TurnCompleted { .. } => Some((Bearing::South, 1.0)),
+        ServerEvent::TurnFailed { .. } => Some((Bearing::South, 1.5)),
         _ => None,
     }
 }
@@ -181,6 +190,29 @@ mod tests {
         let (b, w) = event_bearing(&ev).expect("beat sync is activity");
         assert_eq!(b, Bearing::East, "the jam warms the tracks bearing");
         assert!(w > 0.0);
+    }
+
+    #[test]
+    fn turn_completed_and_turn_failed_land_on_the_south_switchboard_bearing() {
+        let completed = ServerEvent::TurnCompleted {
+            context_id: ctx(1),
+            principal_id: PrincipalId::nil(),
+            output_block_id: None,
+            stop_reason: kaijutsu_client::TurnCompletedStopReason::EndTurn,
+            origin: kaijutsu_client::TurnOrigin::Interactive,
+        };
+        let failed = ServerEvent::TurnFailed {
+            context_id: ctx(1),
+            principal_id: PrincipalId::nil(),
+            error: "boom".to_string(),
+            origin: kaijutsu_client::TurnOrigin::Interactive,
+        };
+        let (b_ok, w_ok) = event_bearing(&completed).expect("a completed turn is south activity");
+        let (b_err, w_err) = event_bearing(&failed).expect("a failed turn is south activity");
+        assert_eq!(b_ok, Bearing::South, "turn traffic warms the switchboard bearing");
+        assert_eq!(b_err, Bearing::South);
+        assert!(w_ok > 0.0 && w_err > 0.0);
+        assert!(w_err > w_ok, "a failure should weigh at least as heavy as a clean completion");
     }
 
     #[test]

@@ -12,6 +12,13 @@ pub enum Station {
     PatchBay,
     Tracks,
     Vfs,
+    /// The south wall's presence-lamp switchboard (`view::room::switchboard`)
+    /// — a real station identity (nameplate, marker pylon, gold cap) for what
+    /// used to be the grey reserved South stub. Deliberately **not** in
+    /// [`built`](Station::built)'s dive-target set: there is no dive scene,
+    /// only the ambient wall of lamps at room scale (`station_is_zoomable`'s
+    /// table in `room/mod.rs` carries the "no dive" half of this call).
+    Switchboard,
     Radiators,
 }
 
@@ -24,6 +31,7 @@ impl Station {
             Station::PatchBay => "PATCH BAY",
             Station::Tracks => "TRACKER",
             Station::Vfs => "DATA HORIZON",
+            Station::Switchboard => "SWITCHBOARD",
             Station::Radiators => "RADIATORS",
         }
     }
@@ -31,16 +39,20 @@ impl Station {
     /// Whether a dive target exists yet (well + patch bay + the FSN
     /// landscape, `view::fsn`, `docs/scenes/vfs.md` slice 0 + the tracker
     /// station, `view::tracker`, slice 0 of the plan `snazzy-jumping-hejlsberg.md`).
+    /// `Switchboard` is deliberately excluded — it has a nameplate and a
+    /// marker pylon (a real station identity) but no dive scene, only the
+    /// ambient lamp wall at room scale.
     pub fn built(self) -> bool {
         matches!(self, Station::TimeWell | Station::PatchBay | Station::Tracks | Station::Vfs)
     }
 
     /// Carousel order.
-    pub const ALL: [Station; 5] = [
+    pub const ALL: [Station; 6] = [
         Station::TimeWell,
         Station::PatchBay,
         Station::Tracks,
         Station::Vfs,
+        Station::Switchboard,
         Station::Radiators,
     ];
 }
@@ -86,6 +98,7 @@ mod tests {
         assert_eq!(Station::PatchBay.label(), "PATCH BAY");
         assert_eq!(Station::Tracks.label(), "TRACKER");
         assert_eq!(Station::Vfs.label(), "DATA HORIZON");
+        assert_eq!(Station::Switchboard.label(), "SWITCHBOARD");
         assert_eq!(Station::Radiators.label(), "RADIATORS");
     }
 
@@ -95,6 +108,7 @@ mod tests {
         assert!(Station::PatchBay.built());
         assert!(Station::Tracks.built());
         assert!(Station::Vfs.built());
+        assert!(!Station::Switchboard.built(), "a real station identity, but no dive scene");
         assert!(!Station::Radiators.built());
     }
 
@@ -115,7 +129,7 @@ mod tests {
 
     #[test]
     fn step_forward_wraps_past_end() {
-        let mut c = StationCarousel::new(Station::Radiators); // index 4, last
+        let mut c = StationCarousel::new(Station::Radiators); // index 5, last
         c.step(1);
         assert_eq!(c.focused, 0);
         assert_eq!(c.focused_station(), Station::TimeWell);
@@ -132,17 +146,17 @@ mod tests {
     #[test]
     fn step_handles_large_positive_dir() {
         let mut c = StationCarousel::new(Station::TimeWell); // index 0
-        // 5 stations: +7 should land on (0 + 7) % 5 == 2.
+        // 6 stations: +7 should land on (0 + 7) % 6 == 1.
         c.step(7);
-        assert_eq!(c.focused, 2);
+        assert_eq!(c.focused, 1);
     }
 
     #[test]
     fn step_handles_large_negative_dir() {
         let mut c = StationCarousel::new(Station::TimeWell); // index 0
-        // -12 mod 5 (Euclidean) == 3.
-        c.step(-12);
-        assert_eq!(c.focused, 3);
+        // -13 mod 6 (Euclidean) == 5.
+        c.step(-13);
+        assert_eq!(c.focused, 5);
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub mod activity;
 pub mod bearing;
 pub mod nav;
 mod shot;
+mod switchboard;
 
 use std::time::Instant;
 
@@ -160,11 +161,15 @@ const KEEPOUT_RADIUS: f32 = 150.0;
 /// Marker pylon dimensions (a slim square post standing on the floor).
 const MARKER_WIDTH: f32 = 26.0;
 const MARKER_HEIGHT: f32 = 260.0;
-/// Reserved-bearing (South) marker height — roughly a third of a built
-/// station's pylon, so the empty plot reads as a low waymarker post rather
-/// than a monolith standing in the overview shot's near foreground (the
+/// Reserved-bearing marker height — roughly a third of a built station's
+/// pylon, so an empty plot reads as a low waymarker post rather than a
+/// monolith standing in the overview shot's near foreground (the
 /// south-marker-blocks-the-overview bug, `shell.md` open question 1). Still
-/// tall enough to read as "reserved, not vanished."
+/// tall enough to read as "reserved, not vanished." Currently unreachable in
+/// practice: every [`bearing::wall_placements`] entry carries `Some(station)`
+/// now that the switchboard slice gave South a real station too — kept live
+/// (the `wp.station.is_some()` branch below is generic, not South-specific)
+/// for whichever bearing is next to go from reserved to built.
 const MARKER_HEIGHT_RESERVED: f32 = MARKER_HEIGHT / 3.0;
 
 // ── Pylon furniture (Amy-tunable) ────────────────────────────────────────────
@@ -172,9 +177,11 @@ const MARKER_HEIGHT_RESERVED: f32 = MARKER_HEIGHT / 3.0;
 /// Every bearing pylon gets a wider low plinth grounding it to the floor.
 const PYLON_PLINTH_WIDTH: f32 = MARKER_WIDTH * 2.4;
 const PYLON_PLINTH_HEIGHT: f32 = 18.0;
-/// A gold cap slab crowns every BUILT station's pylon ([`wants_gold_cap`]).
-/// The reserved South marker gets a plinth only — it stays humble, a stub for
-/// a station that doesn't exist yet, not dressed like one that does.
+/// A gold cap slab crowns every BUILT station's pylon ([`wants_gold_cap`]) —
+/// including South's since the switchboard slice: every wall bearing now
+/// carries a real station, so this comment's old "the reserved South marker
+/// stays humble" carve-out no longer applies to anything currently spawned
+/// (`wants_gold_cap`'s own doc has the up-to-date story).
 const PYLON_CAP_WIDTH: f32 = MARKER_WIDTH * 1.6;
 const PYLON_CAP_HEIGHT: f32 = 14.0;
 // The plinth reads `ScenePalette::table` directly (it was a bare alias for
@@ -482,6 +489,7 @@ impl Plugin for RoomPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RoomState>()
             .init_resource::<BearingActivity>()
+            .init_resource::<switchboard::SwitchboardState>()
             .add_plugins(MaterialPlugin::<TraceGlowMaterial>::default())
             .add_systems(OnEnter(Screen::Room), enter_room)
             .add_systems(OnExit(Screen::Room), exit_room)
@@ -490,6 +498,15 @@ impl Plugin for RoomPlugin {
             // resources stay current while you're elsewhere). Bounded to five
             // bearings.
             .add_systems(Update, ingest_room_activity)
+            // The switchboard's own ambient ingest: `TurnCompleted`/`TurnFailed`
+            // push events feed the per-lamp ember/flash state machine, and the
+            // roster reconcile follows `DriftState`'s own poll cadence — both
+            // ungated for the same "stays current while you're elsewhere"
+            // reason as the line above (`switchboard`'s module doc).
+            .add_systems(
+                Update,
+                (switchboard::ingest_switchboard_events, switchboard::reconcile_switchboard),
+            )
             // `.after(InputPhase::Dispatch)`: these consume ActionFired from
             // the central dispatcher and should see this frame's actions, not
             // last frame's.
@@ -509,6 +526,12 @@ impl Plugin for RoomPlugin {
             .add_systems(
                 Update,
                 (ease_shell_camera, apply_room_dive_visibility).run_if(in_state(Screen::Room)),
+            )
+            // The lamp material sync only ever finds entities while the room
+            // scene is alive, so it's gated the same as `sync_room_glow`.
+            .add_systems(
+                Update,
+                switchboard::sync_switchboard_glow.run_if(in_state(Screen::Room)),
             );
     }
 }
@@ -635,20 +658,25 @@ fn enter_room(
     crate::view::time_well::scene::arm_well(&mut well_state, &mut well_tracks);
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
-    // at the labeled ones (the reserved South bearing gets a dim marker only).
+    // at every labeled one — every bearing is labeled now that the switchboard
+    // slice gave South a real station (`Station::Switchboard`, "SWITCHBOARD").
     // A furnished bearing (`bearing::station_is_room_furniture` — PatchBay/W,
     // "the wheel IS the west station", and since 2026-07-13 Vfs/N, whose
     // panel-spanning FSN portal is the station) gets neither: no marker, no
-    // plate — the station's own wall-mounted face stands in for both.
+    // plate — the station's own wall-mounted face stands in for both. The
+    // switchboard's lamp grid ALSO mounts on its wall panel
+    // (`switchboard::spawn_switchboard`, called separately below) but is
+    // deliberately not in that furniture set — it still wants the generic
+    // marker + nameplate a furnished bearing skips.
     for wp in bearing::wall_placements() {
         if wp.station.is_some_and(bearing::station_is_room_furniture) {
             continue;
         }
 
         let hue = Vec3::from_array(wp.hue);
-        // The reserved South bearing (no station) gets a low stub — tall
-        // enough to read as "reserved", short enough to stop standing in the
-        // overview shot's near foreground (MARKER_HEIGHT_RESERVED).
+        // `MARKER_HEIGHT_RESERVED` never applies today (every wall_placement
+        // now carries `Some(station)`) — kept live for a future reserved
+        // bearing (see its own doc).
         let marker_h = if wp.station.is_some() { MARKER_HEIGHT } else { MARKER_HEIGHT_RESERVED };
         let marker_mesh = meshes.add(Cuboid::new(MARKER_WIDTH, marker_h, MARKER_WIDTH));
         let marker_mat = mats.add(unlit(lin_v(hue * palette.marker)));
@@ -706,9 +734,9 @@ fn enter_room(
     }
 
     // Pylon plinths + gold caps — the plain marker posts get grounded furniture
-    // (`shell.md`'s "the atrium rules" read); the reserved South stub stays
-    // plinth-only ([`wants_gold_cap`]). Skips the furnished W bearing same as
-    // the marker/plate loop above.
+    // (`shell.md`'s "the atrium rules" read); every wall bearing wants a gold
+    // cap now ([`wants_gold_cap`]). Skips the furnished W bearing same as the
+    // marker/plate loop above.
     spawn_pylons(&mut commands, root, &palette, &mut meshes, &mut mats);
 
     // No W-bearing furniture spawns here any more (the 2026-07-10 wall-mount
@@ -721,6 +749,14 @@ fn enter_room(
     // violet information threads that used to stand as free-floating
     // radiators. The chamber, not room chrome (no RoomDistraction).
     spawn_walls(&mut commands, root, &palette, &mut meshes, &mut mats, &mut glow_mats);
+
+    // The switchboard's lamp grid — the south wall's own content, the same
+    // "mounted on its panel" idiom the wheel/tracker/portal use, spawned once
+    // the octagon shell above stands. `switchboard::spawn_switchboard` reads
+    // resources `enter_room` already holds (no new system params — this
+    // function is already at Bevy's function-as-system arity ceiling, its
+    // own doc above has the story).
+    switchboard::spawn_switchboard(&mut commands, root, &mut meshes, &mut mats);
 
     // Re-root the patch bay into the room as furniture at the W bearing (slice B,
     // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
@@ -1326,10 +1362,13 @@ fn spawn_walls(
 }
 
 /// Whether a wall bearing's pylon earns a gold cap slab — every built station
-/// does; the reserved South marker stays humble (a plinth only): `shell.md`'s
-/// "future MCP broker switchboard" placeholder shouldn't out-dress the
-/// stations that actually exist yet. Pure — no Bevy types — so the gating is
-/// unit-testable without spawning anything.
+/// does. `shell.md`'s old "future MCP broker switchboard" placeholder is
+/// exactly what South's `Station::Switchboard` now IS (the switchboard
+/// slice): it stands with the same built-pylon treatment as every other wall
+/// station, no special-casing here. A future genuinely-reserved bearing
+/// (`station: None`) would still stay humble — a plinth only — this fn just
+/// has nothing left to gate against today. Pure — no Bevy types — so the
+/// gating is unit-testable without spawning anything.
 fn wants_gold_cap(wp: &bearing::WallPlacement) -> bool {
     wp.station.is_some()
 }
@@ -1402,8 +1441,12 @@ fn spawn_pylons(
 /// N fullscreens the FSN portal (the primary FSN surface now — diving is
 /// de-emphasized; `Screen::Fsn` remains in code but is keyboard-unreachable,
 /// tracked in `docs/issues.md`). Kept as a table (not a bare `true`) so a
-/// future genuinely-unzoomable station has a row to flip. Pure — no Bevy
-/// types — unit-tested like `bearing::station_is_room_furniture`.
+/// future genuinely-unzoomable station has a row to flip — [`Station::Switchboard`]
+/// (the switchboard slice) is the first one to actually flip it: the lamp
+/// wall is room-scale-only by design (the mission brief: "NOT zoomable/divable
+/// yet"), so it's the one station carousel-focus can approach but Enter can't
+/// fullscreen. Pure — no Bevy types — unit-tested like
+/// `bearing::station_is_room_furniture`.
 fn station_is_zoomable(station: Station) -> bool {
     matches!(
         station,
@@ -2026,6 +2069,10 @@ mod tests {
         (Station::PatchBay, true),
         (Station::Tracks, true),
         (Station::Vfs, true),
+        // The first exception to "every wall station zooms" — the
+        // switchboard's lamp wall is room-scale-only by design, no dive
+        // scene to fullscreen onto (`station_is_zoomable`'s doc).
+        (Station::Switchboard, false),
         (Station::Radiators, true),
     ];
 
@@ -2263,12 +2310,17 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_south_marker_stays_plinth_only() {
+    fn the_switchboard_south_marker_now_wants_a_gold_cap() {
+        // South used to be the reserved, humble-plinth-only bearing; the
+        // switchboard slice gave it a real station (`Station::Switchboard`),
+        // so it now earns the same built-pylon treatment as every other wall
+        // station — locks in the flip so a future edit can't silently
+        // regress South back to a bare stub.
         let south = bearing::wall_placements()
             .into_iter()
             .find(|wp| wp.bearing == Bearing::South)
             .expect("south has a wall placement");
-        assert!(!wants_gold_cap(&south), "the reserved bearing stays humble — no gold cap");
+        assert!(wants_gold_cap(&south), "the switchboard's south pylon earns the gold cap now");
     }
 
     // ── the well table ──

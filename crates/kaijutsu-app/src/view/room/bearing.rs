@@ -93,6 +93,7 @@ pub fn focus_dir(station: Station) -> Option<[f32; 3]> {
         Station::PatchBay => Some(Bearing::West.dir()),
         Station::Tracks => Some(Bearing::East.dir()),
         Station::Vfs => Some(Bearing::North.dir()),
+        Station::Switchboard => Some(Bearing::South.dir()),
         Station::Radiators => Some(RADIATOR_FOCUS_DIR),
     }
 }
@@ -112,11 +113,15 @@ pub struct WallPlacement {
 }
 
 /// The four cardinal wall placements, in `Station::ALL`-adjacent order (W, E,
-/// N, S). The reserved South bearing renders a dim, unlabeled marker (no
-/// station, grey hue) — the placeholder for the future MCP/LLM engine room
-/// (`shell.md`). Hues avoid the reserved fabric hues except where a station
-/// owns one later: patch bay leans crimson (MIDI), tracks amber (rhythm), VFS
-/// green (data horizon). **Amy-tunable.**
+/// N, S). South now carries a real station too — [`Station::Switchboard`]
+/// (the presence-lamp wall, `view::room::switchboard`), replacing the old
+/// grey, station-less reserved stub — so it gets a marker, a nameplate, and
+/// a gold cap the same as every other built bearing (`super::wants_gold_cap`
+/// gates purely on `station.is_some()`, no special-casing needed). Hues avoid
+/// the reserved fabric hues except where a station owns one later: patch bay
+/// leans crimson (MIDI), tracks amber (rhythm), VFS green (data horizon);
+/// the switchboard stays a cool instrument-panel steel — the signal lives in
+/// its lamp grid, not its pylon. **Amy-tunable.**
 pub fn wall_placements() -> [WallPlacement; 4] {
     [
         WallPlacement {
@@ -138,10 +143,10 @@ pub fn wall_placements() -> [WallPlacement; 4] {
             hue: [0.40, 0.85, 0.52],
         },
         WallPlacement {
-            station: None,
+            station: Some(Station::Switchboard),
             bearing: Bearing::South,
             dir: Bearing::South.dir(),
-            hue: [0.42, 0.44, 0.52],
+            hue: [0.58, 0.62, 0.72],
         },
     ]
 }
@@ -689,6 +694,7 @@ mod tests {
         assert_eq!(focus_dir(Station::PatchBay), Some(Bearing::West.dir()));
         assert_eq!(focus_dir(Station::Tracks), Some(Bearing::East.dir()));
         assert_eq!(focus_dir(Station::Vfs), Some(Bearing::North.dir()));
+        assert_eq!(focus_dir(Station::Switchboard), Some(Bearing::South.dir()));
         assert_eq!(focus_dir(Station::Radiators), Some(RADIATOR_FOCUS_DIR));
     }
 
@@ -706,10 +712,15 @@ mod tests {
     }
 
     #[test]
-    fn reserved_south_marker_has_no_station() {
+    fn south_bearing_now_carries_the_switchboard_station() {
+        // South used to be the grey, station-less reserved stub; the
+        // switchboard slice gave it a real station identity — locks the
+        // change in so a future edit can't silently un-reserve it back to
+        // `None` (`docs/scenes/shell.md`'s old "future MCP broker
+        // switchboard" placeholder, now built).
         let placements = wall_placements();
         let south = placements.iter().find(|p| p.bearing == Bearing::South).unwrap();
-        assert_eq!(south.station, None, "South is reserved — a dim marker, no label");
+        assert_eq!(south.station, Some(Station::Switchboard));
     }
 
     // ── station-furniture gate ──
@@ -730,6 +741,12 @@ mod tests {
         // station's own furniture/signage (2026-07-13; the fn doc has the
         // story).
         (Station::Vfs, true),
+        // The switchboard's lamp grid mounts ON the wall panel like the
+        // wheel/tracker/portal do, but it still wants the generic marker
+        // pylon + nameplate treatment (`SWITCHBOARD`) the furniture stations
+        // skip — so it stays OUT of this gate, unlike its wall-mounted
+        // siblings above.
+        (Station::Switchboard, false),
         (Station::Radiators, false),
     ];
 
