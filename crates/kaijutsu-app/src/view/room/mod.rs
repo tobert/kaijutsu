@@ -93,6 +93,7 @@
 pub mod activity;
 pub mod bearing;
 pub mod nav;
+mod seats;
 mod shot;
 mod switchboard;
 
@@ -490,9 +491,10 @@ impl Plugin for RoomPlugin {
         app.init_resource::<RoomState>()
             .init_resource::<BearingActivity>()
             .init_resource::<switchboard::SwitchboardState>()
+            .init_resource::<seats::SeatsState>()
             .add_plugins(MaterialPlugin::<TraceGlowMaterial>::default())
             .add_systems(OnEnter(Screen::Room), enter_room)
-            .add_systems(OnExit(Screen::Room), exit_room)
+            .add_systems(OnExit(Screen::Room), (exit_room, seats::clear_seats))
             // Ambient ingest runs on **every** screen so the room opens warm —
             // the same rationale as `time_well::live::ingest_live_events` (both
             // resources stay current while you're elsewhere). Bounded to five
@@ -537,6 +539,18 @@ impl Plugin for RoomPlugin {
                 Update,
                 switchboard::sync_switchboard_glow
                     .after(switchboard::reconcile_switchboard)
+                    .run_if(in_state(Screen::Room)),
+            )
+            // Seats at the table: one wisp per attached peer
+            // (`connection::peers::PeerRoster`, polled ungated elsewhere —
+            // its own plugin). Both halves are gated to the room (a wisp
+            // needs `RoomRoot` to parent onto); `sync_seats` runs
+            // `.after(reconcile_seats)` so a wisp spawned this frame is
+            // ticked/moved the same frame (`seats`'s own module doc).
+            .add_systems(
+                Update,
+                (seats::reconcile_seats, seats::sync_seats)
+                    .chain()
                     .run_if(in_state(Screen::Room)),
             );
     }

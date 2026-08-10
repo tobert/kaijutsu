@@ -258,6 +258,9 @@ fn main() {
         .add_plugins(ui::dock::DockPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(connection::drift::DriftPlugin)
+        // Attached-peer roster polling (kernel peer registry) — powers the
+        // room's "seats at the table" wisps, one per connected client.
+        .add_plugins(connection::peers::PeerRosterPlugin)
         // Room level + patch bay station + time well (docs/scenes/): dive into
         // a zoomed station via `RoomState::zoomed`, Ctrl+W to jump straight
         // into the well. RoomPlugin MUST be added before any zoomable

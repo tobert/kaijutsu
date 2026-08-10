@@ -133,6 +133,13 @@ pub enum RpcResultMessage {
     DriftQueueReceived {
         staged: Vec<kaijutsu_client::StagedDriftInfo>,
     },
+    /// Attached-peer roster received (`connection::peers::poll_peer_roster`,
+    /// the same periodic-poll pattern as the two arms above). Drained into
+    /// `PeerRoster`, consumed by `view::room::seats` to reconcile each
+    /// attached peer's wisp entity.
+    PeersReceived {
+        peers: Vec<kaijutsu_client::PeerInfo>,
+    },
     /// Semantic clusters received (time-well band-2 poll). Drained into
     /// `TimeWellState.clusters` to drive the haystack's cluster-grouped angle.
     ClustersReceived {

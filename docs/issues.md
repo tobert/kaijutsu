@@ -518,6 +518,26 @@ schema addition: add `instance` (and maybe a `kind` string) to `PeerInfo` so
 
 ---
 
+## Seats-at-the-table follow-ups: nameplate LOD, turn-event flare (2026-08-10, seats)
+
+`view::room::seats` gives every attached peer (`connection::peers::PeerRoster`)
+a wisp orbiting the well — no nameplates in v1, they'd be illegible clutter
+at room scale (mission call). Two follow-ups noted rather than built:
+
+- **LOD-gated nameplate on well-zoom.** A label that fades in only once the
+  camera is close enough to read it (the well-zoom LOD the mission brief
+  anticipated) — needs a "which wisp is nearest/under cursor" pick, not
+  built here.
+- **Turn-event flare needs principal↔peer correlation.** `ServerEvent::TurnCompleted`
+  carries `principal_id`, not a peer nick — there's no join today between
+  "which context turn just finished" and "which attached peer should flare."
+  Until that correlation exists, a seat can't visibly react to its own turn
+  completing/failing the way `switchboard`'s lamps do for contexts. Enabler:
+  thread the acting peer's nick (or instance) onto the turn-completion event,
+  or expose a context→peer lookup the seats reconcile loop can join against.
+
+---
+
 ## Conversation block-focus indicator is invisible (2026-08-04, live BRP debug)
 
 The "j/k navigation stuck" mystery from the 08-03 signoff is SOLVED and it
