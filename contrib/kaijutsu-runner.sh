@@ -41,6 +41,7 @@
 #   --release is consumed by the runner; every other arg is passed through to
 #   kaijutsu-app verbatim, e.g.:
 #     ./contrib/kaijutsu-runner.sh --host 192.168.1.4 --port 2222
+#     ./contrib/kaijutsu-runner.sh --maximize     (or --fullscreen for gamescope)
 #
 # Control files (touch to trigger):
 #   /tmp/kj.pause    - pause watching (remove to resume)
