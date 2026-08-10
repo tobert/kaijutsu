@@ -6,6 +6,27 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## cc-* hook re-registration mints a new context per MCP relaunch (2026-08-10, fleet-lead observation)
+
+After the 08-10 kernel restart, sessions whose `kaijutsu-mcp` process
+relaunched re-registered into **fresh** contexts (`cc-kaijutsu-0810-1339` →
+`-1556`, `cc-candle-…-1318` → `-1609`, same principals) because the label
+carries the MCP launch timestamp. Sessions whose MCP process survived
+re-attached statelessly to their existing context (the designed behavior —
+`register_session` is deterministic given the same label). Consequences: the
+old context is silently orphaned (conversation history, pending drift —
+a fleet-lead drift to `-1339` was lost this way), and context-count grows per
+relaunch. Two candidate shapes: (a) hook computes a stable per-session label
+(session id, not launch time) so relaunch = re-attach; (b) registration
+looks up live-context-by-principal+repo and resumes it unless told otherwise.
+Amy flagged interest ("if it doesn't [reconnect cleanly] let's look into
+smoothing that out"). Related gotcha: startup agent detection can report a
+previous session's id (memory: project_claude_code_hooks) — any fix must not
+resurrect *that* bug in the other direction. Host field on registration
+(machine name in `kj context info`) would also make the fleet board
+self-evident; today origin is only inferrable via principal + ListAgents
+absence.
+
 ## Background exec → kaish's job system (2026-08-07, Amy: "we should do the work and set the rule")
 
 An audit of every spawn site found exactly one ad-hoc host exec left in
