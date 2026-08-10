@@ -807,22 +807,18 @@ impl KjDispatcher {
     /// are simply omitted. Previewing a prompt is exactly the thing you
     /// want to do while a context's model is still unconfigured.
     ///
-    /// Two divergences from the turn path are known and NOT yet closed
-    /// (2026-08-07 review; tracked in `docs/issues.md`). Both are narrow, but
-    /// the whole value of this verb is fidelity, so they are named rather
-    /// than left for the next reader to discover:
+    /// Model source and the staging guard both now mirror the turn path
+    /// exactly (closed 2026-08-10; was `docs/issues.md` "`kj context prompt`
+    /// diverges from the turn path in two ways"):
     ///
     /// - **Model source.** Both sides call the same `resolve_context_model`,
-    ///   but this reads `provider`/`model` off the KernelDb row while the
-    ///   turn path reads them from the live DriftRouter handle
-    ///   (`llm_stream.rs`). `apply_context_config` writes both together, so
-    ///   they agree in the ordinary case — a preview racing a `kj context
-    ///   set`, or any future path that updates one without the other, can
-    ///   show a `<model>` the turn would not pick.
-    /// - **Staging.** The turn path refuses a `Staging` context outright.
-    ///   This renders the prompt regardless, so a staged context previews a
-    ///   prompt that cannot currently run. `<context state="staging"/>` is
-    ///   present in the output, but nothing says "this would be refused".
+    ///   fed the live DriftRouter handle's `provider`/`model` — never the
+    ///   KernelDb row — so a preview can't show a `<model>` the turn would
+    ///   not pick. (The RPC `--model` override remains a legitimate
+    ///   divergence: a preview has no future turn argument to reflect.)
+    /// - **Staging.** A `Staging` context is refused here exactly as
+    ///   `spawn_llm_for_prompt` refuses it, instead of rendering a prompt
+    ///   that could not actually run.
     async fn context_prompt(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         // Same !Send guard-scoping constraint as context_info: KernelDb's
         // parking_lot::MutexGuard must not cross an `.await` below.
@@ -849,30 +845,42 @@ impl KjDispatcher {
             (target_id, row, cast_label)
         };
 
-        // Situational label/state/provider come from the live DriftRouter
-        // handle, NOT the KernelDb row — mirroring exactly what
+        // Situational label/state/provider/model come from the live
+        // DriftRouter handle, NOT the KernelDb row — mirroring exactly what
         // `spawn_llm_for_prompt` reads for a real turn (llm_stream.rs). A
-        // resolved target_id with no drift handle renders all three absent,
+        // resolved target_id with no drift handle renders all four absent,
         // same as the turn path would — an honest gap, not a row fallback
         // that would make this view lie about what the turn path sees.
-        let (ctx_label, ctx_state, ctx_provider_name) = {
+        let (ctx_label, ctx_state, ctx_provider_name, ctx_model) = {
             let drift = self.drift_router().read();
             match drift.get(target_id) {
-                Some(h) => (h.label.clone(), Some(h.state), h.provider.clone()),
-                None => (None, None, None),
+                Some(h) => (h.label.clone(), Some(h.state), h.provider.clone(), h.model.clone()),
+                None => (None, None, None, None),
             }
         };
 
+        // Mirror the turn path's staging guard (llm_stream.rs's
+        // `spawn_llm_for_prompt`) exactly: a staged context refuses a turn,
+        // so this preview refuses too rather than rendering a prompt that
+        // could not actually run.
+        if ctx_state == Some(ContextState::Staging) {
+            return KjResult::Err(
+                "kj context prompt: context is in staging mode — commit to enable LLM prompts"
+                    .to_string(),
+            );
+        }
+
         // Resolved effective model — same ladder `context_info` and the
         // turn path use (explicit override → cast slot → registry
-        // default). Unlike the turn path, an unresolved model does not
-        // error here; see the fn doc comment.
+        // default), fed from the same source the turn path reads
+        // (DriftRouter handle, not the KernelDb row — see fn doc comment).
+        // Unlike the turn path, an unresolved model does not error here.
         let resolved = {
             let registry = self.kernel().llm().read().await;
             crate::model_resolution::resolve_context_model(
                 &row.context_type,
-                row.provider.as_deref(),
-                row.model.as_deref(),
+                ctx_provider_name.as_deref(),
+                ctx_model.as_deref(),
                 cast_label.as_deref(),
                 &registry,
             )
@@ -1928,7 +1936,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::kj::KjResult;
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::{EdgeKind, PrincipalId};
+    use kaijutsu_types::{ContextState, EdgeKind, PrincipalId};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -3183,6 +3191,78 @@ mod tests {
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
     }
 
+    /// Repro/regression for `docs/issues.md` "`kj context info` human and
+    /// `--json` renders disagree about cwd" (2026-08-07). Filed against the
+    /// pre-kaish-0.13 `--json` envelope, which built a separate JSON shape
+    /// from the human-text render and could show `shell: null` for a
+    /// context whose human text showed a real `Cwd:` line. kaish 0.13
+    /// retired that separate envelope (`render_json_envelope` is gone —
+    /// `--json` now emits `data` verbatim, per `kj_builtin.rs`), and
+    /// `context_info` itself has always fed both renders from the SAME
+    /// `shell` binding (one `db.get_context_shell` read, destructured once,
+    /// used by both the `Cwd:` text line and the `data.cwd` field) — so a
+    /// disagreement is no longer structurally possible. This test pins
+    /// that: both renders must agree whether cwd is set, and its value,
+    /// covering the case that reproduced the original report (cwd IS set)
+    /// as well as the unset case.
+    #[tokio::test]
+    async fn context_info_json_cwd_matches_human_render() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+
+        // Case 1: cwd set — the exact shape of the original bug report.
+        let with_cwd = register_context(&d, Some("cwd-set"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: with_cwd,
+                cwd: Some("/home/atobey/kaijutsu".into()),
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+        let c = caller_with_context(with_cwd);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        let msg = result.message().to_string();
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(
+                    v["cwd"].as_str(),
+                    Some("/home/atobey/kaijutsu"),
+                    "data.cwd must carry the configured path, not null: {v:?}"
+                );
+                assert!(
+                    msg.contains("Cwd:     /home/atobey/kaijutsu"),
+                    "human text must show the same cwd data.cwd reports: {msg}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        // Case 2: no shell row at all — both renders must agree it's absent
+        // (omitted from text, null in JSON), not one showing stale data.
+        let no_cwd = register_context(&d, Some("cwd-unset"), None, principal);
+        let c2 = caller_with_context(no_cwd);
+        let result2 = d.dispatch(&[s("context"), s("info")], &c2).await;
+        assert!(result2.is_ok(), "info failed: {}", result2.message());
+        let msg2 = result2.message().to_string();
+        match result2 {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert!(
+                    v["cwd"].is_null(),
+                    "data.cwd must be null when no shell row exists: {v:?}"
+                );
+                assert!(
+                    !msg2.contains("Cwd:"),
+                    "human text must omit Cwd: when data.cwd is null: {msg2}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
     /// `kj context info --json`'s `usage` field is the token-usage gauge's
     /// public surface — an app-side gauge is built against this shape, so it
     /// needs to expose exactly the persisted `ContextUsageRow`, both in the
@@ -4173,6 +4253,91 @@ mod tests {
         assert!(
             !msg.contains("current marker"),
             "explicit ref must NOT leak the caller's current context: {msg}"
+        );
+    }
+
+    /// Regression for `docs/issues.md` "`kj context prompt` diverges from
+    /// the turn path in two ways" — model-source half. Forces the KernelDb
+    /// row and the live DriftRouter handle apart (the divergence
+    /// `apply_context_config` normally prevents by writing both together)
+    /// and asserts the verb reports the handle's model, matching what
+    /// `spawn_llm_for_prompt` would actually pick — not the row's.
+    #[tokio::test]
+    async fn context_prompt_model_follows_drift_handle_not_row() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("modelctx"), None, principal);
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Row says one model; the live handle (what the turn path reads)
+        // says another. A real caller can't normally produce this split —
+        // `apply_context_config` writes both together — but a preview
+        // racing a `kj context set`, or a future path that updates one
+        // without the other, can.
+        {
+            let db = d.kernel_db().lock();
+            db.update_model(ctx, Some("row-provider"), Some("row-only-model"))
+                .unwrap();
+        }
+        {
+            let mut drift = d.drift_router().write();
+            drift
+                .configure_llm(ctx, "handle-provider", "handle-only-model")
+                .unwrap();
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("prompt")], &c).await;
+        assert!(result.is_ok(), "prompt failed: {}", result.message());
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(
+                    v["resolved_model"].as_str(),
+                    Some("handle-only-model"),
+                    "resolved_model must come from the DriftRouter handle (the turn path's \
+                     source), not the KernelDb row: {v:?}"
+                );
+                assert_eq!(
+                    v["resolved_backend"].as_str(),
+                    Some("handle-provider"),
+                    "resolved_backend must come from the DriftRouter handle: {v:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// Regression for `docs/issues.md` "`kj context prompt` diverges from
+    /// the turn path in two ways" — staging half. The turn path
+    /// (`spawn_llm_for_prompt`) refuses a `Staging` context outright; the
+    /// preview must refuse the same way instead of rendering a prompt that
+    /// could never actually run.
+    #[tokio::test]
+    async fn context_prompt_refuses_staging_context_like_turn_path() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("stagingctx"), None, principal);
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        {
+            let mut drift = d.drift_router().write();
+            drift.set_state(ctx, ContextState::Staging).unwrap();
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("prompt")], &c).await;
+        assert!(
+            !result.is_ok(),
+            "a staging context's prompt must be refused, matching the turn path: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("staging"),
+            "refusal should name staging as the reason: {}",
+            result.message()
         );
     }
 }

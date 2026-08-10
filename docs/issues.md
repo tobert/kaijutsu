@@ -112,24 +112,6 @@ derived state (the kernel is the head). Second voices in flight: gemini-pro
 deliberate (batch, durable handle `gemini/batches/pn8p3vcg5faecoeekb8a95s50cm9cb7mkrh8`)
 + deepseek consult; melt results into a design doc before building.
 
-## `kj context prompt` diverges from the turn path in two ways (2026-08-07, kaibo/deepseek review)
-
-The verb exists so prompt tuning is verifiable rather than inferred, so
-fidelity is the whole feature. Two gaps, both narrow, both real:
-
-- **Model source.** Both sides call `resolve_context_model`, but the verb
-  feeds it `provider`/`model` from the KernelDb row while the turn path feeds
-  it the live DriftRouter handle (`llm_stream.rs:318-319`).
-  `apply_context_config` writes both together so they normally agree; a
-  preview racing `kj context set`, or a future path updating one only, shows
-  a `<model>` the turn would not pick. Fix: read the DriftRouter, as the turn
-  path does. (Note the RPC `--model` override is a *legitimate* divergence —
-  a preview can't know a future turn's argument.)
-- **Staging.** The turn path refuses a `Staging` context
-  (`llm_stream.rs:320-341`). The verb renders anyway, so a staged context
-  previews a prompt that cannot run. `state="staging"` appears in
-  `<situation>` but nothing says it would be refused.
-
 ## kaish-help and kaish-kernel must be bumped together (2026-08-07, adoption)
 
 Now that prompts are composed from `kaish-help`, the guidance kaijutsu ships
@@ -149,42 +131,6 @@ Neither direction fails loudly — a prompt that mildly misdescribes the shell
 produces worse agent behavior, not an error — which is what makes it worth
 writing down. When the release lands, move both pins in one commit and drop
 the git dep TODO in `Cargo.toml` at the same time.
-
-## `kj context info` human and `--json` renders disagree about cwd (2026-08-07)
-
-Human output shows `Cwd: /home/atobey/src/kaijutsu`; `--json` reports
-`shell: null` for the same context. Found while chasing the turn-path cwd bug
-(fixed same day) — the disagreement cost real diagnosis time, because the
-JSON view suggested a context had no cwd when it did. One of the two renders
-is lying; make them share a source.
-
-## Two context-creation paths disagree about stamping the model (2026-08-07, stance tuning)
-
-Found while fixing the coder stance's model dispatch. The RPC create path
-reads the registry defaults and writes them onto the new `ContextRow`
-(`kaijutsu-server/src/rpc.rs:2390-2412`, `provider`/`model` fields) — so a
-context made by the GUI, `register_session`, or the ACP bridge carries a
-stamped model and `kj context info --json` reports `resolved_source:
-"context"`. `kj context create` does not stamp: the row's `model` stays
-`null` and resolution falls through to the registry default
-(`resolved_source: "default"`). Verified live both ways on zorak.
-
-Same divergent-creation-path family as the bug
-`test_rpc_created_context_runs_rc_create` (`e2e_kj_workflow.rs:596`) guards,
-and it has real consequences:
-
-- Anything reading `.model` gets a different answer depending on which door
-  the context came through. That is exactly what broke the stance dispatch.
-- A stamped row is a *snapshot*: change the registry default later and
-  RPC-created contexts keep the old model while kj-created ones follow. One
-  of those is probably wrong, and which one is a design decision nobody has
-  made on purpose.
-- It makes RPC-path tests structurally unable to catch null-model bugs —
-  the toothless-stance-test trap below.
-
-Decide the intent: either both paths stamp (creation freezes the model, and
-`resolved_source` mostly stops mattering) or neither does (the row means
-"override", inheritance stays live). Don't leave it split.
 
 ## rc seed assets have no rebuild tracking (2026-08-07)
 

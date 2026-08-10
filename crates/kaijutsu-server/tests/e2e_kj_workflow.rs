@@ -664,21 +664,23 @@ fn test_rpc_default_context_type_is_default() {
 // Coder stance branch selection (S00-stance.kai) on the RPC creation path.
 //
 // NOTE what these two tests do and don't pin: `create_context_typed` goes
-// through the kernel RPC `create_context`, and that path STAMPS the
-// registry-default provider/model onto the new `ContextRow` itself
-// (`crates/kaijutsu-server/src/rpc.rs` `create_context_inner`, ~line
-// 2390-2412) whenever no per-context override is given. So on this path
-// `.model` is never actually null — it equals the registry default — which
-// means these two tests pass under BOTH the old buggy `.model` read and the
-// fixed `.resolved_model` read. They still pin something real (branch
-// selection follows the effective model when driven over RPC), just not the
-// `.model`-vs-`.resolved_model` regression itself — see
-// `test_coder_stance_crisp_for_null_row_model_via_kj_dispatch` below for the
-// test that actually distinguishes the two.
+// through the kernel RPC `create_context`. Through 2026-08-10 that path
+// STAMPED the registry-default provider/model onto the new `ContextRow`
+// itself (`crates/kaijutsu-server/src/rpc.rs` `create_context_inner`)
+// whenever no per-context override was given — a divergence from the kj
+// dispatch path below, closed per `docs/issues.md` "Two context-creation
+// paths disagree about stamping the model": neither path stamps now, so
+// `.model` is genuinely null here too and `.resolved_model` is the only
+// thing reading through to the registry default. These two tests still pin
+// something real (branch selection follows the effective model when driven
+// over RPC) but no longer distinguish `.model` from `.resolved_model` reads
+// by themselves — see `test_coder_stance_crisp_for_null_row_model_via_kj_dispatch`
+// below for the test that pins the null-row-model case explicitly (now true
+// of both creation paths, not just kj dispatch).
 // ============================================================================
 
 #[test]
-fn test_coder_stance_crisp_for_rpc_stamped_fast_model() {
+fn test_coder_stance_crisp_for_rpc_created_fast_model() {
     run_local(async {
         // Registry default only — no per-context model override.
         let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
@@ -729,7 +731,7 @@ fn test_coder_stance_crisp_for_rpc_stamped_fast_model() {
 }
 
 #[test]
-fn test_coder_stance_synth_for_rpc_stamped_non_matching_model() {
+fn test_coder_stance_synth_for_rpc_created_non_matching_model() {
     run_local(async {
         let addr = start_server_with_mock_llm_model("kaijutsu-reflective-test-model").await;
         let client = connect_client(addr).await;
@@ -780,21 +782,21 @@ fn test_coder_stance_synth_for_rpc_stamped_non_matching_model() {
 
 // ============================================================================
 // The `.model`-vs-`.resolved_model` regression itself: a context whose
-// `ContextRow.model` column is genuinely NULL (not stamped with the
-// registry default, unlike the RPC creation path above).
+// `ContextRow.model` column is genuinely NULL. Since 2026-08-10 this is true
+// of BOTH creation paths (see the note above the RPC tests), but this test
+// pins it via the kj dispatch path specifically, which has always worked
+// this way and is where the regression was first found.
 //
 // `kj context create <label> --type coder` — the kaish/kj dispatch path
 // (`crates/kaijutsu-kernel/src/kj/context.rs`, `context_create`) — writes
-// `model: None` on the row (line ~890) and only touches it if an explicit
-// `--model` was given (`apply_context_config`, ~line 292). No `--model` here,
-// so the row stays null and the rc create-lifecycle's
-// `kj context info --json | jq -r '.model'` reads `null` while
-// `.resolved_model` reads through to the registry default. This is the case
-// the old buggy script silently sent down the synth branch no matter what
-// model was actually bound (every ACP session, every default-resolved coder
-// context). Driven through `shell_execute` so it exercises kj dispatch
-// rather than the RPC `create_context` path, which stamps the row and would
-// pass under the old buggy code too (see the tests above).
+// `model: None` on the row and only touches it if an explicit `--model` was
+// given (`apply_context_config`). No `--model` here, so the row stays null
+// and the rc create-lifecycle's `kj context info --json | jq -r '.model'`
+// reads `null` while `.resolved_model` reads through to the registry
+// default. This is the case the old buggy script silently sent down the
+// synth branch no matter what model was actually bound (every ACP session,
+// every default-resolved coder context). Driven through `shell_execute` so
+// it exercises kj dispatch rather than the RPC `create_context` path.
 // ============================================================================
 
 #[test]
@@ -859,6 +861,71 @@ fn test_coder_stance_crisp_for_null_row_model_via_kj_dispatch() {
              fast-executor registry default; got {} blocks: {:#?}",
             blocks.len(),
             blocks
+        );
+    });
+}
+
+// ============================================================================
+// Regression for `docs/issues.md` "Two context-creation paths disagree about
+// stamping the model" (2026-08-07). Through 2026-08-10, `create_context_inner`
+// (the RPC path both `create_context_typed` and `create_context` share) read
+// the registry default and wrote it onto the new `ContextRow`'s
+// `provider`/`model` columns unconditionally — freezing a snapshot of
+// whatever the default happened to be at creation time, and reporting
+// `resolved_source: "context"` (as if an explicit override had been given)
+// even though no caller asked for one. `kj context create` never did this:
+// its row stays `provider: None, model: None` absent an explicit `--model`,
+// so `resolve_context_model` falls through live to the registry default
+// every call (`resolved_source: "default"`) and a later default change
+// reaches it. The decision made closing this entry: neither path stamps —
+// the row is the explicit-override slot only, never a creation-time cache of
+// the default. This test pins that an RPC-created context, with a registry
+// default configured but no explicit model given, has a null row and
+// resolves via "default", matching what `kj context create` has always done.
+// ============================================================================
+
+#[test]
+fn test_rpc_created_context_does_not_stamp_the_registry_default() {
+    run_local(async {
+        let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let ctx = kernel
+            .create_context_typed("rpc-unstamped", "default")
+            .await
+            .expect("create_context_typed");
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let (_, output, status) =
+            shell_exec_wait(&kernel, "kj context info --json", ctx).await;
+        assert_eq!(status, Status::Done, "kj context info --json failed: {output}");
+
+        let data: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("kj context info --json did not emit JSON ({e}): {output}"));
+
+        assert!(
+            data["provider"].is_null(),
+            "RPC-created row.provider must be null (never stamped with the \
+             registry default) — matching `kj context create`: {data}"
+        );
+        assert!(
+            data["model"].is_null(),
+            "RPC-created row.model must be null (never stamped with the \
+             registry default) — matching `kj context create`: {data}"
+        );
+        assert_eq!(
+            data["resolved_model"].as_str(),
+            Some("claude-haiku-4-5"),
+            "resolution must still reach the registry default live, through \
+             `resolve_context_model`, even with a null row: {data}"
+        );
+        assert_eq!(
+            data["resolved_source"].as_str(),
+            Some("default"),
+            "resolved_source must read \"default\" (live registry fallback), \
+             not \"context\" (which implies an explicit override that was \
+             never given): {data}"
         );
     });
 }
