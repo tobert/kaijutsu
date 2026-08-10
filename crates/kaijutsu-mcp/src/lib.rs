@@ -79,7 +79,9 @@ use rmcp::model::{LoggingLevel, SetLevelRequestParams};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use kaijutsu_client::{ActorHandle, SshConfig, SyncedDocument, connect_ssh, spawn_actor};
+use kaijutsu_client::{
+    ActorHandle, PeerConfig, PeerInvocation, SshConfig, SyncedDocument, connect_ssh, spawn_actor,
+};
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use tokio::sync::watch;
@@ -101,6 +103,15 @@ use tree::format_dag_tree;
 fn mcp_peer_instance() -> &'static str {
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| format!("kaijutsu-mcp-{}", uuid::Uuid::new_v4()))
+}
+
+/// Peer nick for an MCP session registered under `label` — `"mcp/<label>"`,
+/// the `<kind>/<name>` convention for new peer-registry clients
+/// (docs/instrument-design.md, "Many hands, one trust boundary"; the app
+/// predates the convention and keeps its bare `"kaijutsu-app"` nick). Pure
+/// so the derivation is unit-testable without a live kernel.
+fn peer_nick_for_label(label: &str) -> String {
+    format!("mcp/{label}")
 }
 
 // ============================================================================
@@ -1624,18 +1635,89 @@ impl KaijutsuMcp {
         // 3-8: sync, build SyncedDocument, spawn doc task + event bridge,
         // publish JoinedContext / shared_context_id — shared with
         // `stabilize_context_label`'s reattach case (see `finish_join`).
-        match finish_join(remote, context_id, label, resumed, previous_context).await {
-            Ok(outcome) => serde_json::json!({
-                "success": true,
-                "context_id": outcome.context_id.to_hex(),
-                "context_short": outcome.context_id.short(),
-                "label": outcome.label,
-                "resumed": outcome.resumed,
-                "previous_context": outcome.previous_context,
-            })
-            .to_string(),
-            Err(e) => e,
+        let outcome = match finish_join(remote, context_id, label, resumed, previous_context).await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return e,
+        };
+
+        // 9. Attach as a peer so the kernel's peer registry — and anything
+        // rendering "who's at the table" (docs/instrument-design.md, "Many
+        // hands, one trust boundary") — sees this MCP session. Best-effort:
+        // peer presence is ambient, never load-bearing, so a failure here
+        // must NOT fail registration.
+        //
+        // Re-attach safety: `PeerRegistry::attach` (kaijutsu-kernel/src/
+        // peers.rs) upserts on the (nick, instance) key — re-attaching with
+        // the same pair drops the previous invoke channel and replaces the
+        // registration in place rather than erroring or duplicating, so
+        // calling this every time `register_session_impl` reaches here
+        // (including the `resumed` branch above, which re-runs this with an
+        // unchanged label/instance) is safe. In practice this block only
+        // runs once per process: the `already_registered` short-circuit at
+        // the top of this function returns before reaching here on any
+        // later call in the same session. Reconnect-triggered re-attach
+        // (network blip, not a fresh `register_session` call) is handled
+        // separately and automatically by `ActorHandle`'s own replay of
+        // `peer_registration` (actor.rs) — this call just seeds that state.
+        //
+        // Deliberately NOT inside `finish_join`: the other caller,
+        // `stabilize_context_label`, re-joins under a DIFFERENT label, and
+        // (nick, instance) is the upsert key — attaching there would leave
+        // two registrations for one process (placeholder nick + stable
+        // nick) rather than replacing one. The cost is a peer nick that
+        // keeps the placeholder label after stabilization; tracked in
+        // docs/issues.md.
+        {
+            let nick = peer_nick_for_label(&outcome.label);
+            let (peer_tx, peer_rx) = std::sync::mpsc::channel::<PeerInvocation>();
+            // Lightweight drain: no peer actions are implemented yet, so
+            // every invocation gets a graceful "unsupported" error reply
+            // instead of the callback hanging until the kernel-side timeout.
+            //
+            // A plain OS thread, NOT `tokio::task::spawn_blocking`: this loop
+            // never returns on its own (it exits only once every `peer_tx`
+            // clone is dropped, i.e. connection teardown), and a
+            // `spawn_blocking` task that never completes wedges a `current_
+            // thread` runtime's blocking pool on drop — confirmed live: with
+            // `spawn_blocking` here, `cargo test -p kaijutsu-mcp --test
+            // e2e_shell` (each test builds its own `current_thread` runtime,
+            // see `run_local` there) reliably corrupted the reactor for
+            // later async I/O in the SAME test ("there is no reactor
+            // running", a russh channel-IO panic, well after this block had
+            // already returned). A detached `std::thread` has no such tie to
+            // the runtime's shutdown bookkeeping.
+            std::thread::spawn(move || {
+                while let Ok(invocation) = peer_rx.recv() {
+                    let _ = invocation.reply.send(Err(format!(
+                        "mcp peer does not implement action '{}' yet",
+                        invocation.action
+                    )));
+                }
+            });
+            let peer_config = PeerConfig {
+                nick: nick.clone(),
+                instance: mcp_peer_instance().to_string(),
+            };
+            match remote.actor.attach_peer(peer_config, peer_tx).await {
+                Ok(info) => {
+                    tracing::info!(nick = %info.nick, "MCP session attached as peer");
+                }
+                Err(e) => {
+                    tracing::warn!(nick = %nick, "peer attach failed (non-fatal): {e}");
+                }
+            }
         }
+
+        serde_json::json!({
+            "success": true,
+            "context_id": outcome.context_id.to_hex(),
+            "context_short": outcome.context_id.short(),
+            "label": outcome.label,
+            "resumed": outcome.resumed,
+            "previous_context": outcome.previous_context,
+        })
+        .to_string()
     }
 
     // ========================================================================
@@ -2607,6 +2689,16 @@ mod tests {
         assert_eq!(input_char_len("日本語"), 3);
         assert_eq!(input_char_len("hello"), 5);
         assert_eq!(input_char_len(""), 0);
+    }
+
+    /// `register_session`'s peer nick follows the `<kind>/<name>` convention
+    /// (docs/instrument-design.md): a session labeled "toad" attaches as
+    /// "mcp/toad", not the bare label or the app's legacy bare nick.
+    #[test]
+    fn peer_nick_for_label_uses_mcp_prefix_convention() {
+        assert_eq!(peer_nick_for_label("toad"), "mcp/toad");
+        assert_eq!(peer_nick_for_label("e2e-session-123"), "mcp/e2e-session-123");
+        assert_eq!(peer_nick_for_label(""), "mcp/");
     }
 
     /// The bug: an object param arrives double-encoded as a JSON string. We must

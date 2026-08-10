@@ -180,6 +180,18 @@ pub struct KernelInfo {
     pub contexts: Vec<ContextInfo>,
 }
 
+/// An attached peer, as reported by `listPeers`.
+///
+/// Mirrors the wire `PeerInfo` struct (kaijutsu.capnp), which currently
+/// carries only `nick`/`attachedAt` — no `instance`, so two windows sharing a
+/// nick are indistinguishable here (docs/issues.md tracks the schema gap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub nick: String,
+    /// Unix timestamp ms when the peer attached.
+    pub attached_at: u64,
+}
+
 // ============================================================================
 // Context Membership
 // ============================================================================
@@ -1874,6 +1886,20 @@ impl KernelHandle {
         Ok(result)
     }
 
+    /// List all peers currently attached to this kernel.
+    #[tracing::instrument(skip(self), name = "rpc_client.list_peers")]
+    pub async fn list_peers(&self) -> Result<Vec<PeerInfo>, RpcError> {
+        let request = self.kernel.list_peers_request();
+        let response = request.send().promise.await?;
+        let peers = response.get()?.get_peers()?;
+
+        let mut result = Vec::with_capacity(peers.len() as usize);
+        for p in peers.iter() {
+            result.push(parse_peer_info(&p)?);
+        }
+        Ok(result)
+    }
+
     /// Invoke another peer through the kernel.
     #[tracing::instrument(skip(self, params), name = "rpc_client.invoke_peer")]
     pub async fn invoke_peer(
@@ -3083,6 +3109,17 @@ fn parse_kernel_info(
         user_count: reader.get_user_count(),
         agent_count: reader.get_agent_count(),
         contexts,
+    })
+}
+
+/// Parse a `PeerInfo` from Cap'n Proto — shared by `list_peers` decode and
+/// the roundtrip test below.
+fn parse_peer_info(
+    reader: &crate::kaijutsu_capnp::peer_info::Reader<'_>,
+) -> Result<PeerInfo, RpcError> {
+    Ok(PeerInfo {
+        nick: reader.get_nick()?.to_string()?,
+        attached_at: reader.get_attached_at(),
     })
 }
 
@@ -4767,5 +4804,25 @@ mod tests {
             parsed.attached,
             vec![ContextId::from_bytes([1u8; 16]), ContextId::from_bytes([2u8; 16])]
         );
+    }
+
+    /// `PeerInfo` round-trips through `parse_peer_info` — the decode helper
+    /// `list_peers` uses. No live kernel needed: builds the capnp message
+    /// directly, same shape `set_peer_info` (kaijutsu-server/src/rpc.rs)
+    /// would produce.
+    #[test]
+    fn test_parse_peer_info_roundtrip() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::peer_info::Builder>();
+        builder.set_nick("mcp/toad");
+        builder.set_attached_at(1_754_800_000_000);
+
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::peer_info::Reader>()
+            .unwrap();
+        let parsed = parse_peer_info(&reader).unwrap();
+
+        assert_eq!(parsed.nick, "mcp/toad");
+        assert_eq!(parsed.attached_at, 1_754_800_000_000);
     }
 }

@@ -434,6 +434,41 @@ dir. Until then, verify with:
 
     strings -a target/debug/deps/<test-binary> | grep -o "<a distinctive string>"
 
+## Peer-registry doctrine — ACP/headless clients still need to attach; `PeerInfo` lacks `instance` on the wire (2026-08-10, peers-plumbing)
+
+Every connected client is supposed to register in the kernel's peer registry
+so the app can render "who's at the table" (`docs/instrument-design.md`,
+"Many hands, one trust boundary"). `kaijutsu-mcp`'s `register_session` now
+does this (`crates/kaijutsu-mcp/src/lib.rs`, the `peer_nick_for_label` +
+attach block right after `finish_join` returns) — nick `mcp/<label>`,
+instance a per-process UUID mirroring the app's `app_peer_instance()`,
+invocations drained with a graceful "unsupported action" reply since no peer
+actions are implemented on the MCP side yet. Use that as the pattern.
+
+Still needed:
+- **ACP sessions** (`kaijutsu-acp`) don't attach as peers at all.
+- **The upcoming headless client** should attach on connect, same pattern.
+- **The MCP peer nick goes stale on label stabilization.** An auto-registered
+  session attaches under its placeholder label, then
+  `stabilize_context_label` re-joins the same process under `{base}-{sid8}`
+  via `finish_join` — but the attach lives in `register_session_impl`, not in
+  `finish_join`, so the registry keeps `mcp/<placeholder>`. Attaching inside
+  `finish_join` is not the fix as-is: (nick, instance) is the upsert key, so
+  a second attach under a different nick registers a *second* peer for one
+  process instead of replacing the first. Wants either a detach-then-attach
+  on rename, or a registry keyed on instance alone.
+
+Also: the wire `PeerInfo` struct (kaijutsu.capnp) carries only `nick` +
+`attachedAt` — no `instance`/kind field. `listPeers` output can't distinguish
+two windows/sessions sharing a nick (multi-window app instances, or two MCP
+sessions attached under the same label from different processes) from each
+other; a caller rendering presence sees one nick, not N. Candidate future
+schema addition: add `instance` (and maybe a `kind` string) to `PeerInfo` so
+`listPeers` round-trips what the registry already tracks server-side
+(`crates/kaijutsu-kernel/src/peers.rs`'s `PeerInfo` has both).
+
+---
+
 ## Conversation block-focus indicator is invisible (2026-08-04, live BRP debug)
 
 The "j/k navigation stuck" mystery from the 08-03 signoff is SOLVED and it

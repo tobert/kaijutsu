@@ -84,6 +84,8 @@ The cooperative interior isn't only the model and one user — it's every player
 
 This is the multi-player face of the same rule as the front-door checker: concentrate restraint where the trust actually ends (outside the unix user), and keep the interior an instrument. "Less privileged" inside means *narrower focus*, not *less trusted* — and it's expressed by narrowing what a player's loadout even reaches (so footguns are absent by construction), not by gating trusted actions behind permission denials. Autonomous control-plane work the instrument does on a player's behalf (a beat firing its page-turn) stays able to act; the focus lives in the player's loadout, not in starving the kernel's own lifecycle.
 
+Made concrete: every connected client — the Bevy app, an MCP session, a future ACP or headless client — attaches itself to the kernel's peer registry (`attachPeer`/`listPeers`, kaijutsu.capnp) as soon as it's live. The nick convention for a new client kind is `<kind>/<name>` — an MCP session registered under label "toad" attaches as `mcp/toad`; the app predates the convention and keeps its bare `kaijutsu-app` nick since other code already invokes it by that name. The registry is how the room renders presence — "who's at the table" — the same ergonomic bookkeeping this section describes elsewhere, never an access list gating one player from another.
+
 ---
 
 ## Beyond the single turn

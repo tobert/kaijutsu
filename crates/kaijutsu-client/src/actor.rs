@@ -74,7 +74,7 @@ use crate::constants::{
 };
 use crate::rpc::{
     Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
-    KernelInfo, LlmConfigInfo, McpResource, McpToolResult, ShellValue, SimilarContext,
+    KernelInfo, LlmConfigInfo, McpResource, McpToolResult, PeerInfo, ShellValue, SimilarContext,
     StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
@@ -634,6 +634,9 @@ enum RpcCommand {
         params: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, CallError>>,
     },
+    ListPeers {
+        reply: oneshot::Sender<Result<Vec<PeerInfo>, CallError>>,
+    },
 }
 
 // ── Client-side peer types ──────────────────────────────────────────────────
@@ -729,6 +732,7 @@ impl RpcCommand {
             Self::ResubscribeBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::AttachPeer { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::InvokePeer { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListPeers { reply } => { let _ = reply.send(Err(err)); }
         }
     }
 }
@@ -1625,6 +1629,12 @@ impl ActorHandle {
             reply,
         })
         .await
+    }
+
+    /// List all peers currently attached to the kernel.
+    #[tracing::instrument(skip(self))]
+    pub async fn list_peers(&self) -> Result<Vec<PeerInfo>, CallError> {
+        self.send(|reply| RpcCommand::ListPeers { reply }).await
     }
 }
 
@@ -3186,6 +3196,9 @@ async fn dispatch_kernel_command(
                 kernel, reply, close_tx, k,
                 k.invoke_peer(&nick, &action, &params)
             );
+        }
+        RpcCommand::ListPeers { reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.list_peers());
         }
     }
 }

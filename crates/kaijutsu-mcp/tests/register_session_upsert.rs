@@ -250,3 +250,38 @@ fn concluded_context_gets_fresh_suffixed_label_not_resurrected() {
         assert_eq!(out["stdout"].as_str(), Some("fresh-context\n"));
     });
 }
+
+/// `register_session` attaches the MCP session as a peer (docs/
+/// instrument-design.md, "Many hands, one trust boundary" — every connected
+/// client registers so the room can render who's at the table). Nick follows
+/// the `mcp/<label>` convention; presence must be visible via `listPeers`
+/// through the same actor the session used to register.
+#[test]
+fn register_session_attaches_as_mcp_peer() {
+    run_local(async {
+        let addr = start_server().await;
+        let label = "peer-attach-test";
+
+        let mcp = connect_mcp(addr).await;
+        let reg = register_with_retry(&mcp, label).await;
+        assert!(
+            reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            "register_session did not succeed: {reg}"
+        );
+
+        let Backend::Remote(remote) = mcp.backend() else {
+            panic!("expected Remote backend");
+        };
+
+        let expected_nick = format!("mcp/{label}");
+        let peers = remote
+            .actor
+            .list_peers()
+            .await
+            .expect("list_peers must succeed");
+        assert!(
+            peers.iter().any(|p| p.nick == expected_nick),
+            "expected peer '{expected_nick}' to be attached after register_session, got {peers:?}"
+        );
+    });
+}
