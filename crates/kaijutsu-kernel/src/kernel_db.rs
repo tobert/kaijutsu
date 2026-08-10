@@ -131,6 +131,19 @@ pub struct ContextRow {
     /// from `provider`/`model` above: those are an explicit PER-CONTEXT
     /// override that always wins over a cast slot when set.
     pub cast_id: Option<CastId>,
+    /// Advisory hostname the registering client self-reported (`gethostname`
+    /// on the kaijutsu-mcp side today), or `None` when unknown — an old
+    /// client that never called `setContextOriginHost`, a creation path with
+    /// no client to ask (genesis bootstrap, fork), or a pre-migration row.
+    /// Set ONCE, right after creation, via `KernelDb::set_origin_host` (never
+    /// baked into `write_context`'s own INSERT) — mirrors `created_by`: an
+    /// origin fact, not a "last seen from" one, so a later reconnect from a
+    /// different machine does NOT overwrite it. Shared-trust model: this is
+    /// observability, not auth — the server trusts the client's self-report
+    /// (docs/issues.md "cc-* hook re-registration mints a new context per
+    /// MCP relaunch"). Rendered as `"-"` when `None` (`kj context info`,
+    /// `kj context list`).
+    pub origin_host: Option<String>,
 }
 
 impl ContextRow {
@@ -521,7 +534,10 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- The cast this context plays under (NULL = no ensemble assigned, falls
     -- through to the registry default). Distinct from `provider`/`model`
     -- above, which are an explicit per-context override that always wins.
-    cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
+    cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
+    -- Advisory hostname the registering client self-reported at creation
+    -- (NULL = unknown). See `ContextRow::origin_host`'s doc comment.
+    origin_host  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL;
@@ -1408,6 +1424,7 @@ impl KernelDb {
             "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE contexts ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
+            "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -2242,13 +2259,15 @@ impl KernelDb {
                 system_prompt, consent_mode, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
-                last_activity_at, promoted_at, demoted_at, paused_at, cast_id
+                last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
+                origin_host
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21
+                ?17, ?18, ?19, ?20, ?21,
+                ?22
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -2272,6 +2291,7 @@ impl KernelDb {
                     row.demoted_at,
                     row.paused_at,
                     row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.origin_host,
                 ],
             )
             .map_err(|e| {
@@ -2291,7 +2311,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -2397,6 +2417,25 @@ impl KernelDb {
         let updated = self.conn.execute(
             "UPDATE contexts SET context_type = ?1 WHERE context_id = ?2",
             params![context_type, blob_param(id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) a context's advisory `origin_host` — the hostname the
+    /// registering client self-reported. Deliberately NOT part of
+    /// `write_context`'s own INSERT: it is set once, right after creation,
+    /// by the `setContextOriginHost` RPC handler, so creation paths with no
+    /// client to ask (genesis bootstrap, fork, tests) simply never call this
+    /// and the row keeps `origin_host = NULL` ("-" on display). `host =
+    /// None` clears an existing value. Unknown context id is a loud
+    /// `NotFound`, same convention as `update_label`/`update_context_type`.
+    pub fn set_origin_host(&self, id: ContextId, host: Option<&str>) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET origin_host = ?1 WHERE context_id = ?2",
+            params![host, blob_param(id.as_bytes())],
         )?;
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("context {}", id.short())));
@@ -2643,7 +2682,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -2660,7 +2699,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -2711,7 +2750,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -2730,7 +2769,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -2769,7 +2808,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, dag.depth
+                   c.cast_id, c.origin_host, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -2777,7 +2816,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(21)?;
+            let depth: i64 = row.get(22)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -2800,7 +2839,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, lineage.depth
+                   c.cast_id, c.origin_host, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -2808,7 +2847,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(21)?;
+            let depth: i64 = row.get(22)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -2830,7 +2869,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, subtree.depth
+                   c.cast_id, c.origin_host, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -2838,7 +2877,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(21)?;
+            let depth: i64 = row.get(22)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4898,7 +4937,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
              FROM contexts WHERE label = ?1",
         )?;
 
@@ -5721,6 +5760,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         demoted_at: row.get(18)?,
         paused_at: row.get(19)?,
         cast_id: read_opt_cast_id(row, 20)?,
+        origin_host: row.get(21)?,
     })
 }
 
@@ -5801,6 +5841,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         demoted_at: None,
         paused_at: None,
         cast_id: None,
+        origin_host: None,
     }
 }
 
@@ -5962,6 +6003,97 @@ mod tests {
         insert_context_with_doc(&db, &row, ws_id);
         let loaded = db.get_context(row.context_id).unwrap().unwrap();
         assert_eq!(loaded.last_activity_at, None, "fresh row: never touched");
+    }
+
+    /// Same idempotency contract as `last_activity_at_migration_...` above,
+    /// for the `origin_host` column this change adds. A pre-migration row
+    /// (simulated here by simply never calling `set_origin_host`) must still
+    /// round-trip as `None` — "old rows without the field still render" is
+    /// the same fact as "a fresh, never-set row reads back as None".
+    #[test]
+    fn origin_host_migration_is_idempotent_no_op_on_fresh_db() {
+        let db = KernelDb::in_memory().unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("origin-host-mig-check"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let loaded = db.get_context(row.context_id).unwrap().unwrap();
+        assert_eq!(
+            loaded.origin_host, None,
+            "fresh/pre-migration row: never set, must read back as None (\"-\" on display), \
+             not error or default to some fabricated string"
+        );
+    }
+
+    /// `origin_host` is deliberately NOT part of `write_context`'s own
+    /// INSERT (see the field's doc comment) — it is set via the dedicated
+    /// `set_origin_host`, exactly like `update_label`. Round-trip through
+    /// both: a context created with no host known, then stamped after the
+    /// fact, ends up with the value `get_context` reads back — and does NOT
+    /// silently vanish or get coerced to empty-string (which would break the
+    /// "-" display fallback, since `Some("")` and `None` render identically
+    /// but mean different things to a caller checking `.is_some()`).
+    #[test]
+    fn set_origin_host_round_trips_through_get_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("origin-host-set"));
+        insert_context_with_doc(&db, &row, ws_id);
+
+        // Freshly created: no host reported yet.
+        assert_eq!(db.get_context(row.context_id).unwrap().unwrap().origin_host, None);
+
+        db.set_origin_host(row.context_id, Some("zorak")).unwrap();
+        assert_eq!(
+            db.get_context(row.context_id).unwrap().unwrap().origin_host,
+            Some("zorak".to_string()),
+            "set_origin_host must be visible on the very next get_context read"
+        );
+
+        // Clearing (host = None) must also round-trip, not merely no-op.
+        db.set_origin_host(row.context_id, None).unwrap();
+        assert_eq!(
+            db.get_context(row.context_id).unwrap().unwrap().origin_host,
+            None,
+            "set_origin_host(None) must clear a previously-set value"
+        );
+    }
+
+    /// `set_origin_host` on an unknown context must fail loudly
+    /// (`NotFound`), same convention as `update_label`/`update_context_type`
+    /// — never a silent no-op that could be mistaken for success.
+    #[test]
+    fn set_origin_host_unknown_context_is_not_found() {
+        let db = KernelDb::in_memory().unwrap();
+        let err = db.set_origin_host(ContextId::new(), Some("moltar")).unwrap_err();
+        assert!(matches!(err, KernelDbError::NotFound(_)), "got: {err:?}");
+    }
+
+    /// `list_active_contexts`/`list_all_contexts`/`structural_parents`/
+    /// `structural_children`/`context_dag`/`fork_lineage`/`subtree_snapshot`/
+    /// `find_context_by_label` all share the same `contexts` column list —
+    /// this exercises the two CTE-based reads (`context_dag`, whose SELECT
+    /// appends `origin_host` BEFORE the extra `depth` column) to catch a
+    /// column-index-off-by-one if `origin_host` and `depth` ever get
+    /// reordered without updating both `row_to_context_row` and the `depth`
+    /// read together.
+    #[test]
+    fn origin_host_survives_the_context_dag_cte_read() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("origin-host-dag"));
+        insert_context_with_doc(&db, &row, ws_id);
+        db.set_origin_host(row.context_id, Some("moltar")).unwrap();
+
+        let dag = db.context_dag().unwrap();
+        let (found, depth) = dag
+            .into_iter()
+            .find(|(r, _)| r.context_id == row.context_id)
+            .expect("row must appear in the DAG (it's a root — no structural edges)");
+        assert_eq!(found.origin_host, Some("moltar".to_string()));
+        assert_eq!(depth, 0, "a root with no structural parent is depth 0");
     }
 
     /// A real `ALTER TABLE` failure — not the expected/ignorable "duplicate
@@ -7118,6 +7250,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         };
 
         let ctx = row.to_context();
@@ -7171,6 +7304,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
@@ -7198,6 +7332,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             cast_id: Some(cast_id),
+            origin_host: None,
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -7286,6 +7421,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(

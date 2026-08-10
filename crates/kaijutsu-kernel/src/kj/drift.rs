@@ -654,6 +654,7 @@ impl KjDispatcher {
                         demoted_at: None,
                         paused_at: None,
                         cast_id: None,
+                        origin_host: None,
                     };
                     db.insert_context_with_document(&row, ws)
                         .map_err(|e| format!("failed to persist lost+found context row: {e}"))

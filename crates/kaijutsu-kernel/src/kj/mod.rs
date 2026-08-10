@@ -1030,6 +1030,7 @@ pub(crate) mod test_helpers {
                 demoted_at: None,
                 paused_at: None,
                 cast_id: None,
+                origin_host: None,
             };
             db.insert_context(&row).unwrap();
 

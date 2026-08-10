@@ -17,11 +17,28 @@ fn cast_tag(cast_id: Option<CastId>, casts: &HashMap<CastId, String>) -> String 
         .unwrap_or_default()
 }
 
+/// `[host:<name>]` tag for `format_context_table`/`format_context_tree` —
+/// same optional-suffix convention as `cast_tag`, but `origin_host` needs no
+/// map lookup (it's a plain string already on the row). Omitted entirely
+/// when unknown (old client, or a creation path with nothing to report —
+/// see `ContextRow::origin_host`'s doc comment), never rendered as "-" here:
+/// this is a tag list, and an unconditional "-" tag on every untouched row
+/// would be noise `kj context info`'s explicit `Host: -` line already covers.
+fn origin_host_tag(origin_host: &Option<String>) -> String {
+    origin_host
+        .as_deref()
+        .map(|h| format!(" [host:{h}]"))
+        .unwrap_or_default()
+}
+
 /// Format a context list as a flat table.
 ///
 /// Marks the current context with `*` and ring-0 (promoted) contexts with a
 /// trailing `[ring0]` tag; `casts` resolves each row's `cast_id` to its label
-/// for an additional `[cast:<label>]` tag (omitted when uncast).
+/// for an additional `[cast:<label>]` tag (omitted when uncast). A
+/// `[host:<name>]` tag follows when `origin_host` is known (docs/issues.md
+/// "cc-* hook re-registration..." — makes the fleet board self-evident from
+/// `kj context list` alone).
 pub fn format_context_table(
     contexts: &[ContextRow],
     current: Option<ContextId>,
@@ -48,7 +65,10 @@ pub fn format_context_table(
             ""
         };
         let cast = cast_tag(ctx.cast_id, casts);
-        lines.push(format!("{marker} {id_short}  {label:<16} {model}{ring0}{cast}"));
+        let host = origin_host_tag(&ctx.origin_host);
+        lines.push(format!(
+            "{marker} {id_short}  {label:<16} {model}{ring0}{cast}{host}"
+        ));
     }
 
     lines.join("\n")
@@ -58,7 +78,7 @@ pub fn format_context_table(
 ///
 /// `dag` is a list of (ContextRow, depth) from the recursive CTE. `casts`
 /// resolves each row's `cast_id` to its label, same convention as
-/// `format_context_table`.
+/// `format_context_table` (including the `[host:<name>]` tag).
 pub fn format_context_tree(
     dag: &[(ContextRow, i64)],
     current: Option<ContextId>,
@@ -81,10 +101,11 @@ pub fn format_context_tree(
         let model = format_model(&ctx.provider, &ctx.model);
         let id_short = ctx.context_id.short();
         let cast = cast_tag(ctx.cast_id, casts);
+        let host = origin_host_tag(&ctx.origin_host);
 
         let prefix = if *depth > 0 { "└─ " } else { "" };
         lines.push(format!(
-            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}{cast}"
+            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}{cast}{host}"
         ));
     }
 
@@ -225,6 +246,15 @@ pub fn format_context_info(
 
     lines.push(format!("Created: {}", format_timestamp(ctx.created_at)));
     lines.push(format!("By:      {}", ctx.created_by.short()));
+    // Advisory: the registering client's self-reported hostname, or "-" when
+    // unknown (old client, or a creation path with nothing to report — see
+    // `ContextRow::origin_host`'s doc comment). Always shown, unlike the
+    // conditionally-omitted fields below — "unknown" is itself the useful
+    // fleet-board answer, not noise to hide.
+    lines.push(format!(
+        "Host:    {}",
+        ctx.origin_host.as_deref().unwrap_or("-")
+    ));
 
     // Time-well placement stamps — omitted entirely when unset, so the
     // common (auto-placed, unpaused) context shows nothing extra.
@@ -417,6 +447,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         }
     }
 
@@ -525,6 +556,53 @@ mod tests {
         assert!(output.contains("Type:    coder"));
         // 32 lowercase hex chars, leading zeros preserved.
         assert!(output.contains("Trace:   000000000000000000000000000000ab"));
+    }
+
+    /// `Host:` is UNCONDITIONAL — unlike Fork/Promoted/Demoted/Paused, which
+    /// are omitted entirely when unset, "unknown host" is itself the useful
+    /// fleet-board answer (not noise to hide), so it renders "-" rather than
+    /// disappearing. This is the display-layer half of "old rows without the
+    /// field still render" — `make_row` here has `origin_host: None`, same
+    /// as a genuinely pre-migration DB row.
+    #[test]
+    fn info_shows_host_as_dash_when_unknown() {
+        let row = make_row(Some("no-host-ctx"), ContextId::new());
+        let output = format_context_info(&row, 0, 0, false, None);
+        assert!(output.contains("Host:    -"), "output: {output}");
+    }
+
+    #[test]
+    fn info_shows_host_when_known() {
+        let mut row = make_row(Some("hosted-ctx"), ContextId::new());
+        row.origin_host = Some("zorak".to_string());
+        let output = format_context_info(&row, 0, 0, false, None);
+        assert!(output.contains("Host:    zorak"), "output: {output}");
+    }
+
+    /// `kj context list`'s table gets the same fact as an OPTIONAL
+    /// `[host:<name>]` tag (never an unconditional "-" tag — see
+    /// `origin_host_tag`'s doc comment on why the table and the `info` text
+    /// use different conventions for the same unknown state).
+    #[test]
+    fn table_tags_origin_host_when_known_and_omits_when_unknown() {
+        let mut hosted = make_row(Some("hosted"), ContextId::new());
+        hosted.origin_host = Some("moltar".to_string());
+        let unhosted = make_row(Some("unhosted"), ContextId::new());
+
+        let output = format_context_table(&[hosted, unhosted], None, &HashMap::new());
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].contains("[host:moltar]"), "output: {output}");
+        assert!(!lines[1].contains("[host:"), "output: {output}");
+    }
+
+    #[test]
+    fn tree_tags_origin_host_when_known() {
+        let mut hosted = make_row(Some("hosted"), ContextId::new());
+        hosted.origin_host = Some("moltar".to_string());
+        let dag = vec![(hosted, 0i64)];
+
+        let output = format_context_tree(&dag, None, &HashMap::new());
+        assert!(output.contains("[host:moltar]"), "output: {output}");
     }
 
     #[test]

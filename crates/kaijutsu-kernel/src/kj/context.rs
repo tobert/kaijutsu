@@ -735,6 +735,11 @@ impl KjDispatcher {
             "consent_mode": format!("{:?}", row.consent_mode),
             "context_state": format!("{:?}", row.context_state),
             "context_type": row.context_type,
+            // Advisory: the registering client's self-reported hostname
+            // (`null` when unknown — old client, or a creation path with
+            // nothing to report). See `ContextRow::origin_host`'s doc
+            // comment.
+            "origin_host": row.origin_host,
             "trace_id": trace_id.map(crate::kj::format::hex32),
             "forked_from": row.forked_from.map(|id| id.to_hex()),
             "fork_kind": row.fork_kind.as_ref().map(|k| format!("{k:?}")),
@@ -1097,6 +1102,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 cast_id: None,
+                origin_host: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -1204,6 +1210,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 cast_id: None,
+                origin_host: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));

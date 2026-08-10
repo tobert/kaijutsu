@@ -156,6 +156,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         }
     }
 

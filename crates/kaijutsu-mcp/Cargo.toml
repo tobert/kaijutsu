@@ -23,6 +23,11 @@ parking_lot.workspace = true
 anyhow.workspace = true
 whoami.workspace = true
 clap.workspace = true
+# Registering client's own hostname, sent to the kernel as advisory
+# `origin_host` metadata (register_session). Same crate + idiom as
+# kaijutsu-app's `sink_host()` (midi_presence.rs) — one convention for
+# "which machine" across the workspace.
+hostname.workspace = true
 
 # MCP server
 rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }

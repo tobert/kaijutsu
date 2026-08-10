@@ -6183,6 +6183,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "hostname",
  "kaijutsu-agent-tools",
  "kaijutsu-client",
  "kaijutsu-crdt",

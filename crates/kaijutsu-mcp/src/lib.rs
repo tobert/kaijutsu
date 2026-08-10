@@ -1510,6 +1510,38 @@ impl KaijutsuMcp {
             }
         };
 
+        // Advisory: record the registering machine's hostname on a FRESH
+        // context only (`!resumed` — the "concluded/archived, mint a
+        // suffixed label" branch above also counts as fresh: `resumed` is
+        // never set there). Mirrors `created_by`/`created_at`: an origin
+        // fact, set once, never overwritten by a later attach from a
+        // different machine (docs/issues.md "cc-* hook re-registration
+        // mints a new context per MCP relaunch" — fleet-board
+        // self-evidence). The stabilization path is covered too: a
+        // rename-in-place keeps this row (and stamp); a reattach switches
+        // to a context an earlier process stamped at its own creation.
+        // Best-effort: a failure here is logged and swallowed rather than
+        // failing the whole registration over a piece of observability
+        // metadata — see `setContextOriginHost`'s capnp doc comment on the
+        // shared-trust/advisory framing.
+        if !resumed {
+            let origin_host = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_default();
+            if !origin_host.is_empty() {
+                if let Err(e) =
+                    remote.actor.set_context_origin_host(context_id, &origin_host).await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "register_session: failed to record origin_host (non-fatal)",
+                    );
+                }
+            }
+        }
+
         // 3-8: sync, build SyncedDocument, spawn doc task + event bridge,
         // publish JoinedContext / shared_context_id — shared with
         // `stabilize_context_label`'s reattach case (see `finish_join`).

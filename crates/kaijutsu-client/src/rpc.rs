@@ -291,6 +291,12 @@ pub struct ContextInfo {
     /// the wire), same falls-through-to-registry-default semantics as an
     /// absent `provider`/`model` override.
     pub cast_label: Option<String>,
+    /// Advisory hostname the registering client self-reported at creation
+    /// (`ContextRow::origin_host`), or `None` when unknown (old client, a
+    /// creation path with nothing to report, or a pre-migration row). Set
+    /// once via `setContextOriginHost`; never overwritten by a later
+    /// resume/attach from a different machine.
+    pub origin_host: Option<String>,
 }
 
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
@@ -1616,6 +1622,41 @@ impl KernelHandle {
                 .get_error()?
                 .to_str()
                 .unwrap_or("set_context_paused failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
+    /// Set (or clear, on `""`) a context's advisory `origin_host` — the
+    /// registering client's own hostname. Called once, right after context
+    /// creation, by a client that knows its own host (e.g.
+    /// `register_session` on the kaijutsu-mcp side); every other creation
+    /// path (fork, genesis bootstrap, the app's `create_context_typed`) is
+    /// unaffected and simply never calls this. Shared-trust model: advisory
+    /// metadata, not auth.
+    #[tracing::instrument(skip(self), name = "rpc_client.set_context_origin_host")]
+    pub async fn set_context_origin_host(
+        &self,
+        context_id: ContextId,
+        origin_host: &str,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.set_context_origin_host_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_origin_host(origin_host);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader
+                .get_error()?
+                .to_str()
+                .unwrap_or("set_context_origin_host failed");
             Err(RpcError::ServerError(msg.to_string()))
         }
     }
@@ -2955,6 +2996,15 @@ fn parse_context_info(
         Some(cast_label_str.to_string())
     };
 
+    // Empty = unknown (old client, no client to ask, or pre-migration row) —
+    // same "absence is the wire sentinel" convention as `cast_label` above.
+    let origin_host_str = reader.get_origin_host()?.to_str().unwrap_or("");
+    let origin_host = if origin_host_str.is_empty() {
+        None
+    } else {
+        Some(origin_host_str.to_string())
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2984,6 +3034,7 @@ fn parse_context_info(
         background_last_finished_status,
         background_last_exit_code,
         cast_label,
+        origin_host,
     })
 }
 

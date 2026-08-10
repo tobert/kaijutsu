@@ -1403,6 +1403,7 @@ fn bootstrap_discovered_context(
         demoted_at: None,
         paused_at: None,
         cast_id: None,
+        origin_host: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -1467,6 +1468,7 @@ mod context_bootstrap_tests {
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -2263,6 +2265,7 @@ fn write_context_row_to_handle_info(
     info.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
 }
 
 /// Verify a context can be joined, healing the DriftRouter registration from
@@ -2446,6 +2449,7 @@ async fn create_context_inner(
             demoted_at: None,
             paused_at: None,
             cast_id: None,
+            origin_host: None,
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error
@@ -3791,6 +3795,9 @@ impl kernel::Server for KernelImpl {
                                 .map(String::as_str)
                                 .unwrap_or(""),
                         );
+                        // Advisory registering-client hostname (empty = unknown).
+                        // See `ContextHandleInfo.originHost`'s capnp doc comment.
+                        c.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
                     }
 
                     // Context-window usage — the bottom-dock gauge's wire spine
@@ -6823,6 +6830,49 @@ impl kernel::Server for KernelImpl {
                     "set_context_paused: context={} paused={}",
                     context_id.short(),
                     paused
+                );
+                results.get().set_success(true);
+            }
+            Err(e) => {
+                results.get().set_success(false);
+                results.get().set_error(e.to_string());
+            }
+        }
+        Promise::ok(())
+    }
+
+    /// Set (or clear, on empty `originHost`) a context's advisory
+    /// `origin_host` — see `setContextOriginHost`'s capnp doc comment.
+    /// Shared-trust model: this is observability, not auth — the server
+    /// trusts the client's self-reported hostname without validating it
+    /// against the connection's actual peer address.
+    fn set_context_origin_host(
+        self: Rc<Self>,
+        params: kernel::SetContextOriginHostParams,
+        mut results: kernel::SetContextOriginHostResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard =
+            extract_rpc_trace(p.get_trace(), "set_context_origin_host").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let origin_host_raw = pry!(pry!(p.get_origin_host()).to_str()).to_owned();
+        let origin_host = if origin_host_raw.is_empty() {
+            None
+        } else {
+            Some(origin_host_raw.as_str())
+        };
+
+        let db = self.kernel.kernel_db.lock();
+        match db.set_origin_host(context_id, origin_host) {
+            Ok(()) => {
+                log::info!(
+                    "set_context_origin_host: context={} host={:?}",
+                    context_id.short(),
+                    origin_host
                 );
                 results.get().set_success(true);
             }
