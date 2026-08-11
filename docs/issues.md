@@ -35,6 +35,56 @@ wants her word.
 
 ---
 
+## rmcp protocol-version fallback drops us to 2025-11-25 (2026-08-11, via kaibo lead; re-verified against our own version)
+
+**Trigger has a date, not a probability: the day a client requests a protocol
+version newer than `2026-07-28`.** Claude Code is the client that will do it.
+
+kaibo lead flagged this as a latent bug across rmcp-based servers. It applies
+to us, but **two of the relayed specifics are wrong for rmcp 3.0.1, which is
+what we pin** (`Cargo.toml:141`; kaibo is on 3.1.2) — and the difference
+matters because the recommended fix does not fix the actual failure.
+
+Read from `~/.cargo/registry/.../rmcp-3.0.1/`:
+
+- **`supported_protocol_versions` is NOT 3.1.0+**, and is not our problem. It
+  exists in 3.0.1 (`src/handler/server.rs:328`) and its trait default already
+  returns `ProtocolVersion::KNOWN_VERSIONS`, which **includes**
+  `V_2026_07_28` (`src/model.rs:186`). So the "strict client rejects
+  tools/list" path (`src/handler/server.rs:65-71`) does not fire for
+  2026-07-28. We do not override it, and we should not need to.
+- **A client asking for `2026-07-28` is honored, not downgraded.**
+  `negotiate_protocol_version` (`src/service/server.rs:464-478`) returns the
+  client's requested version whenever it is in `KNOWN_VERSIONS`.
+
+The real exposure is narrower and worse:
+
+- For a version rmcp 3.0.1 does **not** know — i.e. anything newer than
+  `2026-07-28` — negotiation falls back to `server_fallback`, which is
+  `get_info().protocol_version`. Our `get_info` (`crates/kaijutsu-mcp/src/lib.rs:2130`)
+  uses `ServerInfo::new(...)` and never calls `with_protocol_version`, so it
+  takes `ProtocolVersion::default()` → `LATEST` → **`V_2025_11_25`**
+  (`src/model.rs:175`). We would not fall back one step to 2026-07-28; we
+  would fall back **two**, past a version we fully support.
+- Not fully silent: it emits `tracing::warn!("client requested unsupported
+  protocol version; falling back to server default")`. Whether we would *see*
+  that in a stdio server's log is a separate question worth answering.
+
+**The fix is `with_protocol_version`, not `supported_protocol_versions`.**
+Overriding the latter cannot help — `negotiate_protocol_version` never
+consults it; it reads the hardcoded `KNOWN_VERSIONS`. Setting
+`ServerInfo::new(...).with_protocol_version(ProtocolVersion::V_2026_07_28)`
+makes the fallback land on the newest version we actually implement. Cheap,
+and it converts a two-step silent-ish regression into a one-step one.
+
+Then re-check on any rmcp bump: this whole analysis is version-pinned, and the
+constants (`LATEST`, `KNOWN_VERSIONS`, `STANDARD_HEADERS = V_2026_07_28`) are
+exactly the kind of thing that moves underneath us. Related: the SEP-2577
+deprecations papered over in the 1.7 → 3.0.1 bump are still open above.
+
+Skew note: `~/bin/kaijutsu-mcp` is a **separately built binary** — a fix here
+does not reach a running client until that binary is rebuilt and relaunched.
+
 ## `kj backend` has no health check (re-filed 2026-08-11)
 
 Salvaged from the deleted models.toml papercuts section — the only idea there
