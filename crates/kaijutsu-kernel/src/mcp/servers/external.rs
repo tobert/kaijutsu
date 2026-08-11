@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
-    ProgressNotificationParam, ReadResourceRequestParams, RequestMetaObject, ResourceContents,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
+    ResourceContents, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kept for now, see the
 // `enable_roots` comment on `BrokerClientHandler::new` below.
@@ -98,6 +98,15 @@ impl BrokerClientHandler {
     #[allow(deprecated)]
     fn new(tx: broadcast::Sender<ServerNotification>) -> Self {
         let mut info = ClientInfo::default();
+        // Advertise the newest protocol this rmcp knows, not `ProtocolVersion::
+        // default()`. `default()` is `LATEST`, which is *not* the newest known
+        // version — rmcp pins `LATEST = V_2025_11_25` while `KNOWN_VERSIONS`
+        // tops out at `V_2026_07_28` (true in both 3.0.1 and 3.1.2). Taking the
+        // default silently negotiated every external server (kaibo, bevy_brp)
+        // down to 2025-11-25 and dropped the version-gated fields with it.
+        // Bump this deliberately when rmcp learns a newer version; see
+        // docs/issues.md "rmcp protocol-version fallback".
+        info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities = ClientCapabilities::builder()

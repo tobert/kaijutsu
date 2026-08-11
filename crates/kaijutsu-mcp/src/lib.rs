@@ -56,6 +56,8 @@ use rmcp::{
         Resource,
         ResourceContents,
         Role,
+        // Protocol negotiation
+        ProtocolVersion,
         // Server types
         ServerCapabilities,
         ServerInfo,
@@ -2138,7 +2140,17 @@ impl ServerHandler for KaijutsuMcp {
                 .enable_logging()
                 .enable_completions()
                 .build(),
-        ).with_instructions("Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with CRDT-backed consistency.")
+        )
+        // Advertise the newest protocol this rmcp knows, not `ProtocolVersion::
+        // default()` (= `LATEST` = `V_2025_11_25`, which is NOT the newest known
+        // version — `KNOWN_VERSIONS` tops out at `V_2026_07_28` in both 3.0.1 and
+        // 3.1.2). This value is the *fallback* a client lands on when it asks for
+        // a version rmcp doesn't know; leaving it at the default would drop such
+        // a client two steps, past a version we fully support. Bump deliberately
+        // when rmcp learns a newer version. See docs/issues.md "rmcp
+        // protocol-version fallback".
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        .with_instructions("Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with CRDT-backed consistency.")
     }
 
     // ========================================================================
