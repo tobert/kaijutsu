@@ -17,8 +17,8 @@ use super::types::{
 
 /// Fan-out notification from a server instance.
 ///
-/// `Elicitation` is reserved per D-25; no emitter in Phase 1. The coalescer
-/// (§5.3) subscribes to these streams in Phase 2.
+/// `Elicitation` gained an emitter in the 2026-07-28 work (it declines, but
+/// visibly). The coalescer (§5.3) subscribes to these streams in Phase 2.
 #[derive(Clone, Debug)]
 pub enum ServerNotification {
     ToolsChanged,
@@ -30,6 +30,16 @@ pub enum ServerNotification {
         tool: Option<String>,
     },
     Elicitation(ElicitationRequest),
+    /// Progress against a long-running call we tagged with a `progressToken`.
+    /// `token` is the self-describing string we minted in `build_meta`
+    /// (`kaijutsu/<instance>/<nonce>`), so a log line identifies its own call
+    /// without a correlation table.
+    Progress {
+        token: String,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<String>,
+    },
 }
 
 /// Uniform tool interface (§4.1).

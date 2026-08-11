@@ -162,11 +162,22 @@ impl ClientHandler for BrokerClientHandler {
 
     fn on_progress(
         &self,
-        _params: ProgressNotificationParam,
+        params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        // Phase 1: progress → not surfaced yet (coalescer comes in Phase 2).
-        async {}
+        let tx = self.tx.clone();
+        async move {
+            let token = match &params.progress_token.0 {
+                rmcp::model::NumberOrString::String(s) => s.to_string(),
+                rmcp::model::NumberOrString::Number(n) => n.to_string(),
+            };
+            let _ = tx.send(ServerNotification::Progress {
+                token,
+                progress: params.progress,
+                total: params.total,
+                message: params.message,
+            });
+        }
     }
 
     /// Answer an `elicitation/create` from an external server.
@@ -522,7 +533,24 @@ impl ExternalMcpServer {
                 }),
             );
         }
-        RequestMetaObject::from(obj)
+        let mut meta = RequestMetaObject::from(obj);
+        // A server only reports progress against a token the *client* supplied,
+        // so without this a 15-minute consult is silent by construction —
+        // nothing in `on_progress` could have fired no matter how it was
+        // written. The token is self-describing (`kaijutsu/<instance>/<nonce>`)
+        // so a progress line identifies its own call without a correlation
+        // table on our side.
+        meta.set_progress_token(rmcp::model::ProgressToken(
+            rmcp::model::NumberOrString::String(
+                format!(
+                    "kaijutsu/{}/{}",
+                    self.instance_id,
+                    uuid::Uuid::now_v7().simple()
+                )
+                .into(),
+            ),
+        ));
+        meta
     }
 }
 
@@ -952,6 +980,49 @@ mod tests {
             marked = true
         });
         assert!(marked, "a closed transport is a real health signal");
+    }
+
+    /// The load-bearing half of progress support. A server only reports
+    /// against a `progressToken` the client supplied, so if this stops being
+    /// set, `on_progress` goes silent and no test of the handler would notice
+    /// — the notification simply never arrives. Assert the token exists and is
+    /// self-describing, since a bare uuid in a log is useless without a
+    /// correlation table we do not keep.
+    #[test]
+    fn requests_carry_a_self_describing_progress_token() {
+        let server = fake_server("test.ext");
+        let ctx = CallContext {
+            principal_id: PrincipalId::new(),
+            context_id: ContextId::new(),
+            session_id: SessionId::new(),
+            kernel_id: KernelId::new(),
+            cwd: None,
+            trace: TraceContext {
+                traceparent: String::new(),
+                tracestate: String::new(),
+            },
+        };
+
+        let meta = server.build_meta(&ctx);
+        let token = meta
+            .get_progress_token()
+            .expect("requests must carry a progressToken or progress is impossible");
+        let token = match token.0 {
+            rmcp::model::NumberOrString::String(s) => s.to_string(),
+            rmcp::model::NumberOrString::Number(n) => n.to_string(),
+        };
+        assert!(
+            token.starts_with("kaijutsu/test.ext/"),
+            "token should name its instance so a progress log is self-locating, got {token}"
+        );
+
+        // Two calls must not collide, or progress lines from concurrent
+        // consults interleave under one identity.
+        let token2 = match server.build_meta(&ctx).get_progress_token().expect("token").0 {
+            rmcp::model::NumberOrString::String(s) => s.to_string(),
+            rmcp::model::NumberOrString::Number(n) => n.to_string(),
+        };
+        assert_ne!(token, token2, "progress tokens must be per-call");
     }
 
     #[test]

@@ -2625,6 +2625,26 @@ async fn pump_loop(
                     }
                 }
             }
+            Ok(ServerNotification::Progress {
+                token,
+                progress,
+                total,
+                message,
+            }) => {
+                // Surfacing this as a log is the whole point for now: a long
+                // kaibo consult used to be indistinguishable from a hung one.
+                // Deliberately NOT routed through the coalescer — progress is
+                // already rate-limited by the sender, and collapsing it would
+                // destroy exactly the liveness signal we came for.
+                tracing::info!(
+                    instance = %id,
+                    token = %token,
+                    progress,
+                    total,
+                    message = message.as_deref().unwrap_or(""),
+                    "MCP progress"
+                );
+            }
             Ok(ServerNotification::Elicitation(req)) => {
                 // No collector wired yet (docs/issues.md, elicitation slice
                 // 1b) — `BrokerClientHandler::create_elicitation` has already
