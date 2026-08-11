@@ -70,17 +70,30 @@ The real exposure is narrower and worse:
   protocol version; falling back to server default")`. Whether we would *see*
   that in a stdio server's log is a separate question worth answering.
 
-**The fix is `with_protocol_version`, not `supported_protocol_versions`.**
-Overriding the latter cannot help — `negotiate_protocol_version` never
-consults it; it reads the hardcoded `KNOWN_VERSIONS`. Setting
+**The fix is `with_protocol_version`.** Setting
 `ServerInfo::new(...).with_protocol_version(ProtocolVersion::V_2026_07_28)`
 makes the fallback land on the newest version we actually implement. Cheap,
 and it converts a two-step silent-ish regression into a one-step one.
 
-Then re-check on any rmcp bump: this whole analysis is version-pinned, and the
-constants (`LATEST`, `KNOWN_VERSIONS`, `STANDARD_HEADERS = V_2026_07_28`) are
-exactly the kind of thing that moves underneath us. Related: the SEP-2577
-deprecations papered over in the 1.7 → 3.0.1 bump are still open above.
+**Version-qualified, and this is the part that will bite on a bump:** *on
+3.0.1*, overriding `supported_protocol_versions` cannot help, because
+`negotiate_protocol_version` never consults it — it reads the hardcoded
+`KNOWN_VERSIONS` (`src/service/server.rs:468`). **That mechanism is fixed
+upstream in 3.1.2**, where negotiation *does* consult the server's supported
+set (kaibo lead's read of their own vendored 3.1.2: `service/server.rs:587-591`,
+with a `server_supported.contains` check at `:474`). So the *lever* is
+correct on both, but the *reason it works* differs — do not carry this
+paragraph's reasoning across an rmcp bump without re-reading the source.
+
+Re-check on any rmcp bump generally: the constants (`LATEST`,
+`KNOWN_VERSIONS`, `STANDARD_HEADERS = V_2026_07_28`) and the negotiation path
+both move underneath us. Related: the SEP-2577 deprecations papered over in
+the 1.7 → 3.0.1 bump are still open above.
+
+**Practice this produced** (kaibo lead, after each of us read our own pinned
+copy and reached different true answers): *"neither of us should have
+inherited the other's read of a differently-pinned crate."* A dependency
+analysis is a claim about a version, not about a crate.
 
 Skew note: `~/bin/kaijutsu-mcp` is a **separately built binary** — a fix here
 does not reach a running client until that binary is rebuilt and relaunched.
