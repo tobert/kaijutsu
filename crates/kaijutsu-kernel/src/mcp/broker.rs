@@ -2625,8 +2625,19 @@ async fn pump_loop(
                     }
                 }
             }
-            Ok(ServerNotification::Elicitation(_)) => {
-                // Reserved per D-25; no live handling yet.
+            Ok(ServerNotification::Elicitation(req)) => {
+                // No collector wired yet (docs/issues.md, elicitation slice
+                // 1b) — `BrokerClientHandler::create_elicitation` has already
+                // declined by the time this arrives. Log it rather than
+                // dropping it on the floor: until something can answer, the
+                // only thing that makes an unanswerable question actionable is
+                // knowing it was asked, and by whom.
+                tracing::warn!(
+                    instance = %id,
+                    message = %req.message,
+                    has_schema = req.schema.is_some(),
+                    "MCP elicitation received and declined (no collector wired)"
+                );
             }
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,

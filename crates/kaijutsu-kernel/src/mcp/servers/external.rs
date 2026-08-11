@@ -15,14 +15,15 @@ use async_trait::async_trait;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
-    ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
-    ResourceContents, SubscribeRequestParams, UnsubscribeRequestParams,
+    ElicitRequestParams, ElicitResult, ElicitationAction, ProgressNotificationParam,
+    ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, ResourceContents,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kept for now, see the
 // `enable_roots` comment on `BrokerClientHandler::new` below.
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
-use rmcp::service::{NotificationContext, RunningService};
+use rmcp::service::{NotificationContext, RequestContext, RunningService};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient};
 use tokio::process::Command;
@@ -35,7 +36,7 @@ use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{
-    Health, InstanceId, KernelCallParams, KernelReadResource, KernelResource,
+    ElicitationRequest, Health, InstanceId, KernelCallParams, KernelReadResource, KernelResource,
     KernelResourceContents, KernelResourceList, KernelTool, KernelToolResult, LogLevel,
     ToolContent,
 };
@@ -166,6 +167,62 @@ impl ClientHandler for BrokerClientHandler {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         // Phase 1: progress → not surfaced yet (coalescer comes in Phase 2).
         async {}
+    }
+
+    /// Answer an `elicitation/create` from an external server.
+    ///
+    /// We still **decline** — nothing in the kernel can collect an answer yet
+    /// (that is slice 1b in `docs/issues.md`, a design pass: where a pending
+    /// elicitation lives, how an answer routes back, timeout behaviour). What
+    /// this override changes is that the decline is no longer *invisible*.
+    ///
+    /// rmcp's trait default declines silently, so an external server asking a
+    /// question got a "no" that nobody — human, sibling context, or log —
+    /// ever saw. CLAUDE.md: silent fallbacks are often a mistake. We now emit
+    /// the reserved `ServerNotification::Elicitation` (D-25) and warn, so the
+    /// request is at least observable and we can find out whether kaibo or
+    /// bevy_brp ever actually send one.
+    fn create_elicitation(
+        &self,
+        request: ElicitRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send + '_ {
+        let tx = self.tx.clone();
+        async move {
+            let (message, schema) = match &request {
+                ElicitRequestParams::FormElicitationParams {
+                    message,
+                    requested_schema,
+                    ..
+                } => (
+                    message.clone(),
+                    serde_json::to_value(requested_schema).ok(),
+                ),
+                ElicitRequestParams::UrlElicitationParams {
+                    message,
+                    url,
+                    elicitation_id,
+                    ..
+                } => (
+                    format!("{message} (url mode: {url}, id {elicitation_id})"),
+                    None,
+                ),
+                // `ElicitRequestParams` is #[non_exhaustive]: a mode added by a
+                // future spec must still be seen rather than silently declined.
+                other => (format!("unrecognized elicitation mode: {other:?}"), None),
+            };
+
+            tracing::warn!(
+                "MCP elicitation declined (no collector wired yet — docs/issues.md \
+                 slice 1b): {message}"
+            );
+            let _ = tx.send(ServerNotification::Elicitation(ElicitationRequest {
+                message: std::borrow::Cow::Owned(message),
+                schema,
+            }));
+
+            Ok(ElicitResult::new(ElicitationAction::Decline))
+        }
     }
 
     fn on_tool_list_changed(
@@ -824,6 +881,77 @@ mod tests {
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
         }
+    }
+
+    /// Pins the client half of the 2026-07-28 fix. `ClientInfo::default()`
+    /// takes `ProtocolVersion::default()`, which is `LATEST` — and rmcp pins
+    /// `LATEST = V_2025_11_25` while `KNOWN_VERSIONS` tops out at
+    /// `V_2026_07_28`. Taking the default silently negotiated every external
+    /// server down two versions. This fails if someone drops the explicit
+    /// assignment, and it fails *loudly* rather than degrading quietly on the
+    /// wire, which is the whole reason it exists.
+    #[test]
+    fn client_advertises_the_newest_protocol_rmcp_knows() {
+        let (tx, _) = broadcast::channel(4);
+        let handler = BrokerClientHandler::new(tx);
+        let advertised = handler.get_info().protocol_version;
+
+        assert_eq!(
+            advertised,
+            ProtocolVersion::V_2026_07_28,
+            "client must advertise 2026-07-28, not ProtocolVersion::default()"
+        );
+        assert_ne!(
+            advertised,
+            ProtocolVersion::default(),
+            "if rmcp's LATEST ever catches up to the newest known version this \
+             assertion goes vacuous — at that point delete it and re-read \
+             ProtocolVersion::KNOWN_VERSIONS to pick the new ceiling"
+        );
+    }
+
+    /// A per-call protocol outcome must not condemn the whole instance.
+    /// Now that we negotiate 2026-07-28 a server may answer `tools/call` with
+    /// an MRTR `InputRequiredResult` or a task result; the raw `Peer` methods
+    /// surface those as `UnexpectedResponse`. Marking down on that would take
+    /// out every other call to the server, and `mark_down` has no automatic
+    /// recovery — it stays Down until `kj mcp reload`.
+    #[test]
+    fn per_call_outcomes_do_not_mark_the_instance_down() {
+        use rmcp::service::ServiceError;
+
+        let instance = InstanceId::new("test.ext");
+        for err in [
+            ServiceError::UnexpectedResponse,
+            ServiceError::InputRequiredRoundsExceeded { max_rounds: 10 },
+            ServiceError::Cancelled { reason: None },
+            ServiceError::Timeout {
+                timeout: std::time::Duration::from_secs(900),
+            },
+        ] {
+            let label = err.to_string();
+            let mut marked = false;
+            let _ = map_rmcp_service_error(err, &instance, |_| marked = true);
+            assert!(
+                !marked,
+                "{label} must not mark the instance Down — it is a per-call \
+                 outcome, not a health signal"
+            );
+        }
+    }
+
+    /// The counterweight to the test above: a genuinely broken transport
+    /// still has to mark the instance Down, or the health model is decorative.
+    #[test]
+    fn transport_failure_still_marks_the_instance_down() {
+        use rmcp::service::ServiceError;
+
+        let instance = InstanceId::new("test.ext");
+        let mut marked = false;
+        let _ = map_rmcp_service_error(ServiceError::TransportClosed, &instance, |_| {
+            marked = true
+        });
+        assert!(marked, "a closed transport is a real health signal");
     }
 
     #[test]
