@@ -39,8 +39,10 @@ use rmcp::{
         router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
     },
     model::{
+        CallToolResult,
         // Resource types
         CancelledNotificationParam,
+        ContentBlock,
         // Completion types
         CompleteRequestParams,
         CompleteResult,
@@ -185,7 +187,34 @@ impl ShellCompletion {
     /// `context_shell`. The shape is documented on the tool descriptions —
     /// agents parse this to extract `stdout`, `exit_code`, structured `data`,
     /// and the result block id for follow-up reads.
-    fn to_json(&self) -> String {
+    ///
+    /// Callers get it via `into_tool_result`, which ships it as both text and
+    /// `structuredContent`.
+    /// Wrap the envelope as a 2026-07-28 tool result.
+    ///
+    /// `CallToolResult::structured` puts the JSON in **both** places: `content`
+    /// as text (byte-identical to what `to_json` returned before, so every
+    /// existing consumer is unaffected) and `structuredContent` as a real
+    /// object. Clients that understand the new field stop re-parsing a string;
+    /// clients that don't see no change at all. Purely additive on the wire.
+    ///
+    /// Error envelopes (`timeout`, `stream_closed`) deliberately do NOT use
+    /// `structured_error`: `isError` is for "the tool failed to run", and here
+    /// the tool ran fine and is reporting a command outcome. Callers detect
+    /// failure via `exit_code` / `status`, exactly as the tool description
+    /// says — flipping `isError` would make well-formed results look like tool
+    /// faults.
+    fn into_tool_result(&self) -> CallToolResult {
+        CallToolResult::structured(self.to_value())
+    }
+
+    /// The envelope as a real `serde_json::Value`.
+    ///
+    /// This is the single source of truth for the shape; `to_json` stringifies
+    /// it and the `shell` tool hands it to `CallToolResult::structured` so the
+    /// same object rides both as text (back-compat) and as
+    /// `structuredContent` (2026-07-28).
+    fn to_value(&self) -> serde_json::Value {
         match self {
             Self::Done {
                 snapshot,
@@ -223,7 +252,6 @@ impl ShellCompletion {
                     "data": data,
                     "elapsed_ms": elapsed_ms,
                 })
-                .to_string()
             }
             Self::Timeout {
                 cmd_block_id,
@@ -236,8 +264,7 @@ impl ShellCompletion {
                 "block_id": cmd_block_id.to_key(),
                 "elapsed_ms": elapsed_ms,
                 "error": format!("Timeout after {}s waiting for command", timeout_secs),
-            })
-            .to_string(),
+            }),
             Self::StreamClosed {
                 cmd_block_id,
                 elapsed_ms,
@@ -248,10 +275,50 @@ impl ShellCompletion {
                 "block_id": cmd_block_id.to_key(),
                 "elapsed_ms": elapsed_ms,
                 "error": "Event stream closed before completion",
-            })
-            .to_string(),
+            }),
         }
     }
+}
+
+/// Declared result shape for `shell` / `context_shell` (`Tool.outputSchema`,
+/// 2026-07-28).
+///
+/// Hand-written rather than derived: the envelope is assembled with
+/// `serde_json::json!` from several sources (`BlockSnapshot`, `OutputData`,
+/// timing) and has no single Rust struct to `#[derive(JsonSchema)]` from.
+/// Inventing one purely to derive a schema would put a second definition of
+/// the shape next to the first and let them drift — the exact failure this
+/// codebase keeps finding. Keep this in step with
+/// `ShellCompletion::to_value` by hand; the round-trip test below fails if a
+/// key goes missing.
+///
+/// `exit_code` is `["integer", "null"]` on purpose: null means "hasn't
+/// replicated yet", which is deliberately distinct from 0.
+fn shell_output_schema() -> std::sync::Arc<rmcp::model::JsonObject> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "stdout": { "type": "string" },
+            "stderr": { "type": "string" },
+            "exit_code": {
+                "type": ["integer", "null"],
+                "description": "null = not yet replicated; treat as unknown, not success"
+            },
+            "status": { "type": "string" },
+            "block_id": { "type": "string" },
+            "content_type": { "type": "string" },
+            "ephemeral": { "type": "boolean" },
+            "data": { "description": "kj structured payload when present" },
+            "elapsed_ms": { "type": "integer" },
+            "error": { "type": "string", "description": "present on timeout / stream_closed" }
+        },
+        "required": ["stdout", "exit_code", "status", "block_id", "elapsed_ms"]
+    });
+    let obj = match schema {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!("literal above is an object"),
+    };
+    std::sync::Arc::new(obj)
 }
 
 /// Remote backend state — persistent actor connection to kaijutsu-server.
@@ -1190,24 +1257,39 @@ impl KaijutsuMcp {
 
     #[tool(
         description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as CRDT blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
-        annotations(open_world_hint = true)
+        annotations(open_world_hint = true),
+        output_schema = shell_output_schema()
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
-    pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
+    pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> CallToolResult {
+        // These three are *pre-execution* failures: the tool never ran. They
+        // now carry `isError: true` instead of returning an error string as a
+        // successful result, which is what "Error: ..." text used to do — a
+        // client had to string-match to notice. A command that runs and exits
+        // non-zero is NOT this case and stays a success envelope (see
+        // `into_tool_result`).
         let (ctx_id, actor) = match self.require_joined().await {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
         };
         let remote = match self.remote() {
             Some(r) => r,
-            None => return "Error: shell requires --connect to server".to_string(),
+            None => {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Error: shell requires --connect to server",
+                )]);
+            }
         };
         // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
         // when execution completes.
         let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
             Ok(id) => id,
-            Err(e) => return format!("Error starting command: {e}"),
+            Err(e) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error starting command: {e}"
+                ))]);
+            }
         };
 
         tracing::info!(
@@ -1227,7 +1309,7 @@ impl KaijutsuMcp {
             "Shell command",
         )
         .await
-        .to_json()
+        .into_tool_result()
     }
 
     // ========================================================================
@@ -2854,7 +2936,7 @@ mod tests {
             snapshot: Box::new(snap),
             elapsed_ms: 42,
         };
-        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+        let json: serde_json::Value = completion.to_value();
 
         assert_eq!(json["stdout"], "hello world\n");
         assert_eq!(json["stderr"], "", "no stderr → empty string");
@@ -2865,6 +2947,91 @@ mod tests {
         assert_eq!(json["ephemeral"], false);
         assert!(json["data"].is_null(), "no OutputData → data must be null");
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    /// The 2026-07-28 shape: the envelope must ride as BOTH `content` text and
+    /// `structuredContent`. The text half is what every existing consumer
+    /// reads, so it must stay byte-identical to the old `to_json()` output —
+    /// this change is additive on the wire or it is a breaking one.
+    #[test]
+    fn tool_result_carries_the_envelope_as_text_and_structured() {
+        let snap = make_result_snapshot("hello\n", Some(0));
+        let completion = ShellCompletion::Done {
+            snapshot: Box::new(snap),
+            elapsed_ms: 7,
+        };
+        let value = completion.to_value();
+        let result = completion.into_tool_result();
+
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structuredContent must be present");
+        assert_eq!(structured, &value, "structuredContent must be the envelope");
+
+        let text = match result.content.first().expect("a content block") {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected a text content block, got {other:?}"),
+        };
+        assert_eq!(
+            text,
+            value.to_string(),
+            "content text must remain the serialized envelope — older clients read this"
+        );
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "a command that ran is not a tool failure, whatever its exit code"
+        );
+    }
+
+    /// A non-zero exit is a *command* outcome, not a *tool* failure. If this
+    /// ever flips to `isError: true`, every failing build would look to a
+    /// client like the shell tool itself broke.
+    #[test]
+    fn nonzero_exit_is_not_a_tool_error() {
+        let snap = make_result_snapshot("boom\n", Some(127));
+        let result = ShellCompletion::Done {
+            snapshot: Box::new(snap),
+            elapsed_ms: 2,
+        }
+        .into_tool_result();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["exit_code"],
+            127
+        );
+    }
+
+    /// The declared schema and the envelope must not drift. Every `required`
+    /// key in the schema has to actually appear in a Done envelope.
+    #[test]
+    fn output_schema_matches_the_envelope() {
+        let snap = make_result_snapshot("x\n", Some(0));
+        let value = ShellCompletion::Done {
+            snapshot: Box::new(snap),
+            elapsed_ms: 1,
+        }
+        .to_value();
+
+        let schema = shell_output_schema();
+        let required = schema["required"].as_array().expect("required list");
+        for key in required {
+            let key = key.as_str().unwrap();
+            assert!(
+                value.get(key).is_some(),
+                "schema requires `{key}` but the envelope has no such field"
+            );
+        }
+
+        let props = schema["properties"].as_object().expect("properties");
+        for key in value.as_object().unwrap().keys() {
+            assert!(
+                props.contains_key(key),
+                "envelope emits `{key}` but the schema does not declare it"
+            );
+        }
     }
 
     /// `to_json()` must use `OutputData::to_json()`'s semantic form — a kj
@@ -2885,7 +3052,7 @@ mod tests {
             snapshot: Box::new(snap),
             elapsed_ms: 7,
         };
-        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+        let json: serde_json::Value = completion.to_value();
 
         assert_eq!(
             json["data"],
@@ -2901,14 +3068,11 @@ mod tests {
         // inside stdout).
         let snap =
             make_result_snapshot_with_stderr("build ok\n", "warning: unused variable\n", Some(0));
-        let json: serde_json::Value = serde_json::from_str(
-            &ShellCompletion::Done {
-                snapshot: Box::new(snap),
-                elapsed_ms: 3,
-            }
-            .to_json(),
-        )
-        .unwrap();
+        let json: serde_json::Value = ShellCompletion::Done {
+            snapshot: Box::new(snap),
+            elapsed_ms: 3,
+        }
+        .to_value();
 
         assert_eq!(json["stdout"], "build ok\n");
         assert_eq!(json["stderr"], "warning: unused variable\n");
@@ -2927,7 +3091,7 @@ mod tests {
             snapshot: Box::new(snap),
             elapsed_ms: 5,
         };
-        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+        let json: serde_json::Value = completion.to_value();
 
         assert_eq!(json["exit_code"], 7);
         assert_eq!(json["status"], "error");
@@ -2941,14 +3105,11 @@ mod tests {
         // that produced the empty-stdout-after-reconnect bug; `null` is self-
         // announcing so callers don't trust a fabricated success.
         let snap = make_result_snapshot("ok\n", None);
-        let json: serde_json::Value = serde_json::from_str(
-            &ShellCompletion::Done {
-                snapshot: Box::new(snap),
-                elapsed_ms: 1,
-            }
-            .to_json(),
-        )
-        .unwrap();
+        let json: serde_json::Value = ShellCompletion::Done {
+            snapshot: Box::new(snap),
+            elapsed_ms: 1,
+        }
+        .to_value();
         assert!(
             json["exit_code"].is_null(),
             "missing exit_code must be null, got {}",
@@ -2970,7 +3131,7 @@ mod tests {
             timeout_secs: 300,
             elapsed_ms: 300_000,
         };
-        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+        let json: serde_json::Value = completion.to_value();
 
         assert_eq!(json["status"], "timeout");
         assert_eq!(json["exit_code"], -1);
@@ -2994,7 +3155,7 @@ mod tests {
             cmd_block_id,
             elapsed_ms: 50,
         };
-        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+        let json: serde_json::Value = completion.to_value();
 
         assert_eq!(json["status"], "stream_closed");
         assert_eq!(json["exit_code"], -1);

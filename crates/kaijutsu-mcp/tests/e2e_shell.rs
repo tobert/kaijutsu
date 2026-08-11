@@ -107,7 +107,12 @@ fn shell_returns_stdout() {
                 timeout_secs: Some(30),
             }))
             .await;
-        let env: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // `shell` returns a 2026-07-28 tool result; the envelope rides as
+        // `structuredContent` (and, for older clients, as content text).
+        let env: serde_json::Value = out
+            .structured_content
+            .clone()
+            .expect("shell must return structuredContent");
 
         assert_eq!(
             env["status"].as_str(),
@@ -177,7 +182,12 @@ fn shell_survives_dead_event_feed() {
             }))
             .await;
         let elapsed = started.elapsed();
-        let env: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // `shell` returns a 2026-07-28 tool result; the envelope rides as
+        // `structuredContent` (and, for older clients, as content text).
+        let env: serde_json::Value = out
+            .structured_content
+            .clone()
+            .expect("shell must return structuredContent");
 
         assert_eq!(
             env["status"].as_str(),
@@ -221,7 +231,12 @@ fn shell_sequential_commands() {
                     timeout_secs: Some(30),
                 }))
                 .await;
-            let env: serde_json::Value = serde_json::from_str(&out).unwrap();
+            // `shell` returns a 2026-07-28 tool result; the envelope rides as
+        // `structuredContent` (and, for older clients, as content text).
+        let env: serde_json::Value = out
+            .structured_content
+            .clone()
+            .expect("shell must return structuredContent");
             assert_eq!(
                 env["stdout"].as_str(),
                 Some(format!("line{n}\n").as_str()),

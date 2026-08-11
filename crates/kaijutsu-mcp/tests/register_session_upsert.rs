@@ -95,7 +95,9 @@ async fn run_shell(mcp: &KaijutsuMcp, command: &str) -> serde_json::Value {
             timeout_secs: Some(30),
         }))
         .await;
-    serde_json::from_str(&out).unwrap_or_else(|e| panic!("shell reply was not JSON: {e}: {out}"))
+    out.structured_content
+        .clone()
+        .unwrap_or_else(|| panic!("shell reply carried no structuredContent: {out:?}"))
 }
 
 /// The core regression guard: a second MCP session (a fresh actor — the
