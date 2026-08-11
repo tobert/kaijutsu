@@ -98,6 +98,106 @@ analysis is a claim about a version, not about a crate.
 Skew note: `~/bin/kaijutsu-mcp` is a **separately built binary** — a fix here
 does not reach a running client until that binary is rebuilt and relaunched.
 
+## MCP 2026-07-28 adoption — four slices, in priority order (2026-08-11, post rmcp 3.1.2 bump)
+
+We now negotiate `2026-07-28` on both surfaces and run rmcp 3.1.2. That opens
+four things worth having. Ordered by value; Amy approved working them in this
+order. Verified against the vendored SDK, not training memory — re-verify on
+any rmcp bump (see the version trap in the rmcp entry above).
+
+### 1. Elicitation — we silently decline every request today
+
+`BrokerClientHandler` (`crates/kaijutsu-kernel/src/mcp/servers/external.rs`)
+does not override `create_elicitation`, so rmcp's trait default
+(`handler/client.rs:179-191`) **auto-declines every elicitation, silently**. An
+external server asking us a question gets a "no" nobody ever sees. That is the
+silent-fallback pattern CLAUDE.md rejects, and the socket for the fix already
+exists: `ServerNotification::Elicitation` (`mcp/server_like.rs`, `mcp/types.rs`)
+is defined and its one consumer no-ops it (`mcp/broker.rs`, *"Reserved per
+D-25; no live handling yet"*). Nothing constructs it.
+
+Mechanism: a server sends `elicitation/create` in one of two modes — **form**
+(`message` + `requested_schema`, a restricted JSON Schema of primitives only,
+`model/elicitation_schema.rs`) or **URL** (`message` + `url` +
+`elicitation_id`, for out-of-band consent flows). We answer
+`ElicitResult { action: Accept | Decline | Cancel, content }`.
+
+Slices:
+- **1a — stop being silent.** Override `create_elicitation` to emit
+  `ServerNotification::Elicitation` and surface it as a block, then decline.
+  Same outcome as today, but *visible*. Small, no policy questions.
+- **1b — let someone answer.** In the many-hands model the answer can come
+  from a human, a sibling context, or the app — the protocol does not care
+  who. Wants a real design pass: where the pending elicitation lives, how an
+  answer routes back, timeout behaviour. **Not a patch — a design
+  conversation.**
+- Blocker for both: `peer.elicit`/`elicit_url` are gated
+  `#[cfg(all(feature = "schemars", feature = "elicitation"))]`;
+  `crates/kaijutsu-mcp/Cargo.toml` enables only `server`/`macros`/
+  `transport-io`, so the **`elicitation` feature must be added**.
+- Unknown, needs probing: whether kaibo or bevy_brp ever send elicitation, and
+  whether Claude Code's client implements it on the server surface.
+
+### 2. `structuredContent` + `outputSchema` on `shell`
+
+`ShellCompletion::to_json` hand-rolls an envelope, stringifies it into a
+`TextContent`, and hopes the caller re-parses. 2026-07-28 has a first-class
+mechanism: `Tool::with_output_schema::<T>()` declares the result shape, and
+`CallToolResult::structured()` carries it as real JSON
+(`model.rs` `structured_content`). Keep the existing field names
+(`stdout`/`stderr`/`exit_code`/`status`/`block_id`/`content_type`/`ephemeral`/
+`data`/`elapsed_ms`) so nothing downstream breaks; add a short human-readable
+`text` block for clients that only render `content`. Consider
+`ContentBlock::ResourceLink` for `block_id` so it becomes navigable rather
+than a string the model must know to re-request. Self-contained, low risk.
+
+### 3. `on_progress` is a deliberate no-op
+
+`BrokerClientHandler::on_progress` is an explicit empty impl marked "Phase 2".
+Long kaibo consultations are therefore 15 minutes of silence. Note the
+`progressToken` must be sent by *us* in the request `_meta` for a server to
+report against it. Pairs naturally with (4).
+
+### 4. Tasks (SEP-2663) for outbound long calls
+
+`tools/call` can return a task handle instead of blocking: statuses
+`working`/`input_required`/terminal, `tasks/get` polling with a
+server-suggested `poll_interval_ms`, `ttl_ms` expiry, cooperative
+`tasks/cancel`, `notifications/tasks` pushes, and in-task input requests
+answered via `tasks/update`. Client must declare `.enable_tasks()` first; no
+compliant server offers it otherwise.
+
+**Two boundaries to hold, decided 2026-08-11:**
+
+- **MCP `TaskStatus` is NOT `BlockKind::Task`.** The enums rhyme
+  (`Working/InputRequired/Completed/Failed/Cancelled` vs
+  `Open/InProgress/Done/Cancelled`) and they are different nouns: ours is a
+  durable to-do item tracked in a conversation, theirs is an in-flight RPC
+  handle. Do not unify them.
+- **MCP tasks do NOT replace `background_exec`.** Ours streams output into a
+  CRDT block every player can see; an MCP task's result goes only to the one
+  client polling it. In a many-hands model that is a downgrade. Tasks are for
+  the *outbound* long-call problem (kaibo), not for kernel-owned background
+  work.
+- Amy's related question — should kaish `jobs` show MCP work? — resolves the
+  same way: an MCP **task** is job-shaped (stable id, status, cancel, TTL) and
+  belongs there; a raw in-flight **request** is not (no pid, no signals, wrong
+  ownership direction, sub-second churn) and wants a read-only `kj mcp` view
+  instead.
+- Unknown, needs probing: whether kaibo declares the tasks extension.
+
+### Also open, from the same survey
+
+- `Timeout` no longer marks an instance Down (fixed `0676da42`), but there is
+  still **no automatic reconnect** — `reconnect()` exists and is never called
+  ("Phase 1 does not invoke this automatically"). A genuinely dead server stays
+  Down until `kj mcp reload`. Worth a health-check/backoff pass.
+- We call the raw `Peer::call_tool`/`read_resource`, not the MRTR-aware
+  `RunningService` helpers. Blast radius is fixed (`f389e84f`), but we still
+  cannot *drive* an MRTR round-trip — and doing so needs (1) first, since the
+  helpers fulfil input requests through the `ClientHandler` that currently
+  auto-declines.
+
 ## `kj backend` has no health check (re-filed 2026-08-11)
 
 Salvaged from the deleted models.toml papercuts section — the only idea there
