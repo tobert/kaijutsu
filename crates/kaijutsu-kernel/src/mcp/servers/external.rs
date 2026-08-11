@@ -491,6 +491,37 @@ fn map_rmcp_service_error(
             let _ = instance;
             McpError::Protocol(e.to_string())
         }
+        // Per-call outcomes that say nothing about the instance's health.
+        // Marking the whole server Down here would take out every other
+        // in-flight and future call to it (e.g. all concurrent kaibo
+        // consultations) because one call used a shape we don't drive.
+        //
+        // `UnexpectedResponse` is the live one: now that we negotiate
+        // 2026-07-28, a server is permitted to answer `tools/call` with an
+        // MRTR `InputRequiredResult` (SEP-2322) or a `CreateTaskResult`
+        // (SEP-2663) — `rmcp` gates both on the peer's negotiated version
+        // (`service/server.rs:68`). The raw `Peer` methods we call only match
+        // the plain result, so those arrive here. That is "the server tried a
+        // protocol feature we don't support", not "the transport is broken".
+        ServiceError::UnexpectedResponse => {
+            let _ = instance;
+            McpError::Unsupported
+        }
+        ServiceError::InputRequiredRoundsExceeded { max_rounds } => {
+            let _ = instance;
+            McpError::Protocol(format!(
+                "server kept requesting input beyond {max_rounds} MRTR rounds"
+            ))
+        }
+        ServiceError::Cancelled { reason } => {
+            // We cancelled, or the call was cancelled for us. Not the
+            // server's fault and not a health signal.
+            let _ = instance;
+            McpError::Protocol(format!(
+                "call cancelled: {}",
+                reason.as_deref().unwrap_or("<unknown>")
+            ))
+        }
         other => {
             let msg = other.to_string();
             mark_down(msg.clone());
@@ -569,10 +600,14 @@ impl McpServerLike for ExternalMcpServer {
             }
         };
 
-        let result = peer.call_tool(req).await.map_err(|e| {
-            self.mark_down(format!("{e}"));
-            McpError::Protocol(e.to_string())
-        })?;
+        // Route through the shared classifier rather than marking down on any
+        // error: `call_tool` used to treat every failure as an instance-health
+        // signal, which is wrong for per-call outcomes (see
+        // `map_rmcp_service_error`).
+        let result = peer
+            .call_tool(req)
+            .await
+            .map_err(|e| map_rmcp_service_error(e, &self.instance_id, |m| self.mark_down(m)))?;
 
         Ok(translate_result(result))
     }
