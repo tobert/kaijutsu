@@ -513,6 +513,17 @@ fn map_rmcp_service_error(
                 "server kept requesting input beyond {max_rounds} MRTR rounds"
             ))
         }
+        ServiceError::Timeout { timeout } => {
+            // A slow call is not a sick server. This matters concretely: a
+            // 5–15 minute kaibo consultation that overruns its `call_timeout`
+            // used to take the whole instance Down, and `mark_down` has no
+            // automatic recovery — `reconnect()` is never called on its own
+            // ("Phase 1 does not invoke this automatically"), so a single slow
+            // consult disabled kaibo until someone ran `kj mcp reload`.
+            // Genuine unreachability still surfaces as a transport error below.
+            let _ = instance;
+            McpError::Protocol(format!("call timed out after {timeout:?}"))
+        }
         ServiceError::Cancelled { reason } => {
             // We cancelled, or the call was cancelled for us. Not the
             // server's fault and not a health signal.

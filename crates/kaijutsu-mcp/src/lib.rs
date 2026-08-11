@@ -61,8 +61,6 @@ use rmcp::{
         // Server types
         ServerCapabilities,
         ServerInfo,
-        SubscribeRequestParams,
-        UnsubscribeRequestParams,
     },
     prompt, prompt_handler, prompt_router,
     schemars::JsonSchema,
@@ -592,8 +590,6 @@ pub(crate) async fn stabilize_context_label(
 pub struct McpServerState {
     /// Current logging level (default: info)
     pub log_level: Arc<Mutex<LoggingLevel>>,
-    /// Resource subscriptions (URI -> subscription active)
-    pub subscriptions: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[allow(deprecated)]
@@ -601,7 +597,6 @@ impl Default for McpServerState {
     fn default() -> Self {
         Self {
             log_level: Arc::new(Mutex::new(LoggingLevel::Info)),
-            subscriptions: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -2136,7 +2131,6 @@ impl ServerHandler for KaijutsuMcp {
                 .enable_prompts()
                 .enable_prompts_list_changed()
                 .enable_resources()
-                .enable_resources_subscribe()
                 .enable_logging()
                 .enable_completions()
                 .build(),
@@ -2342,35 +2336,14 @@ impl ServerHandler for KaijutsuMcp {
         ))
     }
 
-    /// Subscribe to resource updates.
-    async fn subscribe(
-        &self,
-        request: SubscribeRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        let mut subs = self
-            .server_state
-            .subscriptions
-            .lock()
-            .map_err(|_| McpError::internal_error("Lock error", None))?;
-        subs.insert(request.uri);
-        Ok(())
-    }
-
-    /// Unsubscribe from resource updates.
-    async fn unsubscribe(
-        &self,
-        request: UnsubscribeRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        let mut subs = self
-            .server_state
-            .subscriptions
-            .lock()
-            .map_err(|_| McpError::internal_error("Lock error", None))?;
-        subs.remove(&request.uri);
-        Ok(())
-    }
+    // `subscribe`/`unsubscribe` are deliberately NOT implemented. We advertised
+    // `resources.subscribe` and accepted subscriptions into a HashSet that
+    // nothing ever read: no `resources/updated` notification is sent anywhere
+    // in this crate, so a subscriber waited forever for an event that could not
+    // arrive. Falling through to rmcp's default (`method_not_found`) fails loud
+    // instead. The 2026-07-28 replacement is `subscriptions/listen`
+    // (`accepted_subscription_filter` + `listen`); implement that if a real
+    // consumer appears.
 
     // ========================================================================
     // Completion
