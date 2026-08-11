@@ -48,12 +48,15 @@ Client side (fetch + cache):
   `crates/kaijutsu-server/tests/sftp_transport.rs:85-114`.
 
 App side (the template — audio only today):
-- `BlobPrefetch` Bevy resource drives `CuePayload::Cas(hash)` resolves off-thread and
-  drains results each frame: `crates/kaijutsu-app/src/audio.rs:55-232`.
+- `CasPrefetch` (renamed/split from the old `BlobPrefetch`, no longer a Bevy
+  resource — it's the DJ thread's own **Send** SFTP world) dispatches
+  `CuePayload::Cas(hash)` resolves off-thread; outcomes land on the DJ thread's
+  `select!` via a `tokio::mpsc` channel rather than a per-frame drain:
+  `crates/kaijutsu-app/src/dj/prefetch.rs:89-124`.
   Note **why** it owns a separate single-worker tokio runtime: SFTP futures are `Send`,
-  but the RPC actor runtime is `!Send`/`LocalSet`, so we can't resolve on it
-  (`audio.rs:55-93`). Lazy connect + drop-transport-on-error redial:
-  `resolve_with_lazy_connect` `audio.rs:114-139`.
+  but the DJ thread's own runtime is current-thread, so we can't resolve on it
+  (`dj/prefetch.rs:79-98`). Lazy connect + drop-transport-on-error redial:
+  `resolve_with_lazy_connect` `dj/prefetch.rs:166-221`.
 
 CAS hash facts (for the decode/cache step):
 - BLAKE3 truncated to 16 bytes → 32 hex chars; `prefix()` = first 2, `remainder()` =

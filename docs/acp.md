@@ -99,10 +99,9 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
   lib.rs:80,451`).
 
 **The gaps, prioritized:**
-1. ~~**Turn-completion event is not on the wire**~~ **SHIPPED on branch
-   `turn-events`** (2026-08-04, Opus agent; 4966 tests green, awaiting
-   review/merge — squash the `cf93e339`+`3cc8fcc4` pair for bisectability).
-   Step-0 finding: interactive turns published NOTHING (an
+1. ~~**Turn-completion event is not on the wire**~~ **SHIPPED, merged to main**
+   (branch `turn-events`, 2026-08-04, Opus agent; 4966 tests green; merge commit
+   `9554602c`). Step-0 finding: interactive turns published NOTHING (an
    `announce_completion: bool` consumer-filter living in the producer);
    replaced with `TurnOrigin { Interactive, Autonomous }` on every event —
    beat.rs filters, everyone publishes. Stop reason:
@@ -113,10 +112,10 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
    subscription set. Catch-up for late/reconnecting subscribers deliberately
    deferred (needs a catch-up story, not a journal — noted on the
    TurnFlow-durability issue).
-2. ~~**No Ask pathway for `session/request_permission`**~~ **SHIPPED on
-   branch `hook-ask`** (2026-08-05, Sonnet agent; 1949 kaijutsu-kernel +
+2. ~~**No Ask pathway for `session/request_permission`**~~ **SHIPPED, merged to
+   main** (branch `hook-ask`, 2026-08-05, Sonnet agent; 1949 kaijutsu-kernel +
    304 kaijutsu-server + 139 kaijutsu-client tests green, `cargo build
-   --workspace` clean, awaiting review/merge). `HookAction::Ask(AskSpec)`
+   --workspace` clean; merge commit `232c99c9`). `HookAction::Ask(AskSpec)`
    joins Invoke/Deny/Log/ShortCircuit (`hook_table.rs`), with an
    `HookActionWire::Ask { description }` admin-wire surface and DB
    persistence (`hooks.action_ask_description`) alongside the others.
@@ -154,9 +153,9 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
    (`subscriptions.rs`); a real SSH+capnp e2e proving the cross-thread
    bridge itself — not just each side's fakes — actually joins
    (`kaijutsu-server/tests/permission_ask_wire.rs`).
-3. ~~**`register_session` reconnect/label-conflict**~~ **SHIPPED on branch
-   `register-session-upsert`** (2026-08-04, Sonnet agent; 2440 tests green,
-   awaiting review/merge). Upsert semantics: DB-driven `resolveContextLabel`
+3. ~~**`register_session` reconnect/label-conflict**~~ **SHIPPED, merged to
+   main** (branch `register-session-upsert`, 2026-08-04, Sonnet agent; 2440
+   tests green; merge commit `7670d72e`). Upsert semantics: DB-driven `resolveContextLabel`
    RPC → attach-if-live (`resumed: true` + timestamps for the stale-id
    hazard), suffix-fresh if concluded (`previous_context` in reply). Bonus
    finding: boot-time recovery already re-registers non-archived contexts,
@@ -174,8 +173,8 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
 
 Suggested order: #1 (+#5 riding along) → #3 → #2 → adapter prototype can
 start with `request_permission` stubbed to auto-allow → #4 and real
-permissions before any untrusted frontend. #1–#3 are now all shipped
-(pending merge); #2's `HookAction::Ask` + `PermissionEvents` is real
+permissions before any untrusted frontend. #1–#3 are now all shipped and
+merged to main; #2's `HookAction::Ask` + `PermissionEvents` is real
 permission plumbing, not the stub the original order assumed — an adapter
 can wire `session/request_permission` straight to `subscribe_permission_events`
 / `permission_events_channel` from day one instead of auto-allowing.

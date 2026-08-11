@@ -204,20 +204,6 @@ kj drift pull approach-b "summarize what you tried"
 Fan out, let bindings think in parallel, pull the digests back. Children
 share the block store but have isolated histories.
 
-### 7. Personas (tool surface, not prompt)
-
-Personas narrow the tool surface a binding can reach during a turn:
-
-```
-personas_list
-personas_apply name=explorer
-```
-
-Today personas are an instance allowlist (e.g. `explorer` = `builtin.file`,
-`builtin.block`, `builtin.resources`, `builtin.kernel_info` — read-mostly).
-They do **not** include a system prompt yet. Use them when an orchestrator
-wants a child binding to be tool-bounded by role.
-
 ## The Turn Pump
 
 When does a binding actually take a turn?
@@ -313,7 +299,8 @@ kj context switch <parent-label>
 — by design. These verbs live in `kj` (via `shell`) rather than as
 individual broker tools. The tool-surface footprint of lifting 30+ verbs
 into broker namespace was judged worse than keeping `kj` as the rich
-entry point. See `docs/kj-cleanup.md` for the locked direction.
+entry point — see the removal note at the top of `impl KaijutsuMcp` in
+`kaijutsu-mcp/src/lib.rs` for the locked direction.
 
 **How to use them:** drive `shell "kj …"`. The new structured return
 gives you `exit_code` for failure detection and `data` for structured

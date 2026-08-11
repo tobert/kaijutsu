@@ -9,9 +9,12 @@
 > clock design + the M2–M4 roadmap), `docs/pcm.md` (the render/wire-cue side),
 > `docs/shared-state.md` (the `/run` substrate a probe attachment writes).
 >
-> **Ahead** (per `docs/midi.md`): M2 MIDI-in telemetry, M3 the drift-modeled clock
-> (the `Modeled` variant + `apply_estimate`), M4 cross-node + the edge node. Also
-> deferred: the cold-start re-arm sweep (a kernel restart resets tracks to stopped).
+> **Update:** the `Modeled` clock (M3) is no longer future work — it shipped with a
+> full body, a live MIDI-in → `apply_estimate` producer, and `kj transport clock
+> <track> modeled` as the selector; see "Clock sources" below. **Ahead** (per
+> `docs/midi.md` / `docs/midi-next.md`, the live roadmap): M4 cross-node + the edge
+> node. Also deferred: the cold-start re-arm sweep (a kernel restart resets tracks
+> to stopped).
 
 ## The insight
 
@@ -135,14 +138,18 @@ enum, deliberately not a `Box<dyn>` (no hot-loop vtable; maps 1:1 to the
 persisted `clock_kind` column):
 
 - **`System(SystemClock)`** — a wall-period timer at a tempo. `next_fire(last,
-  now)` returns `now + period`; `set_period` is the tempo knob. The only
-  constructable variant today.
-- **`Modeled`** — the MIDI/drift-modeled clock, uninhabited until M3. Its shape
-  is decided in `docs/midi.md`: a `ClockSource` is a *proxy* for a clock that may
-  be *remote* and *drift-modeled* — an edge node observes the master, fits a
-  tempo/phase/drift model, and ships low-rate *estimates* over the RPC control
-  plane; the kernel regenerates a tight local clock phase-locked to that
-  estimate. Distribute tempo and intent, never pulses.
+  now)` returns `now + period`; `set_period` is the tempo knob. The default
+  variant (tracks arm on it unless `Modeled` is selected).
+- **`Modeled` (`ModeledClock`, `kaijutsu-server/src/clock.rs`)** — the MIDI/drift-
+  modeled clock, live since M3 (2026-07-06). A `ClockSource` is a *proxy* for a
+  clock that may be *remote* and *drift-modeled*: `crates/kaijutsu-app/src/midi_in.rs`
+  observes the master and reports `{beat, tempo}` estimates over
+  `reportClockEstimate`, `beat.rs::apply_clock_estimate` folds them into
+  `ModeledClock::apply_estimate` (tempo slew-limited, phase slewed or re-anchored
+  on a seek), and the kernel regenerates a tight local clock phase-locked to that
+  estimate. Free-runs like `SystemClock` until the first reference lands; select it
+  with `kj transport clock <track> modeled`. Distribute tempo and intent, never
+  pulses.
 - **arbitrary external signals** — solar-power peaks, compute-availability
   cycles, "good cluster / bad cluster." The track is the seam between an
   exogenous beat and whoever's attached: the world beats the track, the track

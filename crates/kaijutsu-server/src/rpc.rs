@@ -4892,7 +4892,7 @@ impl kernel::Server for KernelImpl {
 
         let _ctx_span = if let Some(drift) = self.kernel.kernel.drift().try_read() {
             let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
-            Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_document_history").entered())
+            Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_context_history").entered())
         } else {
             None
         };
@@ -5703,7 +5703,7 @@ impl kernel::Server for KernelImpl {
 
         let _ctx_span = if let Some(drift) = self.kernel.kernel.drift().try_read() {
             let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
-            Some(kaijutsu_telemetry::context_root_span(&trace_id, "compact_document").entered())
+            Some(kaijutsu_telemetry::context_root_span(&trace_id, "compact_context").entered())
         } else {
             None
         };

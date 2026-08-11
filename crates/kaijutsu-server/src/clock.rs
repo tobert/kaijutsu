@@ -8,13 +8,18 @@
 //! low-rate *estimates* over RPC, and the kernel's modeled clock phase-locks to
 //! that estimate (docs/midi.md, "distribute tempo, not pulses").
 //!
-//! This stage ships [`SystemClock`] only (midi.md M1). The trait is shaped now
-//! so M3's drift-modeled clock slots in without rework — but `ClockEstimate` and
-//! the estimate-injection hook are NOT defined here yet (no dead-code theater;
-//! they land with their producer at M3, per the Stage 3 review). [`ModeledClock`]
-//! is an uninhabited placeholder: the variant exists in [`ClockSourceKind`] so
-//! `clock_kind` persistence and the dispatch shape are real, but you cannot
-//! construct one until M3 gives it a body.
+//! Both variants of [`ClockSourceKind`] are live. [`SystemClock`] landed at
+//! midi.md M1; [`ModeledClock`] has a body, a [`ClockSource`] impl, and a
+//! producer — `kj transport clock <track> modeled` selects it, and estimates
+//! arrive over `reportClockEstimate@98` from an edge observer
+//! (`kaijutsu-app/src/midi_in.rs` → `BeatRequest::ClockEstimate` →
+//! `beat.rs::apply_clock_estimate` → [`ModeledClock::apply_estimate`]).
+//!
+//! (Through 2026-08-11 this header claimed `ModeledClock` was "an uninhabited
+//! placeholder ... you cannot construct one until M3 gives it a body". That was
+//! already false — contradicted by [`ClockSourceKind::from_persisted`] a hundred
+//! lines below, which restores `"modeled"` rows. Trust the code, not this
+//! paragraph, if they ever disagree again.)
 
 use std::time::Duration;
 

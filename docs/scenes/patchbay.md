@@ -25,7 +25,7 @@ namespace), `docs/mounts.md` (the wire-ownership note), `docs/midi.md`
   precedent: `client_views` in `kernel_db.rs`, namespace: `/etc/client/`).
 - **Endpoints are symbolic names, resolved live.** The app's own source
   endpoint is the ALSA seq port opened by `MidiOut::open()` in
-  `crates/kaijutsu-app/src/midi.rs` (client `"kaijutsu-app"`, port
+  `crates/kaijutsu-app/src/dj/midi.rs` (client `"kaijutsu-app"`, port
   `"render"` — carries both music cues and the metronome click today). Synth
   client numbers are **dynamic** (TiMidity is 128/129/whatever per boot) —
   always resolve by name, never store a number.
@@ -140,7 +140,7 @@ Each shippable alone, in order; 1 is independent and can land any time.
 
 On startup the app auto-connects its render port to a detected GM synth,
 killing the re-`aconnect`-after-restart papercut (`docs/mounts.md` note).
-Lives in `crates/kaijutsu-app/src/midi.rs` beside `MidiOut`; no scene
+Lives in `crates/kaijutsu-app/src/dj/midi.rs` beside `MidiOut`; no scene
 dependency either way. Semantics:
 
 - **Detect by name, never by number** — case-insensitive substring match on

@@ -62,7 +62,7 @@ the server extracts it via `extract_rpc_trace()`.
 | Turn outcome | `turn.{op}`, `turn.*` fields | `turn.events_push{turn.stop_reason}` | 100% |
 | CRDT sync | `sync.{op}` | `sync.push_ops` | 1% |
 
-### Server RPC (59 methods)
+### Server RPC
 
 All non-VFS kernel RPC methods in `rpc.rs` are instrumented. Async methods
 (those using `Promise::from_future`) use `.instrument(span)` on the future.
@@ -73,8 +73,8 @@ Sync methods use `span.entered()` guards.
 | Execution | `execute`, `execute_tool`, `shell_execute`, `prompt` |
 | Context | `create_context`, `join_context`, `list_contexts`, `get_context_id` |
 | Fork/Thread | `fork`, `thread`, `cherry_pick_block` |
-| Document | `attach_document`, `detach_document`, `push_ops`, `get_document_state`, `get_document_history`, `compact_document` |
-| Drift | `drift_push`, `drift_pull`, `drift_merge`, `drift_flush`, `drift_queue`, `drift_cancel` |
+| CRDT / history | `push_ops`, `get_context_history`, `compact_context` |
+| Drift | `drift_queue`, `drift_cancel` (push/pull/merge/flush moved into `kj` dispatch, `kaijutsu-kernel/src/kj/drift.rs`) |
 | MCP | `register_mcp`, `unregister_mcp`, `list_mcp_servers`, `call_mcp_tool`, `list_mcp_resources`, `read_mcp_resource` |
 | LLM config | `configure_llm`, `get_llm_config`, `set_default_provider`, `set_default_model` |
 | Tools | `get_tool_schemas`, `get_tool_filter`, `set_tool_filter` |
@@ -141,43 +141,33 @@ All `ExecutionEngine::execute()` implementations:
 | `DriftMergeEngine` | `drift.merge` | Merge fork back to parent |
 | `DriftLsEngine` | `engine.drift_ls` | List available contexts |
 
-### MCP Tools (25 tools)
+### MCP Tools (10 tools)
 
-All 25 tools in `kaijutsu-mcp/src/lib.rs` have `#[tracing::instrument]`:
+The MCP slim-down cut 16 doc/block/drift-detail tools that duplicated
+kernel-side functionality now reached through `kj` (via `shell`/`context_shell`)
+— see the removal note at the top of `impl KaijutsuMcp` in
+`kaijutsu-mcp/src/lib.rs`. All 10 remaining `#[tool(...)]` methods have
+`#[tracing::instrument]`:
 
 | Tool | Span |
 |------|------|
-| `doc_create` | `mcp.doc_create` |
-| `doc_list` | `mcp.doc_list` |
-| `doc_delete` | `mcp.doc_delete` |
-| `doc_tree` | `mcp.doc_tree` |
-| `doc_undo` | `mcp.doc_undo` |
-| `block_create` | `mcp.block_create` |
-| `block_read` | `mcp.block_read` |
-| `block_append` | `mcp.block_append` |
-| `block_edit` | `mcp.block_edit` |
-| `block_list` | `mcp.block_list` |
-| `block_status` | `mcp.block_status` |
-| `block_inspect` | `mcp.block_inspect` |
-| `block_history` | `mcp.block_history` |
-| `block_diff` | `mcp.block_diff` |
-| `kernel_search` | `mcp.kernel_search` |
-| `drift_ls` | `mcp.drift_ls` |
-| `drift_push` | `mcp.drift_push` |
-| `drift_pull` | `mcp.drift_pull` |
-| `drift_merge` | `mcp.drift_merge` |
-| `drift_flush` | `mcp.drift_flush` |
-| `drift_queue` | `mcp.drift_queue` |
-| `drift_cancel` | `mcp.drift_cancel` |
 | `kaish_exec` | `mcp.kaish_exec` |
+| `list_kernel_tools` | `mcp.list_kernel_tools` |
 | `shell` | `mcp.shell` |
+| `register_session` | `mcp.register_session` |
 | `whoami` | `mcp.whoami` |
+| `invoke_peer` | `mcp.invoke_peer` |
+| `read_input` | `mcp.read_input` |
+| `write_input` | `mcp.write_input` |
+| `edit_input` | `mcp.edit_input` |
+| `submit_input` | `mcp.submit_input` |
 
 ### LLM (4 methods)
 
-`RigProvider` methods emit spans with `llm.model` and `llm.provider` fields.
-Rig-core 0.30 also emits `gen_ai.*` spans (token counts, response model) that
-nest underneath.
+Provider methods emit spans with `llm.model` and `llm.provider` fields (rig-core
+is gone — see `kaijutsu-kernel/src/lib.rs:88`, provider dispatch replaced it).
+`gen_ai.*` exists only as **metrics** now (`kaijutsu-telemetry/src/metrics.rs`),
+not spans — see Metrics below.
 
 | Method | Fields |
 |--------|--------|
@@ -270,9 +260,12 @@ operation touching that context creates a span under the context's trace via
 `context_root_span()`. This enables querying "show me everything that happened
 in context X" in Jaeger/Grafana.
 
-**Instrumented RPC methods:** join_context, push_ops, get_document_state,
-shell_execute, drift_push/pull/merge/flush, cherry_pick_block,
-get_document_history, compact_document.
+**Instrumented RPC methods:** join_context, push_ops, shell_execute,
+cherry_pick_block, get_context_history, compact_context, drift_queue,
+drift_cancel. (`get_context_history` and `compact_context` carried stale
+`"get_document_history"` / `"compact_document"` span-name strings from before
+the document→context rename until 2026-08-11 — if you are correlating traces
+older than that, the span names differ from the method names.)
 
 The `trace_id` is exposed on the wire via `ContextHandleInfo.traceId` and parsed
 into `ContextInfo.trace_id` on the client side. A reverse index

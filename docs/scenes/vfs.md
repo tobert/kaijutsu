@@ -290,7 +290,8 @@ landed:
   copies of a miniature. Now ONE panel-spanning portal (880×470 of the ~954
   visible face) with the render texture matched to the glass's aspect, a
   lower ~25° orbit for a horizon read, and a 1.5× world-footprint bump
-  (`ROOT_WORLD_SIZE` 3000, orbit scaled with it) so districts get air. The
+  (`ROOT_WORLD_SIZE` 2000 → 3000, orbit scaled with it) so districts get air —
+  a later 4× horizon bump the same evening took it to 12000, current value. The
   "DATA HORIZON" nameplate and the N marker pylon are gone — both stood in
   front of the view they advertised; `Station::Vfs` joined
   `station_is_room_furniture` (the portal IS the station's face). Diving is

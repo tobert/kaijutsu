@@ -132,9 +132,9 @@ Existing views slot in as stations #0 and #1.
 |---|---------|-----------|--------|
 | 0 | Conversation | Append-only block sequence | Shipped (2D view; joined to the well by the dive-through) |
 | 1 | Time well | Context forest by recency/placement | Shipped; `docs/timewell.md` |
-| 2 | Patch bay | Relation: endpoint edges, declared intent vs live reality | **Designed** — `docs/scenes/patchbay.md`; viz-first (see below); circle-matrix direction (Amy, waves 1–3) |
+| 2 | Patch bay | Relation: endpoint edges, declared intent vs live reality | **Shipped (slices 0+1)** — `docs/scenes/patchbay.md`; `crates/kaijutsu-app/src/view/patch_bay/mod.rs`; viz-first (see below); circle-matrix direction (Amy, waves 1–3) |
 | 3 | Drift / mailboxes | Flows in flight between contexts; queues pooling | Concepting |
-| 4 | Track transport / score | Cyclic time: playhead, tempo, attached musicians | Concepting — **vertical beat highway** (Guitar Hero / DDR lineage), not a score view; a score view comes later as a 2D special view, not core (Amy, wave 1). Wire slice shipped (`TrackInfo`) |
+| 4 | Track transport / score | Cyclic time: playhead, tempo, attached musicians | **Shipped** — the TRACKER station (2026-07-15), `crates/kaijutsu-app/src/view/tracker/{mod.rs,grid.rs}`; **vertical beat highway** (Guitar Hero / DDR lineage), not a score view; a score view comes later as a 2D special view, not core (Amy, wave 1). Wire slice shipped (`TrackInfo`) |
 | 5 | VFS / rc library | Tree with ownership zones; scripts as objects | **Designed (early)** — `docs/scenes/vfs.md`: fsn / Jurassic Park lineage with LOD-on-approach as a primitive (Amy, waves 1–2); interaction UX still to concept |
 | — | MCP broker, LLM routing, … | Registry + in-flight invocations; providers/spend | Uninventoried; add when a station is designed |
 

@@ -161,10 +161,11 @@ Two more orthogonal axes that read like overlap but aren't:
   Image). A `ToolResult` can have `ContentType::Svg`; they vary independently.
 
 CRDT mechanics live in `kaijutsu-crdt`, built on a fork of diamond-types
-(`diamond-types-extended`). The **target** store is `BlockStore`: one DTE document
-*per block* for text, plus per-field Last-Write-Wins Lamport timestamps for
-metadata. A **legacy** `BlockDocument` (single shared DTE doc) is still public and
-in use during an unfinished migration — see [Tensions](#tensions--known-debt).
+(`diamond-types-extended`). Storage is `BlockStore`: one DTE document *per
+block* for text, plus per-field Last-Write-Wins Lamport timestamps for
+metadata. The earlier single-shared-DTE-document `BlockDocument` model was
+demolished 2026-08-09 (commit `75e31b60`) — `BlockStore` is the only storage
+path now.
 
 ---
 
@@ -312,8 +313,6 @@ because the gap itself is architecturally informative:
   `@`-routing.
 - **External MCP admin is offline.** The capnp methods exist but
   `list_mcp_servers` returns empty; external-server registration is deferred.
-- **Two CRDT storage impls coexist.** `BlockStore` (target) and `BlockDocument`
-  (legacy) are both public; the legacy path silently drops newer fields.
 
 ---
 
@@ -325,7 +324,6 @@ The big-ticket items the code review surfaced (all recorded in
 - **`rpc.rs` monolith** (~7,400 lines, one `impl kernel::Server`) and **`KernelDb`
   god-table** (~5,900 lines, ~20 tables behind one mutex) are the two largest
   single-file concentrations.
-- **Dual CRDT storage** with silent field-dropping on the legacy path.
 - **Silent fallbacks** in a few kernel paths (broker tool-listing returns empty on
   error; binding resolve falls back to deny-all) — counter to the "crash over
   corrupt/confuse" stance.

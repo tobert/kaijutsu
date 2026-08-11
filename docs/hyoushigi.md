@@ -614,7 +614,7 @@ fallback are exercised by their first user.
 > - **The transport:** the beat scheduler (`kaijutsu-server/src/beat.rs`) is
 >   the single coalescing driver described above — one `(Instant, TrackId)`
 >   heap + ingress, generation tokens against stale entries. Surface:
->   `kj transport attach|detach|play|pause|stop|tempo|ooda|rotate|render`,
+>   `kj transport attach|detach|play|pause|stop|tempo|ooda|clock|rotate`,
 >   track-scoped. The tick is **event-counted**: pause freezes musical time
 >   and resume picks up at +1 — no wall-clock catch-up, no rewind (revisiting
 >   the past is an export, not a seek). Tracks arm **stopped** (no surprise

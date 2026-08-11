@@ -102,23 +102,23 @@ The CRDT layer: an ordered, multi-writer-safe block log per context, built on
 `diamond-types-extended` (a fork of diamond-types). Text is a character-level
 CRDT; block order is fractional indexing; metadata is per-field LWW.
 
-### Two storage impls (one is legacy)
+### One storage impl: `BlockStore`
 
-- **`BlockStore`** (`block_store.rs:76`) — **the target architecture.** A
-  `BTreeMap<BlockId, BlockContent>` where **each block owns its own DTE
-  document** for content. Manages a Lamport clock (LWW), per-principal `seq_lanes`,
-  a monotonic `next_tick`, and a `version` counter. `block_ids_ordered()`
-  (`block_store.rs:199`) sorts by `order_key` (tiebreak `BlockId`) — never iterate
-  the `BTreeMap` for timeline order, it's principal-major. Append `order_key` is
-  the *successor* of the predecessor's key (`content.rs:134`), decoupled from
-  `tick` to avoid stale-counter mis-sorts. Sync via `ops_since(frontiers) →
-  SyncPayload` / `merge_ops` (`block_store.rs:1193`, `:1242`); persistence via
-  `StoreSnapshot` (parallel `Vec<BlockSnapshot>` + per-block DTE history, CBOR).
-- **`BlockDocument`** (`document.rs:114`) — **legacy.** A single shared DTE
-  document holding all blocks as paths. Still `pub` and in use during an
-  unfinished migration; its `get_block_snapshot` returns newer fields
-  (`ephemeral`, `stderr`, `signature`, `track`, …) as hardcoded `None`/`false`.
-  Any code path through the legacy doc silently drops those fields.
+`BlockStore` (`block_store.rs:76`) is the single CRDT storage path — a
+`BTreeMap<BlockId, BlockContent>` where **each block owns its own DTE
+document** for content. Manages a Lamport clock (LWW), per-principal `seq_lanes`,
+a monotonic `next_tick`, and a `version` counter. `block_ids_ordered()`
+(`block_store.rs:199`) sorts by `order_key` (tiebreak `BlockId`) — never iterate
+the `BTreeMap` for timeline order, it's principal-major. Append `order_key` is
+the *successor* of the predecessor's key (`content.rs:134`), decoupled from
+`tick` to avoid stale-counter mis-sorts. Sync via `ops_since(frontiers) →
+SyncPayload` / `merge_ops` (`block_store.rs:1193`, `:1242`); persistence via
+`StoreSnapshot` (parallel `Vec<BlockSnapshot>` + per-block DTE history, CBOR).
+
+The earlier `BlockDocument` — a single shared DTE document holding all blocks
+as paths, kept alongside `BlockStore` during an unfinished migration — was
+demolished 2026-08-09 (commit `75e31b60`); `crates/kaijutsu-crdt/src/document.rs`
+is gone and no `struct BlockDocument` remains anywhere in the tree.
 
 `BlockContent` (`content.rs:178`) is the per-block unit: a DTE doc scoped to one
 block's `content`, the `order_key`, an `Option<Tick>`, an `Option<TrackId>`, and
@@ -143,9 +143,6 @@ the retired `kv` tag is deliberately never reused (see the tombstone in
 
 ### Smells (not fixed — see [issues](../issues.md))
 
-- Two live storage impls; the legacy one drops fields, retains the old
-  duplicate-block seq bug (`document.rs:892`), and diverges on `set_collapsed`
-  semantics.
 - `calc_order_key` calls `block_ids_ordered()` (an O(N) sort) on **every** insert
   (`block_store.rs:390`); the bench that exposes it is `#[ignore]`d.
 - `StoreSnapshot` has a breaking-format note ("delete existing databases when

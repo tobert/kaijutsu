@@ -6,6 +6,47 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Summaries drift stronger than what they summarise (2026-08-11, three instances in one day)
+
+Not a code bug — a writing failure mode worth naming, because it cost real
+scoping work today:
+
+1. This file claimed "isotest proved fresh-$HOME boot ... and no host state".
+   isotest proves process-lifecycle guarantees; fresh-$HOME is a precondition
+   demonstrated by construction. Work on brak was scoped against the stronger
+   reading (see the brak entry).
+2. `crates/kaijutsu-server/src/clock.rs`'s own module header called
+   `ModeledClock` "an uninhabited placeholder ... you cannot construct one
+   until M3". It has had a body, a `ClockSource` impl, a persistence path, a
+   `kj` selector and an end-to-end producer for weeks — and was contradicted
+   by `from_persisted` a hundred lines below it in the same file. Fixed.
+3. `docs/tracks.md` inherited (2) and listed M3 as "Ahead".
+
+Same shape every time: someone summarised what was *observed*, the summary read
+stronger than what was *pinned*, and the next reader inherited the stronger
+version without re-deriving it. Note the direction is not always optimistic —
+(2) and (3) *under*-reported shipped work, which is how a finished subsystem
+stays invisible.
+
+Candidate convention, **not yet a rule — Amy's call**: a claim about what is
+*proven* carries the assertion name or a `file:line`, so the next reader can
+tell pinned from observed at a glance. Three instances is a pattern; a rule
+wants her word.
+
+---
+
+## `kj backend` has no health check (re-filed 2026-08-11)
+
+Salvaged from the deleted models.toml papercuts section — the only idea there
+that outlived the file it was about. There is no way to ask whether a
+configured backend's `base_url` actually answers; a wrong URL surfaces as a
+failed turn much later. Wants something like `kj backend check <name>` (or a
+`--check` on `kj backend list`) that probes each configured endpoint and
+reports reachability + model list. Verified absent: no `doctor`/`check` verb in
+`crates/kaijutsu-kernel/src/kj/backend.rs`.
+
+---
+
 ## Background exec → kaish's job system (2026-08-07, Amy: "we should do the work and set the rule")
 
 An audit of every spawn site found exactly one ad-hoc host exec left in
@@ -63,11 +104,28 @@ sftp-handoff-mail protocol. brak is NOT a build box: zorak builds and
 syncs binaries. What kaijutsu owes when this gets picked up: a server
 build/config profile for a small x86_64 box (release build, modest
 memory, no GPU/local-model assumptions), reachable over tailnet from
-Claude Code sessions on all three machines. Groundwork that already
-exists: isotest proved fresh-$HOME boot with generated host keys +
-add-key provisioning and no host state; contrib/install-systemd.sh +
-kaijutsu-server.service are the unit story. Jam doc:
+Claude Code sessions on all three machines. Jam doc:
 ~/src/zorak/docs/plans/cybernetic-infra.md (Q2).
+
+**Correction (2026-08-11, read from code).** This entry used to claim
+"isotest proved fresh-$HOME boot with generated host keys + add-key
+provisioning and no host state" and named contrib/install-systemd.sh +
+kaijutsu-server.service as "the unit story". Both readings were too
+strong, and work was being scoped against them:
+
+- **isotest does not prove zero-host-state boot.** `docs/isotest.md:3-8`
+  scopes the harness to *process-lifecycle* guarantees (PDEATHSIG orphan
+  guard, process-group kills, restart hygiene), and every assertion at
+  `docs/isotest.md:61-83` is a lifecycle assertion. Fresh-$HOME is a
+  **precondition demonstrated by construction, not an asserted
+  invariant** — nothing fails if it regresses. It is already false twice,
+  benignly: the embedded mcp.toml reaches for `bevy_brp_mcp` and a
+  hardcoded kaibo path (`docs/isotest.md:95-96`), and the suite runs
+  `--network=none`, loopback SSH only (`docs/isotest.md:19-20, 43-47`).
+  **Tailnet reachability — the whole point of brak-as-coordinator — has
+  never been exercised.** A green isotest says nothing about it.
+- **Therefore the brak cold boot is not gated on isotest.** It is gated
+  on a unit that does not exist (below).
 
 Amendments (same evening, zorak session): fleet binary distribution goes
 through **halfremembered-launcher** (zorak + github; Amy: "may need
@@ -81,6 +139,52 @@ the one-body model stretched across machines, not multi-kernel
 federation. It therefore *supports* the option-2 verdict in
 docs/crdt-position-2026-08.md rather than triggering its federation
 escape hatch; empirical question 2 should be read with this in evidence.
+
+### The launcher-shaped unit does not exist (2026-08-11)
+
+Neither shipped unit can run on brak, and the gap is structural rather
+than a config tweak:
+
+- `contrib/install-systemd.sh` runs `cargo build --release` and sets
+  `WorkingDirectory=$REPO_DIR` — it needs a git checkout *and* a Rust
+  toolchain on the target, contradicting this entry's own "brak is NOT a
+  build box". Do not run it there.
+- `contrib/kaijutsu-server.service` is a dev unit: hardcoded
+  `target/debug/`, a `/bin/bash -c` that reads `~/.anthropic-key.txt` and
+  `~/.deepseek-key`, and `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`
+  which will not exist on brak. Cold-booting it tests a fiction.
+
+Owed: a unit that runs a launcher-managed binary path and nothing else —
+no repo, no toolchain, no checkout-dependent `WorkingDirectory`,
+`EnvironmentFile=` instead of inline key reads (and a decision on whether
+a fleet coordinator needs provider keys at all — **Amy's call**), OTLP
+optional. **zorak lead owns the draft**, in zorak's `systemd/` where
+units-before-install is the convention; it moves here on Amy's word. The
+distribution half is ready: halfremembered-launcher has atomic install +
+versioned deploys with rollback (branch `atomic-install`, unpushed
+pending Amy).
+
+Three things that will bite whoever does this:
+
+- **`loginctl enable-linger` appears nowhere in this repo.** A `--user`
+  unit without linger does not start at boot and dies on logout. On an
+  always-on headless N100 that presents as "the binary is broken".
+- **Provisioning is a mandatory pre-boot step.** The shipped binary has
+  `allow_anonymous: false` and no registration RPC
+  (`docs/isotest.md:52-54`) — without `add-key` first you get a running
+  server nobody can reach.
+- **glibc skew is asymmetric and trends the wrong way.** brak is Arch
+  like zorak, so this is version skew, not distro mismatch — but glibc
+  symbol versioning is one-directional: a binary built against a *newer*
+  glibc fails on an *older* one, never the reverse. zorak is the daily
+  driver and brak is an appliance nobody logs into, so zorak leading is
+  the default trajectory, not the unlucky case. isotest carries an `ldd`
+  preflight (`docs/isotest.md:34-37`) because this is real; the launcher
+  sync path has none. Filed with zorak lead as a launcher feature
+  request: run the preflight *on the target, pre-activation* (the seam
+  atomic install creates), stamp build-time glibc into deploy metadata,
+  and abort-and-report rather than auto-rollback — a silent revert to an
+  older binary hides the actual problem.
 
 ## opencode support — shared lane with kaibo (2026-08-09, via kaibo session relay)
 
@@ -963,38 +1067,9 @@ the build. Do it as its own slice with a visual pass on ABC + SVG blocks.
 
 Amy: *"we can add items to work on mcp servers, we haven't maintained that in a
 while and have changed a lot around it."* Ranked most-broken first. Entries the
-audit **disproved** were deleted from the Gemini-comparison section below rather
-than left to rot.
+audit **disproved** were deleted from the Gemini-comparison survey rather
+than left to rot (that survey now lives in `docs/wishlist-gemini-cli.md`).
 
-- **External MCP is a complete implementation with no caller — HIGH.**
-  `mcp/servers/external.rs` (722 lines) is *solid*, not half-built: stdio/HTTP
-  transport, `connect`/`reconnect`, `_meta` propagation, correct `Health::Down`
-  handling that doesn't down an instance on `METHOD_NOT_FOUND`, unit tests. But
-  `McpServerConfig` is never constructed and `connect()` never called outside its
-  own tests; all ~130 `broker.register*` call sites register builtins
-  (`kernel.rs:598-720`). Cause is exact: `8e650fcb` (Phase 1 M3) built the new
-  type, then `cc5cb05a` (Phase 1 M5, *"aggressive deletions… no dual paths"*)
-  deleted the old `mcp_pool.rs` (~3046 LOC) and `mcp_config.rs` (221 LOC,
-  the TOML→config loader) wholesale — and the replacement caller was never
-  written. `ssh.rs:275` marks the spot.
-  **Fix (~real subsystem work, not a knob)**: rebuild the mcp.toml→
-  `Vec<McpServerConfig>` loader (~200 LOC, `mcp_config.rs`'s old job against the
-  new struct), call it at `ssh.rs:275`, extend the schema (below), and add a
-  `kj mcp reload` verb.
-- **`kj config set mcp.toml` silently does nothing — the exact pattern we reject.**
-  The write lands in the CRDT correctly and there is no watcher, no reload hook,
-  no consumer. The command succeeds and has zero runtime effect. (The config
-  layer itself is fine — seeded via `config_seed.rs:25,65`, `kj config`
-  list/show/set/edit/reset all correct and tested. The problem is purely that
-  nothing reads the file.) Also: mcp.toml's header documents a `fork` field
-  ("share"/"instance"/"exclude") that **has no corresponding field in
-  `McpServerConfig`** — vestigial doc for a feature never built.
-- **No per-server `call_timeout` in the schema — blocks the kaibo case.**
-  `InstancePolicy::for_kernel` (`policy.rs:44`) hands every instance the
-  kernel-wide 120s default (`kaijutsu-types/src/timeout.rs:84`); `McpServerConfig`
-  has no timeout override field at all. A 5–15 minute kaibo consultation dies at
-  120s *even after* the turn-loop clamp fix. `policy_set` can raise it live, but
-  see next item.
 - **No `InstancePolicy` persists across restart — undocumented.** `Broker.policies`
   (`broker.rs:537`) is a bare in-memory `RwLock<HashMap<InstanceId,
   InstancePolicy>>` with no DB table (contrast hooks, which *do* persist). Any
@@ -1566,41 +1641,6 @@ bloom/vi-dive/search items below; they stay on record, not on deck.
   a dedicated key. If it stays unreachable long enough, consider deleting
   the screen instead of carrying it.
 
-## `cargo fmt` unsafe repo-wide (found 2026-07-13, FSN slice-1 lanes; re-bitten 2026-07-16)
-
-**2026-07-16 update (both pcm lanes hit it independently):** the installed
-rustfmt (1.9.0, no pinned toolchain, no `rustfmt.toml`) reformats ~350 lines
-of pre-existing code even when scoped to a single touched file, and
-`cargo fmt -p <crate>` ignores file arguments entirely (one lane reformatted
-100 unrelated files before catching it; both caught + reverted via
-`git status` before committing). Until a `rustfmt.toml` or pinned toolchain
-lands, subagent briefs should say "hand-match surrounding style, do NOT run
-a formatter" — the current briefs' `cargo fmt` instruction is a trap.
-
-This environment's rustfmt (1.9.0-stable) disagrees with whatever version
-produced the repo's current formatting: a bare `cargo fmt -p <crate>`
-reformats ~55–95 pre-existing files (pub mod/use reordering etc.). Both
-slice-1 lanes caught it, reverted the collateral, and hand-formatted their
-new code instead. No committed `rustfmt.toml` exists. Fix: pin a rustfmt
-edition/config that matches the tree (or bite the bullet with one dedicated
-whole-repo fmt commit), then re-enable fmt in the loop.
-
-**2026-08-01 (diff slices 0+1):** house style keeps compact single-line
-struct literals that default rustfmt explodes — a `rustfmt.toml` raising
-`struct_lit_width` would reconcile most of the drift in one commit (32 diffs
-in kaijutsu-types, 5 in kaijutsu-cas, etc.). Note: the new `kaijutsu-diff`
-crate WAS formatted with stock rustfmt, so it's formatter-clean and slightly
-unlike its neighbors; whichever config lands should keep it clean too.
-
-**2026-08-02 (diff slice 5, re-bitten):** an agent's `cargo fmt` buried a
-20-line change under ~6000 lines of unrelated reformatting; unwound by hand.
-The standing rule until this ships: *format only what you touched*. The fix
-is one command plus a judgement call Amy owns (`git blame` clean line vs
-`git log -L` history rewrite); if the whole-repo fmt happens, it must be its
-own commit with **nothing else in it**.
-
----
-
 ## MCP `data` shape change + unbounded rich_json (seeded 2026-07-18, `kj transport list` / `OutputData.rich_json` 3-model review)
 
 Follow-ups noted but not done while fixing the review findings on `kj
@@ -1820,7 +1860,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   lane"). Do NOT make `context_type` a closed `enum` or newtype: it names an open
   **rc-bucket directory** (`project_rc_lifecycle`). Live follow-ons are the other
   axes (decouple-Act-from-ABC; per-type `BeatPolicy`), tracked under Hyoushigi.
-- **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
 - **Context-type tool policy (unified governance):** The `kj` surface is now
   capability-gated — escalation-relevant verbs check the caller's loadout via
   `KjDispatcher::require_cap` (five authority caps: `drive`/`fork`/`drift`/
@@ -1860,22 +1899,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   families when signed Thinking exists in history (a DeepSeek nonce fed to
   Anthropic 400s); allow the transition only at `fork`, where an rc script
   decides to elide thinking or downgrade it to plain blocks.
-- **Cold start seeds no binding-admin context (want a ROOT director).** The
-  bootstrap (`kaijutsu-server/src/rpc.rs:1369`) seeds exactly one **`coder`**
-  context (`genesis`) when the kernel comes up with zero contexts — nothing with
-  `admin`/`rc-write`. Consequence: any binding-admin op (e.g. repairing a live
-  context whose loadout came from a stale seed — see the stale-rc entry under
-  Control Plane — or running `kj rc reseed`, which needs `rc-write`) requires
-  manually `kj context create <x> --type director` first, since only rc-privileged
-  callers or an `admin`-capped context can widen another's loadout, and no
-  user-facing shell is rc-privileged. Want: a fresh kernel seeds a **ROOT
-  director** (the `director` type already grants `admin`+`rc-write`). Design
-  wrinkle: a `director` loadout has **no `drive`/`fork` authority**, so ROOT can't
-  itself be the conversational default the app opens into — either seed *both*
-  (ROOT director + a usable coder), or have ROOT spawn the coder and let the app
-  default to the coder. Confirmed not implemented as of 2026-06-13; genesis was
-  repaired by hand this session via a throwaway director.
-
 ## Drift — June 2026 audit
 
 - **Extract `ContextRegistry` from `DriftRouter`:** DriftRouter carries ~7
@@ -1898,10 +1921,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   variations of "insert drift block + record edge + run rc lifecycle".
   Extract the shared operation; the command layer should dispatch, not
   orchestrate.
-- **Drift distillation half-integrated:** `build_distillation_prompt`
-  machinery sits behind a "drift engines removed" comment + TODO
-  (`drift.rs:602-665`). Decide: integrate or delete.
-
 ## Turn Loop (kaijutsu-server/src/llm_stream.rs) — June 2026 audit
 
 - **Decompose the agentic loop** (after FlowBus settles; they share event
@@ -2197,14 +2216,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   as a scrolling violet ticker, newest line blooms). Design + buildability
   notes in shell.md "Ambient telemetry rules"; rides the existing MSDF
   panel pipeline + event stream. Good next wave after trace-glow ships.
-- **Theme: push config changes to connected apps** (found during the color
-  pass, 2026-07-12): the app fetches theme.toml only at connect-time
-  bootstrap — a `kj config set` mid-session applies to nobody until the
-  next reconnect/restart. The `[scene.post]` hot-apply plumbing is already
-  in place app-side (`apply_scene_post_on_change` fires on any ScenePalette
-  write), so the missing piece is kernel→client: a config-changed
-  notification that re-triggers the theme fetch. Matches the still-open
-  "live hot-reload-on-edit" note in config-crdt-ownership.md.
 - **Theme: tokenize the remaining compiled-only color families**
   (2026-07-12, follow-up to the color pass): `block_*` conversation text
   colors, `syntax` highlighting, `md_*` markdown, `sparkline_*`,
@@ -2404,7 +2415,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **Cross-kernel drift:** Schema preserves `kernel_id` everywhere; not yet implemented.
 - **Compact quality:** Distill model selection, preset-level or context-level summary-style control.
 - **POSIX context quartet:** Implement `kj wait` and `kj stop` to complete the fork/drive/wait/merge paradigm.
-- **`kj drive` follow-up:** Add verb-level refusal for driving Staging contexts.
 - **Autonomous turn runaway guard:** Add a `drive_depth` cap to prevent unbounded fan-out from `--prompt` forks.
 - **TurnFlow catch-up for late/reconnecting subscribers:** the *lossy* half is FIXED (2026-08-05, the FlowBus backpressure rework — a live subscriber can no longer miss an event; it is terminated with an explicit signal instead). What remains is the **catch-up** story: a client that subscribes *late*, or reconnects mid-turn, was never a subscriber when the outcome was published, so it still misses `turn.completed`/`turn.failed` and must fall back to reading the block log — which recovers *what* the turn wrote but never *why it stopped* (`TurnStopReason` has no block-log shadow; `EndTurn`, `MaxTokens`, and a soft cancel all leave the same `Done` block behind). Deliberately un-journaled (blocks are the durable record; replaying completions after a restart would announce turns nobody is waiting on), so the fix is a bounded per-context "last outcome" the subscriber reads on attach, not a journal.
 - **Headless turn cwd is `/`:** Decide whether to thread the context's stored shell cwd into the headless `ExecContext`.
@@ -2445,10 +2455,12 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   with per-entry records under a new `--json` flag; `kj rc reset <path>`
   remains the manual pull (live is truth, no auto-overwrite). Remaining gap —
   the worse half: `reset`/`reseed` only fix *future* contexts. A context
-  already created from a stale seed keeps its broken loadout and can only be
-  repaired from a binding-admin context, which the cold-start bootstrap
-  doesn't provide (see "Cold start seeds no binding-admin context" under
-  Architecture).
+  already created from a stale seed keeps its broken loadout and must be
+  repaired from a binding-admin context. **No longer structurally blocked**
+  (2026-08-11): cold start now seeds a ROOT director with admin + rc-write
+  (`crates/kaijutsu-server/src/rpc.rs:2112`), so the authority to repair
+  exists — what's missing is the repair path itself, not a context to run it
+  from.
 - **`local` is a kaish reserved word (like `set`).** `--model local` lexes as
   the `local` builtin keyword → `found ';' expected identifier`. Same class as
   the `set` reserved-word gotcha; quote it (`--model "local"`) or pass the full
@@ -2469,23 +2481,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `TurnFlow::Failed`. Also worth: per-provider/per-context `default_tools` as the
   norm so players never get `all`; per-model timeout overrides if 30s/300s ever
   prove wrong for a slow local model.
-- **P3 — external `mcp__kaijutsu__shell` `data` needs a persisted block field.**
-  The *in-kernel* `builtin.shell` now carries kj's `.data` in its `structured`
-  envelope (shipped 2026-06-14, `mcp/servers/shell.rs`), and `kj <cmd> --json`
-  returns the payload in stdout for any consumer. The remaining gap is the
-  *external* `mcp__kaijutsu__shell`, which observes the result via CRDT sync
-  (polls a block snapshot, reads `snapshot.output`) rather than a return value.
-  Root cause (traced 2026-06-14): kj sets `ExecResult.data` (a kaish `Value`),
-  but the server's `shell_execute` only persists `ExecResult.output()`
-  (`OutputData`) onto the block (`rpc.rs:6104` → `set_output`), and the block
-  carries only `output: OutputData` — which can't faithfully hold arbitrary JSON
-  (an inspect object). Faithful fix: a new persisted `data` field on the block,
-  mirroring the `.output` vs `.data` split — thread through `kaijutsu-types`
-  `BlockSnapshot`, `kaijutsu-crdt` (content/document/block_store), the capnp
-  `BlockSnapshot` wire (the real cost — three-binary bounce), then `set_data` in
-  `shell_execute` and read it in the MCP `to_json` (`kaijutsu-mcp/src/lib.rs`).
-  CBOR oplog evolution is additive (safe); capnp is the work. P3 because the
-  `--json` envelope already unblocks consumers today.
 - **External shell-hang fix — one residual verification.** The 2026-06-17
   executor-starvation hang is fixed (`SubscriberHealth` reap tolerance +
   `resubscribe_blocks` + joined-context-scoped subscription; story in devlog).
@@ -3389,24 +3384,12 @@ New observations from the crate-by-crate architecture sweep (see
 existing entry are marked *(confirms above)*.
 
 **CRDT data model:**
-- **Dual storage impls.** `BlockStore` (target) and `BlockDocument` (legacy) are
-  both `pub` and in use; the legacy path returns newer fields
-  (`ephemeral`/`stderr`/`signature`/`track`) as hardcoded `None`/`false`
-  (`kaijutsu-crdt/src/document.rs:482`) and retains the duplicate-block seq bug
-  fixed in `BlockStore` (`document.rs:892` vs `block_store.rs:320`). Pick a
-  migration deadline.
 - `calc_order_key` calls `block_ids_ordered()` (O(N) sort) on **every** insert
   (`kaijutsu-crdt/src/block_store.rs:390`); the bench exposing it is `#[ignore]`d.
 - Tombstones aren't a first-class `BlockSnapshot` field — they ride a side
   `deleted_blocks` list re-applied by hand (`block_store.rs:1637`).
 - `StoreSnapshot` has a breaking-format note with no migration path ("delete
   existing databases when upgrading", `block_store.rs:1680`).
-
-**UTF-8 offset hazard:**
-- `EditEngine` passes **byte** offsets/lengths to `block_store.edit_text`
-  (`kaijutsu-kernel/src/file_tools/edit.rs:132`) while `FileDocumentCache` is
-  careful to use **char** counts (`cache.rs:276`). Multi-byte content can corrupt
-  the CRDT splice. Audit `edit_text`'s parameter semantics and unify.
 
 **`kj` single-source guarantee is manual** — `dispatch()` routing and
 `kj_command()` schema tree must be hand-kept in sync; a subcommand added to one
@@ -3417,8 +3400,6 @@ but not the other is unreflectable (`kaijutsu-kernel/src/kj/mod.rs:589`).
 (`theme.rs:59`). Belongs in a UI/config crate.
 
 **`kaijutsu-index`:**
-- `rebuild()` is a TODO stub (`lib.rs:214`) — evicted HNSW slots accumulate
-  forever.
 - Metadata lock held across ONNX `embed()` (`lib.rs:160`) serializes all
   `index_context` calls.
 - `ort` uses `download-binaries` — fetches ONNX Runtime at build time, breaks
@@ -3462,240 +3443,11 @@ crates)*
 
 ---
 
-## Gemini CLI feature comparison — candidate work (2026-06-23)
+## Cache & cost — decided direction (2026-06-24)
 
-Differentiators surfaced by scanning `~/src/research/gemini-cli` (Node/TS terminal
-agent) with sonnet subagents, each verified against the kernel source before being
-listed. Lens: capabilities gemini-cli has that kaijutsu plausibly lacks — *not* a
-full feature inventory. Filtered through the **instrument-not-harness** stance:
-items tagged ⚠️ sit in tension with it (silent override / harness-UX) and want an
-opt-in or kernel-capability reframing before adoption. Pick from these; they are
-candidates, not commitments.
-
-### Provider resilience (the headline — Gemini's alignment + availability is the reason we're here)
-
-- **LLM retry + backoff with jitter.** Claude/OpenAI/DeepSeek clients issue a
-  single HTTP request and propagate `LlmError::RateLimited`/`ApiError`/`NetworkError`
-  with no retry — one transient 5xx/SSL hiccup aborts the whole turn and loses
-  context. gemini-cli `retryWithBackoff` (`packages/core/src/utils/retry.ts`): exp
-  backoff, ±30% jitter, `Retry-After` respect, retryable-vs-terminal classification.
-  Transparent to the user; clean instrument fit. **Strongest, lowest-risk item.**
-- **Model availability state + fallback chain.** No per-model health map; a 429
-  just fails. gemini-cli tracks terminal/transient health and walks a policy chain
-  (pro→flash→…). ⚠️ Make it opt-in (`--allow-fallback` / alias policy) so the kernel
-  doesn't silently swap the model the user chose.
-- **Extended-thinking wiring — nearly free.** Types, builder, and SSE parsing are
-  *done* (`Thinking::Enabled`, `with_thinking()` `llm/claude/build.rs:224`,
-  `ResponseBlock::Thinking`) but the stream path hardcodes `thinking: None`
-  (`build.rs:143`) and no `BuildOpts` field exposes it. ⚠️ `Thinking::Enabled {
-  budget_tokens }` 400s on Opus 4.8 (adaptive-only) — wire **adaptive thinking +
-  `effort`** through `BuildOpts` + per-model config, not `budget_tokens`. Toggling
-  thinking doesn't invalidate the tools+system cache, so it's safe to flip per-context.
-  Claude 4.x thinks by default — small delta, real win.
-- **Token-aware context window.** Only an *output* cap exists (`max_output_tokens`,
-  default 64K); no per-model *input* limit table, no pre-send estimate, no media
-  weighting. Windowed hydration (`llm/mailbox.rs:197`) is block-count, not token-count
-  — near-limit contexts get silently truncated or 400'd by the provider. Add a
-  per-model input-limit table + pre-send estimate warning. Optionally an EMA
-  chars-per-token calibrator fed by actual API usage (gemini's `AdaptiveTokenCalculator`).
-- **Classifier-based model routing.** ⚠️ Opt-in only: route cheap turns to haiku,
-  hard turns to opus via a fast classifier (gemini `ModelRouterService`). Surface as
-  `route: auto` alias policy, never a silent override.
-
-### Context & memory
-
-- **Auto token-threshold compression with LLM summarization + verification.**
-  Windowed hydration drops the middle block range with no summary (the motivating
-  incident in `docs/conversation-session.md`). gemini `ChatCompressionService` fires
-  at ≥50% of the window, LLM-summarizes the older segment into a `<state_snapshot>`,
-  then runs a verification turn to catch omissions. Pair this with the windowing notch
-  so dropped history leaves a distilled trace.
-- **JIT subdirectory context injection.** *(merged: surfaced by both the tools and
-  context scans.)* On a tool crossing into a new subtree, gemini crawls upward for
-  not-yet-loaded `GEMINI.md` and appends it to the tool result. kaijutsu loads rc/
-  stances at context-create only — no path-triggered per-directory injection. Append
-  any `KAIJUTSU.md` between the accessed path and workspace root on first access.
-- **Filesystem memory-file discovery.** No traversal of the host FS for
-  user-maintained markdown memory. gemini crawls up to the git root merging
-  `GEMINI.md` tiers (global→project) + recursive `@path` imports. Discover/inject a
-  per-directory `KAIJUTSU.md` at hydration — user-editable working agreements that
-  attach to a directory without touching kernel config.
-- **Date / OS / cwd in situational context — cheap.** `build_system_prompt`
-  (`llm/system_prompt.rs:69`) injects id/label/model/tools but *not* today's date,
-  platform, or cwd. ~20 tokens kills a class of stale-temporal and platform-wrong
-  reasoning. Add fields to `SituationalContext`.
-- **`kj memory show`.** No way to inspect the *assembled* system prompt (base + rc
-  sections + situational) without reading source files — memory debugging is opaque.
-  Add a render command; optionally `kj memory refresh` to hot-reload stance edits
-  without re-creating the context.
-- **Memory inbox (LLM-proposed durable patches).** Drift targets live contexts, not
-  files. gemini lets the model propose memory edits as unified diffs queued for
-  user apply/dismiss. A file-targeting analog of drift: model proposes a stance/memory
-  patch → inbox → user reviews before it takes effect.
-
-### Tools
-
-- **`web_fetch` + `web_search` builtins.** Zero web-acquisition tools exist (reqwest
-  is LLM-API-only). Without a fetch primitive the instrument can't research anything
-  not pre-loaded; every harness must BYO scraper MCP. Add a `builtin.web` server:
-  HTML→text fetch (rate-limited, private-IP block, untrusted-content wrapper) + search.
-- **`read_many` (multi-glob batch read).** Today: glob then loop-read. gemini
-  `read_many_files` expands patterns, reads all matches (incl. images/PDF/audio),
-  returns one joined payload with per-file truncation markers. Saves turns on
-  codebase-wide context loading.
-- **Omission-placeholder validator on edits — fits "crash over corruption."**
-  `EditEngine` validates the `old_string` match but doesn't scan `new_string` for LLM
-  shorthand (`// rest of code…`, `(unchanged)`) — so a placeholder gets applied
-  verbatim, corrupting the file *past* the hash check. Reject pre-apply. Directly
-  serves the no-silent-corruption directive.
-- **Structured `ask_user` tool.** `KjResult::Latch` is a single destructive-op
-  confirmation, not a model-callable way to surface ambiguous decisions mid-turn.
-  gemini `ask_user` submits a batch of typed questions (text/confirm/choice) that
-  block until answered. Kernel supplies the interrupt primitive; harness chooses to
-  expose it.
-- **Optional edit-correction hook.** ⚠️ When `old_string` misses, gemini runs a
-  second LLM pass to repair the search string (fuzzy fallback first). kaijutsu fails
-  loud *by design*. Don't auto-repair (corruption risk) — but emit a structured
-  error + correction-context block so a harness can opt into recovery, mirroring
-  gemini's `getDisableLLMCorrection` toggle.
-- **Plan-mode toggle.** `read_only_shell` is a static binding, not a model-asserted
-  mid-session mode. gemini `enter_plan_mode`/`exit_plan_mode` flips to read-only with
-  a visible reason. A lightweight plan-mode token (vs the heavier fork) for
-  single-session exploration constraint, surfaced to the harness via a `KjResult` variant.
-- **Caching visible-tool resolutions — future-proofing, NOT a live hot path.**
-  *(Downgraded 2026-07-29 audit; the previous entry claimed `list_visible_tools`
-  ran on every tool dispatch. It doesn't.)* `build_tool_definitions` →
-  `list_tool_defs_via_broker` (`kernel.rs:532`) runs **once per LLM turn**
-  (`llm_stream.rs:318`); the tool list is computed before the agentic loop and
-  reused unchanged through it. The only per-call retrigger is the model invoking
-  `tool_search`. The `RwLock`s are also never held across `list_tools().await`.
-  With only in-memory builtins registered this costs nothing — revisit when
-  Phase 2 lands external servers with genuinely slow `list_tools`.
-
-*(Deleted 2026-07-29: "Socket hook vs. Hook Table alignment" — verified FIXED in
-`6d45414c` (2026-06-18), before the entry was even written. `agent_id`→
-`principal_id` maps correctly in `contrib/adapters/claude-to-kaijutsu.jq:29`,
-`.tool_response // .tool_output` is handled at :23, and
-`crates/kaijutsu-mcp/tests/adapter_mapping.rs` round-trips real fixtures. The
-"fragile PID-based socket discovery" claim was also stale — `resolve_hook_socket`
-is now a 6-stage ladder with ping-based session disambiguation and a stale-socket
-sweep, with 10+ tests. "Contradictory hook persistence documentation" also
-deleted — folded into the hook-lockout entry below, which is the real issue.)*
-
-### Safety, sandboxing & policy
-
-- **Kernel-level process isolation for kaish shell — HIGH.** EmbeddedKaish runs real
-  binaries with the full kernel process's privileges; `WorkspaceGuard` is VFS-layer
-  only and is bypassed the moment a builtin shells out via `LocalBackend`. A
-  compromised tool can read `/etc/passwd`, `ptrace`, or exfiltrate keys. gemini wraps
-  exec in `bwrap --unshare-all` + seccomp (Linux) / seatbelt (macOS). Add an OS-isolation
-  wrapper for shell-tool exec, toggled by a capability binding.
-- **Env/secret masking for agent-invoked shell — HIGH (supply-chain).** A
-  coder-context agent can `echo $ANTHROPIC_API_KEY` — the context env (incl. provider
-  keys) is handed to kaish unstripped. gemini bind-mounts zero-byte files over `.env*`
-  and strips `*_API_KEY`/`*_TOKEN`/`GITHUB_*` from the sandboxed env. Strip
-  credential-pattern vars from the env visible to agent shell commands; configurable allowlist.
-- **Network egress cap.** Capability model has no network axis; MCP subprocesses get
-  unrestricted sockets. `npm install`/`curl` leak data with no gate — sharper risk
-  given the multi-user SSH model. Add a `network` binding axis (deny-by-default),
-  enforced via net-namespace when OS isolation lands.
-- **Declarative policy loader + argument-pattern deny rules.** *(merged: the
-  sandboxing and extensibility scans both hit this.)* Bindings are coarse (whole
-  tool/instance, no arg matching) and only authorable via kaish hook syntax or
-  `builtin.bindings`. gemini has a tiered TOML engine (Default<Workspace<User<Admin),
-  `argsPattern` regex, `allow`/`deny`/`ask_user`. Add a TOML/`policy.kai` loader that
-  hydrates PreCall Deny/Allow hooks from declarative rules (tool glob + args pattern +
-  decision) at create time — e.g. "deny `write_file` to `~/.ssh/*`" without writing Rust.
-- **Workspace rc trust gate.** No "do you trust this project?" gate before executing
-  `.kai` rc from a workspace dir — a malicious rc runs on context create, affecting an
-  always-on multi-user kernel. gemini gates project config behind a trust dialog that
-  audits discovered commands/MCP/hooks. Require operator approval before running rc
-  from a non-trusted-root; surface discovered rc/mcp/binding config first.
-- **Sandbox-expansion protocol.** `WorkspaceGuard` denies a path with a hard failure
-  and no escalation. gemini surfaces a "grant session/persistent?" modal on denial.
-  Emit a structured expansion request (Cap'n Proto event) so the operator can grant
-  session-scoped paths without tearing down the context.
-- **Pre-execution veto hook (external checker protocol).** MCP hooks fire on
-  lifecycle events, not as a pre-call veto. gemini runs external checker subprocesses
-  via a versioned JSON protocol (stdin: tool call + context; stdout: allow/deny/ask;
-  fail-closed on timeout). Lets operators plug in compliance/content/rate-limit checks
-  without patching the kernel — a clean instrument capability.
-- **LLM-derived task policy (conseca-analog).** ⚠️ Risky as a sole gate (LLM error
-  ⇒ allow). gemini derives per-prompt least-privilege constraints from the request +
-  tool list, then enforces at call time. Only as an *optional secondary* stage after
-  static bindings, fail-open with telemetry.
-
-### Session & workflow
-
-- **Pre-edit filesystem checkpoint + `kj restore` — HIGH.** `KernelState::checkpoint`
-  (`state.rs:160`) snapshots in-memory vars only, not the host FS, and isn't tied to
-  tool execution. A bad edit run leaves files half-modified with no mechanical rollback.
-  gemini auto-commits a shadow git snapshot before every file-write tool, with
-  `/restore`. Auto-snapshot + `kj restore <checkpoint>` to revert FS + conversation.
-- **Turn rewind + FS revert.** `kj fork` is a forward branch (explore), the inverse
-  of "undo that last edit." gemini `/rewind` walks back N turns and reverses file
-  edits (exact-match, patch-merge fallback) with a diff preview. A backward escape
-  hatch that doesn't spawn a new context branch.
-- **Named conversation bookmarks (save/resume in-place).** Fork diverges history;
-  there's no "park this state, try another direction in the *same* context, snap back."
-  gemini `/resume save|resume|delete <tag>` snapshots and restores LLM wire history
-  in place. Distinct from fork — avoids unbounded DAG branching for quick what-ifs.
-- **User-defined prompt command templates.** rc scripts fire on lifecycle events;
-  there's no user-authored named command. gemini loads `.toml` from
-  `~/.gemini/commands/` + project dirs → `/git:commit` etc. with `{{args}}`. Add
-  `~/.config/kaijutsu/commands/` + `<project>/.kaijutsu/commands/`, invocable as
-  `kj cmd:<name> [args]`.
-- **Inline `@{file}` prompt injection.** The user can't say "here's the file I mean"
-  in prompt text — they must wait for the model to choose to call `read`. gemini
-  expands `@{path}` (text/image/PDF) in the input before submission. Parse `@{path}`
-  in `write_input`, respecting the VFS boundary.
-- **`!{shell}` injection in prompt templates.** Pairs with command templates: gemini
-  expands `!{git diff --staged}` stdout into the prompt at construction time (policy-
-  confirmed), outside the model's tool loop — e.g. a `/git:review` one-liner.
-- **Conversation export.** `block_list`/`block_read` extract internally but nothing
-  produces a portable file. Add `kj conversation export <path.md|json>` for sharing/
-  bug-reports/archival outside the system.
-
-### Extensibility & integration
-
-- **Turn- and model-boundary hooks — HIGH.** The hook table (`mcp/hook_table.rs`:
-  PreCall/PostCall/OnError/OnNotification/ListTools) is scoped to MCP tool calls only;
-  the socket listener (`hook_listener.rs`) is an inbound *mirror*, not an outbound
-  interceptor. gemini has BeforeAgent/AfterAgent/BeforeModel/AfterModel that can
-  block/rewrite. The kernel owns the turn loop (`llm_stream.rs`) — add BeforeModel/
-  AfterModel + BeforeTurn/AfterTurn phases so rc scripts can reshape requests/responses
-  (cache hints, PII filter, retry) without bespoke Rust. **Decided 2026-06-24 — see
-  *Cache & cost* below:** phase named `BeforeModelTurn`/`AfterModelTurn`; rename the
-  existing MCP `PreCall`/`PostCall` to MCP-scoped names; mechanics(Rust transport) /
-  policy(per-provider data) / decisions(kaish hook) split; contract = `HookAction`
-  verdict + stdout→block payload (append-only).
-- **Headless one-shot with JSONL streaming — HIGH.** `kj drive --prompt`
-  (`kj/drive.rs:93`) fires-and-returns; the turn runs server-side with no
-  consume-until-done path. CI/eval harnesses need a blocking subprocess. Add
-  `kj run --prompt … --output-format jsonl` that streams turn events
-  (turn.requested/tool_call/tool_result/turn.completed) and exits with a machine code.
-  The completion half is now available to a client: `subscribeTurnEvents` pushes
-  a structured stop reason (end_turn / cancelled / max_tokens / max_iterations),
-  which is exactly the machine exit code this wants.
-  *(relates to the existing "headless turn cwd is `/`" item.)*
-- **Python/TS thin SDK.** `kaijutsu-client` is full-featured but requires Rust
-  compilation; eval/CI tooling lives in Python/TS. Wrap `kj run --json` JSONL (or the
-  RPC bindings) into an async session driver so harnesses don't compile Rust.
-- **IDE peer integration.** No editor bridge (`kaijutsu-editor` is a terminal vi
-  builtin, not an IDE plugin). The peer model (`PeerRegistry`/`invoke_peer`) already
-  fits: a VS Code extension registers as a kaijutsu peer, sends open-file/cursor/
-  selection blocks into the active context, and renders kernel-proposed edits as diffs.
-- **Extension bundle manifest.** rc bundles exist but with no named-unit manifest,
-  install/update lifecycle, or scoped enable/disable. gemini's `gemini-extension.json`
-  bundles MCP servers + hooks + commands + context as one versioned, git-URL-installable
-  unit. An `extension.toml` (rc scripts + contrib adapters + context configs) installable
-  via `kj extension install <git-url>` — configures the instrument, doesn't host it.
-- **Hook fingerprinting / trust.** CRDT ownership is the integrity model but there's
-  no change-detection warning when an rc/hook body changes via `kj rc reset` or sync
-  (extends the existing "stale rc seed" item). gemini fingerprints project hooks and
-  warns on change. Track hook-body hashes; warn/block-by-default on unexpected change.
-
-### Cache & cost — decided direction (2026-06-24)
+*(Promoted from the Gemini CLI survey when that wishlist moved to
+`docs/wishlist-gemini-cli.md` on 2026-08-11 — unlike the survey, this is a
+locked decision with concrete remaining work.)*
 
 A working session with the lead context converged several candidates above into
 decisions. Organizing lens: **the Anthropic prompt cache is a prefix match — any byte
@@ -3843,67 +3595,6 @@ in tests/engrave_tests.rs.)
   (title baseline ≈ bracket y); nudge the title up or the bracket down.
 - ~~MED — redundant key-sig accidentals~~ — VERIFIED NOT A BUG: the parser doesn't stamp
   key-sig accidentals onto `note.accidental`, so `K:G FFFF` draws exactly 1 sharp. (False positive.)
-
----
-
-## kj config / shell surface (papercuts — found 2026-06-30 wiring local llama.cpp providers)
-
-Standing up a local-model musician meant editing `models.toml`, which surfaced a
-cluster of friction in the config + shell surface:
-
-- **Config drift is silent (want a `kj config doctor`).** The live CRDT
-  `models.toml` pointed its local providers at `ollama` (:11434) and `lemonade`
-  (:8000) — both stopped/disabled — with **no provider** for the actually-running
-  llama.cpp servers (:2020 gemma4-26b, :2021 gemma4-e4b); the stale host
-  `~/.config/kaijutsu/models.toml` pointed at a *third* dead endpoint (vestigial
-  lemonade :13305). Nothing flags that a configured provider's `base_url` is
-  unreachable until a turn fails (or, worse, hangs). A `kj config doctor` /
-  startup probe that pings each enabled provider's `base_url` and warns on the dead
-  ones would turn a silent config-vs-reality drift into a loud one (same class as
-  the rc/source drift we watch for).
-- ~~`kj config set` ignores piped stdin~~ / ~~No `kj config edit`~~ — **SHIPPED
-  2026-07-04**: stdin promotion generalized from the rc-only gate
-  (`wants_stdin_content()`, `runtime/kj_builtin.rs`) so piping works as the
-  help always claimed, and `kj config edit <path>` opens a vi session via the
-  same `editor_open_signaled` path as `kj rc edit` (`ConfigCommand::Edit`;
-  `Set`'s old `edit` alias retired).
-- **The MCP/context shell is read-only for host writes** — `> file` (even
-  `> /dev/null`) fails `redirect: read-only filesystem`, so you can't stage a temp
-  file in-shell; the edit had to be staged via a separate host write and read back.
-  If RO is intentional, a `/dev/null` sink and a writable scratch dir would remove
-  the sharp edge for scripting.
-- **`kj context create` took ~60 s** for one musician (others were instant) —
-  anomalous, possibly a blocking create-time hydrate/model call; worth a look.
-- **(unreproduced) a `kj` shell call hung the full 300 s timeout once** mid-session;
-  `kj context list --tree` and `kj model list` both return fast now, so noting it
-  as a one-off to watch, not a fixable repro yet.
-- **Provider naming: the `type =` field decision (residue of the silent
-  unknown-provider drop; the fail-loud halves SHIPPED 2026-07-04).** Shipped:
-  `kj config set`/`edit` on `models.toml` now parses the TOML and **rejects**
-  unknown `[providers.<name>]` types at write time, and the boot warn says
-  `unknown provider type 'X' (supported: anthropic, deepseek, openai, ollama,
-  lemonade, local)` — the "missing API key?" guess now appears only on actual
-  `AuthError`. Remaining design decision (human call): a real `type =` field so
-  a provider can be named freely (`[providers.gemma-e4b] type = "openai"`)
-  instead of overloading the four OpenAI-compat type-names as base_url slots.
-  **Latent skew found while implementing:** `Provider::from_config` still
-  accepts `"claude"` as a legacy alias for `"anthropic"`, but the write-time
-  validator doesn't — `[providers.claude]` boots fine but is now rejected at
-  `kj config set`. No shipped config uses it; decide alias-in-both or
-  alias-nowhere (dovetails with the `type =` decision). Also (deepseek review
-  2026-07-04, LOW): the interactive `kj config edit` editor-session save path
-  writes through `blocks.edit_text()` and never calls `validate_config_write`
-  — only `set`/`edit --content` validate. Backstopped by the boot-time
-  unknown-type warn and the `config-write` gate; close it by validating at
-  editor save/flush for config-owned docs if it ever bites.
-- **Two `models.toml` files, only one is read.** The kernel loads providers from
-  the **CRDT** `/etc/config/models.toml` (via `kj config`), and the legacy host
-  `~/.config/kaijutsu/models.toml` is **ignored** — but it still exists, looks
-  authoritative, and disagrees (it had a vestigial `openai-local` → dead :13305).
-  Editing the host file does nothing; you must `kj config set`. Either delete the
-  host file on migration, or have the kernel warn that it found+ignored it. (Same
-  CRDT-vs-host ownership confusion as rc, but here there's a stale host artifact
-  actively misleading.)
 
 ---
 
