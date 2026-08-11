@@ -96,6 +96,28 @@ shared-trust model and with how `BackgroundRegistry` already works.
 
 ## kaijutsu on brak: fleet coordination service (2026-08-09, via zorak session, Amy aware)
 
+> **DEPRIORITIZED 2026-08-11 — Amy, leaning not ruling.** *"I'm torn about
+> bringing kaijutsu kernel service over, brak is not a powerful dev machine.
+> So kernel will be likely on zorak since it depends on Zorak's GPU anyways.
+> At least for now. we'll push binaries around later."*
+>
+> The load-bearing reason is the **GPU dependency**, not brak's size: the
+> kernel wants local models (embeddings / semantic index), so one-kernel-on-
+> zorak follows from where the GPU is. Keep that framing — "brak is a small
+> box" invites someone to reopen this the moment they see a bigger small box.
+>
+> **brak already participates, as a client.** It runs Claude Code in screen
+> with `kaijutsu-mcp` against zorak's kernel — so fleet participation was
+> never gated on a kernel deployment there. The entry below (and the
+> launcher-unit gap under it) was written assuming otherwise.
+>
+> Everything below stays on record because the *shape* is still the blessed
+> one (ONE kernel, many tailnet clients) and the deployment gaps are real
+> whenever a kernel does land on a box that isn't zorak. Nothing here is
+> active work right now. Also parked with it: **does a kernel that is purely
+> a coordinator need provider API keys at all?** — moot while the kernel
+> lives on zorak, live again the moment one doesn't.
+
 Fleet direction from tonight's planning: brak (always-on N100 on UPS,
 tailnet 100.113.35.53) should eventually run the kaijutsu kernel as the
 fleet's coordination service — machine sessions on zorak/brak/moltar talk
