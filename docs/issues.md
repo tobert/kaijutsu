@@ -61,6 +61,34 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ---
 
+## Two seeds from the rc-create lockout fix (2026-08-12, `788fb0d7`)
+
+Found while closing that item; recorded rather than folded in, because
+neither is that bug.
+
+- **`test_dispatcher` leaves the broker's DB handle unset**, so
+  `broker.set_binding` (and therefore `kj binding allow`) lands only in the
+  in-memory cache — which `require_cap` and `has_usable_loadout` never read,
+  by design: they read KernelDb, the authoritative store the broker
+  write-through targets in production. The rebind repair test hit this the
+  loud way: the rc script reported `allowed operator on context …` and the
+  loadout stayed empty. Fixed *in that one test* with
+  `broker().set_db(kernel_db.clone())`. **Open question: which other binding
+  tests on this fixture are asserting against the cache instead of the
+  store?** `kj::drive`'s gate tests already know (they write straight to the
+  DB with a comment explaining why) — so the knowledge exists and is applied
+  ad hoc per test. Candidate fix: wire the DB in `test_dispatcher` itself, so
+  the fixture matches production and the per-test workaround stops being
+  something each author has to know.
+- **Sweep the authz-shaped `.ok().flatten()` / `unwrap_or(false)` sites.**
+  The "errors that were only strings" pass (Aug 3–4, devlog) fixed this
+  collapse in `Broker::binding_checked`; `require_cap` held an untouched copy
+  for months, where a KernelDb read failure was indistinguishable from a
+  missing grant. The family is "a fault silently becomes a policy decision" —
+  worth grepping deliberately in gate/predicate paths rather than waiting for
+  the next one to surface. Note the direction of the risk: deny-by-default
+  makes the *safe* wrong answer easy to ship and hard to notice.
+
 ## Summaries drift stronger than what they summarise (2026-08-11, three instances in one day)
 
 Not a code bug — a writing failure mode worth naming, because it cost real
