@@ -165,3 +165,18 @@ into layout math — convert via `view::ui_rtt::logical_size` /
 `logical_content_size` (invisible at 1x, breaks on HiDPI).
 
 Bevy source: `~/src/bevy`, examples at `~/src/bevy/examples/`
+
+**Check what `~/src/bevy` is on before trusting it.** It is a working
+checkout, not a pinned mirror — on 2026-08-12 it was five months stale
+(0.18.1) while 0.19.0 was out, so a sweep planned against it would have
+concluded 0.19 did not exist. Run `git -C ~/src/bevy describe --tags` first,
+`git fetch` and check out the tag you actually mean, and **say in your
+findings which tag you read**. While we are mid-migration, **prefer the cargo
+caches** (`~/.cargo/registry/`) as truth for "what does version X require" — a
+cached `.crate` tarball's `Cargo.toml` is the real manifest and cannot go
+stale the way a checkout can. This applies to subagents too: tell them the
+tag, don't let them assume.
+
+A related trap that already bit us: **a dependency's own version number says
+nothing about which Bevy it targets.** `bevy_brp_extras = "0.19"` requires
+`bevy 0.18.1`; its first release wanting Bevy 0.19 is 0.21.0.
