@@ -2084,6 +2084,38 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   families when signed Thinking exists in history (a DeepSeek nonce fed to
   Anthropic 400s); allow the transition only at `fork`, where an rc script
   decides to elide thinking or downgrade it to plain blocks.
+## Bevy 0.19 upgrade — planned, not started (2026-08-12)
+
+Full plan: **`docs/bevy-019-upgrade.md`**. Verified against the 104 official
+0.19 migration guides, not training memory. Headline: 7 of 104 guides touch
+us; the framework's big reworks (parley text, resources-as-components,
+render-graph-as-systems) are near-misses because we never used those APIs.
+
+Blockers, all small except one decision: `bevy_brp_extras = "0.19"` actually
+requires `bevy 0.18.1` (need ≥0.21 — the pin that reads current is the one
+holding us back); `vello` 0.7→0.9 must land atomically with the bump (Bevy
+goes wgpu 27→29 and we hand Bevy's device straight to vello); four mechanical
+import/field fixes; 24 `Assets::get_mut` sites needing `mut` bindings.
+
+The one real decision is **rodio**: Bevy 0.19's `bevy_audio` wants rodio 0.22,
+which deleted `OutputStream`/`Sink` — the API `audio_sched.rs` (868 lines) is
+built on via our own direct `rodio = "0.20"` pin. Hold at 0.20 (two copies in
+the tree, and correct the now-false dedupe comment at `Cargo.toml:32-33`) or
+rewrite the playback core. Invisible from the Bevy guides; found by reading
+rodio's source.
+
+Not urgent — 0.18.1 works. Independent of the drift lane in both directions.
+
+## Test leaks a pidfile into `/tmp` (2026-08-12, via kaish's /tmp audit)
+
+`background_exec.rs:1609` builds a pidfile at
+`std::env::temp_dir().join("bg-exec-test-childpid-{uuid}")` and never removes
+it — one leftover confirmed on zorak from 08-10. Not implicated in the 4.9G
+that audit was chasing (that was cc session storage); flagged so it is fixed
+at the source rather than misattributed later. The kernel test harness already
+has the right pattern — `Kernel::with_temp_cleanup(root)`, which drops a temp
+root when the dispatcher drops. Small.
+
 ## Drift UX — cross-session ergonomics (2026-08-12)
 
 Design record + full gap list: **`docs/drift-ux.md`**. Slice 1 (`push`
