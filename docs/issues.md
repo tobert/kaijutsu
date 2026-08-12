@@ -2099,14 +2099,16 @@ Remaining, in order:
   unmanaged deliberately ("for observation", `0c06f51c`) — four weeks in,
   the cost is now measurable. Fix is small (conclude on `session.end`) but
   **needs Amy's word**, plus a decision on sweeping the 152 already resident.
-- **`push` and `pull` speak different address grammars.** `push` → in-memory
-  router (`drift.rs:330-338`); `pull`/`merge`/`history` →
-  `refs::resolve_context_arg`, which also accepts full UUIDs and `.`/`.parent`
-  chains (`kj/refs.rs:23-40`). So `merge .parent` works and `push .parent`
-  does not. Route push through the same resolver, registry as fallback.
 - **A received drift is a dead end for reply.** Hydration surfaces the short
   id only (`llm/hydrate.rs:344-357`) — never the sender's label, no thread id,
-  no hint that replying is possible. Carry the label.
+  no hint that replying is possible. **Not the cheap fix it looks like.**
+  Stamping the label on the block is ~65 refs across 14 files plus wire and
+  app renderers, *and* it stamps a mutable value — `stabilize_context_label`
+  renames `cc-*` contexts, so a stamped label goes stale and displays a wrong
+  address as a right one. Resolving at hydration is correct but
+  `translate_block` has no DB access and has several callers; it wants a
+  label snapshot passed in, not a DB handle held across hydration. Small
+  design pass, not a patch.
 - **Should an arriving drift wake a turn?** Nothing subscribes to the block to
   drive the target; it surfaces on the next natural turn. Four shapes written
   up in `drift-ux.md` with no recommendation — it touches the turn loop and

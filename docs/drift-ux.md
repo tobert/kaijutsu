@@ -177,10 +177,23 @@ kj drift push cc-kaijutsu "..."   →  ambiguous context prefix 'cc-kaijutsu':
                                      matches [60 candidates]
 ```
 
-The most natural way to name this project's own session — its name — is
-unusable as a drift address, and gets monotonically worse with every session
-ever started. Dead contexts are not inert: they consume the live namespace.
-That converts gap #5 from "the roster is untidy" into "addressing degrades
+**Scope this precisely — it is prefix addressing that breaks, not all of it.**
+Resolution tries exact label first and returns before any ambiguity check
+(`ids.rs:283-296`), and falls through to the 8-hex-char short id at step 3. So:
+
+| Form | Today |
+|---|---|
+| `push cc-kaijutsu-3fc34b49` (exact label) | works |
+| `push 05b98e89` (short id) | works |
+| `push cc-kaijutsu` (label prefix) | **ambiguous, 60 candidates** |
+
+The loss is real — abbreviating a label is the entire reason to have one, and
+it is the form a human or model reaches for first — but a session is still
+addressable if you spell it out. Read the gap as "the ergonomic address form
+decays to unusable, monotonically", not "cc contexts cannot be reached".
+
+Dead contexts are not inert: they consume the live namespace. That converts
+gap #5 from "the roster is untidy" into "the usable address form degrades
 without bound", which is a correctness-shaped problem wearing an ergonomics
 costume.
 
@@ -229,15 +242,37 @@ only writes a text block. Pair it with a one-shot sweep for the 152 already
 resident. Concluding is reversible-ish and non-destructive — archived contexts
 keep their blocks; they just stop competing for the name.
 
-**Slice 3 — one address grammar.** Route `push` through
-`refs::resolve_context_arg` so `.`/`.parent` and full UUIDs work everywhere.
-Keep the registry lookup as a fallback so live-only contexts still resolve.
-Small, mechanical, removes a papercut nobody should have to learn.
+**Slice 3 — one address grammar. SHIPPED 2026-08-12 (`46878b28`).** `push`
+resolves through `refs::resolve_context_arg` like everything else, so `.`,
+`.parent` chains and full UUIDs work on it; the router stays as a fallback.
+Structural refs are also the one address form immune to the label collisions
+in gap #5 — a fork can reach its parent without naming anything.
 
-**Slice 4 — make reply obvious.** Carry the sender's *label* into the hydrated
-text alongside the short id, so a receiver sees
-`[push from lead-kaijutsu (a1b2c3d4)]`. Consider a trailing reply hint in the
-rendered block. Cheap; makes the message self-describing.
+**Slice 4 — make reply obvious. NOT cheap; needs a decision.** The intent
+stands: a receiver should see `[push from lead-kaijutsu (a1b2c3d4)]` rather
+than a bare short id. Costing it revealed the estimate in the first draft of
+this doc was wrong, and *why* it is wrong is the useful part.
+
+Two implementations, and they are not equivalent:
+
+- **Stamp the label on the block at delivery.** Mechanically parallel to
+  `source_model`, which means ~65 references across 14 files plus the wire
+  schema and the app renderers — not a papercut fix. Worse, it stamps a
+  **mutable** value: `stabilize_context_label` renames `cc-*` contexts after
+  their first real session id arrives, so a stamped label can go stale. A
+  stale label is not merely cosmetic — it is a *wrong address* displayed as
+  a right one, which is the failure class this whole lane exists to remove.
+- **Resolve the label at hydration.** Always current by construction, and no
+  schema change. But `translate_block` has no DB access today, and it is
+  called from several paths (`llm/mod.rs`, `mailbox.rs` ×3). It wants a
+  label snapshot built once by the caller and passed in — deliberately *not*
+  a live DB handle held across hydration, which would invite the lock
+  ordering we already have filed pain about.
+
+Resolution-at-hydration is the correct design. It is a small design pass, not
+a mechanical edit, so it is not being done on a guess. Note that gap #4 also
+matters less now that slice 3 landed: a receiver can reply with `.parent`
+where the drift came from its parent, without needing any label at all.
 
 **Slice 5 — real presence.** A kernel-side "who is attached right now" view,
 distinct from "not yet archived". Wants the `ContextRegistry` extraction first.
