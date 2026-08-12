@@ -2162,12 +2162,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   from outside, and the in-thread watchdog goes quiet with it — that silence is
   the only remaining signal. Not worth chasing until it actually recurs. Related:
   `tech_debt_peer_reattach_on_reconnect`.
-- **Post-reconnect re-sync — CLEANUP only (detection + re-fetch delivery both
-  shipped 2026-06-24; story in devlog/git).** There are **two `SyncGeneration`
-  types** — `kaijutsu-client` (`subscriptions.rs`, currently unused) and the
-  app's own (`actor_plugin.rs`, the wired one). Fold the app's into the client
-  one (or delete the dead one) as part of moving the cache; moving the whole
-  `DocumentCache` into the client is the bigger refactor.
 - **LLM providers:**
   - Per-model knobs in the app (server-side config is now cast_slots/backend_models, 2026-08-03; the app renders none of it yet).
   - Push subscriber for `ConversationMailbox`.

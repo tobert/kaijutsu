@@ -848,7 +848,7 @@ impl LlmRegistry {
     /// context window" — it reads the same `provider_configs` that
     /// [`Self::provider_config`] and `kj model`/`kj models` already resolve
     /// through, so there is no second alias-aware lookup that could
-    /// disagree with [`Self::resolve_model`]. Callers pass an
+    /// disagree with it. Callers pass an
     /// already-resolved provider + model (e.g. the context row's columns,
     /// or the registry default), not an alias name. `None` must be
     /// rendered as an explicit "unknown" by every caller — never a
@@ -916,17 +916,16 @@ impl LlmRegistry {
             .map(|a| (a.backend.as_str(), a.model.as_str()))
     }
 
-    /// Resolve a model name, returning the provider and model to use.
-    ///
-    /// Checks aliases first. If no alias matches, uses the default provider
-    /// with the given model name.
-    pub fn resolve_model(&self, model_name: &str) -> Option<(Arc<Provider>, String)> {
-        if let Some((provider_name, model)) = self.resolve_alias(model_name) {
-            self.get(provider_name).map(|p| (p, model.to_string()))
-        } else {
-            self.default_provider().map(|p| (p, model_name.to_string()))
-        }
-    }
+    // `resolve_model` lived here and is deliberately GONE (2026-08-12). It
+    // resolved an alias, and on a miss silently pinned the bare name onto the
+    // registry's *default provider* — the sharp edge behind the 2026-07-04
+    // cross-provider distill bug, which was fixed by routing around it rather
+    // than by changing it. Every caller has since migrated to
+    // `kj::parse::resolve_model_choice`, which parses the `provider/model`
+    // slash form and refuses to guess a provider. The old function was left
+    // with zero callers, which made it a loaded name waiting to be reached
+    // for. Use `resolve_model_choice`; if you need alias-only resolution,
+    // `resolve_alias` is right here and does not invent a provider.
 
     /// List all registered providers.
     pub fn list(&self) -> Vec<&str> {

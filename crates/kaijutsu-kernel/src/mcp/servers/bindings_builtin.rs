@@ -19,10 +19,18 @@
 //!   through the Phase 3 pump and emits a child Resource block under the
 //!   original read.
 //!
-//! No hook-evaluation carve-out (D-53). A user who locks themselves out of
-//! `bind`/`unbind` with an overbroad `PreCall Deny(*)` recovers by
-//! restarting the kernel (hooks are in-memory) — same escape hatch as
-//! every other admin instance.
+//! No hook-evaluation carve-out (D-53): an overbroad `PreCall Deny(*)` can
+//! lock a user out of `bind`/`unbind` — and out of `builtin.hooks` itself,
+//! so even `hook_list`/`hook_remove` return `Denied`.
+//!
+//! **Restarting the kernel does NOT recover this.** Hooks are persisted and
+//! rehydrated from SQLite at `Broker::set_db` (`mcp/broker.rs:318`), so a
+//! self-lockout survives the restart that undoes it for every other admin
+//! instance. This comment claimed the opposite ("hooks are in-memory") from
+//! before persistence landed; corrected 2026-08-12. There is no `kj hook`
+//! CLI, so the only recovery today is editing kernel SQLite by hand — which
+//! the project's own rule forbids. Tracked in `docs/issues.md` (hook
+//! self-lockout); `hooks_admin_is_subject_to_hooks` pins the behaviour.
 //!
 //! Holds `Weak<Broker>` to avoid the Arc-cycle.
 
