@@ -301,6 +301,49 @@ resolves through `refs::resolve_context_arg` like everything else, so `.`,
 Structural refs are also the one address form immune to the label collisions
 in gap #5 — a fork can reach its parent without naming anything.
 
+### Should short ids exist at all? (Amy, 2026-08-12)
+
+> "we should probably drop short ids entirely. they don't really help you do
+> they? and for me, we can do tab completion eventually."
+
+**Largely correct, and the honest answer from the model side is "no".** Split
+by position, because the two uses have different answers:
+
+- **Display** (`[push from context a1b2c3d4]`): near-worthless to a model.
+  `a1b2c3d4` supports no inference about who sent it — it cannot be reasoned
+  from, only copied. A label is strictly better here. This is what slice 4 was
+  already about; Amy's question just makes the conclusion stronger, from
+  "add the label alongside" to "the short id was never the useful part".
+- **Address** (`kj drift push a1b2c3d4`): a workaround, not a help. The only
+  reason to reach for one today is that labels fail — the 60-candidate
+  collision in gap #5. Fix deregistration and a model would essentially never
+  type one. Where genuine certainty is needed, a **full UUID** serves better;
+  the short form's sole advantage is typing economy, which is a human concern,
+  and tab completion answers it better than an 8-hex handle does.
+
+Two caveats that stop this from being a clean deletion:
+
+1. **19 of 291 live contexts have no label at all** (measured on zorak
+   2026-08-12). Drop ids from addressing entirely and those become
+   unreachable. Either labels become mandatory (auto-named at create) or the
+   full UUID stays as the precise fallback.
+2. **Labels are mutable; ids are not.** `stabilize_context_label` renames
+   `cc-*` contexts. This is the same staleness argument that governs slice 4 —
+   so the `ContextId` must remain the *stored* identity on blocks and edges.
+   The argument here is against **displaying** short ids and against making
+   them the ergonomic address, not against ids existing.
+
+**Proposed shape** (needs Amy's yes):
+
+- Stored identity stays `ContextId`. Unchanged, stable, on every block/edge.
+- Display resolves to the label at render time, falling back to the short id
+  **only** when a context has no label.
+- Addressing is labels + tab completion, with full UUID as the exact
+  fallback. Short-id prefix matching retires.
+- **Prerequisite: ruling (a).** Labels can only carry this weight once dead
+  contexts stop consuming the namespace. This is another reason the
+  deregistration fix outranks the polish.
+
 **Slice 4 — make reply obvious. NOT cheap; needs a decision.** The intent
 stands: a receiver should see `[push from lead-kaijutsu (a1b2c3d4)]` rather
 than a bare short id. Costing it revealed the estimate in the first draft of
