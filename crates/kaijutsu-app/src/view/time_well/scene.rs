@@ -1257,6 +1257,187 @@ pub fn well_keyboard(
 mod tests {
     use super::*;
 
+    /// Helper: the card mesh's positions, before worrying about which face.
+    fn card_mesh_positions() -> Vec<[f32; 3]> {
+        use bevy::mesh::VertexAttributeValues;
+        match card_block_mesh().attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(VertexAttributeValues::Float32x3(p)) => p.clone(),
+            _ => panic!("card mesh must carry Float32x3 positions"),
+        }
+    }
+
+    /// The rounded prism keeps the *exact* outer bounds the old `Cuboid` had —
+    /// this is what lets the silhouette change be purely visual: seats, ring
+    /// placement and the selection-pop scale tween all measure against these.
+    /// It also stands on its bottom edge (y from 0 up), not centred.
+    #[test]
+    fn card_mesh_keeps_cuboid_bounds_and_stands_on_its_bottom_edge() {
+        let pos = card_mesh_positions();
+        assert!(!pos.is_empty(), "mesh must have vertices");
+
+        let (mut max_x, mut min_y, mut max_y, mut max_z) =
+            (f32::MIN, f32::MAX, f32::MIN, f32::MIN);
+        for p in &pos {
+            max_x = max_x.max(p[0].abs());
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+            max_z = max_z.max(p[2].abs());
+        }
+
+        assert!(
+            (max_x - CARD_WIDTH * 0.5).abs() < 1e-3,
+            "half-width should be {}, got {max_x}",
+            CARD_WIDTH * 0.5
+        );
+        assert!(
+            (max_z - CARD_THICKNESS * 0.5).abs() < 1e-3,
+            "half-thickness should be {}, got {max_z}",
+            CARD_THICKNESS * 0.5
+        );
+        // Origin at the bottom edge: y spans 0..CARD_HEIGHT after the shift.
+        assert!(min_y.abs() < 1e-3, "bottom edge should sit at y=0, got {min_y}");
+        assert!(
+            (max_y - CARD_HEIGHT).abs() < 1e-3,
+            "top edge should sit at y={CARD_HEIGHT}, got {max_y}"
+        );
+    }
+
+    /// The point of the change: the silhouette is *rounded*, so no vertex sits
+    /// in the square corner the old cuboid had. Guards against silently
+    /// reverting to a square slab (radius collapsing to 0 would trip this).
+    #[test]
+    fn card_mesh_corners_are_rounded_not_square() {
+        let shape = card_shape();
+        let radius = (shape.y + shape.w) * CARD_HEIGHT;
+        assert!(radius > 1.0, "test is vacuous unless the radius is real");
+
+        let (hw, hh) = (CARD_WIDTH * 0.5, CARD_HEIGHT * 0.5);
+        // Corners in the mesh's own (bottom-edge-origin) space.
+        let corners = [
+            Vec2::new(hw, 0.0),
+            Vec2::new(-hw, 0.0),
+            Vec2::new(hw, CARD_HEIGHT),
+            Vec2::new(-hw, CARD_HEIGHT),
+        ];
+        // A vertex may come no closer to a square corner than the arc does.
+        // The arc's nearest approach is radius * (1 - 1/sqrt(2)).
+        let min_gap = radius * (1.0 - std::f32::consts::FRAC_1_SQRT_2) * 0.9;
+
+        for p in card_mesh_positions() {
+            let v = Vec2::new(p[0], p[1]);
+            for c in corners {
+                assert!(
+                    v.distance(c) > min_gap,
+                    "vertex {v:?} sits in the square corner {c:?} — silhouette is not rounded"
+                );
+            }
+        }
+
+        // Every rim vertex must lie *on* that rounded rect's boundary — the same
+        // SDF `well_card.wgsl` evaluates, so mesh and shader describe one shape.
+        // (The two fan centres are the only interior vertices.)
+        let sd_round_box = |p: Vec2, b: Vec2, r: f32| {
+            let q = p.abs() - b + Vec2::splat(r);
+            q.max(Vec2::ZERO).length() + q.x.max(q.y).min(0.0) - r
+        };
+        let b = Vec2::new(hw, hh);
+        let mut rim = 0;
+        for p in card_mesh_positions() {
+            // Back to centred coords: the mesh stands on its bottom edge.
+            let v = Vec2::new(p[0], p[1] - hh);
+            if v.length() < 1e-3 {
+                continue; // fan centre
+            }
+            rim += 1;
+            let d = sd_round_box(v, b, radius);
+            assert!(
+                d.abs() < 1e-2,
+                "vertex {v:?} is {d} off the rounded-rect boundary the shader draws"
+            );
+        }
+        assert!(rim > 8, "expected a real rim, got {rim} vertices");
+    }
+
+    /// Every triangle must wind counter-clockwise as seen from outside — Bevy
+    /// leaves `cull_mode` at back-face culling, so an inverted winding makes a
+    /// face silently *invisible* rather than wrong-coloured. Checked by
+    /// comparing each triangle's geometric normal against its authored vertex
+    /// normal, which covers the front fan, the reversed back fan, and the side
+    /// wall in one sweep.
+    #[test]
+    fn card_mesh_triangles_all_face_outward() {
+        use bevy::mesh::{Indices, VertexAttributeValues};
+        let mesh = card_block_mesh();
+
+        let Some(VertexAttributeValues::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("positions");
+        };
+        let Some(VertexAttributeValues::Float32x3(nrm)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        else {
+            panic!("normals");
+        };
+        let Some(Indices::U32(idx)) = mesh.indices() else {
+            panic!("u32 indices");
+        };
+        assert_eq!(idx.len() % 3, 0, "triangle list must be whole triangles");
+
+        let mut checked = 0;
+        for tri in idx.chunks_exact(3) {
+            let (a, b, c) = (
+                Vec3::from_array(pos[tri[0] as usize]),
+                Vec3::from_array(pos[tri[1] as usize]),
+                Vec3::from_array(pos[tri[2] as usize]),
+            );
+            let geometric = (b - a).cross(c - a);
+            // Degenerate slivers carry no winding information; skip them.
+            if geometric.length() < 1e-6 {
+                continue;
+            }
+            // Authored outward direction for this triangle.
+            let authored = (Vec3::from_array(nrm[tri[0] as usize])
+                + Vec3::from_array(nrm[tri[1] as usize])
+                + Vec3::from_array(nrm[tri[2] as usize]))
+                / 3.0;
+            assert!(
+                geometric.normalize().dot(authored.normalize()) > 0.0,
+                "triangle {tri:?} winds inward — back-face culling would hide it"
+            );
+            checked += 1;
+        }
+        assert!(checked > 20, "expected a real mesh, checked {checked} triangles");
+    }
+
+    /// Side faces must carry the sentinel UV `well_card.wgsl` keys the cut-edge
+    /// colour off (`uv.x < -0.5`), and the two large faces must stay inside the
+    /// 0..1 texture range so the MSDF panel lands on them. A regression here
+    /// paints text slivers down the card edge, or the edge colour across a face.
+    #[test]
+    fn card_mesh_tags_edges_with_sentinel_uvs_and_faces_with_real_ones() {
+        use bevy::mesh::VertexAttributeValues;
+        let mesh = card_block_mesh();
+        let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("card mesh must carry Float32x2 uvs");
+        };
+
+        let sentinels = uvs.iter().filter(|uv| uv[0] < -0.5).count();
+        let faces = uvs.len() - sentinels;
+        assert!(sentinels > 0, "the slab edge must be tagged for the shader");
+        assert!(faces > 0, "the card faces must carry real uvs");
+
+        for uv in uvs {
+            if uv[0] < -0.5 {
+                assert_eq!(*uv, [-1.0, -1.0], "sentinel must be the exact tag");
+            } else {
+                assert!(
+                    (0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]),
+                    "face uv {uv:?} escapes the panel texture"
+                );
+            }
+        }
+    }
+
     /// The in-flight guard is per-context: the first placement on an id wins,
     /// repeats are refused until the set clears (the next poll), and a
     /// different context is unaffected.
@@ -2136,27 +2317,49 @@ fn label_shape() -> Vec4 {
     Vec4::new(LABEL_TEX_W / LABEL_TEX_H, 0.0, 0.0, 0.0)
 }
 
-/// Shared rim-card mesh: a thin 3D block (`CARD_WIDTH × CARD_HEIGHT ×
-/// [`CARD_THICKNESS`]`) whose **both** large faces render the card. A near card
-/// shows its outward `+Z` face; a far card (facing away in a ring-aligned band)
-/// shows its `−Z` face — front-facing from the camera's side, so it renders too
-/// under default back-face culling. No double-siding needed.
+/// Arc segments per rounded corner of the card silhouette. Six reads smooth at
+/// focus-card size; the corner arc is only ~5.4 world units on a 120×75 card.
+const CARD_CORNER_SEGMENTS: usize = 6;
+
+/// Shared rim-card mesh: a thin rounded-rect **prism** (`CARD_WIDTH ×
+/// CARD_HEIGHT × [`CARD_THICKNESS`]`) whose **both** large faces render the
+/// card. A near card shows its outward `+Z` face; a far card (facing away in a
+/// ring-aligned band) shows its `−Z` face — front-facing from the camera's
+/// side, so it renders too under default back-face culling. No double-siding
+/// needed.
 ///
-/// UV fix: Bevy's `Cuboid` authors the `−Z` (back) face's UVs so text reads
-/// upright + non-mirrored *from behind*, but the `+Z` (front) face's UVs are
-/// **V-flipped** relative to the [`Rectangle`] convention the MSDF panel
-/// texture is built for (`Rectangle`: uv (0,0) at the world top-left; `Cuboid`
-/// front: uv (0,0) at bottom-left). Left as-is, the front/near face would show
-/// text upside-down. We flip V on the front face's four vertices (the first
-/// four in Bevy's cuboid vertex order) so the front matches the `Rectangle`
-/// convention; the back face is already correct and untouched. Result: both
-/// large faces read upright + non-mirrored with culling left at its default.
+/// **Why a prism and not a `Cuboid` (2026-08-12).** `well_card.wgsl` draws a
+/// *rounded* box and discards outside it, so a square slab disagreed with its
+/// own face: the silhouette overhung the rounded body at every corner, the
+/// square side strips framed a rounded tile, and the leftover corner wedges
+/// were transparent-but-occluding — the shader's own comment called the
+/// rounded corners "silhouette fiction". Amy called it on sight ("square edges
+/// and transparent front/back that show around the rounded tile border"). The
+/// silhouette now *is* the rounded rect, so mesh and shader agree.
 ///
-/// The thin ±X/±Y side faces get **sentinel UVs** (−1) instead of Bevy's
-/// default full 0..1 mapping: a squeezed texture sliver on an 8-unit edge read
-/// as noise, so `well_card.wgsl` detects the sentinel and paints those faces
-/// as the card's *cut edge* — the border/accent color, the slab edge as the
-/// card's border by design.
+/// The corner radius is deliberately **concentric** with the shader's body
+/// corner rather than equal to it: [`card_shape`] insets the body by `inset`
+/// and rounds it by `corner_radius` (both in the shader's y-normalized UV
+/// space), so the outward offset curve of that corner has radius
+/// `corner_radius + inset`. Scaling by [`CARD_HEIGHT`] puts it in world units.
+/// This keeps the card's outer bounds *exactly* what the cuboid had — no
+/// layout, seat, or occlusion change — and preserves the even `inset`-wide
+/// margin the ring band's outer half glows into (`well_card.wgsl` lets alpha
+/// survive past `d = 0` on purpose so bloom spills past the rounded edge).
+///
+/// UV convention: the MSDF panel texture is built for [`Rectangle`] — uv (0,0)
+/// at the world **top-left**. Both large faces are authored to that directly
+/// (front `u = (x + w/2)/w`; back mirrored, `u = (w/2 − x)/w`, since it is read
+/// from behind), so text lands upright and non-mirrored on either side with
+/// culling left at its default. Building the mesh ourselves also drops the old
+/// dependency on Bevy's internal cuboid vertex ordering, which the previous
+/// version indexed into by hand — a latent trap across engine upgrades.
+///
+/// The side faces get **sentinel UVs** (−1): a squeezed texture sliver on an
+/// 8-unit edge read as noise, so `well_card.wgsl` detects the sentinel and
+/// paints them as the card's *cut edge* — the border/accent color, the slab
+/// edge as the card's border by design (Amy, 2026-07-06). They now wrap the
+/// rounded profile instead of forming a square box around it.
 ///
 /// The mesh origin is the **bottom edge** (vertices shifted +Y by half the
 /// height), not the center: a card's transform sits on its ring line
@@ -2165,22 +2368,104 @@ fn label_shape() -> Vec4 {
 /// pop (`highlight_selection`'s scale tween) grows it upward off the ring
 /// instead of through it.
 fn card_block_mesh() -> Mesh {
-    use bevy::mesh::VertexAttributeValues;
-    let mut mesh = Mesh::from(Cuboid::new(CARD_WIDTH, CARD_HEIGHT, CARD_THICKNESS));
-    if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
-        // Bevy's cuboid vertex order: front (+Z) 0..4, back (−Z) 4..8, then the
-        // four side faces 8..24 (right/left/top/bottom).
-        for (i, uv) in uvs.iter_mut().enumerate() {
-            if i < 4 {
-                // Front face: V-flip to the Rectangle convention (see above).
-                uv[1] = 1.0 - uv[1];
-            } else if i >= 8 {
-                // Side faces: sentinel — the shader renders these as the cut edge.
-                *uv = [-1.0, -1.0];
-            }
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    let hw = CARD_WIDTH * 0.5;
+    let hh = CARD_HEIGHT * 0.5;
+    let hz = CARD_THICKNESS * 0.5;
+
+    // Concentric with the shader's rounded body — see the doc comment.
+    let shape = card_shape();
+    let radius = ((shape.y + shape.w) * CARD_HEIGHT).min(hw).min(hh);
+
+    // Outline, counter-clockwise viewed from +Z (Bevy/wgpu front faces are CCW),
+    // walking the four corner arcs. Consecutive arcs are joined by the straight
+    // edges implicitly: an arc's last point and the next arc's first point share
+    // an outward normal, so those quads stay flat.
+    let corners = [
+        (Vec2::new(hw - radius, -(hh - radius)), -FRAC_PI_2),
+        (Vec2::new(hw - radius, hh - radius), 0.0),
+        (Vec2::new(-(hw - radius), hh - radius), FRAC_PI_2),
+        (Vec2::new(-(hw - radius), -(hh - radius)), PI),
+    ];
+    let mut outline: Vec<Vec2> = Vec::with_capacity(4 * (CARD_CORNER_SEGMENTS + 1));
+    let mut radial: Vec<Vec2> = Vec::with_capacity(outline.capacity());
+    for (center, start) in corners {
+        for i in 0..=CARD_CORNER_SEGMENTS {
+            let a = start + FRAC_PI_2 * (i as f32 / CARD_CORNER_SEGMENTS as f32);
+            let dir = Vec2::new(a.cos(), a.sin());
+            outline.push(center + dir * radius);
+            radial.push(dir);
         }
     }
-    mesh.translated_by(Vec3::Y * (CARD_HEIGHT * 0.5))
+    let n = outline.len();
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * 4 + 2);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(n * 4 + 2);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(n * 4 + 2);
+    let mut indices: Vec<u32> = Vec::with_capacity(n * 12);
+
+    // Rectangle convention: uv (0,0) at the top-left of the *full* card quad.
+    let front_uv = |p: Vec2| [(p.x + hw) / CARD_WIDTH, (hh - p.y) / CARD_HEIGHT];
+    let back_uv = |p: Vec2| [(hw - p.x) / CARD_WIDTH, (hh - p.y) / CARD_HEIGHT];
+
+    // --- Front face (+Z): triangle fan, CCW from +Z ---
+    let front_center = positions.len() as u32;
+    positions.push([0.0, 0.0, hz]);
+    normals.push([0.0, 0.0, 1.0]);
+    uvs.push(front_uv(Vec2::ZERO));
+    let front_ring = positions.len() as u32;
+    for p in &outline {
+        positions.push([p.x, p.y, hz]);
+        normals.push([0.0, 0.0, 1.0]);
+        uvs.push(front_uv(*p));
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        indices.extend_from_slice(&[front_center, front_ring + i as u32, front_ring + j as u32]);
+    }
+
+    // --- Back face (−Z): same fan wound the other way so it is CCW from −Z ---
+    let back_center = positions.len() as u32;
+    positions.push([0.0, 0.0, -hz]);
+    normals.push([0.0, 0.0, -1.0]);
+    uvs.push(back_uv(Vec2::ZERO));
+    let back_ring = positions.len() as u32;
+    for p in &outline {
+        positions.push([p.x, p.y, -hz]);
+        normals.push([0.0, 0.0, -1.0]);
+        uvs.push(back_uv(*p));
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        indices.extend_from_slice(&[back_center, back_ring + j as u32, back_ring + i as u32]);
+    }
+
+    // --- Side wall: sentinel UVs, outward radial normals, CCW from outside ---
+    let side = positions.len() as u32;
+    for (p, dir) in outline.iter().zip(radial.iter()) {
+        positions.push([p.x, p.y, hz]);
+        normals.push([dir.x, dir.y, 0.0]);
+        uvs.push([-1.0, -1.0]);
+        positions.push([p.x, p.y, -hz]);
+        normals.push([dir.x, dir.y, 0.0]);
+        uvs.push([-1.0, -1.0]);
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (fi, bi) = (side + (i as u32) * 2, side + (i as u32) * 2 + 1);
+        let (fj, bj) = (side + (j as u32) * 2, side + (j as u32) * 2 + 1);
+        indices.extend_from_slice(&[fi, bi, bj, fi, bj, fj]);
+    }
+
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+        .translated_by(Vec3::Y * (CARD_HEIGHT * 0.5))
 }
 
 /// Saturation/lightness for [`accent_color`]'s per-context hue — room-palette
