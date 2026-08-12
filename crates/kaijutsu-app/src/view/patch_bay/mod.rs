@@ -399,7 +399,7 @@ pub struct PatchBayPlugin;
 impl Plugin for PatchBayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PatchBayState>()
-            .insert_non_send_resource(PatchBayAlsa::default())
+            .insert_non_send(PatchBayAlsa::default())
             .add_plugins(MaterialPlugin::<ChordMaterial>::default())
             // No `OnEnter`/`OnExit(Screen::PatchBay)` any more (2026-07-10
             // evening, the fullscreen-panel pivot): there is no second screen

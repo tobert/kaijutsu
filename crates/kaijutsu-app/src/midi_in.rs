@@ -57,7 +57,7 @@ impl Plugin for MidiInPlugin {
         app.init_resource::<crate::midi_presence::MidiPortTopology>();
         // NonSend: the receiver end of the capture thread's channel stays on
         // the main thread with its drain system (same stance as MidiSink).
-        app.insert_non_send_resource(MidiEar::default());
+        app.insert_non_send(MidiEar::default());
         app.add_systems(Startup, open_midi_ear);
         app.add_systems(Update, (drain_ear, cut_and_ship, ship_clock_estimates).chain());
     }
@@ -708,7 +708,7 @@ mod tests {
             .init_resource::<crate::midi_presence::MidiPortTopology>()
             .add_systems(Update, drain_ear);
         app.world_mut()
-            .insert_non_send_resource(MidiEar { rx: Some(rx), failed: false });
+            .insert_non_send(MidiEar { rx: Some(rx), failed: false });
         app.update();
 
         assert_eq!(app.world().resource::<CaptureState>().ring.len(), 1);
@@ -747,7 +747,7 @@ mod tests {
             .init_resource::<crate::midi_presence::MidiPortTopology>()
             .add_systems(Update, drain_ear);
         app.world_mut()
-            .insert_non_send_resource(MidiEar { rx: Some(rx), failed: false });
+            .insert_non_send(MidiEar { rx: Some(rx), failed: false });
         app.update();
 
         let topo = app.world().resource::<crate::midi_presence::MidiPortTopology>();
