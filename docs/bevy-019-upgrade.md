@@ -35,7 +35,7 @@ The real work is concentrated in four places, and only one of them is large:
 | # | Item | Kind | Effort |
 |---|---|---|---|
 | 1 | `bevy_brp_extras` pin | blocker, dependency | 1 line |
-| 2 | vello 0.7.0 → 0.9.0, atomic with the bump | blocker, dependency | 2 lines + GPU smoke test |
+| 2 | ~~vello 0.7.0 → 0.9.0~~ — MOOT, vello retired from the app 2026-08-12 | n/a | 0 |
 | 3 | 4 mechanical compile fixes (imports + one field rename) | blocker, code | ~9 files, ~20 min |
 | 4 | `Assets::get_mut` needs `mut` bindings | mechanical, code | 24 sites / 15 files, 1–2 h |
 | 5 | **rodio 0.20 vs 0.22 divergence** | **decision + possible rewrite** | 0 to ~2 days |
@@ -61,34 +61,22 @@ This matters beyond the app: BRP is how agents drive the live GUI for testing
 (`contrib/kaijutsu-runner.sh`). A broken BRP costs the autonomous testing
 loop, not just a feature.
 
-### 2. vello must move in the same commit (dependency)
+### 2. vello — MOOT, retired from the app (was: "must move in the same commit")
 
-Not optional, and there is **no working intermediate state**:
-
-| | wgpu required |
-|---|---|
-| Bevy 0.18.1 (`bevy_render/Cargo.toml`) | `27` |
-| Bevy 0.19.0 (same file, tag `v0.19.0`) | **`29.0.3`** |
-| vello 0.7.0 (our pin, `kaijutsu-app/Cargo.toml:57`) | `^27.0.1` |
-| vello 0.9.0 (latest) | `^29.0.3` |
-
-`Cargo.lock` today resolves **exactly one** `wgpu 27.0.1` for the whole tree —
-verified. That single shared instance is *why* we can hand Bevy's device
-straight to vello:
-
-- `view/vello_rasterizer.rs:52` — `RenderDevice::wgpu_device().clone()` passed
-  into `vello::Renderer::new`
-- `view/ui_rtt.rs:311-316` — Bevy's `RenderDevice`, `RenderQueue` and a
-  Bevy-owned `GpuImage::texture_view` handed to `render_to_texture`
-
-The moment Bevy moves to wgpu 29 while vello stays on 27, those become two
-distinct Rust types and it is a hard type mismatch. **Bump `vello` 0.7.0 →
-0.9.0 atomically with the Bevy bump.** vello deliberately tracks Bevy's wgpu
-pin each release, so this is a supported path, not a fight. `kurbo 0.13.0` /
-`peniko 0.6.0` caret pins absorb vello 0.9's requirements with no edit.
-
-Requires a real GPU smoke test afterward — both the offscreen rasterizer and
-its CPU safe-mode fallback (`vello_rasterizer.rs:50-71`).
+This whole blocker no longer exists. It was written against a checkout where
+`view/vello_rasterizer.rs` handed Bevy's wgpu device straight into
+`vello::Renderer::new` (needing vello's wgpu pin to match Bevy's exactly,
+hence "atomic with the bump" below) — but vello was retired from
+`kaijutsu-app` entirely on 2026-08-12 (docs/issues.md), independently of this
+plan and before it was executed. `vello_rasterizer.rs` is deleted, the vello
+half of `ui_rtt.rs` (`extract_vello_scenes`/`render_vello_scenes`,
+`UiVectorScene`) is deleted, and `vello` is absent from
+`kaijutsu-app/Cargo.toml` and the whole workspace's `Cargo.lock` (verified
+via `cargo tree -i vello`). The dock chrome that was vello's last consumer
+now renders through the same MSDF pipeline block cells use. `kurbo`/`peniko`
+stay as direct dependencies (Parley's own types), unaffected by this either
+way. No GPU smoke test of a vello rasterizer is needed for this upgrade —
+there is no vello rasterizer left to test.
 
 ### 3. Four mechanical compile fixes
 
@@ -170,8 +158,9 @@ the instrument looks.
 
 - **Text/parley: near-zero.** We already depend on `parley = "0.7.0"` directly
   and have **zero** `bevy_text` usage in `src/text/`. Own asset loader, own
-  atlas, own `PositionedGlyph`/`FontId`, direct-to-vello glyphs. Bevy's native
-  text appears in exactly one place app-wide.
+  atlas, own `PositionedGlyph`/`FontId`, direct-to-MSDF glyphs (no vello in
+  the path at all, since 2026-08-12). Bevy's native text appears in exactly
+  one place app-wide.
 - **resources_as_components: 4 lines.** `Res`/`ResMut` sugar retained, so
   **687** use sites across 57 files need no change. Only
   `insert_non_send_resource` → `insert_non_send` (deprecated, not removed) at
@@ -234,16 +223,15 @@ commit because there is no compiling state between them.
    `insert_non_send_resource` calls. Both are valid on 0.18 (the latter is
    only *deprecated* in 0.19), so this de-risks the big commit and can be
    reviewed on its own.
-2. **The bump, atomically:** `bevy` 0.18→0.19, `vello` 0.7.0→0.9.0,
+2. **The bump, atomically:** `bevy` 0.18→0.19,
    `bevy_brp_extras` 0.19→0.21+, `bevy_remote` and `bevy_mesh` 0.18→0.19,
    `cargo update -p bevy_tweening` (upstream already merged 0.19 support).
 3. **Same commit:** the four mechanical compile fixes (`AlphaMode` ×6, `Hdr`,
    `immediate_size` ×2, `TextFont`).
 4. **Same commit:** correct the now-false rodio dedupe comment at
    `Cargo.toml:32-33` under path A.
-5. **Verify on moltar:** GPU smoke test of the vello rasterizer + CPU
-   fallback; BRP round-trip (the testing loop depends on it); MIDI in/out
-   unchanged; then Amy's bloom re-tune pass.
+5. **Verify on moltar:** BRP round-trip (the testing loop depends on it);
+   MIDI in/out unchanged; then Amy's bloom re-tune pass.
 6. **Separately, later:** the rodio 0.22 migration (path B), if we want the
    single-copy invariant back.
 

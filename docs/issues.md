@@ -1229,24 +1229,17 @@ sitting inert and are a smaller, separate decision:
 
 **Decide**: finish the stub-strip treatment, or delete these two remnants too.
 
-## Vello may now be fully droppable from kaijutsu-app (2026-08-01, post msdf-music merge)
+## Rename `VelloTextStyle`/`VelloFont*` shaping types (follow-up from the de-vello pass)
 
-After ABC moved onto the MSDF geometry renderer, `text/abc.rs` makes zero
-`vello::` calls, and every `BlockRenderMethod` assignment site in
-`block_render.rs` now writes `::Msdf` — nothing observed *producing*
-`BlockRenderMethod::Vello` anymore, yet the enum variant, its two consumer
-branches (`block_render.rs` ~1171, ~1734), `view/vello_rasterizer.rs`, its
-`ui_rtt`/`plugin`/`main` wiring, and the `vello = "0.7"` dependency all remain.
-The enum variant's own doc comment still claims "SVG only", but SVG moved to
-CPU resvg in `742c6f75` — the comment looks stale, not the evidence.
-
-**Verify then drop**: confirm no default/init path leaves a block in `::Vello`
-(check `BlockRenderMethod`'s Default impl and spawn sites), confirm the
-rasterizer isn't reachable some other way, then delete the variant, both
-consumer branches, `vello_rasterizer.rs`, and the dependency — and rename the
-`VelloTextStyle`/`VelloFont*` shaping types whose prefix stops meaning anything
-(already flagged in the cleanup survey). Big win: a whole GPU dependency off
-the build. Do it as its own slice with a visual pass on ABC + SVG blocks.
+`vello` itself is gone from `kaijutsu-app` (Cargo.toml, Cargo.lock — verified
+via `cargo tree -i vello`, 2026-08-12: dock chrome was the last real
+consumer, moved onto MSDF; `view/vello_rasterizer.rs` and the vello half of
+`view/ui_rtt.rs` are deleted). What's left is a naming nicety: `VelloFont`,
+`VelloTextStyle`, `VelloTextAlign`, `VelloFontAxes` (`text/shaping/`) are pure
+Parley shaping types — their `Vello*` prefix no longer means anything. Left
+alone during the de-vello pass because renaming ripples into every
+consumer (`ui/dock.rs`, `view/block_render.rs`, `text/rich.rs`, ...) for a
+naming change, not a behavior change — a separate mechanical slice.
 
 ## MCP subsystem — audit 2026-07-29 (sonnet, read-only, verified against source + git history)
 
@@ -2093,9 +2086,12 @@ render-graph-as-systems) are near-misses because we never used those APIs.
 
 Blockers, all small except one decision: `bevy_brp_extras = "0.19"` actually
 requires `bevy 0.18.1` (need ≥0.21 — the pin that reads current is the one
-holding us back); `vello` 0.7→0.9 must land atomically with the bump (Bevy
-goes wgpu 27→29 and we hand Bevy's device straight to vello); four mechanical
-import/field fixes; 24 `Assets::get_mut` sites needing `mut` bindings.
+holding us back); four mechanical import/field fixes; 24 `Assets::get_mut`
+sites needing `mut` bindings. The `vello` 0.7→0.9/wgpu 27→29 blocker this
+list used to carry is gone: `vello` was retired from `kaijutsu-app` entirely
+(2026-08-12, docs/issues.md's Vello-retirement work) — nothing in the app
+hands a device to it any more, so the upgrade no longer needs to land a
+vello bump atomically with the Bevy bump.
 
 The one real decision is **rodio**: Bevy 0.19's `bevy_audio` wants rodio 0.22,
 which deleted `OutputStream`/`Sink` — the API `audio_sched.rs` (868 lines) is
@@ -2403,21 +2399,6 @@ key-value store demolished 2026-07-04.*
     elsewhere (see that component's doc comment) — also fixed before it
     shipped.
 
-- **Retire the dead `BlockRenderMethod::Vello` variant + `UiVectorScene`
-  plumbing** (2026-08-01, opened when `msdf-music` merged into main's
-  `feat/svg-cpu` work). ABC and SVG were the last two vello producers in the
-  conversation view and they came off on *separate* branches, so the count
-  only reached zero at that merge: nothing assigns
-  `BlockRenderMethod::Vello` any more. The variant, the `has_vello_content`
-  extract field and its `clear`-ordering logic, and the per-block
-  `UiVectorScene`/vello-scene plumbing in `view::block_render` are all
-  now-constant dead weight (`has_vello` is unconditionally `false`, so the
-  MSDF composite's "did vello already draw here" branch never takes).
-  Correct as-is, just vestigial — a demolition, not a fix. Vello itself
-  stays: it is still the Parley shaping and `Brush` source behind the MSDF
-  path, and the time well / FSN scenes are separate consumers that this
-  entry does not cover.
-
 - **SVG block rendering off vello — also needs a visual pass** (2026-07-30,
   `feat/svg-cpu`, branched from `feat/devello`; same "no running app during
   the change" caveat as the de-vello pass above). `text/rich.rs`'s
@@ -2601,19 +2582,13 @@ key-value store demolished 2026-07-04.*
   bookkeeping (`content_version`/`last_built_version`/`scene_version`/`text`/
   `color`). Name is misleading. Mechanical rename across `block_render.rs`,
   `lifecycle.rs`, `overlay.rs`, `shell_dock.rs`, `render.rs`.
-- **Verify two unexercised render surfaces:** (1) a Vello-content *cell*
-  (SVG/sparkline, `has_vello_content == true`) rasterizing via
-  `render_vello_scenes` then compositing MSDF labels on top — needs a
-  conversation with rich content; (2) the unfocused-pane summary, the one
-  surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
-  multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
-  (ABC dropped out of the "Vello-content cell" category on the msdf-music
-  branch — `text/abc.rs` makes no vello calls at all now; noteheads/text
-  render as MSDF glyph quads and staff lines/beams/slurs/ties/repeat-dots
-  as flat-colored geometry triangles via `text::msdf::geometry` +
-  `music_geometry_renderer`. `render_method` for ABC blocks is `Msdf` like
-  every other MSDF-rendered block kind now, not a `Vello`-tagged special
-  case.)
+- **Verify one unexercised render surface:** the unfocused-pane summary, the
+  one surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
+  multi-pane layout to eyeball. All MSDF-only surfaces (including docks,
+  role borders, and — since 2026-08-12 — the North/South dock chrome
+  itself) verified via build/test; the "Vello-content cell" category this
+  entry used to also name is gone entirely along with vello
+  (`has_vello_content`/`render_vello_scenes` no longer exist).
 - **Vi editor command mode (Slice 3, `docs/vi.md`) — steps 1–3 shipped; open
   remainders:** runner-verify the slice-3 polish (capnp `@6` ⇒ kernel+app
   rebuild+restart; eyeball `:r !cmd` splice, bad-`:cmd` E492 on the strip, `fg`
