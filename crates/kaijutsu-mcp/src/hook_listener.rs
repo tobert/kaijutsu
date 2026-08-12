@@ -320,6 +320,50 @@ impl HookListener {
                 if let Err(e) = self.insert_text_block(Role::System, &content).await {
                     author_error.get_or_insert(e);
                 }
+
+                // Then archive the context (Amy's ruling, 2026-08-12). Ordering
+                // matters: the "Session ended" block above is written first so
+                // the record is complete before it is frozen.
+                //
+                // Archiving — not concluding. `list_active_contexts` filters on
+                // `archived_at IS NULL` only, and `conclude_context` never
+                // touches `archived_at`, so concluding would leave the label
+                // still competing for resolution and fix nothing. Archive is
+                // also not "trash": archived contexts are retained work, kept
+                // for referential integrity, later search, and research. It
+                // frees the *name*, not the content.
+                //
+                // The name is deliberately left as-is (no rename, no suffix) —
+                // the label leaves the active set intact so it stays meaningful
+                // to the indexing work this is feeding.
+                //
+                // Why this matters: without it, `cc-*` contexts accumulate
+                // forever and drift addressing degrades without bound. Drift
+                // resolves label *prefixes*, so once many contexts share
+                // `cc-<project>`, that prefix resolves to nothing usable.
+                //
+                // A session that keeps going after this (e.g. `/clear`
+                // re-keying a live process) is safe: `register_session` never
+                // resurrects an archived context, it mints a fresh
+                // suffixed-label one.
+                if let Some(ref remote) = self.remote
+                    && let Some(ctx_id) = self.context_id()
+                {
+                    match remote.actor.archive_context(ctx_id).await {
+                        Ok(()) => tracing::info!(
+                            context = %ctx_id.short(),
+                            "archived context on session.end"
+                        ),
+                        // Loud, not swallowed: a failure here means the label
+                        // keeps competing for drift resolution, which is the
+                        // whole problem this closes.
+                        Err(e) => tracing::warn!(
+                            context = %ctx_id.short(),
+                            "failed to archive context on session.end, its label \
+                             stays in the active set: {e}"
+                        ),
+                    }
+                }
             }
 
             "prompt.submit" => {
