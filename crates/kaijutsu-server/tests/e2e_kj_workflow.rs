@@ -154,7 +154,11 @@ fn test_fork_work_drift_merge_e2e() {
             "echo in fork failed: {work_output}"
         );
 
-        // Drift push: stage content for main
+        // Drift push: send content to main. Since 2026-08-12 `push` DELIVERS
+        // rather than staging — staging moved behind `--stage`. This test used
+        // to assert "staged" here and then rely on the flush below to land the
+        // block; both halves are now checked for the behaviour they actually
+        // have.
         let (_cmd_id, push_output, push_status) = shell_exec_wait(
             &kernel,
             r#"kj drift push main "auth bypass in login""#,
@@ -167,12 +171,26 @@ fn test_fork_work_drift_merge_e2e() {
             "kj drift push failed: {push_output}"
         );
         assert!(
-            push_output.to_lowercase().contains("staged")
-                || push_output.to_lowercase().contains("queued"),
-            "expected 'staged' in push output, got: {push_output}"
+            push_output.to_lowercase().contains("drifted"),
+            "expected 'drifted' in push output, got: {push_output}"
         );
 
-        // Drift flush
+        // The contract worth pinning end-to-end: the block is in the target's
+        // document as soon as push returns, with no flush in between.
+        let after_push = get_all_blocks(&kernel, main_ctx).await;
+        assert!(
+            after_push
+                .iter()
+                .any(|b| b.kind == BlockKind::Drift && b.content.contains("auth bypass")),
+            "push must deliver without a flush; blocks: {:?}",
+            after_push
+                .iter()
+                .map(|b| (&b.kind, &b.content))
+                .collect::<Vec<_>>()
+        );
+
+        // ...and flush therefore has nothing left to do. This is the assertion
+        // that would have caught the old behaviour surviving.
         let (_cmd_id, flush_output, flush_status) =
             shell_exec_wait(&kernel, "kj drift flush", exploration_id).await;
         assert_eq!(
@@ -181,8 +199,8 @@ fn test_fork_work_drift_merge_e2e() {
             "kj drift flush failed: {flush_output}"
         );
         assert!(
-            flush_output.to_lowercase().contains("flush"),
-            "expected 'flush' in output, got: {flush_output}"
+            flush_output.to_lowercase().contains("nothing to flush"),
+            "push already delivered, so flush should have nothing staged, got: {flush_output}"
         );
 
         // Verify drift landed in main
