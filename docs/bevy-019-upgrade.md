@@ -1,7 +1,25 @@
 # Bevy 0.18.1 → 0.19 upgrade plan
 
-**Status: PLANNING ONLY.** Amy asked for a plan while she reads the drift UX
-doc; nothing here is executed. Written 2026-08-12.
+**Status: planned, not started. Handed to a moltar session 2026-08-12.**
+
+If you are picking this up, read this box first — three things changed after
+the plan was written, and two of them delete work:
+
+1. **Vello is retired.** Blocker 2 ("vello must move in the same commit") is
+   **moot** — vello was removed from `kaijutsu-app` entirely on 2026-08-12,
+   after this plan was drafted. `cargo tree -i vello` finds nothing, the lock
+   has zero vello crates. That deletes the one item here that needed a GPU
+   smoke test rather than a compile fix.
+2. **rodio is ruled: path B, and it lands BEFORE the Bevy bump.** See "The one
+   real decision" below. Do not start the Bevy bump on top of an unconverged
+   audio stack.
+3. **Do not trust `~/src/bevy` without checking what it is on** — it was five
+   months stale when this was written. See `AGENTS.md`. Prefer the cargo
+   registry cache for "what does version X require".
+
+Everything below was verified against the 104 official 0.19 migration guides
+and re-checked against source; `file:line` citations are current as of
+2026-08-12. Suggested order is at "Suggested sequence" — but do rodio first.
 
 Planned against the **104 official migration guides** in the `v0.19.0` tag
 (`_release-content/migration-guides/`), cross-referenced against actual usage
@@ -135,11 +153,36 @@ cpal/rodio dedupe to one copy."* **0.19 falsifies that comment.** Two paths:
   `Player` or raw `Mixer::add` — not a mechanical rename. Needs a design
   decision on which replaces the `Sink`-per-cue + `Vec<Sink>` cancel model.
 
-**Recommendation: A now, B as its own scoped piece of work.** Bundling a
-playback-engine rewrite into a framework bump makes both harder to review and
-harder to bisect. But A is only acceptable if the stale comment is corrected
-in the same commit — leaving it is precisely the model-facing-drift failure we
-promoted a constraint about this morning.
+**RULED (Amy, 2026-08-12): path B, and it lands BEFORE the Bevy bump.** Do the
+rodio 0.20 → 0.22 migration as its own scoped work first, then upgrade Bevy
+onto an already-converged audio stack. This supersedes an earlier
+recommendation in this doc of "A now, B later" — that was written before the
+ruling and is struck rather than deleted so nobody re-derives it.
+
+Consequences of B-first, which is a *better* sequence than what this doc
+originally proposed:
+
+- The two-copies-in-the-tree question never arises. No "verify no double ALSA
+  device open", no larger binary, no false manifest comment to correct —
+  because by the time Bevy pulls rodio 0.22, we are already on it.
+- The `Cargo.toml:32-33` "dedupe to one copy" invariant stays **true**
+  throughout, rather than being briefly false and then repaired.
+- The playback rewrite gets reviewed and bisected on its own, which was the
+  real argument behind the old recommendation. B-first satisfies that argument
+  better than A-then-B did.
+
+Scope for whoever takes it: `audio_sched.rs` is the only file that touches
+rodio types (`dj/*.rs` and `main.rs` mention it in comments only). The design
+call is what replaces the `Sink`-per-cue + `live: Vec<Sink>` cancel/flush
+model — `Player` per cue is the closest analog; raw `mixer::Mixer::add` is the
+lower-level option.
+
+**Standing direction, not scheduled:** Amy has said kaijutsu's sound component
+is important enough to own outright if it comes to that — a kaijutsu-owned
+abstraction with ALSA/PipeWire on Linux and CoreAudio on macOS, rather than
+rodio underneath. ALSA-direct MIDI stays regardless. Do not build toward that
+yet, but do not paint us away from it: keep the rewrite's seam at a shape that
+could take a second backend.
 
 ## Visual regression: bloom
 
@@ -219,6 +262,8 @@ her availability, not on technical dependency.
 Each step should build and test before the next; steps 2–4 are one atomic
 commit because there is no compiling state between them.
 
+0. **rodio 0.20 → 0.22 first** (ruled). Its own work, its own review. The bump
+   should land on an audio stack that is already converged.
 1. **Prep, no Bevy change.** Fix the 24 `Assets::get_mut` sites and the 4
    `insert_non_send_resource` calls. Both are valid on 0.18 (the latter is
    only *deprecated* in 0.19), so this de-risks the big commit and can be
@@ -237,12 +282,12 @@ commit because there is no compiling state between them.
 
 ## Open questions for Amy
 
-1. **rodio path A or B?** A is a one-line comment fix plus accepting two
-   copies; B is a scoped rewrite of `audio_sched.rs`'s core. My
-   recommendation is A now, B later and on its own.
-2. **Is the bloom re-tune yours or ours?** It is a taste call about how the
-   instrument looks; I would rather hand you a build and a knob than guess.
-3. **When?** Nothing here is urgent — 0.18.1 is working. The strongest
+1. **Is the bloom re-tune yours or ours?** It is a taste call about how the
+   instrument looks; better to hand Amy a build and a knob than guess.
+2. **When?** Nothing here is urgent — 0.18.1 is working. The strongest
    argument for going sooner is that the ecosystem crates already moved, so we
    are the laggard, and `bevy_brp_extras` will keep drifting away from a pin
    that reads deceptively current.
+
+Resolved: *rodio path A or B?* → **B, before the bump** (Amy, 2026-08-12).
+*Vello lockstep?* → moot, vello retired.
