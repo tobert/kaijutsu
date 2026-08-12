@@ -2112,7 +2112,27 @@ Remaining, in order:
 - **Should an arriving drift wake a turn?** Nothing subscribes to the block to
   drive the target; it surfaces on the next natural turn. Four shapes written
   up in `drift-ux.md` with no recommendation — it touches the turn loop and
-  the spend posture, so it is Amy's ruling, possibly in person.
+  the spend posture, so it is Amy's ruling, possibly in person. The GLM review
+  argues this is *the* music problem rather than a follow-on ("the difference
+  between an instrument and a message board") and that shape B is nearly free.
+- **rc lifecycle identity smear — blocks a drift rc script writes are
+  attributed to the *sender*.** `run_kai_script` materializes the rc kaish
+  with `principal = caller.principal_id` (`kj/lifecycle.rs:376,388`) — the
+  sender's — while binding the shell to the *target* context. Capabilities
+  are fine: they gate on `caller.context_id` (`kj/mod.rs:563-576`), which is
+  the target, so authorization runs in the right direction (this is where a
+  2026-08-12 GLM review was wrong, and the correction is recorded in
+  `drift-ux.md`). What is actually wrong is narrower: authorship of any block
+  the script writes, and `privileged` riding in from the sender's shell.
+  Harmless while the shipped `drift` rc script only clears prompt cache;
+  **must be fixed before shape B ships** an `S50-drive.kai`, because then the
+  sender's identity would be driving the target's turn.
+- **Drift edge metadata is inconsistent across delivery paths.** Immediate
+  push stamps `drift_kind.to_string()` (`"push"`, `kj/drift.rs:335`); flush
+  stamps `format!("{kind}#{staged_id}")` (`"push#1"`, `:629`). So
+  `kj drift history` cannot uniformly trace an edge back to a staging event.
+  Arguably correct as-is — an immediate push *has* no staging event — but the
+  two paths should agree on a scheme rather than differ by accident.
 
 ## Drift — June 2026 audit
 
