@@ -2122,15 +2122,28 @@ Design record + full gap list: **`docs/drift-ux.md`**. Slice 1 (`push`
 delivers immediately, staging behind `--stage`) SHIPPED `b2cdb770`.
 Remaining, in order:
 
-- **cc-\* contexts never deregister, and that breaks addressing.** Measured
-  on live zorak 2026-08-12: 289 contexts, 152 `cc-*`, **60 sharing the
-  `cc-kaijutsu` prefix**. Drift resolves a label prefix and errors
-  `Ambiguous` on >1 match (`ids.rs:311-320`), so `kj drift push cc-kaijutsu`
-  is unusable *today* and degrades monotonically. `session.end`/`agent.stop`
-  only write text blocks (`hook_listener.rs:315-376`); pileup was left
-  unmanaged deliberately ("for observation", `0c06f51c`) — four weeks in,
-  the cost is now measurable. Fix is small (conclude on `session.end`) but
-  **needs Amy's word**, plus a decision on sweeping the 152 already resident.
+- **cc-\* contexts never deregister, and that breaks addressing. RULED, ready
+  to build.** Measured on live zorak 2026-08-12: 289 contexts, 152 `cc-*`,
+  **60 sharing the `cc-kaijutsu` prefix**. Drift resolves a label prefix and
+  errors `Ambiguous` on >1 match (`ids.rs:311-320`), so
+  `kj drift push cc-kaijutsu` is unusable *today* and degrades monotonically.
+  `session.end`/`agent.stop` only write text blocks
+  (`hook_listener.rs:315-376`).
+  **Amy 2026-08-12: `session.end` archives the context; names do not change;
+  a one-shot sweep of the resident backlog is authorized.** Archive is not
+  trash — archived contexts are retained work kept for referential integrity,
+  later search, and research, with indexing already in flight elsewhere. No
+  kernel change needed: `archived_at` is already what both resolvers filter
+  on. Do **not** rename or suffix on archive; the label leaves the active set
+  intact, which keeps it meaningful for the coming index.
+- **`lost+found` has no discovery or working surface** (Amy, 2026-08-12: "we
+  need to add some tools for discovering and working with lost+found"). It is
+  created lazily by the dead-letter path (`drift.rs:606-680`) and *nothing
+  points at it* — no `kj` verb lists it, and a caller whose drift dead-lettered
+  gets no pointer. Wants at minimum: a way to see it exists and its depth, a
+  way to read what landed there, and a way to re-deliver an entry to its
+  intended target. Weight goes up if drift starts carrying musical material —
+  a silent `lost+found` is a dropped phrase nobody goes looking for.
 - **A received drift is a dead end for reply.** Hydration surfaces the short
   id only (`llm/hydrate.rs:344-357`) — never the sender's label, no thread id,
   no hint that replying is possible. **Not the cheap fix it looks like.**
@@ -2141,12 +2154,15 @@ Remaining, in order:
   `translate_block` has no DB access and has several callers; it wants a
   label snapshot passed in, not a DB handle held across hydration. Small
   design pass, not a patch.
-- **Should an arriving drift wake a turn?** Nothing subscribes to the block to
-  drive the target; it surfaces on the next natural turn. Four shapes written
-  up in `drift-ux.md` with no recommendation — it touches the turn loop and
-  the spend posture, so it is Amy's ruling, possibly in person. The GLM review
-  argues this is *the* music problem rather than a follow-on ("the difference
-  between an instrument and a message board") and that shape B is nearly free.
+- **Arriving drift and turns — RULED (Amy, 2026-08-12).** Default stays the
+  gentle mailbox drop picked up on the receiver's next turn. `kj drift push
+  --drive` *requests* a turn. A per-context setting decides whether drive
+  requests are honoured, **defaulting to off** — the receiver-side veto is
+  what makes a sender-side flag safe, and it is why this is not the rejected
+  "sender declares" shape. Natural home for the setting is the context
+  binding/loadout (an ergonomic-nudge capability), not a new concept.
+  **Blocked on the rc identity-smear fix below** — a driven turn must not be
+  attributed to the sender's principal.
 - **rc lifecycle identity smear — blocks a drift rc script writes are
   attributed to the *sender*.** `run_kai_script` materializes the rc kaish
   with `principal = caller.principal_id` (`kj/lifecycle.rs:376,388`) — the
