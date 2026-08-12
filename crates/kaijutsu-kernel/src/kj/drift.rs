@@ -237,18 +237,41 @@ impl KjDispatcher {
         content: &[String],
         caller: &KjCaller,
     ) -> KjResult {
-        // Resolve destination
-        let target_id = {
-            let router = self.drift_router().read();
-            match router.resolve_context(dst_query) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj drift push: {e}")),
-            }
-        };
-
+        // The caller's own context is resolved first: you must be somewhere
+        // to push from, and `.`/`.parent` below are relative to it. This also
+        // keeps the friendly "no active context joined" error ahead of any
+        // destination-lookup failure.
         let context_id = match caller.require_context() {
             Ok(id) => id,
             Err(e) => return e,
+        };
+
+        // Resolve destination through the *shared* reference grammar —
+        // `.`, `.parent` chains, full UUIDs, labels, hex prefixes — the same
+        // one `pull`/`merge`/`history` use. Push previously resolved through
+        // the in-memory router alone, so `merge .parent` worked and
+        // `push .parent` did not (docs/drift-ux.md, gap #3).
+        //
+        // The router remains a fallback for anything registered in this
+        // process that the DB cannot resolve. On a double failure we report
+        // the DB's error: it resolves against the larger candidate set, so
+        // its message (the ambiguity candidate list in particular) is the
+        // more useful of the two.
+        let target_id = {
+            let db_result = {
+                let db = self.kernel_db().lock();
+                refs::resolve_context_arg(Some(dst_query), caller, &db)
+            };
+            match db_result {
+                Ok(id) => id,
+                Err(db_err) => {
+                    let router = self.drift_router().read();
+                    match router.resolve_context(dst_query) {
+                        Ok(id) => id,
+                        Err(_) => return KjResult::Err(format!("kj drift push: {db_err}")),
+                    }
+                }
+            }
         };
 
         // Determine content and drift kind
@@ -1064,6 +1087,86 @@ mod tests {
             queue.message().contains("precious"),
             "content must survive a failed push: {}",
             queue.message()
+        );
+    }
+
+    /// `push` must accept the same address grammar as `pull`/`merge`/
+    /// `history` — including the structural `.parent` chain. Before this,
+    /// `merge .parent` worked and `push .parent` did not, because push
+    /// resolved through the in-memory router while everything else went
+    /// through `refs::resolve_context_arg`. Structural refs also dodge label
+    /// collisions entirely, which matters while the `cc-*` namespace is
+    /// crowded (see `docs/drift-ux.md` gap #5).
+    #[tokio::test]
+    async fn drift_push_accepts_parent_ref() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
+        d.block_store()
+            .create_document(parent, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(child);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s(".parent"), s("upward")], &c)
+            .await;
+        assert!(result.is_ok(), "push .parent failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(parent).expect("snapshots");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.kind == kaijutsu_types::BlockKind::Drift
+                    && b.content.contains("upward")),
+            "drift should have landed in the parent context"
+        );
+    }
+
+    /// `.` resolves to the caller's own context on `push` too. Pushing to
+    /// yourself is odd but legal, and the point here is that the grammar is
+    /// shared — `.` must not be read as a label.
+    #[tokio::test]
+    async fn drift_push_accepts_current_ref() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let me = register_context(&d, Some("me"), None, principal);
+        d.block_store()
+            .create_document(me, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(me);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("."), s("note to self")], &c)
+            .await;
+        assert!(result.is_ok(), "push . failed: {}", result.message());
+        let blocks = d.block_store().block_snapshots(me).expect("snapshots");
+        assert!(blocks
+            .iter()
+            .any(|b| b.kind == kaijutsu_types::BlockKind::Drift));
+    }
+
+    /// An ambiguous label prefix must still report every candidate rather
+    /// than silently picking one. This is the failure mode the crowded
+    /// `cc-*` namespace produces in the field, so it is worth pinning.
+    #[tokio::test]
+    async fn drift_push_ambiguous_prefix_names_candidates() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let _a = register_context(&d, Some("cc-proj-aaaa"), None, principal);
+        let _b = register_context(&d, Some("cc-proj-bbbb"), None, principal);
+
+        let c = caller_with_context(src);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("cc-proj"), s("hi")], &c)
+            .await;
+        assert!(!result.is_ok(), "ambiguous prefix must not resolve");
+        let msg = result.message();
+        assert!(msg.contains("ambiguous"), "msg: {msg}");
+        assert!(
+            msg.contains("cc-proj-aaaa") && msg.contains("cc-proj-bbbb"),
+            "error must name the candidates: {msg}"
         );
     }
 
