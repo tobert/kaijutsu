@@ -74,9 +74,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         col += vec3<f32>(0.30, 0.42, 0.55) * sheen * 0.5 * inside;
     }
 
-    // MSDF text on top (text texture is transparent except glyphs).
+    // MSDF text on top (text texture is transparent except glyphs). The MSDF
+    // pass writes PREMULTIPLIED rgb (msdf_block.wgsl multiplies color by
+    // alpha), so composite with the premultiplied "over" — `mix(col,
+    // text.rgb, text.a)` would multiply the fringes by alpha a second time
+    // and etch a dark rim around every glyph (the same bug class
+    // BlockFxMaterial::specialize fixes for the UI lane).
     let text = textureSample(card_texture, card_sampler, in.uv);
-    col = mix(col, text.rgb, text.a);
+    col = col * (1.0 - text.a) + text.rgb;
     alpha = max(alpha, text.a * inside);
 
     // Ring band hugging the inner edge of the rounded box. HDR colors below push
