@@ -17,7 +17,7 @@
 //! byte-identical text from one place.
 
 use bevy::prelude::*;
-use vello::peniko::Brush;
+use peniko::Brush;
 
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;

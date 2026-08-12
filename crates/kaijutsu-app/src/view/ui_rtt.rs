@@ -38,7 +38,7 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
-use vello::kurbo::Affine;
+use kurbo::Affine;
 
 use crate::view::vello_rasterizer::{VelloRasterizer, VelloRasterizerSettings};
 
@@ -285,7 +285,7 @@ pub fn render_vello_scenes(
         }
 
         let params = vello::RenderParams {
-            base_color: vello::peniko::Color::TRANSPARENT,
+            base_color: peniko::Color::TRANSPARENT,
             width: item.width,
             height: item.height,
             antialiasing_method: render_settings.antialiasing,

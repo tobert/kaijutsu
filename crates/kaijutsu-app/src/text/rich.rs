@@ -16,7 +16,7 @@
 //! falls back to markdown.
 
 use bevy::prelude::*;
-use vello::peniko::Brush;
+use peniko::Brush;
 
 use std::sync::Arc;
 

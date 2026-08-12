@@ -14,8 +14,8 @@ use bevy::prelude::*;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::view::block_render::GpuTextureLimits;
 use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, logical_size};
-use vello::kurbo::Affine;
-use vello::peniko::Fill;
+use kurbo::Affine;
+use peniko::Fill;
 
 use crate::cell::ContextSwitchRequested;
 use crate::connection::RpcConnectionState;
@@ -211,7 +211,7 @@ fn draw_dock_text(
     y: f64,
     font_size: f32,
     font: &VelloFont,
-    brush: &vello::peniko::Brush,
+    brush: &peniko::Brush,
 ) -> f64 {
     if text.is_empty() {
         return 0.0;
@@ -302,7 +302,7 @@ fn draw_sparkline_at(
     line_color: Color,
     fill_alpha: f32,
 ) {
-    use vello::kurbo::{Cap, Join, Stroke};
+    use kurbo::{Cap, Join, Stroke};
 
     let colors = SparklineColors {
         line: line_color,

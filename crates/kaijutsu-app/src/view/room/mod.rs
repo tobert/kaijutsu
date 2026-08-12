@@ -117,7 +117,7 @@ use crate::view::patch_bay;
 use crate::view::scene_palette::{ScenePalette, lin_scaled};
 use crate::view::time_well::live::WellBeats;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
-use vello::peniko::Brush;
+use peniko::Brush;
 
 // ── Room geometry (Amy-tunable) ─────────────────────────────────────────────
 // Color/brightness constants moved onto `Res<ScenePalette>`
