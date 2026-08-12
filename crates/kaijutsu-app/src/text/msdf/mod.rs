@@ -16,15 +16,13 @@
 //! BlockFxMaterial (post-processing: glow, animation)
 //! ```
 //!
-//! Vello still handles SVG (a CPU vector rasterizer, out of the
-//! conversation-view de-vello scope) — the only remaining
-//! `BlockRenderMethod::Vello` site in the conversation view. Everything else
-//! is off vello: MSDF renders text content (PlainText, Markdown, Output,
-//! border/role-divider labels) and, together with `geometry`'s flat-colored
-//! triangles, ABC music notation (no vello content at all); sparklines and
-//! the image placeholder are plain UI rectangle geometry (`text::sparkline`);
-//! block borders / role dividers are an SDF shader (`cell::block_border` +
-//! `shaders::BlockFxMaterial`).
+//! The conversation view is entirely off vello for block content: MSDF
+//! renders text content (PlainText, Markdown, Output, border/role-divider
+//! labels) and, together with `geometry`'s flat-colored triangles, ABC music
+//! notation; SVG is a CPU raster (`text::svg_raster`, resvg/tiny-skia) into a
+//! child `Image`; sparklines and the image placeholder are plain UI
+//! rectangle geometry (`text::sparkline`); block borders / role dividers are
+//! an SDF shader (`cell::block_border` + `shaders::BlockFxMaterial`).
 
 pub mod atlas;
 pub mod generator;
@@ -130,12 +128,16 @@ pub struct MsdfBlockGeometry {
 
 /// Which renderer draws a block's base content into its texture (before the
 /// `BlockFxMaterial` shader post-processes border/glow/label decoration on
-/// top — that part is never Vello, regardless of this enum).
+/// top). Single-variant today — every block cell texture is MSDF-rendered
+/// (or carries no texture content at all, for a block whose content is
+/// plain UI geometry: sparkline, image placeholder, SVG raster — spawned as
+/// sibling child entities instead). Kept as a component/bundle marker
+/// (`msdf_surface_bundle`) rather than collapsed away; a `Vello` variant
+/// existed here until it was retired as dead weight (docs/issues.md,
+/// 2026-08-12) — nothing had assigned it since ABC and SVG both moved off
+/// vello.
 #[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockRenderMethod {
-    /// Vello rasterizes the block's content (SVG only — ABC notation moved
-    /// to MSDF + `geometry`; see this module's doc comment).
-    Vello,
     /// MSDF renders text glyphs (or nothing, for a block whose content is
     /// plain UI geometry — sparkline, image placeholder — spawned as
     /// sibling child entities instead of texture content).

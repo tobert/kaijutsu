@@ -16,13 +16,12 @@
 //! clip, z-order. `BackgroundColor` works again. No coordinate space
 //! mismatches.
 //!
-//! ABC and SVG were the last two `BlockRenderMethod::Vello` producers, and
-//! they came off vello on separate branches — this module reached zero only
-//! when those two merged. Nothing assigns that variant any more; the
-//! conversation view now touches vello solely for Parley text SHAPING
-//! (`VelloFont` layout, `Brush` colors), never for rasterization. Retiring
-//! the dead variant and its `UiVectorScene` plumbing is tracked in
-//! `docs/issues.md`.
+//! ABC and SVG were the last two vello content producers here, and they came
+//! off vello on separate branches; this module's block cell textures no
+//! longer touch vello at all — not even a `UiVectorScene`/`vello::Scene`
+//! plumbed through and left empty. The conversation view touches vello
+//! solely for Parley text SHAPING (`VelloFont` layout, `Brush` colors),
+//! never for rasterization.
 
 use std::collections::HashMap;
 
@@ -61,7 +60,7 @@ use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_
 use crate::text::svg_raster::{fit_svg_to_box, rasterize_svg};
 use crate::ui::theme::Theme;
 use crate::view::role_divider;
-use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, ui_rtt_texture_dims};
+use crate::view::ui_rtt::{UiRttTexture, ui_rtt_texture_dims};
 use bevy::math::Rot2;
 use bevy::ui::UiTransform;
 
@@ -71,20 +70,19 @@ use bevy::ui::UiTransform;
 
 /// Per-block content + bookkeeping (the build-decision side of a block cell).
 ///
-/// The rasterizable scene + built dimensions live on the sibling
-/// [`UiVectorScene`]; this component carries only what the *build* systems need
-/// to decide when to rebuild (content versions, formatted text, color). The
-/// name is historical — it no longer holds a scene; rename to `BlockContent` is
-/// a tracked follow-up.
+/// Block cells carry no rasterizable scene at all any more — this component
+/// carries what the *build* systems need to decide when to rebuild (content
+/// versions, formatted text, color). The name is historical; rename to
+/// `BlockContent` is a tracked follow-up.
 #[derive(Component)]
 pub struct BlockScene {
     /// Content version from sync_block_cell_buffers.
     pub content_version: u64,
     /// Content version that was last built into a scene.
     pub last_built_version: u64,
-    /// Monotonic counter bumped each rebuild. Double duty: drives the MSDF
-    /// glyph version (= scene_version) and, on the Vello path, is copied into
-    /// `UiVectorScene.version` to gate vello rasterization.
+    /// Monotonic counter bumped each rebuild, driving the MSDF glyph version
+    /// (`MsdfBlockGlyphs.version = scene_version`, never derived any other
+    /// way — see that field's own doc comment for why).
     pub scene_version: u64,
     /// Formatted text content (set by sync_block_cell_buffers).
     pub text: String,
@@ -330,12 +328,12 @@ impl Plugin for BlockRenderPlugin {
             return;
         };
 
-        // SVG block cells rasterize their vello scene via the generic
-        // UiRttPlugin (extract_vello_scenes / render_vello_scenes); this
-        // plugin owns only the MSDF compositing pass, which runs *after* the
-        // generic vello render so SVG content lands in the texture
-        // first (borders are a separate BlockFxMaterial post-process, never
-        // part of this texture's contents).
+        // This plugin owns the sole render pass for block cell textures:
+        // flat-colored geometry (ABC engraving, Diff bands) then MSDF glyphs
+        // on top. SVG is a CPU raster (`text::svg_raster`) composited as a
+        // separate child `ImageNode`, never through this texture (borders
+        // are a further separate BlockFxMaterial post-process on top of
+        // both).
         render_app
             .init_resource::<ExtractedMsdfAtlas>()
             .init_resource::<ExtractedMsdfBlockData>()
@@ -476,7 +474,6 @@ pub fn build_block_scenes(
         (
             Entity,
             &mut BlockScene,
-            &mut UiVectorScene,
             &mut UiRttTexture,
             &ComputedNode,
             &mut Node,
@@ -520,7 +517,7 @@ pub fn build_block_scenes(
     let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
 
     for (
-        entity, mut block_scene, mut ui_scene, mut rtt, computed, mut node, rich, border, vis, effects,
+        entity, mut block_scene, mut rtt, computed, mut node, rich, border, vis, effects,
         mut msdf_glyphs, mut msdf_geometry, mut render_method, excluded_state,
         existing_geometry_children,
     ) in block_cells.iter_mut()
@@ -640,7 +637,6 @@ pub fn build_block_scenes(
         // the new content. Cheap: a `clear()` on an already-empty Vec.
         msdf_geometry.vertices.clear();
 
-        let scene = vello::Scene::new();
         let content_height: f32;
 
         // Determine the brush for plain text
@@ -681,7 +677,7 @@ pub fn build_block_scenes(
                 );
                 let fallback_brush = bevy_color_to_brush(theme.block_assistant);
 
-                // MSDF renders text; `scene` stays empty for markdown blocks.
+                // MSDF renders text; no vello scene of any kind here.
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
@@ -857,9 +853,8 @@ pub fn build_block_scenes(
                 // ABC renders entirely through MSDF + geometry now — no
                 // vello scene content at all, same as Markdown/Output/
                 // PlainText below. `render_method` stays `Msdf` (the
-                // default) so `ui_scene.version` is never bumped for these
-                // blocks and the generic vello extract skips their (empty)
-                // scene, exactly like every other MSDF-rendered block kind.
+                // default), exactly like every other MSDF-rendered block
+                // kind.
                 let default_opts = kaijutsu_abc::engrave::EngravingOptions::default();
                 let elements =
                     kaijutsu_abc::engrave::layout::engrave(tune, &default_opts);
@@ -1278,7 +1273,6 @@ pub fn build_block_scenes(
             node.height = target_height;
         }
 
-        ui_scene.scene = scene;
         // `width` itself (used above for max_advance/layout and label
         // positions) stays the raw Taffy value — only what we store for the
         // RTT texture mapping gets rounded, same reasoning as `total_height`
@@ -1287,16 +1281,6 @@ pub fn build_block_scenes(
         rtt.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
         block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
-
-        // Gate vello rasterization to Vello blocks. MSDF cells leave
-        // `ui_scene.version` untouched so the generic extract skips their (empty)
-        // scene — `render_msdf_block_textures` clears the texture itself
-        // (`has_vello_content == false`). Vello blocks adopt `scene_version` so
-        // the extract's `version > last_rendered` gate fires. This reproduces the
-        // old `render_method != Msdf` extract skip.
-        if *render_method == BlockRenderMethod::Vello {
-            ui_scene.version = block_scene.scene_version;
-        }
     }
 }
 
@@ -1492,19 +1476,17 @@ pub fn resize_block_textures(
 
 /// Render MSDF geometry + text glyphs to per-block textures.
 ///
-/// Runs after Vello rendering so SVG content is already present in the
-/// texture for the blocks that have it (most blocks have none — see
-/// `has_vello_content` below; ABC no longer does either, see this module's
-/// doc comment). Two composited passes run per item, in order: flat-colored
-/// music geometry (staff lines, beams, slurs, ties, repeat dots) first,
-/// then MSDF glyphs on top — reproducing the "vello draws lines, MSDF
-/// composites glyphs on top" layering ABC used to get from vello, now with
-/// geometry as the first layer instead. A block is only considered
-/// "settled" (its `version` advances into `last_rendered`, stopping
-/// re-extraction) once EVERY non-empty layer it has has rendered
-/// successfully this frame — a block with geometry ready but glyphs still
-/// atlas-pending must keep re-extracting every frame, not have its pending
-/// glyphs silently forgotten because geometry alone "counted" as done.
+/// This is the sole renderer of block cell texture content — no vello pass
+/// runs before it. Two composited passes run per item, in order: flat-colored
+/// music geometry (staff lines, beams, slurs, ties, repeat dots) first, then
+/// MSDF glyphs on top — reproducing the "lines under glyphs" layering ABC
+/// used to get from vello, now with geometry as the first MSDF-world layer
+/// instead. A block is only considered "settled" (its `version` advances
+/// into `last_rendered`, stopping re-extraction) once EVERY non-empty layer
+/// it has has rendered successfully this frame — a block with geometry ready
+/// but glyphs still atlas-pending must keep re-extracting every frame, not
+/// have its pending glyphs silently forgotten because geometry alone
+/// "counted" as done.
 pub fn render_msdf_block_textures(
     msdf_renderer: Option<Res<MsdfBlockRenderer>>,
     geometry_renderer: Option<Res<MusicGeometryRenderer>>,
@@ -1610,9 +1592,8 @@ pub fn render_msdf_block_textures(
         let mut glyph_ok = !has_glyphs;
 
         if has_geometry {
-            // Clear only if nothing (vello) drew to this texture already
-            // this frame — geometry is always the first MSDF-world layer.
-            let clear = !item.has_vello_content;
+            // Geometry is always the first layer drawn to this texture
+            // (nothing else precedes it), so it always clears.
             if geometry_renderer.encode_render(
                 &device,
                 &mut encoder,
@@ -1620,7 +1601,7 @@ pub fn render_msdf_block_textures(
                 &gpu_images,
                 &item.image_handle,
                 &geometry_vertices,
-                clear,
+                true,
             ) {
                 geometry_ok = true;
                 encoded_any = true;
@@ -1644,9 +1625,9 @@ pub fn render_msdf_block_textures(
                 gamma_correction: render_params.gamma_correction,
             };
 
-            // Clear only if NEITHER vello NOR a just-drawn geometry layer
-            // put anything in the texture first this frame.
-            let clear = !item.has_vello_content && !(has_geometry && geometry_ok);
+            // Clear only if a just-drawn geometry layer didn't already put
+            // something in the texture first this frame.
+            let clear = !(has_geometry && geometry_ok);
             if msdf_renderer.encode_render(
                 &device,
                 &mut encoder,
@@ -1744,12 +1725,6 @@ struct ExtractedMsdfBlockItem {
     scale: f32,
     version: u64,
     rainbow: bool,
-    /// Whether this is an SVG block that vello already rendered into the
-    /// texture this frame (false = the texture has no prior content and
-    /// MSDF must clear it before compositing; that covers everything else,
-    /// ABC and borders included — border decoration is never part of this
-    /// texture).
-    has_vello_content: bool,
 }
 
 /// A surface's logical→physical scale from its texture + build-space widths.
@@ -1828,22 +1803,19 @@ fn extract_msdf_blocks(
         Query<(
             &MsdfBlockGlyphs,
             Option<&MsdfBlockGeometry>,
-            &BlockRenderMethod,
             &UiRttTexture,
         )>,
     >,
 ) {
     extracted.items.clear();
 
-    for (msdf_glyphs, msdf_geometry, render_method, texture) in query.iter() {
+    for (msdf_glyphs, msdf_geometry, texture) in query.iter() {
         let asset_id = texture.image.id();
         let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
         if !should_extract_msdf_block(msdf_glyphs.version, msdf_glyphs.glyphs.is_empty(), last) {
             continue;
         }
 
-        // Vello blocks have content rendered by the Vello pass — MSDF composites on top
-        let has_vello = *render_method == BlockRenderMethod::Vello;
         // `MsdfBlockGeometry` is only ever populated for the block cells that
         // draw flat-colored shapes (ABC engraving, Diff bands) — every other
         // MSDF-glyph-bearing surface (role headers, the shell
@@ -1861,7 +1833,6 @@ fn extract_msdf_blocks(
             scale: msdf_item_scale(texture.width, texture.built_width),
             version: msdf_glyphs.version,
             rainbow: msdf_glyphs.rainbow,
-            has_vello_content: has_vello,
         });
     }
 }

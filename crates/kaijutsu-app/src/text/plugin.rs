@@ -1,12 +1,15 @@
-//! Text rendering plugin for Bevy using Vello + MSDF.
+//! Text rendering plugin for Bevy using Parley + MSDF.
 //!
-//! Vello handles vector content (SVG only, in this crate — the sole
-//! remaining `BlockRenderMethod::Vello` site in the conversation view).
 //! MSDF handles text (plain, markdown, output, border/role-divider labels)
 //! and, together with `msdf::geometry`'s flat-colored triangles, ABC music
-//! notation. Sparklines and the image placeholder are plain UI rectangle
-//! geometry (`text::sparkline`); block borders and the role-group divider
-//! are an SDF shader (`cell::block_border` + `shaders`).
+//! notation. SVG is a CPU raster (`text::svg_raster`, resvg/tiny-skia) into a
+//! child `ImageNode`. Sparklines and the image placeholder are plain UI
+//! rectangle geometry (`text::sparkline`); block borders and the role-group
+//! divider are an SDF shader (`cell::block_border` + `shaders`). Vello
+//! itself is still a dependency — it's the Parley text SHAPING + `Brush`
+//! source behind `VelloFont`/`VelloTextStyle` below, and the dock chrome
+//! (`ui::dock`) still rasterizes through it — but nothing in this module's
+//! path touches it for rasterization any more.
 
 use std::collections::HashSet;
 
@@ -19,14 +22,14 @@ use super::msdf::{FontDataMap, MsdfGenerator, PositionedGlyph};
 use super::resources::{ShapingFonts, SvgFontDb, TextMetrics};
 use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
-/// Plugin that enables Vello + MSDF text rendering.
+/// Plugin that enables Parley-shaped MSDF text rendering.
 ///
 /// Sets up:
 /// - MSDF atlas, generator, and font data map
 /// - Font loading and DPI-aware text metrics
 ///
-/// Vector rasterization (SVG only) is owned by `VelloRasterizerPlugin` +
-/// `UiRttPlugin`.
+/// The vello offscreen rasterizer (`VelloRasterizerPlugin` + `UiRttPlugin`)
+/// is a separate plugin — dock chrome's only remaining consumer, not text.
 pub struct KjTextPlugin;
 
 impl Plugin for KjTextPlugin {
