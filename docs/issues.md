@@ -6,32 +6,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## `test_fork_work_drift_merge_e2e` fails on main (2026-08-12, found during the Bevy 0.19 bump)
-
-`cargo test -p kaijutsu-server --test e2e_kj_workflow` — 13 pass, this one
-fails, deterministically (3/3 reruns):
-
-```
-crates/kaijutsu-server/tests/e2e_kj_workflow.rs:169
-expected 'staged' in push output, got: drifted → main
-```
-
-Found while establishing a green baseline for the Bevy upgrade, and
-**confirmed pre-existing** — it fails identically at the pre-bump commit in a
-clean worktree, so it is not upgrade fallout. Nothing in this crate's tree
-touches Bevy.
-
-The push output says `drifted → main` where the test wants `staged`, so this
-is the drift lane's own vocabulary/behavior having moved without the test
-following — either the staging step stopped happening or the reporting
-changed. Decide which, then fix the side that is wrong; a test asserting on
-prose is fragile either way. Secondary noise to ignore while debugging: the
-teardown then panics inside russh with "there is no reactor running", which
-is a shutdown-ordering artifact of the first failure, not a second bug.
-
-Worth fixing soon simply because a red test on main trains us to skim past
-red tests.
-
 ## Summaries drift stronger than what they summarise (2026-08-11, three instances in one day)
 
 Not a code bug — a writing failure mode worth naming, because it cost real
