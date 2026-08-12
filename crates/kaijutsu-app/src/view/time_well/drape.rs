@@ -415,7 +415,7 @@ pub fn sync_lineage_drapes(
         if cached.0 != sel_pos || cached.1 != end {
             cached.0 = sel_pos;
             cached.1 = end;
-            if let Some(m) = meshes.get_mut(&mesh3d.0) {
+            if let Some(mut m) = meshes.get_mut(&mesh3d.0) {
                 *m = drape_mesh(sel_pos, end, axis);
             }
         }

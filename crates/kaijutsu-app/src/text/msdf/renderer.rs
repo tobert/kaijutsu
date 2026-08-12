@@ -105,7 +105,8 @@ impl MsdfBlockRenderer {
             address_mode_v: AddressMode::ClampToEdge,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
-            mipmap_filter: FilterMode::Nearest,
+            // 0.19/wgpu split mipmap filtering into its own enum; same Nearest.
+            mipmap_filter: MipmapFilterMode::Nearest,
             ..default()
         });
 
@@ -199,7 +200,7 @@ impl MsdfBlockRenderer {
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
-            push_constant_ranges: vec![],
+            immediate_size: 0,
             zero_initialize_workgroup_memory: false,
         });
 
@@ -303,6 +304,7 @@ impl MsdfBlockRenderer {
         {
             encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("msdf_block_clear_pass"),
+                multiview_mask: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_gpu.texture_view,
                     resolve_target: None,
@@ -390,6 +392,7 @@ impl MsdfBlockRenderer {
 
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("msdf_block_render_pass"),
+                multiview_mask: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_gpu.texture_view,
                     resolve_target: None,

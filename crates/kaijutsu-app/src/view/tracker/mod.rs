@@ -881,7 +881,7 @@ fn pulse_tracker_playheads(
             || (cur.green - target.y).abs() > 1e-4
             || (cur.blue - target.z).abs() > 1e-4;
         if changed
-            && let Some(m) = materials.get_mut(&handle.0)
+            && let Some(mut m) = materials.get_mut(&handle.0)
         {
             m.base_color = Color::LinearRgba(LinearRgba::rgb(target.x, target.y, target.z));
         }

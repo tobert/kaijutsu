@@ -350,7 +350,7 @@ fn setup_camera(
     palette: Res<view::scene_palette::ScenePalette>,
 ) {
     use bevy::post_process::bloom::{Bloom, BloomPrefilter};
-    use bevy::render::view::Hdr;
+    use bevy::camera::Hdr;
     commands.spawn((
         Camera3d::default(),
         Camera {

@@ -322,7 +322,7 @@ impl MsdfAtlas {
         self.version = self.version.wrapping_add(1);
         self.growth_epoch = self.growth_epoch.wrapping_add(1);
 
-        if let Some(image) = images.get_mut(&self.texture) {
+        if let Some(mut image) = images.get_mut(&self.texture) {
             image.resize(Extent3d {
                 width: new_width,
                 height: new_height,
@@ -403,7 +403,7 @@ impl MsdfAtlas {
             return;
         }
 
-        if let Some(image) = images.get_mut(&self.texture) {
+        if let Some(mut image) = images.get_mut(&self.texture) {
             // Reuse the existing Vec allocation instead of a fresh
             // `self.pixels.clone()` every dirty frame — the atlas texture is
             // multi-MiB, and warmup dirties it often. `clone_from` handles a
@@ -795,7 +795,7 @@ mod tests {
 
         // If sync ran while not dirty it would stomp this sentinel — prove
         // the early return actually skips the body.
-        if let Some(image) = images.get_mut(&atlas.texture) {
+        if let Some(mut image) = images.get_mut(&atlas.texture) {
             image.data = None;
         }
         let mut atlas = atlas;

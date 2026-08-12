@@ -114,9 +114,12 @@ rand = "0.8"
 shellexpand = "3"
 
 # Bevy Remote Protocol (debugging)
-bevy_remote = "0.18"
-bevy_brp_extras = "0.19"
-bevy_mesh = "0.18"
+bevy_remote = "0.19"
+# NOTE: bevy_brp_extras' version number tracks its own releases, NOT bevy's —
+# 0.19.0 wanted bevy 0.18.1 and was what pinned us to 0.18. 0.20+ wants bevy
+# 0.19. Read its manifest, never its version number, before bumping bevy.
+bevy_brp_extras = "0.22"
+bevy_mesh = "0.19"
 
 # Geometry primitives (used directly by kaijutsu-abc's engraving IR; also a
 # direct kaijutsu-app dependency, not a vello re-export — vello itself is

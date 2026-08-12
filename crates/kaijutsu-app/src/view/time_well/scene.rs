@@ -1842,7 +1842,7 @@ pub fn sync_deck_material(
     let Ok(handle) = deck.single() else {
         return;
     };
-    let Some(mat) = ring_materials.get_mut(&handle.0) else {
+    let Some(mut mat) = ring_materials.get_mut(&handle.0) else {
         return;
     };
 
@@ -2058,7 +2058,7 @@ pub fn dim_nonfocused_rings(
         if cur != target {
             let eased = cur + (target - cur) * alpha;
             let next = if (eased - target).abs() <= SETTLE_EPS { target } else { eased };
-            if let Some(mat) = ring_materials.get_mut(&handle.0) {
+            if let Some(mut mat) = ring_materials.get_mut(&handle.0) {
                 mat.color.w = next;
             }
         }
@@ -2073,7 +2073,7 @@ pub fn dim_nonfocused_rings(
         if cur != target {
             let eased = cur + (target - cur) * alpha;
             let next = if (eased - target).abs() <= SETTLE_EPS { target } else { eased };
-            if let Some(mat) = card_materials.get_mut(&handle.0) {
+            if let Some(mut mat) = card_materials.get_mut(&handle.0) {
                 mat.dim.x = next;
             }
         }

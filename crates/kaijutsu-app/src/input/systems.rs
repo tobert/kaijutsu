@@ -365,7 +365,7 @@ pub fn handle_quit(mut actions: MessageReader<ActionFired>, mut exit: MessageWri
 /// Handle DebugToggle action.
 pub fn handle_debug_toggle(
     mut actions: MessageReader<ActionFired>,
-    mut debug_options: ResMut<UiDebugOptions>,
+    mut debug_options: ResMut<GlobalUiDebugOptions>,
 ) {
     for ActionFired { action, .. } in actions.read() {
         if matches!(action, Action::DebugToggle) {

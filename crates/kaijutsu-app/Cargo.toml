@@ -32,10 +32,11 @@ kaijutsu-telemetry.workspace = true
 # fewer layer. 0.22's cpal support moved behind an opt-in "playback" feature
 # (it was a hard dependency under 0.20), so it must be listed explicitly
 # alongside "wav"/"vorbis" now that default-features is off, or the whole
-# `stream` module and device output vanish. We are on 0.22 ahead of Bevy
-# (0.18's bevy_audio still wants rodio ^0.20, so this is a deliberate second
-# copy in the dep tree until Bevy 0.19 brings bevy_audio onto rodio ^0.22 and
-# restores the single-copy dedupe).
+# `stream` module and device output vanish. Bevy 0.19's bevy_audio wants rodio
+# ^0.22 too, so this shares one copy with Bevy — keep this requirement and
+# Bevy's in the same semver range so cpal/rodio stay deduped (`cargo tree -d`
+# is the check). We briefly ran ahead of Bevy here, on 0.22 while 0.18 still
+# wanted ^0.20; the 0.19 bump closed that gap.
 rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "vorbis"] }
 
 # kaish (for syntax validation)
@@ -49,11 +50,11 @@ logos = "0.16"
 # anymore, so there's nothing left to decode WAV *through bevy*. Dropping
 # bevy_audio from the build entirely (full feature enumeration instead of
 # "default") is deliberate follow-up hygiene, NOT this lane (docs/pcm.md R5).
-bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
+bevy = { version = "0.19", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true
 bevy_mesh.workspace = true
 bevy_remote.workspace = true
-bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }
+bevy_tweening = "0.16"
 
 # Text rendering (Parley shaping + MSDF): we own the shaping + MSDF glyph
 # atlas + scene→texture primitive. `vello` itself is GONE (retired

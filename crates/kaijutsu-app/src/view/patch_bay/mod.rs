@@ -1006,7 +1006,7 @@ fn update_wire_selection(
             continue;
         };
         if cur != want
-            && let Some(mat) = chord_materials.get_mut(&handle.0)
+            && let Some(mut mat) = chord_materials.get_mut(&handle.0)
         {
             mat.params.x = want;
         }
@@ -1029,7 +1029,7 @@ fn pulse_render_chords(
     }
     let now = time.elapsed_secs_wrapped();
     for handle in chords.iter() {
-        if let Some(mat) = chord_materials.get_mut(&handle.0) {
+        if let Some(mut mat) = chord_materials.get_mut(&handle.0) {
             mat.params.y = now;
         }
     }

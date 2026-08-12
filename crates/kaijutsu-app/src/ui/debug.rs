@@ -7,7 +7,12 @@
 use bevy::prelude::*;
 
 /// Configure UI debug overlay (OFF by default, F1 to toggle)
-pub fn setup_debug_overlay(mut debug_options: ResMut<UiDebugOptions>) {
+///
+/// Bevy 0.19 split this in two: `UiDebugOptions` is now a per-node `Component`
+/// override, and `GlobalUiDebugOptions` is the app-wide resource. We want the
+/// app-wide one. The new `outline_*` fields keep their defaults
+/// (`outline_border_box: true`, the rest false) — that is 0.18's behavior.
+pub fn setup_debug_overlay(mut debug_options: ResMut<GlobalUiDebugOptions>) {
     debug_options.enabled = false;
     debug_options.line_width = 1.0;
     debug_options.show_hidden = false;

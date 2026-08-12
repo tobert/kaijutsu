@@ -530,7 +530,7 @@ pub fn sync_unfocused_pane_summaries(
                 };
 
                 // The unfocused-pane summary is the one surface rendered with
-                // Bevy's native text pipeline rather than the MSDF/Vello path —
+                // Bevy's native text pipeline rather than the MSDF path —
                 // a deliberate pragmatic choice for a dimmed, secondary label.
                 // Our bundled mono font keeps it visually consistent.
                 let summary_entity = commands
@@ -538,8 +538,8 @@ pub fn sync_unfocused_pane_summaries(
                         UnfocusedPaneSummary,
                         Text::new(summary_text),
                         TextFont {
-                            font: asset_server.load("fonts/CascadiaCodeNF.ttf"),
-                            font_size: 14.0,
+                            font: asset_server.load("fonts/CascadiaCodeNF.ttf").into(),
+                            font_size: FontSize::Px(14.0),
                             ..default()
                         },
                         TextColor(theme.fg_dim),

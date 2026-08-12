@@ -537,7 +537,7 @@ pub fn sync_card_live_uniforms(
             continue;
         };
         if cur != (chatter, beat, border)
-            && let Some(mat) = materials.get_mut(&handle.0)
+            && let Some(mut mat) = materials.get_mut(&handle.0)
         {
             mat.dim.y = chatter;
             mat.dim.z = beat;

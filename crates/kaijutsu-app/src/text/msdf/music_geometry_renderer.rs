@@ -96,7 +96,7 @@ impl MusicGeometryRenderer {
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
-            push_constant_ranges: vec![],
+            immediate_size: 0,
             zero_initialize_workgroup_memory: false,
         });
 
@@ -176,6 +176,7 @@ impl MusicGeometryRenderer {
 
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("music_geometry_render_pass"),
+                multiview_mask: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_gpu.texture_view,
                     resolve_target: None,

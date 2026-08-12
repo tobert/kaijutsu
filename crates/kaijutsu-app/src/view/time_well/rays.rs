@@ -492,7 +492,7 @@ pub fn animate_track_rays(
             continue;
         };
         if cur != next
-            && let Some(mat) = materials.get_mut(&handle.0)
+            && let Some(mut mat) = materials.get_mut(&handle.0)
         {
             mat.params = next;
         }

@@ -702,7 +702,7 @@ pub fn build_card_scenes(
         let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
         commit_panel_glyphs(&mut msdf, glyphs);
 
-        if let Some(mat) = materials.get_mut(&mat_node.0) {
+        if let Some(mut mat) = materials.get_mut(&mat_node.0) {
             mat.accent = accent_vec4(&card.data.accent);
         }
     }
@@ -730,7 +730,7 @@ pub fn sync_card_material_params(
     query: Query<(&CardParams, &MeshMaterial3d<WellCardMaterial>), Changed<CardParams>>,
 ) {
     for (params, mat_node) in query.iter() {
-        if let Some(mat) = materials.get_mut(&mat_node.0) {
+        if let Some(mut mat) = materials.get_mut(&mat_node.0) {
             mat.params = card_params(params);
         }
     }
@@ -782,7 +782,7 @@ pub fn update_reading_card(
         .and_then(|sel| cards.iter().find(|c| c.context_id == sel))
     {
         Some(card) => {
-            if let Some(mat) = materials.get_mut(&mat_node.0) {
+            if let Some(mut mat) = materials.get_mut(&mat_node.0) {
                 let accent = accent_vec4(&card.data.accent);
                 mat.accent = accent;
                 // The focus card is the selection — no selection/lineage ring on it.
@@ -815,7 +815,7 @@ pub fn update_reading_card(
             }
         }
         None => {
-            if let Some(mat) = materials.get_mut(&mat_node.0) {
+            if let Some(mut mat) = materials.get_mut(&mat_node.0) {
                 mat.accent = Vec4::ZERO; // blank plate
                 mat.border = Vec4::ZERO; // no frame around nothing
             }

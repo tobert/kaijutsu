@@ -1467,7 +1467,7 @@ pub fn resize_block_textures(
             max_dim,
             &mut images,
         );
-        if resized && let Some(mat) = fx_materials.get_mut(&mat_node.0) {
+        if resized && let Some(mut mat) = fx_materials.get_mut(&mat_node.0) {
             mat.texture = texture.image.clone();
         }
     }

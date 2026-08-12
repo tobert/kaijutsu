@@ -77,7 +77,7 @@ fn sync_block_fx(
 
     for (mat_node, border, label_metrics, is_chat_overlay, is_shell_dock, cursor_geom, rtt, excluded_state) in query.iter() {
         let is_overlay = is_chat_overlay || is_shell_dock;
-        let Some(mat) = fx_materials.get_mut(&mat_node.0) else {
+        let Some(mut mat) = fx_materials.get_mut(&mat_node.0) else {
             continue;
         };
 

@@ -747,7 +747,7 @@ pub fn sync_diff_cursor(
     theme: Res<Theme>,
 ) {
     for (mat_node, geom, rtt) in surfaces.iter() {
-        let Some(mat) = materials.get_mut(&mat_node.0) else {
+        let Some(mut mat) = materials.get_mut(&mat_node.0) else {
             continue;
         };
         let (cp, cc, sp, sc) = crate::shaders::cursor_selection_uniforms(

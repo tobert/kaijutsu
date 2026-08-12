@@ -12,6 +12,7 @@
 //! structure; the bright/blooming vocabulary stays reserved for live action).
 
 use bevy::prelude::*;
+use bevy::material::AlphaMode;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 

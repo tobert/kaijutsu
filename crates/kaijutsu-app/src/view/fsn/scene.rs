@@ -792,7 +792,7 @@ pub fn apply_fsn_lod(
         let h = heat.normalized(path);
         let gain = base_gain * sel_lift * (1.0 + h * HEAT_GAIN_LIFT);
         let hue = lerp_hue(palette.fsn_edge, palette.gold, h);
-        if let Some(mat) = mats.get_mut(&fe.wireframe_material) {
+        if let Some(mut mat) = mats.get_mut(&fe.wireframe_material) {
             let want = lin_scaled(hue, gain);
             if mat.base_color != want {
                 mat.base_color = want;
@@ -870,7 +870,7 @@ pub fn sync_ship_glow(
     let Ok(ship) = ships.single() else { return };
     let h = heat.normalized("/");
     let gain = palette.trim + (palette.crest - palette.trim) * h;
-    if let Some(mat) = mats.get_mut(&ship.material) {
+    if let Some(mut mat) = mats.get_mut(&ship.material) {
         let want = lin_scaled(palette.gold, gain);
         if mat.base_color != want {
             mat.base_color = want;

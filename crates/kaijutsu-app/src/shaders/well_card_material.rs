@@ -10,6 +10,7 @@
 //! `main::setup_camera`); animation reads `globals.time` directly.
 
 use bevy::prelude::*;
+use bevy::material::AlphaMode;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
