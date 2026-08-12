@@ -432,9 +432,10 @@ impl Tool for KjBuiltin {
                 ("Create isolated workspace", "kj fork --name debug-auth"),
                 ("Navigate to context", "kj context switch debug-auth"),
                 (
-                    "Stage finding for another context",
+                    "Send a finding to another context (delivered immediately)",
                     "kj drift push main \"auth tokens are stored in Redis\"",
                 ),
+                ("Batch instead of sending now", "kj drift push --stage main \"...\""),
                 ("Deliver all staged drifts", "kj drift flush"),
                 (
                     "LLM-distill another context's work",

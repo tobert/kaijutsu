@@ -111,6 +111,32 @@ B and D compose, and together they are probably the closest thing to what cc
 messaging *feels* like without adopting its spend model. That is an
 observation, not a recommendation.
 
+**A GLM review (2026-08-12) pushed back hard on deferring this at all, and the
+argument deserves to be on the record:** for the music case specifically, gap
+#2 *is* the problem, not a follow-on. Slices 1 and 3 make the plumbing work;
+until something wakes the receiver, material handed mid-piece sits unread
+until that player happens to take a turn — "the difference between an
+instrument and a message board". It also observed that shape B is closer to
+free than the doc implies: `deliver_drift` already runs the target's `drift`
+rc lifecycle on every delivery, `kj drive` already publishes
+`TurnFlow::Requested`, and the shipped `S40-cache.kai` already runs on
+arrival — so shape B is roughly "add an `S50-drive.kai` for musician
+contexts".
+
+One part of that review I checked and **disagree with**: it argued shape B
+inherits shape C's consent flaw because the rc lifecycle runs under the
+sender's `KjCaller`. The principal *is* the sender's (`lifecycle.rs:376`),
+but capabilities gate on `caller.context_id` (`kj/mod.rs:563-576`), and the
+rc shell is materialized against the **target** context (`lifecycle.rs:388`,
+`kj_builtin.rs:638`). So `kj drive` inside a drift rc script authorizes
+against the *target's* binding — the right direction for consent, and shape B
+does not inherit C's flaw.
+
+The real residue is narrower: blocks the script writes are attributed to the
+sender's principal, and `privileged` rides in from the sender's shell. That
+is an identity smear worth fixing before shape B ships, but it is not the
+consent hole it was reported as.
+
 ### 3. `push` and `pull` speak different address grammars
 
 Two resolvers, same noun:
@@ -235,12 +261,39 @@ a first bite at the "orchestration bloat" entry in `issues.md` — `pull`,
 `merge` and `flush` still inline their own copies and can migrate when next
 touched.
 
-**Slice 2 — stop the bleeding on the namespace.** Deregister (conclude) a
-`cc-*` context on `session.end`. This is the small half of gap #5 and does not
-need the `ContextRegistry` extraction: the hook already fires and currently
-only writes a text block. Pair it with a one-shot sweep for the 152 already
-resident. Concluding is reversible-ish and non-destructive — archived contexts
-keep their blocks; they just stop competing for the name.
+**Slice 2 — stop the bleeding on the namespace.** Deregister a `cc-*` context
+on `session.end`, and sweep the 152 already resident. The hook already fires
+and currently only writes a text block, so the trigger is free.
+
+**Corrected 2026-08-12 after a GLM review caught a load-bearing error here.**
+The first draft said "conclude on `session.end`" and claimed concluding frees
+the label. It does not:
+
+- `list_active_contexts` filters on `archived_at IS NULL` **only**
+  (`kernel_db.rs:2687`) — concluded contexts are still returned.
+- `conclude_context` sets `context_state`/`concluded_at` and never touches
+  `archived_at` (`kernel_db.rs:2500-2511`).
+- `DriftRouter::set_state` mutates the handle in place; the handle stays in
+  the `contexts` map, and `resolve_context` iterates all values with no state
+  filter (`drift.rs:334-336, 376-386`).
+
+So concluding leaves a context competing for its name on **both** resolution
+paths, and slice 2 as originally written would not have fixed the
+60-candidate ambiguity that motivated it. Conclude/archive were conflated.
+
+Three ways to actually fix it, and this is the real decision:
+
+- **Archive instead of conclude.** Works today with no kernel change —
+  `archived_at` is exactly what both resolvers filter on. But archive is the
+  "trash" state, not the "done" state, and it is a heavier claim to make
+  about a session that merely ended.
+- **Exclude concluded from resolution.** Change `list_active_contexts` and
+  `DriftRouter::resolve_context` to skip concluded contexts. Cleanest
+  semantically — a concluded context *is* done and should not compete for a
+  name — but it changes what `resolve_context` returns for **every** caller,
+  not just drift. That blast radius needs its own look.
+- **Unregister from the router only.** Fixes the in-memory path and leaves the
+  DB path broken. Half a fix; listed for completeness, not recommended.
 
 **Slice 3 — one address grammar. SHIPPED 2026-08-12 (`46878b28`).** `push`
 resolves through `refs::resolve_context_arg` like everything else, so `.`,
@@ -286,12 +339,14 @@ not scheduled.
 1. **Should an arriving drift be able to trigger a turn?** The four shapes are
    in gap #2 above. This is the one that touches the turn loop and the spend
    posture at once, so it is yours to rule on.
-2. **May a `session.end` hook conclude its context?** Slice 2 depends on it.
-   Concluding is non-destructive — blocks are kept, the label stops competing —
-   but it changes what a cc session leaves behind, and the original pipeline
-   left pileup unmanaged *deliberately* ("for observation", `0c06f51c`). Four
-   weeks of observation now say the cost is a 60-way ambiguous prefix. Asking
-   rather than assuming, because reversing that decision is yours.
+2. **How should a `session.end` hook retire its context — archive, or make
+   `concluded` stop competing for names?** Slice 2 depends on it, and the
+   question is sharper than the first draft had it (concluding alone changes
+   nothing; see slice 2). Archive works today with no kernel change but
+   overclaims — it is the trash state. Excluding concluded from resolution is
+   semantically right but changes `resolve_context` for every caller. Either
+   way it reverses the deliberate "unmanaged for observation" decision
+   (`0c06f51c`); four weeks of observation now cost a 60-way ambiguous prefix.
 3. **Do we sweep the 152 existing cc-\* contexts?** A one-shot conclude of
    everything with no activity in N days would restore the namespace
    immediately. Same non-destructive argument, larger blast radius, and it
