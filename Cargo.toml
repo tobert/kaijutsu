@@ -124,7 +124,6 @@ bevy_mesh = "0.18"
 kurbo = "0.13"
 
 # Text rendering
-cosmic-text = "0.16"   # pinned by Bevy 0.18
 pulldown-cmark = "0.13"
 
 # Diff engine (Apache-2.0) — the engine inside gitoxide and Helix. Histogram +
