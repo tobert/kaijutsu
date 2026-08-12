@@ -2255,6 +2255,27 @@ Remaining, in order:
   kernel change needed: `archived_at` is already what both resolvers filter
   on. Do **not** rename or suffix on archive; the label leaves the active set
   intact, which keeps it meaningful for the coming index.
+- **kaish latches are going away — approvals become ours, bespoke** (Amy,
+  2026-08-12: "the kaish latches are going away in the next release. we'll
+  rebuild approvals in kaijutsu bespoke, using some of kaish's new tools for
+  giving us visibility into a command"). This supersedes the earlier read that
+  our only kaish approval-surface exposure was a *change* to `LatchRequest` at
+  the 0.14 bump — it is a **removal**, so the work is ours either way.
+  Consumption points to replace: `LatchRequest` construction at
+  `mcp/servers/shell.rs:774` and the `structured.latch.nonce`/`.hint` batch
+  loop (`:462-464`), plus `.latch` reads in `runtime/kj_builtin.rs:456,752`.
+  Verbs that are latched today and therefore need the bespoke path before the
+  bump: `kj context archive` / `remove` / `retag`, `kj workspace remove`
+  (`workspace.rs:306`), `kj preset remove` (`preset.rs:283`).
+  Design note worth keeping from using it in anger during the sweep: the
+  current nonce is scoped to the **label**, not the id — confirming names what
+  it authorizes, and a batch keyed on ids fails loudly with "nonce scope
+  mismatch". Keep that property. Amy's steer is that kaish's new
+  command-visibility tools are the substrate, not a reimplementation of
+  latches.
+- **Sweep jobs for trash contexts — LATER, explicitly not now** (Amy,
+  2026-08-12: "we can add sweep jobs later to clean up trash contexts, but not
+  now"). The one-shot sweep ran; do not build recurring automation for it yet.
 - **MCP connections that never receive hook traffic mint a context that never
   stabilizes and never archives** (found 2026-08-12, during the sweep). The
   sweep took `cc-*` from 161 → 26 and the `cc-kaijutsu` prefix from 60 → 12.
@@ -2377,11 +2398,26 @@ key-value store demolished 2026-07-04.*
   are fine: they gate on `caller.context_id` (`kj/mod.rs:563-576`), which is
   the target, so authorization runs in the right direction (this is where a
   2026-08-12 GLM review was wrong, and the correction is recorded in
-  `drift-ux.md`). What is actually wrong is narrower: authorship of any block
-  the script writes, and `privileged` riding in from the sender's shell.
-  Harmless while the shipped `drift` rc script only clears prompt cache;
-  **must be fixed before shape B ships** an `S50-drive.kai`, because then the
-  sender's identity would be driving the target's turn.
+  `drift-ux.md`).
+
+  **Narrowed again 2026-08-12 — `privileged` is NOT smeared.** An earlier
+  revision of this entry (and two verbal relays) claimed `privileged` rode in
+  from the sender's shell. It does not:
+  `materialize_context_kaish_rc` passes `true` unconditionally
+  (`kj/context_shell.rs:71-91`), because privilege is a property of *being the
+  rc runner*, not of whoever triggered it — and `KjCaller::privileged`'s own
+  doc says it is "stamped at `KjBuiltin` construction by the rc runner —
+  **never** derived from a shell var" precisely to stop it being forgeable.
+
+  So the smear is exactly one field: **`principal_id`**. An rc script runs
+  under the principal of whoever *caused* the lifecycle to fire, so blocks it
+  writes into the target context are authored by a foreign principal.
+  Harmless while the shipped `drift` rc script only clears prompt cache.
+  **Must be resolved before shape B ships an `S50-drive.kai`**, because then a
+  whole driven turn is attributed to the context that requested it rather than
+  to the context that ran it. Note it is not self-evidently a bug — "caused by
+  X" is arguably true — so the fix is a decision about whose name belongs on
+  work done on someone else's behalf, not a mechanical correction.
 - **Drift edge metadata is inconsistent across delivery paths.** Immediate
   push stamps `drift_kind.to_string()` (`"push"`, `kj/drift.rs:335`); flush
   stamps `format!("{kind}#{staged_id}")` (`"push#1"`, `:629`). So
