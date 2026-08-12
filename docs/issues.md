@@ -6,6 +6,61 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Theme changes don't repaint existing conversation blocks (2026-08-12)
+
+`kj config set /etc/config/theme.toml` reaches the app live (ThemeReceived →
+`sync_block_fx` re-syncs material uniforms every frame), but MSDF *texture
+content* re-renders only when a surface's glyph version advances
+(`ExtractedMsdfBlockData.last_rendered` in `view/block_render.rs`). So
+knobs baked at raster time (`msdf_gamma_correction`, `msdf_stem_darkening`,
+glyph colors) leave already-rendered blocks stale until they re-render for
+some other reason. Material-side knobs (`text_glow_*`, borders) do apply
+live — the split is invisible from the theme file. The dock
+(repaints ~4×/s) updates instantly, which makes the conversation staleness
+look like a bug in the theme push. `docs/color.md` sells `kj config set` as a
+"live color-management console" — either bump every `MsdfBlockGlyphs.version`
+on ThemeReceived (cost: one full repaint per theme change, fine) or document
+the raster-time carve-out. Found while live-tuning gamma (2026-08-12).
+
+## `kj config show` output is not round-trippable, and a corrupt theme falls back silently (2026-08-12)
+
+Two contributing factors that compounded into an hour of phantom results:
+
+1. `kj config show <file>` prints a human header (`path:`, `length:`, blank
+   line, ` ```toml ` fence, closing fence). Piping it into `kj config set`
+   — the obvious sed-tweak idiom, which the shell happily accepts — embeds
+   the header into the stored file; each roundtrip nests another copy.
+   Wants a `--raw`/`--body` flag (or: `set` could refuse content whose first
+   line matches its own `show` header — it is never intentional).
+2. When the stored theme TOML fails to parse, the app falls back to
+   compiled-in defaults **silently** (no dock indicator, nothing in the
+   conversation). Every subsequent theme experiment silently tested the
+   defaults instead. Doctrine says crash > corruption; here at minimum the
+   parse error should surface loudly (drift notification / dock error glyph).
+   Repro: any `show | sed | set` roundtrip before (1) is fixed.
+
+## Dock RTT sizes skip physical-px rounding (2026-08-12, kaibo find)
+
+`render_north_dock`/`render_south_dock` stamp `rtt.built_width = logical.x`
+raw (`ui/dock.rs`), while block cells round via `round_to_physical_px`
+(`view/block_render.rs:1222`). At fractional DPI that makes
+`msdf_item_scale` a hair off exact, giving sub-pixel glyph drift on the
+dock. Cosmetic, pre-existing (found during the premultiplied-compositing
+review, deepseek job-1); fold into the tier-2 "unify RTT resize" cleanup.
+
+## text_glow wants a re-tune with Amy's eyes (2026-08-12, post-blend-fix)
+
+The violet text halo (`text_glow_radius = 2.5`, `#cbb8ff59`) now renders at
+its true designed strength — the straight-alpha compositing bug had been
+crushing it since birth, so its tuned values have never actually been seen
+on screen. At a 960×600 window it reads as fuzz (it was most of the "text
+looks fuzzy" report), with glow off the text is *crisp*; at 4k it may well be
+the intended synthwave neon. Decisions: strength/alpha, and whether a
+fixed-pixel radius should scale with font size / scale factor. Live CRDT
+currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
+
+---
+
 ## Summaries drift stronger than what they summarise (2026-08-11, three instances in one day)
 
 Not a code bug — a writing failure mode worth naming, because it cost real
@@ -2624,8 +2679,9 @@ key-value store demolished 2026-07-04.*
     sparkline surfaces moved off UI-node rectangles onto flat triangles in
     the block/dock texture (`build_sparkline_vertices`), with the true
     trapezoid fill; the rotated-segment and bar-tiled-fill code is deleted.
-    Block-cell sparklines still deserve one live look on the runner (dock
-    ones are BRP-verified).
+    Both surfaces live-verified 2026-08-12: dock via BRP + Amy's eyes
+    (flicker gone), block-cell via a ```sparkline fence in a test context
+    (renders correctly first try — likely its first-ever live render).
   - **Role divider label vertical centering + line thickness** —
     `fieldset::ROLE_LABEL_FONT_SIZE`/`ROLE_DIVIDER_THICKNESS` preserve the
     pre-shader Vello values exactly on paper; worth a glance since the

@@ -26,6 +26,7 @@ use crate::text::msdf::{
     FontDataMap, MsdfAtlas, MsdfBlockGeometry, MsdfBlockGlyphs, PositionedGlyph,
     collect_msdf_glyphs, geometry::GeometryVertex,
 };
+use crate::shaders::BlockFxMaterial;
 use crate::view::block_render::GpuTextureLimits;
 use crate::view::ui_rtt::{UiRttTexture, logical_size};
 
@@ -332,11 +333,19 @@ fn append_dock_sparkline(
 pub fn spawn_docks(
     mut commands: Commands,
     theme: Res<Theme>,
+    mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
     tiling_root: Query<Entity, With<super::tiling_reconciler::TilingRoot>>,
 ) {
     let Ok(root) = tiling_root.single() else {
         return;
     };
+
+    // Both docks composite their RTT texture through a default
+    // BlockFxMaterial (no border, no glow — a pure texture draw) rather than
+    // the ImageNode: the texture content is premultiplied, and only the
+    // material's pipeline declares that blend state. The ImageNode stays as
+    // the handle slot resize_rtt_texture repoints, tinted fully transparent
+    // so the UI image pipeline (straight-alpha) never draws it.
 
     // North dock — inserted at index 0 (before ContentArea). Carries
     // `MsdfBlockGeometry` for its two sparklines (flat triangles in the same
@@ -350,7 +359,8 @@ pub fn spawn_docks(
                 ..default()
             },
             BorderColor::all(theme.border),
-            ImageNode::default(),
+            ImageNode::default().with_color(Color::NONE),
+            MaterialNode(fx_materials.add(BlockFxMaterial::default())),
             MsdfBlockGlyphs::default(),
             MsdfBlockGeometry::default(),
             UiRttTexture::default(),
@@ -370,7 +380,8 @@ pub fn spawn_docks(
                 ..default()
             },
             BorderColor::all(theme.border),
-            ImageNode::default(),
+            ImageNode::default().with_color(Color::NONE),
+            MaterialNode(fx_materials.add(BlockFxMaterial::default())),
             MsdfBlockGlyphs::default(),
             UiRttTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
@@ -802,20 +813,26 @@ pub fn render_south_dock(
 /// sizes from `ComputedNode` (full-width bar) rather than measured content.
 pub fn resize_dock_textures(
     mut query: Query<
-        (&ComputedNode, &mut UiRttTexture, &mut ImageNode),
+        (
+            &ComputedNode,
+            &mut UiRttTexture,
+            &mut ImageNode,
+            &MaterialNode<BlockFxMaterial>,
+        ),
         Or<(With<NorthDock>, With<SouthDock>)>,
     >,
     text_metrics: Res<crate::text::TextMetrics>,
     gpu_limits: Res<GpuTextureLimits>,
     mut images: ResMut<Assets<Image>>,
+    mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     let scale = text_metrics.scale_factor;
     let max_dim = gpu_limits.max_texture_dim;
 
-    for (computed, mut texture, mut image_node) in query.iter_mut() {
+    for (computed, mut texture, mut image_node, mat_node) in query.iter_mut() {
         // ComputedNode is physical px; resize_rtt_texture expects logical.
         let size = logical_size(computed);
-        crate::view::ui_rtt::resize_rtt_texture(
+        let resized = crate::view::ui_rtt::resize_rtt_texture(
             &mut texture,
             &mut image_node,
             size.x,
@@ -824,6 +841,11 @@ pub fn resize_dock_textures(
             max_dim,
             &mut images,
         );
+        // The material draws the texture on screen (the ImageNode is a
+        // non-drawing handle slot) — repoint it at the fresh allocation.
+        if resized && let Some(mut mat) = fx_materials.get_mut(&mat_node.0) {
+            mat.texture = texture.image.clone();
+        }
     }
 }
 

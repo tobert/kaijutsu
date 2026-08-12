@@ -106,7 +106,10 @@ msdf_stem_darkening = 0.15
 msdf_horz_scale = 1.1
 msdf_vert_scale = 0.6
 msdf_text_bias = 0.5
-msdf_gamma_correction = 0.85
+# Tuned against correct premultiplied compositing (2026-08-12). The old 0.85
+# (<1 fattens fringes) compensated for a straight-alpha double-multiply bug
+# that darkened them; with that fixed, >1 tightens AA to perceptual coverage.
+msdf_gamma_correction = 1.6
 
 # Constellation view
 constellation_base_radius = 500.0

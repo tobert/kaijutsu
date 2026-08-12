@@ -132,7 +132,13 @@ pub fn msdf_surface_bundle(material: Handle<BlockFxMaterial>) -> impl Bundle {
         UiRttTexture::default(),
         MsdfBlockGlyphs::default(),
         BlockRenderMethod::Msdf,
-        ImageNode::default(),
+        // Fully-transparent tint: the ImageNode exists only as the handle
+        // slot resize_rtt_texture repoints — the BlockFxMaterial is the sole
+        // screen compositor for the texture. A visible tint here makes Bevy
+        // draw the texture a second time through the UI image pipeline
+        // (straight-alpha, wrong for our premultiplied content), doubling
+        // every glyph fringe into a dark halo.
+        ImageNode::default().with_color(Color::NONE),
         MaterialNode(material),
     )
 }

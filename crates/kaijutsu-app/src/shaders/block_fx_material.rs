@@ -5,8 +5,9 @@
 //! overlays, text halo, and cursor beam.
 
 use bevy::prelude::*;
-use bevy::render::render_resource::AsBindGroup;
+use bevy::render::render_resource::{AsBindGroup, BlendState, RenderPipelineDescriptor};
 use bevy::shader::ShaderRef;
+use bevy::ui_render::ui_material::UiMaterialKey;
 
 use super::selection::SelectionRects;
 
@@ -119,5 +120,20 @@ impl Default for BlockFxMaterial {
 impl UiMaterial for BlockFxMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/block_fx.wgsl".into()
+    }
+
+    fn specialize(descriptor: &mut RenderPipelineDescriptor, _key: UiMaterialKey<Self>) {
+        // The MSDF pass renders glyphs into the block texture with
+        // premultiplied alpha, and block_fx.wgsl keeps every composite
+        // (glow, border, cursor) premultiplied through to its return value.
+        // Bevy's stock UiMaterial pipeline blends with ALPHA_BLENDING
+        // (straight alpha, src_factor = SrcAlpha), which multiplies our
+        // already-premultiplied fringes by alpha a second time — a dark halo
+        // around every glyph. Declare the truth instead.
+        if let Some(fragment) = &mut descriptor.fragment
+            && let Some(Some(target)) = fragment.targets.first_mut()
+        {
+            target.blend = Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        }
     }
 }
