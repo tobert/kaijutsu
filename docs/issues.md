@@ -2191,13 +2191,39 @@ chase:
   (`main.rs:341-344`) — the saturated-color trick there is exactly what the
   fix changes.
 
-- **`parley` is duplicated: ours 0.7.0, `bevy_text`'s 0.9.0.** New with 0.19,
-  whose text stack moved onto parley. Harmless today — our shaping/MSDF path
-  never touches `bevy_text` — but it is two shaping engines and two font
-  databases in one binary, and it is the same single-copy hygiene we just
-  restored for rodio. Closing it means moving `crates/kaijutsu-app/Cargo.toml`
-  to `parley = "0.9"` and fixing whatever `text/shaping/` needs; check
-  `kurbo`/`peniko` move with it. `cargo tree -d` is the check.
+- ~~`parley` is duplicated~~ — **done**, we are on 0.9 alongside `bevy_text`
+  (Amy: "bump parley to match bevy and generally try to match bevy when we
+  can"). It left one thing behind, below.
+
+## parley 0.9 has no Japanese line-segmentation model (2026-08-12, from the parley bump)
+
+The app logs this on essentially every layout containing Japanese — **307
+times in a few minutes** on a normal session:
+
+```
+ICU4X data error: No segmentation model for language: ja
+```
+
+New with parley 0.9, which added `icu_normalizer`/`icu_properties`/
+`icu_segmenter` (0.7 had **zero** ICU dependencies). Parley already enables
+`icu_segmenter`'s `compiled_data`, so this is not a feature flag we forgot —
+the compiled set omits the dictionary/LSTM models for the languages that do
+not use spaces (ja, and presumably zh/th/km/lo/my), and parley exposes no
+feature to add them.
+
+Two costs, in order:
+
+1. **Log spam**, which is the immediate one — it drowns the runner output we
+   read while testing.
+2. **Japanese line breaking falls back to non-dictionary rules.** No visible
+   damage today: the only standing Japanese is the 会術 title, which is short
+   and never wraps. It would start to matter for wrapped Japanese body text —
+   which is not hypothetical here, since Amy writes Japanese in the app.
+
+Nothing is broken, so this is not urgent. Options when it is worth doing:
+silence the log at our end (cheapest, treats the symptom), pull the ICU4X
+segmentation data in ourselves, or raise it upstream with parley — the
+honest fix, since any parley user rendering CJK hits this.
 
 ## Test leaks a pidfile into `/tmp` (2026-08-12, via kaish's /tmp audit)
 

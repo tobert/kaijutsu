@@ -963,8 +963,11 @@ pub fn build_block_scenes(
                             let m = line.metrics();
                             crate::text::diff::PreviewRow {
                                 text_offset: line.text_range().start,
-                                top: m.min_coord,
-                                bottom: m.max_coord,
+                                // parley 0.9 split min/max_coord per axis. 0.7's
+                                // pair was documented as the line's top/bottom,
+                                // i.e. the block axis — not the inline one.
+                                top: m.block_min_coord,
+                                bottom: m.block_max_coord,
                             }
                         })
                         .collect();

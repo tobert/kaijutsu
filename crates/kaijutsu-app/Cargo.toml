@@ -61,7 +61,7 @@ bevy_tweening = "0.16"
 # 2026-08-12, docs/issues.md — the dock chrome was its last consumer);
 # `kurbo`/`peniko` stay as direct dependencies since Parley's own types
 # (`Brush`, transforms) are drawn from them.
-parley = "0.7.0"
+parley = "0.9.0"
 kurbo = "0.13.0"
 peniko = "0.6.0"
 pulldown-cmark.workspace = true

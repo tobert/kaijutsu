@@ -10,8 +10,10 @@ use std::borrow::Cow;
 
 use bevy::{prelude::*, reflect::TypePath};
 use parley::{
-    FontSettings, FontStyle, FontVariation, Layout, RangedBuilder, StyleProperty,
+    FontFamily, FontFamilyName, FontStyle, FontVariation, FontVariations, Layout, RangedBuilder,
+    StyleProperty,
 };
+use parley::setting::Tag;
 use peniko::Brush;
 
 use super::context::{LOCAL_FONT_CONTEXT, LOCAL_LAYOUT_CONTEXT, get_global_font_context};
@@ -81,8 +83,11 @@ impl VelloFont {
                 apply_font_styles(&mut builder, style);
                 apply_variable_axes(&mut builder, &style.font_axes);
 
-                builder.push_default(StyleProperty::FontStack(parley::FontStack::Single(
-                    parley::FontFamily::Named(Cow::Owned(self.family_name.clone())),
+                // parley 0.9 renamed the pair: the old `FontStack` (a list of
+                // families) is now `FontFamily`, and the old `FontFamily` (one
+                // family) is now `FontFamilyName`. Same single-family meaning.
+                builder.push_default(StyleProperty::FontFamily(FontFamily::Single(
+                    FontFamilyName::Named(Cow::Owned(self.family_name.clone())),
                 )));
                 builder.push_default(StyleProperty::Brush(style.brush.clone()));
                 for span in spans {
@@ -97,11 +102,9 @@ impl VelloFont {
 
                 let mut layout = builder.build(value);
                 layout.break_all_lines(max_advance);
-                layout.align(
-                    max_advance,
-                    text_align.into(),
-                    parley::AlignmentOptions::default(),
-                );
+                // 0.9 drops `align`'s `max_advance`: it aligns against the width
+                // `break_all_lines` already laid the lines out to.
+                layout.align(text_align.into(), parley::AlignmentOptions::default());
                 layout
             })
         })
@@ -123,12 +126,14 @@ fn apply_font_styles(builder: &mut RangedBuilder<'_, Brush>, style: &VelloTextSt
 fn apply_variable_axes(builder: &mut RangedBuilder<'_, Brush>, axes: &VelloFontAxes) {
     let mut variable_axes: Vec<FontVariation> = vec![];
 
+    // 0.9 stopped re-exporting swash and owns its own settings types. Tags are
+    // the 4-ASCII-char OpenType axis names below, so a parse failure is a typo
+    // in this file, not runtime data — panic rather than silently drop an axis
+    // (the old `tag_from_str_lossy` could not fail and would have masked one).
     let mut push = |tag: &str, value: Option<f32>| {
         if let Some(value) = value {
-            variable_axes.push(parley::swash::Setting {
-                tag: parley::swash::tag_from_str_lossy(tag),
-                value,
-            });
+            let tag = Tag::parse(tag).expect("variable-axis tags are 4 ASCII chars");
+            variable_axes.push(FontVariation::new(tag, value));
         }
     };
     push("wght", axes.weight);
@@ -150,7 +155,7 @@ fn apply_variable_axes(builder: &mut RangedBuilder<'_, Brush>, axes: &VelloFontA
         builder.push_default(StyleProperty::FontStyle(FontStyle::Oblique(axes.slant)));
     }
 
-    builder.push_default(StyleProperty::FontVariations(FontSettings::List(
+    builder.push_default(StyleProperty::FontVariations(FontVariations::List(
         variable_axes.into(),
     )));
 }
