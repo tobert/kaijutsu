@@ -2623,19 +2623,24 @@ key-value store demolished 2026-07-04.*
   `block_scene.scene_version` instead. Unify on bump-from-own; the planned
   Diff arm follows bump-from-own and must not copy the deviation.
 
-- **HUD sparklines flicker post-vello-removal** (2026-08-12, Amy at the
-  controls on moltar; "not a priority, maybe we need to do more serious
-  design work on those"). The top-right HUD sparkline graphs visibly
-  flicker. Two candidate contributing factors are already written down
-  elsewhere in this file and are worth checking before anything else:
-  (a) the **version-bump divergence** immediately below — the Sparkline arm
-  bumps `MsdfBlockGlyphs.version` from `block_scene.scene_version` rather
-  than its own previous, which is exactly the shape that re-renders every
-  frame something else changes; and (b) the **unvalidated segment-rotation
-  geometry** in the de-vello entry below, which was written without a
-  running app. Amy's framing is the important part though: the fix may not
-  be a bug fix at all — these graphs may want real design work rather than
-  repair, so decide what they should *be* before patching how they draw.
+- **Block-cell sparklines still render as UI-node children — migrate to the
+  triangle lane** (2026-08-12). The HUD flicker fix moved the *dock*
+  sparklines onto `text::sparkline::build_sparkline_vertices` →
+  `MsdfBlockGeometry` (flat triangles in the dock's own texture; the old
+  path despawned/respawned ~230 `Node` children per data tick *after*
+  `UiSystems::Layout`, so every rebuild rendered one frame of never-laid-out
+  children — neither of the two candidate factors previously suspected). The
+  block-cell sparkline arm (`view/block_render.rs` `Sparkline` match arm)
+  still spawns `spawn_rect_child`/`spawn_segment_child` children with the
+  bar-tiled fill approximation. Migrating it to `build_sparkline_vertices`
+  gets the true trapezoid fill, retires the rotated-segment + joint-patch
+  geometry, and — since the arm would then fill `MsdfBlockGeometry` and bump
+  like ABC/Diff — dissolves its half of the version-bump divergence entry
+  below. Block cells don't flicker the way the dock did (they rebuild on
+  content change, not on a 250ms timer), so this is unification, not a bug
+  fix. Bigger design question still open per Amy: what these HUD graphs
+  should *be* (data source, window, labels) — the DockSparkline
+  read-`/run` note above still stands.
 
 - **Conversation-view de-vello pass — needs a visual pass in the running
   app** (2026-07-30, `feat/devello`; a validation pass is planned

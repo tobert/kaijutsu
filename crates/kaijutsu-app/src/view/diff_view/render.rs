@@ -30,7 +30,7 @@ use crate::text::msdf::{
     collect_msdf_glyphs, collect_msdf_glyphs_styled,
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
+use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush, color_to_rgba8 as rgba8};
 use crate::ui::theme::Theme;
 use crate::view::block_render::BlockScene;
 use crate::view::components::OverlayCursorGeometry;
@@ -684,16 +684,6 @@ pub fn build_diff_surface(
     window.drawn = Some(cursor_key);
 }
 
-/// RGBA8 for the geometry vertex format.
-fn rgba8(color: Color) -> [u8; 4] {
-    let c = color.to_srgba();
-    [
-        (c.red.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.green.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
-    ]
-}
 
 /// The bottom strip: what you are reading, where you are, and — loudly — that
 /// the block has changed underneath you.

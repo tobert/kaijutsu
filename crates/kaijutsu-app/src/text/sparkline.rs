@@ -21,6 +21,8 @@ use bevy::prelude::Color;
 #[cfg(test)]
 use kurbo::{BezPath, Point};
 
+use crate::text::msdf::geometry::{GeometryVertex, rect_quad, stroke_line_quad};
+
 /// Parsed sparkline data from a fenced code block.
 #[derive(Clone, Debug)]
 pub struct SparklineData {
@@ -258,6 +260,96 @@ pub fn build_sparkline_geometry(
     }
 
     geometry
+}
+
+/// Build flat-colored triangle-list vertices for a sparkline, for surfaces
+/// that render through the MSDF pass's geometry lane (`MsdfBlockGeometry`)
+/// instead of spawning UI-node children. The North dock draws its two HUD
+/// sparklines this way, directly into the texture it already renders: the
+/// child-respawn path despawned/respawned ~230 `Node` entities per data tick
+/// *after* `UiSystems::Layout` had run, so every rebuild rendered one frame
+/// of never-laid-out (zero-size) children — the 4Hz HUD flicker.
+///
+/// Same visual contract as [`build_sparkline_geometry`] with one deliberate
+/// upgrade: the fill under each sample pair is the true linear-interpolation
+/// trapezoid (a convex quad — two triangles — trivial in a triangle lane),
+/// not the bar-tiled midpoint approximation that axis-aligned rectangle
+/// children forced.
+///
+/// Coordinates are block-local LOGICAL pixels (`GeometryVertex`'s contract —
+/// the render-world builder converts to physical NDC); `offset` shifts the
+/// whole sparkline. Colors are straight-alpha RGBA8 (`text::color_to_rgba8`),
+/// premultiplied later in the geometry fragment shader.
+///
+/// Emission order is fill trapezoids, then stroke segments, then joint
+/// patches — the geometry pass draws in order, so the stroke composites over
+/// the fill.
+pub fn build_sparkline_vertices(
+    data: &SparklineData,
+    width: f32,
+    height: f32,
+    padding: f32,
+    offset: (f32, f32),
+    line_color: [u8; 4],
+    fill_color: Option<[u8; 4]>,
+) -> Vec<GeometryVertex> {
+    let n = data.values.len();
+    let mut vertices = Vec::new();
+    if n == 0 {
+        return vertices;
+    }
+
+    let (ox, oy) = (offset.0 as f64, offset.1 as f64);
+    let stroke = SPARKLINE_STROKE_WIDTH as f64;
+
+    if n == 1 {
+        // Single value: a short flat dash centered in the block, matching
+        // `build_sparkline_geometry`'s single-point case. No fill — one
+        // sample spans no area.
+        let draw_width = (width as f64 - 2.0 * padding as f64).max(1.0);
+        let dash = 4.0_f64.min(draw_width / 2.0);
+        let cx = ox + width as f64 * 0.5;
+        let cy = oy + padding as f64 + (height as f64 - 2.0 * padding as f64).max(1.0) * 0.5;
+        vertices.extend(stroke_line_quad(cx - dash, cy, cx + dash, cy, stroke, line_color));
+        return vertices;
+    }
+
+    let points = sparkline_points(data, width as f64, height as f64, padding as f64);
+    let bottom = oy + padding as f64 + (height as f64 - 2.0 * padding as f64).max(1.0);
+
+    if let Some(fill) = fill_color {
+        for pair in points.windows(2) {
+            let (x0, y0) = (ox + pair[0].0, oy + pair[0].1);
+            let (x1, y1) = (ox + pair[1].0, oy + pair[1].1);
+            let p0 = GeometryVertex { x: x0 as f32, y: y0 as f32, color: fill };
+            let p1 = GeometryVertex { x: x1 as f32, y: y1 as f32, color: fill };
+            let b1 = GeometryVertex { x: x1 as f32, y: bottom.max(y1) as f32, color: fill };
+            let b0 = GeometryVertex { x: x0 as f32, y: bottom.max(y0) as f32, color: fill };
+            vertices.extend([p0, p1, b1, p0, b1, b0]);
+        }
+    }
+
+    for pair in points.windows(2) {
+        let (x0, y0) = (ox + pair[0].0, oy + pair[0].1);
+        let (x1, y1) = (ox + pair[1].0, oy + pair[1].1);
+        vertices.extend(stroke_line_quad(x0, y0, x1, y1, stroke, line_color));
+    }
+
+    // Small squares plugging the notch butt-capped segments leave at each
+    // interior direction change (endpoints need none) — the triangle-lane
+    // sibling of `build_sparkline_geometry`'s joint rects.
+    for &(x, y) in &points[1..n - 1] {
+        let half = stroke * 0.5;
+        vertices.extend(rect_quad(
+            ox + x - half,
+            oy + y - half,
+            stroke,
+            stroke,
+            line_color,
+        ));
+    }
+
+    vertices
 }
 
 /// Computed paths ready for SVG export (golden regression tests only — see
@@ -731,6 +823,140 @@ mod tests {
                 (a.x + a.width - b.x).abs() < 1e-4,
                 "gap/overlap between fill bars: {a:?} then {b:?}"
             );
+        }
+    }
+
+    // -- build_sparkline_vertices: triangle-lane sparkline --
+
+    const LINE: [u8; 4] = [10, 20, 30, 255];
+    const FILL: [u8; 4] = [10, 20, 30, 38];
+
+    #[test]
+    fn vertices_empty_data_yields_nothing() {
+        let data = SparklineData { values: vec![], label: None };
+        let v = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn vertices_single_value_is_one_dash_quad_no_fill() {
+        let data = SparklineData { values: vec![42.0], label: None };
+        let v = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
+        assert_eq!(v.len(), 6, "one quad = two triangles");
+        assert!(v.iter().all(|vx| vx.color == LINE), "a lone sample has no fill area");
+        // Dash is horizontal and centered: endpoints recover cx ± dash.
+        let cx = (v[0].x + v[4].x) / 2.0;
+        assert!((cx - 40.0).abs() < 1e-3, "dash centered at width/2, got {cx}");
+    }
+
+    /// n samples: (n-1) fill trapezoids + (n-1) stroke quads + (n-2) joint
+    /// squares, 6 vertices each; dropping the fill color drops exactly the
+    /// fill lane.
+    #[test]
+    fn vertices_counts_per_lane() {
+        let data = SparklineData {
+            values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
+            label: None,
+        };
+        let with_fill =
+            build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
+        assert_eq!(with_fill.len(), 6 * (4 + 4 + 3));
+        assert_eq!(with_fill.iter().filter(|v| v.color == FILL).count(), 6 * 4);
+        assert_eq!(with_fill.iter().filter(|v| v.color == LINE).count(), 6 * (4 + 3));
+
+        let no_fill = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, None);
+        assert_eq!(no_fill.len(), 6 * (4 + 3));
+        assert!(no_fill.iter().all(|v| v.color == LINE));
+    }
+
+    /// The stroke lane must land exactly on the shared normalized points:
+    /// `stroke_line_quad` emits `[a, b, d, b, c, d]` where `(a+d)/2` is the
+    /// segment start and `(b+c)/2` its end.
+    #[test]
+    fn vertices_stroke_quads_recover_data_points() {
+        let data = SparklineData {
+            values: vec![2.0, 9.0, 3.0],
+            label: None,
+        };
+        let (w, h, pad) = (80.0_f32, 20.0_f32, 2.0_f32);
+        let v = build_sparkline_vertices(&data, w, h, pad, (0.0, 0.0), LINE, None);
+        let points = sparkline_points(&data, w as f64, h as f64, pad as f64);
+
+        for i in 0..data.values.len() - 1 {
+            let quad = &v[i * 6..i * 6 + 6];
+            let start = (
+                (quad[0].x + quad[2].x) / 2.0,
+                (quad[0].y + quad[2].y) / 2.0,
+            );
+            let end = (
+                (quad[1].x + quad[4].x) / 2.0,
+                (quad[1].y + quad[4].y) / 2.0,
+            );
+            assert!((start.0 - points[i].0 as f32).abs() < 1e-2, "segment {i} start x");
+            assert!((start.1 - points[i].1 as f32).abs() < 1e-2, "segment {i} start y");
+            assert!((end.0 - points[i + 1].0 as f32).abs() < 1e-2, "segment {i} end x");
+            assert!((end.1 - points[i + 1].1 as f32).abs() < 1e-2, "segment {i} end y");
+        }
+    }
+
+    /// Fill trapezoids hang the true interpolated top edge (the data points
+    /// themselves, not the bar-tiled midpoint) down to the baseline, and tile
+    /// left-to-right without gaps.
+    #[test]
+    fn vertices_fill_trapezoids_span_points_to_baseline() {
+        let data = SparklineData {
+            values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
+            label: None,
+        };
+        let (w, h, pad) = (80.0_f32, 20.0_f32, 2.0_f32);
+        let v = build_sparkline_vertices(&data, w, h, pad, (0.0, 0.0), LINE, Some(FILL));
+        let points = sparkline_points(&data, w as f64, h as f64, pad as f64);
+        let bottom = pad + (h - 2.0 * pad).max(1.0);
+
+        for i in 0..data.values.len() - 1 {
+            // Emission order per trapezoid: [p0, p1, b1, p0, b1, b0].
+            let quad = &v[i * 6..i * 6 + 6];
+            assert!((quad[0].x - points[i].0 as f32).abs() < 1e-3);
+            assert!((quad[0].y - points[i].1 as f32).abs() < 1e-3, "top edge is the data point");
+            assert!((quad[1].x - points[i + 1].0 as f32).abs() < 1e-3);
+            assert!((quad[1].y - points[i + 1].1 as f32).abs() < 1e-3);
+            assert!((quad[2].y - bottom).abs() < 1e-3, "hangs to the baseline");
+            assert!((quad[5].y - bottom).abs() < 1e-3);
+            assert!((quad[5].x - quad[0].x).abs() < 1e-3, "b0 under p0");
+        }
+    }
+
+    #[test]
+    fn vertices_offset_shifts_everything() {
+        let data = SparklineData {
+            values: vec![1.0, 3.0, 7.0, 2.0],
+            label: None,
+        };
+        let base = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
+        let moved =
+            build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (100.0, 8.0), LINE, Some(FILL));
+        assert_eq!(base.len(), moved.len());
+        for (b, m) in base.iter().zip(&moved) {
+            assert!((m.x - b.x - 100.0).abs() < 1e-3);
+            assert!((m.y - b.y - 8.0).abs() < 1e-3);
+            assert_eq!(b.color, m.color);
+        }
+    }
+
+    /// Degenerate inputs (flat series, single sample, negative flats) must
+    /// produce finite coordinates — mirrors
+    /// `sparkline_geometry_is_finite_for_degenerate_inputs` for this lane.
+    #[test]
+    fn vertices_finite_for_degenerate_inputs() {
+        for values in [vec![5.0, 5.0, 5.0], vec![0.0], vec![-3.0, -3.0]] {
+            let data = SparklineData { values, label: None };
+            let v = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
+            for vx in &v {
+                assert!(
+                    vx.x.is_finite() && vx.y.is_finite(),
+                    "non-finite vertex from degenerate input: {vx:?}"
+                );
+            }
         }
     }
 

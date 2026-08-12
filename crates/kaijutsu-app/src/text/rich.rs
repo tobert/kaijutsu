@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use kaijutsu_types::{ContentType, OutputData, OutputEntryType};
 
-use super::components::bevy_color_to_brush;
+use super::components::{bevy_color_to_brush, color_to_rgba8 as rgba8};
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
 use super::sparkline::{
     SparklineData, try_parse_sparkline,
@@ -311,16 +311,6 @@ pub fn diff_band_colors(theme: &crate::ui::theme::Theme) -> super::diff::DiffBan
     }
 }
 
-/// RGBA8 for the geometry vertex format.
-fn rgba8(color: Color) -> [u8; 4] {
-    let c = color.to_srgba();
-    [
-        (c.red.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.green.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
-    ]
-}
 
 /// The background washes behind *changed words*, resolved from the theme.
 ///

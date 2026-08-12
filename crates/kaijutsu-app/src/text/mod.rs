@@ -22,7 +22,7 @@ pub mod shaping;
 pub mod sparkline;
 pub mod svg_raster;
 
-pub use components::{KjTextEffects, bevy_color_to_brush};
+pub use components::{KjTextEffects, bevy_color_to_brush, color_to_rgba8};
 pub use plugin::KjTextPlugin;
 pub use resources::{ShapingFonts, SvgFontDb, TextMetrics};
 pub use rich::RichContent;

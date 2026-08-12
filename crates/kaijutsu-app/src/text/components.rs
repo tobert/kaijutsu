@@ -27,6 +27,20 @@ pub fn bevy_color_to_brush(color: Color) -> peniko::Brush {
     ))
 }
 
+/// Convert a Bevy `Color` to straight-alpha RGBA8 — the flat-geometry vertex
+/// format (`text::msdf::geometry::GeometryVertex::color`, premultiplied later
+/// in the geometry fragment shader). Component-wise truncating conversion,
+/// shared so every geometry producer agrees bit-for-bit.
+pub fn color_to_rgba8(color: Color) -> [u8; 4] {
+    let c = color.to_srgba();
+    [
+        (c.red.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.green.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
+    ]
+}
+
 /// Build a scrolling rainbow gradient brush.
 ///
 /// The rainbow flows spatially through the text: each character's color

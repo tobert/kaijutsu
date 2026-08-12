@@ -5,31 +5,35 @@
 //! role headers use — `view::block_render::{extract_msdf_blocks,
 //! render_msdf_block_textures}` — since neither is gated on `BlockCell`).
 //! Text collects glyphs into `MsdfBlockGlyphs`; the North dock's two
-//! sparklines are plain Bevy UI rectangle children (`text::sparkline`, same
-//! plain-geometry approach as a block cell's sparkline arm), not scene
-//! content.
+//! sparklines are flat-colored triangles in `MsdfBlockGeometry`
+//! (`text::sparkline::build_sparkline_vertices`), drawn into the same dock
+//! texture — they used to be per-piece UI-node children, which respawned
+//! after layout on every data tick and blanked for a frame (the HUD
+//! flicker).
 //!
 //! `DockState` resource holds all widget data. Data-gathering systems write to
 //! `DockState` fields; render systems read `DockState` + `ComputedNode` and
-//! rebuild the glyph buffer (+ respawn sparkline children) each frame the
-//! data changes.
+//! rebuild the glyph + geometry buffers each frame the data changes — both
+//! ride `MsdfBlockGlyphs.version` (fill both, bump once; see
+//! `MsdfBlockGeometry`'s doc comment).
 
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
-use crate::view::block_render::{
-    ContentGeometryChildren, GpuTextureLimits, clear_content_geometry_children,
-    spawn_rect_child, spawn_segment_child,
+use crate::text::color_to_rgba8;
+use crate::text::msdf::{
+    FontDataMap, MsdfAtlas, MsdfBlockGeometry, MsdfBlockGlyphs, PositionedGlyph,
+    collect_msdf_glyphs, geometry::GeometryVertex,
 };
+use crate::view::block_render::GpuTextureLimits;
 use crate::view::ui_rtt::{UiRttTexture, logical_size};
 
 use crate::cell::ContextSwitchRequested;
 use crate::connection::RpcConnectionState;
 use crate::connection::actor_plugin::ServerEventMessage;
 use crate::input::FocusArea;
-use crate::text::sparkline::{SPARKLINE_STROKE_WIDTH, SparklineData, build_sparkline_geometry};
+use crate::text::sparkline::{SparklineData, build_sparkline_vertices};
 
 /// A dock sparkline — ring-buffer time series with fixed capacity.
 #[derive(Clone, Debug)]
@@ -294,17 +298,13 @@ fn measure_text_or_heuristic(text: &str, font_size: f32, font: Option<&VelloFont
     }
 }
 
-/// Spawn a dock sparkline at `(x, y)` as plain Bevy UI rectangle children —
-/// fill bars, stroke segments, interior joints — appending the spawned
-/// entities to `spawned` so the caller can track them in a
-/// [`ContentGeometryChildren`]. Same plain-geometry approach as a block
-/// cell's sparkline arm (`view::block_render::build_block_scenes`,
-/// `text::sparkline`): no vello, no shader, just literal rectangles Bevy's
-/// own UI rasterizer draws.
-fn spawn_dock_sparkline(
-    commands: &mut Commands,
-    parent: Entity,
-    spawned: &mut Vec<Entity>,
+/// Append a dock sparkline at `(x, y)` as flat-colored triangles — drawn into
+/// the dock's own MSDF texture via `MsdfBlockGeometry`, in the same rebuild
+/// that collects the dock's glyphs, so the sparkline updates atomically with
+/// the text around it (no child entities, no layout round-trip, no
+/// one-frame blank).
+fn append_dock_sparkline(
+    vertices: &mut Vec<GeometryVertex>,
     data: &SparklineData,
     width: f64,
     height: f64,
@@ -313,38 +313,15 @@ fn spawn_dock_sparkline(
     line_color: Color,
     fill_alpha: f32,
 ) {
-    let geometry = build_sparkline_geometry(data, width as f32, height as f32, 2.0);
-    let offset = (x as f32, y as f32);
-    let fill_color = line_color.with_alpha(fill_alpha);
-
-    for bar in &geometry.fill_bars {
-        spawned.push(spawn_rect_child(
-            commands,
-            parent,
-            (bar.x, bar.y, bar.width, bar.height),
-            offset,
-            fill_color,
-        ));
-    }
-    for segment in &geometry.segments {
-        spawned.push(spawn_segment_child(
-            commands,
-            parent,
-            segment,
-            SPARKLINE_STROKE_WIDTH,
-            offset,
-            line_color,
-        ));
-    }
-    for joint in &geometry.joints {
-        spawned.push(spawn_rect_child(
-            commands,
-            parent,
-            (joint.x, joint.y, joint.width, joint.height),
-            offset,
-            line_color,
-        ));
-    }
+    vertices.extend(build_sparkline_vertices(
+        data,
+        width as f32,
+        height as f32,
+        2.0,
+        (x as f32, y as f32),
+        color_to_rgba8(line_color),
+        Some(color_to_rgba8(line_color.with_alpha(fill_alpha))),
+    ));
 }
 
 // ============================================================================
@@ -361,7 +338,9 @@ pub fn spawn_docks(
         return;
     };
 
-    // North dock — inserted at index 0 (before ContentArea)
+    // North dock — inserted at index 0 (before ContentArea). Carries
+    // `MsdfBlockGeometry` for its two sparklines (flat triangles in the same
+    // texture as the glyphs); the South dock is text-only and doesn't.
     let north = commands
         .spawn((
             NorthDock,
@@ -373,6 +352,7 @@ pub fn spawn_docks(
             BorderColor::all(theme.border),
             ImageNode::default(),
             MsdfBlockGlyphs::default(),
+            MsdfBlockGeometry::default(),
             UiRttTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
@@ -405,26 +385,23 @@ pub fn spawn_docks(
 
 /// Render the North dock scene: title (left), pulse + connection (right).
 pub fn render_north_dock(
-    mut commands: Commands,
     dock_state: Res<DockState>,
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     mut query: Query<
         (
-            Entity,
             &mut MsdfBlockGlyphs,
+            &mut MsdfBlockGeometry,
             &mut UiRttTexture,
             &ComputedNode,
-            Option<&ContentGeometryChildren>,
         ),
         With<NorthDock>,
     >,
     mut atlas: Option<ResMut<MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
 ) {
-    let Ok((entity, mut msdf_glyphs, mut rtt, computed, existing_children)) = query.single_mut()
-    else {
+    let Ok((mut msdf_glyphs, mut msdf_geometry, mut rtt, computed)) = query.single_mut() else {
         return;
     };
 
@@ -445,10 +422,8 @@ pub fn render_north_dock(
         return;
     };
 
-    clear_content_geometry_children(&mut commands, entity, existing_children);
-
     let mut glyphs: Vec<PositionedGlyph> = Vec::new();
-    let mut spawned: Vec<Entity> = Vec::new();
+    let mut geometry: Vec<GeometryVertex> = Vec::new();
     let width = logical_width as f64;
 
     // Insets: 16px horizontal, 6px vertical
@@ -513,10 +488,8 @@ pub fn render_north_dock(
 
     // Draw sparklines
     let spark_y = (36.0 - spark_h) / 2.0; // vertically center in 36px dock
-    spawn_dock_sparkline(
-        &mut commands,
-        entity,
-        &mut spawned,
+    append_dock_sparkline(
+        &mut geometry,
         &dock_state.event_spark.data,
         spark_w,
         spark_h,
@@ -526,10 +499,8 @@ pub fn render_north_dock(
         0.15,
     );
     if !dock_state.detached {
-        spawn_dock_sparkline(
-            &mut commands,
-            entity,
-            &mut spawned,
+        append_dock_sparkline(
+            &mut geometry,
             &dock_state.activity_spark.data,
             spark_w,
             spark_h,
@@ -582,10 +553,9 @@ pub fn render_north_dock(
         &mut font_data_map,
     );
 
-    if !spawned.is_empty() {
-        commands.entity(entity).insert(ContentGeometryChildren(spawned));
-    }
-
+    // Fill both, bump once: sparkline triangles ride the glyph version (see
+    // `MsdfBlockGeometry`'s doc comment for why it has no counter of its own).
+    msdf_geometry.vertices = geometry;
     msdf_glyphs.glyphs = glyphs;
     msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1).max(1);
     let logical = logical_size(computed);
