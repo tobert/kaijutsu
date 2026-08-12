@@ -113,6 +113,22 @@ pub struct StagedDrift {
     /// Number of times this drift has been requeued after a delivery failure.
     /// Items exceeding [`MAX_DRIFT_RETRIES`] are dropped on requeue.
     pub retry_count: u32,
+    /// True while a flush has [`drain`](DriftRouter::drain)ed this item for
+    /// delivery but has not yet reported the outcome via
+    /// [`complete`](DriftRouter::complete) (success) or
+    /// [`requeue`](DriftRouter::requeue) (failure). The item stays physically
+    /// in `DriftRouter::staging` while checked out — only the flag flips —
+    /// so it remains visible to `queue()` and reachable by `cancel()` during
+    /// the async delivery window. Before this flag existed, `drain` removed
+    /// the item into the caller's local `Vec`, making it invisible to a
+    /// concurrent `cancel` until the flush finished; a cancelled-but-in-flight
+    /// item then survived `requeue` and came back on the next flush.
+    pub in_flight: bool,
+    /// Set by [`cancel`](DriftRouter::cancel) when the item was already
+    /// in flight. `requeue` consults this to drop the item instead of
+    /// restoring it — a cancel that lands mid-delivery must not be undone
+    /// by the delivery's own failure-handling.
+    pub cancelled: bool,
 }
 
 /// Maximum number of requeue attempts before a staged drift is discarded.
@@ -456,19 +472,37 @@ impl DriftRouter {
             drift_kind,
             created_at: kaijutsu_types::now_millis(),
             retry_count: 0,
+            in_flight: false,
+            cancelled: false,
         });
 
         Ok(id)
     }
 
     /// Cancel a staged drift by ID.
+    ///
+    /// Works whether the item is still waiting (removed outright, the
+    /// original behavior) or currently checked out by a flush's
+    /// [`drain`](Self::drain) (marked [`cancelled`](StagedDrift::cancelled)
+    /// instead — the item may already be mid-delivery, so `cancel` cannot
+    /// yank it out from under the in-flight I/O; it records the intent and
+    /// [`requeue`](Self::requeue) honors it if delivery fails).
     pub fn cancel(&mut self, staged_id: u64) -> bool {
-        let len_before = self.staging.len();
-        self.staging.retain(|s| s.id != staged_id);
-        self.staging.len() < len_before
+        let Some(pos) = self.staging.iter().position(|s| s.id == staged_id) else {
+            return false;
+        };
+        if self.staging[pos].in_flight {
+            self.staging[pos].cancelled = true;
+        } else {
+            self.staging.remove(pos);
+        }
+        true
     }
 
-    /// View the staging queue.
+    /// View the staging queue — includes items currently checked out by a
+    /// flush ([`StagedDrift::in_flight`]), not just ones still waiting. A
+    /// player running `kj drift queue` mid-flush sees the whole picture
+    /// instead of the item silently vanishing until the flush resolves it.
     pub fn queue(&self) -> &[StagedDrift] {
         &self.staging
     }
@@ -478,31 +512,79 @@ impl DriftRouter {
     /// If `for_context` is `Some`, only drains items where the source or target
     /// matches the given context. Otherwise drains everything.
     ///
-    /// The caller is responsible for injecting blocks into target documents.
-    /// Failed items should be returned via [`requeue`](Self::requeue).
+    /// Unlike a true drain, matched items are **not removed** from
+    /// `staging` — they are marked [`in_flight`](StagedDrift::in_flight) and
+    /// a clone is returned to the caller. This keeps them visible to
+    /// `queue()` and reachable by `cancel()` for the duration of the async
+    /// delivery the caller is about to perform, and keeps an item that is
+    /// already checked out from being drained a second time by a concurrent
+    /// flush. The caller is responsible for injecting blocks into target
+    /// documents, then reporting the outcome back per item: success via
+    /// [`complete`](Self::complete), failure via [`requeue`](Self::requeue).
     #[tracing::instrument(skip(self), name = "drift.drain")]
     pub fn drain(&mut self, for_context: Option<ContextId>) -> Vec<StagedDrift> {
-        match for_context {
-            None => std::mem::take(&mut self.staging),
-            Some(ctx) => {
-                let (matched, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut self.staging)
-                    .into_iter()
-                    .partition(|s| s.source_ctx == ctx || s.target_ctx == ctx);
-                self.staging = remaining;
-                matched
+        let mut drained = Vec::new();
+        for item in self.staging.iter_mut() {
+            if item.in_flight {
+                continue;
+            }
+            let matches = match for_context {
+                None => true,
+                Some(ctx) => item.source_ctx == ctx || item.target_ctx == ctx,
+            };
+            if matches {
+                item.in_flight = true;
+                drained.push(item.clone());
             }
         }
+        drained
+    }
+
+    /// Report a [`drain`](Self::drain)ed item as successfully delivered.
+    ///
+    /// Clears its in-flight bookkeeping in `staging` — the counterpart to
+    /// `requeue` on the success path. Without this, a delivered item would
+    /// linger in `staging` forever, permanently marked in-flight.
+    pub fn complete(&mut self, staged_id: u64) {
+        self.staging.retain(|s| s.id != staged_id);
     }
 
     /// Re-queue staged drifts that failed to deliver.
     ///
-    /// Increments each item's `retry_count`. Items that have already been
-    /// requeued [`MAX_DRIFT_RETRIES`] times move to the dead letter queue
-    /// rather than accumulating indefinitely under persistent failure.
-    /// The flush engine writes dead letter items to "lost+found" so content
-    /// is never silently discarded.
+    /// `items` are the caller's [`drain`](Self::drain)ed copies. For each,
+    /// the router-side record in `staging` is authoritative for whether
+    /// `cancel` marked it cancelled while it was in flight — the caller's
+    /// copy predates that mutation. A cancelled item is dropped here rather
+    /// than restored or dead-lettered: the cancel already happened, and
+    /// pretending the retry machinery still owns it would resurrect
+    /// something a player explicitly cancelled.
+    ///
+    /// Surviving items have `retry_count` incremented. Items that have
+    /// already been requeued [`MAX_DRIFT_RETRIES`] times move to the dead
+    /// letter queue rather than accumulating indefinitely under persistent
+    /// failure. The flush engine writes dead letter items to "lost+found" so
+    /// content is never silently discarded.
     pub fn requeue(&mut self, items: Vec<StagedDrift>) {
         for mut item in items {
+            let Some(pos) = self.staging.iter().position(|s| s.id == item.id) else {
+                // Already gone from staging — e.g. `unregister` swept it to
+                // the dead letter queue directly while it was in flight.
+                // Nothing to restore; the item isn't lost, just already
+                // accounted for elsewhere.
+                continue;
+            };
+            let cancelled = self.staging[pos].cancelled;
+            self.staging.remove(pos);
+            if cancelled {
+                tracing::info!(
+                    drift_id = item.id,
+                    "dropping cancelled in-flight drift instead of requeuing"
+                );
+                continue;
+            }
+
+            item.in_flight = false;
+            item.cancelled = false;
             item.retry_count += 1;
             if item.retry_count > MAX_DRIFT_RETRIES {
                 tracing::warn!(
@@ -912,7 +994,13 @@ mod tests {
 
         let drained = router.drain(None);
         assert_eq!(drained.len(), 2);
-        assert!(router.queue().is_empty());
+        // OLD behavior encoded here was `queue().is_empty()` — drain used to
+        // physically remove items into the caller's Vec. It now marks them
+        // in-flight and leaves them visible in `staging` (see the in-flight
+        // cancel tests below for why: a concurrent `cancel`/`queue` during
+        // the delivery window must still see them).
+        assert_eq!(router.queue().len(), 2, "in-flight items stay visible");
+        assert!(router.queue().iter().all(|s| s.in_flight));
     }
 
     #[test]
@@ -1006,9 +1094,17 @@ mod tests {
         let drained = router.drain(Some(a));
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].source_ctx, a);
-        // c→b should remain
-        assert_eq!(router.queue().len(), 1);
-        assert_eq!(router.queue()[0].source_ctx, c);
+        // Both remain visible in queue() — a→b as in-flight (drain no
+        // longer removes it, only flags it), c→b untouched and still
+        // waiting. OLD behavior encoded here was `queue().len() == 1`
+        // (only c→b) because drain used to remove a→b outright.
+        assert_eq!(router.queue().len(), 2);
+        let waiting: Vec<_> = router.queue().iter().filter(|s| !s.in_flight).collect();
+        assert_eq!(waiting.len(), 1, "only c→b should still be waiting");
+        assert_eq!(waiting[0].source_ctx, c);
+        let in_flight: Vec<_> = router.queue().iter().filter(|s| s.in_flight).collect();
+        assert_eq!(in_flight.len(), 1, "a→b should be in-flight, not gone");
+        assert_eq!(in_flight[0].source_ctx, a);
     }
 
     #[test]
@@ -1204,7 +1300,11 @@ mod tests {
 
         let drained = router.drain(None);
         assert_eq!(drained.len(), 2);
-        assert!(router.queue().is_empty());
+        // OLD behavior encoded here was `queue().is_empty()` — see
+        // test_drain's comment; drain now flags in place instead of
+        // removing, so both items are still visible (in-flight) here.
+        assert_eq!(router.queue().len(), 2);
+        assert!(router.queue().iter().all(|s| s.in_flight));
 
         router.requeue(drained);
 
@@ -1461,5 +1561,129 @@ mod tests {
         // Original labels still work
         assert_eq!(router.resolve_context("alpha").unwrap(), a);
         assert_eq!(router.resolve_context("beta").unwrap(), b);
+    }
+
+    // ========================================================================
+    // In-flight cancel — the flush-blind-spot bug (docs/issues.md "Drift —
+    // June 2026 audit": drift_flush is non-atomic over the router lock).
+    //
+    // `drain` used to *remove* items from `staging` into the caller's local
+    // Vec, so a concurrent `cancel` during the async delivery window (block
+    // insert + rc lifecycle in `kj/drift.rs::drift_flush`) found nothing and
+    // reported false/"not staged" — the drift then survived to `requeue` and
+    // came back on the next flush despite having been cancelled. These tests
+    // drive the router directly, without any real concurrency, to prove the
+    // sequence deterministically: drain (simulating a flush checking an item
+    // out) → cancel (simulating a racing player) → requeue (simulating the
+    // delivery failing) must drop the cancelled item, not restore it.
+    // ========================================================================
+
+    #[test]
+    fn test_cancel_in_flight_drops_on_requeue() {
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+
+        let id1 = router
+            .stage(src, tgt, "one".into(), None, DriftKind::Push)
+            .unwrap();
+        let id2 = router
+            .stage(src, tgt, "two".into(), None, DriftKind::Push)
+            .unwrap();
+
+        // Simulate a flush checking both items out for delivery.
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 2);
+
+        // A concurrent `kj drift cancel` for id1 must succeed even though the
+        // item is mid-flight — this is exactly what the old `staging`-only
+        // search missed.
+        assert!(
+            router.cancel(id1),
+            "cancel must succeed for an item that is currently in flight"
+        );
+        // Cancelling something already checked out must not remove it from
+        // sight immediately (delivery may already be underway) — it should
+        // still show up as in-flight until the flush resolves it.
+        assert_eq!(router.queue().len(), 2, "cancel must not vanish the item early");
+
+        // Simulate the flush's delivery failing for both items (e.g. the
+        // target document was gone) and requeuing as `drift_flush` does.
+        router.requeue(drained);
+
+        // The cancelled item must NOT come back; the other one must.
+        let ids: Vec<_> = router.queue().iter().map(|s| s.id).collect();
+        assert!(!ids.contains(&id1), "cancelled item resurrected: {ids:?}");
+        assert!(ids.contains(&id2), "non-cancelled item lost: {ids:?}");
+        assert_eq!(router.queue().len(), 1);
+    }
+
+    #[test]
+    fn test_cancel_returns_true_and_queue_shows_in_flight_item() {
+        // A player running `kj drift queue` mid-flush must still see the
+        // item that's checked out — it hasn't vanished, it's in transit.
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        let id = router
+            .stage(src, tgt, "mid-flight".into(), None, DriftKind::Push)
+            .unwrap();
+
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 1);
+
+        let queued = router.queue();
+        assert_eq!(queued.len(), 1, "in-flight item vanished from queue()");
+        assert_eq!(queued[0].id, id);
+        assert!(
+            queued[0].in_flight,
+            "queue() should mark the item as in-flight"
+        );
+        assert!(!queued[0].cancelled);
+
+        // Drain a second time (e.g. a second flush call) must not re-grab an
+        // item that's already checked out — that would double-deliver it.
+        assert!(
+            router.drain(None).is_empty(),
+            "an in-flight item must not be drained twice"
+        );
+
+        router.requeue(drained);
+    }
+
+    #[test]
+    fn test_complete_removes_delivered_in_flight_item() {
+        // A successful delivery must clear the in-flight bookkeeping — it
+        // must not linger in queue() forever after the flush that delivered
+        // it.
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        let id = router
+            .stage(src, tgt, "delivered".into(), None, DriftKind::Push)
+            .unwrap();
+
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(router.queue().len(), 1, "still visible while in flight");
+
+        router.complete(id);
+
+        assert!(
+            router.queue().is_empty(),
+            "a delivered item must not linger in the queue"
+        );
+    }
+
+    #[test]
+    fn test_cancel_unknown_id_returns_false() {
+        let mut router = DriftRouter::new();
+        assert!(!router.cancel(999_999));
     }
 }

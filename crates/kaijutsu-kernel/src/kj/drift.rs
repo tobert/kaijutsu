@@ -612,6 +612,12 @@ impl KjDispatcher {
             ) {
                 Ok(_) => {
                     injected += 1;
+                    // Delivered — clear the in-flight bookkeeping `drain`
+                    // set so this item stops showing up in `queue()` and a
+                    // stray `cancel` on its id becomes a normal "not found"
+                    // instead of silently doing nothing. Lock is taken and
+                    // dropped here, never held across the `.await` below.
+                    self.drift_router().write().complete(drift.id);
 
                     // Record the drift edge in context_edges so `kj drift
                     // history` can find it. `drift_kind` and `source_model`
@@ -684,14 +690,20 @@ impl KjDispatcher {
         // sink BEFORE draining: if lost+found can't be created, the queue must
         // keep its items rather than have them drained into a context that does
         // not exist. Re-read the flag — the loop above can dead-letter more.
-        let has_dead = !self.drift_router().read().dead_letters().is_empty();
+        let dead_letter_count = self.drift_router().read().dead_letters().len();
+        let has_dead = dead_letter_count > 0;
         let mut dead_written = 0usize;
         let mut dead_retained = 0usize;
         if has_dead {
             let lf_id = match self.ensure_lost_found_context() {
                 Ok(id) => id,
                 Err(e) => {
-                    let retained = self.drift_router().read().dead_letters().len();
+                    // Nothing between the count above and here can have
+                    // touched dead_letter — ensure_lost_found_context only
+                    // creates/claims the sink context, it never drains the
+                    // queue — so the earlier count is still accurate; no
+                    // need to re-acquire the read lock just to re-read it.
+                    let retained = dead_letter_count;
                     tracing::error!("lost+found unavailable, {retained} dead letters retained: {e}");
                     return KjResult::Err(format!(
                         "kj drift flush: flushed {injected}/{count} drifts, but {retained} dead \

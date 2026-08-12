@@ -407,13 +407,25 @@ pub fn format_drift_queue(items: &[crate::drift::StagedDrift]) -> String {
         } else {
             item.content.clone()
         };
+        // In-flight: a flush has drained this item and is delivering it —
+        // still visible here rather than vanishing until the flush resolves
+        // it. Cancelled-while-in-flight is worth a distinct marker too: the
+        // delivery may still land, but requeue on failure will drop it.
+        let status = if item.cancelled {
+            " [cancelling]"
+        } else if item.in_flight {
+            " [in-flight]"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "#{:<3} {} → {}  {:?}  {}",
+            "#{:<3} {} → {}  {:?}  {}{}",
             item.id,
             item.source_ctx.short(),
             item.target_ctx.short(),
             item.drift_kind,
             preview,
+            status,
         ));
     }
     lines.join("\n")

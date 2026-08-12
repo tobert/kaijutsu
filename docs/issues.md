@@ -2350,16 +2350,28 @@ key-value store demolished 2026-07-04.*
   with the registry. (Considered 2026-06-13; deferred — it's a cohesive
   multi-file extraction touching drift.rs + rpc.rs + every "what contexts
   exist" caller, best done when the kernel isn't under concurrent edit.)
-- **`drift_flush` is non-atomic over the router lock:** takes the write
-  lock four separate times (`kj/drift.rs:422`, `:510`, `:516`, `:521`),
-  allowing interleaving with concurrent stage/cancel between windows.
-  Document why that's safe or restructure drain→requeue as one critical
-  section. (The suspected lock-across-await is NOT real — db lock at
-  `:455-471` drops before the `:487` await.)
 - **`kj/drift.rs` orchestration bloat:** push/pull/merge/flush each inline
   variations of "insert drift block + record edge + run rc lifecycle".
   Extract the shared operation; the command layer should dispatch, not
   orchestrate.
+- **Residual race: `unregister` vs. an in-flight delivery that then
+  succeeds.** Fixed 2026-08-12: `DriftRouter::drain` now marks items
+  `in_flight` in place (`drift.rs`) instead of removing them into the
+  caller's local `Vec`, so `cancel`/`queue` see them during a flush's async
+  delivery window and a cancelled item is dropped on `requeue` instead of
+  resurrected — see `drift.rs` module docs on `StagedDrift::in_flight` /
+  `DriftRouter::{drain,complete,requeue}`. One narrower race survives: if
+  `unregister(ctx)` runs *between* `drain` and the delivery's outcome, and
+  the target document write actually succeeds despite the context now being
+  unregistered, the item is both "delivered" (block landed before teardown)
+  and swept to `dead_letter` by `unregister`'s indiscriminate sweep over
+  `staging` (which doesn't check `in_flight`) — so it gets written into
+  lost+found too, looking like a failure that never happened. Needs
+  `unregister` to either skip in-flight items or have `complete`/`requeue`
+  check "was this context unregistered out from under me" before deciding
+  dead-letter vs. drop. Low priority: requires a context to be destroyed in
+  the exact window between drain and the block-store write during that
+  context's own outbound or inbound flush.
 ## Turn Loop (kaijutsu-server/src/llm_stream.rs) — June 2026 audit
 
 - **Decompose the agentic loop** (after FlowBus settles; they share event
