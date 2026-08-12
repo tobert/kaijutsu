@@ -17,10 +17,10 @@
 //!   `scene_geometry` datums (octagon shell, W-wall patch-wheel mount) they
 //!   have to agree on without eyeballing each other.
 //! - Styling: `scene_palette`.
-//! - Render plumbing: `vello_rasterizer`, `ui_rtt` (render-to-texture
-//!   sizing). Bevy Remote Protocol inspector glue lives in
-//!   `kaish::brp_methods` (kaish-adjacent: agents drive both over the same
-//!   protocol).
+//! - Render plumbing: `ui_rtt` (the generic render-to-texture primitive +
+//!   sizing helpers; no vello — retired 2026-08-12, docs/issues.md). Bevy
+//!   Remote Protocol inspector glue lives in `kaish::brp_methods`
+//!   (kaish-adjacent: agents drive both over the same protocol).
 //! - `components` — the component/resource types shared across the above.
 
 pub mod block_render;
@@ -45,7 +45,6 @@ pub mod submit;
 pub mod sync;
 pub mod time_well;
 pub mod tracker;
-pub mod vello_rasterizer;
 pub mod ui_rtt;
 
 // Re-export all public types

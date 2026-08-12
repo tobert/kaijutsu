@@ -18,6 +18,7 @@
 //! here, not something rasterized via vello).
 
 use bevy::prelude::Color;
+#[cfg(test)]
 use kurbo::{BezPath, Point};
 
 /// Parsed sparkline data from a fenced code block.
@@ -261,6 +262,7 @@ pub fn build_sparkline_geometry(
 
 /// Computed paths ready for SVG export (golden regression tests only — see
 /// module docs; production rendering uses `build_sparkline_geometry`).
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct SparklinePaths {
     pub line: BezPath,
@@ -269,7 +271,10 @@ pub struct SparklinePaths {
 
 /// Build a `kurbo::BezPath` pair (line + fill) from sparkline data, for the
 /// golden SVG regression tests. Not used by the live renderer — see module
-/// docs.
+/// docs. Dock chrome (`ui::dock`) was the last production caller before it
+/// moved onto `build_sparkline_geometry` (retiring vello, docs/issues.md,
+/// 2026-08-12); test-only since.
+#[cfg(test)]
 pub fn build_sparkline_paths(
     data: &SparklineData,
     width: f64,

@@ -1,15 +1,15 @@
 //! Text rendering plugin for Bevy using Parley + MSDF.
 //!
-//! MSDF handles text (plain, markdown, output, border/role-divider labels)
-//! and, together with `msdf::geometry`'s flat-colored triangles, ABC music
-//! notation. SVG is a CPU raster (`text::svg_raster`, resvg/tiny-skia) into a
-//! child `ImageNode`. Sparklines and the image placeholder are plain UI
-//! rectangle geometry (`text::sparkline`); block borders and the role-group
-//! divider are an SDF shader (`cell::block_border` + `shaders`). Vello
-//! itself is still a dependency — it's the Parley text SHAPING + `Brush`
-//! source behind `VelloFont`/`VelloTextStyle` below, and the dock chrome
-//! (`ui::dock`) still rasterizes through it — but nothing in this module's
-//! path touches it for rasterization any more.
+//! MSDF handles text (plain, markdown, output, border/role-divider labels,
+//! dock chrome) and, together with `msdf::geometry`'s flat-colored
+//! triangles, ABC music notation. SVG is a CPU raster (`text::svg_raster`,
+//! resvg/tiny-skia) into a child `ImageNode`. Sparklines and the image
+//! placeholder are plain UI rectangle geometry (`text::sparkline`); block
+//! borders and the role-group divider are an SDF shader
+//! (`cell::block_border` + `shaders`). No vello rasterization anywhere in
+//! the app any more (retired 2026-08-12, docs/issues.md) — `VelloFont`/
+//! `VelloTextStyle` below name Parley SHAPING types only, the `vello` crate
+//! itself is gone from `Cargo.toml`.
 
 use std::collections::HashSet;
 

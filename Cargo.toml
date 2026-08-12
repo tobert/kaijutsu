@@ -118,7 +118,9 @@ bevy_remote = "0.18"
 bevy_brp_extras = "0.19"
 bevy_mesh = "0.18"
 
-# Geometry primitives (transitive dep via vello — zero new compiled code)
+# Geometry primitives (used directly by kaijutsu-abc's engraving IR; also a
+# direct kaijutsu-app dependency, not a vello re-export — vello itself is
+# gone, retired 2026-08-12, docs/issues.md)
 kurbo = "0.13"
 
 # Text rendering

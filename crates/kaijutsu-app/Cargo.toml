@@ -51,10 +51,11 @@ bevy_remote.workspace = true
 bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }
 avian2d = "0.6"
 
-# Text rendering (Vello-based + MSDF): we own the rasterizer + shaping +
-# scene→texture primitive. ABC notation is the last conversation-view consumer
-# of vello (`text/abc.rs`) — SVG moved to the CPU resvg/tiny-skia stack below.
-vello = "0.7.0"
+# Text rendering (Parley shaping + MSDF): we own the shaping + MSDF glyph
+# atlas + scene→texture primitive. `vello` itself is GONE (retired
+# 2026-08-12, docs/issues.md — the dock chrome was its last consumer);
+# `kurbo`/`peniko` stay as direct dependencies since Parley's own types
+# (`Brush`, transforms) are drawn from them.
 parley = "0.7.0"
 kurbo = "0.13.0"
 peniko = "0.6.0"

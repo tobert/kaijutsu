@@ -158,7 +158,11 @@ pub struct ContentGeometryChildren(pub Vec<Entity>);
 /// Called unconditionally at the top of each rebuilt block cell — arms that
 /// draw geometry (sparkline, image placeholder) respawn fresh children right
 /// after; arms that don't just leave the component removed.
-fn clear_content_geometry_children(
+///
+/// `pub(crate)`: `ui::dock` reuses this + [`spawn_rect_child`]/
+/// [`spawn_segment_child`] for the North dock's sparklines — the same
+/// plain-rectangle-geometry approach, just outside a `BlockCell`.
+pub(crate) fn clear_content_geometry_children(
     commands: &mut Commands,
     entity: Entity,
     existing: Option<&ContentGeometryChildren>,
@@ -174,7 +178,7 @@ fn clear_content_geometry_children(
 
 /// Spawn one axis-aligned rectangle child (fill bar, joint dot, or a plain
 /// background panel) at `offset`-relative local content-space coordinates.
-fn spawn_rect_child(
+pub(crate) fn spawn_rect_child(
     commands: &mut Commands,
     parent: Entity,
     rect: (f32, f32, f32, f32), // x, y, width, height
@@ -203,7 +207,7 @@ fn spawn_rect_child(
 /// at `(segment.cx, segment.cy)` (local content space), `segment.length` px
 /// long, `thickness` px tall, rotated `segment.angle` radians about its own
 /// center via `UiTransform` (see the pivot note on `SparklineSegment::angle`).
-fn spawn_segment_child(
+pub(crate) fn spawn_segment_child(
     commands: &mut Commands,
     parent: Entity,
     segment: &SparklineSegment,
@@ -346,7 +350,6 @@ impl Plugin for BlockRenderPlugin {
                 Render,
                 render_msdf_block_textures
                     .in_set(RenderSystems::Render)
-                    .after(crate::view::ui_rtt::render_vello_scenes)
                     .run_if(|msdf: Res<ExtractedMsdfBlockData>| !msdf.items.is_empty()),
             );
     }

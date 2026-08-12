@@ -1,27 +1,35 @@
-//! Vello-drawn dock bars (North + South).
+//! MSDF-drawn dock bars (North + South) — no vello.
 //!
-//! Each dock is a single Bevy entity with `UiVectorScene` + `UiRttTexture` +
-//! `ImageNode` (the kaijutsu-owned vello→texture primitive). All text is drawn
-//! directly into the Vello scene — no child entities, no flex layout for widgets.
+//! Each dock is a single Bevy entity with `MsdfBlockGlyphs` + `UiRttTexture` +
+//! `ImageNode` (the same generic MSDF extract/render pass block cells and
+//! role headers use — `view::block_render::{extract_msdf_blocks,
+//! render_msdf_block_textures}` — since neither is gated on `BlockCell`).
+//! Text collects glyphs into `MsdfBlockGlyphs`; the North dock's two
+//! sparklines are plain Bevy UI rectangle children (`text::sparkline`, same
+//! plain-geometry approach as a block cell's sparkline arm), not scene
+//! content.
 //!
 //! `DockState` resource holds all widget data. Data-gathering systems write to
 //! `DockState` fields; render systems read `DockState` + `ComputedNode` and
-//! rebuild the Vello scene each frame the data changes.
+//! rebuild the glyph buffer (+ respawn sparkline children) each frame the
+//! data changes.
 
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::view::block_render::GpuTextureLimits;
-use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, logical_size};
-use kurbo::Affine;
-use peniko::Fill;
+use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
+use crate::view::block_render::{
+    ContentGeometryChildren, GpuTextureLimits, clear_content_geometry_children,
+    spawn_rect_child, spawn_segment_child,
+};
+use crate::view::ui_rtt::{UiRttTexture, logical_size};
 
 use crate::cell::ContextSwitchRequested;
 use crate::connection::RpcConnectionState;
 use crate::connection::actor_plugin::ServerEventMessage;
 use crate::input::FocusArea;
-use crate::text::sparkline::{SparklineColors, SparklineData, build_sparkline_paths};
+use crate::text::sparkline::{SPARKLINE_STROKE_WIDTH, SparklineData, build_sparkline_geometry};
 
 /// A dock sparkline — ring-buffer time series with fixed capacity.
 #[derive(Clone, Debug)]
@@ -198,20 +206,30 @@ pub struct NorthDock;
 pub struct SouthDock;
 
 // ============================================================================
-// TEXT DRAWING HELPERS
+// TEXT + SPARKLINE DRAWING HELPERS
 // ============================================================================
 
-/// Draw text into a Vello scene at (x, y) and return the advance width.
+/// Collect MSDF glyphs for one run of dock text at `(x, y)`, appending them
+/// into `glyphs`, and return the advance width — same signature/contract as
+/// the vello-drawing function this replaces, so every call site below reads
+/// unchanged.
 ///
-/// `y` is the top of the text area — baseline is offset by font metrics.
-fn draw_dock_text(
-    scene: &mut vello::Scene,
+/// `y` is the top of the text area; `collect_msdf_glyphs`'s offset does the
+/// same job the old `Affine::translate((x, y))` transform did, since a glyph
+/// run's own `offset()`/`baseline()` are already relative to that top-left
+/// origin. Single-color text — no span brushes, `brush` is the fallback for
+/// every glyph — same as a block cell's checkbox glyphs
+/// (`view::block_render::build_block_scenes`).
+fn collect_dock_text_glyphs(
+    glyphs: &mut Vec<PositionedGlyph>,
     text: &str,
     x: f64,
     y: f64,
     font_size: f32,
     font: &VelloFont,
     brush: &peniko::Brush,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
 ) -> f64 {
     if text.is_empty() {
         return 0.0;
@@ -221,48 +239,23 @@ fn draw_dock_text(
         font_size,
         ..default()
     };
-
     let layout = font.layout(text, &style, VelloTextAlign::Left, None);
-    let transform = Affine::translate((x, y));
 
     for line in layout.lines() {
         for item in line.items() {
-            let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                continue;
-            };
-            let mut gx = glyph_run.offset();
-            let gy = glyph_run.baseline();
-            let run = glyph_run.run();
-            let run_font = run.font();
-            let run_font_size = run.font_size();
-
-            scene
-                .draw_glyphs(run_font)
-                .brush(brush)
-                .hint(true)
-                .transform(transform)
-                .font_size(run_font_size)
-                .normalized_coords(run.normalized_coords())
-                .draw(
-                    Fill::NonZero,
-                    glyph_run.glyphs().map(|glyph| {
-                        let px = gx + glyph.x;
-                        let py = gy - glyph.y;
-                        gx += glyph.advance;
-                        vello::Glyph {
-                            id: glyph.id as _,
-                            x: px,
-                            y: py,
-                        }
-                    }),
-                );
+            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                font_data_map.register(gr.run().font());
+            }
         }
     }
+
+    glyphs.extend(collect_msdf_glyphs(&layout, &[], brush, (x, y), atlas));
 
     layout.width() as f64
 }
 
-/// Measure text width without drawing.
+/// Measure text width without drawing. Pure Parley shaping — no vello, no
+/// MSDF; unchanged by the dock's move off vello.
 fn measure_text(text: &str, font_size: f32, font: &VelloFont) -> f64 {
     if text.is_empty() {
         return 0.0;
@@ -289,11 +282,17 @@ fn measure_text_or_heuristic(text: &str, font_size: f32, font: Option<&VelloFont
     }
 }
 
-/// Draw a sparkline at (x, y) in a Vello scene.
-///
-/// Builds paths from `data` and strokes/fills with `line_color` and a fill at `fill_alpha`.
-fn draw_sparkline_at(
-    scene: &mut vello::Scene,
+/// Spawn a dock sparkline at `(x, y)` as plain Bevy UI rectangle children —
+/// fill bars, stroke segments, interior joints — appending the spawned
+/// entities to `spawned` so the caller can track them in a
+/// [`ContentGeometryChildren`]. Same plain-geometry approach as a block
+/// cell's sparkline arm (`view::block_render::build_block_scenes`,
+/// `text::sparkline`): no vello, no shader, just literal rectangles Bevy's
+/// own UI rasterizer draws.
+fn spawn_dock_sparkline(
+    commands: &mut Commands,
+    parent: Entity,
+    spawned: &mut Vec<Entity>,
     data: &SparklineData,
     width: f64,
     height: f64,
@@ -302,29 +301,38 @@ fn draw_sparkline_at(
     line_color: Color,
     fill_alpha: f32,
 ) {
-    use kurbo::{Cap, Join, Stroke};
+    let geometry = build_sparkline_geometry(data, width as f32, height as f32, 2.0);
+    let offset = (x as f32, y as f32);
+    let fill_color = line_color.with_alpha(fill_alpha);
 
-    let colors = SparklineColors {
-        line: line_color,
-        fill: Some(line_color.with_alpha(fill_alpha)),
-    };
-    let paths = build_sparkline_paths(data, width, height, 2.0);
-    let transform = Affine::translate((x, y));
-
-    let line_brush = bevy_color_to_brush(colors.line);
-    let stroke = Stroke {
-        width: 1.5,
-        join: Join::Round,
-        start_cap: Cap::Round,
-        end_cap: Cap::Round,
-        ..Default::default()
-    };
-
-    if let (Some(fill_path), Some(fill_color)) = (&paths.fill, &colors.fill) {
-        let fill_brush = bevy_color_to_brush(*fill_color);
-        scene.fill(Fill::NonZero, transform, &fill_brush, None, fill_path);
+    for bar in &geometry.fill_bars {
+        spawned.push(spawn_rect_child(
+            commands,
+            parent,
+            (bar.x, bar.y, bar.width, bar.height),
+            offset,
+            fill_color,
+        ));
     }
-    scene.stroke(&stroke, transform, &line_brush, None, &paths.line);
+    for segment in &geometry.segments {
+        spawned.push(spawn_segment_child(
+            commands,
+            parent,
+            segment,
+            SPARKLINE_STROKE_WIDTH,
+            offset,
+            line_color,
+        ));
+    }
+    for joint in &geometry.joints {
+        spawned.push(spawn_rect_child(
+            commands,
+            parent,
+            (joint.x, joint.y, joint.width, joint.height),
+            offset,
+            line_color,
+        ));
+    }
 }
 
 // ============================================================================
@@ -352,7 +360,7 @@ pub fn spawn_docks(
             },
             BorderColor::all(theme.border),
             ImageNode::default(),
-            UiVectorScene::default(),
+            MsdfBlockGlyphs::default(),
             UiRttTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
@@ -371,7 +379,7 @@ pub fn spawn_docks(
             },
             BorderColor::all(theme.border),
             ImageNode::default(),
-            UiVectorScene::default(),
+            MsdfBlockGlyphs::default(),
             UiRttTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
@@ -385,19 +393,32 @@ pub fn spawn_docks(
 
 /// Render the North dock scene: title (left), pulse + connection (right).
 pub fn render_north_dock(
+    mut commands: Commands,
     dock_state: Res<DockState>,
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&mut UiVectorScene, &mut UiRttTexture, &ComputedNode), With<NorthDock>>,
+    mut query: Query<
+        (
+            Entity,
+            &mut MsdfBlockGlyphs,
+            &mut UiRttTexture,
+            &ComputedNode,
+            Option<&ContentGeometryChildren>,
+        ),
+        With<NorthDock>,
+    >,
+    mut atlas: Option<ResMut<MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
 ) {
-    let Ok((mut scene_comp, mut rtt, computed)) = query.single_mut() else {
+    let Ok((entity, mut msdf_glyphs, mut rtt, computed, existing_children)) = query.single_mut()
+    else {
         return;
     };
 
     // Rebuild on data/theme change or when the dock changed width (right-aligned
-    // groups must reflow; a stale-width scene would otherwise stretch onto the
-    // resized texture).
+    // groups must reflow; a stale-width glyph layout would otherwise stretch
+    // onto the resized texture).
     // ComputedNode is physical px; the dock scene builds in logical.
     let logical_width = logical_size(computed).x;
     let width_changed = (rtt.built_width - logical_width).abs() > 0.5;
@@ -408,8 +429,14 @@ pub fn render_north_dock(
     let Some(font) = fonts.get(&font_handles.mono) else {
         return;
     };
+    let Some(ref mut atlas) = atlas else {
+        return;
+    };
 
-    let mut scene = vello::Scene::new();
+    clear_content_geometry_children(&mut commands, entity, existing_children);
+
+    let mut glyphs: Vec<PositionedGlyph> = Vec::new();
+    let mut spawned: Vec<Entity> = Vec::new();
     let width = logical_width as f64;
 
     // Insets: 16px horizontal, 6px vertical
@@ -419,14 +446,16 @@ pub fn render_north_dock(
     // Left group: title (CJK font for kanji, falls back to mono)
     let title_font = fonts.get(&font_handles.cjk).unwrap_or(font);
     let title_brush = bevy_color_to_brush(theme.accent);
-    draw_dock_text(
-        &mut scene,
+    collect_dock_text_glyphs(
+        &mut glyphs,
         &dock_state.title.text,
         pad_h,
         pad_v,
         dock_state.title.font_size,
         title_font,
         &title_brush,
+        atlas,
+        &mut font_data_map,
     );
 
     // Right group: sparklines + pulse + gap + connection (right-aligned)
@@ -466,8 +495,10 @@ pub fn render_north_dock(
 
     // Draw sparklines
     let spark_y = (36.0 - spark_h) / 2.0; // vertically center in 36px dock
-    draw_sparkline_at(
-        &mut scene,
+    spawn_dock_sparkline(
+        &mut commands,
+        entity,
+        &mut spawned,
         &dock_state.event_spark.data,
         spark_w,
         spark_h,
@@ -476,8 +507,10 @@ pub fn render_north_dock(
         theme.accent,
         0.15,
     );
-    draw_sparkline_at(
-        &mut scene,
+    spawn_dock_sparkline(
+        &mut commands,
+        entity,
+        &mut spawned,
         &dock_state.activity_spark.data,
         spark_w,
         spark_h,
@@ -490,44 +523,54 @@ pub fn render_north_dock(
     let text_right_x = right_x + sparks_total;
 
     if !dock_state.event_pulse.text.is_empty() {
-        draw_dock_text(
-            &mut scene,
+        collect_dock_text_glyphs(
+            &mut glyphs,
             &dock_state.event_pulse.text,
             text_right_x,
             pad_v + 4.0, // slightly lower for smaller text
             dock_state.event_pulse.font_size,
             font,
             &pulse_brush,
+            atlas,
+            &mut font_data_map,
         );
     }
 
     if !dock_state.global_errors.text.is_empty() {
-        draw_dock_text(
-            &mut scene,
+        collect_dock_text_glyphs(
+            &mut glyphs,
             &dock_state.global_errors.text,
             text_right_x + pulse_w + gap,
             pad_v + 4.0, // same size class as the pulse text, same offset
             dock_state.global_errors.font_size,
             font,
             &errors_brush,
+            atlas,
+            &mut font_data_map,
         );
     }
 
-    draw_dock_text(
-        &mut scene,
+    collect_dock_text_glyphs(
+        &mut glyphs,
         &dock_state.connection.text,
         text_right_x + pulse_w + gap + errors_w + gap,
         pad_v,
         dock_state.connection.font_size,
         font,
         &conn_brush,
+        atlas,
+        &mut font_data_map,
     );
 
-    scene_comp.scene = scene;
+    if !spawned.is_empty() {
+        commands.entity(entity).insert(ContentGeometryChildren(spawned));
+    }
+
+    msdf_glyphs.glyphs = glyphs;
+    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1).max(1);
     let logical = logical_size(computed);
     rtt.built_width = logical.x;
     rtt.built_height = logical.y;
-    scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
 /// Render the South dock scene.
@@ -538,10 +581,12 @@ pub fn render_south_dock(
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&mut UiVectorScene, &mut UiRttTexture, &ComputedNode), With<SouthDock>>,
+    mut query: Query<(&mut MsdfBlockGlyphs, &mut UiRttTexture, &ComputedNode), With<SouthDock>>,
     mut hit_regions: ResMut<DockHitRegions>,
+    mut atlas: Option<ResMut<MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
 ) {
-    let Ok((mut scene_comp, mut rtt, computed)) = query.single_mut() else {
+    let Ok((mut msdf_glyphs, mut rtt, computed)) = query.single_mut() else {
         return;
     };
 
@@ -555,8 +600,11 @@ pub fn render_south_dock(
     let Some(font) = fonts.get(&font_handles.mono) else {
         return;
     };
+    let Some(ref mut atlas) = atlas else {
+        return;
+    };
 
-    let mut scene = vello::Scene::new();
+    let mut glyphs: Vec<PositionedGlyph> = Vec::new();
     let width = logical_width as f64;
     hit_regions.south_regions.clear();
 
@@ -569,27 +617,31 @@ pub fn render_south_dock(
     let mut x = pad_h;
 
     let mode_brush = bevy_color_to_brush(dock_state.mode.color);
-    let mode_w = draw_dock_text(
-        &mut scene,
+    let mode_w = collect_dock_text_glyphs(
+        &mut glyphs,
         &dock_state.mode.text,
         x,
         pad_v,
         dock_state.mode.font_size,
         font,
         &mode_brush,
+        atlas,
+        &mut font_data_map,
     );
     x += mode_w + gap;
 
     if !dock_state.model_badge.text.is_empty() {
         let model_brush = bevy_color_to_brush(dock_state.model_badge.color);
-        let model_w = draw_dock_text(
-            &mut scene,
+        let model_w = collect_dock_text_glyphs(
+            &mut glyphs,
             &dock_state.model_badge.text,
             x,
             pad_v,
             dock_state.model_badge.font_size,
             font,
             &model_brush,
+            atlas,
+            &mut font_data_map,
         );
         x += model_w + gap;
     }
@@ -608,66 +660,76 @@ pub fn render_south_dock(
     );
     let usage_x = (hints_x - gap - usage_w).max(x + gap);
 
-    draw_dock_text(
-        &mut scene,
+    collect_dock_text_glyphs(
+        &mut glyphs,
         &dock_state.context_usage.text,
         usage_x,
         pad_v,
         dock_state.context_usage.font_size,
         font,
         &usage_brush,
+        atlas,
+        &mut font_data_map,
     );
 
-    draw_dock_text(
-        &mut scene,
+    collect_dock_text_glyphs(
+        &mut glyphs,
         &dock_state.hints.text,
         hints_x,
         pad_v,
         dock_state.hints.font_size,
         font,
         &hints_brush,
+        atlas,
+        &mut font_data_map,
     );
 
     // === Middle area: activity + block_activity + contexts ===
     // Activity items go left-to-right from current x
     if !dock_state.agent_activity.text.is_empty() {
         let brush = bevy_color_to_brush(dock_state.agent_activity.color);
-        let w = draw_dock_text(
-            &mut scene,
+        let w = collect_dock_text_glyphs(
+            &mut glyphs,
             &dock_state.agent_activity.text,
             x,
             pad_v,
             dock_state.agent_activity.font_size,
             font,
             &brush,
+            atlas,
+            &mut font_data_map,
         );
         x += w + gap;
     }
 
     if !dock_state.block_activity.text.is_empty() {
         let brush = bevy_color_to_brush(dock_state.block_activity.color);
-        let w = draw_dock_text(
-            &mut scene,
+        let w = collect_dock_text_glyphs(
+            &mut glyphs,
             &dock_state.block_activity.text,
             x,
             pad_v,
             dock_state.block_activity.font_size,
             font,
             &brush,
+            atlas,
+            &mut font_data_map,
         );
         x += w + gap;
     }
 
     if !dock_state.background_jobs.text.is_empty() {
         let brush = bevy_color_to_brush(dock_state.background_jobs.color);
-        let w = draw_dock_text(
-            &mut scene,
+        let w = collect_dock_text_glyphs(
+            &mut glyphs,
             &dock_state.background_jobs.text,
             x,
             pad_v,
             dock_state.background_jobs.font_size,
             font,
             &brush,
+            atlas,
+            &mut font_data_map,
         );
         x += w + gap;
     }
@@ -678,7 +740,9 @@ pub fn render_south_dock(
         // Notification mode: single text
         let notif_text = format!("\u{2190} @{}: \"{}\"", source, preview);
         let brush = bevy_color_to_brush(theme.accent);
-        let w = draw_dock_text(&mut scene, &notif_text, x, pad_v, 11.0, font, &brush);
+        let w = collect_dock_text_glyphs(
+            &mut glyphs, &notif_text, x, pad_v, 11.0, font, &brush, atlas, &mut font_data_map,
+        );
         let _ = w; // advance x not needed — notification is a single item
     } else if !ctx.badges.is_empty() {
         let badge_gap = 8.0_f64;
@@ -696,7 +760,9 @@ pub fn render_south_dock(
             let brush = bevy_color_to_brush(color);
 
             let x_start = x as f32;
-            let w = draw_dock_text(&mut scene, &label, x, pad_v, 11.0, font, &brush);
+            let w = collect_dock_text_glyphs(
+                &mut glyphs, &label, x, pad_v, 11.0, font, &brush, atlas, &mut font_data_map,
+            );
             let x_end = (x + w) as f32;
             hit_regions
                 .south_regions
@@ -707,22 +773,28 @@ pub fn render_south_dock(
         if ctx.overflow_count > 0 {
             let overflow_text = format!("+{}", ctx.overflow_count);
             let brush = bevy_color_to_brush(theme.fg_dim);
-            let w = draw_dock_text(&mut scene, &overflow_text, x, pad_v, 11.0, font, &brush);
+            let w = collect_dock_text_glyphs(
+                &mut glyphs, &overflow_text, x, pad_v, 11.0, font, &brush, atlas,
+                &mut font_data_map,
+            );
             x += w + badge_gap;
         }
 
         if ctx.staged_count > 0 {
             let staged_text = format!("\u{00b7}{} staged", ctx.staged_count);
             let brush = bevy_color_to_brush(theme.fg_dim);
-            draw_dock_text(&mut scene, &staged_text, x, pad_v, 11.0, font, &brush);
+            collect_dock_text_glyphs(
+                &mut glyphs, &staged_text, x, pad_v, 11.0, font, &brush, atlas,
+                &mut font_data_map,
+            );
         }
     }
 
-    scene_comp.scene = scene;
+    msdf_glyphs.glyphs = glyphs;
+    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1).max(1);
     let logical = logical_size(computed);
     rtt.built_width = logical.x;
     rtt.built_height = logical.y;
-    scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
 /// Size each dock's render texture to its laid-out node (physical pixels) and
@@ -976,7 +1048,7 @@ fn format_global_error_badge(
 /// change tick — whether or not it actually removed anything, so gating on
 /// `queue.is_changed()` would not skip any real work. Instead this only
 /// touches `DockState` when the *displayed* text actually differs, which is
-/// what gates the vello rebuild in `render_north_dock`.
+/// what gates the glyph rebuild in `render_north_dock`.
 pub fn update_global_errors_badge(
     queue: Res<crate::view::components::GlobalErrorQueue>,
     theme: Res<Theme>,
@@ -2101,7 +2173,7 @@ pub fn update_block_activity(
 // PLUGIN
 // ============================================================================
 
-/// Plugin for Vello-drawn dock bars.
+/// Plugin for the MSDF-drawn dock bars.
 pub struct DockPlugin;
 
 impl Plugin for DockPlugin {

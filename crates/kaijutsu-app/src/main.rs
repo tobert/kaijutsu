@@ -186,17 +186,13 @@ fn main() {
         })
         // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
         .add_plugins(BrpExtrasPlugin)
-        // Text rendering (Vello vector graphics)
+        // Text rendering (Parley shaping + MSDF glyphs)
         .add_plugins(text::KjTextPlugin)
         // Focus-based input dispatch (Phase 1: emits alongside old handlers)
         .add_plugins(input::InputPlugin)
         // Cell editing
         .add_plugins(cell::CellPlugin)
-        // Offscreen vello rasterizer (kaijutsu-owned)
-        .add_plugins(view::vello_rasterizer::VelloRasterizerPlugin)
-        // Generic vello-scene → UI texture primitive
-        .add_plugins(view::ui_rtt::UiRttPlugin)
-        // Per-block Vello texture rendering
+        // Per-block MSDF texture rendering (also serves role headers + dock chrome)
         .add_plugins(view::block_render::BlockRenderPlugin)
         // Peer transport (drift navigation: kernel → app invocations)
         .add_plugins(peers::PeersPlugin)
