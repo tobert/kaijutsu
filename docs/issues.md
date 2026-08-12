@@ -6,6 +6,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `test_fork_work_drift_merge_e2e` fails on main (2026-08-12, found during the Bevy 0.19 bump)
+
+`cargo test -p kaijutsu-server --test e2e_kj_workflow` — 13 pass, this one
+fails, deterministically (3/3 reruns):
+
+```
+crates/kaijutsu-server/tests/e2e_kj_workflow.rs:169
+expected 'staged' in push output, got: drifted → main
+```
+
+Found while establishing a green baseline for the Bevy upgrade, and
+**confirmed pre-existing** — it fails identically at the pre-bump commit in a
+clean worktree, so it is not upgrade fallout. Nothing in this crate's tree
+touches Bevy.
+
+The push output says `drifted → main` where the test wants `staged`, so this
+is the drift lane's own vocabulary/behavior having moved without the test
+following — either the staging step stopped happening or the reporting
+changed. Decide which, then fix the side that is wrong; a test asserting on
+prose is fragile either way. Secondary noise to ignore while debugging: the
+teardown then panics inside russh with "there is no reactor running", which
+is a shutdown-ordering artifact of the first failure, not a second bug.
+
+Worth fixing soon simply because a red test on main trains us to skim past
+red tests.
+
 ## Summaries drift stronger than what they summarise (2026-08-11, three instances in one day)
 
 Not a code bug — a writing failure mode worth naming, because it cost real
@@ -2175,30 +2201,29 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   families when signed Thinking exists in history (a DeepSeek nonce fed to
   Anthropic 400s); allow the transition only at `fork`, where an rc script
   decides to elide thinking or downgrade it to plain blocks.
-## Bevy 0.19 upgrade — planned, not started (2026-08-12)
+## Bevy 0.19 leftovers (2026-08-12, the upgrade shipped same day)
 
-Full plan: **`docs/bevy-019-upgrade.md`**. Verified against the 104 official
-0.19 migration guides, not training memory. Headline: 7 of 104 guides touch
-us; the framework's big reworks (parley text, resources-as-components,
-render-graph-as-systems) are near-misses because we never used those APIs.
+The upgrade itself is done and the plan doc is retired — story in the devlog
+("The instrument changes its strings"). Two things it deliberately did not
+chase:
 
-Blockers, all small except one decision: `bevy_brp_extras = "0.19"` actually
-requires `bevy 0.18.1` (need ≥0.21 — the pin that reads current is the one
-holding us back); four mechanical import/field fixes; 24 `Assets::get_mut`
-sites needing `mut` bindings. The `vello` 0.7→0.9/wgpu 27→29 blocker this
-list used to carry is gone: `vello` was retired from `kaijutsu-app` entirely
-(2026-08-12, docs/issues.md's Vello-retirement work) — nothing in the app
-hands a device to it any more, so the upgrade no longer needs to land a
-vello bump atomically with the Bevy bump.
+- **Bloom re-tune — Amy's, whenever.** 0.19 fixes Karis-average luma to
+  compute in linear rather than sRGB space, which dims saturated bloom. No
+  code change is needed; this is a taste call about how the instrument looks,
+  and the first screenshot on 0.19 does read subdued. Knobs: `main.rs:352-360`
+  (the `Bloom` + `BloomPrefilter` setup, threshold is a deliberate literal)
+  and the hot-reloadable theme presets at `view/scene_palette.rs:280-293`.
+  Start at the "HDR-tell boundary" the well-card glow rides
+  (`main.rs:341-344`) — the saturated-color trick there is exactly what the
+  fix changes.
 
-The one real decision is **rodio**: Bevy 0.19's `bevy_audio` wants rodio 0.22,
-which deleted `OutputStream`/`Sink` — the API `audio_sched.rs` (868 lines) is
-built on via our own direct `rodio = "0.20"` pin. Hold at 0.20 (two copies in
-the tree, and correct the now-false dedupe comment at `Cargo.toml:32-33`) or
-rewrite the playback core. Invisible from the Bevy guides; found by reading
-rodio's source.
-
-Not urgent — 0.18.1 works. Independent of the drift lane in both directions.
+- **`parley` is duplicated: ours 0.7.0, `bevy_text`'s 0.9.0.** New with 0.19,
+  whose text stack moved onto parley. Harmless today — our shaping/MSDF path
+  never touches `bevy_text` — but it is two shaping engines and two font
+  databases in one binary, and it is the same single-copy hygiene we just
+  restored for rodio. Closing it means moving `crates/kaijutsu-app/Cargo.toml`
+  to `parley = "0.9"` and fixing whatever `text/shaping/` needs; check
+  `kurbo`/`peniko` move with it. `cargo tree -d` is the check.
 
 ## Test leaks a pidfile into `/tmp` (2026-08-12, via kaish's /tmp audit)
 
@@ -2463,6 +2488,20 @@ key-value store demolished 2026-07-04.*
   (Sparkline `block_render.rs:~677`, Svg `:~745`) bump from
   `block_scene.scene_version` instead. Unify on bump-from-own; the planned
   Diff arm follows bump-from-own and must not copy the deviation.
+
+- **HUD sparklines flicker post-vello-removal** (2026-08-12, Amy at the
+  controls on moltar; "not a priority, maybe we need to do more serious
+  design work on those"). The top-right HUD sparkline graphs visibly
+  flicker. Two candidate contributing factors are already written down
+  elsewhere in this file and are worth checking before anything else:
+  (a) the **version-bump divergence** immediately below — the Sparkline arm
+  bumps `MsdfBlockGlyphs.version` from `block_scene.scene_version` rather
+  than its own previous, which is exactly the shape that re-renders every
+  frame something else changes; and (b) the **unvalidated segment-rotation
+  geometry** in the de-vello entry below, which was written without a
+  running app. Amy's framing is the important part though: the fix may not
+  be a bug fix at all — these graphs may want real design work rather than
+  repair, so decide what they should *be* before patching how they draw.
 
 - **Conversation-view de-vello pass — needs a visual pass in the running
   app** (2026-07-30, `feat/devello`; a validation pass is planned

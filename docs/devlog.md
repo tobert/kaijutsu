@@ -1168,3 +1168,69 @@ pinned by test instead of comment. And the crosstalk stance stopped being
 theory: while the model toured the repo in Amy's toad session, the lead
 watched the same blocks from the kj side and Amy watched from the app —
 three players reading one score, which is what the instrument was for.
+
+## The instrument changes its strings (August 12)
+
+Two upgrades landed in a day that a scouting report had said would take
+several, and the interesting part is why the estimate was wrong in that
+direction.
+
+The Bevy 0.19 plan was written by reading all 104 official migration guides
+against the app rather than from memory — deliberately, because model
+training data predates even 0.18's own event-system rename, so any
+recalled claim about 0.19 is suspect by construction. The verdict:
+**seven of 104 guides touched us.** The framework's headline reworks —
+the text stack onto parley, resources-as-components, render-graph-as-
+systems, the extract refactor — were all near-misses, because we had never
+used the APIs they changed. We own our shaping and our MSDF atlas, our
+render-world code was already written as plain systems on `ExtractSchedule`,
+our UI is hand-rolled, and our 687 `Res`/`ResMut` sites kept their sugar.
+The upgrade was small; it had only been wearing a scary hat.
+
+What was actually load-bearing was a dependency whose version number lied.
+`bevy_brp_extras = "0.19"` reads perfectly current and requires
+`bevy 0.18.1`; the release that wants Bevy 0.19 is 0.21. So the one crate
+pinning us to the old engine was the one that looked most up to date — and
+because BRP is how agents drive the live GUI, it was pinning the testing
+loop too. The lesson generalizes past this crate: **read a dependency's
+manifest, never its version number**, and prefer the cargo registry cache
+as truth, because a working checkout of upstream can be five months stale
+while you plan against it. That one nearly bit us too.
+
+The second blocker was invisible to every guide, because it was ours:
+`avian2d` had been declared and never used — no import, no symbol, one line
+in a manifest — and it hard-pinned Bevy 0.18. A physics engine nobody
+called was the thing standing between us and the upgrade. Amy ruled delete
+over bump, which took 440 lines of lockfile with it. Dead dependencies are
+not free; they vote on your version constraints.
+
+Sequencing was the other real decision, and it was made before any code
+moved. Bevy 0.19's `bevy_audio` wants rodio 0.22, which deleted
+`OutputStream` and `Sink` outright — the exact API the 868-line scheduled
+playback engine was built on. The tempting order was to bump Bevy and let a
+second rodio copy sit in the tree. Amy ruled the opposite: **migrate rodio
+first, on its own, then upgrade onto an already-converged audio stack.**
+That kept the "one copy of rodio/cpal" invariant true throughout instead of
+briefly false and then repaired, and it let the playback rewrite be
+reviewed and bisected as itself rather than as noise inside a framework
+bump. The manifest comment that had promised dedupe would return "when Bevy
+0.19 brings bevy_audio onto rodio ^0.22" got to become simply true.
+
+The upgrade found exactly one thing no guide mentioned, and it was a real
+API split rather than a rename: 0.19 divided `UiDebugOptions` into a
+per-node `Component` and a new `GlobalUiDebugOptions` resource, so asking
+for the old one as a resource stops compiling in a way that says "not a
+`Resource`" rather than "moved." Everything else was mechanical, and the
+widest change — 25 `Assets::get_mut` sites now returning `AssetMut<A>` so
+that `AssetEvent::Modified` only fires on real mutation — was applied from
+rustc's own machine-applicable spans rather than by hand. The compiler
+knows where the bindings are; there is no reason to guess and no reason to
+take credit for finding them.
+
+One habit paid for itself twice. A workspace test failed after the bump, in
+a crate with no Bevy anywhere in its tree. The cheap move is to reason that
+it can't be related and move on. Instead it got checked out at the pre-bump
+commit in a worktree and run there, where it failed identically — so it went
+into the backlog as a pre-existing drift-lane regression with proof, rather
+than as a suspicion. Inference would have reached the same answer here.
+Sooner or later it won't, and the worktree costs two minutes.
