@@ -899,13 +899,41 @@ deny-by-default.
   but ~40 docs skipping should surface as ONE loud aggregate (count +
   first error) at boot end, and `kj status`-visible state — same
   loud-not-silent treatment external MCP failures got.
-- **rc-create failure → unbound context → total facade lockout.** When
-  S10-binding.kai can't run, the context is created ANYWAY with no
-  binding, then deny-by-default locks every surface including the
-  operator's own kj — mistake-prevention became a lockout (violates the
-  "ergonomic nudge, not auth denial" stance). Options: refuse context
-  creation when the create lifecycle fails (crash-over-corruption), or a
-  documented operator escape hatch. Decide on purpose.
+- **rc-create failure → unbound context.** When `S10-binding.kai` can't run,
+  the context is created ANYWAY with no binding, and deny-by-default then
+  makes it inert — it cannot drive, fork, drift, or widen its own loadout.
+
+  **Downgraded 2026-08-12: this is NOT a "total facade lockout".** That
+  wording (mine) was wrong. `kj context switch` is **ungated by design** —
+  `kj/context.rs:402-407` says so in as many words: *"Read/navigation verbs
+  (list/info/current/switch/log) stay ungated too."* So you can always leave a
+  broken context and remove it from a working one. Reading is ungated too, so
+  the Error blocks the failed lifecycle wrote are readable in place —
+  diagnosis works, only *action* is blocked.
+
+  **Amy asked the right question (2026-08-12): when would create actually need
+  to abort?** Mostly it would not, and aborting indiscriminately would be
+  worse than the bug:
+
+  - `S00-stance` failing → no system prompt. Degraded but usable, and a fork
+    fixes it. Aborting would destroy a working context over a cosmetic failure.
+  - `S40-cache` failing → no cache breakpoints. Costs tokens. Cosmetic.
+  - `S10-binding` failing → the only one that yields an *inert* context.
+
+  And even that one is weak grounds for abort, because a freshly-created
+  context **holds nothing worth saving** — abort and create-then-discard cost
+  about the same. So the case for aborting is ergonomic (don't leave litter and
+  a confusing half-context behind), not safety.
+
+  **If we do it, gate on the OUTCOME, not on which script failed:** "did this
+  context end up with a usable binding?" catches both a failed binding script
+  and one that succeeded while producing nothing. Keying on script identity
+  hard-codes rc layout into the kernel and misses the second case.
+
+  **Cheaper candidate, possibly most of the value:** nothing currently tells a
+  caller the exit exists. Add it to the denial — "this context has no loadout;
+  `kj context switch <other>` to leave" — and the sharp edge mostly goes away
+  without touching creation semantics at all.
 - **Broken-window contexts (2026-08-05 14:27–15:05) are unbound**: at
   least `2e1334a4` (this CC session's kaijutsu-mcp context) and
   `1c39e6ab` (`acp-kaijutsu-1785954617`, the first toad attempt). They
