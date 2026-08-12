@@ -2255,6 +2255,23 @@ Remaining, in order:
   kernel change needed: `archived_at` is already what both resolvers filter
   on. Do **not** rename or suffix on archive; the label leaves the active set
   intact, which keeps it meaningful for the coming index.
+- **MCP connections that never receive hook traffic mint a context that never
+  stabilizes and never archives** (found 2026-08-12, during the sweep). The
+  sweep took `cc-*` from 161 → 26 and the `cc-kaijutsu` prefix from 60 → 12.
+  **Ten of the twelve survivors are `cc-kaijutsu-0812-HHMM`** — the
+  *pre-stabilization* label form (`main.rs:396`), which means those contexts
+  never got a hook event carrying a `session_id`, so `maybe_stabilize_label`
+  never renamed them. They came from short-lived `kaijutsu-mcp --connect`
+  invocations — diagnostic probes and `/mcp` reconnects — in a single day.
+  Two compounding problems: they are minted per connection rather than per
+  *session*, and the new `session.end` archiving cannot reclaim them because
+  no `session.end` ever fires for a connection that had no session. So this is
+  the residual generator the sweep does not close — roughly ten per day for
+  one project. Options: don't register until the first hook event proves a
+  real session (register lazily), or let a connection that closes without ever
+  stabilizing archive its own context on drop. **Self-inflicted note for
+  future sessions: probing the kernel via `kaijutsu-mcp --connect` adds to the
+  pileup; prefer the already-attached MCP `shell` tool.**
 - **`lost+found` has no discovery or working surface** (Amy, 2026-08-12: "we
   need to add some tools for discovering and working with lost+found"). It is
   created lazily by the dead-letter path (`drift.rs:606-680`) and *nothing
