@@ -29,9 +29,8 @@ kj drift pull approach-b "summarize what you tried"
 ### Share a Finding
 
 ```bash
-# Stage a concrete finding (no LLM, fast)
+# Send a concrete finding (no LLM, fast — delivered immediately)
 kj drift push main "retry logic in client.rs:142 drops errors silently"
-kj drift flush
 ```
 
 ### Complete a Fork

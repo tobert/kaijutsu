@@ -1564,7 +1564,7 @@ esac
         for content in ["one", "two", "three"] {
             let r = d
                 .dispatch(
-                    &argv(&["drift", "push", "dst", content]),
+                    &argv(&["drift", "push", "--stage", "dst", content]),
                     &caller,
                 )
                 .await;
@@ -1621,7 +1621,7 @@ esac
 
         let caller = caller_with_context(src);
         for content in ["one", "two"] {
-            d.dispatch(&argv(&["drift", "push", "dst", content]), &caller)
+            d.dispatch(&argv(&["drift", "push", "--stage", "dst", content]), &caller)
                 .await;
         }
 

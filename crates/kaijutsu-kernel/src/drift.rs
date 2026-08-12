@@ -13,16 +13,20 @@
 //! # Flow
 //!
 //! ```text
-//! drift push <ctx> "content"
-//!       │
-//!       ▼
-//! DriftRouter.stage(StagedDrift { source, target, content, ... })
-//!       │
-//! drift flush
-//!       │
-//!       ▼
-//! DriftRouter.flush() → insert_drift_block() on target document
+//! drift push <ctx> "content"          drift push --stage <ctx> "content"
+//!       │                                   │
+//!       ▼                                   ▼
+//! insert_drift_block() on            DriftRouter.stage(StagedDrift { ... })
+//! target document, now                     │
+//!                                    drift flush
+//!                                          │
+//!                                          ▼
+//!                                    DriftRouter.flush() → insert_drift_block()
 //! ```
+//!
+//! `push` delivers immediately; `--stage` opts into the batching queue that
+//! `queue`/`cancel`/`flush` operate on. A failed immediate delivery falls back
+//! to the staging queue (loudly, as an error) so content is never lost.
 
 use std::collections::HashMap;
 use std::sync::Arc;

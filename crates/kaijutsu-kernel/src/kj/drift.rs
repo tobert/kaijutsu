@@ -30,15 +30,20 @@ pub(crate) struct DriftArgs {
 
 #[derive(Subcommand, Debug)]
 enum DriftCommand {
-    /// Stage content for a target context. With --summarize, LLM-distill
-    /// the caller's whole context instead of sending literal content.
+    /// Send content to a target context, delivered immediately. With
+    /// --summarize, LLM-distill the caller's whole context instead of
+    /// sending literal content. With --stage, queue it for a later
+    /// `flush` instead of delivering now.
     Push {
         /// Destination context reference
         dst: String,
         /// LLM-distill the caller's context instead of using literal content
         #[arg(long, short = 's')]
         summarize: bool,
-        /// Content to stage (joined with spaces). Omit when using --summarize.
+        /// Queue for a later `kj drift flush` instead of delivering now
+        #[arg(long)]
+        stage: bool,
+        /// Content to send (joined with spaces). Omit when using --summarize.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         content: Vec<String>,
     },
@@ -124,8 +129,12 @@ impl KjDispatcher {
             DriftCommand::Push {
                 dst,
                 summarize,
+                stage,
                 content,
-            } => self.drift_push(&dst, summarize, &content, caller).await,
+            } => {
+                self.drift_push(&dst, summarize, stage, &content, caller)
+                    .await
+            }
             DriftCommand::Pull { src, prompt } => self.drift_pull(&src, &prompt, caller).await,
             DriftCommand::Merge { ctx } => self.drift_merge(ctx.as_deref(), caller).await,
             DriftCommand::Flush => self.drift_flush(caller).await,
@@ -138,10 +147,93 @@ impl KjDispatcher {
         }
     }
 
+    /// Insert a drift block into `target_ctx`, record the `context_edges`
+    /// row, and run the target's `drift` rc lifecycle.
+    ///
+    /// This is the shared shape that `push` (immediate), `pull`, `merge`
+    /// and `flush` each used to inline — see the "orchestration bloat"
+    /// entry in `docs/issues.md`. Only the immediate-`push` path is routed
+    /// through it so far; the others are unchanged and can migrate when
+    /// they are next touched.
+    ///
+    /// A failed *insert* is returned to the caller so it can decide what to
+    /// do with the content (immediate `push` stages it rather than losing
+    /// it). A failed edge write or rc script is logged and does not fail
+    /// the delivery — the block is already durable, and refusing to
+    /// acknowledge a delivered block would be the worse lie.
+    async fn deliver_drift(
+        &self,
+        source_ctx: ContextId,
+        target_ctx: ContextId,
+        content: &str,
+        source_model: Option<String>,
+        drift_kind: DriftKind,
+        edge_metadata: String,
+        caller: &KjCaller,
+    ) -> Result<(), String> {
+        let after = self.block_store().last_block_id(target_ctx);
+        self.block_store()
+            .insert_drift_block(
+                target_ctx,
+                None,
+                after.as_ref(),
+                content,
+                source_ctx,
+                source_model.clone(),
+                drift_kind,
+            )
+            .map_err(|e| e.to_string())?;
+
+        {
+            let db = self.kernel_db().lock();
+            let edge = crate::kernel_db::ContextEdgeRow {
+                edge_id: uuid::Uuid::now_v7(),
+                source_id: source_ctx,
+                target_id: target_ctx,
+                kind: EdgeKind::Drift,
+                metadata: Some(edge_metadata),
+                created_at: kaijutsu_types::now_millis() as i64,
+            };
+            if let Err(e) = db.insert_edge(&edge) {
+                tracing::warn!(
+                    "drift: failed to insert edge {} → {}: {e}",
+                    source_ctx.short(),
+                    target_ctx.short()
+                );
+            }
+        }
+
+        if let Err(e) = self
+            .run_rc_lifecycle(
+                super::lifecycle::VERB_DRIFT,
+                target_ctx,
+                None,
+                None,
+                Some(super::lifecycle::DriftInfo {
+                    kind: drift_kind,
+                    source_ctx,
+                    target_ctx,
+                    source_model,
+                }),
+                caller,
+            )
+            .await
+        {
+            tracing::warn!(
+                "rc drift lifecycle {} → {}: {e}",
+                source_ctx.short(),
+                target_ctx.short()
+            );
+        }
+
+        Ok(())
+    }
+
     async fn drift_push(
         &self,
         dst_query: &str,
         summarize: bool,
+        stage: bool,
         content: &[String],
         caller: &KjCaller,
     ) -> KjResult {
@@ -180,6 +272,52 @@ impl KjDispatcher {
             let router = self.drift_router().read();
             router.get(context_id).and_then(|h| h.model.clone())
         };
+
+        // Deliver now unless the caller explicitly asked to batch. `push`
+        // staging by default meant a send could report success and deliver
+        // nothing until someone remembered `flush` — the silent-fallback
+        // shape CLAUDE.md rejects. Staging survives as `--stage`, which is
+        // what makes `cancel` and batching possible. See `docs/drift-ux.md`.
+        if !stage {
+            let stage_after_failure = |e: String| {
+                let mut router = self.drift_router().write();
+                match router.stage(
+                    context_id,
+                    target_id,
+                    content.clone(),
+                    source_model.clone(),
+                    drift_kind,
+                ) {
+                    // Loud, not silent: the push failed, but the content is
+                    // parked in the queue that already knows how to retry
+                    // and dead-letter rather than lose it.
+                    Ok(id) => KjResult::Err(format!(
+                        "kj drift push: delivery to {dst_query} failed: {e}; staged as \
+                         #{id} — run 'kj drift flush' to retry"
+                    )),
+                    Err(stage_err) => KjResult::Err(format!(
+                        "kj drift push: delivery to {dst_query} failed: {e}; staging also \
+                         failed: {stage_err} — CONTENT LOST"
+                    )),
+                }
+            };
+
+            return match self
+                .deliver_drift(
+                    context_id,
+                    target_id,
+                    &content,
+                    source_model.clone(),
+                    drift_kind,
+                    drift_kind.to_string(),
+                    caller,
+                )
+                .await
+            {
+                Ok(()) => KjResult::ok(format!("drifted → {}", dst_query)),
+                Err(e) => stage_after_failure(e),
+            };
+        }
 
         // Stage the drift
         let staged_id = {
@@ -781,7 +919,16 @@ mod tests {
 
         let c = caller_with_context(src);
         let result = d
-            .dispatch(&[s("drift"), s("push"), s("dst"), s("hello from src")], &c)
+            .dispatch(
+                &[
+                    s("drift"),
+                    s("push"),
+                    s("--stage"),
+                    s("dst"),
+                    s("hello from src"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "push failed: {}", result.message());
         assert!(result.message().contains("staged drift #1"));
@@ -793,6 +940,133 @@ mod tests {
         assert!(msg.contains("hello from src"), "queue: {msg}");
     }
 
+    /// `push` delivers immediately — no `flush` in between. This is the
+    /// slice-1 contract from `docs/drift-ux.md`: the verb named `push` must
+    /// push. Staging as the default meant a send could report success and
+    /// deliver nothing, which in the music case is a dropped note.
+    #[tokio::test]
+    async fn drift_push_delivers_immediately() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(src);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("dst"), s("hello from src")], &c)
+            .await;
+        assert!(result.is_ok(), "push failed: {}", result.message());
+
+        // Landed in the target document without a flush.
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        let drifted: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .collect();
+        assert_eq!(
+            drifted.len(),
+            1,
+            "expected exactly one drift block, saw {} blocks total",
+            blocks.len()
+        );
+        assert!(
+            drifted[0].content.contains("hello from src"),
+            "content: {}",
+            drifted[0].content
+        );
+
+        // Nothing left staged.
+        let queue = d.dispatch(&[s("drift"), s("queue")], &c).await;
+        assert_eq!(queue.message(), "(queue empty)");
+    }
+
+    /// `--stage` keeps the old batching behaviour: nothing reaches the
+    /// target until `flush`. Staging is still worth having (it is what
+    /// makes `cancel` possible and lets a sender batch); it just is not the
+    /// default any more.
+    #[tokio::test]
+    async fn drift_push_stage_defers_delivery() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(src);
+        let result = d
+            .dispatch(
+                &[s("drift"), s("push"), s("--stage"), s("dst"), s("later")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "push --stage failed: {}", result.message());
+        assert!(
+            result.message().contains("staged drift #1"),
+            "msg: {}",
+            result.message()
+        );
+
+        // Nothing delivered yet.
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b.kind == kaijutsu_types::BlockKind::Drift),
+            "staged drift must not be delivered before flush"
+        );
+
+        // It is sitting in the queue, and flush delivers it.
+        let queue = d.dispatch(&[s("drift"), s("queue")], &c).await;
+        assert!(queue.message().contains("later"), "queue: {}", queue.message());
+        let flush = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(flush.is_ok(), "flush: {}", flush.message());
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        assert!(blocks
+            .iter()
+            .any(|b| b.kind == kaijutsu_types::BlockKind::Drift));
+    }
+
+    /// An immediate push whose delivery fails must not lose the content and
+    /// must not pretend it worked. It falls back to the staging queue — the
+    /// machinery that already knows how to retry and dead-letter — and says
+    /// so loudly via `KjResult::Err`. Loud fallback, not silent.
+    #[tokio::test]
+    async fn drift_push_delivery_failure_stages_loudly() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("sender"), None, principal);
+        // No document on the target — insertion cannot succeed.
+        let _dst = register_context(&d, Some("nodoc"), None, principal);
+
+        let c = caller_with_context(src);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("nodoc"), s("precious")], &c)
+            .await;
+        assert!(
+            !result.is_ok(),
+            "a failed delivery must not report success: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("staged"),
+            "error must say the content was staged: {}",
+            result.message()
+        );
+
+        // Content preserved, recoverable by flush.
+        let queue = d.dispatch(&[s("drift"), s("queue")], &c).await;
+        assert!(
+            queue.message().contains("precious"),
+            "content must survive a failed push: {}",
+            queue.message()
+        );
+    }
+
     #[tokio::test]
     async fn drift_cancel() {
         let d = test_dispatcher().await;
@@ -801,7 +1075,7 @@ mod tests {
         let _dst = register_context(&d, Some("b"), None, principal);
 
         let c = caller_with_context(src);
-        d.dispatch(&[s("drift"), s("push"), s("b"), s("content")], &c)
+        d.dispatch(&[s("drift"), s("push"), s("--stage"), s("b"), s("content")], &c)
             .await;
 
         let result = d.dispatch(&[s("drift"), s("cancel"), s("1")], &c).await;
@@ -839,7 +1113,13 @@ mod tests {
 
         let c = caller_with_context(src);
         d.dispatch(
-            &[s("drift"), s("push"), s("receiver"), s("important finding")],
+            &[
+                s("drift"),
+                s("push"),
+                s("--stage"),
+                s("receiver"),
+                s("important finding"),
+            ],
             &c,
         )
         .await;
@@ -880,7 +1160,7 @@ mod tests {
 
         // Stage a deliverable item so flush proceeds past the empty-staging guard.
         let c = caller_with_context(src);
-        d.dispatch(&[s("drift"), s("push"), s("dst"), s("ok")], &c)
+        d.dispatch(&[s("drift"), s("push"), s("--stage"), s("dst"), s("ok")], &c)
             .await;
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());
@@ -998,7 +1278,10 @@ mod tests {
 
         // Push + flush is what writes the edge.
         let push = d
-            .dispatch(&[s("drift"), s("push"), s("dst"), s("payload")], &c)
+            .dispatch(
+                &[s("drift"), s("push"), s("--stage"), s("dst"), s("payload")],
+                &c,
+            )
             .await;
         assert!(push.is_ok(), "push: {}", push.message());
         let flush = d.dispatch(&[s("drift"), s("flush")], &c).await;
@@ -1056,7 +1339,10 @@ mod tests {
 
         let c = caller_with_context(src);
         let push = d
-            .dispatch(&[s("drift"), s("push"), s("dst"), s("finding")], &c)
+            .dispatch(
+                &[s("drift"), s("push"), s("--stage"), s("dst"), s("finding")],
+                &c,
+            )
             .await;
         assert!(push.is_ok(), "push: {}", push.message());
         // First staged drift in a fresh router lands at id=1; we assert
@@ -1484,9 +1770,18 @@ mod tests {
 
         let c = caller_with_context(src);
 
-        // Push to a context WITHOUT a document — insertion will fail
-        d.dispatch(&[s("drift"), s("push"), s("nodoc"), s("will fail")], &c)
-            .await;
+        // Stage to a context WITHOUT a document — insertion will fail at flush
+        d.dispatch(
+            &[
+                s("drift"),
+                s("push"),
+                s("--stage"),
+                s("nodoc"),
+                s("will fail"),
+            ],
+            &c,
+        )
+        .await;
 
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());

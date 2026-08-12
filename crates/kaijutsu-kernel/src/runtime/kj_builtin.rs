@@ -2047,8 +2047,9 @@ mod tests {
         assert!(is_distill_verb(&argv("drift push main --summarize")));
 
         // Negatives: a plain fork copies (no distill); `drift push` without
-        // `--summarize` stages literal content; `drift flush`/`push` deliver;
-        // `drive` only publishes a turn request; everything else is local.
+        // `--summarize` ships literal content; `drift flush` only delivers
+        // what is already staged; `drive` only publishes a turn request;
+        // everything else is local.
         assert!(!is_distill_verb(&argv("fork --name x")));
         assert!(!is_distill_verb(&argv(
             "drift push main some literal content"
@@ -2102,7 +2103,13 @@ mod tests {
 
         let principal = PrincipalId::system();
         let here = register_context(&dispatcher, Some("here"), None, principal);
-        register_context(&dispatcher, Some("sink"), None, principal);
+        let sink = register_context(&dispatcher, Some("sink"), None, principal);
+        // `push` delivers immediately, so the target needs a document to
+        // receive the distilled block.
+        dispatcher
+            .block_store()
+            .create_document(sink, kaijutsu_types::DocKind::Conversation, None)
+            .expect("create_document (sink)");
         // summarize needs blocks to distill — seed one.
         dispatcher
             .block_store()
@@ -2153,8 +2160,8 @@ mod tests {
             "distill must not trip the script timeout (124)"
         );
         assert!(
-            res.text_out().contains("staged drift"),
-            "distill should have staged the summary: {}",
+            res.text_out().contains("drifted"),
+            "distill should have delivered the summary: {}",
             res.text_out()
         );
     }
