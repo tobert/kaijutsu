@@ -2203,26 +2203,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   families when signed Thinking exists in history (a DeepSeek nonce fed to
   Anthropic 400s); allow the transition only at `fork`, where an rc script
   decides to elide thinking or downgrade it to plain blocks.
-## Bevy 0.19 leftovers (2026-08-12, the upgrade shipped same day)
-
-The upgrade itself is done and the plan doc is retired — story in the devlog
-("The instrument changes its strings"). Two things it deliberately did not
-chase:
-
-- **Bloom re-tune — Amy's, whenever.** 0.19 fixes Karis-average luma to
-  compute in linear rather than sRGB space, which dims saturated bloom. No
-  code change is needed; this is a taste call about how the instrument looks,
-  and the first screenshot on 0.19 does read subdued. Knobs: `main.rs:352-360`
-  (the `Bloom` + `BloomPrefilter` setup, threshold is a deliberate literal)
-  and the hot-reloadable theme presets at `view/scene_palette.rs:280-293`.
-  Start at the "HDR-tell boundary" the well-card glow rides
-  (`main.rs:341-344`) — the saturated-color trick there is exactly what the
-  fix changes.
-
-- ~~`parley` is duplicated~~ — **done**, we are on 0.9 alongside `bevy_text`
-  (Amy: "bump parley to match bevy and generally try to match bevy when we
-  can"). It left one thing behind, below.
-
 ## parley opts out of dictionary line breaking for Japanese — check back (2026-08-12, from the parley 0.9 bump)
 
 **Log silenced, behaviour left alone** (Amy: "silence it and we'll track an
@@ -2619,6 +2599,20 @@ key-value store demolished 2026-07-04.*
   - Latch nonces should eventually live in a SQLite table rather than in-memory.
 
 ## User Interface (kaijutsu-app) & UX
+
+- **`well_card.wgsl`'s discard comment is stale and says the opposite of the
+  code** (2026-08-12, found while tightening the card inset). The comment
+  above the `alpha < 0.5` discard claims "the ring band's outer half (alpha =
+  band past d=0) deliberately survives, so the glow still spills just past the
+  rounded edge." It does not: `band` is computed as
+  `(1.0 - smoothstep(ring_w, ring_w + aa, abs(d))) * inside`, and `inside`
+  goes to zero at `d = 0`, so the band is already clipped at the body edge.
+  The halo is the bloom post-pass spreading in screen space, which needs no
+  geometry to spill into. Harmless today — the correct behaviour is the one
+  the code has, and it is *why* shrinking `card_shape()`'s `inset` costs
+  nothing — but a comment that describes the opposite of its code is exactly
+  the failure mode the "summaries drift stronger" entry above names. Delete
+  the claim or restate it as "bloom does the spilling, not the geometry."
 
 - **`build_block_scenes` version-bump pattern diverges per arm** (2026-08-01,
   deepseek seam review for `docs/diff.md` — verify line refs before fixing).
