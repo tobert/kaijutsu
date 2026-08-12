@@ -399,11 +399,14 @@ to mine.
 > we will also want a way for a context to be able to disable drive requests,
 > perhaps by default."
 
-**The general policy now lives in `docs/drive-consent.md`** — Amy asked for
-this to be "driven in to code and docs generally", because it is not drift's
-question. Drift's `--drive` is just the first caller; per-`context_type`
-defaults (musicians on) and the cold-prompt-cache suppression are described
-there. What follows is the drift-shaped summary.
+**The general policy lives in `docs/issues.md`** ("Drive gates — self vs
+external, and don't drive the archived"), because it is not drift's question —
+drift's `--drive` is just its first caller. Two things from there bear on
+drift directly: **self-drive is already gated** by `Capability::Drive` on the
+caller (`kj/drive.rs:61-64`), so only *external* drive needs the new
+target-side gate; and **`kj drive` must refuse archived contexts**, which is
+required independent of any consent work. What follows is the drift-shaped
+summary.
 
 This is **shape A as the default with an explicit opt-in escalation**, plus a
 receiver-side veto the four shapes did not contain. Note what it is *not*:

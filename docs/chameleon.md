@@ -43,6 +43,22 @@ which derives the lane from the label, attaches stopped + OODA-armed).
 
 ## Decisions
 
+- **Self-drive and external drive are different questions (2026-08-12).** A
+  musician's beat tick driving its own context
+  (`rc/musician/tick/S10-drive.kai`) is **self**-drive, and it is already
+  governed by `Capability::Drive` on the caller — which is precisely what lets
+  narrowing a musician's binding stop its OODA tick (`kj/drive.rs:61-64`).
+  Another context asking this one to take a turn (drift's `--drive`) is
+  **external** drive, and that is gated on the *target*, default off — but
+  **on by default for musicians**, because a player that cannot be woken
+  cannot take a hand-off mid-piece, which is the whole point of the band.
+  The split means the beat scheduler needs no special-case bypass: it was
+  never the thing being gated. Two consequences for players: a context can be
+  pinned stopped by denying external drive *and* withholding its own `Drive`
+  cap; and drive must refuse **archived** contexts outright, since those are
+  retained work kept for search and research, not sleeping players. Full
+  design in `docs/issues.md` ("Drive gates"); drift's caller-side view in
+  `docs/drift-ux.md`.
 - **Tracks, not voices (2026-06-11).** The stable lane identity on the
   timeline is a *track* (DAW sense): the track persists while players come
   and go; `Cell.played_by` separately records who played, so a substitute

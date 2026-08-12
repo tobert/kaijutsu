@@ -2163,19 +2163,68 @@ Remaining, in order:
   binding/loadout (an ergonomic-nudge capability), not a new concept.
   **Blocked on the rc identity-smear fix below** — a driven turn must not be
   attributed to the sender's principal.
-  **General policy: `docs/drive-consent.md`** (Amy: drive it into code and
-  docs generally — it is not drift's question). Two gates, both required:
-  *consent* (per-context, defaulted per `context_type` via rc — musicians on,
-  coders maybe, everything else off) and *warmth* (suppress a drive when the
-  provider prompt cache has likely aged out, because our contexts are always
-  revivable from durable state, which makes an expensive full reprocess look
-  free). The warmth predicate is computable with **no new schema**:
-  `context_usage.updated_at` is the last completed LLM call — the right clock,
-  unlike `last_activity_at` which any block write touches — measured against
-  the shortest `cache_breakpoints` TTL (ephemeral ≈5m / extended ≈1h), with
-  `cache_read_tokens > 0` as corroboration. Both refusals must be **loud**,
-  and there should be a way to insist, since cold-cache is a cost signal not
-  a correctness one.
+## Drive gates — self vs external, and don't drive the archived (2026-08-12)
+
+Amy asked for the `--drive` default-off idea to be driven into code and docs
+generally: it is not drift's question. `kj drift push --drive` is just the
+first caller; the beat scheduler and any future orchestration are the same
+shape. **Deliberately small — Amy: "I don't want to get crazy with
+permissions."** Half of it already exists.
+
+**Self-drive is already gated, and correctly.** `kj drive` requires
+`Capability::Drive` on the **caller's** context (`kj/drive.rs:61-64`), with
+the intent stated in the code: *"what makes narrowing a musician's binding
+actually stop its OODA tick."* So "this context may drive" is solved. Amy's
+self-vs-external split maps onto it cleanly:
+
+- **self-drive** (caller == target, e.g. `rc/musician/tick/S10-drive.kai`
+  driving its own context) — governed by the existing `Drive` cap. No new
+  concept. This also answers the "does the beat scheduler bypass consent?"
+  question: it never needed to, because a musician's tick is *self*-drive and
+  consent is about *external* drive.
+- **external drive** (caller != target) — the genuinely new gate, on the
+  **target**. Per-context, default off, with `context_type` defaults via rc:
+  musicians on (a player that cannot be woken cannot take a hand-off
+  mid-piece), coders probably, everything else off. Home is the context
+  binding/loadout — an ergonomic nudge, not a security boundary; a context
+  that declines is *focused*, not distrusted.
+
+Amy's "this session cannot be driven, to ensure things stay stopped" then
+needs no third mechanism: deny external drive on the target **and** withhold
+`Drive` from the context itself, and nothing can start it — one existing knob
+plus one new one.
+
+**The archived check is required regardless, and is not a permission.**
+`kj drive` has **no context-state gate at all** (verified: no `ContextState` /
+`archived` reference anywhere in `kj/drive.rs`). Label resolution already
+filters archived rows, but `KernelDb::resolve_context` parses a **full UUID
+first** through `get_context`, which has *no* `archived_at` filter
+(`kernel_db.rs:2308-2315`) — so `kj drive <full-uuid>` drives an archived
+context today. That becomes live the moment the sweep archives 152 of them,
+and it is worse than wasted tokens: archived contexts are *retained work* kept
+for referential integrity, later search, and research, so driving one mutates
+the record we are preserving. **Refuse drive on archived contexts, loudly.**
+Cheap, deterministic, no estimation — do this one first.
+
+**Cold-cache suppression** is the softer companion, and it is Amy's insight:
+kaijutsu contexts are designed to be always revivable from durable state,
+which is exactly what makes revival look *free* to anything that can request
+it. When the provider prompt cache has aged out, the next call reprocesses the
+whole conversation as a cache miss. Computable with **no new schema**:
+`context_usage.updated_at` is the wallclock of the last *completed LLM call*
+(`kernel_db.rs:624-635`) — the right clock, where `contexts.last_activity_at`
+reads falsely warm because any block write touches it — measured against the
+shortest `cache_breakpoints` TTL (`kj/cache.rs:138-141`; ephemeral ≈5m,
+extended ≈1h), with `cache_read_tokens > 0` as corroboration. Conservative
+edges on purpose: no breakpoints or no usage row means there is no cache to
+lose, so do not suppress — that is an ordinary cold call.
+
+Refusals must be **loud** (a silently-dropped escalation is the
+silent-fallback shape CLAUDE.md rejects), and there should be a way to
+*insist*, because cold-cache is a cost signal, not a correctness one.
+
+*"KV" in this entry means the model's attention/prompt cache — not the kernel
+key-value store demolished 2026-07-04.*
 - **rc lifecycle identity smear — blocks a drift rc script writes are
   attributed to the *sender*.** `run_kai_script` materializes the rc kaish
   with `principal = caller.principal_id` (`kj/lifecycle.rs:376,388`) — the
