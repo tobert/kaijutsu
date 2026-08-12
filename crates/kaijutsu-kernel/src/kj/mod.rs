@@ -566,23 +566,54 @@ impl KjDispatcher {
                  this verb requires the '{label}' capability"
             )));
         };
-        let allowed = self
-            .kernel_db()
+        // Three outcomes, kept distinct on purpose. The old `.ok().flatten()`
+        // collapsed them: a KernelDb read *failure* became indistinguishable
+        // from an ordinary missing grant, which is the same defect
+        // `Broker::binding_checked` already fixed — this was the remaining
+        // copy. And every denial pointed at `kj binding allow`, a door that is
+        // locked for exactly the caller who lands here:
+        // `binding::authorize_binding_write` refuses widening from any caller
+        // that is neither privileged nor binding-admin.
+        match self.kernel_db().lock().get_context_binding(ctx) {
+            Err(e) => Err(KjResult::Err(format!(
+                "kj {verb}: denied — authorization unavailable for context {}: {e}. \
+                 This is a KernelDb read failure, not a missing grant: the loadout \
+                 could not be read at all, so deny-by-default applies.",
+                ctx.short()
+            ))),
+            // No row and a row that grants nothing are the same *outcome* —
+            // no usable loadout — so they get the same answer. Gate on the
+            // outcome, never on which rc script failed to produce it.
+            Ok(None) => Err(unbound_denial(verb, ctx, "has no loadout", &label)),
+            Ok(Some(b)) if b.is_empty() => {
+                Err(unbound_denial(verb, ctx, "holds an empty loadout", &label))
+            }
+            Ok(Some(b)) if b.allows(&cap) => Ok(()),
+            Ok(Some(_)) => Err(KjResult::Err(format!(
+                "kj {verb}: denied — context {ctx_short} lacks the '{label}' capability. \
+                 A context cannot widen its own loadout: grant it from a binding-admin \
+                 context with `kj binding allow \"{label}\" {ctx_short}`.",
+                ctx_short = ctx.short()
+            ))),
+        }
+    }
+
+    /// "Did this context end up with a usable loadout?" — the outcome question
+    /// `kj context create` reports on and `kj context rebind` gates on.
+    ///
+    /// A missing binding row and a row that grants nothing answer the same: no.
+    /// That is deliberate. Keying on *which rc script failed* instead would
+    /// hard-code rc layout into the kernel and would miss the second case — a
+    /// binding step that ran to completion and bound nothing.
+    ///
+    /// A DB read failure is an error, never a `false`: "we could not tell" and
+    /// "it has none" are different answers and callers must not conflate them.
+    pub(crate) fn has_usable_loadout(&self, ctx: ContextId) -> Result<bool, String> {
+        self.kernel_db()
             .lock()
             .get_context_binding(ctx)
-            .ok()
-            .flatten()
-            .map(|b| b.allows(&cap))
-            .unwrap_or(false);
-        if allowed {
-            Ok(())
-        } else {
-            Err(KjResult::Err(format!(
-                "kj {verb}: denied — context {} lacks the '{label}' capability \
-                 (grant with `kj binding allow \"{label}\"`)",
-                ctx.short()
-            )))
-        }
+            .map(|b| b.is_some_and(|b| !b.is_empty()))
+            .map_err(|e| e.to_string())
     }
 
     /// Summarize a context's blocks via LLM.
@@ -701,6 +732,29 @@ impl KjDispatcher {
                 )
             })
     }
+}
+
+/// The denial a context with no usable loadout gets — the state an rc `create`
+/// lifecycle leaves behind when its binding step fails (or succeeds without
+/// binding anything). Such a context is inert: deny-by-default grants it
+/// nothing, and it cannot widen itself.
+///
+/// It is *not* locked in, and the point of this message is to say so. Reading
+/// and navigation stay ungated by design (`kj/context.rs`), so the escape is
+/// always available and the Error blocks explaining the failure are always
+/// readable in place. Before this existed the exit was oral tradition and the
+/// denial pointed at `kj binding allow`, which this caller can never use.
+fn unbound_denial(verb: &str, ctx: ContextId, state: &str, label: &str) -> KjResult {
+    KjResult::Err(format!(
+        "kj {verb}: denied — context {ctx_short} {state}: its rc create lifecycle \
+         did not bind it, so it grants nothing (including the '{label}' capability \
+         this verb needs) and cannot widen itself. \
+         Read this context's Error blocks for why it failed. \
+         Repair: `kj context rebind`. Or leave it: `kj context create <label-of-new>` \
+         then `kj context switch <label-of-new>` (both ungated), and \
+         `kj context remove {ctx_short}` from there.",
+        ctx_short = ctx.short()
+    ))
 }
 
 /// Render the auto-generated clap help text for a parser without going
@@ -1234,6 +1288,172 @@ mod help_footgun_tests {
         assert!(
             created.is_some(),
             "`kj context create --name help` should mint a context labelled 'help'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod require_cap_outcome_tests {
+    //! The authz gate has three outcomes and they must stay three.
+    //!
+    //! `require_cap` used to collapse them with `.ok().flatten()`: a KernelDb
+    //! read *failure* was indistinguishable from an ordinary missing grant, and
+    //! every denial advised `kj binding allow` — a door
+    //! `binding::authorize_binding_write` holds shut against exactly the caller
+    //! who reads the message (widening needs privileged or binding-admin).
+    //! Each test below fails if one of those distinctions collapses again.
+
+    use super::test_helpers::*;
+    use super::*;
+    use crate::mcp::{Capability, ContextToolBinding};
+
+    fn denial(result: Result<(), KjResult>) -> String {
+        match result {
+            Ok(()) => panic!("expected a denial, got Ok"),
+            Err(k) => k.message().to_string(),
+        }
+    }
+
+    /// "We could not read the loadout" must never be phrased as "you lack the
+    /// capability" — the operator would go hunting for a grant that isn't the
+    /// problem while a DB fault goes unreported.
+    #[tokio::test]
+    async fn db_read_failure_does_not_masquerade_as_a_missing_grant() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("poisoned"), None, PrincipalId::new());
+        // Drop a binding detail table out from under a context that still has
+        // its parent row, so `get_context_binding` fails partway through.
+        d.kernel_db()
+            .lock()
+            .poison_context_binding_detail_table_for_test()
+            .expect("poison the binding detail table");
+
+        let msg = denial(d.require_cap(&caller_with_context(ctx), Capability::Operator, "test"));
+        assert!(
+            msg.contains("authorization unavailable"),
+            "a DB read failure should say so: {msg}"
+        );
+        assert!(
+            !msg.contains("lacks the"),
+            "a DB failure must not read as a missing grant: {msg}"
+        );
+        assert!(
+            !msg.contains("no loadout"),
+            "a DB failure must not read as an unbound context: {msg}"
+        );
+    }
+
+    /// The locked-door regression: an unbound context cannot widen itself, so
+    /// the denial must name the exits that are actually ungated.
+    #[tokio::test]
+    async fn unbound_context_is_told_an_exit_that_works() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("unbound"), None, PrincipalId::new());
+        d.kernel_db()
+            .lock()
+            .delete_context_binding(ctx)
+            .expect("delete the binding row");
+
+        let msg = denial(d.require_cap(&caller_with_context(ctx), Capability::Operator, "test"));
+        assert!(msg.contains("no loadout"), "should name the state: {msg}");
+        assert!(
+            msg.contains("'operator' capability"),
+            "should still name the capability the verb needed: {msg}"
+        );
+        assert!(
+            msg.contains("kj context rebind"),
+            "should offer the repair: {msg}"
+        );
+        assert!(
+            msg.contains("kj context switch"),
+            "should offer the ungated exit: {msg}"
+        );
+        assert!(
+            !msg.contains("kj binding allow"),
+            "this caller can never widen itself — advising it is the bug: {msg}"
+        );
+    }
+
+    /// Outcome, not row presence: a binding row that grants nothing leaves the
+    /// context every bit as inert as a missing row, and gets the same answer.
+    #[tokio::test]
+    async fn empty_binding_reads_as_unbound_not_as_a_missing_grant() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("empty"), None, PrincipalId::new());
+        d.kernel_db()
+            .lock()
+            .upsert_context_binding(ctx, &ContextToolBinding::new())
+            .expect("write an empty binding");
+
+        let msg = denial(d.require_cap(&caller_with_context(ctx), Capability::Operator, "test"));
+        assert!(
+            msg.contains("empty loadout") && msg.contains("kj context rebind"),
+            "an empty loadout is the same outcome as none: {msg}"
+        );
+    }
+
+    /// A context that *is* bound but lacks one capability is a different case:
+    /// it keeps the capability-named denial, but the remedy is routed to a
+    /// binding-admin context, because no context may widen itself.
+    #[tokio::test]
+    async fn bound_context_missing_one_cap_is_pointed_at_a_binding_admin() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("narrow"), None, PrincipalId::new());
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::AllInstances); // non-empty, but no `operator`
+        d.kernel_db()
+            .lock()
+            .upsert_context_binding(ctx, &binding)
+            .expect("write a narrow binding");
+
+        let msg = denial(d.require_cap(&caller_with_context(ctx), Capability::Operator, "test"));
+        assert!(
+            msg.contains("lacks the 'operator' capability"),
+            "should still name the missing capability: {msg}"
+        );
+        assert!(
+            msg.contains("binding-admin"),
+            "the remedy belongs to a binding-admin context: {msg}"
+        );
+        assert!(
+            !msg.contains("no loadout") && !msg.contains("empty loadout"),
+            "a bound context is not the unbound case: {msg}"
+        );
+    }
+
+    /// The gate still passes what it should — these messages are only reached
+    /// on denial.
+    #[tokio::test]
+    async fn a_granted_capability_still_passes() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("granted"), None, PrincipalId::new());
+        assert!(
+            d.require_cap(&caller_with_context(ctx), Capability::Operator, "test")
+                .is_ok(),
+            "register_context grants operator"
+        );
+    }
+
+    /// `has_usable_loadout` answers "we could not tell" as an error, never as a
+    /// `false` — `kj context rebind` gates on it, and a DB fault must not look
+    /// like an invitation to re-run the create lifecycle.
+    #[tokio::test]
+    async fn has_usable_loadout_reports_db_failure_rather_than_false() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("poisoned"), None, PrincipalId::new());
+        assert_eq!(
+            d.has_usable_loadout(ctx),
+            Ok(true),
+            "the seeded test loadout is usable"
+        );
+
+        d.kernel_db()
+            .lock()
+            .poison_context_binding_detail_table_for_test()
+            .expect("poison the binding detail table");
+        assert!(
+            d.has_usable_loadout(ctx).is_err(),
+            "a DB read failure is not the same answer as 'has no loadout'"
         );
     }
 }

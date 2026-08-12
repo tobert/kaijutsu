@@ -1234,3 +1234,62 @@ commit in a worktree and run there, where it failed identically — so it went
 into the backlog as a pre-existing drift-lane regression with proof, rather
 than as a suspicion. Inference would have reached the same answer here.
 Sooner or later it won't, and the worktree costs two minutes.
+
+## The denial that pointed at a locked door (August 12)
+
+The sharpest item in the kernel backlog had been sitting there since the
+task_status boot flood in early August, wearing a description that was
+wrong. When a context's `create` rc lifecycle failed at its binding step,
+the context was created anyway, holding nothing — and the entry called that
+a total lockout. It isn't. `kj context switch` and every read verb are
+ungated *by design*, and the code says so in as many words, so the operator
+can always walk out of a broken context and can always read the Error blocks
+the failed lifecycle left behind. Diagnosis works. Only action is blocked.
+
+Amy's question was the one that unlocked it: **when would `create` actually
+need to abort?** Almost never, it turns out. A failed stance script costs a
+system prompt; a failed cache script costs tokens; only the binding step
+leaves something inert. And even there, a freshly-created context holds
+nothing worth saving, so abort and create-then-discard cost about the same.
+The case for aborting was ergonomic, not safety — and aborting has a cost
+the bug doesn't: it destroys the Error blocks that explain *why*, which is
+the one part of the story that currently works.
+
+Reading the gate turned up something sharper than the entry recorded. The
+denial didn't merely fail to mention the exit; it advised one that was
+locked. Every refusal ended with *grant with `kj binding allow`*, and the
+binding-write authorizer refuses widening from any caller that is neither
+privileged nor binding-admin — which is exactly the caller reading the
+message. Underneath it, the same line was collapsing a KernelDb read
+*failure* into "denied," so a database fault and a missing grant were the
+same sentence. That is the August 3–4 lesson resurfacing in authz clothes,
+in the one copy of it the broker's fix hadn't reached. And a third: a failed
+lifecycle was a `tracing::warn!` under a plain "created context" success
+line, so the operator was told it worked and found out at their first real
+verb.
+
+So the fix came in two halves that meet. The gate now has three outcomes
+and keeps them three — DB failure, no usable loadout, missing capability —
+and the unbound case names exits that exist: `kj context rebind`, or
+create-switch-remove, which had worked all along as oral tradition and was
+written down nowhere. Creation stays un-aborted and simply stops lying,
+reporting the outcome it produced. And `kj context rebind` re-runs the
+`create` lifecycle on a context that has none, ungated on precisely the
+argument that leaves `create` ungated: the loadout comes from rc, not from
+the caller, so a rebind grants what birth would have granted and nothing
+else. Gating it on `Operator` would have put the repair behind a capability
+the broken context cannot hold — the lockout itself, rebuilt as a feature.
+
+Both halves gate on the *outcome* — "does this context have a usable
+loadout?" — never on which script failed. Keying on script identity would
+hard-code rc layout into the kernel and would miss the quieter case: a
+binding step that ran to completion and bound nothing. The test that matters
+most is the one asserting `rebind` is not capability-gated, because that is
+the decision a future refactor is most likely to undo while tidying.
+
+One test earned its keep by failing for an honest reason. The repair test's
+rc script reported success while the loadout stayed empty: `test_dispatcher`
+leaves the broker's DB handle unset, so `kj binding allow` had written to a
+cache the authorization path never reads. Wiring the handle as production
+does made the test faithful — and made the fixture's own gap visible instead
+of letting a green run paper over it.

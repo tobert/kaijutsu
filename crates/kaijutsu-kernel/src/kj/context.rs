@@ -108,6 +108,10 @@ enum ContextCommand {
     /// Get-or-create the well-known "scratch" context.
     #[command(alias = "self")]
     Scratch,
+    /// Re-run the `create` rc lifecycle on a context left with no usable
+    /// loadout — the repair for a create-time rc failure (default: current).
+    /// Refuses a context that already has a loadout.
+    Rebind { context: Option<String> },
     /// Apply settable config to an existing context (default: current).
     Set {
         context: Option<String>,
@@ -405,6 +409,14 @@ impl KjDispatcher {
         // its first context), and the new context's loadout is assigned by its
         // rc `create` lifecycle, not the caller's. Read/navigation verbs
         // (list/info/current/switch/log) stay ungated too.
+        //
+        // `rebind` is ungated on that same argument, and must stay that way: it
+        // re-runs the rc lifecycle that assigns loadouts, so it grants exactly
+        // what birth would have and nothing the caller chose. Gating it on
+        // `Operator` would put the repair for a no-loadout context behind a
+        // capability that exact context cannot hold — the lockout it exists to
+        // undo. Its own guards (no usable loadout, not archived) are in
+        // `context_rebind`.
         if matches!(
             parsed.command,
             ContextCommand::Set { .. }
@@ -446,6 +458,9 @@ impl KjDispatcher {
                 .await
             }
             ContextCommand::Scratch => self.context_scratch(caller).await,
+            ContextCommand::Rebind { context } => {
+                self.context_rebind(context.as_deref(), caller).await
+            }
             ContextCommand::Set { context, config } => {
                 self.context_set(context.as_deref(), config.into(), caller).await
             }
@@ -1152,7 +1167,10 @@ impl KjDispatcher {
         };
 
         // Run rc create-lifecycle scripts. Failures surface as Error
-        // blocks in the new context — they don't abort context creation.
+        // blocks in the new context — they don't abort context creation
+        // (Amy, 2026-08-12: a fresh context holds nothing worth saving, so
+        // aborting buys little and destroys the Error blocks that explain the
+        // failure; `kj context rebind` is the repair).
         if let Err(e) = self
             .run_rc_lifecycle("create", new_id, parent_id, None, None, caller)
             .await
@@ -1167,7 +1185,130 @@ impl KjDispatcher {
         if !config_changes.is_empty() {
             msg.push_str(&format!(" [{}]", config_changes.join(", ")));
         }
+        // Report the *outcome*, not just the log line. A failed lifecycle used
+        // to be a `tracing::warn!` under a plain success message — the operator
+        // was told creation worked and only found out when the new context
+        // refused its first real verb.
+        match self.has_usable_loadout(new_id) {
+            Ok(true) => {}
+            Ok(false) => msg.push_str(
+                " — WARNING: its rc create lifecycle left it with no loadout, so it \
+                 is inert (deny-by-default) and cannot widen itself. \
+                 Read its Error blocks for why, then `kj context rebind` to repair.",
+            ),
+            Err(e) => msg.push_str(&format!(
+                " — WARNING: could not read back its loadout to confirm the rc create \
+                 lifecycle bound it: {e}"
+            )),
+        }
         KjResult::ok(msg)
+    }
+
+    /// `kj context rebind [<ctx>]` — re-run the `create` rc lifecycle against a
+    /// context that has no usable loadout. The repair half of the create-time
+    /// rc failure recorded in `docs/issues.md`.
+    ///
+    /// Amy ruled (2026-08-12) against aborting creation when the lifecycle
+    /// fails: a fresh context holds nothing worth saving, and aborting would
+    /// destroy the Error blocks that explain *why* it failed — the one part of
+    /// diagnosis that works today, since reading stays ungated. So creation
+    /// still succeeds, loudly, and this verb repairs the result.
+    ///
+    /// **Ungated on the same argument that leaves `create` ungated** (see
+    /// `dispatch_context`): the loadout comes from the rc lifecycle, not from
+    /// the caller, so a rebind grants exactly what birth would have granted and
+    /// nothing the caller picked. The guards below are what keep it a *repair*
+    /// rather than a general "re-run rc" button:
+    ///
+    /// * **no usable loadout** — gating on the outcome, not on which script
+    ///   failed, catches both a binding step that errored and one that ran and
+    ///   bound nothing. It also stops a warm context from re-running `create`
+    ///   scripts, which are not idempotent (`S00-stance` appends a stance,
+    ///   `S20-arm` arms a beat).
+    /// * **not archived** — archived contexts are retained work, inert by
+    ///   design; unarchive first if a repair is really wanted.
+    ///
+    /// A context that fails the read-back afterwards is reported as a failure,
+    /// not as a cheerful success: the binding step is still broken and the
+    /// operator needs to know that before they try to use the context.
+    async fn context_rebind(&self, target_arg: Option<&str>, caller: &KjCaller) -> KjResult {
+        let row = {
+            let db = self.kernel_db().lock();
+            let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context rebind: {e}")),
+            };
+            match db.get_context(target_id) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return KjResult::Err(format!(
+                        "kj context rebind: context {} not found",
+                        target_id.short()
+                    ));
+                }
+                Err(e) => return KjResult::Err(format!("kj context rebind: {e}")),
+            }
+        };
+        let target_id = row.context_id;
+
+        // `archived_at` is authoritative for archived-ness per `ContextState`'s
+        // own doc comment, so check it ahead of the enum (as `kj drive` does).
+        if row.archived_at.is_some() || row.context_state == ContextState::Archived {
+            return KjResult::Err(format!(
+                "kj context rebind: context {} is archived — archived contexts are \
+                 retained work, inert by design; unarchive it first if it really \
+                 needs a loadout",
+                target_id.short()
+            ));
+        }
+
+        match self.has_usable_loadout(target_id) {
+            Ok(false) => {}
+            Ok(true) => {
+                return KjResult::Err(format!(
+                    "kj context rebind: context {} already has a loadout — nothing to \
+                     repair. Rebind is not a way to re-run `create` scripts on a warm \
+                     context; they append stances and arm beats, and are not idempotent.",
+                    target_id.short()
+                ));
+            }
+            Err(e) => {
+                return KjResult::Err(format!(
+                    "kj context rebind: could not read context {}'s loadout, so there is \
+                     no way to tell a repair from a re-run — refusing rather than \
+                     guessing: {e}",
+                    target_id.short()
+                ));
+            }
+        }
+
+        if let Err(e) = self
+            .run_rc_lifecycle("create", target_id, row.forked_from, None, None, caller)
+            .await
+        {
+            return KjResult::Err(format!("kj context rebind: rc create lifecycle: {e}"));
+        }
+
+        // Individual script failures land as Error blocks rather than an Err
+        // from the lifecycle, so the read-back is what actually says whether the
+        // repair took.
+        match self.has_usable_loadout(target_id) {
+            Ok(true) => KjResult::ok(format!(
+                "rebound context {} — the rc create lifecycle assigned it a loadout",
+                target_id.short()
+            )),
+            Ok(false) => KjResult::Err(format!(
+                "kj context rebind: the rc create lifecycle ran but context {} still has \
+                 no loadout — its binding step is still failing. Read the context's \
+                 Error blocks for the reason.",
+                target_id.short()
+            )),
+            Err(e) => KjResult::Err(format!(
+                "kj context rebind: lifecycle ran, but reading context {}'s loadout back \
+                 failed, so the repair is unconfirmed: {e}",
+                target_id.short()
+            )),
+        }
     }
 
     /// `kj context scratch` — get-or-create the well-known "scratch"
@@ -4338,6 +4479,184 @@ mod tests {
             result.message().contains("staging"),
             "refusal should name staging as the reason: {}",
             result.message()
+        );
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    //! `kj context rebind` — the repair half of the create-time rc failure in
+    //! `docs/issues.md`. Creation deliberately still succeeds when its rc
+    //! lifecycle fails (Amy, 2026-08-12: a fresh context holds nothing worth
+    //! saving, and aborting would destroy the Error blocks that explain the
+    //! failure), so this verb has to be able to fix the result afterwards.
+
+    use crate::kj::KjCaller;
+    use crate::kj::test_helpers::*;
+    use kaijutsu_types::PrincipalId;
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    /// **The decision this test exists to protect.** `rebind` must not be
+    /// Operator-gated: that would put the repair behind a capability the broken
+    /// context cannot hold, which is precisely the lockout it undoes. Here the
+    /// caller *is* the unbound context, and the refusal it gets must be about
+    /// the outcome, never about authorization.
+    #[tokio::test]
+    async fn rebind_is_ungated_so_an_unbound_context_can_invoke_it() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("inert"), None, PrincipalId::new());
+        d.kernel_db()
+            .lock()
+            .delete_context_binding(ctx)
+            .expect("delete the binding row");
+
+        let result = d
+            .dispatch(&[s("context"), s("rebind")], &caller_with_context(ctx))
+            .await;
+
+        // This dispatcher has no rc scripts, so the repair cannot actually
+        // succeed — the point is *which* failure comes back.
+        let msg = result.message();
+        assert!(
+            !msg.contains("denied"),
+            "rebind must never be capability-gated: {msg}"
+        );
+        assert!(
+            msg.contains("still has no loadout"),
+            "the refusal should report the outcome: {msg}"
+        );
+    }
+
+    /// The happy path: an unbound context re-runs its `create` lifecycle and
+    /// comes back bound. The rc script is what grants — the caller never picks.
+    #[tokio::test]
+    async fn rebind_repairs_an_unbound_context_by_rerunning_create() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc(); // .kai scripts reach the `kj` builtin through this
+        // Production wiring: the broker persists `set_binding` through to
+        // KernelDb, which is the authoritative store `has_usable_loadout` and
+        // `require_cap` read. `test_dispatcher` leaves that handle unset, so
+        // without this the rc script's `kj binding allow` would touch only the
+        // in-memory cache and the repair could never be observed.
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        install_rc_script_file(
+            &d,
+            "/etc/rc/test/create/S10-binding.kai",
+            "kj binding allow operator",
+        )
+        .await;
+
+        let ctx = register_context(&d, Some("broken"), None, PrincipalId::new());
+        d.kernel_db()
+            .lock()
+            .update_context_type(ctx, "test")
+            .expect("update_context_type");
+        d.kernel_db()
+            .lock()
+            .delete_context_binding(ctx)
+            .expect("delete the binding row");
+        assert_eq!(
+            d.has_usable_loadout(ctx),
+            Ok(false),
+            "precondition: the context starts inert"
+        );
+
+        let result = d
+            .dispatch(&[s("context"), s("rebind")], &caller_with_context(ctx))
+            .await;
+        let blocks: Vec<String> = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| b.content)
+            .collect();
+        assert!(
+            result.is_ok(),
+            "rebind should repair: {} (blocks: {blocks:?})",
+            result.message()
+        );
+        assert_eq!(
+            d.has_usable_loadout(ctx),
+            Ok(true),
+            "the rc create lifecycle should have bound it"
+        );
+    }
+
+    /// Guarding on the outcome is what keeps this a repair instead of a general
+    /// "re-run rc" button: `create` scripts append stances and arm beats, and
+    /// are not idempotent.
+    #[tokio::test]
+    async fn rebind_refuses_a_context_that_already_has_a_loadout() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("warm"), None, PrincipalId::new());
+
+        let result = d
+            .dispatch(&[s("context"), s("rebind")], &caller_with_context(ctx))
+            .await;
+        assert!(!result.is_ok(), "a bound context has nothing to repair");
+        assert!(
+            result.message().contains("already has a loadout"),
+            "refusal should say why: {}",
+            result.message()
+        );
+    }
+
+    /// Archived contexts are retained work, inert by design — not a repair
+    /// target. (`archived_at` is authoritative for archived-ness.)
+    #[tokio::test]
+    async fn rebind_refuses_an_archived_context() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("archived"), None, PrincipalId::new());
+        d.kernel_db()
+            .lock()
+            .delete_context_binding(ctx)
+            .expect("delete the binding row");
+        d.kernel_db()
+            .lock()
+            .archive_context(ctx)
+            .expect("archive the context");
+
+        let result = d
+            .dispatch(&[s("context"), s("rebind")], &caller_with_context(ctx))
+            .await;
+        assert!(!result.is_ok(), "an archived context must not be rebound");
+        assert!(
+            result.message().contains("archived"),
+            "refusal should name archival as the reason: {}",
+            result.message()
+        );
+    }
+
+    /// Creation stays truthful: when the rc lifecycle leaves the new context
+    /// with no loadout, the success line says so instead of reporting a clean
+    /// birth the operator only discovers is broken at their first real verb.
+    #[tokio::test]
+    async fn create_reports_a_context_its_rc_left_unbound() {
+        let d = test_dispatcher().await;
+        // An unjoined caller: `create` without `--parent` then resolves the
+        // parent to None rather than the caller's fake context id (which would
+        // trip the `forked_from` foreign key).
+        let caller = KjCaller {
+            context_id: None,
+            ..test_caller()
+        };
+        // No rc scripts are installed here, so nothing binds the new context.
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("fresh")], &caller)
+            .await;
+        assert!(result.is_ok(), "create still succeeds: {}", result.message());
+        let msg = result.message();
+        assert!(
+            msg.contains("created context 'fresh'"),
+            "the creation itself is still reported: {msg}"
+        );
+        assert!(
+            msg.contains("no loadout") && msg.contains("kj context rebind"),
+            "an unbound outcome must be reported with its repair: {msg}"
         );
     }
 }
