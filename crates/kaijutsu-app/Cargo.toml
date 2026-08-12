@@ -25,13 +25,18 @@ kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true
 
 # Direct rodio dep (docs/pcm.md R5 — the app owns rodio outright, decided
-# 2026-07-16): `audio_sched.rs`'s scheduler thread builds the `OutputStream`
+# 2026-07-16): `audio_sched.rs`'s scheduler thread builds the `MixerDeviceSink`
 # and decodes/trims/gains samples; bevy_audio no longer plays anything
 # (main.rs disables `AudioPlugin`). "wav" + "vorbis" match what bevy_audio's
 # "wav" feature + bevy's default "vorbis" used to decode — same formats, one
-# fewer layer. bevy still pulls rodio 0.20 transitively (see the `bevy` dep
-# comment below); same semver range, so cpal/rodio dedupe to one copy.
-rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
+# fewer layer. 0.22's cpal support moved behind an opt-in "playback" feature
+# (it was a hard dependency under 0.20), so it must be listed explicitly
+# alongside "wav"/"vorbis" now that default-features is off, or the whole
+# `stream` module and device output vanish. We are on 0.22 ahead of Bevy
+# (0.18's bevy_audio still wants rodio ^0.20, so this is a deliberate second
+# copy in the dep tree until Bevy 0.19 brings bevy_audio onto rodio ^0.22 and
+# restores the single-copy dedupe).
+rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "vorbis"] }
 
 # kaish (for syntax validation)
 kaish-kernel.workspace = true

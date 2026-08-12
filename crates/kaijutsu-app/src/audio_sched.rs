@@ -5,12 +5,13 @@
 //! is the ONE path for ALL sample playback from here on — play-now and
 //! scheduled/trimmed/gained are the same mechanism, never two.
 //!
-//! rodio 0.20's `OutputStream` (and the `cpal::Stream` it wraps) is `!Send`,
-//! so it is built and lives entirely on ONE dedicated `std::thread` —
-//! [`run`] — and never touches Bevy's main thread. Bevy systems in
-//! `audio.rs` never see rodio types at all: they compute a deadline (via
-//! [`effective_deadline`]) and send a [`SchedulerCmd`] over a crossbeam
-//! channel; everything rodio-shaped lives from [`spawn`] down.
+//! rodio 0.22's `MixerDeviceSink` (built via `DeviceSinkBuilder`, and the
+//! `cpal::Stream` it wraps) is `!Send`, so it is built and lives entirely on
+//! ONE dedicated `std::thread` — [`run`] — and never touches Bevy's main
+//! thread. Bevy systems in `audio.rs` never see rodio types at all: they
+//! compute a deadline (via [`effective_deadline`]) and send a
+//! [`SchedulerCmd`] over a crossbeam channel; everything rodio-shaped lives
+//! from [`spawn`] down.
 //!
 //! [`backdated_lead`]/[`effective_deadline`] mirror `midi.rs::backdate_events`'s
 //! epoch-backdating discipline (`docs/midi.md` "The one timebase") collapsed
@@ -18,14 +19,14 @@
 //! of MIDI events) has no event list to partially drop — it either fires
 //! now, fires later, or the whole cue is rejected as too stale to trust.
 //!
-//! Testability (the house TDD rule): only [`OutputStream::try_default`] and
-//! the eventual `Sink::append` genuinely need a live audio device — everything
-//! else (the backdating ladder, the deadline-ordered pending queue, decoding
-//! + trim + gain) is plain data and pure functions, exercised without one.
-//! [`build_source`] and [`handle_cmd`] both work fine with `output: None`
-//! (the graceful no-device path this module already needs for a headless
-//! box), so unit tests drive them directly; only the literal thread-plus-device
-//! smoke test at the bottom is `#[ignore]`d.
+//! Testability (the house TDD rule): only [`DeviceSinkBuilder::open_default_sink`]
+//! and the eventual `Player::append` genuinely need a live audio device —
+//! everything else (the backdating ladder, the deadline-ordered pending
+//! queue, decoding + trim + gain) is plain data and pure functions,
+//! exercised without one. [`build_source`] and [`handle_cmd`] both work fine
+//! with `output: None` (the graceful no-device path this module already
+//! needs for a headless box), so unit tests drive them directly; only the
+//! literal thread-plus-device smoke test at the bottom is `#[ignore]`d.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::Resource;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source, decoder::DecoderError};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source, decoder::DecoderError};
 use tracing::warn;
 
 use kaijutsu_audio::{REF_STALE_MAX, stamp_age};
@@ -112,11 +113,11 @@ impl AudioSchedulerHandle {
 }
 
 /// Spawn the scheduler thread and return the Bevy-side handle. Building the
-/// `OutputStream` happens ON the new thread (rodio 0.20's `OutputStream` is
-/// `!Send` — it cannot be built here and handed over). A missing/broken audio
-/// device degrades gracefully: [`run`] warns once and keeps draining commands
-/// so a headless box neither wedges nor crashes the app, matching
-/// `midi.rs`'s no-ALSA posture.
+/// `MixerDeviceSink` happens ON the new thread (rodio 0.22's
+/// `MixerDeviceSink` is `!Send` — it cannot be built here and handed over).
+/// A missing/broken audio device degrades gracefully: [`run`] warns once and
+/// keeps draining commands so a headless box neither wedges nor crashes the
+/// app, matching `midi.rs`'s no-ALSA posture.
 pub(crate) fn spawn() -> AudioSchedulerHandle {
     let (tx, rx) = unbounded();
     std::thread::Builder::new()
@@ -269,12 +270,17 @@ fn drain_ready<T>(heap: &mut BinaryHeap<Scheduled<T>>, now: Instant) -> Vec<T> {
 
 // ── Decode + trim + gain (needs no audio device — just bytes) ─────────────
 
-type BoxedSource = Box<dyn Source<Item = i16> + Send>;
+// rodio 0.21+ fixed `Source`'s associated `Item` to `Sample` (`f32` unless
+// the `64bit` feature is on, which this crate doesn't enable) — `Decoder`
+// no longer yields `i16` like it did under 0.20, and the `Source` trait
+// itself is no longer generic over the sample type, so there is nothing to
+// name here beyond `Send`.
+type BoxedSource = Box<dyn Source + Send>;
 
 /// Decode `bytes`, apply the clip source-range + gain, and box it — the
 /// "decode ahead of the deadline" step (`docs/pcm.md` R5): this runs off the
 /// scheduler thread's hot loop as soon as a `PlayAt` command arrives, so the
-/// eventual `sink.append` at the deadline is just a queue push, never a
+/// eventual `player.append` at the deadline is just a queue push, never a
 /// decode. Needs no audio device: `Decoder::new` only parses bytes.
 fn build_source(
     bytes: Vec<u8>,
@@ -297,25 +303,19 @@ fn build_source(
 
 // ── The thread body ─────────────────────────────────────────────────────
 
-/// Build (or fail to build) an output stream, append `source` through a
-/// fresh `Sink`, and track it in `live` for [`handle_cmd`]'s `Flush` arm to
-/// stop later. `output: None` (no device) degrades silently past this point —
-/// warned once at [`run`]'s startup, not per-cue.
-fn fire(
-    source: BoxedSource,
-    output: Option<&(OutputStream, OutputStreamHandle)>,
-    live: &mut Vec<Sink>,
-) {
-    let Some((_, handle)) = output else {
+/// Build (or fail to build) a player against the shared mixer, append
+/// `source` through it, and track it in `live` for [`handle_cmd`]'s `Flush`
+/// arm to stop later. `output: None` (no device) degrades silently past this
+/// point — warned once at [`run`]'s startup, not per-cue. `Player::connect_new`
+/// is infallible (unlike 0.20's `Sink::try_new`), so there is no error arm
+/// here anymore.
+fn fire(source: BoxedSource, output: Option<&MixerDeviceSink>, live: &mut Vec<Player>) {
+    let Some(device) = output else {
         return;
     };
-    match Sink::try_new(handle) {
-        Ok(sink) => {
-            sink.append(source);
-            live.push(sink);
-        }
-        Err(e) => warn!("kaijutsu-audio-sched: sink creation failed: {e}"),
-    }
+    let player = Player::connect_new(device.mixer());
+    player.append(source);
+    live.push(player);
 }
 
 /// Apply one command against the scheduler's state. Pure enough to unit-test
@@ -323,9 +323,9 @@ fn fire(
 /// rodio's device-dependent bits unless `output` is `Some`.
 fn handle_cmd(
     cmd: SchedulerCmd,
-    output: Option<&(OutputStream, OutputStreamHandle)>,
+    output: Option<&MixerDeviceSink>,
     pending: &mut BinaryHeap<Scheduled<BoxedSource>>,
-    live: &mut Vec<Sink>,
+    live: &mut Vec<Player>,
     next_seq: &mut u64,
 ) {
     match cmd {
@@ -363,8 +363,8 @@ fn handle_cmd(
         }
         SchedulerCmd::Flush => {
             pending.clear();
-            for sink in live.drain(..) {
-                sink.stop();
+            for player in live.drain(..) {
+                player.stop();
             }
         }
     }
@@ -378,8 +378,8 @@ fn handle_cmd(
 /// separate unpark to wire up, and a timeout means it's time to fire
 /// whatever's ready.
 fn run(rx: Receiver<SchedulerCmd>) {
-    let output = match OutputStream::try_default() {
-        Ok(pair) => Some(pair),
+    let output = match DeviceSinkBuilder::open_default_sink() {
+        Ok(sink) => Some(sink),
         Err(e) => {
             warn!(
                 "kaijutsu-audio-sched: no audio output device ({e}); render cues will be drained \
@@ -389,13 +389,13 @@ fn run(rx: Receiver<SchedulerCmd>) {
         }
     };
     let mut pending: BinaryHeap<Scheduled<BoxedSource>> = BinaryHeap::new();
-    let mut live: Vec<Sink> = Vec::new();
+    let mut live: Vec<Player> = Vec::new();
     let mut next_seq: u64 = 0;
 
     loop {
         // Opportunistic pruning: cheap, and keeps `live` from growing
         // unbounded across a long session.
-        live.retain(|s| !s.empty());
+        live.retain(|p| !p.empty());
 
         let cmd = match pending.peek() {
             None => match rx.recv() {
@@ -667,7 +667,9 @@ mod tests {
             return;
         };
         let source = build_source(bytes, None, None, 0.0).expect("real WAV decodes");
-        assert!(source.channels() > 0);
+        // `channels()` returns `NonZero<u16>` as of rodio 0.21+ (was plain
+        // `u16` under 0.20) — `.get()` to compare against a bare literal.
+        assert!(source.channels().get() > 0);
     }
 
     #[test]
@@ -683,7 +685,7 @@ mod tests {
             -6.0,
         )
         .expect("decodes with trim + gain");
-        assert!(trimmed.channels() > 0);
+        assert!(trimmed.channels().get() > 0);
     }
 
     #[test]
@@ -697,10 +699,10 @@ mod tests {
 
     // ── handle_cmd: the state machine, exercised with output: None ────────
     //
-    // `output: None` never reaches `Sink::try_new`/`OutputStream` — only
-    // `run`'s `OutputStream::try_default()` call is genuinely device-bound,
-    // so all of this is real coverage of the decode/heap/flush bookkeeping
-    // without a device anywhere in the loop.
+    // `output: None` never reaches `Player::connect_new`/`MixerDeviceSink` —
+    // only `run`'s `DeviceSinkBuilder::open_default_sink()` call is
+    // genuinely device-bound, so all of this is real coverage of the
+    // decode/heap/flush bookkeeping without a device anywhere in the loop.
 
     #[test]
     fn play_now_with_no_device_decodes_but_plays_nothing() {
