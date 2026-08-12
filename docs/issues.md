@@ -2163,6 +2163,19 @@ Remaining, in order:
   binding/loadout (an ergonomic-nudge capability), not a new concept.
   **Blocked on the rc identity-smear fix below** — a driven turn must not be
   attributed to the sender's principal.
+  **General policy: `docs/drive-consent.md`** (Amy: drive it into code and
+  docs generally — it is not drift's question). Two gates, both required:
+  *consent* (per-context, defaulted per `context_type` via rc — musicians on,
+  coders maybe, everything else off) and *warmth* (suppress a drive when the
+  provider prompt cache has likely aged out, because our contexts are always
+  revivable from durable state, which makes an expensive full reprocess look
+  free). The warmth predicate is computable with **no new schema**:
+  `context_usage.updated_at` is the last completed LLM call — the right clock,
+  unlike `last_activity_at` which any block write touches — measured against
+  the shortest `cache_breakpoints` TTL (ephemeral ≈5m / extended ≈1h), with
+  `cache_read_tokens > 0` as corroboration. Both refusals must be **loud**,
+  and there should be a way to insist, since cold-cache is a cost signal not
+  a correctness one.
 - **rc lifecycle identity smear — blocks a drift rc script writes are
   attributed to the *sender*.** `run_kai_script` materializes the rc kaish
   with `principal = caller.principal_id` (`kj/lifecycle.rs:376,388`) — the

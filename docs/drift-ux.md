@@ -399,6 +399,12 @@ to mine.
 > we will also want a way for a context to be able to disable drive requests,
 > perhaps by default."
 
+**The general policy now lives in `docs/drive-consent.md`** — Amy asked for
+this to be "driven in to code and docs generally", because it is not drift's
+question. Drift's `--drive` is just the first caller; per-`context_type`
+defaults (musicians on) and the cold-prompt-cache suppression are described
+there. What follows is the drift-shaped summary.
+
 This is **shape A as the default with an explicit opt-in escalation**, plus a
 receiver-side veto the four shapes did not contain. Note what it is *not*:
 not shape C. C was rejected because a sender flag spending a receiver's tokens
