@@ -2414,10 +2414,30 @@ key-value store demolished 2026-07-04.*
   writes into the target context are authored by a foreign principal.
   Harmless while the shipped `drift` rc script only clears prompt cache.
   **Must be resolved before shape B ships an `S50-drive.kai`**, because then a
-  whole driven turn is attributed to the context that requested it rather than
-  to the context that ran it. Note it is not self-evidently a bug — "caused by
-  X" is arguably true — so the fix is a decision about whose name belongs on
-  work done on someone else's behalf, not a mechanical correction.
+  whole driven turn would be attributed to the context that requested it
+  rather than to the context that ran it.
+
+  **RESOLVED by Amy 2026-08-12** — "can the principal be set for the origin of
+  the drift just on the drift block? then the rest of the blocks in the
+  context would belong to the context owner imo." That is the right split, and
+  it answers the question this entry was stuck on (whose name belongs on work
+  done on another's behalf) by separating two things that were conflated:
+
+  - **The drift block carries its origin.** Author it as the *sending*
+    principal — that block genuinely came from elsewhere, and provenance is
+    what it is for.
+  - **Everything else belongs to the context owner.** rc scripts are the
+    context doing its own lifecycle work; that they were *triggered* from
+    outside does not make the resulting blocks foreign.
+
+  Implementable as-is, no new plumbing: `insert_drift_block_as` already takes
+  an explicit `Option<PrincipalId>` (`block_store.rs:3043-3052`) and the plain
+  `insert_drift_block` wrapper simply passes `None`
+  (`block_store.rs:3020-3040`), so the drift-block half is threading the
+  caller's principal through the four `kj/drift.rs` insert sites. The rc half
+  is `run_kai_script` taking the target's `ContextRow.created_by` instead of
+  `caller.principal_id` (`kj/lifecycle.rs:376,388`). Both want tests pinning
+  the authorship, since nothing asserts it today.
 - **Drift edge metadata is inconsistent across delivery paths.** Immediate
   push stamps `drift_kind.to_string()` (`"push"`, `kj/drift.rs:335`); flush
   stamps `format!("{kind}#{staged_id}")` (`"push#1"`, `:629`). So
