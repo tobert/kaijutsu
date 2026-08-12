@@ -76,6 +76,51 @@ impl KjDispatcher {
             }
         };
 
+        // Only a `Live` context may be driven. Nothing enforced this before,
+        // which mattered in two directions:
+        //
+        //  * `Archived` — reachable in practice, because label resolution
+        //    filters archived rows but `KernelDb::resolve_context` parses a
+        //    full UUID first through `get_context`, which does not. Archived
+        //    contexts are *retained work* (referential integrity, later
+        //    search, research), so driving one mutates the record we are
+        //    keeping. This went live the moment `session.end` began archiving.
+        //  * `Staging` — already documented as "LLM blocked" on
+        //    `ContextState` (post-fork curation, while `excluded` is still
+        //    being toggled); the doc comment simply had no enforcement.
+        //
+        // `Concluded` is refused for the same reason as archived, one step
+        // softer: its documented recovery is `fork`, not a turn.
+        //
+        // `archived_at` is authoritative for archived-ness per `ContextState`'s
+        // own doc comment, so it is checked ahead of the enum.
+        {
+            let db = self.kernel_db().lock();
+            if let Ok(Some(row)) = db.get_context(target) {
+                let refusal = if row.archived_at.is_some() {
+                    Some("archived — archived contexts are retained work; fork it to continue")
+                } else {
+                    match row.context_state {
+                        kaijutsu_types::ContextState::Live => None,
+                        kaijutsu_types::ContextState::Staging => Some(
+                            "staging — post-fork curation blocks LLM invocation; \
+                             finish curating first",
+                        ),
+                        kaijutsu_types::ContextState::Concluded => {
+                            Some("concluded — fork it to continue the work")
+                        }
+                        kaijutsu_types::ContextState::Archived => Some(
+                            "archived — archived contexts are retained work; fork it to continue",
+                        ),
+                    }
+                };
+                if let Some(why) = refusal {
+                    let name = row.label.clone().unwrap_or_else(|| target.short());
+                    return KjResult::Err(format!("kj drive: context '{name}' is {why}"));
+                }
+            }
+        }
+
         // A context with no blocks has nothing to anchor a turn after — there's
         // no document/history to act on. Crash loudly rather than publish a
         // turn request with no valid anchor.
@@ -215,6 +260,81 @@ mod tests {
             }
             other => panic!("expected Requested, got {other:?}"),
         }
+    }
+
+    /// An archived context must not be drivable. Archived contexts are
+    /// *retained work* — kept for referential integrity, later search, and
+    /// research — so driving one mutates the record we are preserving.
+    ///
+    /// This is reachable in practice because label resolution filters
+    /// archived rows but `KernelDb::resolve_context` parses a full UUID
+    /// first through `get_context`, which does not. It became live the
+    /// moment `session.end` started archiving contexts.
+    #[tokio::test]
+    async fn drive_refuses_an_archived_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let here = register_context(&d, Some("here"), None, principal);
+        let gone = register_context(&d, Some("gone"), None, principal);
+        seed_with_block(&d, here, principal);
+        seed_with_block(&d, gone, principal);
+        d.kernel_db().lock().archive_context(gone).unwrap();
+
+        let c = caller_with_context(here);
+        // Address it by full UUID — the path that bypasses the active-context
+        // filter and is therefore the one that must be gated here.
+        let result = d.dispatch(&[s("drive"), gone.to_hex()], &c).await;
+        assert!(!result.is_ok(), "archived context must not be drivable");
+        let msg = result.message();
+        assert!(msg.contains("archived"), "error should say why: {msg}");
+    }
+
+    /// `Concluded` means "done"; its documented recovery is `fork`, not a
+    /// turn. Driving one resurrects work its owner explicitly finished.
+    #[tokio::test]
+    async fn drive_refuses_a_concluded_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let here = register_context(&d, Some("here"), None, principal);
+        let done = register_context(&d, Some("done"), None, principal);
+        seed_with_block(&d, here, principal);
+        seed_with_block(&d, done, principal);
+        d.kernel_db().lock().conclude_context(done).unwrap();
+
+        let c = caller_with_context(here);
+        let result = d.dispatch(&[s("drive"), s("done")], &c).await;
+        assert!(!result.is_ok(), "concluded context must not be drivable");
+        assert!(
+            result.message().contains("concluded"),
+            "error should say why: {}",
+            result.message()
+        );
+    }
+
+    /// `ContextState::Staging` is documented as "LLM blocked" — post-fork
+    /// curation, where the user is still toggling `excluded`. Nothing
+    /// enforced that on the drive path before this.
+    #[tokio::test]
+    async fn drive_refuses_a_staging_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let here = register_context(&d, Some("here"), None, principal);
+        let curating = register_context(&d, Some("curating"), None, principal);
+        seed_with_block(&d, here, principal);
+        seed_with_block(&d, curating, principal);
+        d.kernel_db()
+            .lock()
+            .update_context_state(curating, kaijutsu_types::ContextState::Staging)
+            .unwrap();
+
+        let c = caller_with_context(here);
+        let result = d.dispatch(&[s("drive"), s("curating")], &c).await;
+        assert!(!result.is_ok(), "staging context must not be drivable");
+        assert!(
+            result.message().contains("staging"),
+            "error should say why: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]

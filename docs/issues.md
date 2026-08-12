@@ -2313,17 +2313,26 @@ needs no third mechanism: deny external drive on the target **and** withhold
 `Drive` from the context itself, and nothing can start it — one existing knob
 plus one new one.
 
-**The archived check is required regardless, and is not a permission.**
-`kj drive` has **no context-state gate at all** (verified: no `ContextState` /
-`archived` reference anywhere in `kj/drive.rs`). Label resolution already
-filters archived rows, but `KernelDb::resolve_context` parses a **full UUID
-first** through `get_context`, which has *no* `archived_at` filter
-(`kernel_db.rs:2308-2315`) — so `kj drive <full-uuid>` drives an archived
-context today. That becomes live the moment the sweep archives 152 of them,
-and it is worse than wasted tokens: archived contexts are *retained work* kept
-for referential integrity, later search, and research, so driving one mutates
-the record we are preserving. **Refuse drive on archived contexts, loudly.**
-Cheap, deterministic, no estimation — do this one first.
+**The archived check — SHIPPED 2026-08-12.** `kj drive` now refuses any
+target that is not `Live`, before it publishes a turn request. It had *no*
+context-state gate at all, and the archived case was genuinely reachable:
+label resolution filters archived rows, but `KernelDb::resolve_context`
+parses a **full UUID first** through `get_context`, which has no
+`archived_at` filter (`kernel_db.rs:2308-2315`) — so `kj drive <full-uuid>`
+drove an archived context. That mattered because archived contexts are
+*retained work* kept for referential integrity, later search, and research;
+driving one mutates the record we are preserving. `archived_at` is checked
+ahead of the enum, per `ContextState`'s own doc comment naming it
+authoritative.
+
+Two neighbours came along, because the same missing gate covered them:
+`Staging` was **already documented** on `ContextState` as "LLM blocked"
+(post-fork curation) with nothing enforcing it, and `Concluded` is refused
+for the archived reason one step softer — its documented recovery is `fork`,
+not a turn. Each refusal names the state and the way forward. Tests:
+`drive_refuses_an_archived_context` (addressed by full UUID, the path that
+bypasses the filter), `drive_refuses_a_concluded_context`,
+`drive_refuses_a_staging_context`.
 
 **Cold-cache suppression** is the softer companion, and it is Amy's insight:
 kaijutsu contexts are designed to be always revivable from durable state,
