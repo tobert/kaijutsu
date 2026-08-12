@@ -2306,8 +2306,19 @@ pub fn accent_vec4(accent: &str) -> Vec4 {
 /// `WellCardMaterial.shape` = `[aspect (CARD_TEX_W/H = 1.6), corner_radius,
 /// ring_width, inset]` in the shader's aspect-corrected UV space. Same for rim
 /// and focus cards (both 1.6 aspect).
+///
+/// `inset` is the one to reach for if the card's transparent border reads too
+/// wide (Amy, 2026-08-12: "tighten the gaps a notch"). It is the gap between
+/// the shader's rounded body and the mesh silhouette, in units of
+/// [`CARD_HEIGHT`] — `0.008 × 75 ≈ 0.6` world units, down from `0.012 ≈ 0.9`.
+/// [`card_block_mesh`] derives the prism's corner radius as
+/// `corner_radius + inset`, so the silhouette stays concentric with the body
+/// automatically and the card's outer bounds never move. Shrinking it does not
+/// cost the glow: the ring `band` is multiplied by `inside`, so it is already
+/// clipped at the body edge, and the halo comes from the bloom post-pass in
+/// screen space, which needs no geometry to spread into. **Amy-tunable.**
 pub fn card_shape() -> Vec4 {
-    Vec4::new(1.6, 0.06, 0.045, 0.012)
+    Vec4::new(1.6, 0.06, 0.045, 0.008)
 }
 
 /// `WellCardMaterial.shape` for the [`HorizonLabel`] panel: its own texture
