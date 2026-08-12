@@ -2084,6 +2084,34 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   families when signed Thinking exists in history (a DeepSeek nonce fed to
   Anthropic 400s); allow the transition only at `fork`, where an rc script
   decides to elide thinking or downgrade it to plain blocks.
+## Drift UX — cross-session ergonomics (2026-08-12)
+
+Design record + full gap list: **`docs/drift-ux.md`**. Slice 1 (`push`
+delivers immediately, staging behind `--stage`) SHIPPED `b2cdb770`.
+Remaining, in order:
+
+- **cc-\* contexts never deregister, and that breaks addressing.** Measured
+  on live zorak 2026-08-12: 289 contexts, 152 `cc-*`, **60 sharing the
+  `cc-kaijutsu` prefix**. Drift resolves a label prefix and errors
+  `Ambiguous` on >1 match (`ids.rs:311-320`), so `kj drift push cc-kaijutsu`
+  is unusable *today* and degrades monotonically. `session.end`/`agent.stop`
+  only write text blocks (`hook_listener.rs:315-376`); pileup was left
+  unmanaged deliberately ("for observation", `0c06f51c`) — four weeks in,
+  the cost is now measurable. Fix is small (conclude on `session.end`) but
+  **needs Amy's word**, plus a decision on sweeping the 152 already resident.
+- **`push` and `pull` speak different address grammars.** `push` → in-memory
+  router (`drift.rs:330-338`); `pull`/`merge`/`history` →
+  `refs::resolve_context_arg`, which also accepts full UUIDs and `.`/`.parent`
+  chains (`kj/refs.rs:23-40`). So `merge .parent` works and `push .parent`
+  does not. Route push through the same resolver, registry as fallback.
+- **A received drift is a dead end for reply.** Hydration surfaces the short
+  id only (`llm/hydrate.rs:344-357`) — never the sender's label, no thread id,
+  no hint that replying is possible. Carry the label.
+- **Should an arriving drift wake a turn?** Nothing subscribes to the block to
+  drive the target; it surfaces on the next natural turn. Four shapes written
+  up in `drift-ux.md` with no recommendation — it touches the turn loop and
+  the spend posture, so it is Amy's ruling, possibly in person.
+
 ## Drift — June 2026 audit
 
 - **Extract `ContextRegistry` from `DriftRouter`:** DriftRouter carries ~7
