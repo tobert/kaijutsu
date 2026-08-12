@@ -62,6 +62,17 @@ bevy_tweening = "0.16"
 # `kurbo`/`peniko` stay as direct dependencies since Parley's own types
 # (`Brush`, transforms) are drawn from them.
 parley = "0.9.0"
+
+# Not called from our code — here to flip one feature on a transitive dep, via
+# cargo's feature unification. parley 0.9 line-breaks through icu_segmenter,
+# which warns once per layout containing Japanese (docs/issues.md). With
+# icu_provider's `logging` feature OFF — nobody enables it — its internal `log`
+# module is a shim that is `std::eprintln!` in debug builds, so the warning
+# bypasses tracing entirely and cannot be filtered. Turning `logging` on routes
+# it through the real `log` crate, where tracing-subscriber's bridge picks it up
+# and `main.rs`'s EnvFilter can silence it. Pure dev-loop hygiene: the shim is a
+# no-op macro under `not(debug_assertions)`, so release builds never printed it.
+icu_provider = { version = "2.2", default-features = false, features = ["logging"] }
 kurbo = "0.13.0"
 peniko = "0.6.0"
 pulldown-cmark.workspace = true

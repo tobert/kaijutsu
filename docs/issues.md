@@ -2223,35 +2223,65 @@ chase:
   (Amy: "bump parley to match bevy and generally try to match bevy when we
   can"). It left one thing behind, below.
 
-## parley 0.9 has no Japanese line-segmentation model (2026-08-12, from the parley bump)
+## parley opts out of dictionary line breaking for Japanese — check back (2026-08-12, from the parley 0.9 bump)
 
-The app logs this on essentially every layout containing Japanese — **307
-times in a few minutes** on a normal session:
+**Log silenced, behaviour left alone** (Amy: "silence it and we'll track an
+issue for ourselves to check back in. I might file an upstream issue if we
+find we need it sooner than later"). Revisit when wrapped Japanese body text
+starts to matter — the upstream brief is written up below, ready to file.
 
+parley 0.9 line-breaks through `icu_segmenter` (0.7 had **zero** ICU
+dependencies), and picks the constructor that loads no dictionary for the
+unspaced scripts:
+
+```rust
+// parley-0.9.0/src/analysis/mod.rs:56,63,70 — all three word-break modes
+LineSegmenter::new_for_non_complex_scripts(opt)
 ```
-ICU4X data error: No segmentation model for language: ja
-```
 
-New with parley 0.9, which added `icu_normalizer`/`icu_properties`/
-`icu_segmenter` (0.7 had **zero** ICU dependencies). Parley already enables
-`icu_segmenter`'s `compiled_data`, so this is not a feature flag we forgot —
-the compiled set omits the dictionary/LSTM models for the languages that do
-not use spaces (ja, and presumably zh/th/km/lo/my), and parley exposes no
-feature to add them.
+Every layout containing Japanese then hits `select()`'s miss arm and warns
+`ICU4X data error: No segmentation model for language: ja` — measured at
+**~190 lines per 45 seconds** with 会術 on screen.
 
-Two costs, in order:
+**Silencing it took two pieces, and the first one is the interesting bit.**
+`icu_provider` only calls the real `log` crate when its `logging` feature is
+on. With it off — nobody enabled it — `icu_provider::log` is a shim
+(`lib.rs:188-221`): `pub use std::eprintln as warn` under `debug_assertions`,
+and a **no-op macro** without it. So the warning was a bare `eprintln!`
+straight to stderr that no `tracing` filter could ever reach, *and* it never
+existed in release builds at all — this was always dev-loop-only noise. The
+fix is a direct `icu_provider` dependency in `kaijutsu-app/Cargo.toml` whose
+only job is to turn `logging` on via feature unification, which routes the
+warning through `log` → tracing-subscriber's bridge, where `main.rs`'s
+`EnvFilter` entry `icu_provider=error` drops it (`error`, not `off`, so a real
+ICU data failure still surfaces). Verified: ~190 per 45s → **0 per 45s**.
 
-1. **Log spam**, which is the immediate one — it drowns the runner output we
-   read while testing.
-2. **Japanese line breaking falls back to non-dictionary rules.** No visible
-   damage today: the only standing Japanese is the 会術 title, which is short
-   and never wraps. It would start to matter for wrapped Japanese body text —
-   which is not hypothetical here, since Amy writes Japanese in the app.
+**The trap, recorded because it is the tempting wrong fix:** feature
+unification fixes the *logging*, but it cannot fix the *data*.
+`icu_segmenter`'s `default = ["compiled_data", "auto"]` while parley takes
+`default-features = false, features = ["compiled_data"]`, which looks exactly
+like the culprit — but adding `icu_segmenter` with `auto`/`lstm` as our own
+direct dependency does **nothing**, because `new_for_non_complex_scripts`
+builds `ComplexPayloadsBorrowed::new()`, which sets `ja`/`th`/`km`/`lo`/`my`
+to `None` *unconditionally* — no `cfg(feature)` anywhere near it, and the call
+sites are `const {}` blocks with no hook. The gate is a call site, not a
+feature. Two adjacent problems, one solvable by a feature and one not.
 
-Nothing is broken, so this is not urgent. Options when it is worth doing:
-silence the log at our end (cheapest, treats the symptom), pull the ICU4X
-segmentation data in ourselves, or raise it upstream with parley — the
-honest fix, since any parley user rendering CJK hits this.
+**parley's choice is defensible**, which shapes the upstream ask: the CJ
+dictionary is ~5.1 MB of baked data (`segmenter_dictionary_auto_v1`; the SE
+Asian dictionaries are another ~5.3 MB). A layout crate adding that to every
+binary unconditionally would be worse. So the ask upstream is *"give us a way
+to opt in"*, not *"load it by default"*.
+
+**What we actually lose is modest.** UAX #14 still permits breaks between
+ideographs, so Japanese does wrap — it just may break mid-word instead of at
+dictionary word boundaries, which is close to traditional CJK typesetting
+anyway. Today the only standing Japanese is the 会術 title, which never wraps.
+
+Options, when it is worth doing: raise the opt-in with parley upstream (the
+honest fix — any parley user rendering CJK hits this), or take line breaking
+over ourselves with `icu_segmenter` directly (big: parley owns line breaking
+internally and exposes no segmenter hook, so this means displacing it).
 
 ## Test leaks a pidfile into `/tmp` (2026-08-12, via kaish's /tmp audit)
 

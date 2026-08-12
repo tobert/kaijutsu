@@ -132,9 +132,21 @@ fn main() {
     let file_appender = tracing_appender::rolling::never(&log_dir, "kaijutsu-app.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
+    // `icu_provider=error`: parley 0.9 line-breaks through icu_segmenter built
+    // with `LineSegmenter::new_for_non_complex_scripts`, which loads no
+    // dictionary for the unspaced scripts — so every layout containing Japanese
+    // warns `ICU4X data error: No segmentation model ...: ja`, hundreds of lines
+    // a minute with 会術 on screen. It is the *expected* result of parley's
+    // configuration, not a fault we can fix from here (docs/issues.md).
+    //
+    // This line only bites because `kaijutsu-app`'s Cargo.toml takes a direct
+    // `icu_provider` dependency solely to enable its `logging` feature — see the
+    // comment there. Without that, icu's warning is a bare `eprintln!` in debug
+    // builds and no filter can reach it. Dropped to `error` rather than `off` so
+    // a real ICU data failure still surfaces.
     let registry = tracing_subscriber::registry()
         .with(EnvFilter::new(
-            "warn,kaijutsu_app=debug,kaijutsu_client=debug",
+            "warn,kaijutsu_app=debug,kaijutsu_client=debug,icu_provider=error",
         ))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .with(fmt::layer().with_writer(std::io::stderr));

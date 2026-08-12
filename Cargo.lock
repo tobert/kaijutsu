@@ -5312,6 +5312,7 @@ checksum = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
+ "log",
  "serde",
  "stable_deref_trait",
  "writeable",
@@ -5886,6 +5887,7 @@ dependencies = [
  "editor-types",
  "futures",
  "hostname",
+ "icu_provider",
  "image",
  "indexmap 2.14.0",
  "kaijutsu-abc",
