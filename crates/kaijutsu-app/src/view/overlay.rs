@@ -284,7 +284,6 @@ pub(crate) fn sync_compose_text_glyphs(
         block_scene.color = text_color;
         block_scene.content_version = block_scene.content_version.wrapping_add(1);
         block_scene.last_built_version = block_scene.content_version;
-        block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
 
         // Set explicit height on the node
         node.height = Val::Px(total_height);

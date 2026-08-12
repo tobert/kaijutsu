@@ -149,9 +149,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // PBR fragment. Without this line the whole quad paints into the opaque
     // pass and the rounded corners are silhouette fiction: every card ships a
     // sharp-edged accent box around its rounded face (and those invisible
-    // corners occlude the lattice behind them). The ring band's outer half
-    // (alpha = band past d=0) deliberately survives, so the glow still spills
-    // just past the rounded edge.
+    // corners occlude the lattice behind them). Nothing survives beyond the
+    // body edge's anti-aliasing width: `band` is multiplied by `inside`,
+    // which fades 1→0 over d in [0, aa], and this cut lands mid-fade. The
+    // glow's visible spill past the rounded edge is the bloom post-pass
+    // spreading in screen space, which needs no fragments to spill into.
     if (alpha < 0.5) {
         discard;
     }

@@ -220,7 +220,6 @@ pub fn build_editor_surface(
         scene.color = text_color;
         scene.content_version = scene.content_version.wrapping_add(1);
         scene.last_built_version = scene.content_version;
-        scene.scene_version = scene.scene_version.wrapping_add(1);
         *last_cmdline = cmdline.clone();
     }
 

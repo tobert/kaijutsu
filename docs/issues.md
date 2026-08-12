@@ -2600,47 +2600,16 @@ key-value store demolished 2026-07-04.*
 
 ## User Interface (kaijutsu-app) & UX
 
-- **`well_card.wgsl`'s discard comment is stale and says the opposite of the
-  code** (2026-08-12, found while tightening the card inset). The comment
-  above the `alpha < 0.5` discard claims "the ring band's outer half (alpha =
-  band past d=0) deliberately survives, so the glow still spills just past the
-  rounded edge." It does not: `band` is computed as
-  `(1.0 - smoothstep(ring_w, ring_w + aa, abs(d))) * inside`, and `inside`
-  goes to zero at `d = 0`, so the band is already clipped at the body edge.
-  The halo is the bloom post-pass spreading in screen space, which needs no
-  geometry to spill into. Harmless today — the correct behaviour is the one
-  the code has, and it is *why* shrinking `card_shape()`'s `inset` costs
-  nothing — but a comment that describes the opposite of its code is exactly
-  the failure mode the "summaries drift stronger" entry above names. Delete
-  the claim or restate it as "bloom does the spilling, not the geometry."
-
-- **`build_block_scenes` version-bump pattern diverges per arm** (2026-08-01,
-  deepseek seam review for `docs/diff.md` — verify line refs before fixing).
-  `MsdfBlockGlyphs.version`'s doc (`text/msdf/mod.rs:~100`) says never derive
-  the bump from another counter, and the text-bearing arms (Markdown/Abc/
-  Output/Image) bump from their own previous — but the text-*clearing* arms
-  (Sparkline `block_render.rs:~677`, Svg `:~745`) bump from
-  `block_scene.scene_version` instead. Unify on bump-from-own; the planned
-  Diff arm follows bump-from-own and must not copy the deviation.
-
-- **Block-cell sparklines still render as UI-node children — migrate to the
-  triangle lane** (2026-08-12). The HUD flicker fix moved the *dock*
-  sparklines onto `text::sparkline::build_sparkline_vertices` →
-  `MsdfBlockGeometry` (flat triangles in the dock's own texture; the old
-  path despawned/respawned ~230 `Node` children per data tick *after*
-  `UiSystems::Layout`, so every rebuild rendered one frame of never-laid-out
-  children — neither of the two candidate factors previously suspected). The
-  block-cell sparkline arm (`view/block_render.rs` `Sparkline` match arm)
-  still spawns `spawn_rect_child`/`spawn_segment_child` children with the
-  bar-tiled fill approximation. Migrating it to `build_sparkline_vertices`
-  gets the true trapezoid fill, retires the rotated-segment + joint-patch
-  geometry, and — since the arm would then fill `MsdfBlockGeometry` and bump
-  like ABC/Diff — dissolves its half of the version-bump divergence entry
-  below. Block cells don't flicker the way the dock did (they rebuild on
-  content change, not on a 250ms timer), so this is unification, not a bug
-  fix. Bigger design question still open per Amy: what these HUD graphs
-  should *be* (data source, window, labels) — the DockSparkline
-  read-`/run` note above still stands.
+- **HUD graph design: what should the dock sparklines *be*?** (2026-08-12,
+  Amy). Rendering is settled — flat triangles in the dock texture, both dock
+  and block-cell sparklines on `text::sparkline::build_sparkline_vertices` —
+  but the graphs themselves are placeholders: events/sec kernel-wide and
+  active-context running blocks, 40 samples at 250ms (a 10s window), no
+  labels or thresholds. For the ambient-command-center role, decide data
+  source, window, and labeling before polishing pixels further. The
+  DockSparkline read-`/run` note above still stands. A `UiMaterial` shader
+  (shader-AA lines, `BlockFxMaterial`-style uniform data) is the fallback if
+  triangle rendering disappoints at ambient distance.
 
 - **Conversation-view de-vello pass — needs a visual pass in the running
   app** (2026-07-30, `feat/devello`; a validation pass is planned
@@ -2651,20 +2620,12 @@ key-value store demolished 2026-07-04.*
   `view::block_render::spawn_segment_child`/`spawn_rect_child`); this pass
   was done without running the app (the runner was down), so unit tests
   cover the pure math but not pixels. Specifically worth eyeballing:
-  - **Sparkline segment rotation.** `spawn_segment_child` centers a thin
-    `Node` at each stroke segment's midpoint and rotates it via
-    `UiTransform::from_rotation(Rot2::radians(dy.atan2(dx)))`. Reasoned
-    through `bevy_ui`'s `ui_layout_system` source (rotation pivots the
-    node's own layout center) and pinned with a test that checks the
-    rotated endpoints land on the original data points
-    (`sparkline.rs::geometry_segment_endpoints_recover_via_rotation`) — but
-    that's bevy_math math, not a render. Watch for an upside-down or
-    mirrored polyline.
-  - **Sparkline fill shape.** The fill is now bar-tiled (each bar's top is
-    the midpoint height of the two points it spans), not the old smooth
-    linear-interpolation polygon — a deliberate simplification (no
-    triangles/rotation needed) that will look slightly different for noisy
-    data, more so for few, widely-spaced points.
+  - ~~Sparkline segment rotation / fill shape~~ — MOOT (2026-08-12): both
+    sparkline surfaces moved off UI-node rectangles onto flat triangles in
+    the block/dock texture (`build_sparkline_vertices`), with the true
+    trapezoid fill; the rotated-segment and bar-tiled-fill code is deleted.
+    Block-cell sparklines still deserve one live look on the runner (dock
+    ones are BRP-verified).
   - **Role divider label vertical centering + line thickness** —
     `fieldset::ROLE_LABEL_FONT_SIZE`/`ROLE_DIVIDER_THICKNESS` preserve the
     pre-shader Vello values exactly on paper; worth a glance since the

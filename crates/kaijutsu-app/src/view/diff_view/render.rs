@@ -472,7 +472,6 @@ pub fn build_diff_surface(
         scene.text = preview.plain_text.clone();
         scene.content_version = scene.content_version.wrapping_add(1);
         scene.last_built_version = scene.content_version;
-        scene.scene_version = scene.scene_version.wrapping_add(1);
 
         window.first_row = first_row;
         window.end_row = end_row;

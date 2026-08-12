@@ -52,17 +52,15 @@ use crate::text::msdf::{
 };
 use crate::text::rich::{RichContent, RichContentKind, SVG_MAX_HEIGHT};
 use crate::text::{
-    ShapingFonts, KjTextEffects, TextMetrics, bevy_color_to_brush,
+    ShapingFonts, KjTextEffects, TextMetrics, bevy_color_to_brush, color_to_rgba8,
 };
 use crate::text::components::rainbow_brush;
 use crate::text::markdown::MarkdownColors;
-use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_geometry};
+use crate::text::sparkline::{SparklineColors, build_sparkline_vertices};
 use crate::text::svg_raster::{fit_svg_to_box, rasterize_svg};
 use crate::ui::theme::Theme;
 use crate::view::role_divider;
 use crate::view::ui_rtt::{UiRttTexture, ui_rtt_texture_dims};
-use bevy::math::Rot2;
-use bevy::ui::UiTransform;
 
 // ============================================================================
 // COMPONENTS
@@ -80,10 +78,6 @@ pub struct BlockScene {
     pub content_version: u64,
     /// Content version that was last built into a scene.
     pub last_built_version: u64,
-    /// Monotonic counter bumped each rebuild, driving the MSDF glyph version
-    /// (`MsdfBlockGlyphs.version = scene_version`, never derived any other
-    /// way — see that field's own doc comment for why).
-    pub scene_version: u64,
     /// Formatted text content (set by sync_block_cell_buffers).
     pub text: String,
     /// Text color (set by sync_block_cell_buffers).
@@ -103,7 +97,6 @@ impl Default for BlockScene {
         Self {
             content_version: 0,
             last_built_version: 0,
-            scene_version: 0,
             text: String::new(),
             color: Color::WHITE,
             svg_raster_physical_size: (0, 0),
@@ -144,25 +137,22 @@ pub fn msdf_surface_bundle(material: Handle<BlockFxMaterial>) -> impl Bundle {
     )
 }
 
-/// Child entities a block's content-drawing arm spawned (sparkline polyline,
-/// image placeholder background, or the rasterized `Svg` bitmap) that must be
-/// despawned before the arm rebuilds them for new content. Sparkline/image
-/// children are a plain Bevy UI `Node` + `BackgroundColor` (+ `UiTransform`
-/// for rotated stroke segments); the `Svg` child is a `Node` + `ImageNode`
+/// Child entities a block's content-drawing arm spawned (image placeholder
+/// background, or the rasterized `Svg` bitmap) that must be despawned before
+/// the arm rebuilds them for new content. Image children are a plain Bevy UI
+/// `Node` + `BackgroundColor`; the `Svg` child is a `Node` + `ImageNode`
 /// sampling a CPU-rasterized `Image` (`text::svg_raster`). No vello, no
 /// custom shader in any case — Bevy's own UI rasterizer draws every pixel.
+/// (Sparklines used to live here too; they draw as flat triangles in the
+/// block's texture now — `MsdfBlockGeometry`.)
 #[derive(Component, Default)]
 pub struct ContentGeometryChildren(pub Vec<Entity>);
 
 /// Despawn any content-geometry children left over from a previous build.
 /// Called unconditionally at the top of each rebuilt block cell — arms that
-/// draw geometry (sparkline, image placeholder) respawn fresh children right
-/// after; arms that don't just leave the component removed.
-///
-/// `pub(crate)`: `ui::dock` reuses this + [`spawn_rect_child`]/
-/// [`spawn_segment_child`] for the North dock's sparklines — the same
-/// plain-rectangle-geometry approach, just outside a `BlockCell`.
-pub(crate) fn clear_content_geometry_children(
+/// draw children (image placeholder, Svg) respawn fresh ones right after;
+/// arms that don't just leave the component removed.
+fn clear_content_geometry_children(
     commands: &mut Commands,
     entity: Entity,
     existing: Option<&ContentGeometryChildren>,
@@ -176,9 +166,9 @@ pub(crate) fn clear_content_geometry_children(
     commands.entity(entity).remove::<ContentGeometryChildren>();
 }
 
-/// Spawn one axis-aligned rectangle child (fill bar, joint dot, or a plain
-/// background panel) at `offset`-relative local content-space coordinates.
-pub(crate) fn spawn_rect_child(
+/// Spawn one axis-aligned rectangle child (a plain background panel) at
+/// `offset`-relative local content-space coordinates.
+fn spawn_rect_child(
     commands: &mut Commands,
     parent: Entity,
     rect: (f32, f32, f32, f32), // x, y, width, height
@@ -196,38 +186,6 @@ pub(crate) fn spawn_rect_child(
                 height: Val::Px(h),
                 ..default()
             },
-            BackgroundColor(color),
-        ))
-        .id();
-    commands.entity(parent).add_child(child);
-    child
-}
-
-/// Spawn one rotated rectangle child — a sparkline stroke segment — centered
-/// at `(segment.cx, segment.cy)` (local content space), `segment.length` px
-/// long, `thickness` px tall, rotated `segment.angle` radians about its own
-/// center via `UiTransform` (see the pivot note on `SparklineSegment::angle`).
-pub(crate) fn spawn_segment_child(
-    commands: &mut Commands,
-    parent: Entity,
-    segment: &SparklineSegment,
-    thickness: f32,
-    offset: (f32, f32),
-    color: Color,
-) -> Entity {
-    let left = segment.cx - segment.length * 0.5 + offset.0;
-    let top = segment.cy - thickness * 0.5 + offset.1;
-    let child = commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(left),
-                top: Val::Px(top),
-                width: Val::Px(segment.length),
-                height: Val::Px(thickness),
-                ..default()
-            },
-            UiTransform::from_rotation(Rot2::radians(segment.angle)),
             BackgroundColor(color),
         ))
         .id();
@@ -626,18 +584,19 @@ pub fn build_block_scenes(
             None
         };
 
-        // Shed any content-geometry children (sparkline polyline / image
-        // placeholder rect) from a previous build — the arms below respawn
-        // fresh ones if this build is still one of those kinds.
+        // Shed any content-geometry children (image placeholder rect / Svg
+        // bitmap) from a previous build — the arms below respawn fresh ones
+        // if this build is still one of those kinds.
         clear_content_geometry_children(&mut commands, entity, existing_geometry_children);
 
-        // Shed any flat-colored geometry from a previous build. Two arms
-        // populate `MsdfBlockGeometry` (ABC engraving, Diff bands) and both
-        // refill it below; every other arm must not inherit it. Geometry has
-        // no version of its own — it rides `MsdfBlockGlyphs.version`, which
-        // the arms bump — so a stale `vertices` from a block that used to be
-        // a diff and is now plain text would keep compositing bands behind
-        // the new content. Cheap: a `clear()` on an already-empty Vec.
+        // Shed any flat-colored geometry from a previous build. Three arms
+        // populate `MsdfBlockGeometry` (ABC engraving, Diff bands, Sparkline
+        // triangles) and all refill it below; every other arm must not
+        // inherit it. Geometry has no version of its own — it rides
+        // `MsdfBlockGlyphs.version`, which the arms bump — so a stale
+        // `vertices` from a block that used to be a diff and is now plain
+        // text would keep compositing bands behind the new content. Cheap: a
+        // `clear()` on an already-empty Vec.
         msdf_geometry.vertices.clear();
 
         let content_height: f32;
@@ -699,9 +658,10 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Sparkline(data)) => {
-                // No vello scene, no shader — the polyline is plain Bevy UI
-                // rectangles (thin rotated `Node`s for the stroke, axis-
-                // aligned ones for fill/joints), spawned as children below.
+                // Flat triangles in the block's own texture — the same
+                // `MsdfBlockGeometry` lane ABC engraving and Diff bands use
+                // (the dock's HUD sparklines moved here first; the old
+                // UI-node-children path is retired).
                 *render_method = BlockRenderMethod::Msdf;
 
                 // A sparkline has NO text of its own, which makes it the one
@@ -715,50 +675,21 @@ pub fn build_block_scenes(
                 // as a sparkline — so without this the partially-streamed
                 // source text stays composited behind the plot.
                 msdf_glyphs.glyphs.clear();
-                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
 
                 let h = theme.sparkline_height;
                 content_height = h;
 
                 if content_width > 0.0 && h > 0.0 {
-                    let geometry = build_sparkline_geometry(data, content_width, h, 4.0);
-                    let offset = (pad_left, pad_top);
-                    let mut spawned = Vec::with_capacity(
-                        geometry.segments.len() + geometry.joints.len() + geometry.fill_bars.len(),
+                    msdf_geometry.vertices = build_sparkline_vertices(
+                        data,
+                        content_width,
+                        h,
+                        4.0,
+                        (pad_left, pad_top),
+                        color_to_rgba8(sparkline_colors.line),
+                        sparkline_colors.fill.map(color_to_rgba8),
                     );
-
-                    if let Some(fill_color) = sparkline_colors.fill {
-                        for bar in &geometry.fill_bars {
-                            spawned.push(spawn_rect_child(
-                                &mut commands,
-                                entity,
-                                (bar.x, bar.y, bar.width, bar.height),
-                                offset,
-                                fill_color,
-                            ));
-                        }
-                    }
-                    for segment in &geometry.segments {
-                        spawned.push(spawn_segment_child(
-                            &mut commands,
-                            entity,
-                            segment,
-                            crate::text::sparkline::SPARKLINE_STROKE_WIDTH,
-                            offset,
-                            sparkline_colors.line,
-                        ));
-                    }
-                    for joint in &geometry.joints {
-                        spawned.push(spawn_rect_child(
-                            &mut commands,
-                            entity,
-                            (joint.x, joint.y, joint.width, joint.height),
-                            offset,
-                            sparkline_colors.line,
-                        ));
-                    }
-
-                    commands.entity(entity).insert(ContentGeometryChildren(spawned));
                 }
             }
             Some(RichContentKind::Svg {
@@ -783,7 +714,7 @@ pub fn build_block_scenes(
                 // behind the raster in any transparent/semi-transparent
                 // region.
                 msdf_glyphs.glyphs.clear();
-                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
 
                 match fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT) {
                     None => {
@@ -994,10 +925,9 @@ pub fn build_block_scenes(
                     let glyphs =
                         crate::text::msdf::collect_msdf_glyphs_styled(&layout, text_offset, atlas);
                     msdf_glyphs.glyphs = glyphs;
-                    // Bump from the field's OWN previous value (ABC's
-                    // pattern), never from `scene_version` — see
-                    // `MsdfBlockGlyphs::version`. Geometry and glyphs ride
-                    // this single gate together.
+                    // Bump from the field's OWN previous value, never from
+                    // another counter — see `MsdfBlockGlyphs::version`.
+                    // Geometry and glyphs ride this single gate together.
                     msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
@@ -1077,7 +1007,7 @@ pub fn build_block_scenes(
                     );
                     msdf_glyphs.glyphs = glyphs;
                     // Derive from the field's OWN previous value, never
-                    // `scene_version` — see `MsdfBlockGlyphs::version`'s doc
+                    // another counter — see `MsdfBlockGlyphs::version`'s doc
                     // comment for the bug this reintroduces otherwise
                     // (staff-without-glyphs, msdf-music live verify
                     // 2026-07-16). This arm didn't exist when that fix
@@ -1286,7 +1216,6 @@ pub fn build_block_scenes(
         rtt.built_width = round_to_physical_px(width, scale);
         rtt.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
-        block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
     }
 }
 
