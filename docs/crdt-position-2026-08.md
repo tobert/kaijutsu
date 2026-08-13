@@ -538,9 +538,32 @@ accumulated state and would wait forever. Subscribe first, then query, then
 watch — the standard shape, and the mirror has been hiding the need for it.
 
 The stall fallback simplifies in the same move: instead of resyncing a whole
-document, it re-runs the same one-shot query. `e2e_shell.rs:152` already proves
-the tool survives a dead event feed, so that path has a test before it has an
-implementation.
+document, it re-runs the same one-shot query — and it should be a
+`query_blocks(BlockFilter { parent_id, max_depth: 1, kinds: [ToolResult],
+statuses: [Done, Error] })` plus a client-side `is_shell()` filter, not a
+`get_context_sync`. Phase 2's authoritative final read can shrink the same way:
+once the event has told us the result's id, `get_block(ctx, result_id)` is
+exactly as correct as re-pulling the whole context (the server writes content
+and exit_code before flipping status, which is what makes the read safe) and
+vastly cheaper. That retires the last `get_context_sync` on the hot path.
+
+**The blocker to solve FIRST: the existing dead-feed test goes vacuous.**
+`e2e_shell.rs:152` (`shell_survives_dead_event_feed`) looked like a test that
+exists before its implementation. It is not — it would silently stop guarding
+anything. It calls `debug_kill_event_listener`, which aborts the **event
+bridge**; the bridge is a *consumer* of `actor.subscribe_events()`. A watcher
+that subscribes to that broadcast directly never notices the bridge dying, so
+the test would pass trivially, for the wrong reason, while the failure mode it
+names went uncovered.
+
+That test's own doc comment already admits it cannot force a real server-side
+reap and settles for the client-side equivalent. Slice 4 breaks that
+equivalence, so the seam has to move with the design: the honest one is
+something like `ActorHandle::debug_stop_event_delivery()`, which silences the
+broadcast at its source. That is *more* faithful than today's seam — a reaped
+FlowBus subscription silences every consumer, not just one — and it is a
+prerequisite, not cleanup. **Do not implement the watcher before the seam**, or
+the first green run will be meaningless.
 
 Also still open: `kaijutsu-acp` runs its own `SyncedDocument`, so the MCP is
 the last *replicator* but not the last mirror.
