@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use kaijutsu_crdt::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, ToolKind};
+use kaijutsu_types::timeout::tiers;
 use kaijutsu_kernel::SharedBlockStore;
 
 use crate::RemoteState;
@@ -28,16 +29,52 @@ use crate::hook_types::{
 
 /// Per-candidate connect+ping timeout during hook socket resolution
 /// (`resolve_hook_socket`). Short — dead/stale sockets must not add
-/// meaningful latency to every hook call.
-pub const PING_TIMEOUT: Duration = Duration::from_millis(200);
+/// meaningful latency to every hook call. **Probe tier**: liveness only, no
+/// work behind it, and it is paid once per candidate on the hook critical
+/// path, so it has to stay negligible against [`tiers::HOOK_PATH`].
+pub const PING_TIMEOUT: Duration = tiers::PROBE;
 
 /// Connect timeout for the stale-socket sweep at serve startup
 /// (`sweep_stale_sockets`). A listening socket accepts near-instantly; this
 /// only bounds the worst case (e.g. a socket whose listener is wedged).
-const SWEEP_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// **Probe tier**, same reasoning.
+const SWEEP_CONNECT_TIMEOUT: Duration = tiers::PROBE;
 
 /// Maximum size of a block's content created from hook events.
 const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
+
+/// Run the hook's work under `budget`, degrading to a permissive response if
+/// it overruns.
+///
+/// Extracted from `handle_connection` so the *degraded* branch is reachable
+/// from a test — it is the branch that only fires when something is already
+/// wrong, which is exactly the kind that rots untested.
+///
+/// On overrun the caller is told, in `context`, that the event may not have
+/// been recorded. Saying so beats both alternatives: going silent would let a
+/// missing block look like a normal turn, and denying would block the user's
+/// action over an ambient mirror.
+async fn with_hook_budget<F>(budget: Duration, event_name: &str, work: F) -> HookResponse
+where
+    F: std::future::Future<Output = HookResponse>,
+{
+    match tokio::time::timeout(budget, work).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                event = %event_name,
+                ?budget,
+                "hook path exceeded its budget — returning permissive response; \
+                 this event's block may be missing or land late"
+            );
+            HookResponse::allow_with_context(format!(
+                "kaijutsu: hook work exceeded {budget:?} and was cut short — this \
+                 event may not have been recorded. The kernel is slow or \
+                 mid-resync; your action was not blocked."
+            ))
+        }
+    }
+}
 
 /// Hook listener — receives events over a Unix socket and writes CRDT blocks.
 pub struct HookListener {
@@ -221,17 +258,37 @@ impl HookListener {
             }
         }
 
-        // Stabilize the placeholder label onto a Claude-Code-session-stable
-        // one now that we (may) know the true session id — BEFORE authoring
-        // this event's own block, so a relaunch-reattach switch lands it in
-        // the right context. One-shot per process (`pending_label_base`'s
-        // `Mutex::take`); a no-op on every event after the first that finds
-        // a session id.
-        if let Some(sid) = self.session_id.lock().ok().and_then(|g| g.clone()) {
-            self.maybe_stabilize_label(&sid).await;
-        }
+        // Everything from here to the response is on Claude Code's hook
+        // critical path, and CC gives up at `tiers::CC_HOOK_DEADLINE`. Bound
+        // the whole span by our own shorter `tiers::HOOK_PATH` so WE answer
+        // first: if CC's deadline lands while we are still working it kills
+        // the hook, the user sees a timeout, and whatever we were doing
+        // finishes into a void.
+        //
+        // Not hypothetical headroom. The RPCs inside `maybe_stabilize_label`
+        // carry the request tier, and `AuthorBlocks` queues FIFO in the doc
+        // task behind a resync whose fetch is bounded the same way — so a
+        // hook that arrives mid-resync can wait far past CC's patience.
+        //
+        // Degrading here is consistent with what this path already promises
+        // for *failure*: the mirror is ambient, so its slowness must not
+        // block the user's action any more than its errors do. We return the
+        // permissive response and say what happened in `context` rather than
+        // going silent.
+        let hook_work = async {
+            // Stabilize the placeholder label onto a Claude-Code-session-stable
+            // one now that we (may) know the true session id — BEFORE authoring
+            // this event's own block, so a relaunch-reattach switch lands it in
+            // the right context. One-shot per process (`pending_label_base`'s
+            // `Mutex::take`); a no-op on every event after the first that finds
+            // a session id.
+            if let Some(sid) = self.session_id.lock().ok().and_then(|g| g.clone()) {
+                self.maybe_stabilize_label(&sid).await;
+            }
+            self.process_event(&event).await
+        };
 
-        let response = self.process_event(&event).await;
+        let response = with_hook_budget(tiers::HOOK_PATH, &event.event, hook_work).await;
 
         let json = serde_json::to_string(&response).unwrap_or_default();
         writer.write_all(json.as_bytes()).await?;
@@ -1063,6 +1120,46 @@ mod tests {
 
     use super::*;
     use crate::hook_types::ToolInfo;
+
+    /// The hook must answer before Claude Code gives up. When the work
+    /// overruns, the response is permissive and *says so* — a silently
+    /// missing block would look like an ordinary turn, and denying would
+    /// block the user's action over a mirror that is ambient by design.
+    #[tokio::test]
+    async fn hook_budget_degrades_to_a_permissive_response_and_explains() {
+        let never = std::future::pending::<HookResponse>();
+        let response =
+            with_hook_budget(Duration::from_millis(10), "tool.after", never).await;
+
+        assert_eq!(
+            response.block, "allow",
+            "an overrun must never block the user's action"
+        );
+        let context = response
+            .context
+            .expect("an overrun must be visible, not silent");
+        assert!(
+            context.contains("may not have been recorded"),
+            "the note must warn that the event may be missing, got: {context}"
+        );
+    }
+
+    /// Non-vacuity guard for the test above: work that finishes inside the
+    /// budget passes its own response through untouched, so the assertion
+    /// there is pinning the overrun branch rather than the wrapper always
+    /// returning the same thing.
+    #[tokio::test]
+    async fn hook_budget_passes_fast_work_through_unchanged() {
+        let quick = async { HookResponse::allow_with_context("drift note") };
+        let response = with_hook_budget(Duration::from_secs(5), "tool.after", quick).await;
+
+        assert_eq!(response.block, "allow");
+        assert_eq!(
+            response.context.as_deref(),
+            Some("drift note"),
+            "a response produced inside the budget must not be replaced"
+        );
+    }
 
     /// A fresh, empty temp directory for this test, never reused across
     /// tests or runs.
