@@ -141,6 +141,10 @@ modal_backdrop = "#00000099"
 block_border_user = "#00000000"
 block_border_assistant = "#00000000"
 
+# Focus ring for the keyboard-focused conversation block (j/k) — cyan on
+# purpose, absent from the block-kind border palette above
+block_border_focus = "#8be9fdcc"
+
 # Layout spacing
 indent_width = 24.0
 role_header_height = 20.0

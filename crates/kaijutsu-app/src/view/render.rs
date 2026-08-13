@@ -10,7 +10,7 @@ use bevy::prelude::*;
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationScrollState,
-    ConversationSpacer, EditorEntities, FocusedBlockCell, LayoutGeneration, MainCell,
+    ConversationSpacer, EditorEntities, LayoutGeneration, MainCell,
     RoleGroupBorder, RoleGroupBorderLayout,
 };
 use crate::ui::theme::Theme;
@@ -782,47 +782,10 @@ pub fn readback_block_heights(
 }
 
 // Role group divider styling lives in block_render::sync_role_group_headers.
-
-/// Highlight the focused block cell with a visual indicator.
-pub fn highlight_focused_block(
-    mut focused_cells: Query<(&BlockCell, &mut BlockScene), With<FocusedBlockCell>>,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    theme: Res<Theme>,
-) {
-    if focused_cells.is_empty() {
-        return;
-    }
-
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-
-    let Ok(editor) = main_cells.get(main_ent) else {
-        return;
-    };
-
-    let blocks: std::collections::HashMap<_, _> =
-        editor.blocks().into_iter().map(|b| (b.id, b)).collect();
-
-    for (block_cell, mut block_scene) in focused_cells.iter_mut() {
-        if let Some(block) = blocks.get(&block_cell.block_id) {
-            let base_color = block_color(block, &theme);
-            let srgba = base_color.to_srgba();
-            let focused_color = Color::srgba(
-                (srgba.red * 1.15).min(1.0),
-                (srgba.green * 1.15).min(1.0),
-                (srgba.blue * 1.15).min(1.0),
-                srgba.alpha,
-            );
-            if block_scene.color != focused_color {
-                block_scene.color = focused_color;
-                // Force rebuild so the highlight is visible
-                block_scene.content_version = block_scene.content_version.wrapping_add(1);
-            }
-        }
-    }
-}
+// Focus feedback lives in cell::block_border::apply_focus_style — the border
+// is the only per-block visual every block kind has. (A text-brighten
+// system lived here until 2026-08-13; markdown blocks ignored it entirely,
+// and its content_version bump could collide with the next doc_version.)
 
 /// Pure computation of top/bottom `ConversationSpacer` heights from the
 /// logical geometry of the entities that end up shown (`Display::Flex`) this

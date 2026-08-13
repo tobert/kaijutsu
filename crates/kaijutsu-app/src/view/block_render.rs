@@ -261,6 +261,47 @@ fn create_svg_raster_image(
 /// pipeline yet — see the `RichContentKind::Image` arm in `build_block_scenes`).
 const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
 
+/// One full repaint per theme arrival, so raster-time knobs reach blocks
+/// that are already on screen. Raster inputs sit behind TWO doc-version
+/// gates that a theme change does not advance: `sync_block_cell_buffers`
+/// derives `BlockScene.color` from the theme (skipped while
+/// `last_render_version` is current), and `build_block_scenes` bakes
+/// glyphs (skipped while `last_built_version` is current;
+/// gamma/stem-darkening then apply when the texture renders). So a theme
+/// pushed over RPC (`kj config set`) only reached blocks that happened to
+/// re-render for another reason, while material-side knobs (glow,
+/// borders) applied live via `sync_block_fx` — making the staleness read
+/// as a broken theme push (2026-08-12 gamma session).
+///
+/// Reopens BOTH gates — live verification of a rewind-only version
+/// repainted plain text with its STALE baked color. Ordering makes the
+/// repaint a single frame: this runs in `Update` ahead of
+/// `CellPhase::Buffer`, so the same frame re-derives color (sync,
+/// Update) and then re-bakes glyphs (build, PostUpdate).
+///
+/// Rewinds `last_built_version` instead of bumping `content_version`:
+/// `content_version` is assigned from `doc_version` by
+/// `sync_block_cell_buffers`, so advancing it here could land exactly on
+/// the next doc version and silently swallow a real content rebuild.
+pub fn repaint_block_scenes_on_theme_change(
+    theme: Res<Theme>,
+    mut blocks: Query<(&mut BlockCell, &mut BlockScene)>,
+) {
+    if !theme.is_changed() || theme.is_added() {
+        return;
+    }
+    for (mut cell, mut scene) in blocks.iter_mut() {
+        // A never-built block bakes the new theme on its first build;
+        // rewinding it would only disturb the `never_built` semantics in
+        // `build_block_scenes`' rebuild gate.
+        if scene.last_built_version == 0 {
+            continue;
+        }
+        cell.last_render_version = None;
+        scene.last_built_version = scene.content_version.wrapping_sub(1);
+    }
+}
+
 // ============================================================================
 // PLUGIN
 // ============================================================================
@@ -1892,6 +1933,99 @@ mod tests {
     /// Test-only `BlockId` — the value is never inspected, only carried.
     fn test_block_id() -> kaijutsu_crdt::BlockId {
         kaijutsu_crdt::BlockId::new(kaijutsu_crdt::ContextId::new(), kaijutsu_crdt::PrincipalId::new(), 0)
+    }
+
+    // -- repaint_block_scenes_on_theme_change -------------------------------
+
+    /// A theme pushed over RPC must reopen the version gate on every
+    /// already-built block (raster-time knobs — glyph colors, gamma — are
+    /// baked at build/render time), without touching `content_version`
+    /// (doc-owned) and without disturbing never-built blocks. Fails against
+    /// pre-fix code where nothing reacted to `Theme` changing: stale blocks
+    /// kept their old raster until an unrelated rebuild (issues.md
+    /// 2026-08-12, found live-tuning gamma).
+    #[test]
+    fn theme_change_rewinds_built_blocks_so_they_rebuild() {
+        let mut app = App::new();
+        app.insert_resource(Theme::default());
+        app.add_systems(Update, repaint_block_scenes_on_theme_change);
+
+        let built = app
+            .world_mut()
+            .spawn((
+                {
+                    let mut cell = BlockCell::new(test_block_id());
+                    cell.last_render_version = Some(7);
+                    cell
+                },
+                BlockScene {
+                    content_version: 7,
+                    last_built_version: 7,
+                    ..Default::default()
+                },
+            ))
+            .id();
+        let never_built = app
+            .world_mut()
+            .spawn((
+                {
+                    let mut cell = BlockCell::new(test_block_id());
+                    cell.last_render_version = Some(3);
+                    cell
+                },
+                BlockScene::default(),
+            ))
+            .id();
+
+        // Frame 1: Theme is freshly added — startup must not force a repaint.
+        app.update();
+        assert_eq!(
+            app.world().get::<BlockScene>(built).unwrap().last_built_version,
+            7,
+            "theme insertion at startup must not count as a theme change"
+        );
+
+        // A theme actually arriving (kj config set → ThemeReceived) reopens
+        // build_block_scenes' version gate on the built block...
+        app.world_mut()
+            .resource_mut::<Theme>()
+            .msdf_gamma_correction += 1.0;
+        app.update();
+        let scene = app.world().get::<BlockScene>(built).unwrap();
+        assert_ne!(
+            scene.content_version, scene.last_built_version,
+            "built block must be marked for rebuild after a theme change"
+        );
+        assert_eq!(
+            scene.content_version, 7,
+            "content_version is doc-owned and must not move"
+        );
+        assert_eq!(
+            app.world().get::<BlockCell>(built).unwrap().last_render_version,
+            None,
+            "sync_block_cell_buffers' gate must reopen too — a rebuild alone \
+             re-bakes the STALE BlockScene.color (caught live 2026-08-13)"
+        );
+
+        // ...while a never-built block stays pristine — it bakes the new
+        // theme on its first build anyway.
+        let scene = app.world().get::<BlockScene>(never_built).unwrap();
+        assert_eq!(scene.last_built_version, 0);
+        assert_eq!(scene.content_version, 0);
+        assert_eq!(
+            app.world().get::<BlockCell>(never_built).unwrap().last_render_version,
+            Some(3),
+            "never-built blocks are left entirely alone"
+        );
+
+        // Quiet frames leave everything alone.
+        let before = app.world().get::<BlockScene>(built).unwrap().last_built_version;
+        app.update();
+        assert_eq!(
+            app.world().get::<BlockScene>(built).unwrap().last_built_version,
+            before,
+            "no theme change → no writes"
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::ui::theme::Theme;
 use crate::view::document::DocumentCache;
 use crate::view::{
     BlockCell, BlockCellContainer, BlockKind, BlockSnapshot, CellEditor, DriftKind, EditorEntities,
-    MainCell, Role,
+    FocusedBlockCell, MainCell, Role,
 };
 
 // ============================================================================
@@ -145,7 +145,15 @@ pub fn determine_block_border_style(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    block_cells: Query<(Entity, &BlockCell, Option<&BlockBorderStyle>, Option<&BlockExcludedState>)>,
+    block_cells: Query<(
+        Entity,
+        &BlockCell,
+        Option<&BlockBorderStyle>,
+        Option<&BlockExcludedState>,
+        Has<FocusedBlockCell>,
+    )>,
+    focus_gained: Query<(), (With<BlockCell>, Changed<FocusedBlockCell>)>,
+    mut focus_lost: RemovedComponents<FocusedBlockCell>,
     theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
     layout_gen: Res<super::components::LayoutGeneration>,
@@ -154,8 +162,14 @@ pub fn determine_block_border_style(
     doc_cache: Res<DocumentCache>,
     mut last_gen: Local<u64>,
 ) {
-    // Border styles only change when blocks change (add/remove/line count/status)
-    if layout_gen.0 == *last_gen {
+    // Border styles change when blocks change (add/remove/line count/status,
+    // all folded into layout_gen) — and when keyboard focus moves, which
+    // touches no layout at all: marker insertions arrive via `Changed`,
+    // removals via `RemovedComponents`. Without this escape the focus ring
+    // would wait for the next layout bump — exactly the
+    // change-never-applies trap the 2026-08-04 focus debug called out.
+    let focus_moved = !focus_gained.is_empty() || focus_lost.read().count() > 0;
+    if layout_gen.0 == *last_gen && !focus_moved {
         return;
     }
     *last_gen = layout_gen.0;
@@ -206,7 +220,8 @@ pub fn determine_block_border_style(
     };
 
     for &entity in container.block_cells.values() {
-        let Ok((ent, block_cell, existing_style, existing_excluded)) = block_cells.get(entity)
+        let Ok((ent, block_cell, existing_style, existing_excluded, focused)) =
+            block_cells.get(entity)
         else {
             continue;
         };
@@ -226,12 +241,10 @@ pub fn determine_block_border_style(
         }
 
         let has_result_below = has_result.contains(&block.id);
-        let new_style = compute_border_style(
-            block,
+        let new_style = apply_focus_style(
+            compute_border_style(block, &theme, &ctx, has_result_below, text_metrics.cell_font_size),
+            focused,
             &theme,
-            &ctx,
-            has_result_below,
-            text_metrics.cell_font_size,
         );
 
         match (&new_style, existing_style) {
@@ -505,5 +518,192 @@ fn compute_border_style(
     }
 
     result
+}
+
+/// Overlay keyboard-focus feedback (`FocusedBlockCell`, moved by j/k) onto
+/// a block's computed border style.
+///
+/// Focus lives on the border because the border is the only per-block
+/// visual that can exist for every block kind: the previous indicator — a
+/// 1.15× brighten of the plain-text color — changed zero pixels on
+/// markdown blocks, whose spans carry their own theme brushes, so focus
+/// moved with nothing on screen showing it (2026-08-04 live debug). Two
+/// rules keep this overlay layout-neutral, so focusing a block can never
+/// reflow its text:
+///
+/// - A block that already has a border keeps its kind, labels, animation,
+///   and — critically — its padding; only the stroke color changes.
+///   Padding feeds text layout in `build_block_scenes`.
+/// - A borderless block gains a minimal ring with ZERO padding — the same
+///   clearance as no border at all, drawn purely by the `block_fx` shader.
+fn apply_focus_style(
+    style: Option<BlockBorderStyle>,
+    focused: bool,
+    theme: &Theme,
+) -> Option<BlockBorderStyle> {
+    if !focused {
+        return style;
+    }
+    match style {
+        Some(mut style) => {
+            style.color = theme.block_border_focus;
+            Some(style)
+        }
+        None => Some(BlockBorderStyle {
+            kind: BorderKind::Full,
+            color: theme.block_border_focus,
+            thickness: theme.block_border_thickness,
+            corner_radius: theme.block_border_corner_radius,
+            padding: BorderPadding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            },
+            animation: BorderAnimation::None,
+            top_label: None,
+            bottom_label: None,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::components::LayoutGeneration;
+    use kaijutsu_crdt::{ContentType, Status};
+
+    /// Minimal world for `determine_block_border_style`: a MainCell whose
+    /// editor holds `n` plain user text blocks (borderless under the
+    /// default theme — `block_border_user` is transparent), each with a
+    /// matching `BlockCell` entity in the container.
+    fn border_test_app(block_count: usize) -> (App, Vec<Entity>) {
+        let mut app = App::new();
+        app.init_resource::<crate::text::TextMetrics>();
+        app.init_resource::<Theme>();
+        app.init_resource::<LayoutGeneration>();
+        app.init_resource::<RpcConnectionState>();
+        app.init_resource::<DriftState>();
+        app.init_resource::<DocumentCache>();
+        app.init_resource::<EditorEntities>();
+        app.add_systems(Update, determine_block_border_style);
+
+        let mut editor = CellEditor::new();
+        let mut ids = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            let id = editor
+                .store
+                .insert_block(
+                    None,
+                    ids.last(),
+                    Role::User,
+                    BlockKind::Text,
+                    format!("block {i}"),
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert_block");
+            ids.push(id);
+        }
+
+        let main_ent = app.world_mut().spawn((editor, MainCell)).id();
+        let mut container = BlockCellContainer::default();
+        let mut cells = Vec::with_capacity(block_count);
+        for &id in &ids {
+            let ent = app.world_mut().spawn(BlockCell::new(id)).id();
+            container.add(id, ent);
+            cells.push(ent);
+        }
+        app.world_mut().entity_mut(main_ent).insert(container);
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+
+        // First compute pass needs a layout generation ahead of the
+        // system's Local high-water mark.
+        app.world_mut().resource_mut::<LayoutGeneration>().bump();
+        app.update();
+        (app, cells)
+    }
+
+    /// The 2026-08-04 regression pair: focus must be VISIBLE (the old
+    /// text-brighten indicator changed zero pixels on markdown blocks) and
+    /// must REVERT when it moves on (the old one never un-highlighted).
+    /// Both focus moves here happen with `LayoutGeneration` untouched, so
+    /// this also pins the `Changed`/`RemovedComponents` escape past the
+    /// layout_gen early-return — without it the ring never tracks j/k.
+    #[test]
+    fn focus_ring_moves_and_reverts_between_blocks() {
+        let (mut app, cells) = border_test_app(2);
+        let (a, b) = (cells[0], cells[1]);
+        let focus_color = app.world().resource::<Theme>().block_border_focus;
+
+        // Borderless baseline: plain user text under the default theme.
+        assert!(app.world().get::<BlockBorderStyle>(a).is_none());
+        assert!(app.world().get::<BlockBorderStyle>(b).is_none());
+
+        // Focus A → A gains the ring, layout untouched.
+        app.world_mut().entity_mut(a).insert(FocusedBlockCell);
+        app.update();
+        let ring = app
+            .world()
+            .get::<BlockBorderStyle>(a)
+            .expect("focused block must gain a visible border");
+        assert_eq!(ring.color, focus_color);
+        assert_eq!(
+            ring.padding,
+            BorderPadding { top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 },
+            "focus on a borderless block must not introduce padding (layout-neutral)"
+        );
+        assert!(app.world().get::<BlockBorderStyle>(b).is_none());
+
+        // Move focus A → B (as handle_navigate_blocks does).
+        app.world_mut().entity_mut(a).remove::<FocusedBlockCell>();
+        app.world_mut().entity_mut(b).insert(FocusedBlockCell);
+        app.update();
+        assert!(
+            app.world().get::<BlockBorderStyle>(a).is_none(),
+            "the ring must revert when focus moves away"
+        );
+        let ring = app
+            .world()
+            .get::<BlockBorderStyle>(b)
+            .expect("newly focused block must gain the ring");
+        assert_eq!(ring.color, focus_color);
+
+        // Unfocus entirely — nothing left behind.
+        app.world_mut().entity_mut(b).remove::<FocusedBlockCell>();
+        app.update();
+        assert!(app.world().get::<BlockBorderStyle>(b).is_none());
+    }
+
+    /// Focus over an existing border recolors the stroke and nothing else:
+    /// kind, labels, animation, and padding all survive, so focusing a
+    /// bordered block can never reflow its text or drop its labels.
+    #[test]
+    fn apply_focus_style_recolors_without_touching_layout() {
+        let theme = Theme::default();
+        let styled = BlockBorderStyle {
+            kind: BorderKind::OpenBottom,
+            color: theme.block_border_tool_call,
+            thickness: 2.0,
+            corner_radius: 3.0,
+            padding: BorderPadding::default(),
+            animation: BorderAnimation::Chase,
+            top_label: Some("TOOL CALL".into()),
+            bottom_label: Some("running".into()),
+        };
+
+        let focused = apply_focus_style(Some(styled.clone()), true, &theme)
+            .expect("style must survive focus");
+        assert_eq!(focused.color, theme.block_border_focus);
+        assert_eq!(
+            BlockBorderStyle { color: styled.color, ..focused },
+            styled,
+            "focus must change the stroke color and nothing else"
+        );
+
+        // Unfocused passes through untouched, Some or None.
+        assert_eq!(apply_focus_style(Some(styled.clone()), false, &theme), Some(styled));
+        assert_eq!(apply_focus_style(None, false, &theme), None);
+    }
 }
 

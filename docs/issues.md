@@ -6,21 +6,34 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Theme changes don't repaint existing conversation blocks (2026-08-12)
+## Theme changes never reach a running app — there is no live config push (2026-08-13, revised)
 
-`kj config set /etc/config/theme.toml` reaches the app live (ThemeReceived →
-`sync_block_fx` re-syncs material uniforms every frame), but MSDF *texture
-content* re-renders only when a surface's glyph version advances
-(`ExtractedMsdfBlockData.last_rendered` in `view/block_render.rs`). So
-knobs baked at raster time (`msdf_gamma_correction`, `msdf_stem_darkening`,
-glyph colors) leave already-rendered blocks stale until they re-render for
-some other reason. Material-side knobs (`text_glow_*`, borders) do apply
-live — the split is invisible from the theme file. The dock
-(repaints ~4×/s) updates instantly, which makes the conversation staleness
-look like a bug in the theme push. `docs/color.md` sells `kj config set` as a
-"live color-management console" — either bump every `MsdfBlockGlyphs.version`
-on ThemeReceived (cost: one full repaint per theme change, fine) or document
-the raster-time carve-out. Found while live-tuning gamma (2026-08-12).
+The 2026-08-12 version of this entry blamed raster-time gates in the app for
+theme staleness. Those gates are now fixed and tested
+(`repaint_block_scenes_on_theme_change` in `view/block_render.rs` reopens
+BOTH doc-version gates — `last_render_version` for color re-derive and
+`last_built_version` for glyph re-bake — one frame, on any `Theme` resource
+change). But live BRP verification exposed the deeper contributing factor
+the old entry got wrong: **`ThemeReceived` has exactly one send site, the
+connect-time bootstrap fetch** (`actor_plugin.rs`), and `ServerEvent` has no
+config/theme variant at all. `kj config set /etc/config/theme.toml` updates
+the CRDT and nothing tells a running app — verified pixel-identical
+before/after a live set, while the same change applied fine across a
+restart. The 08-12 dock A/Bs must have ridden restarts/reconnects.
+
+Remaining work is the delivery leg (kernel + client + app): a config-changed
+server event (or a config subscription) that re-fires `ThemeReceived` on
+theme writes. The app side is ready — the moment `Theme` is replaced, the
+full repaint happens (this is unit-tested). `docs/color.md` sells `kj config
+set` as a "live color-management console"; until the push exists, it is a
+next-connect console.
+
+Related smaller finds from the same session: block text colors
+(`block_user`, `block_assistant`, …) exist only in the app's compiled-in
+`Theme` — `ThemeData` (the TOML wire format) has no fields for them, so no
+theme file can change conversation text colors at all. And `Theme` derives
+neither `Reflect` nor registers with BRP, so it cannot be poked remotely for
+testing.
 
 ## `kj config show` output is not round-trippable, and a corrupt theme falls back silently (2026-08-12)
 
@@ -31,7 +44,10 @@ Two contributing factors that compounded into an hour of phantom results:
    — the obvious sed-tweak idiom, which the shell happily accepts — embeds
    the header into the stored file; each roundtrip nests another copy.
    Wants a `--raw`/`--body` flag (or: `set` could refuse content whose first
-   line matches its own `show` header — it is never intentional).
+   line matches its own `show` header — it is never intentional). Even the
+   "safe" strip idiom below accretes one trailing `\n` per roundtrip
+   (measured 2026-08-13: 6502 → 6503 → 6504 … bytes) — harmless to TOML,
+   but the length check must expect +1, not equality.
 2. When the stored theme TOML fails to parse, the app falls back to
    compiled-in defaults **silently** (no dock indicator, nothing in the
    conversation). Every subsequent theme experiment silently tested the
@@ -693,43 +709,6 @@ at room scale (mission call). Two follow-ups noted rather than built:
   or expose a context→peer lookup the seats reconcile loop can join against.
 
 ---
-
-## Conversation block-focus indicator is invisible (2026-08-04, live BRP debug)
-
-The "j/k navigation stuck" mystery from the 08-03 signoff is SOLVED and it
-was never navigation: an instrumented live session showed 8/8 `j`/`k`
-presses moving `FocusTarget` correctly (log-verified, both directions)
-while two screenshots at adjacent focus indexes differed by 4 pixels at
-max channel delta 0.28/255. **Focus moves; nothing visible shows it.**
-Mechanism, three contributing factors, all render-side:
-
-- The only focus visual is a 1.15× brighten of the block's plain-text
-  color (`view/render.rs:787` `highlight_focused_block`, multiply at
-  `:813`); `FocusedBlockCell` has exactly one consumer.
-- Markdown/rich blocks ignore that color entirely (per-span theme brushes,
-  `block_render.rs:677`), and most conversation content is markdown — so
-  for typical blocks the brighten changes zero pixels.
-- The borders you CAN see are kind/status styling
-  (`cell/block_border.rs:143` takes no focus input); the fork block's
-  purple border reads as a focus ring and anchored the misdiagnosis. The
-  first `j` "works" visually only because the cold-start `None → 0` focus
-  jump scrolls the viewport to document top.
-
-Also: nothing un-highlights (one-way write until `doc_version` advances),
-and `highlight_focused_block:806` clones a whole-document snapshot
-(`editor.blocks()`, 187 blocks) every frame a block is focused, against
-the discipline stated at `render.rs:83` — should be
-`editor.block_snapshot(&block_cell.block_id)`.
-
-Fix sketch (from the debug session, not yet implemented): move focus
-feedback to the border — pass focus into `determine_block_border_style`
-and emit a distinct focus border; note its `layout_gen` early-return at
-`block_border.rs:158` must gain a `focus.is_changed()` escape or the new
-style never applies. Then delete `highlight_focused_block` or give it a
-revert path. Regression tests: extract `next_focus_index` math
-(`input/systems.rs:484-497`) for the ends; an app-level test asserting
-focus-visual moves AND reverts between two blocks (fails on both counts
-today). Also fold in the snapshot-clone fix above.
 
 ## Shell dock never draws a visual-selection highlight (noticed 2026-08-04, tier-2 app cleanup)
 

@@ -480,21 +480,7 @@ pub fn handle_navigate_blocks(
         .as_ref()
         .and_then(|id| block_rows.iter().position(|(bid, _, _)| bid == id));
 
-    // Calculate new index
-    let new_idx = match direction {
-        NavigationDirection::Next => match current_idx {
-            Some(i) if i + 1 < block_rows.len() => i + 1,
-            Some(i) => i,
-            None => 0,
-        },
-        NavigationDirection::Previous => match current_idx {
-            Some(i) if i > 0 => i - 1,
-            Some(i) => i,
-            None => block_rows.len() - 1,
-        },
-        NavigationDirection::First => 0,
-        NavigationDirection::Last => block_rows.len() - 1,
-    };
+    let new_idx = next_focus_index(&direction, current_idx, block_rows.len());
 
     let (new_id, row_y, row_h) = block_rows[new_idx];
 
@@ -518,6 +504,31 @@ pub fn handle_navigate_blocks(
     scroll_to_rect_visible(&mut scroll_state, row_y, row_h);
 
     debug!("Block focus: {:?} (index {})", new_id, new_idx);
+}
+
+/// Pure index math for block-focus navigation. `len` must be > 0 (the
+/// caller returns early on an empty row list). Next/Previous clamp at the
+/// document ends — no wraparound — and from an unfocused start, Next
+/// enters at the top while Previous enters at the bottom.
+fn next_focus_index(
+    direction: &NavigationDirection,
+    current: Option<usize>,
+    len: usize,
+) -> usize {
+    match direction {
+        NavigationDirection::Next => match current {
+            Some(i) if i + 1 < len => i + 1,
+            Some(i) => i,
+            None => 0,
+        },
+        NavigationDirection::Previous => match current {
+            Some(i) if i > 0 => i - 1,
+            Some(i) => i,
+            None => len - 1,
+        },
+        NavigationDirection::First => 0,
+        NavigationDirection::Last => len - 1,
+    }
 }
 
 /// Apply the `FocusedBlockCell` marker once the focused block's entity
@@ -1099,5 +1110,42 @@ pub fn cleanup_stale_focused_markers(
     for entity in focused_markers.iter() {
         commands.entity(entity).remove::<FocusedBlockCell>();
         debug!("Cleaned up stale FocusedBlockCell on {:?}", entity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NavigationDirection, next_focus_index};
+
+    /// The end-clamp rules j/k depend on: no wraparound at either edge,
+    /// and an unfocused start enters the document at the near end for the
+    /// direction pressed.
+    #[test]
+    fn next_focus_index_clamps_at_ends_and_enters_from_either_side() {
+        use NavigationDirection::*;
+
+        // Interior moves
+        assert_eq!(next_focus_index(&Next, Some(0), 3), 1);
+        assert_eq!(next_focus_index(&Previous, Some(2), 3), 1);
+
+        // Clamp at the ends — j at the bottom / k at the top stay put
+        assert_eq!(next_focus_index(&Next, Some(2), 3), 2);
+        assert_eq!(next_focus_index(&Previous, Some(0), 3), 0);
+
+        // Unfocused entry: Next from the top, Previous from the bottom
+        assert_eq!(next_focus_index(&Next, None, 3), 0);
+        assert_eq!(next_focus_index(&Previous, None, 3), 2);
+
+        // First/Last ignore the current position
+        assert_eq!(next_focus_index(&First, Some(2), 3), 0);
+        assert_eq!(next_focus_index(&Last, Some(0), 3), 2);
+        assert_eq!(next_focus_index(&First, None, 3), 0);
+        assert_eq!(next_focus_index(&Last, None, 3), 2);
+
+        // Single-block document: every direction lands on it
+        assert_eq!(next_focus_index(&Next, Some(0), 1), 0);
+        assert_eq!(next_focus_index(&Previous, Some(0), 1), 0);
+        assert_eq!(next_focus_index(&Next, None, 1), 0);
+        assert_eq!(next_focus_index(&Previous, None, 1), 0);
     }
 }

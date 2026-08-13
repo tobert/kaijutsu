@@ -51,6 +51,13 @@ impl Default for AnsiColorsData {
     }
 }
 
+/// Cyan, deliberately absent from the rest of the border palette (gold
+/// tool calls, teal results, red errors, lavender thinking, purple drift)
+/// so the focus ring can't be mistaken for block-kind styling.
+fn default_block_border_focus() -> String {
+    "#8be9fdcc".into()
+}
+
 /// Framework-agnostic theme data.
 ///
 /// Colors are hex strings (`"#rrggbb"` or `"#rrggbbaa"`).
@@ -200,6 +207,12 @@ pub struct ThemeData {
     // User/assistant text borders
     pub block_border_user: String,
     pub block_border_assistant: String,
+    /// Focus ring for the keyboard-focused conversation block (j/k). A
+    /// serde default, not a required field: themes stored in the CRDT
+    /// before this knob existed must keep parsing, or the app silently
+    /// reverts to compiled-in defaults.
+    #[serde(default = "default_block_border_focus")]
+    pub block_border_focus: String,
 
     // Layout spacing
     pub indent_width: f32,
@@ -352,6 +365,7 @@ impl Default for ThemeData {
             // User/assistant borders (transparent = disabled)
             block_border_user: "#00000000".into(),
             block_border_assistant: "#00000000".into(),
+            block_border_focus: default_block_border_focus(),
 
             // Layout spacing
             indent_width: 24.0,

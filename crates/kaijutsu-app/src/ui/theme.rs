@@ -442,6 +442,10 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     pub block_border_user: Color,
     pub block_border_assistant: Color,
+    /// Focus ring for the keyboard-focused conversation block (j/k) —
+    /// applied by `block_border::apply_focus_style` over whatever border
+    /// the block otherwise has.
+    pub block_border_focus: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Layout spacing constants
@@ -698,6 +702,9 @@ impl Default for Theme {
             // User/assistant text borders — transparent (opt-in)
             block_border_user: Color::srgba(0.0, 0.0, 0.0, 0.0),
             block_border_assistant: Color::srgba(0.0, 0.0, 0.0, 0.0),
+            // Focus ring — cyan #8be9fdcc, distinct from every block-kind
+            // border color
+            block_border_focus: Color::srgba(0.545, 0.914, 0.992, 0.8),
 
             // Layout spacing
             indent_width: 24.0,
@@ -897,6 +904,7 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
         // User/assistant text borders
         theme.block_border_user = hex_to_color(&td.block_border_user);
         theme.block_border_assistant = hex_to_color(&td.block_border_assistant);
+        theme.block_border_focus = hex_to_color(&td.block_border_focus);
 
         // Layout spacing
         theme.indent_width = td.indent_width;

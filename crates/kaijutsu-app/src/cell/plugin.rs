@@ -163,6 +163,10 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
+                // Theme repaint gate-reopen must precede the buffer sync so
+                // one frame carries color re-derive + glyph re-bake together.
+                crate::view::block_render::repaint_block_scenes_on_theme_change
+                    .before(view_render::sync_block_cell_buffers),
                 // Block cell buffers (TopLeft anchor)
                 view_render::sync_block_cell_buffers,
                 // Input overlay (chat)
@@ -174,9 +178,7 @@ impl Plugin for CellPlugin {
                 view_shell_dock::sync_shell_dock_visibility
                     .after(view_shell_dock::update_shell_dock_summon),
                 view_shell_dock::sync_shell_dock_style_to_theme,
-                // Highlighting
-                view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
-                // Block border style
+                // Block border style (also carries the block-focus ring)
                 block_border::determine_block_border_style
                     .after(view_render::sync_block_cell_buffers),
                 ApplyDeferred.after(block_border::determine_block_border_style),
