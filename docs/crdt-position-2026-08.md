@@ -206,3 +206,94 @@ merge_ops concurrency counter (instrumentation), BlockDocument demolition
 - Instrumentation still wanted before any refinement pass: merge_ops
   concurrency counter + kernel-internal "did merge do non-trivial work"
   twin.
+
+---
+
+# Build notes (2026-08-13) — corrections found on contact with the code
+
+Appended when work on the migration actually started. The paper above stays
+verbatim; these are the places it does not survive contact, plus the state of
+each scheduled step.
+
+**Correction: step 3's "`insert_block_as` exists" is wrong**, and it is the
+one error that would misdirect the migration. `insert_block_as` is a
+*kernel-side* `BlockStore` method (`kernel/src/block_store.rs:1245`). There is
+**no block-authoring verb anywhere in `kaijutsu.capnp`'s `Kernel` interface**
+(ordinals @0–@105 enumerated; @79–@83 are retired stubs). The nearest
+reachable surface is the kernel MCP tool `block_create` via `executeTool @18`
+— and it is **not sufficient**: it hardcodes `after=None`, `Status::Done` and
+`ContentType::Plain`, and its `metadata` parameter is parsed and then never
+read (`mcp/servers/block.rs:45-47` vs. the dispatch arm), so `tool_name`,
+`tool_input`, `tool_kind` and `is_error` are unreachable over the wire. Tool
+blocks routed through it would render with no name and no input **and nothing
+would error**. Step 3 therefore needs a new capnp verb (an `authorBlock` /
+`authorToolPair` pair), not a call-site swap. Append at the next free ordinal;
+never renumber — a schema change bounces three separately-built binaries.
+
+**Status of the four scheduled steps:**
+
+1. `BlockDocument` demolition — **done** (`75e31b60`).
+2. Merge-classifier instrumentation — **built, and now readable.** The
+   counters existed since the review but reached only `log::debug!` and reset
+   on every kernel restart, so question 1 still had no answer four days on.
+   Now exported as `kaijutsu.crdt.merge_application` (`outcome` =
+   `fast_forward` | `concurrent`) through the already-wired meter provider, so
+   the series survives restarts. Classification logic is
+   `MergeStats::outcome_since`, tested.
+3. MCP doc-task migration — **not started.** `kaijutsu-mcp` still runs
+   `SyncedDocument`; `doc_task.rs:387` is the single remaining production
+   `push_ops` call site in the system.
+4. Plain-projection stream variant — **not started**, and mostly not needed
+   yet. Creation, status, metadata, output, delete, move are *already* plain
+   (`onBlockInserted` carries a full `BlockSnapshot`). The only DTE-encoded
+   gap is **incremental text growth on an existing block**, and nothing in the
+   MCP consumes it — "notify on event, re-read the block" suffices with zero
+   schema work. A `BlockTextDelta` payload is needed only for live streaming
+   text in a thin client.
+
+**Two other framing corrections.** `kaijutsu-acp` also runs a `SyncedDocument`
+(`acp/src/session.rs:14`), so the MCP is the last *replicator* but not the
+last mirror. And retiring the mirror will **not** unlink diamond-types from
+the MCP binary: `kaijutsu-mcp` depends on `kaijutsu-crdt` directly for its
+`Backend::Local` mode. "No client links DTE" for that binary is a separate,
+larger decision.
+
+**What actually dies when step 3 lands:** nothing in `kaijutsu-client`. The
+app and ACP keep `SyncedDocument`, `SyncManager` and `subscriptions.rs`; the
+app also keeps `document_store.rs` and `synced_input.rs`. The one thing that
+reaches zero production callers is **`push_ops`** — which is exactly what the
+paper predicted.
+
+**Sequencing, with the non-negotiable first.** Two existing tests are
+**vacuous with respect to replication**: `hook_remote_e2e.rs:249` asserts
+against the *local mirror*, so it would pass unchanged if `push_ops` silently
+failed, and `e2e_shell.rs`'s stdout assertions read an authoritative
+post-`Done` fetch rather than the mirror. So:
+
+- **Slice 0 — add the server-side acceptance test first.** Fire the hook, then
+  assert via `get_all_blocks` (a server read) that the ToolCall/ToolResult
+  pair landed with the right name, input, status, parent and order. It passes
+  today against `push_ops` and must still pass after. Without it the
+  migration is being done behind an assertion that cannot detect the failure
+  mode it is meant to catch.
+- **Slice 1 — the read side**, no schema change: move the cold readers
+  (prompts, resources, completions) from the mirror to `get_blocks_query` /
+  `get_block`. Independently shippable; shrinks the mirror's remaining job to
+  `find_terminal` alone.
+- **Slice 2** — the new authoring verb. **Slice 3** — flip `HookListener` to
+  it and delete `AuthorBlocks` / `push_new_ops` / `pushed_frontier`; races 3
+  and 4 then vanish by construction rather than by guard.
+- **Slice 4, separately** — replace the last mirror reader (`find_terminal`,
+  hot path on every `shell` call). `e2e_shell.rs:152` already proves the tool
+  survives a dead event feed, so the fallback shape is validated.
+
+**Three decisions this surfaces, wanted before slice 2, not during:**
+principal attribution (blocks carry the MCP session principal today, local
+mode stamps `system()`, server-side authoring would carry the connection
+principal — three answers, and `b356fc45` makes this area sensitive);
+**atomicity** of the ToolCall/ToolResult/status triple, currently one
+mutex-held operation and otherwise three round trips that can orphan a
+`ToolCall` at `Running`; and **latency direction**, which *reverses* — today
+authoring acks after a local insert and pushes fire-and-forget, whereas RPC
+authoring makes the hook wait on the network, against a 5s Claude Code hook
+timeout and a 30s RPC timeout.

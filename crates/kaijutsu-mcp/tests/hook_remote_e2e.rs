@@ -297,6 +297,129 @@ fn tool_after_completes_the_call_block_remote_mode() {
     });
 }
 
+/// **Slice 0 of the CRDT-position migration** (docs/crdt-position-2026-08.md,
+/// "Build notes"): the acceptance test that has to exist *before* the MCP is
+/// moved off client-side replication.
+///
+/// Its sibling above, `tool_after_completes_the_call_block_remote_mode`, is
+/// **vacuous with respect to replication**: it asserts against
+/// `remote.synced` — the process-local mirror that `insert_tool_blocks` wrote
+/// to synchronously. If `push_ops` silently failed and nothing ever reached
+/// the kernel, that test would still pass. It proves authoring, not delivery.
+///
+/// This one reads back through `get_all_blocks`, an authoritative **server**
+/// query, so it can only pass if the hook-authored blocks genuinely crossed
+/// the wire. It passes today against `push_ops`; after the migration to RPC
+/// authoring it must still pass, unchanged. That is the whole point — it is
+/// written against the *contract* (hook fires ⇒ server holds a correct
+/// ToolCall/ToolResult pair), not against the mechanism, so it survives the
+/// mechanism being replaced underneath it.
+///
+/// It pins the fields the planned `block_create` route would silently drop:
+/// `tool_name`, `tool_input`, the pair's parent link, and terminal status.
+/// `block_create` parses a `metadata` argument and never reads it, so a
+/// migration routed through it would render tool blocks with no name and no
+/// input **and nothing would error** — this test is the tripwire for exactly
+/// that.
+#[test]
+fn hook_authored_tool_blocks_reach_the_server_not_just_the_mirror() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let reg = auto_register_with_retry(&mcp, "hook-tool-server-e2e").await;
+        assert!(
+            reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            "register_session_auto failed: {reg}"
+        );
+
+        let Backend::Remote(remote) = mcp.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let context_id = remote
+            .shared_context_id
+            .lock()
+            .expect("context id mutex")
+            .expect("registered context");
+
+        let listener = Arc::new(HookListener::remote(
+            remote.clone(),
+            Arc::clone(&remote.shared_context_id),
+            Arc::clone(mcp.session_id_arc()),
+            None,
+        ));
+        let socket_path = spawn_listener(listener, "toolcall-server").await;
+
+        let event = serde_json::json!({
+            "event": "tool.after",
+            "source": "claude-code",
+            "tool": {
+                "name": "Bash",
+                "input": {"command": "ls -la /tmp"},
+                "output": "total 0",
+            },
+        })
+        .to_string();
+        send_hook_event(&socket_path, &event).await.unwrap();
+
+        // Authoring acks after the LOCAL insert and pushes fire-and-forget
+        // (doc_task.rs), so the ack says nothing about delivery. Poll the
+        // server rather than sleeping a fixed grace period — a sleep would
+        // make this flaky under load and, worse, would make a genuine
+        // delivery failure look like a slow one.
+        let mut server_blocks = Vec::new();
+        for _ in 0..50 {
+            server_blocks = remote
+                .actor
+                .get_all_blocks(context_id)
+                .await
+                .expect("get_all_blocks");
+            if server_blocks.iter().any(|b| b.kind == BlockKind::ToolCall) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let call = server_blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolCall)
+            .expect(
+                "hook-authored ToolCall must be readable from the SERVER, \
+                 not merely present in the local mirror",
+            );
+
+        assert_eq!(
+            call.tool_name.as_deref(),
+            Some("Bash"),
+            "tool_name must survive the trip to the server"
+        );
+        assert!(
+            call.tool_input
+                .as_deref()
+                .is_some_and(|i| i.contains("ls -la /tmp")),
+            "tool_input must survive the trip to the server, got: {:?}",
+            call.tool_input
+        );
+        assert_eq!(
+            call.status,
+            Status::Done,
+            "the ToolCall must reach a terminal status server-side — an \
+             orphan left at Running is the failure mode splitting the \
+             mutex-held triple into separate RPCs would introduce"
+        );
+
+        let result = server_blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult)
+            .expect("hook-authored ToolResult must be readable from the server");
+        assert_eq!(
+            result.parent_id.as_ref(),
+            Some(&call.id),
+            "the ToolResult must be parented to its ToolCall server-side — \
+             the link `block_create` cannot currently express"
+        );
+    });
+}
+
 /// docs/issues.md "cc-* hook re-registration mints a new context per MCP
 /// relaunch": an MCP process relaunch (process death + respawn, `/mcp
 /// reconnect`) within the SAME Claude Code session must reattach to the
