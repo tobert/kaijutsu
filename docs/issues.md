@@ -6,6 +6,42 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## kaish 0.14 bump — blocked on a latch-surface port, and it unpins `kaish-help` (2026-08-13)
+
+We pin **kaish 0.13** (`Cargo.toml`). **0.14 removes the latch surface**
+(`latch_request()`, `LatchRequest`, `.nonce`) — flagged by the kaish lead as
+the translation-site port predicted during the cut, now concrete.
+
+**Scope, probed rather than taken on report: one production call site.** The
+lead counted six references; that is right for the whole tree, but five are
+tests. Production is `crates/kaijutsu-kernel/src/mcp/servers/shell.rs:467`
+(`result.latch_request()`). The rest construct `LatchRequest` literals in test
+modules (`shell.rs` ~764, `kj_builtin.rs` ~2326–2377). So this is a small port
+with a test-fixture tail, not a six-site sweep — worth knowing before anyone
+budgets it as the larger job.
+
+**It also closes an open TODO.** `kaish-help` is pinned to a git rev (not
+crates.io) because published 0.13 forces an "Overlay mode" paragraph into every
+composed recipe and kaijutsu never enables overlay mode — we would be telling
+our models to run `kaish-vfs commit` for a mode that is off. That rev shipped
+in **0.14.0**, so the TODO's own stated exit condition is met: flip
+`kaish-help` to `"0.14"` in the same bump (`docs/composable-help.md` step 4).
+The two are coupled — the help unpin is the reward for doing the latch port.
+
+**Also from the same exchange — one kaish gotcha of ours is now FIXED and one
+is not a bug.** `${var:0:N}` no longer fails silently: kaish 0.14 (`d129cb5`)
+slices with `${s[0:5]}` (bracket form, start:end, end-exclusive, character-
+counting, negatives and open bounds free) and makes the bash `:offset:length`
+spelling a loud error naming the kaish form. Worth knowing *why* it got
+prioritized: our report said the expansion yielded empty, but the receiving
+lane's re-probe found the word vanishes from the AST entirely — so inside
+quotes it produced a **wrong path, not a missing one** (`"${d:0:4}/file"` →
+`/file`, meaning `rm "${d:0:4}/file"` silently targeted the wrong thing). A
+report describes what was visible; a probe finds the shape. Separately, the
+bare-numeric leading-zero normalization is **ruled intended** (coerce to number,
+quote for a string) and becomes a docs task, not a fix — though the `1e2`
+inconsistency is real and should ride the write-up.
+
 ## Three findings from the slice-3 cross-model review (2026-08-13, gemini-pro + deepseek)
 
 Both models independently confirmed the read-replica invariant holds (three
