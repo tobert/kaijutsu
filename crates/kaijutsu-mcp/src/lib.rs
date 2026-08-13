@@ -86,7 +86,7 @@ use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use tokio::sync::watch;
 
-use doc_task::{DocTaskHandle, ResyncReason, spawn_doc_task, spawn_event_bridge};
+use doc_task::{DocTaskHandle, spawn_doc_task, spawn_event_bridge};
 
 // Re-export public types
 use helpers::*;
@@ -1091,77 +1091,85 @@ impl KaijutsuMcp {
         label: &str,
     ) -> ShellCompletion {
         let start = std::time::Instant::now();
-        let fallback_interval = tokio::time::Duration::from_millis(500);
 
-        // Completion check — finds the finished ToolResult child of our command
-        // block (Done/Error) in the local SyncedDocument.
-        let find_terminal = || -> Option<kaijutsu_crdt::BlockSnapshot> {
-            let guard = remote.synced.lock();
-            let doc = guard.as_ref()?;
-            doc.blocks().into_iter().find(|b| {
-                b.parent_id.as_ref() == Some(&cmd_block_id)
-                    && b.is_shell()
-                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
-                    && matches!(
-                        b.status,
-                        kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error
-                    )
-            })
+        // Completion check — the finished ToolResult child of our command
+        // block, read from the SERVER. This used to scan the local
+        // `SyncedDocument`; the mirror is fed only by the event feed, and the
+        // stall fallback below exists precisely because that feed can die, so
+        // it was a cache that could silently disagree with the authority it
+        // was standing in for. Slice 4 of docs/crdt-position-2026-08.md.
+        //
+        // The filter cannot express `is_shell()` — `BlockFilter` has no
+        // `tool_kind` field — so that stays a client-side check. Which is
+        // also why there is deliberately NO `limit: 1`: the server would cap
+        // before our filter ran and could hand back a non-shell ToolResult
+        // while hiding the real one. A command block has a handful of
+        // children; take them all and pick here.
+        let query_terminal = || async {
+            let filter = kaijutsu_types::BlockFilter {
+                kinds: vec![kaijutsu_crdt::BlockKind::ToolResult],
+                statuses: vec![kaijutsu_crdt::Status::Done, kaijutsu_crdt::Status::Error],
+                parent_id: Some(cmd_block_id),
+                max_depth: 1,
+                ..Default::default()
+            };
+            match remote.actor.query_blocks(ctx_id, filter).await {
+                Ok(blocks) => blocks.into_iter().find(|b| b.is_shell()),
+                Err(e) => {
+                    // Not fatal: a failed poll is a slow poll. The loop's own
+                    // timeout is the backstop, and the next tick retries.
+                    tracing::warn!("{label}: completion poll failed, will retry: {e}");
+                    None
+                }
+            }
         };
 
-        // Phase 1 — wait until the ToolResult reaches a terminal status locally.
-        // Subscribe to the change generation BEFORE the first check: the watch
-        // channel records the version, so a bump that lands between our check
-        // and the `changed().await` below is still observed (no lost wakeup).
-        let mut change_rx = remote.change.subscribe();
-
-        // Stall fallback: `change` is bumped by the doc task, which mostly
-        // has something to bump only when the server's FlowBus bridge
-        // delivers an event. ("Mostly" is load-bearing and currently a bug:
-        // the doc task also bumps after a resync, including the one THIS
-        // fallback requests, so the loop reads its own resync as delivery
-        // progress and resets the backoff below. Filed in docs/issues.md —
-        // the effect is wasted snapshots, not wrong data.)
-        // If that bridge gets reaped mid-command (a burst
-        // of callback timeouts from one transient client stall — see
-        // `SubscriberHealth` server-side), the client is never told: the
-        // broadcast channel stays open, just silent, and without this we'd
-        // block the *entire* `timeout_secs` on a channel that may never fire
-        // again. So: if the stall window passes with no watch progress while
-        // a command is still pending, assume delivery may be dead and force
-        // an authoritative catch-up rather than keep waiting on it blind.
+        // Phase 1 — wait for the ToolResult to reach a terminal status.
         //
-        // The window backs off exponentially within a stall episode (5s,
-        // 10s, 20s, capped at 30s) rather than firing flat every 5s. Dead-
-        // bridge discovery still lands fast — most shell commands finish
-        // under the 5s initial window — but a long, healthy, quiet command
-        // (a multi-minute build, `kj synth all`) doesn't pay for a full-
-        // context `get_context_sync` snapshot every 5s for its whole
-        // runtime; that per-call snapshot cost is already flagged as a perf
-        // issue (docs/issues.md) without piling a tight poll on top of it.
-        const STALL_INITIAL_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-        const STALL_MAX_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(30);
-        let mut stall_window = STALL_INITIAL_WINDOW;
-        let mut next_stall_check = std::time::Instant::now() + stall_window;
-        // Resubscribing replaces a live bridge too (idempotent, but not
-        // free — see `ActorHandle::resubscribe_blocks`), so fire it at most
-        // once per stall episode; real watch progress (delivery is alive
-        // after all, just slow) clears this — and the backed-off window —
-        // for the next one.
-        let mut stall_resubscribed = false;
+        // **Polling is the guarantee; the event feed only makes it fast.**
+        // That inversion is the point of this slice. Before it, the event
+        // feed was the mechanism and an authoritative catch-up was the
+        // emergency: the loop scanned the local mirror on every wake and
+        // only pulled from the server once a stall window convinced it that
+        // delivery had died. So the common path trusted a cache that the
+        // uncommon path existed to correct — and the cache is fed by exactly
+        // the feed whose death we were trying to detect.
+        //
+        // Now every check is an authoritative query and `change` is a
+        // *hint*: it can pull the next poll earlier, never later, and never
+        // makes one more often than `MIN_POLL_INTERVAL`. A dead feed is no
+        // longer an exceptional case to detect and recover from — it just
+        // means nothing arrives early and we fall back to the floor cadence.
+        // Nothing to detect means nothing to get wrong.
+        //
+        // Two bugs die with the old shape. The stall backoff was defeated by
+        // the doc task bumping `change` after its own fallback resync, so the
+        // loop read its own recovery as "delivery is alive" and reset the
+        // ladder (filed in docs/issues.md); there is no ladder to defeat now.
+        // And `ResyncReason::StallFallback` sat outside `do_coalesced_resync`'s
+        // staleness argument because it was the one trigger not caused by the
+        // ordered event stream — this path no longer resyncs at all.
+        const MIN_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(250);
+        const MAX_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
+        // Subscribe BEFORE the first query: the watch records its version, so
+        // a bump landing between the query and the wait is still observed. The
+        // ordering matters more than it used to — the query is now the thing
+        // that can miss, and this is what stops a lost wakeup turning into a
+        // full `timeout_secs` stall.
+        let mut change_rx = remote.change.subscribe();
+        let mut poll_interval = MIN_POLL_INTERVAL;
 
         let local = loop {
-            if let Some(snap) = find_terminal() {
+            if let Some(snap) = query_terminal().await {
                 break snap;
             }
             if start.elapsed().as_secs() > timeout_secs {
-                // A timeout is the precise signal that block-event delivery may
-                // be dead — the server can reap a subscription after a sustained
-                // callback stall, and the client is never told (the broadcast
-                // channel stays open, just silent). Re-subscribe so the *next*
-                // shell call recovers without a full reconnect. Best-effort:
-                // the resubscribe replaces any prior subscription by
-                // (principal, instance) on the server.
+                // Still worth resubscribing on the way out: if the server
+                // reaped our FlowBus subscription, this restores the *next*
+                // call's fast path. It no longer affects correctness here —
+                // the poll floor would have found the result regardless — so
+                // it is best-effort and its failure is only logged.
                 if let Err(e) = remote.actor.resubscribe_blocks().await {
                     tracing::warn!("{label}: resubscribe after timeout failed: {e}");
                 }
@@ -1172,68 +1180,23 @@ impl KaijutsuMcp {
                 };
             }
 
-            // Wait for the next applied event; the fallback tick is now just a
-            // safety net (the watch channel makes lost wakeups impossible) —
-            // UNLESS the bridge is dead, in which case it never fires and this
-            // always times out. That's exactly the case the stall check below
-            // exists to catch.
-            let watch_progressed = matches!(
-                tokio::time::timeout(fallback_interval, change_rx.changed()).await,
+            // Wait for a hint, but never longer than the current floor. A
+            // bump means "something changed, look now" — it is not evidence
+            // that delivery is healthy, and nothing is inferred from its
+            // absence beyond "poll again".
+            let hinted = matches!(
+                tokio::time::timeout(poll_interval, change_rx.changed()).await,
                 Ok(Ok(()))
             );
-            if watch_progressed {
-                stall_window = STALL_INITIAL_WINDOW;
-                next_stall_check = std::time::Instant::now() + stall_window;
-                stall_resubscribed = false;
-                continue;
-            }
-
-            if std::time::Instant::now() < next_stall_check {
-                continue;
-            }
-            tracing::info!(
-                command = %command,
-                cmd_block = %cmd_block_id.to_key(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "shell poll stall fallback: no event-feed progress for the current {}s \
-                 window, forcing authoritative resync",
-                stall_window.as_secs(),
-            );
-            // Pull the server's authoritative snapshot straight into the local
-            // SyncedDocument — the same resync the doc task runs after a
-            // reconnect/lag, routed through its command channel like every
-            // other mutation now (not a direct call — the doc task is the
-            // sole writer). It fetches the server's snapshot and folds it
-            // into `remote.synced` (there is no pre-fetch flush anymore —
-            // the mirror is a read replica with nothing local to flush). If
-            // the command
-            // finished server-side while our delivery path was dead, the very
-            // next `find_terminal()` at the top of this loop picks it up
-            // exactly as if it had arrived locally — no separate fetch/decode
-            // path to keep in sync with Phase 2 below. `change` bumps as
-            // part of this uniformly with every other doc-task mutation.
-            let doc_task = remote.doc_task.lock().ok().and_then(|g| g.clone());
-            match doc_task {
-                Some(handle) => {
-                    if let Err(e) = handle.resync(ResyncReason::StallFallback).await {
-                        tracing::warn!("{label}: stall-fallback resync failed: {e}");
-                    }
-                }
-                None => tracing::warn!(
-                    "{label}: stall-fallback resync skipped — doc task not ready"
-                ),
-            }
-            if !stall_resubscribed {
-                if let Err(e) = remote.actor.resubscribe_blocks().await {
-                    tracing::warn!("{label}: stall-fallback resubscribe failed: {e}");
-                }
-                stall_resubscribed = true;
-            }
-            // Back off within this episode — see the comment above the
-            // window consts. Real watch progress (handled above) is the only
-            // thing that resets it.
-            stall_window = (stall_window * 2).min(STALL_MAX_WINDOW);
-            next_stall_check = std::time::Instant::now() + stall_window;
+            // Back off only while nothing is arriving, so a long quiet
+            // command (a multi-minute build) settles to one cheap query every
+            // couple of seconds instead of four a second. Any hint drops
+            // straight back to the responsive floor.
+            poll_interval = if hinted {
+                MIN_POLL_INTERVAL
+            } else {
+                (poll_interval * 2).min(MAX_POLL_INTERVAL)
+            };
         };
 
         // Phase 2 — read the AUTHORITATIVE final block from the server. A shell

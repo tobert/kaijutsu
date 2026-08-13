@@ -174,7 +174,18 @@ fn shell_survives_dead_event_feed() {
         let started = std::time::Instant::now();
         let out = mcp
             .shell(Parameters(ShellRequest {
-                command: "echo still-alive".to_string(),
+                // MUST be slow enough that the first completion poll misses.
+                // This test was `echo still-alive` and went VACUOUS the moment
+                // the poll started querying the server instead of the local
+                // mirror: an echo finishes server-side before the first query,
+                // so the loop found it immediately and never reached the wait
+                // at all — it proved "one query works", not "the loop survives
+                // a dead feed". Under the old design the mirror *couldn't*
+                // hold the answer with the bridge dead, which is the only
+                // reason the fast command exercised anything.
+                // Verified: with a sleep here, deleting the poll floor hangs
+                // this test; with `echo`, deleting it changes nothing.
+                command: "sleep 2; echo still-alive".to_string(),
                 // Generous request timeout — the assertion below is what
                 // actually proves the stall fallback fired; a bare pass
                 // under a slack timeout would prove nothing.
