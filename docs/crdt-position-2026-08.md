@@ -507,5 +507,40 @@ silently disagree with the server. That is exactly the question
 `docs/memory.md`'s derived-state rule says to ask: *can this state disagree
 with truth silently?* It can. Retiring it is a correctness move.
 
+### Slice 4's route: watch the events, don't rebuild the state
+
+Proposed, not yet built. Recorded so the reasoning survives the session.
+
+The framing that makes slice 4 tractable: the mirror answers *"what is the
+current state?"*, but the shell poll only needs *"did the terminal transition
+happen?"* The second is an **event match**, not a state query — and the events
+already carry everything it needs. `ServerEvent::BlockInserted` ships a full
+`BlockSnapshot` (so `parent_id`, `kind`, `tool_kind`/`is_shell()` and the
+initial `status` are all readable off the event), and
+`ServerEvent::BlockStatusChanged` ships the transition. So:
+
+1. Subscribe to the event stream.
+2. Do **one** authoritative query for the already-terminal case.
+3. Otherwise watch: remember the ToolResult id from a `BlockInserted` whose
+   parent is our command block, then wait for its `BlockStatusChanged` to
+   Done/Error. Handle the insert arriving *already* terminal — the snapshot
+   carries status, so that is a branch, not a race.
+
+Cost per event is zero RPCs, versus one per event for the naive "query on
+every wake" design — which matters because streaming shell output produces
+many `BlockTextOps` events per command.
+
+**Step 2 is not optional, and it is the whole reason the ordering is written
+out.** Today the mirror holds accumulated state, which papers over the
+subscribe-after-the-fact race: if the result landed and completed before we
+started looking, the document still has it. An event-only watcher has no
+accumulated state and would wait forever. Subscribe first, then query, then
+watch — the standard shape, and the mirror has been hiding the need for it.
+
+The stall fallback simplifies in the same move: instead of resyncing a whole
+document, it re-runs the same one-shot query. `e2e_shell.rs:152` already proves
+the tool survives a dead event feed, so that path has a test before it has an
+implementation.
+
 Also still open: `kaijutsu-acp` runs its own `SyncedDocument`, so the MCP is
 the last *replicator* but not the last mirror.
