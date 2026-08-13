@@ -61,6 +61,56 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ---
 
+## kaish captured stdout truncates SILENTLY at 8 KB (2026-08-13)
+
+`OutputLimitConfig::agent()` (`kernel/src/runtime/embedded_kaish.rs:264`) caps
+a builtin's captured stdout at 8192 bytes. Crossing it does **not** error and
+does **not** set a failure code — the capture collapses to a ~1.6 KB
+head+tail splice with `[output truncated]` between them. Command substitution
+therefore hands the script a *plausible, wrong* value.
+
+Found the expensive way during slice-1 rc work: an unbounded
+`grep '^- \[' MEMORY.md | grep -c .` reported **12** where the truth was
+**105** — the first pass overflowed the cap, and the second counted the
+splice. Nothing anywhere reported a problem.
+
+This is the silent-fallback shape CLAUDE.md rejects, and rc scripts are its
+worst host: an rc script computing a digest, a count, or a hash off a
+truncated capture writes a confident wrong fact into a context, and per the
+`create` blast radius it does so on every session registration.
+
+Candidate fixes, cheapest first: make truncation set a nonzero status or a
+shell var an author can test; or emit the truncation notice on stderr as well
+so it is visible in the Trace block; or raise the cap for rc-context shells
+specifically. Any of the three beats the current behavior. Until one lands,
+the discipline is **bound every read before it lands in a variable**
+(`head -n`, a filter) — now recorded in `memory.md`'s mechanics section.
+
+## Memory system — direction decided, slices open (2026-08-13)
+
+Direction is now canonical in [`memory.md`](memory.md): **the kernel is
+memory's best reader, not its new owner** — git keeps storage, kaijutsu grows
+recall. Read it before proposing anything memory-shaped; several attractive
+designs are explicitly dead there (CRDT memory tree, memory-as-contexts, fact
+schemas), and one rule binds work well outside memory:
+
+- **The derived-state rule.** "No second store" is enforced by asking *"can
+  this state disagree with truth **silently**?"* — `derived` is not an
+  exemption. Applies to every cache, index, and mirror we add from here.
+
+Open slices, in `memory.md`: S15 recall script + baseline classification
+(zero Rust), `kj memory search|recall` over MCP, write-back proposals with a
+named drain, and the two kernel-only capabilities (per-turn mailbox recall,
+change-push). Semantic indexing over the forests is **deferred with reasons**
+— the index is `ContextId`-keyed end to end and HNSW's never-reuse slots leak
+a permanent graph point per re-embed, which a git-tracked corpus edited
+hourly would punish.
+
+Two blockers that memory work now co-owns, both already listed elsewhere in
+this file: **hook self-lockout has no recovery path** (third independent
+reason to fix it — it gates the constraint-hook seam), and the
+**external-drive gate** is a prerequisite for the resident-assistant seat.
+
 ## Block-authorship leftovers from the identity-smear split (2026-08-13)
 
 The split itself shipped: drift blocks carry the sender, rc-lifecycle blocks

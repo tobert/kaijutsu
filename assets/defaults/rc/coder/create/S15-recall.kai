@@ -1,0 +1,139 @@
+# S15-recall.kai — inject a compact, receipt-carrying digest of the fleet's
+# shared memory surfaces (docs/memory.md, "Slice 1 — the recall block").
+# Both trees are already reachable read-only through the kernel's catch-all
+# "/" mount (LocalBackend::read_only, kaijutsu-server/src/rpc.rs:1649) with
+# no CRDT staleness window (mount_backend.rs:264-267) — straight off disk
+# at read time, same guarantee docs/memory.md relies on.
+#
+# Hard constraints this script exists to satisfy (docs/memory.md "Mechanics
+# a builder needs" + kj/lifecycle.rs module docs):
+#
+#  - NEVER exit nonzero. A nonzero exit inserts a non-ephemeral
+#    BlockKind::Error the LLM sees on EVERY context create (lifecycle.rs
+#    "Failure semantics"). Every read below is gated by `test -f` first
+#    (a VFS-aware kaish builtin, no exec needed) so a missing file degrades
+#    into a fallback string instead of a failed read, and `exit 0` is also
+#    the literal last line of this script — belt-and-suspenders regardless
+#    of what happened above it. Verified live: kaish does not abort a
+#    script on an unchecked command failure (a failing `cat` mid-script
+#    does not stop a later `echo`/`exit` from running) — the one thing
+#    `exit 0` at the end can't rescue is a *parse* error anywhere in the
+#    script, which aborts before any statement runs; every construct below
+#    was proven live against a running kernel before landing here.
+#  - Local, cheap, kj-and-VFS-only, NO network calls. `date`, `cat`, `grep`,
+#    `sed`, `head`, `test`, `case` are all native kaish builtins, not
+#    external processes (confirmed against kaish-kernel 0.13's
+#    tools/builtin/* registry) — they run in-process regardless of the
+#    context's Capability::Exec / ExternalExec policy, which only gates
+#    genuinely external commands. This script shells out to nothing, so it
+#    behaves identically in a narrow loadout and a wide one.
+#  - Bounded reads. Every extraction is grep/sed-filtered THEN
+#    `head -n 20`-capped before it ever lands in a variable. This also
+#    dodges a live-verified kaish landmine: a single builtin's own stdout
+#    is capped at 8192 bytes (OutputLimitConfig::agent(), wired in
+#    kaijutsu-kernel/src/runtime/embedded_kaish.rs) — cross it and the
+#    captured output silently collapses to a ~1.6KB head+tail+"[output
+#    truncated]" splice instead of erroring. An early, unbounded
+#    `grep '^- \[' MEMORY.md` (105 lines, ~18KB) hit exactly this and
+#    silently mis-reported its own count as 12 instead of 105 when routed
+#    through a second capture. Every capture here is pre-trimmed to a few
+#    KB, comfortably under the cap, and totals are counted via a dedicated
+#    `grep -c` call on the filtered-but-unbounded pipeline (its output is
+#    just a number, so it can't hit the byte cap) rather than derived from
+#    a second pass over an already-large captured variable.
+#
+# git HEAD is read WITHOUT shelling out to `git` (external, exec-gated):
+# `.git/HEAD` and `.git/refs/heads/<branch>` are plain text files, read the
+# same way as everything else. Falls back to "unresolved ref" rather than
+# failing if the ref is packed (packed-refs is not parsed here — rare
+# enough on this tree not to be worth the extra surface for slice 1).
+#
+# NOTIFICATION, never (Role::System, BlockKind::Text) — same rule and same
+# reason as ../../lib/create/S25-datetime.kai. This block's content (date,
+# HEAD, live digests) differs on every create by construction, and the
+# System+Text slot folds into the CACHED system prompt
+# (extract_system_prompt_sections, llm/system_prompt.rs), so putting it there
+# would invalidate the `--target=system` cache breakpoint. Notification
+# hydrates as an ordinary appended user-role turn (llm/hydrate.rs:405, D-34)
+# and is never swept into the system prompt — the model still reads it,
+# cache-safe by construction.
+#
+# The first draft of docs/memory.md specified System+Text for this script;
+# that was wrong and is corrected there. Recall does not need the
+# system-prompt slot — it needs to reach the model, which a Notification
+# does. Recorded because the mistake is easy to repeat: "inject into the
+# system prompt" is the intuitive phrasing and the wrong mechanism for
+# anything that varies per create.
+
+exo="/home/atobey/exomemory"
+fleet_file="$exo/fleet.md"
+mem_file="/home/atobey/.claude/projects/-home-atobey-src-kaijutsu/memory/MEMORY.md"
+
+stamp="$(date -u --iso-8601=seconds)"
+
+# --- exomemory git HEAD, resolved without an external `git` call ---
+head_hash="unavailable (~/exomemory/.git/HEAD not readable)"
+head_file="$exo/.git/HEAD"
+if test -f $head_file; then
+  head_raw="$(cat $head_file)"
+  case "$head_raw" in
+    ref:*)
+      ref_path="$(echo $head_raw | sed 's/^ref: *//')"
+      ref_file="$exo/.git/$ref_path"
+      if test -f $ref_file; then
+        head_hash="$(cat $ref_file)"
+      else
+        head_hash="unresolved ref ($ref_path — likely packed-refs, not read here)"
+      fi
+      ;;
+    *)
+      head_hash="$head_raw"
+      ;;
+  esac
+fi
+
+# --- fleet.md: standing constraints, index-line grade ---
+# Top-level bullets (`- **bold lead** ...`) reduced to their bold lead
+# phrase only — a genuine index line, not a sentence truncated mid-word.
+# Bullets whose bold marker doesn't close on line 1 are dropped rather than
+# shown mangled; that's an accepted loss for slice 1, not a bug.
+fleet_total=0
+fleet_digest="unavailable ($fleet_file not readable)"
+if test -f $fleet_file; then
+  fleet_total="$(grep -E '^- ' $fleet_file | sed -n 's/^- \*\*\([^*]*\)\*\*.*/- \1/p' | grep -c .)"
+  fleet_digest="$(grep -E '^- ' $fleet_file | sed -n 's/^- \*\*\([^*]*\)\*\*.*/- \1/p' | head -n 20)"
+  if test -z "$fleet_digest"; then
+    fleet_digest="(present but no bulleted constraints matched — fleet.md's format may have changed)"
+  fi
+fi
+
+# --- MEMORY.md: the auto-memory topic index, already index-line grade ---
+# Lines already read "- [title](file.md) — one-line description"; reused
+# as-is rather than compressed further, capped to the first 20 of however
+# many exist today.
+mem_total=0
+mem_digest="unavailable ($mem_file not readable)"
+if test -f $mem_file; then
+  mem_total="$(grep -c '^- \[' $mem_file)"
+  mem_digest="$(grep '^- \[' $mem_file | head -n 20)"
+  if test -z "$mem_digest"; then
+    mem_digest="(present but no index lines matched — MEMORY.md's format may have changed)"
+  fi
+fi
+
+content="=== Fleet + memory recall (auto-injected at context create; read-only, direct-from-disk) ===
+Read $stamp. exomemory HEAD: $head_hash.
+Staleness is VISIBLE, not absent: this date+HEAD is a freshness bound on the digest below, not a
+claim that nothing changed since. Treat anything after this stamp as unseen, not absent, and
+re-read the source files directly for anything time-sensitive.
+
+-- fleet.md standing constraints (first 20 of $fleet_total, index-line grade; full file: $fleet_file) --
+$fleet_digest
+
+-- MEMORY.md topic index (first 20 of $mem_total, index-line grade; full file: $mem_file) --
+$mem_digest"
+
+kj block create --role system --kind notification --content "$content"
+
+echo "recall: injected fleet=$fleet_total mem=$mem_total head=$head_hash stamp=$stamp"
+exit 0
