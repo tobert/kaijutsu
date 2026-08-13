@@ -172,8 +172,12 @@ impl KjDispatcher {
         caller: &KjCaller,
     ) -> Result<(), String> {
         let after = self.block_store().last_block_id(target_ctx);
+        // The drift block is the one block in the target that legitimately
+        // belongs to an outsider, so it carries the SENDER. Everything the
+        // arrival then triggers (the target's `drift` rc scripts) belongs to
+        // the context owner instead — see `run_rc_lifecycle_inner`.
         self.block_store()
-            .insert_drift_block(
+            .insert_drift_block_as(
                 target_ctx,
                 None,
                 after.as_ref(),
@@ -181,6 +185,7 @@ impl KjDispatcher {
                 source_ctx,
                 source_model.clone(),
                 drift_kind,
+                Some(caller.principal_id),
             )
             .map_err(|e| e.to_string())?;
 
@@ -310,6 +315,7 @@ impl KjDispatcher {
                     content.clone(),
                     source_model.clone(),
                     drift_kind,
+                    caller.principal_id,
                 ) {
                     // Loud, not silent: the push failed, but the content is
                     // parked in the queue that already knows how to retry
@@ -351,6 +357,7 @@ impl KjDispatcher {
                 content,
                 source_model,
                 drift_kind,
+                caller.principal_id,
             ) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift push: {e}")),
@@ -399,7 +406,9 @@ impl KjDispatcher {
         };
         let after = self.block_store().last_block_id(context_id);
 
-        if let Err(e) = self.block_store().insert_drift_block(
+        // `pull` is a send the caller performs on their own behalf: they asked
+        // for the summary and it lands in their context, so they author it.
+        if let Err(e) = self.block_store().insert_drift_block_as(
             context_id,
             None,
             after.as_ref(),
@@ -407,6 +416,7 @@ impl KjDispatcher {
             source_id,
             source_model.clone(),
             DriftKind::Pull,
+            Some(caller.principal_id),
         ) {
             return KjResult::Err(format!("kj drift pull: failed to insert drift block: {e}"));
         }
@@ -508,7 +518,9 @@ impl KjDispatcher {
             router.get(context_id).and_then(|h| h.model.clone())
         };
         let after = self.block_store().last_block_id(target_id);
-        if let Err(e) = self.block_store().insert_drift_block(
+        // `merge` sends the child's distillation up to the parent — the caller
+        // is the sender, and the block lands in a context they may not own.
+        if let Err(e) = self.block_store().insert_drift_block_as(
             target_id,
             None,
             after.as_ref(),
@@ -516,6 +528,7 @@ impl KjDispatcher {
             context_id,
             source_model.clone(),
             DriftKind::Merge,
+            Some(caller.principal_id),
         ) {
             return KjResult::Err(format!("kj drift merge: failed to insert drift block: {e}"));
         }
@@ -601,7 +614,9 @@ impl KjDispatcher {
 
         for drift in staged {
             let after = self.block_store().last_block_id(drift.target_ctx);
-            match self.block_store().insert_drift_block(
+            // The author is whoever STAGED this item, not whoever is running
+            // flush — see `StagedDrift::staged_by`.
+            match self.block_store().insert_drift_block_as(
                 drift.target_ctx,
                 None,
                 after.as_ref(),
@@ -609,6 +624,7 @@ impl KjDispatcher {
                 drift.source_ctx,
                 drift.source_model.clone(),
                 drift.drift_kind,
+                Some(drift.staged_by),
             ) {
                 Ok(_) => {
                     injected += 1;
@@ -728,7 +744,10 @@ impl KjDispatcher {
                     item.drift_kind,
                     &item.content,
                 );
-                if let Err(e) = self.block_store().insert_drift_block(
+                // A dead letter keeps its original sender. `lost+found` exists
+                // to answer "whose message died?", which the flusher's identity
+                // cannot.
+                if let Err(e) = self.block_store().insert_drift_block_as(
                     lf_id,
                     None,
                     after.as_ref(),
@@ -736,6 +755,7 @@ impl KjDispatcher {
                     item.source_ctx,
                     item.source_model.clone(),
                     item.drift_kind,
+                    Some(item.staged_by),
                 ) {
                     tracing::error!("failed to write dead letter to lost+found, retaining: {e}");
                     unwritten.push(item);
@@ -1018,6 +1038,101 @@ mod tests {
         assert_eq!(queue.message(), "(queue empty)");
     }
 
+    /// The identity smear, drift half: the drift block is the ONE block in the
+    /// target context that legitimately belongs to an outsider, so it must
+    /// carry the *sending* principal. Before this it carried
+    /// `BlockStore::principal_id()` — the kernel's own identity — so every
+    /// drift in the system looked like it came from the same anonymous place
+    /// and "who sent me this?" was unanswerable from the block alone.
+    #[tokio::test]
+    async fn drift_push_block_carries_the_sending_principal() {
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, owner);
+        let dst = register_context(&d, Some("dst"), None, owner);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let sender = caller_with_context(src);
+        assert_ne!(
+            sender.principal_id,
+            d.block_store().principal_id(),
+            "fixture must differ from the store's own principal or the assertion is vacuous"
+        );
+
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("dst"), s("hello from src")], &sender)
+            .await;
+        assert!(result.is_ok(), "push failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        let drifted = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift block landed");
+        assert_eq!(
+            drifted.id.principal_id, sender.principal_id,
+            "drift block must carry the sending principal"
+        );
+    }
+
+    /// Staging splits the sender from the flusher, and the *sender* is the one
+    /// the block belongs to. Contexts are shared (many hands, one trust
+    /// boundary), so "whoever ran flush" is a different principal often enough
+    /// to matter — and attributing a batch to the flusher would silently
+    /// relabel every message in it.
+    #[tokio::test]
+    async fn flushed_drift_carries_the_stager_not_the_flusher() {
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, owner);
+        let dst = register_context(&d, Some("dst"), None, owner);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Two principals sharing one context: one stages, the other flushes.
+        let stager = caller_with_context(src);
+        let mut flusher = caller_with_context(src);
+        flusher.context_id = stager.context_id;
+        assert_ne!(
+            stager.principal_id, flusher.principal_id,
+            "fixture must use two distinct principals or the assertion is vacuous"
+        );
+
+        let staged = d
+            .dispatch(
+                &[
+                    s("drift"),
+                    s("push"),
+                    s("--stage"),
+                    s("dst"),
+                    s("batched note"),
+                ],
+                &stager,
+            )
+            .await;
+        assert!(staged.is_ok(), "stage failed: {}", staged.message());
+
+        let flushed = d.dispatch(&[s("drift"), s("flush")], &flusher).await;
+        assert!(flushed.is_ok(), "flush failed: {}", flushed.message());
+
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        let drifted = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("flushed drift block landed");
+        assert_eq!(
+            drifted.id.principal_id, stager.principal_id,
+            "flushed drift must carry the principal that STAGED it"
+        );
+        assert_ne!(
+            drifted.id.principal_id, flusher.principal_id,
+            "flushed drift must not be relabelled with the flusher"
+        );
+    }
+
     /// `--stage` keeps the old batching behaviour: nothing reaches the
     /// target until `flush`. Staging is still worth having (it is what
     /// makes `cancel` possible and lets a sender batch); it just is not the
@@ -1264,7 +1379,14 @@ mod tests {
         {
             let mut router = d.drift_router().write();
             router
-                .stage(src, dst, "victim".into(), None, kaijutsu_crdt::DriftKind::Push)
+                .stage(
+                    src,
+                    dst,
+                    "victim".into(),
+                    None,
+                    kaijutsu_crdt::DriftKind::Push,
+                    PrincipalId::new(),
+                )
                 .unwrap();
             for _ in 0..8 {
                 let drained = router.drain(None);
@@ -1314,7 +1436,14 @@ mod tests {
         {
             let mut router = d.drift_router().write();
             router
-                .stage(src, dst, "victim".into(), None, kaijutsu_crdt::DriftKind::Push)
+                .stage(
+                    src,
+                    dst,
+                    "victim".into(),
+                    None,
+                    kaijutsu_crdt::DriftKind::Push,
+                    PrincipalId::new(),
+                )
                 .unwrap();
             for _ in 0..8 {
                 let drained = router.drain(None);

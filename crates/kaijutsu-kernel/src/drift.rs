@@ -108,6 +108,13 @@ pub struct StagedDrift {
     pub source_model: Option<String>,
     /// How this drift arrived.
     pub drift_kind: DriftKind,
+    /// The principal that STAGED this drift — the author the delivered block
+    /// gets, not whoever later runs `flush`. Staging splits sender from
+    /// deliverer, and contexts are shared, so the two are routinely different
+    /// principals; attributing a flushed batch to the flusher would silently
+    /// relabel every message in it. Captured here because the sender's
+    /// identity is otherwise gone by the time the item is drained.
+    pub staged_by: PrincipalId,
     /// Creation timestamp (Unix epoch seconds).
     pub created_at: u64,
     /// Number of times this drift has been requeued after a delivery failure.
@@ -451,6 +458,7 @@ impl DriftRouter {
         content: String,
         source_model: Option<String>,
         drift_kind: DriftKind,
+        staged_by: PrincipalId,
     ) -> Result<u64, DriftError> {
         // Validate both contexts exist
         if !self.contexts.contains_key(&source_ctx) {
@@ -470,6 +478,7 @@ impl DriftRouter {
             content,
             source_model,
             drift_kind,
+            staged_by,
             created_at: kaijutsu_types::now_millis(),
             retry_count: 0,
             in_flight: false,
@@ -938,7 +947,7 @@ mod tests {
         router.register(tgt, Some("target"), None, PrincipalId::system()).unwrap();
 
         let id = router
-            .stage(src, tgt, "hello from source".into(), None, DriftKind::Push)
+            .stage(src, tgt, "hello from source".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         assert_eq!(router.queue().len(), 1);
@@ -952,7 +961,14 @@ mod tests {
         let src = ContextId::new();
         router.register(src, Some("source"), None, PrincipalId::system()).unwrap();
 
-        let result = router.stage(src, ContextId::new(), "nope".into(), None, DriftKind::Push);
+        let result = router.stage(
+            src,
+            ContextId::new(),
+            "nope".into(),
+            None,
+            DriftKind::Push,
+            PrincipalId::new(),
+        );
         assert!(result.is_err());
     }
 
@@ -965,10 +981,10 @@ mod tests {
         router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
 
         let id1 = router
-            .stage(src, tgt, "one".into(), None, DriftKind::Push)
+            .stage(src, tgt, "one".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         let _id2 = router
-            .stage(src, tgt, "two".into(), None, DriftKind::Push)
+            .stage(src, tgt, "two".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         assert_eq!(router.queue().len(), 2);
@@ -986,10 +1002,10 @@ mod tests {
         router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
 
         router
-            .stage(src, tgt, "a".into(), None, DriftKind::Push)
+            .stage(src, tgt, "a".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         router
-            .stage(src, tgt, "b".into(), None, DriftKind::Push)
+            .stage(src, tgt, "b".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         let drained = router.drain(None);
@@ -1017,7 +1033,7 @@ mod tests {
             .register(tgt, Some("tgt"), None, PrincipalId::system())
             .unwrap();
         router
-            .stage(src, tgt, "fail".into(), None, DriftKind::Push)
+            .stage(src, tgt, "fail".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         // Cycle drain→requeue MAX_DRIFT_RETRIES+1 times so the per-item
         // retry_count actually crosses the threshold.
@@ -1084,10 +1100,10 @@ mod tests {
 
         // Stage: a→b and c→b
         router
-            .stage(a, b, "from alpha".into(), None, DriftKind::Push)
+            .stage(a, b, "from alpha".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         router
-            .stage(c, b, "from gamma".into(), None, DriftKind::Push)
+            .stage(c, b, "from gamma".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         // Scoped drain for alpha — should only get a→b
@@ -1258,7 +1274,7 @@ mod tests {
         router.register(tgt, Some("target"), None, PrincipalId::system()).unwrap();
 
         let staged_id = router
-            .stage(src, tgt, "test content".into(), None, DriftKind::Push)
+            .stage(src, tgt, "test content".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         assert_eq!(router.queue().len(), 1);
@@ -1292,10 +1308,10 @@ mod tests {
         router.register(tgt, Some("target"), None, PrincipalId::system()).unwrap();
 
         let id1 = router
-            .stage(src, tgt, "first".into(), None, DriftKind::Push)
+            .stage(src, tgt, "first".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         let id2 = router
-            .stage(src, tgt, "second".into(), None, DriftKind::Push)
+            .stage(src, tgt, "second".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         let drained = router.drain(None);
@@ -1325,7 +1341,7 @@ mod tests {
         router.register(tgt, Some("target"), None, PrincipalId::system()).unwrap();
 
         let _id = router
-            .stage(src, tgt, "persistent failure".into(), None, DriftKind::Push)
+            .stage(src, tgt, "persistent failure".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         // Drain and requeue MAX_DRIFT_RETRIES + 1 times — last requeue should
@@ -1416,7 +1432,7 @@ mod tests {
         router.register(src, None, None, PrincipalId::system()).unwrap();
         router.register(dst, None, None, PrincipalId::system()).unwrap();
         router
-            .stage(src, dst, "undeliverable".to_string(), None, DriftKind::Push)
+            .stage(src, dst, "undeliverable".to_string(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         let staged = router.drain(None);
 
@@ -1587,10 +1603,10 @@ mod tests {
         router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
 
         let id1 = router
-            .stage(src, tgt, "one".into(), None, DriftKind::Push)
+            .stage(src, tgt, "one".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
         let id2 = router
-            .stage(src, tgt, "two".into(), None, DriftKind::Push)
+            .stage(src, tgt, "two".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         // Simulate a flush checking both items out for delivery.
@@ -1630,7 +1646,7 @@ mod tests {
         router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
         router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
         let id = router
-            .stage(src, tgt, "mid-flight".into(), None, DriftKind::Push)
+            .stage(src, tgt, "mid-flight".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         let drained = router.drain(None);
@@ -1666,7 +1682,7 @@ mod tests {
         router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
         router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
         let id = router
-            .stage(src, tgt, "delivered".into(), None, DriftKind::Push)
+            .stage(src, tgt, "delivered".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
         let drained = router.drain(None);

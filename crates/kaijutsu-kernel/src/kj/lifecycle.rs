@@ -175,10 +175,26 @@ impl KjDispatcher {
             return Ok(());
         }
 
-        let context_type = {
+        // `owner` is the identity every block this phase writes belongs to.
+        //
+        // rc scripts run *in* a context, on behalf of that context — never on
+        // behalf of whoever tripped the verb. A drift push from one principal
+        // into another's context fires the target's `drift` scripts; attributing
+        // their output to the sender smears the sender across a timeline they
+        // do not own, and the smear is worst exactly where it matters most
+        // (failure blocks name the wrong principal as the one who broke things).
+        //
+        // Safe because the rc principal is an *authorship* value and nothing
+        // else: `require_cap` authorizes against the caller's loadout keyed by
+        // `context_id` (`kj/mod.rs`), never against `principal_id`; rc shells
+        // are constructed privileged; and the host-exec policy is read from the
+        // *context's* binding in `materialize_context_kaish_inner`. Moving this
+        // value changes who the blocks belong to and nothing about what the
+        // scripts may do.
+        let (context_type, owner) = {
             let db = self.kernel_db().lock();
             match db.get_context(new_id) {
-                Ok(Some(row)) => row.context_type,
+                Ok(Some(row)) => (row.context_type, row.created_by),
                 Ok(None) => {
                     return Err(format!(
                         "rc lifecycle: context {} not found",
@@ -224,7 +240,7 @@ impl KjDispatcher {
                     MAX_RC_DEPTH,
                     paths::rc_dir(&context_type, verb)
                 ),
-                caller.principal_id,
+                owner,
             );
             return Ok(());
         }
@@ -233,7 +249,7 @@ impl KjDispatcher {
 
         for script in &scripts {
             match script.extension.as_str() {
-                "md" => run_md_script(self, new_id, script, caller.principal_id),
+                "md" => run_md_script(self, new_id, script, owner),
                 "kai" => {
                     run_kai_script(
                         self,
@@ -245,7 +261,7 @@ impl KjDispatcher {
                         script,
                         child_depth,
                         extra_vars,
-                        caller.principal_id,
+                        owner,
                     )
                     .await
                 }
@@ -257,7 +273,7 @@ impl KjDispatcher {
                         &script.sort_key,
                         None,
                         format!("rc lifecycle: unknown extension '{other}'"),
-                        caller.principal_id,
+                        owner,
                     );
                 }
             }
@@ -978,6 +994,184 @@ mod tests {
             trace.content.contains("tick= phrase= tempo="),
             "without seeded vars the heartbeat must be empty, got: {}",
             trace.content
+        );
+    }
+
+    /// The identity smear, rc half: rc scripts run *in* a context, on behalf of
+    /// that context — never on behalf of whoever happened to trigger the verb.
+    /// A drift push from Amy into a musician's context fires the musician's
+    /// `drift` scripts; before this, every block those scripts produced was
+    /// stamped with *Amy's* principal, so the musician's own timeline read as
+    /// though Amy had been writing in it.
+    ///
+    /// Authorship only. `require_cap` authorizes against the caller's
+    /// *loadout* (`kj/mod.rs`), never against `principal_id`, and rc shells are
+    /// privileged by construction — so moving the rc principal changes who the
+    /// blocks belong to and nothing about what the scripts may do.
+    #[tokio::test]
+    async fn rc_md_block_is_authored_by_context_owner_not_caller() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/tick/S00-stance.md",
+            "test",
+            "tick",
+            "S00",
+            "stance",
+            "md",
+            "Play to the beat.",
+        )
+        .await;
+
+        // Owner creates the context; `created_by` follows the creating caller.
+        let owner = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-owned", "--type", "test"]),
+                &owner,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-owned");
+
+        // A *different* principal fires the verb — the drift-push shape.
+        let visitor = unjoined_caller();
+        assert_ne!(
+            owner.principal_id, visitor.principal_id,
+            "fixture must use two distinct principals or the assertion is vacuous"
+        );
+
+        d.run_rc_lifecycle("tick", new_id, None, None, None, &visitor)
+            .await
+            .expect("tick lifecycle");
+
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let stance = snapshots
+            .iter()
+            .find(|b| b.content.contains("Play to the beat."))
+            .expect("the .md script produced a block");
+        assert_eq!(
+            stance.id.principal_id, owner.principal_id,
+            "rc .md block must belong to the context owner"
+        );
+        assert_ne!(
+            stance.id.principal_id, visitor.principal_id,
+            "rc .md block must NOT be smeared with the triggering caller"
+        );
+    }
+
+    /// Same invariant for the `.kai` path, whose Trace blocks are the ones a
+    /// human actually reads in the timeline.
+    #[tokio::test]
+    async fn rc_kai_trace_block_is_authored_by_context_owner_not_caller() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/tick/S00-report.kai",
+            "test",
+            "tick",
+            "S00",
+            "report",
+            "kai",
+            "echo \"the beat goes on\"",
+        )
+        .await;
+
+        let owner = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-owned-kai", "--type", "test"]),
+                &owner,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-owned-kai");
+
+        let visitor = unjoined_caller();
+        assert_ne!(
+            owner.principal_id, visitor.principal_id,
+            "fixture must use two distinct principals or the assertion is vacuous"
+        );
+
+        d.run_rc_lifecycle("tick", new_id, None, None, None, &visitor)
+            .await
+            .expect("tick lifecycle");
+
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let trace = snapshots
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+            .expect("the echoing script produced a trace block");
+        assert_eq!(
+            trace.id.principal_id, owner.principal_id,
+            "rc Trace block must belong to the context owner"
+        );
+        assert_ne!(
+            trace.id.principal_id, visitor.principal_id,
+            "rc Trace block must NOT be smeared with the triggering caller"
+        );
+    }
+
+    /// Failure blocks are the loudest thing rc writes, so they are the worst
+    /// place to name the wrong principal — a reader chasing "who broke this
+    /// context" would find the visitor.
+    #[tokio::test]
+    async fn rc_failure_block_is_authored_by_context_owner_not_caller() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/tick/S00-broken.zzz",
+            "test",
+            "tick",
+            "S00",
+            "broken",
+            "zzz",
+            "this extension has no handler",
+        )
+        .await;
+        // `.zzz` is filtered out by the loader; use a `.kai` that exits nonzero
+        // to reach the failure path through a supported extension.
+        install_script(
+            &d,
+            "/etc/rc/test/tick/S01-fail.kai",
+            "test",
+            "tick",
+            "S01",
+            "fail",
+            "kai",
+            "exit 3",
+        )
+        .await;
+
+        let owner = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-owned-fail", "--type", "test"]),
+                &owner,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-owned-fail");
+
+        let visitor = unjoined_caller();
+        assert_ne!(owner.principal_id, visitor.principal_id);
+
+        d.run_rc_lifecycle("tick", new_id, None, None, None, &visitor)
+            .await
+            .expect("tick lifecycle");
+
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let failure = snapshots
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Error)
+            .expect("the failing script produced an error block");
+        assert_eq!(
+            failure.id.principal_id, owner.principal_id,
+            "rc failure block must belong to the context owner"
+        );
+        assert_ne!(
+            failure.id.principal_id, visitor.principal_id,
+            "rc failure block must NOT be smeared with the triggering caller"
         );
     }
 

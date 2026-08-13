@@ -61,6 +61,32 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ---
 
+## Block-authorship leftovers from the identity-smear split (2026-08-13)
+
+The split itself shipped: drift blocks carry the sender, rc-lifecycle blocks
+carry the context owner. Two adjacent things were left alone on purpose.
+
+- **`BlockStore::insert_drift_block` is a silent-default wrapper** — it calls
+  `insert_drift_block_as(…, None)`, and `None` falls back to
+  `BlockStore::principal_id()`, the kernel's own identity
+  (`kernel/src/block_store.rs:3059`). That fallback is *how* the smear stayed
+  invisible for months: every drift looked like it came from the same
+  anonymous place and no call site had to think about authorship. The
+  drift paths now pass an explicit principal, but the wrapper survives and
+  the next call site will inherit the same default. Candidate fix: delete the
+  wrapper and make every caller pass `Option<PrincipalId>` explicitly, so
+  "no author" becomes a decision the compiler forces rather than a default
+  someone gets for free. Small and mechanical — 3 remaining call sites.
+- **Fork markers and fork notes still author as the kernel.**
+  `inject_fork_note` (`kj/fork.rs:1442`), the fork-marker insert
+  (`kj/fork.rs:1499`) and the `--compact` distillation seed (`kj/fork.rs:827`)
+  all go through the wrapper, so they carry the store's principal rather than
+  the child context's owner. Out of scope for Amy's drift ruling, and the
+  practical impact is smaller (for a fork, `created_by` is the forking caller
+  anyway), but it is the same defect wearing a different hat. Needs a
+  principal threaded through two helpers that currently take only
+  target/source ids.
+
 ## Two seeds from the rc-create lockout fix (2026-08-12, `788fb0d7`)
 
 Found while closing that item; recorded rather than folded in, because
