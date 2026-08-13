@@ -502,6 +502,40 @@ impl HookListener {
     // the user's actual action. Local mode is unchanged (no doc task there;
     // it writes the in-process `SharedBlockStore` directly, as before).
 
+    /// The principal hook-authored blocks belong to: the **agent session**,
+    /// derived deterministically from the Claude Code session id.
+    ///
+    /// This is the one identity question the hook path has to answer, and it
+    /// used to have two wrong answers. Local mode stamped
+    /// `PrincipalId::system()`, which claims the kernel wrote the block and
+    /// erases the agent. Remote mode carried a `PrincipalId::new()` minted
+    /// once per MCP *process*, so one Claude Code session authored under a
+    /// different principal after every `/mcp reconnect` and a single context
+    /// filled up with blocks from N anonymous principals that were in fact
+    /// the same agent. Same family as the drift/rc identity smear fixed in
+    /// `b356fc45`: a block whose author does not answer "who did this".
+    ///
+    /// Safe to call at authoring time because `handle_connection` captures
+    /// the session id from the event **before** dispatching to
+    /// `process_event` — the same ordering that lets `maybe_stabilize_label`
+    /// run before this event's own block is authored.
+    ///
+    /// The fallback is `system()` and it is a real (if rare) loss of
+    /// attribution — an event carrying no session id at all, before any
+    /// event has carried one — so it warns rather than passing silently.
+    fn author_principal(&self) -> PrincipalId {
+        match self.session_id.lock().ok().and_then(|g| g.clone()) {
+            Some(sid) => PrincipalId::for_agent_session(&sid),
+            None => {
+                tracing::warn!(
+                    "hook authoring before any session id was seen — attributing to \
+                     system(); this block will not name the agent that caused it"
+                );
+                PrincipalId::system()
+            }
+        }
+    }
+
     async fn insert_text_block(&self, role: Role, content: &str) -> Result<(), String> {
         let Some(ctx_id) = self.context_id() else {
             tracing::debug!("Hook insert_text_block: no context yet (register_session not called)");
@@ -517,7 +551,7 @@ impl HookListener {
                 content,
                 Status::Done,
                 ContentType::Plain,
-                Some(PrincipalId::system()),
+                Some(self.author_principal()),
             ) {
                 tracing::warn!("Hook insert_block error: {e}");
             }
@@ -531,7 +565,7 @@ impl HookListener {
             return Ok(());
         };
         let block = AuthoredBlock::Text { role, content: content.to_string() };
-        match handle.author_blocks(vec![block]).await {
+        match handle.author_blocks(vec![block], self.author_principal()).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::error!("Hook insert_text_block: AuthorBlocks failed — mirror desynced: {e}");
@@ -568,7 +602,7 @@ impl HookListener {
                 &tool.name,
                 input,
                 Some(ToolKind::Mcp),
-                Some(PrincipalId::system()),
+                Some(self.author_principal()),
                 None,
                 None,
             ) {
@@ -586,7 +620,7 @@ impl HookListener {
                 is_error,
                 None,
                 Some(ToolKind::Mcp),
-                Some(PrincipalId::system()),
+                Some(self.author_principal()),
                 None,
             ) {
                 tracing::warn!("Hook insert_tool_result error: {e}");
@@ -617,7 +651,7 @@ impl HookListener {
             is_error,
             tool_kind: Some(ToolKind::Mcp),
         };
-        match handle.author_blocks(vec![block]).await {
+        match handle.author_blocks(vec![block], self.author_principal()).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::error!("Hook insert_tool_blocks: AuthorBlocks failed — mirror desynced: {e}");

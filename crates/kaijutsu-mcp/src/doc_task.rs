@@ -31,7 +31,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use kaijutsu_client::{ActorHandle, ConnectionStatus, DocSyncBackend, ServerEvent, SyncEffect, SyncedDocument};
-use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Frontier, Role, Status, ToolKind};
+use kaijutsu_crdt::{
+    BlockId, BlockKind, ContentType, ContextId, Frontier, PrincipalId, Role, Status, ToolKind,
+};
 
 /// Channel capacity for the doc task's command mpsc. Generous — a burst of
 /// hook events, hydrated resync triggers (Lagged event + Lagged status +
@@ -128,6 +130,17 @@ pub enum DocCommand {
     /// later push/resync will carry the ops).
     AuthorBlocks {
         blocks: Vec<AuthoredBlock>,
+        /// Who these blocks belong to — the **agent session**, resolved by
+        /// the producer at author time (`HookListener::author_principal`).
+        ///
+        /// Travels with the content rather than living as ambient state on
+        /// the document, for two reasons. The document's principal was set
+        /// once at construction from a `PrincipalId::new()` minted per MCP
+        /// *process*, so a session that survived a relaunch authored under a
+        /// different identity each time. And carrying it per-command means
+        /// there is no ordering dependency between "set the principal" and
+        /// "author with it" — the pair cannot get out of step.
+        principal: PrincipalId,
         done: oneshot::Sender<Result<(), DocTaskError>>,
     },
     /// Run a resync: flush unpushed local ops, fetch the server's
@@ -152,10 +165,18 @@ pub struct DocTaskHandle {
 
 impl DocTaskHandle {
     /// Author blocks and wait for them to be applied to the document.
-    pub async fn author_blocks(&self, blocks: Vec<AuthoredBlock>) -> Result<(), DocTaskError> {
+    pub async fn author_blocks(
+        &self,
+        blocks: Vec<AuthoredBlock>,
+        principal: PrincipalId,
+    ) -> Result<(), DocTaskError> {
         let (done, ack) = oneshot::channel();
         self.tx
-            .send(DocCommand::AuthorBlocks { blocks, done })
+            .send(DocCommand::AuthorBlocks {
+                blocks,
+                principal,
+                done,
+            })
             .await
             .map_err(|_| DocTaskError::Shutdown)?;
         ack.await.map_err(|_| DocTaskError::Shutdown)?
@@ -244,8 +265,8 @@ async fn run_doc_task<B: DocSyncBackend>(
                     .await;
                 }
             }
-            DocCommand::AuthorBlocks { blocks, done } => {
-                let result = author_blocks_sync(&synced, blocks);
+            DocCommand::AuthorBlocks { blocks, principal, done } => {
+                let result = author_blocks_sync(&synced, blocks, principal);
                 bump(&change);
                 let ok = result.is_ok();
                 let _ = done.send(result);
@@ -295,11 +316,20 @@ fn apply_event_sync(
 fn author_blocks_sync(
     synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
     blocks: Vec<AuthoredBlock>,
+    principal: PrincipalId,
 ) -> Result<(), DocTaskError> {
     let mut guard = synced.lock();
     let Some(doc) = guard.as_mut() else {
         return Err(DocTaskError::NoDocument);
     };
+    // Stamp the authoring identity before inserting. The document was
+    // constructed with a per-process `PrincipalId::new()`, which is wrong for
+    // anything hook-authored: it makes one agent session look like a new
+    // principal after every MCP relaunch. Setting it here rather than at
+    // construction keeps the identity attached to the *content* being
+    // authored, and this is the sole-writer task, so no other writer can
+    // observe the store between the stamp and the inserts below.
+    doc.doc_mut().set_principal_id(principal);
     for block in blocks {
         match block {
             AuthoredBlock::Text { role, content } => {
@@ -459,8 +489,8 @@ async fn do_coalesced_resync<B: DocSyncBackend>(
                     dones.push(d);
                 }
             }
-            Ok(DocCommand::AuthorBlocks { blocks, done }) => {
-                let result = author_blocks_sync(synced, blocks);
+            Ok(DocCommand::AuthorBlocks { blocks, principal, done }) => {
+                let result = author_blocks_sync(synced, blocks, principal);
                 bump(change);
                 let _ = done.send(result);
             }
@@ -790,7 +820,7 @@ mod tests {
                 .author_blocks(vec![AuthoredBlock::Text {
                     role: Role::User,
                     content: "hello-mid-fetch".to_string(),
-                }])
+                }], PrincipalId::for_agent_session("test-session"))
                 .await
         });
         // Give the author's send a moment to actually land in the mpsc
@@ -847,7 +877,7 @@ mod tests {
                 .author_blocks(vec![AuthoredBlock::Text {
                     role: Role::User,
                     content: format!("msg-{i}"),
-                }])
+                }], PrincipalId::for_agent_session("test-session"))
                 .await
                 .unwrap();
         }
@@ -964,6 +994,7 @@ mod tests {
                 role: Role::User,
                 content: "unpushed".to_string(),
             }],
+            principal: PrincipalId::for_agent_session("test-session"),
             done: author_done,
         })
         .await

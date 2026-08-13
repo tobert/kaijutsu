@@ -420,6 +420,98 @@ fn hook_authored_tool_blocks_reach_the_server_not_just_the_mirror() {
     });
 }
 
+/// Hook-authored blocks must belong to the **agent session**, not to a
+/// per-process identity and not to `system()`.
+///
+/// The bug this pins: remote mode carried a `PrincipalId::new()` minted once
+/// per MCP *process*, so one Claude Code session authored under a different
+/// principal after every `/mcp reconnect`, and a context accumulated blocks
+/// from N anonymous principals that were in fact the same agent. Local mode
+/// stamped `PrincipalId::system()`, claiming the kernel wrote them.
+///
+/// Asserting equality with `for_agent_session(sid)` — rather than merely
+/// "not random" — is what makes this imply *stability across relaunches*
+/// without needing a two-process test: the derivation is proven
+/// deterministic by the unit tests in `kaijutsu-types::ids`, so same session
+/// id ⇒ same principal, on any process. The two tests compose.
+///
+/// Read from the SERVER, for the same reason as the test above: the local
+/// mirror would happily show a principal that never crossed the wire.
+#[test]
+fn hook_authored_blocks_belong_to_the_agent_session() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let reg = auto_register_with_retry(&mcp, "hook-principal-e2e").await;
+        assert!(
+            reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            "register_session_auto failed: {reg}"
+        );
+
+        let Backend::Remote(remote) = mcp.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let context_id = remote
+            .shared_context_id
+            .lock()
+            .expect("context id mutex")
+            .expect("registered context");
+
+        let listener = Arc::new(HookListener::remote(
+            remote.clone(),
+            Arc::clone(&remote.shared_context_id),
+            Arc::clone(mcp.session_id_arc()),
+            None,
+        ));
+        let socket_path = spawn_listener(listener, "principal").await;
+
+        let session_id = "sess-principal-test-0001";
+        let event = serde_json::json!({
+            "event": "tool.after",
+            "source": "claude-code",
+            "session_id": session_id,
+            "tool": {
+                "name": "Bash",
+                "input": {"command": "echo hi"},
+                "output": "hi",
+            },
+        })
+        .to_string();
+        send_hook_event(&socket_path, &event).await.unwrap();
+
+        let expected = kaijutsu_crdt::PrincipalId::for_agent_session(session_id);
+
+        let mut server_blocks = Vec::new();
+        for _ in 0..50 {
+            server_blocks = remote
+                .actor
+                .get_all_blocks(context_id)
+                .await
+                .expect("get_all_blocks");
+            if server_blocks.iter().any(|b| b.kind == BlockKind::ToolCall) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let call = server_blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolCall)
+            .expect("hook-authored ToolCall must reach the server");
+
+        assert_eq!(
+            call.id.principal_id, expected,
+            "hook-authored block must belong to the agent session, so the same \
+             Claude Code session keeps one identity across MCP relaunches"
+        );
+        assert_ne!(
+            call.id.principal_id,
+            kaijutsu_crdt::PrincipalId::system(),
+            "must not claim the kernel authored an agent's tool call"
+        );
+    });
+}
+
 /// docs/issues.md "cc-* hook re-registration mints a new context per MCP
 /// relaunch": an MCP process relaunch (process death + respawn, `/mcp
 /// reconnect`) within the SAME Claude Code session must reattach to the

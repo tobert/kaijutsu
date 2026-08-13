@@ -248,6 +248,33 @@ impl PrincipalId {
     pub fn beat() -> Self {
         Self(uuid::Uuid::new_v5(&KAIJUTSU_PRINCIPAL_NS, b"hyoushigi"))
     }
+
+    /// The principal for an **agent session** — a Claude Code session, or any
+    /// other long-lived agent identity that outlives the process hosting it.
+    ///
+    /// Deterministic (UUIDv5 over `session_key`), and that is the whole point:
+    /// an agent's identity must survive the process. The MCP used to mint
+    /// `PrincipalId::new()` once per launch, so a single Claude Code session
+    /// authored under a *different* principal after every `/mcp reconnect`,
+    /// and one context accumulated blocks from N anonymous principals with no
+    /// way to tell they were the same agent. Local mode dodged the question
+    /// entirely by stamping `system()`, which erases the agent instead.
+    ///
+    /// Deriving from the session key makes "who wrote this?" answerable and
+    /// stable, the same property `b356fc45` established for drift and rc
+    /// blocks. Same key in ⇒ same principal out, on any process, on any host.
+    ///
+    /// `session_key` must be the *stable* session identity, not a placeholder.
+    /// For Claude Code that is the session id carried on hook events — **not**
+    /// startup transcript detection, which can report a previous session's id
+    /// (see `hook_listener`'s capture rule, where `session.start` is
+    /// authoritative and overwrites).
+    pub fn for_agent_session(session_key: &str) -> Self {
+        Self(uuid::Uuid::new_v5(
+            &KAIJUTSU_PRINCIPAL_NS,
+            session_key.as_bytes(),
+        ))
+    }
 }
 
 // ── Prefix resolution ───────────────────────────────────────────────────────
@@ -561,6 +588,55 @@ mod tests {
     #[test]
     fn test_system_principal_is_not_nil() {
         assert!(!PrincipalId::system().is_nil());
+    }
+
+    // ── PrincipalId::for_agent_session() ────────────────────────────────
+
+    /// The property the whole fix rests on: the same session key yields the
+    /// same principal, on any process. This is what lets a Claude Code
+    /// session keep one identity across `/mcp reconnect`, instead of the
+    /// per-launch `PrincipalId::new()` that scattered one agent's blocks
+    /// across N anonymous principals.
+    #[test]
+    fn agent_session_principal_is_stable_across_processes() {
+        let a = PrincipalId::for_agent_session("sess-abc123");
+        let b = PrincipalId::for_agent_session("sess-abc123");
+        assert_eq!(a, b, "same session key must give the same principal");
+    }
+
+    /// The other half: distinct sessions must not collide, or two agents
+    /// working in one context would be indistinguishable — the smear this
+    /// replaces, in a new outfit.
+    #[test]
+    fn agent_session_principals_are_distinct_per_session() {
+        let a = PrincipalId::for_agent_session("sess-abc123");
+        let b = PrincipalId::for_agent_session("sess-def456");
+        assert_ne!(a, b);
+    }
+
+    /// A session principal is an *agent*, never the kernel's own lanes.
+    /// Colliding with `system()` or `beat()` would reintroduce exactly the
+    /// false provenance those sentinels are documented to avoid.
+    #[test]
+    fn agent_session_principal_never_collides_with_kernel_lanes() {
+        let agent = PrincipalId::for_agent_session("sess-abc123");
+        assert_ne!(agent, PrincipalId::system());
+        assert_ne!(agent, PrincipalId::beat());
+        assert!(!agent.is_nil());
+    }
+
+    /// Guards a subtle way to reintroduce the bug: deriving from a
+    /// *placeholder* rather than the stable id. The placeholder label carries
+    /// a launch timestamp, so if anyone ever feeds it in here the principal
+    /// silently goes back to being per-launch. Distinct keys must stay
+    /// distinct — which is exactly why the caller must pass the stable id.
+    #[test]
+    fn agent_session_principal_follows_the_key_not_the_launch() {
+        let stable = PrincipalId::for_agent_session("cc-kaijutsu-sess9");
+        let launch_a = PrincipalId::for_agent_session("cc-kaijutsu-0813-1400");
+        let launch_b = PrincipalId::for_agent_session("cc-kaijutsu-0813-1502");
+        assert_ne!(launch_a, launch_b, "timestamped keys are per-launch — the bug");
+        assert_ne!(stable, launch_a);
     }
 
     // ── Type safety (distinct newtypes) ─────────────────────────────────
