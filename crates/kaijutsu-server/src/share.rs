@@ -46,6 +46,19 @@ const MAX_MANIFEST_LEN: usize = 64 * 1024;
 /// an idle session generates none. The keepalive IS that traffic, so a dead
 /// idle client vanishes from `/r` within one interval instead of squatting
 /// until the next VFS op ("Disconnect = unmount, loud", `docs/slash-r.md`).
+///
+/// Must stay strictly greater than [`SHARE_OP_TIMEOUT`] (10s): the keepalive
+/// loop below awaits one tick, then awaits the ping itself, which is bounded
+/// by `SHARE_OP_TIMEOUT` internally (`ShareRegistry::ping` →
+/// `timeout_op`). If the op bound ever reached or exceeded this interval, a
+/// still-alive-but-slow ping would still be in flight when the next tick
+/// fires — `tokio::time::interval`'s default burst behavior would then fire
+/// that tick immediately once the ping resolves, collapsing the intended
+/// gap between pings and defeating "within one interval" as a bound on
+/// detection latency. This is not a tier from [`kaijutsu_types::timeout::tiers`]
+/// (no fixed tier matches a periodic keepalive interval); the real
+/// dependency is on `SHARE_OP_TIMEOUT`, pinned by
+/// `keepalive_interval_outlasts_the_ping_it_paces` below.
 pub const SHARE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Wraps a stream, cancelling `cancel` the moment it observes EOF (a
@@ -293,6 +306,24 @@ async fn with_timeout<T, E: std::fmt::Display>(
 mod tests {
     use super::*;
     use kaijutsu_client::{ShareArg, ShareHandler, ShareServerConfig};
+
+    /// [`SHARE_KEEPALIVE_INTERVAL`]'s doc claims it must outlast
+    /// [`SHARE_OP_TIMEOUT`] — the interval paces a loop whose body is one
+    /// ping bounded by that op timeout. If this ever flips, a slow ping can
+    /// still be in flight when the next tick is already due, and
+    /// `tokio::time::interval`'s burst catch-up fires the next ping the
+    /// instant the first one resolves — no gap, and detection latency for a
+    /// dead-but-quiet peer is no longer bounded by "one interval" the way
+    /// the doc above promises.
+    #[test]
+    fn keepalive_interval_outlasts_the_ping_it_paces() {
+        assert!(
+            SHARE_KEEPALIVE_INTERVAL > SHARE_OP_TIMEOUT,
+            "SHARE_KEEPALIVE_INTERVAL ({SHARE_KEEPALIVE_INTERVAL:?}) must stay \
+             above SHARE_OP_TIMEOUT ({SHARE_OP_TIMEOUT:?}) or a slow-but-alive \
+             ping collapses the pacing gap between keepalive attempts"
+        );
+    }
 
     /// Wire a client-role `run_share_session` against a real
     /// `kaijutsu-client::ShareHandler` over an in-process duplex pipe — no

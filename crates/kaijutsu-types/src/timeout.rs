@@ -163,6 +163,138 @@ impl Default for TimeoutPolicy {
     }
 }
 
+/// Client-side transport timeout policy: SSH transport, the reconnect FSM's
+/// connect-phase budgets, the liveness pinger, per-RPC call deadlines,
+/// reconnect backoff, and the client hop of the peer-invocation ladder
+/// (see [`peer`]).
+///
+/// Mirrors [`TimeoutPolicy`] on the client side of the wire: `Duration`
+/// fields (plus one count, `ssh_keepalive_max`), serde, and a `Default` that
+/// reproduces every value `kaijutsu-client::constants` shipped before this
+/// struct existed — those `pub const`s now derive from
+/// [`TransportTimeouts::DEFAULT`] rather than carrying independent literals,
+/// so this struct is the one place the values live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportTimeouts {
+    /// SSH inactivity timeout. russh closes the session if no I/O in either
+    /// direction for this long. Combined with the keepalive below, sets the
+    /// upper bound on how long a silently-dead peer keeps the socket open.
+    pub ssh_inactivity_timeout: Duration,
+
+    /// SSH keep-alive interval. Client sends SSH_MSG_GLOBAL_REQUEST every
+    /// interval; the server's matching `keepalive_interval` echoes them.
+    /// After `ssh_keepalive_max` unanswered probes the client tears down
+    /// the session.
+    pub ssh_keepalive_interval: Duration,
+
+    /// SSH keep-alive max retries. 3 × 30s = ~90s upper bound on detecting
+    /// a silently-disconnected server at the SSH layer. A count, not a
+    /// duration — russh multiplies it by `ssh_keepalive_interval` itself.
+    pub ssh_keepalive_max: usize,
+
+    // ── FSM connect-phase budgets ───────────────────────────────────────
+    //
+    // The reconnect state machine wraps the full handshake in
+    // `connect_total_budget`, and each phase carries its own per-phase
+    // deadline. The per-phase deadlines add up to the total so a single
+    // hung phase is reported by phase rather than swallowed into a generic
+    // "connect timeout".
+    /// SSH dial + auth + channel open. Generous because SSH agent
+    /// enumeration can be slow when multiple keys are present. Tier:
+    /// [`tiers::HANDSHAKE`] by value.
+    pub ssh_dial_timeout: Duration,
+
+    /// `bind_kernel` RPC. Pure capability handout; never does I/O. Tier:
+    /// [`tiers::HANDSHAKE`] — "one round trip that should not touch disk
+    /// or network beyond the peer" describes this exactly.
+    pub rpc_bind_kernel_timeout: Duration,
+
+    /// `join_context` RPC. May touch the kernel db; should be fast. Tier:
+    /// [`tiers::HANDSHAKE`] by value, though a db touch means it is not
+    /// strictly the "never touch disk" case the tier describes.
+    pub rpc_join_context_timeout: Duration,
+
+    /// Subscribe handshake (block events + resource events combined, run
+    /// in parallel). Independent of the others so a wedged subscriber
+    /// doesn't eat SSH budget. Tier: [`tiers::HANDSHAKE`].
+    pub subscribe_timeout: Duration,
+
+    /// Total budget for the full Connecting transition. Should be ≥ the
+    /// sum of the four phase budgets above; serves as a safety net in case
+    /// a phase forgets to wrap itself. A composite over several
+    /// handshake-tier phases — it does not map onto a single tier itself.
+    pub connect_total_budget: Duration,
+
+    // ── Liveness pinger ──────────────────────────────────────────────────
+    /// Interval between liveness `ping` RPCs while in `Connected`. Detects
+    /// wedged-but-not-dead RPC pipes faster than the SSH keepalive would
+    /// (because SSH transport can be alive while the kernel RPC system
+    /// hangs).
+    pub ping_interval: Duration,
+
+    /// Per-`ping` deadline. If a ping doesn't return within this window
+    /// the FSM transitions to Closing and reconnects. Generous to absorb a
+    /// single slow tick; the SSH keepalive is the backstop. Tier:
+    /// [`tiers::HANDSHAKE`].
+    pub ping_timeout: Duration,
+
+    // ── Per-RPC deadline (dispatched commands) ──────────────────────────
+    /// Default deadline for a single dispatched RPC call. Commands that
+    /// exceed this trigger `CallError::Timeout`; the FSM does NOT tear
+    /// down the connection on per-call timeout (the call's recipient is
+    /// the issue, not the pipe). Override per-call if needed. Tier:
+    /// [`tiers::REQUEST`] — "a single call that may do real work"
+    /// describes this exactly.
+    pub rpc_call_timeout: Duration,
+
+    // ── Backoff policy ───────────────────────────────────────────────────
+    /// Base backoff between reconnect attempts (1s, doubles each
+    /// attempt).
+    pub backoff_base: Duration,
+
+    /// Cap on reconnect backoff. After ~6 attempts we're at 32s capped to
+    /// this.
+    pub backoff_max: Duration,
+
+    // ── Peer invocation ──────────────────────────────────────────────────
+    /// Client-side hop of the three-hop peer-invocation ladder — see
+    /// [`peer`]. After receiving an invocation via Cap'n Proto callback,
+    /// this is how long we wait for the Bevy `poll_peer_invocations`
+    /// system to pick it up and reply. Must fire before the server
+    /// (`peer::SERVER_FORWARD`) and kernel (`peer::KERNEL_WAIT`) hops.
+    pub peer_dispatch: Duration,
+}
+
+impl TransportTimeouts {
+    /// The values `kaijutsu-client::constants` hardcoded before this struct
+    /// existed. `const` (not just a `Default` impl) so
+    /// `kaijutsu-client::constants` can keep its `pub const` names by
+    /// projecting a field straight out of this at compile time — no runtime
+    /// initialization, no churn at call sites.
+    pub const DEFAULT: Self = Self {
+        ssh_inactivity_timeout: Duration::from_secs(300),
+        ssh_keepalive_interval: Duration::from_secs(30),
+        ssh_keepalive_max: 3,
+        ssh_dial_timeout: Duration::from_secs(5),
+        rpc_bind_kernel_timeout: Duration::from_secs(5),
+        rpc_join_context_timeout: Duration::from_secs(5),
+        subscribe_timeout: Duration::from_secs(5),
+        connect_total_budget: Duration::from_secs(25),
+        ping_interval: Duration::from_secs(30),
+        ping_timeout: Duration::from_secs(5),
+        rpc_call_timeout: Duration::from_secs(30),
+        backoff_base: Duration::from_secs(1),
+        backoff_max: Duration::from_secs(30),
+        peer_dispatch: peer::CLIENT_DISPATCH,
+    };
+}
+
+impl Default for TransportTimeouts {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +368,67 @@ mod tests {
         let bytes = crate::codec::encode(&p).unwrap();
         let back: TimeoutPolicy = crate::codec::decode(&bytes).unwrap();
         assert_eq!(p, back);
+    }
+
+    /// Fields whose doc comments claim the handshake tier by value. If one
+    /// of these drifts off `tiers::HANDSHAKE` the doc comment silently
+    /// starts lying about which bucket the timeout belongs to — the same
+    /// failure mode the tier ladder exists to catch.
+    #[test]
+    fn transport_handshake_tier_fields_match_the_handshake_tier() {
+        let t = TransportTimeouts::default();
+        assert_eq!(t.ssh_dial_timeout, tiers::HANDSHAKE);
+        assert_eq!(t.rpc_bind_kernel_timeout, tiers::HANDSHAKE);
+        assert_eq!(t.rpc_join_context_timeout, tiers::HANDSHAKE);
+        assert_eq!(t.subscribe_timeout, tiers::HANDSHAKE);
+        assert_eq!(t.ping_timeout, tiers::HANDSHAKE);
+    }
+
+    /// `rpc_call_timeout`'s doc claims the request tier ("a single call
+    /// that may do real work") almost verbatim from [`tiers::REQUEST`]'s
+    /// own doc. Pin the value so the claim stays true.
+    #[test]
+    fn transport_rpc_call_timeout_matches_the_request_tier() {
+        assert_eq!(TransportTimeouts::default().rpc_call_timeout, tiers::REQUEST);
+    }
+
+    /// `TransportTimeouts::DEFAULT` must reproduce every value
+    /// `kaijutsu-client::constants` hardcoded before this struct existed —
+    /// that crate's `pub const`s now derive from these defaults, so a
+    /// silent change here would silently change client transport behavior
+    /// with no diff at any call site to review.
+    #[test]
+    fn transport_defaults_match_the_values_client_constants_used_to_hardcode() {
+        let t = TransportTimeouts::default();
+        assert_eq!(t.ssh_inactivity_timeout, Duration::from_secs(300));
+        assert_eq!(t.ssh_keepalive_interval, Duration::from_secs(30));
+        assert_eq!(t.ssh_keepalive_max, 3);
+        assert_eq!(t.ssh_dial_timeout, Duration::from_secs(5));
+        assert_eq!(t.rpc_bind_kernel_timeout, Duration::from_secs(5));
+        assert_eq!(t.rpc_join_context_timeout, Duration::from_secs(5));
+        assert_eq!(t.subscribe_timeout, Duration::from_secs(5));
+        assert_eq!(t.connect_total_budget, Duration::from_secs(25));
+        assert_eq!(t.ping_interval, Duration::from_secs(30));
+        assert_eq!(t.ping_timeout, Duration::from_secs(5));
+        assert_eq!(t.rpc_call_timeout, Duration::from_secs(30));
+        assert_eq!(t.backoff_base, Duration::from_secs(1));
+        assert_eq!(t.backoff_max, Duration::from_secs(30));
+        assert_eq!(t.peer_dispatch, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn transport_json_roundtrip() {
+        let t = TransportTimeouts::default();
+        let j = serde_json::to_string(&t).unwrap();
+        let back: TransportTimeouts = serde_json::from_str(&j).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn transport_cbor_roundtrip() {
+        let t = TransportTimeouts::default();
+        let bytes = crate::codec::encode(&t).unwrap();
+        let back: TransportTimeouts = crate::codec::decode(&bytes).unwrap();
+        assert_eq!(t, back);
     }
 }
