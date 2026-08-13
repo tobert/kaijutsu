@@ -845,60 +845,155 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Run `f` against a context's CRDT document, regardless of backend, and
-    /// return its result (or `None` if the context isn't resident). Local reads
-    /// the multi-context kernel store; Remote reads the single joined
-    /// `SyncedDocument`. The closure runs while the backend's guard/lock is
-    /// held — keep it cheap and never `.await` inside it.
-    fn with_doc<R>(
-        &self,
-        ctx: ContextId,
-        f: impl FnOnce(&kaijutsu_crdt::block_store::BlockStore) -> R,
-    ) -> Option<R> {
-        match &self.backend {
-            Backend::Local(store) => store.get(ctx).map(|e| f(&e.doc)),
-            Backend::Remote(remote) => {
-                let guard = remote.synced.lock();
-                // The Remote backend holds exactly one context. Honor the
-                // requested `ctx`: a query for a different context must miss
-                // (return None), not silently read the joined document.
-                guard
-                    .as_ref()
-                    .filter(|d| d.context_id() == ctx)
-                    .map(|d| f(d.doc()))
-            }
-        }
-    }
+    // ------------------------------------------------------------------
+    // Cold readers — prompts/resources/completions. These never touch
+    // `RemoteState.synced` (the event-fed mirror): Remote answers every one
+    // of them with an authoritative RPC. The mirror is not gone — it still
+    // backs `execute_and_poll_shell`'s hot `find_terminal` closure, a
+    // separate slice (docs/crdt-position-2026-08.md, slice 1) — but nothing
+    // below reads it. Local is unchanged: same in-process `BlockStore`
+    // lookups as before this migration.
+    // ------------------------------------------------------------------
 
-    /// Resident context ids. Remote exposes only the single joined context.
-    fn context_ids(&self) -> Vec<ContextId> {
+    /// Resident context ids. Local lists the multi-context kernel store.
+    /// Remote returns the single joined context id from `RemoteState.joined`
+    /// — session state set once by `register_session`'s RPC join (and
+    /// stable until a re-join), not fed by the block-event stream the
+    /// mirror depends on. This has to move off the mirror too, even though
+    /// it isn't one of the numbered sites: `search_context`/`list_resources`/
+    /// `read_resource` all enumerate contexts via this before reading their
+    /// blocks, so leaving it mirror-backed would have them silently iterate
+    /// zero contexts whenever the mirror lagged — defeating the point of
+    /// moving their per-context reads off it.
+    async fn context_ids(&self) -> Vec<ContextId> {
         match &self.backend {
             Backend::Local(store) => store.list_ids(),
             Backend::Remote(remote) => remote
-                .synced
-                .lock()
+                .joined
+                .read()
+                .await
                 .as_ref()
-                .map(|d| vec![d.context_id()])
+                .map(|j| vec![j.context_id])
                 .unwrap_or_default(),
         }
     }
 
-    /// Whether `ctx` is resident in this backend.
-    fn contains_context(&self, ctx: ContextId) -> bool {
-        self.with_doc(ctx, |_| ()).is_some()
+    /// Whether `ctx` is known. `Ok(false)`/`Ok(true)` are real answers;
+    /// `Err` means the check itself failed and must not be papered over as
+    /// "not found".
+    ///
+    /// Local: resident in this backend's in-memory store — unchanged
+    /// semantics. Remote: membership in `actor.list_contexts()`, the
+    /// server's own list. This is a deliberate semantics widening from "the
+    /// mirror happens to hold this context" to "the server knows this
+    /// context exists" — the two could previously diverge (mirror not yet
+    /// populated, or simply never having synced a context this process
+    /// never joined). The server answer is the more correct one for an
+    /// existence check; the only caller (`search_context`, validating a
+    /// user-supplied document_id) wants exactly that.
+    async fn contains_context(&self, ctx: ContextId) -> Result<bool, String> {
+        match &self.backend {
+            Backend::Local(store) => Ok(store.get(ctx).is_some()),
+            Backend::Remote(remote) => {
+                let contexts = remote
+                    .actor
+                    .list_contexts()
+                    .await
+                    .map_err(|e| format!("Error listing contexts: {e}"))?;
+                Ok(contexts.iter().any(|c| c.id == ctx))
+            }
+        }
     }
 
-    /// Read one block snapshot, regardless of backend.
-    fn read_block(&self, ctx: ContextId, id: &BlockId) -> Option<kaijutsu_crdt::BlockSnapshot> {
-        self.with_doc(ctx, |doc| doc.get_block_snapshot(id)).flatten()
+    /// Read one block snapshot. `Ok(None)` means the block genuinely
+    /// doesn't exist (or, Remote-only, the context doesn't); `Err` means the
+    /// read itself failed. Local: unchanged in-process lookup, so a missing
+    /// context stays a quiet `None` there. Remote: `actor.get_block`, one
+    /// RPC — a nonexistent context surfaces as `Err` from the server rather
+    /// than `None`, the same existence-check widening as `contains_context`.
+    async fn read_block(
+        &self,
+        ctx: ContextId,
+        id: &BlockId,
+    ) -> Result<Option<kaijutsu_crdt::BlockSnapshot>, String> {
+        match &self.backend {
+            Backend::Local(store) => Ok(store.get(ctx).and_then(|e| e.doc.get_block_snapshot(id))),
+            Backend::Remote(remote) => remote
+                .actor
+                .get_block(ctx, *id)
+                .await
+                .map_err(|e| format!("Error reading block {}: {e}", id.to_key())),
+        }
     }
 
-    /// Resolve a block-id string to `(ContextId, BlockId)` if it's resident,
-    /// regardless of backend. Replaces the free `find_block(store, ..)` helper.
-    fn locate_block(&self, block_id_str: &str) -> Option<(ContextId, BlockId)> {
-        let block_id = parse_block_id(block_id_str)?;
+    /// Parse a block-id string and read its snapshot in one pass, returning
+    /// `(ContextId, BlockId, BlockSnapshot)`. Previously this called
+    /// `read_block` only to check existence and threw the result away, then
+    /// every caller called `read_block` again for the value it had just
+    /// discarded — a redundant read that was free against the local mirror
+    /// but is a real extra RPC round trip once `read_block` hits the server.
+    /// Collapsed to a single read.
+    async fn locate_block(
+        &self,
+        block_id_str: &str,
+    ) -> Result<Option<(ContextId, BlockId, kaijutsu_crdt::BlockSnapshot)>, String> {
+        let Some(block_id) = parse_block_id(block_id_str) else {
+            return Ok(None);
+        };
         let ctx = block_id.context_id;
-        self.read_block(ctx, &block_id).map(|_| (ctx, block_id))
+        let snapshot = self.read_block(ctx, &block_id).await?;
+        Ok(snapshot.map(|s| (ctx, block_id, s)))
+    }
+
+    /// All blocks in a context, document order. `Ok(None)` if Local doesn't
+    /// have the context resident (unchanged quiet-miss semantics). Remote:
+    /// `actor.get_all_blocks`, one RPC — the server returns blocks in
+    /// document order (verified against `BlockQuery::All`'s handler), so no
+    /// client-side reordering is needed. A context that genuinely doesn't
+    /// exist server-side surfaces as `Err`, same widening as `read_block`.
+    async fn context_blocks(
+        &self,
+        ctx: ContextId,
+    ) -> Result<Option<Vec<kaijutsu_crdt::BlockSnapshot>>, String> {
+        match &self.backend {
+            Backend::Local(store) => Ok(store.get(ctx).map(|e| e.doc.blocks_ordered())),
+            Backend::Remote(remote) => remote
+                .actor
+                .get_all_blocks(ctx)
+                .await
+                .map(Some)
+                .map_err(|e| format!("Error reading blocks for context {ctx}: {e}")),
+        }
+    }
+
+    /// Blocks (document order) plus the document's version, paired because
+    /// there is no cheap standalone version RPC. Local reads both off the
+    /// in-process `BlockStore` directly. Remote makes one `get_context_sync`
+    /// call — the same RPC `execute_and_poll_shell`'s Phase 2 already uses
+    /// to decode an authoritative snapshot — and decodes it into a
+    /// throwaway `SyncedDocument` (never written to `RemoteState.synced`,
+    /// so no race with the mirror's sole-writer doc task). `SyncState`
+    /// already carries `version` on the wire, so that's read straight off
+    /// the RPC reply rather than re-derived from the decoded document.
+    async fn context_blocks_and_version(
+        &self,
+        ctx: ContextId,
+    ) -> Result<Option<(Vec<kaijutsu_crdt::BlockSnapshot>, u64)>, String> {
+        match &self.backend {
+            Backend::Local(store) => {
+                Ok(store.get(ctx).map(|e| (e.doc.blocks_ordered(), e.doc.version())))
+            }
+            Backend::Remote(remote) => {
+                let state = remote
+                    .actor
+                    .get_context_sync(ctx)
+                    .await
+                    .map_err(|e| format!("Error syncing context {ctx}: {e}"))?;
+                let doc = SyncedDocument::from_sync_state(&state, self.session_principal)
+                    .map_err(|e| format!("Error decoding context {ctx} sync state: {e}"))?;
+                Ok(Some((doc.blocks(), state.version)))
+            }
+        }
     }
 
     /// Get the joined context's context_id and sync state.
@@ -1996,7 +2091,7 @@ impl KaijutsuMcp {
         name = "analyze_document",
         description = "Analyze a document's structure, content, and activity for comprehensive understanding"
     )]
-    fn analyze_document(
+    pub async fn analyze_document(
         &self,
         Parameters(args): Parameters<AnalyzeDocumentArgs>,
     ) -> Result<GetPromptResult, McpError> {
@@ -2008,23 +2103,21 @@ impl KaijutsuMcp {
         })?;
 
         let focus = args.focus.as_deref().unwrap_or("all");
-
-        // Pull blocks, structure tree, and version under one guard (works for
-        // both backends), then build the prompt text.
         let want_structure = focus == "all" || focus == "structure";
-        let extracted = self.with_doc(context_id, |doc| {
-            let blocks = doc.blocks_ordered();
-            let tree_lines = if want_structure {
-                let dag = ConversationDAG::from_store(doc);
-                Some(format_dag_tree(&dag, None, false))
-            } else {
-                None
-            };
-            (blocks, tree_lines, doc.version())
-        });
-        let (blocks, tree_lines, version) = extracted.ok_or_else(|| {
-            McpError::invalid_params(format!("Document '{}' not found", args.document_id), None)
-        })?;
+
+        // Off the mirror on Remote — see `context_blocks_and_version`.
+        let (blocks, version) = self
+            .context_blocks_and_version(context_id)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("Document '{}' not found", args.document_id),
+                    None,
+                )
+            })?;
+        let tree_lines = want_structure
+            .then(|| format_dag_tree(&ConversationDAG::from_snapshots(blocks.clone()), None, false));
 
         let mut content = String::new();
 
@@ -2101,7 +2194,7 @@ impl KaijutsuMcp {
         name = "search_context",
         description = "Search documents and return matches with surrounding context"
     )]
-    fn search_context(
+    pub async fn search_context(
         &self,
         Parameters(args): Parameters<SearchContextArgs>,
     ) -> Result<GetPromptResult, McpError> {
@@ -2113,7 +2206,11 @@ impl KaijutsuMcp {
             let id = ContextId::parse(doc_id).map_err(|e| {
                 McpError::invalid_params(format!("Invalid document ID '{}': {}", doc_id, e), None)
             })?;
-            if self.contains_context(id) {
+            if self
+                .contains_context(id)
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?
+            {
                 vec![id]
             } else {
                 return Err(McpError::invalid_params(
@@ -2122,7 +2219,7 @@ impl KaijutsuMcp {
                 ));
             }
         } else {
-            self.context_ids()
+            self.context_ids().await
         };
 
         let mut content = String::new();
@@ -2132,8 +2229,11 @@ impl KaijutsuMcp {
         let context_lines = 3;
 
         for context_id in context_ids {
+            // Off the mirror on Remote — see `context_blocks`.
             let snapshots = self
-                .with_doc(context_id, |doc| doc.blocks_ordered())
+                .context_blocks(context_id)
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?
                 .unwrap_or_default();
 
             for snapshot in snapshots {
@@ -2198,17 +2298,19 @@ impl KaijutsuMcp {
         name = "editing_assistant",
         description = "Get editing context and suggestions for a specific block"
     )]
-    fn editing_assistant(
+    pub async fn editing_assistant(
         &self,
         Parameters(args): Parameters<EditingAssistantArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let (context_id, block_id) = self.locate_block(&args.block_id).ok_or_else(|| {
-            McpError::invalid_params(format!("Block '{}' not found", args.block_id), None)
-        })?;
-
-        let snapshot = self
-            .read_block(context_id, &block_id)
-            .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
+        // `locate_block` now folds the existence check and the real read
+        // into one — see its doc comment.
+        let (context_id, _block_id, snapshot) = self
+            .locate_block(&args.block_id)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("Block '{}' not found", args.block_id), None)
+            })?;
 
         let edit_type = args.edit_type.as_deref().unwrap_or("refine");
 
@@ -2228,22 +2330,29 @@ impl KaijutsuMcp {
         }
         content.push_str("```\n\n");
 
-        // Add parent context if available
-        if let Some(parent_id) = snapshot.parent_id
-            && let Some(parent_snap) = self.read_block(context_id, &parent_id)
-        {
-            content.push_str("## Parent Context\n\n");
-            let preview = if parent_snap.content.len() > 500 {
-                format!("{}...", &parent_snap.content[..500])
-            } else {
-                parent_snap.content.clone()
-            };
-            content.push_str(&format!(
-                "[{}/{}]\n```\n{}\n```\n\n",
-                parent_snap.role.as_str(),
-                parent_snap.kind.as_str(),
-                preview
-            ));
+        // Add parent context if available. A genuine RPC failure here fails
+        // the whole prompt rather than silently dropping the parent section
+        // — consistent with this migration's no-silent-fallback rule, even
+        // though the parent context is "supplementary" content.
+        if let Some(parent_id) = snapshot.parent_id {
+            let parent_snap = self
+                .read_block(context_id, &parent_id)
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?;
+            if let Some(parent_snap) = parent_snap {
+                content.push_str("## Parent Context\n\n");
+                let preview = if parent_snap.content.len() > 500 {
+                    format!("{}...", &parent_snap.content[..500])
+                } else {
+                    parent_snap.content.clone()
+                };
+                content.push_str(&format!(
+                    "[{}/{}]\n```\n{}\n```\n\n",
+                    parent_snap.role.as_str(),
+                    parent_snap.kind.as_str(),
+                    preview
+                ));
+            }
         }
 
         // Add edit-type specific instructions
@@ -2343,9 +2452,13 @@ impl ServerHandler for KaijutsuMcp {
                 .with_mime_type("application/json"),
         );
 
-        // Add each document as a resource
-        for doc_id in self.context_ids() {
-            let blocks = self.with_doc(doc_id, |doc| doc.blocks_ordered());
+        // Add each document as a resource. Off the mirror on Remote — see
+        // `context_blocks`.
+        for doc_id in self.context_ids().await {
+            let blocks = self
+                .context_blocks(doc_id)
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?;
             if let Some(blocks) = blocks {
                 let doc_hex = doc_id.to_hex();
                 resources.push(
@@ -2396,21 +2509,26 @@ impl ServerHandler for KaijutsuMcp {
 
         // Parse URI: kaijutsu://docs, kaijutsu://docs/{id}, kaijutsu://blocks/{id}/{key}
         if uri == "kaijutsu://docs" {
-            // Return list of all documents
-            let docs: Vec<serde_json::Value> = self
-                .context_ids()
-                .iter()
-                .map(|id| {
-                    let block_count = self
-                        .with_doc(*id, |doc| doc.blocks_ordered().len())
-                        .unwrap_or(0);
-                    serde_json::json!({
-                        "id": id.to_hex(),
-                        "kind": "Conversation",
-                        "block_count": block_count
-                    })
-                })
-                .collect();
+            // Return list of all documents. This wants only a per-context
+            // count, but `context_blocks` transfers every block's full
+            // content to compute it — there's no cheap count RPC today
+            // (docs/crdt-position-2026-08.md notes the same gap for shell
+            // Phase 2). Not adding one now; revisit if this resource gets
+            // used against contexts big enough for it to matter.
+            let mut docs = Vec::new();
+            for id in self.context_ids().await {
+                let block_count = self
+                    .context_blocks(id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e, None))?
+                    .map(|b| b.len())
+                    .unwrap_or(0);
+                docs.push(serde_json::json!({
+                    "id": id.to_hex(),
+                    "kind": "Conversation",
+                    "block_count": block_count
+                }));
+            }
 
             let content = serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".to_string());
 
@@ -2426,30 +2544,31 @@ impl ServerHandler for KaijutsuMcp {
                     None,
                 )
             })?;
-            // Return document metadata and block list
-            let extracted = self.with_doc(doc_ctx_id, |doc| {
-                let blocks: Vec<serde_json::Value> = doc
-                    .blocks_ordered()
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "id": s.id.to_key(),
-                            "role": s.role.as_str(),
-                            "kind": s.kind.as_str(),
-                            "status": s.status.as_str(),
-                            "content_preview": if s.content.len() > 100 {
-                                format!("{}...", &s.content[..100])
-                            } else {
-                                s.content.clone()
-                            }
-                        })
+            // Return document metadata and block list. Off the mirror on
+            // Remote — see `context_blocks_and_version`.
+            let (blocks, version) = self
+                .context_blocks_and_version(doc_ctx_id)
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?
+                .ok_or_else(|| {
+                    McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
+                })?;
+            let blocks: Vec<serde_json::Value> = blocks
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id.to_key(),
+                        "role": s.role.as_str(),
+                        "kind": s.kind.as_str(),
+                        "status": s.status.as_str(),
+                        "content_preview": if s.content.len() > 100 {
+                            format!("{}...", &s.content[..100])
+                        } else {
+                            s.content.clone()
+                        }
                     })
-                    .collect();
-                (blocks, doc.version())
-            });
-            let (blocks, version) = extracted.ok_or_else(|| {
-                McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
-            })?;
+                })
+                .collect();
 
             let result = serde_json::json!({
                 "id": doc_id_str,
@@ -2480,19 +2599,21 @@ impl ServerHandler for KaijutsuMcp {
             let doc_id_str = parts[0];
             let block_key = parts[1];
 
-            let (found_ctx_id, block_id) = self.locate_block(block_key).ok_or_else(|| {
-                McpError::invalid_params(
-                    format!(
-                        "Block '{}' not found in document '{}'",
-                        block_key, doc_id_str
-                    ),
-                    None,
-                )
-            })?;
-
-            let snapshot = self
-                .read_block(found_ctx_id, &block_id)
-                .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
+            // `locate_block` folds the existence check and the real read
+            // into one — see its doc comment.
+            let (_found_ctx_id, _block_id, snapshot) = self
+                .locate_block(block_key)
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!(
+                            "Block '{}' not found in document '{}'",
+                            block_key, doc_id_str
+                        ),
+                        None,
+                    )
+                })?;
 
             return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 snapshot.content.clone(),
@@ -2536,6 +2657,7 @@ impl ServerHandler for KaijutsuMcp {
                         {
                             // Complete document IDs
                             self.context_ids()
+                                .await
                                 .into_iter()
                                 .map(|id| id.to_hex())
                                 .filter(|id| id.contains(&request.argument.value))
@@ -2562,6 +2684,7 @@ impl ServerHandler for KaijutsuMcp {
                     "search_context" => {
                         if request.argument.name == "document_id" {
                             self.context_ids()
+                                .await
                                 .into_iter()
                                 .map(|id| id.to_hex())
                                 .filter(|id| id.contains(&request.argument.value))
@@ -2579,6 +2702,7 @@ impl ServerHandler for KaijutsuMcp {
                 let prefix = &resource_ref.uri;
                 if prefix.starts_with("kaijutsu://docs") {
                     self.context_ids()
+                        .await
                         .into_iter()
                         .map(|id| format!("kaijutsu://docs/{}", id.to_hex()))
                         .filter(|uri| uri.contains(&request.argument.value))
