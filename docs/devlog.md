@@ -1293,3 +1293,82 @@ leaves the broker's DB handle unset, so `kj binding allow` had written to a
 cache the authorization path never reads. Wiring the handle as production
 does made the test faithful — and made the fixture's own gap visible instead
 of letting a green run paper over it.
+
+## The mirror that stopped being a mirror (August 13)
+
+`kaijutsu-mcp` was a CRDT replica. It held a `SyncedDocument` of the joined
+context, authored blocks into it, pushed the resulting ops upstream, and
+maintained the whole apparatus that keeps a replica honest: a sole-writer task,
+a command channel, resync coalescing, a pushed-frontier, an event bridge. By
+the end of one day it held none of that, and the thing that replaced it is a
+single integer going up.
+
+The day did not start as a demolition. It started with a schema question —
+there was no block-authoring verb anywhere in the `Kernel` interface, and the
+tempting shortcut (`block_create` via `executeTool`) hardcodes `after`, status
+and content-type, and parses a `metadata` argument it never reads. Tool blocks
+routed through it would arrive with no name and no input **and nothing would
+error**. So `authorBlock`/`completeBlock` were appended at the next free
+ordinals, refusing two things rather than papering over them: an unparseable
+principal, and a ToolResult without its call's id.
+
+Amy's framing is what made the shape right. The earlier design had wanted an
+atomic `authorToolPair`, on the theory that a ToolCall without its result is
+corruption. Her model dissolved that: *a tool call should have a quick lock at
+startup, then run independently of other tool calls* — so the atomic part is
+only the **reservation**, and a ToolCall sitting at `Running` is a legitimate
+pending state, not an orphan. Reserve, then flow.
+
+Then the layers came off in order, and each one was smaller than it looked
+because the previous one had removed the reason for it. Authoring moved to RPC,
+which meant the mirror had no local writer, which meant the resync's pre-fetch
+flush and its abort-on-failure guard were protecting against a hazard that
+could no longer arise — two documented races gone by construction rather than
+by guard. The cold readers moved to server queries. The shell completion poll
+moved last, and inverting it was the key: **polling became the guarantee and
+events became a hint**. Before, the event feed was the mechanism and an
+authoritative catch-up was the emergency — so the common path trusted a cache
+fed by exactly the feed whose death the emergency path existed to detect. After,
+a dead feed is not a condition to detect and recover from; it just means nothing
+arrives early. Nothing to detect is nothing to get wrong. Two filed bugs died in
+that inversion without being fixed.
+
+With the last reader gone the mirror was write-only — maintained for nobody —
+and 624 lines of replica machinery went with it.
+
+**What the day was really about was tests that cannot fail.** Every defect found
+passed careful reading and died on execution, and there were five. A cancellation
+leak the refactor itself created: `with_hook_budget` is `tokio::time::timeout`,
+which *drops* the future, so a budget expiry between the reservation and its
+completion stranded a ToolCall at `Running` forever — the old design could not
+have that bug, because the pair was written under one lock with no await between
+them to cancel at. Splitting a local critical section into sequential awaits
+creates cancellation windows that did not exist. Worse, the design doc had argued
+`Running` was acceptable *because it was transient*; the refactor falsified the
+premise and left the argument standing.
+
+A wire field nobody read — `completeBlock` shipped with an `isError` the server
+ignored, which is precisely the `block_create` defect that justified building the
+verb, written down in the schema and the commit message and reproduced one
+ordinal later anyway. Writing the rule down did not prevent it; a reviewer
+reading the handler did. Made a refused-on-contradiction check, it caught a live
+inconsistency in our own hook path on its first run.
+
+And the sharpest one, because it was invisible until something forced it: the
+test guarding "shell survives a dead event feed" ran `echo`, which finishes
+server-side before the first poll. Under the old design the mirror *could not*
+hold the answer with the feed dead, and that alone is what made a fast command
+exercise anything; the moment the poll asked the server instead, the test proved
+"one query works" and nothing else. It was found by deleting the poll floor and
+watching the test pass anyway.
+
+The habit that worked every time was not review. It was **running the exact
+thing against the real system** — falsifying each new assertion by breaking the
+code under it, and probing idioms in a live kernel instead of reasoning about
+them. That is also how the day's other lane found that our own bug report was
+too kind: we reported a shell expansion yielding empty, and their re-probe found
+the word vanishing from the AST entirely, so inside quotes it produced a *wrong
+path* rather than a missing one. A report describes what was visible from where
+you stood; a probe finds the shape.
+
+An untested mechanism is a claim, however carefully its prose is worded.
