@@ -649,6 +649,52 @@ fn test_rpc_created_context_runs_rc_create() {
     });
 }
 
+/// The assistant seat's create lifecycle, same shape as the coder one above.
+///
+/// Worth having beyond "it emits a block": `assistant` is a brand-new rc
+/// bucket, and nothing registers context types anywhere — a bucket is just a
+/// directory name, and model resolution falls through when no cast claims the
+/// role. So the only thing standing between "the seat works" and "the seat
+/// silently does nothing" is that the directory is spelled right and seeded.
+/// This is the test that fails if the bucket is renamed or dropped from the
+/// embedded defaults.
+#[test]
+fn test_rpc_created_assistant_context_runs_its_stance() {
+    run_local(async {
+        let addr = start_server_with_mock_llm().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let ctx = kernel
+            .create_context_typed("rc-assistant", "assistant")
+            .await
+            .expect("create_context_typed");
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        let has_stance = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("the fleet's assistant seat")
+        });
+        assert!(
+            has_stance,
+            "expected assistant stance block from the rc create lifecycle; \
+             got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+
+        // The coder stance must not leak into a different bucket — the same
+        // negative the default-context test makes, in the direction a
+        // copy-pasted bucket would actually break.
+        assert!(
+            !blocks.iter().any(|b| b.content.contains("You are coding here")),
+            "assistant context must not get the coder stance"
+        );
+    });
+}
+
 #[test]
 fn test_rpc_default_context_type_is_default() {
     run_local(async {

@@ -1,0 +1,83 @@
+# The check-in tick: mechanism first, model on exception. Runs on the beat
+# scheduler's OODA boundary. It gathers raw data as trace output (model-hidden
+# until a turn is driven) and requests a turn ONLY when something needs
+# judgment. Probes never exit nonzero — a nonzero rc exit mints a
+# model-visible Error block by design — so failures are reported as data.
+#
+# THREE KAISH TRAPS ARE LOAD-BEARING BELOW. Each one silently produced the
+# wrong answer in the first draft of this script, and two of them look like
+# working shell. Do not "simplify" them back:
+#
+#   1. `x="$(cmd)" || x="FALLBACK"` NEVER FIRES. A command-substitution
+#      assignment always reports success (kaish `Stmt::Assignment` returns
+#      success unconditionally), so the `||` branch is dead code. The first
+#      draft used it for every probe, which made `signal` unreachable — this
+#      script would have logged "no turn requested" forever while looking
+#      healthy. Capture `rc=$?` on the NEXT line instead. (`if x="$(cmd)";
+#      then` is not an escape hatch either — that is a parse error.)
+#   2. Bare numeric tokens lose their leading zero in `case`/`for`, so
+#      `case "$hour" in 00|01)` cannot match `date '+%H'` output. Quoting
+#      fixes it, but numeric comparison says what we mean and has no
+#      leading-zero hazard at all — including the classic 08/09 octal trap,
+#      which `-lt` handles correctly here.
+#   3. `kj context list --json` is an array of plain STRINGS (label where one
+#      exists, id where not), not objects — `.[].label` is a jq runtime error.
+#
+# All three are with Amy for a kaish scope call. If they are fixed, this
+# script still works; re-test before relaxing anything.
+
+# -- clock, read fresh this turn (the writer-stamps rule applies to us too)
+now="$(date '+%Y-%m-%d %H:%M %Z')"
+hour="$(date '+%H')"
+echo "tick at $now"
+
+# -- quiet hours gate OUTBOUND duties only; quiet work continues. Trap 2.
+quiet=0
+if [[ "$hour" -ge 22 ]] || [[ "$hour" -lt 6 ]]; then
+  quiet=1
+fi
+echo "quiet=$quiet"
+
+# -- probes: raw data only, with pointers. Failures are data, not exits.
+signal=0
+
+# Overridable so the signal path can be exercised on demand: point it at a
+# missing file and this tick MUST raise. That proof-run is a landing
+# requirement, not a nicety — the failure branch had never once been observed
+# to fire, and a green tick log is not evidence that it can.
+queue_path="${KJ_ASSISTANT_QUEUE:-/home/atobey/exomemory/queue.md}"
+
+# queue: does anything await Amy? Trap 1 — rc on the next line, not `||`.
+# `$queue_path` is deliberately UNQUOTED inside the substitution: kaish does no
+# token pasting, so an inner `"$var"` inside `$( )` is a parse error, not a
+# quoting nicety. (Trap 4, and the proof-run below is what caught it — the
+# quoted form was in this script until the first run refused to parse.)
+# Consequence: keep the queue path space-free.
+queue_head="$(head -20 $queue_path)"
+rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  queue_head="READ-FAIL: $queue_path"
+fi
+echo "queue head: $queue_head"
+
+# roster: who is at the table right now? Trap 1 again, and trap 3 in the jq.
+roster="$(kj context list --json | jq -r '.[]' | head -30)"
+rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  roster="READ-FAIL: context list"
+fi
+echo "roster: $roster"
+
+# (drive-decision policy is deliberately dumb in the seed: a turn is requested
+# only when a probe could not complete. Real signal rules grow here as duties
+# migrate, one per parity-gated duty.)
+case "$queue_head$roster" in
+  *READ-FAIL*) signal=1 ;;
+esac
+
+if [[ "$signal" -eq 1 ]] && [[ "$quiet" -eq 0 ]]; then
+  echo "signal raised; requesting a turn"
+  kj drive
+else
+  echo "no turn requested (signal=$signal quiet=$quiet)"
+fi

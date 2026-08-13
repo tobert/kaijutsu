@@ -768,6 +768,93 @@ mod tests {
         assert_eq!(cat.text_out(), "the quick brown fox");
     }
 
+    /// The shell idioms our rc scripts rely on for **failure detection**, run
+    /// through the real embedded kaish.
+    ///
+    /// This exists because the assistant seat's tick script was written with
+    /// `x="$(cmd)" || x="READ-FAIL"` — the obvious idiom, correct in bash, and
+    /// **dead code in kaish**: a command-substitution assignment always
+    /// reports success, so the `||` branch never runs. That script's only
+    /// health signal was built on it, so it could never raise a turn and would
+    /// have logged "no turn requested" forever while looking healthy. Nothing
+    /// in the suite could see it, because nothing executed the idiom.
+    ///
+    /// So this pins the working form (`rc=$?` on the next line) AND the broken
+    /// one, deliberately asserting kaish's current divergence rather than the
+    /// behavior we would prefer. The `||` case is filed with Amy for a scope
+    /// call; **if it gets fixed, this test fails** — which is the point. It
+    /// should fail loudly and be updated on purpose, not silently start
+    /// passing for a new reason.
+    ///
+    /// Guards `assets/defaults/rc/assistant/tick/S10-checkin.kai`.
+    #[tokio::test]
+    async fn rc_failure_detection_idioms_behave_as_the_scripts_assume() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-idioms").await);
+        let kaish = EmbeddedKaish::new("test-idioms", blocks, kernel, None).unwrap();
+        let run = |cmd: &str| {
+            let k = &kaish;
+            let cmd = cmd.to_string();
+            async move {
+                k.execute_with_options(&cmd, ExecuteOptions::default())
+                    .await
+                    .unwrap_or_else(|e| panic!("`{cmd}` failed: {e}"))
+                    .text_out()
+                    .to_string()
+            }
+        };
+
+        // The WORKING idiom: capture rc on the next line and branch on it.
+        let out = run(
+            r#"v="$(cat /definitely/not/here)"; rc=$?; if [[ "$rc" -ne 0 ]]; then v="READ-FAIL"; fi; echo "[$v]""#,
+        )
+        .await;
+        assert!(
+            out.contains("[READ-FAIL]"),
+            "rc=$? must detect a failed command substitution — this is the idiom \
+             every rc probe depends on; got: {out}"
+        );
+
+        // The idiom must NOT false-positive on success.
+        let ok = run(
+            r#"v="$(echo alive)"; rc=$?; if [[ "$rc" -ne 0 ]]; then v="READ-FAIL"; fi; echo "[$v]""#,
+        )
+        .await;
+        assert!(
+            ok.contains("[alive]"),
+            "a successful substitution must keep its value; got: {ok}"
+        );
+
+        // The BROKEN idiom, pinned as currently-divergent. See the doc comment:
+        // when kaish learns POSIX assignment status, this flips and should be
+        // updated deliberately.
+        let dead = run(
+            r#"v="$(cat /definitely/not/here)" || v="READ-FAIL"; echo "[$v]""#,
+        )
+        .await;
+        assert!(
+            dead.contains("[]"),
+            "kaish currently does NOT fire `||` after a command-substitution \
+             assignment. If this now reports READ-FAIL the bug was fixed — good; \
+             update this test and the trap comments in \
+             assets/defaults/rc/assistant/tick/S10-checkin.kai. Got: {dead}"
+        );
+
+        // Quiet-hours arithmetic: `date '+%H'` is zero-padded, and bare numeric
+        // tokens lose their leading zero in `case`, so the scripts use numeric
+        // comparison. Pins the 08/09 would-be-octal boundary too.
+        let hours = run(
+            r#"for h in "03" "08" "14" "22"; do q=0; if [[ "$h" -ge 22 ]] || [[ "$h" -lt 6 ]]; then q=1; fi; echo "$h=$q"; done"#,
+        )
+        .await;
+        for expected in ["03=1", "08=0", "14=0", "22=1"] {
+            assert!(
+                hours.contains(expected),
+                "quiet-hours comparison wrong: expected {expected} in {hours}"
+            );
+        }
+    }
+
     /// The external-exec policy end to end: `Allow` + a Local-mounted cwd runs
     /// a real host binary through kaish's subprocess path; `Deny` fails fast
     /// with `command not found` (127) — no PATH, no absolute-path escape.
