@@ -419,6 +419,35 @@ is. Both intermediate states are transient; only one is honest. The liveness
 residue decision 2 named is handled explicitly — if the result fails to
 author, the call is completed at `Error` rather than left pending forever.
 
+**The residue had a second form, and it took cross-model review to see it.**
+Handling the *error* case is not the same as handling the *cancellation* case.
+`with_hook_budget` is `tokio::time::timeout`, which **drops** the future when
+the budget expires — so a drop landing between `authorBlock(call)` and
+`completeBlock` means the completion code never runs at all, and the block
+stays `Running` forever. The fix is to attach the completion to the
+reservation's *lifetime* rather than to the code path: a drop guard that
+spawns a detached `completeBlock(Error)` if it is dropped still armed.
+
+The generalizable part, worth carrying to any future reserve-then-flow work:
+**splitting a local critical section into sequential awaits creates
+cancellation windows that did not previously exist.** The old code could not
+have this bug — the pair was applied under one lock with no await between the
+writes to cancel at. And note what the refactor did to the *argument*: this
+document justified a visible `Running` state on the grounds that it is
+transient. Slice 3 quietly falsified that premise while leaving the
+justification standing. A leaked `Running` is not a pending tool call; it is a
+lie in the log.
+
+**A related self-inflicted one, same review.** `completeBlock` shipped with an
+`isError` parameter the server never read — the *exact* defect that made
+`block_create` unusable for tool blocks and caused this verb to exist, written
+down in this document and in the schema comment, and reproduced one ordinal
+later anyway. Writing the rule down did not prevent it; a reviewer reading the
+handler did. A redundant wire field has two honest fates — read it, or do not
+declare it — and "documented as ignored" is not one of them. It is now read as
+a consistency check that refuses a contradiction, which caught a live bug in
+the hook path on its first run.
+
 **A test's meaning changed underneath it, and that is worth noticing.**
 `tool_after_completes_the_call_block_remote_mode` asserted against the mirror
 after a fixed 100 ms sleep. That was honest when the write was local
