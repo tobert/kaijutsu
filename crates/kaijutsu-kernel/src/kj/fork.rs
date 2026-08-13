@@ -17,7 +17,9 @@
 use std::collections::HashMap;
 
 use clap::Parser;
-use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind};
+use kaijutsu_types::{
+    ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind, PrincipalId,
+};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -705,7 +707,7 @@ impl KjDispatcher {
 
         // If --prompt given, inject a Drift block
         if let Some(note) = &prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, note)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note, caller.principal_id)
         {
             return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
@@ -742,6 +744,7 @@ impl KjDispatcher {
             source_label.as_deref(),
             staging,
             policy_note,
+            caller.principal_id,
         ) {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
         }
@@ -824,7 +827,12 @@ impl KjDispatcher {
                 let router = self.drift_router().read();
                 router.get(source_id).and_then(|h| h.model.clone())
             };
-            if let Err(e) = self.block_store().insert_drift_block(
+            // The distillation seed belongs to the context owner, not the
+            // store's own identity — same ruling as the fork note/marker
+            // below. At this point in `fork_compact` the child's ContextRow
+            // doesn't exist yet, but its `created_by` (inserted further down)
+            // is always `caller.principal_id`, so that is the right value here.
+            if let Err(e) = self.block_store().insert_drift_block_as(
                 new_id,
                 None,
                 None,
@@ -832,6 +840,7 @@ impl KjDispatcher {
                 source_id,
                 source_model,
                 kaijutsu_crdt::DriftKind::Distill,
+                Some(caller.principal_id),
             ) {
                 return KjResult::Err(format!("kj fork --compact: failed to insert summary: {e}"));
             }
@@ -839,7 +848,7 @@ impl KjDispatcher {
 
         // If --prompt given, inject a fork note after the summary
         if let Some(note) = &prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, note)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note, caller.principal_id)
         {
             tracing::warn!("failed to inject fork note: {e}");
         }
@@ -968,6 +977,7 @@ impl KjDispatcher {
             source_label.as_deref(),
             staging,
             None,
+            caller.principal_id,
         ) {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
@@ -1224,7 +1234,8 @@ impl KjDispatcher {
         // fork marker — matching fork_full's placement so the autonomous turn's
         // anchor lands at the true tail.
         if let Some(note) = &prompt
-            && let Err(e) = self.inject_fork_note(new_root_id, source_id, note)
+            && let Err(e) =
+                self.inject_fork_note(new_root_id, source_id, note, caller.principal_id)
         {
             return KjResult::Err(format!("kj fork --as: failed to inject fork note: {e}"));
         }
@@ -1237,6 +1248,7 @@ impl KjDispatcher {
             Some(&template_ref),
             staging,
             None,
+            caller.principal_id,
         ) {
             tracing::warn!("kj fork --as: failed to inject fork marker: {e}");
         }
@@ -1444,12 +1456,17 @@ impl KjDispatcher {
         target_id: ContextId,
         source_id: ContextId,
         note: &str,
+        // Per Amy's ruling (2026-08-12): a fork marker/note is NOT a drift
+        // arrival from an outsider, it belongs to the context owner. At fork
+        // time that owner is the forking caller (the child's `created_by` —
+        // verified against all three fork call sites, they always match).
+        owner: PrincipalId,
     ) -> Result<(), String> {
         use kaijutsu_crdt::DriftKind;
 
         let after = self.block_store().last_block_id(target_id);
         self.block_store()
-            .insert_drift_block(
+            .insert_drift_block_as(
                 target_id,
                 None,
                 after.as_ref(),
@@ -1457,6 +1474,7 @@ impl KjDispatcher {
                 source_id,
                 None,
                 DriftKind::Push,
+                Some(owner),
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -1478,6 +1496,9 @@ impl KjDispatcher {
         // A visible note appended to the marker — e.g. a dropped hydration
         // policy (3d). `None` for the plain marker.
         note: Option<&str>,
+        // Same reasoning as `inject_fork_note`'s `owner`: the marker belongs
+        // to the context owner, not the store's own identity.
+        owner: PrincipalId,
     ) -> Result<(), String> {
         use kaijutsu_crdt::DriftKind;
 
@@ -1498,7 +1519,7 @@ impl KjDispatcher {
         let after = self.block_store().last_block_id(target_id);
         let block_id = self
             .block_store()
-            .insert_drift_block(
+            .insert_drift_block_as(
                 target_id,
                 None,
                 after.as_ref(),
@@ -1506,6 +1527,7 @@ impl KjDispatcher {
                 source_id,
                 None,
                 DriftKind::Fork,
+                Some(owner),
             )
             .map_err(|e| e.to_string())?;
 
@@ -3525,5 +3547,145 @@ mod tests {
         // Fails before any mutation — no child context was created.
         let found = d.kernel_db().lock().find_context_by_label("child").unwrap();
         assert!(found.is_none(), "failed distill resolution must not create a context");
+    }
+
+    // ── block-authorship leftovers: fork marker/note/compact seed (2026-08-13) ──
+    //
+    // Amy's ruling: the drift block carries the sending principal; everything
+    // else — including fork markers, fork notes, and the --compact distill
+    // seed — belongs to the context owner. Before this fix all three went
+    // through the `insert_drift_block` wrapper, whose `None` fell back to
+    // `BlockStore::principal_id()` (the kernel's own identity), so a fresh
+    // child's very first blocks were authored by nobody real.
+
+    /// The plain fork marker (`kj fork --name`) must carry the forking
+    /// caller's principal — the same value that lands in the child's
+    /// `created_by` — not the store's own identity.
+    #[tokio::test]
+    async fn fork_marker_carries_the_forking_caller() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(source);
+        assert_ne!(
+            c.principal_id,
+            d.block_store().principal_id(),
+            "fixture caller must differ from the store's own principal or the \
+             assertion below is vacuous"
+        );
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("branch")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "branch");
+        let blocks = d.block_store().block_snapshots(child).unwrap();
+        let marker = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("fork marker landed as a Drift block");
+        assert_eq!(
+            marker.id.principal_id, c.principal_id,
+            "fork marker must be authored by the forking caller, not the kernel"
+        );
+    }
+
+    /// `kj fork --prompt` seeds a fork-note Drift block ahead of the marker;
+    /// it must carry the forking caller's principal too.
+    #[tokio::test]
+    async fn fork_note_carries_the_forking_caller() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(source);
+        assert_ne!(
+            c.principal_id,
+            d.block_store().principal_id(),
+            "fixture caller must differ from the store's own principal or the \
+             assertion below is vacuous"
+        );
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--name"), s("branch"), s("--prompt"), s("do the thing")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "branch");
+        let blocks = d.block_store().block_snapshots(child).unwrap();
+        let note = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("do the thing"))
+            .expect("fork note landed as a Drift block");
+        assert_eq!(
+            note.id.principal_id, c.principal_id,
+            "fork note must be authored by the forking caller, not the kernel"
+        );
+    }
+
+    /// `kj fork --compact` seeds the child with an LLM distillation as a Drift
+    /// block (`DriftKind::Distill`). Same ruling: it belongs to the forking
+    /// caller (the child's `created_by`), not the kernel's own identity.
+    #[tokio::test]
+    async fn fork_compact_seed_carries_the_forking_caller() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "material to distill");
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("DISTILL-SEED"))),
+            );
+            reg.set_default("anthropic");
+        }
+        // Distillation needs the calling context's OWN provider+model pair
+        // (see `fork_compact_distill_uses_calling_context_provider`) — a bare
+        // registry default isn't enough.
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
+        }
+
+        let c = caller_with_context(source);
+        assert_ne!(
+            c.principal_id,
+            d.block_store().principal_id(),
+            "fixture caller must differ from the store's own principal or the \
+             assertion below is vacuous"
+        );
+
+        let result = d
+            .dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &c)
+            .await;
+        assert!(result.is_ok(), "compact fork failed: {}", result.message());
+
+        let child = child_id(&d, "child");
+        let blocks = d.block_store().block_snapshots(child).unwrap();
+        let seed = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("DISTILL-SEED"))
+            .expect("distill seed landed as a Drift block");
+        assert_eq!(
+            seed.id.principal_id, c.principal_id,
+            "compact-fork distill seed must be authored by the forking caller, not the kernel"
+        );
     }
 }

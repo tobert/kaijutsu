@@ -3013,33 +3013,16 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Insert a drift block into a document.
-    ///
-    /// Wraps `CrdtBlockStore::insert_drift_block()` with FlowBus emission,
-    /// auto-save, and frontier tracking.
-    pub fn insert_drift_block(
-        &self,
-        context_id: ContextId,
-        parent_id: Option<&BlockId>,
-        after: Option<&BlockId>,
-        content: impl Into<String>,
-        source_context: ContextId,
-        source_model: Option<String>,
-        drift_kind: kaijutsu_crdt::DriftKind,
-    ) -> BlockStoreResult<BlockId> {
-        self.insert_drift_block_as(
-            context_id,
-            parent_id,
-            after,
-            content,
-            source_context,
-            source_model,
-            drift_kind,
-            None,
-        )
-    }
-
     /// Insert a drift block with an explicit author identity.
+    ///
+    /// There is deliberately no `None`-defaulting wrapper here anymore: the
+    /// old `insert_drift_block()` silently fell back to
+    /// `BlockStore::principal_id()` (the kernel's own identity), and that
+    /// silent default is *how* the drift-authorship smear stayed invisible
+    /// for months — no call site ever had to think about who a block
+    /// belonged to. `principal_id: None` is still allowed, but every call
+    /// site must now write it out and say why (see the identity-smear split,
+    /// `docs/issues.md` / commit `b356fc45`).
     pub fn insert_drift_block_as(
         &self,
         context_id: ContextId,
