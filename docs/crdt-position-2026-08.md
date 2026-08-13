@@ -283,7 +283,9 @@ post-`Done` fetch rather than the mirror. So:
 - **Slice 1 — the read side**, no schema change: move the cold readers
   (prompts, resources, completions) from the mirror to `get_blocks_query` /
   `get_block`. Independently shippable; shrinks the mirror's remaining job to
-  `find_terminal` alone.
+  `find_terminal` alone. *(Skipped at the time — see "Correction: slice 1 never
+  shipped" below. It is seven readers, not the afterthought this line makes it
+  sound.)*
 - **Slice 2** — the new authoring verb. **Slice 3** — flip `HookListener` to
   it and delete `AuthorBlocks` / `push_new_ops` / `pushed_frontier`; races 3
   and 4 then vanish by construction rather than by guard.
@@ -459,6 +461,51 @@ carried it back. **The migration changed what an unchanged assertion meant** —
 the slice-0 discipline (write the test against the contract) is what kept it
 meaningful instead of merely passing.
 
-Still open: **slice 4**, the last mirror reader (`find_terminal`, hot on every
-`shell` call). `kaijutsu-acp` also still runs a `SyncedDocument`, so the MCP is
+## Correction: slice 1 never shipped, and "the last mirror reader" was wrong
+
+Found on contact, 2026-08-13, surveying for slice 4. The sequencing above says
+slice 1 "shrinks the mirror's remaining job to `find_terminal` alone" and then
+calls slice 4 "the last mirror reader." **Slice 1 was never done.** It appears
+in the sequencing list but not in the four-step status block, so it fell
+between the two and nobody noticed — including me, who repeated "slice 4 is the
+remaining work" in a handoff without checking.
+
+`find_terminal` is one of **eight** mirror readers. The other seven are cold
+(`with_doc` at `contains_context`, `read_block`, the `analyze_document` and
+`search_context` prompts, `list_resources`, and both `read_resource` branches).
+
+**What the survey changed about the plan.** Two of the cold readers need
+`doc.version()`, and two need only a block count — and there is no cheap RPC
+for either. That looked like a blocker requiring new server capability, which
+would have meant another schema bounce. It is not: `get_context_sync` already
+returns `{ version, ops }`, so a throwaway `SyncedDocument::from_sync_state`
+serves both version and ordered blocks in one call. Shell Phase 2 already does
+exactly that. **Slice 1 needs no schema change** — the "gaps" are cost gaps on
+cold paths, not capability gaps.
+
+The costs are real but acceptable where they land: the `kaijutsu://docs` branch
+transfers every block's content to produce one integer per context, and
+`list_resources` does the same to compute `content.len()`. A metadata
+projection or a count RPC would fix both; neither is worth a bounce today. In
+Remote these loops iterate exactly one context anyway, because `context_ids()`
+collapses to the joined context — itself a filed bug, and one that quietly caps
+the fan-out cost.
+
+**`find_terminal` is different in kind, not just order.** It is a local,
+lock-only check re-run on every event wakeup and every 500 ms fallback tick for
+up to 600 s per shell command. No RPC is cheap enough at that cadence, so slice
+4 is a change to the *polling model*, not a read swap. `BlockFilter` gets
+close — `{ parent_id, max_depth: 1, kinds: [ToolResult], statuses: [Done,
+Error] }` — but cannot express `is_shell()` (`tool_kind` is not a filter
+field), so a client-side filter is required and `limit: 1` would be unsafe with
+it.
+
+**Why bother, now that replication is gone?** The remaining argument is not
+line count. The mirror is fed only by the event feed, and the stall fallback
+exists precisely because that feed can die — so this is a cache that can
+silently disagree with the server. That is exactly the question
+`docs/memory.md`'s derived-state rule says to ask: *can this state disagree
+with truth silently?* It can. Retiring it is a correctness move.
+
+Also still open: `kaijutsu-acp` runs its own `SyncedDocument`, so the MCP is
 the last *replicator* but not the last mirror.
