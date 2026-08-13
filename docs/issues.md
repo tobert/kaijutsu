@@ -79,12 +79,35 @@ worst host: an rc script computing a digest, a count, or a hash off a
 truncated capture writes a confident wrong fact into a context, and per the
 `create` blast radius it does so on every session registration.
 
-Candidate fixes, cheapest first: make truncation set a nonzero status or a
-shell var an author can test; or emit the truncation notice on stderr as well
-so it is visible in the Trace block; or raise the cap for rc-context shells
-specifically. Any of the three beats the current behavior. Until one lands,
-the discipline is **bound every read before it lands in a variable**
-(`head -n`, a filter) — now recorded in `memory.md`'s mechanics section.
+**This is ours, not kaish's** (corrected after filing — the first version of
+this entry read as a kaish defect and would have misrouted the fix). kaish's
+`OutputLimitConfig::agent()` specifies `SpillMode::Disk`: overflow goes to a
+spill file and the truncation message *carries the path*, which is visible and
+recoverable. We don't get that, because
+`kaish-kernel = { version = "0.13", features = ["subprocess"] }` (workspace
+`Cargo.toml:51`) **omits `localfs`**, and a build without it "always behaves
+as `SpillMode::Memory` regardless of this setting" — silent head+tail splice,
+no pointer. kaish's own module doc even says truncating silently "could
+corrupt structured data that an agent acts on."
+
+Candidate fixes, cheapest first:
+
+1. **Raise or remove `max_bytes` for rc/context shells** — one line at
+   `embedded_kaish.rs:264`. 8 KB is a sandboxed-agent default we inherited
+   without choosing it.
+2. **Ask kaish to make Memory-mode truncation loud** — a nonzero status or a
+   testable shell var. The only genuinely kaish-side option, and worth it
+   because Memory mode is the *only* mode for any no-`localfs` embedder.
+3. **Enable `localfs`** to get the pointered disk spill. This is a **design
+   conversation, not a patch**: it hands kaish host-filesystem writes, and
+   CLAUDE.md's "host exec has one owner" doctrine means that routing decision
+   is not a Cargo feature flag we flip quietly.
+
+Also note we are pinned to kaish 0.13 while **0.14.0 published today** — check
+whether anything here moved before acting.
+
+Until one lands, the discipline is **bound every read before it lands in a
+variable** (`head -n`, a filter) — recorded in `memory.md`'s mechanics section.
 
 ## Memory system — direction decided, slices open (2026-08-13)
 
