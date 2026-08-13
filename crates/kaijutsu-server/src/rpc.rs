@@ -7070,6 +7070,30 @@ impl kernel::Server for KernelImpl {
         let block_id = pry!(parse_block_id_from_reader(&pry!(p.get_block_id())));
         let status = status_from_capnp(pry!(p.get_status()));
 
+        // `isError` is redundant with `status` for a ToolCall — `Status::Error`
+        // IS the error state, and there is no separate `set_is_error` on the
+        // store to route it to (`is_error` is a ToolResult insert-time field).
+        // A redundant wire parameter has exactly two honest fates: read it, or
+        // do not declare it. Reading it as a consistency check is the cheaper
+        // one, and it is the fate this verb was created to enforce — the whole
+        // reason `block_create` was unsuitable is that it parses `metadata` and
+        // never reads it, so tool blocks arrive empty and NOTHING errors.
+        // Shipping a new verb with its own quietly-ignored parameter would
+        // repeat that defect at the next ordinal. So: disagreement is a caller
+        // bug, and it is refused rather than silently resolved in favor of one
+        // side. (Cross-model review caught this; see docs/issues.md for the
+        // alternative — dropping the field in a future schema revision.)
+        let is_error = p.get_is_error();
+        if is_error != (status == Status::Error) {
+            results.get().set_success(false);
+            results.get().set_error(format!(
+                "completeBlock: isError={is_error} contradicts status={}; \
+                 Status::Error is the error state for a completed block",
+                status.as_str()
+            ));
+            return Promise::ok(());
+        }
+
         let store = &self.kernel.documents;
 
         if p.get_has_exit_code()

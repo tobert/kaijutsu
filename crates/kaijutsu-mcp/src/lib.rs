@@ -352,7 +352,7 @@ pub struct RemoteState {
     /// `lock()`) and `lock()` is a cheap non-async critical section — held only
     /// for fast doc reads/applies, never across an `.await`.
     pub synced: Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    /// Wake signal: a monotonic generation counter the background listener bumps
+    /// Wake signal: a monotonic generation counter the doc task bumps
     /// (`send_modify`) after each applied event. Waiters (the shell completion
     /// poll) `subscribe()` and `await changed()`. Unlike a bare `Notify`, the
     /// watch channel records the version, so a bump between a waiter's state
@@ -364,9 +364,9 @@ pub struct RemoteState {
     pub shared_context_id: Arc<Mutex<Option<kaijutsu_crdt::ContextId>>>,
     /// Handle to the sole-writer doc task's command channel — `None` until
     /// `register_session` spawns the task (same lifecycle as `synced`/
-    /// `joined`). `HookListener` and `execute_and_poll_shell`'s stall
-    /// fallback send `DocCommand`s through this instead of touching
-    /// `synced` directly; only reads still go straight through the mutex.
+    /// `joined`). Since authoring moved to `authorBlock` RPCs, the only
+    /// remaining producer is `execute_and_poll_shell`'s stall fallback
+    /// (plus the event bridge); reads go straight through the mutex.
     pub doc_task: Arc<Mutex<Option<DocTaskHandle>>>,
     /// Per-session principal for block authorship — mirrors
     /// `KaijutsuMcp::session_principal`, duplicated here so `finish_join`
@@ -1020,9 +1020,14 @@ impl KaijutsuMcp {
         // and the `changed().await` below is still observed (no lost wakeup).
         let mut change_rx = remote.change.subscribe();
 
-        // Stall fallback: `change` is bumped only by the background listener,
-        // which only has something to bump when the server's FlowBus bridge
-        // delivers an event. If that bridge gets reaped mid-command (a burst
+        // Stall fallback: `change` is bumped by the doc task, which mostly
+        // has something to bump only when the server's FlowBus bridge
+        // delivers an event. ("Mostly" is load-bearing and currently a bug:
+        // the doc task also bumps after a resync, including the one THIS
+        // fallback requests, so the loop reads its own resync as delivery
+        // progress and resets the backoff below. Filed in docs/issues.md —
+        // the effect is wasted snapshots, not wrong data.)
+        // If that bridge gets reaped mid-command (a burst
         // of callback timeouts from one transient client stall — see
         // `SubscriberHealth` server-side), the client is never told: the
         // broadcast channel stays open, just silent, and without this we'd
@@ -1103,8 +1108,10 @@ impl KaijutsuMcp {
             // SyncedDocument — the same resync the doc task runs after a
             // reconnect/lag, routed through its command channel like every
             // other mutation now (not a direct call — the doc task is the
-            // sole writer). It flushes any locally-authored ops first, then
-            // folds the fetched state into `remote.synced`. If the command
+            // sole writer). It fetches the server's snapshot and folds it
+            // into `remote.synced` (there is no pre-fetch flush anymore —
+            // the mirror is a read replica with nothing local to flush). If
+            // the command
             // finished server-side while our delivery path was dead, the very
             // next `find_terminal()` at the top of this loop picks it up
             // exactly as if it had arrived locally — no separate fetch/decode
@@ -1143,7 +1150,7 @@ impl KaijutsuMcp {
         // content+exit_code BEFORE flipping status (program order), so a snapshot
         // taken after we observe Done is guaranteed complete. Decode it into a
         // throwaway document (no write to the shared doc → no race with the
-        // sole-writer bg listener) and read just this block.
+        // sole-writer doc task) and read just this block.
         // TODO(perf): this pulls the full context snapshot per shell command; a
         // per-block read RPC would avoid that for large contexts (docs/issues.md).
         match remote.actor.get_context_sync(ctx_id).await {

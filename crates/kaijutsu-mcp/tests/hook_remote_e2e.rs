@@ -333,19 +333,23 @@ fn tool_after_completes_the_call_block_remote_mode() {
 /// "Build notes"): the acceptance test that has to exist *before* the MCP is
 /// moved off client-side replication.
 ///
-/// Its sibling above, `tool_after_completes_the_call_block_remote_mode`, is
-/// **vacuous with respect to replication**: it asserts against
-/// `remote.synced` — the process-local mirror that `insert_tool_blocks` wrote
-/// to synchronously. If `push_ops` silently failed and nothing ever reached
-/// the kernel, that test would still pass. It proves authoring, not delivery.
+/// **Written before the migration, and it did its job.** At the time, its
+/// sibling `tool_after_completes_the_call_block_remote_mode` was *vacuous
+/// with respect to replication*: it asserted against `remote.synced`, the
+/// process-local mirror `insert_tool_blocks` wrote to synchronously, so it
+/// would have passed even if `push_ops` silently failed and nothing ever
+/// reached the kernel. It proved authoring, not delivery.
 ///
 /// This one reads back through `get_all_blocks`, an authoritative **server**
 /// query, so it can only pass if the hook-authored blocks genuinely crossed
-/// the wire. It passes today against `push_ops`; after the migration to RPC
-/// authoring it must still pass, unchanged. That is the whole point — it is
-/// written against the *contract* (hook fires ⇒ server holds a correct
-/// ToolCall/ToolResult pair), not against the mechanism, so it survives the
-/// mechanism being replaced underneath it.
+/// the wire. It passed against `push_ops` and it passes unchanged against
+/// RPC authoring — the whole point, since it is written against the
+/// *contract* (hook fires ⇒ server holds a correct ToolCall/ToolResult pair)
+/// rather than the mechanism.
+///
+/// (The sibling is no longer vacuous either: with the mirror demoted to a
+/// read replica, reaching it now requires the same round trip plus the event
+/// feed. Both tests moved up in strength; only this one was designed to.)
 ///
 /// It pins the fields the planned `block_create` route would silently drop:
 /// `tool_name`, `tool_input`, the pair's parent link, and terminal status.
@@ -672,6 +676,24 @@ fn rpc_authoring_carries_tool_fields_and_completes_independently() {
             "the result must be linked to its call server-side"
         );
         assert_eq!(result.content, "total 0");
+
+        // `isError` must agree with `status`, and disagreement is REFUSED
+        // rather than quietly resolved in favor of one side.
+        //
+        // This is the assertion that keeps the parameter honest. It is
+        // redundant with `status` by construction, which is exactly the shape
+        // that rots into a parsed-and-never-read field — the specific defect
+        // that made `block_create` unusable for tool blocks and caused this
+        // verb to exist. Cross-model review found the server ignoring it;
+        // without a test, it would drift straight back to ignored.
+        let contradiction = remote
+            .actor
+            .complete_block(context_id, call_id, Status::Done, true, None)
+            .await;
+        assert!(
+            contradiction.is_err(),
+            "completeBlock must refuse isError=true with status=Done, got: {contradiction:?}"
+        );
     });
 }
 

@@ -6,6 +6,66 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Three findings from the slice-3 cross-model review (2026-08-13, gemini-pro + deepseek)
+
+Both models independently confirmed the read-replica invariant holds (three
+writers to `RemoteState.synced`, all server-sourced; zero `push_ops` callers in
+the crate), so the flush/frontier deletions are sound. These are what they
+found *around* it. The two hook-path defects they found are already fixed
+(drop-guard for cancellation, `isError` consistency check); these three are not.
+
+**1. MED — the shell poll's stall backoff is defeated by the doc task's own
+resync bump.** `execute_and_poll_shell` treats any `change` bump as "the event
+feed is alive," but `do_coalesced_resync` bumps `change` unconditionally when it
+finishes — including the resync the fallback itself just requested
+(`doc_task.rs`, end of `do_coalesced_resync`; `lib.rs`, the `watch_progressed`
+arm). So the loop reads its own resync as delivery progress, resets
+`stall_window` to the 5 s initial value and clears `stall_resubscribed`. The
+documented 5/10/20/30 backoff never accumulates past its first step, and
+`resubscribe_blocks` re-fires every ~5 s instead of once per episode. Net cost
+on a dead bridge during a long command: a **full `get_context_sync` snapshot
+every 5 s** for the command's whole runtime — precisely the tight poll the
+backoff exists to prevent, on top of the already-filed per-call snapshot cost.
+Wasted work, not wrong data.
+
+*Attribution corrected by probe:* deepseek blamed slice 3's "uniform bump."
+Wrong — `git show 7b1e288b:…/doc_task.rs` has the same unconditional
+`bump(change)` in `do_coalesced_resync`. It arrived with the sole-writer doc
+task (`be7b8b63`, 2026-07-17), whose own doc comment advertises the uniform bump
+as the *fix* for the old listener not bumping. It fixed one thing and broke
+another, and nothing noticed for four weeks. Fix shape: have the fallback
+compare the `change` generation across its own resync, or give resync-origin
+bumps a distinguishable marker.
+
+**2. MED — `ResyncReason::StallFallback` sits outside `do_coalesced_resync`'s
+staleness safety argument.** That argument (see the function's doc comment)
+says an `ApplyEvent` processed after a swap is causally at-or-after the
+snapshot, because every resync trigger *comes from* the ordered event stream.
+`StallFallback` does not: it fires on a local timeout, exactly when the feed is
+suspected slow or dead. An event delivered during the fetch may therefore
+reflect **older** server state than the snapshot, and applying it afterward
+regresses the field — silently, because the header setters stamp a fresh local
+tick rather than doing LWW against the event's own timestamp. Pre-dates slice 3;
+the code comment now carries the caveat. Real fix wants a server-side ordering
+token on events, not a guess.
+
+**3. LOW — rejoin race: an old doc task can clobber a fresh seed.**
+`finish_join` writes the new snapshot into `remote.synced` *before* the old
+`JoinedContext` drops and aborts the old doc task. In that window the old task
+can apply a queued `Resync`/`ApplyEvent` to the same `Arc<Mutex<…>>`, and
+`apply_sync_state` sets `context_id` from the payload — so the just-seeded
+document is replaced by the *old context's* snapshot. Reachable via
+`stabilize_context_label`'s reattach path calling `finish_join` a second time.
+Does not violate the read-replica invariant (the clobbering content is still
+server-sourced), but it is a wrong-context race: the seed write and the abort
+are not ordered by any lock. Fix shape: abort the old task before seeding.
+
+**Also noted, not filed as a defect:** `completeBlock`'s `isError` is redundant
+with `status` by construction. It is now read as a consistency check (a
+contradiction is refused) rather than ignored. If a future schema revision is
+happening anyway, dropping the field is the cleaner end state — but it is not
+worth a bounce of three binaries on its own.
+
 ## Theme changes never reach a running app — there is no live config push (2026-08-13, revised)
 
 The 2026-08-12 version of this entry blamed raster-time gates in the app for

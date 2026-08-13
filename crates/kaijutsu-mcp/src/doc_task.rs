@@ -50,7 +50,10 @@ const DOC_TASK_CHANNEL_CAPACITY: usize = 256;
 
 /// Why a [`DocCommand::Resync`] was requested — carried for logging /
 /// coalescing visibility only, not branched on inside the resync itself
-/// (every reason runs the identical flush→fetch→apply routine).
+/// (every reason runs the identical fetch→apply routine) — with one
+/// consequence noted on [`do_coalesced_resync`]: `StallFallback` alone is not
+/// triggered by the ordered event stream, which is where its safety argument
+/// stops holding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResyncReason {
     /// A `ServerEvent::SyncReset` was applied and reported `NeedsResync`.
@@ -252,6 +255,17 @@ fn apply_event_sync(
 /// makes "apply it after" safe here; see `SyncedDocument::apply_sync_state`
 /// for the sibling case (`pending_events`) where that guarantee does NOT
 /// hold and the buffered events are dropped instead.
+///
+/// **That argument does not cover [`ResyncReason::StallFallback`]** (found by
+/// cross-model review, 2026-08-13; filed in docs/issues.md). Every other
+/// reason is triggered BY the ordered event stream, which is what makes
+/// "anything after is causally later" true. The stall fallback is triggered
+/// by a local timeout instead, precisely when the feed is suspected slow or
+/// dead — so an event delivered during the fetch may reflect server state
+/// OLDER than the snapshot, and applying it afterward can regress a field
+/// with a freshly-stamped local tick. Not fixed here: it predates this
+/// module's move off local authoring and wants a real ordering token
+/// (server-side version/tick on events) rather than a guess.
 async fn do_coalesced_resync<B: DocSyncBackend>(
     backend: &B,
     context_id: ContextId,

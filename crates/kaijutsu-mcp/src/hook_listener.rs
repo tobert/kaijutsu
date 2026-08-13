@@ -20,7 +20,7 @@ use kaijutsu_crdt::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status
 use kaijutsu_types::timeout::tiers;
 use kaijutsu_kernel::SharedBlockStore;
 
-use kaijutsu_client::AuthorBlock;
+use kaijutsu_client::{ActorHandle, AuthorBlock};
 
 use crate::RemoteState;
 use crate::hook_types::{
@@ -74,6 +74,62 @@ where
                  mid-resync; your action was not blocked."
             ))
         }
+    }
+}
+
+/// Guarantees a reserved `ToolCall` reaches a terminal state even if the task
+/// authoring it is **cancelled** partway through.
+///
+/// Reserve-then-flow leaves a liveness residue: between `authorBlock(call)`
+/// and `completeBlock`, the call sits at `Running` with its completion still
+/// in the future. `insert_tool_blocks` handles the *error* form of that
+/// (a failed result still completes the call at `Error`), but not the
+/// *cancellation* form — and cancellation is not hypothetical here.
+/// [`with_hook_budget`] is `tokio::time::timeout`, which DROPS the future
+/// when the budget expires. A drop landing between those two RPCs means the
+/// completion code simply never runs, and the block stays `Running` forever.
+/// That is precisely the state slice 3 argued was legitimate *because it is
+/// transient*; a leaked one is a lie in the log.
+///
+/// So the completion is attached to the reservation's lifetime rather than to
+/// the code path. Dropping while armed spawns a detached `completeBlock` at
+/// `Error`, which outlives the cancelled task. `disarm` is called only after
+/// an explicit completion has actually succeeded — if it failed, the guard
+/// stays armed and gets one more best-effort attempt on the way out.
+struct CallReservation {
+    actor: ActorHandle,
+    context_id: ContextId,
+    call_id: kaijutsu_crdt::BlockId,
+    armed: bool,
+}
+
+impl CallReservation {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CallReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let actor = self.actor.clone();
+        let context_id = self.context_id;
+        let call_id = self.call_id;
+        tracing::error!(
+            %call_id,
+            "hook tool authoring was cancelled or failed mid-sequence — completing the \
+             reserved ToolCall at Error so it does not sit at Running forever"
+        );
+        tokio::spawn(async move {
+            if let Err(e) = actor
+                .complete_block(context_id, call_id, Status::Error, true, None)
+                .await
+            {
+                tracing::error!(%call_id, "detached completeBlock also failed: {e}");
+            }
+        });
     }
 }
 
@@ -551,13 +607,13 @@ impl HookListener {
 
     // -- Block insertion helpers --
     //
-    // Remote mode routes through the doc task's command channel (see
-    // `crate::doc_task`) — the ONLY writer of `remote.synced` now — and
-    // awaits its ack instead of touching the document directly. On failure:
+    // Remote mode authors over RPC (`authorBlock` / `completeBlock`) — the
+    // kernel is the writer, and `remote.synced` is a read replica that sees
+    // these blocks only when the event feed brings them back. On failure:
     // still LOUD (`tracing::error!`, not `warn!`; the caller folds the
     // returned message into the hook's `context` field) but never fails the
-    // hook call itself — the mirror is ambient, its failure must not block
-    // the user's actual action. Local mode is unchanged (no doc task there;
+    // hook call itself — recording an event must not block the user's actual
+    // action. Local mode is unchanged (no RPC there;
     // it writes the in-process `SharedBlockStore` directly, as before).
 
     /// The principal hook-authored blocks belong to: the **agent session**,
@@ -734,6 +790,16 @@ impl HookListener {
             }
         };
 
+        // From here on the reservation exists and MUST reach a terminal
+        // state, including if this task is cancelled mid-flight — see
+        // `CallReservation`.
+        let mut reservation = CallReservation {
+            actor: remote.actor.clone(),
+            context_id: ctx_id,
+            call_id,
+            armed: true,
+        };
+
         let result_err = remote
             .actor
             .author_block(AuthorBlock::tool_result(
@@ -748,30 +814,46 @@ impl HookListener {
             .err();
 
         // Complete the call either way. If the RESULT failed to author, the
-        // reservation is still out there at Running with nothing coming for
-        // it — the liveness residue reserve-then-flow leaves behind. Landing
-        // it at Error is the truth we actually have: the call happened, and
-        // its result did not reach the kernel.
-        let final_status = if is_error || result_err.is_some() {
-            Status::Error
-        } else {
-            Status::Done
-        };
-        if let Err(e) = remote
+        // reservation is out there at Running with nothing coming for it.
+        // Landing it at Error is the truth we actually have: the call
+        // happened, and its result did not reach the kernel.
+        let errored = is_error || result_err.is_some();
+        let final_status = if errored { Status::Error } else { Status::Done };
+        if let Some(ref e) = result_err {
+            tracing::error!("Hook insert_tool_blocks: authorBlock(result) failed: {e}");
+        }
+
+        // `is_error` must agree with `final_status` — the server refuses the
+        // pair when they contradict. Deriving both from `errored` is what
+        // keeps them in step; passing the raw `is_error` here was a real bug
+        // (a tool that SUCCEEDED but whose result failed to author sends
+        // status=Error with is_error=false, which the server rejects).
+        match remote
             .actor
-            .complete_block(ctx_id, call_id, final_status, is_error, None)
+            .complete_block(ctx_id, call_id, final_status, errored, None)
             .await
         {
-            tracing::error!("Hook insert_tool_blocks: completeBlock failed: {e}");
-            return Err(format!("tool call left pending: {e}"));
+            // Only now is the guard unnecessary: the block is terminal.
+            Ok(()) => reservation.disarm(),
+            Err(e) => {
+                // Leave it armed — the drop guard gets one more detached
+                // attempt, which is strictly better than returning here and
+                // leaving the call at Running.
+                tracing::error!("Hook insert_tool_blocks: completeBlock failed: {e}");
+                // Report BOTH failures when both happened; returning only
+                // "left pending" would hide that the result never landed
+                // either, which is the more consequential of the two.
+                return Err(match result_err {
+                    Some(re) => format!("tool result failed to author ({re}) AND the call \
+                                         could not be completed ({e})"),
+                    None => format!("tool call left pending: {e}"),
+                });
+            }
         }
 
         match result_err {
             None => Ok(()),
-            Some(e) => {
-                tracing::error!("Hook insert_tool_blocks: authorBlock(result) failed: {e}");
-                Err(format!("failed to author tool result: {e}"))
-            }
+            Some(e) => Err(format!("failed to author tool result: {e}")),
         }
     }
 
