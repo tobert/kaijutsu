@@ -4661,10 +4661,14 @@ impl kernel::Server for KernelImpl {
                     let tx_self = tx.clone();
 
                     // Bridge task: recv InvokeRequest from channel, call capnp callback.
-                    // Per-invoke timeout matches the client-side bound (15s) so a
-                    // peer that stops reading can't pin this task on the LocalSet.
+                    // Middle hop of the peer ladder — see
+                    // `kaijutsu_types::timeout::peer`. Bounded so a peer that
+                    // stops reading can't pin this task on the LocalSet, and
+                    // ordered so the client's own bound fires first.
+                    // (The old comment here claimed it "matches the
+                    // client-side bound (15s)" while reading 20s.)
                     const PEER_INVOKE_TIMEOUT: std::time::Duration =
-                        std::time::Duration::from_secs(20);
+                        kaijutsu_types::timeout::peer::SERVER_FORWARD;
                     tokio::task::spawn_local(async move {
                         loop {
                             let request = tokio::select! {

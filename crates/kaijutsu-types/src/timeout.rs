@@ -21,6 +21,83 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// # The tier ladder
+///
+/// Timeout values here and in `kaijutsu-client::constants` accumulated during
+/// the MCP-first period, before the app had much to it, and were never fully
+/// swept. The result is not a wrong set of numbers — most are individually
+/// reasonable and well-commented — it is that **the relationships between them
+/// live in prose**, which rots silently. See [`peer`] for a receipt.
+///
+/// New knobs declare a tier, and the tier carries the rationale:
+///
+/// | Tier | Order | What it bounds |
+/// |---|---|---|
+/// | **probe** | ~200 ms | Is something listening? Never does work. |
+/// | **handshake** | ~5 s | One round trip that should not touch disk or network beyond the peer. |
+/// | **request** | ~30 s | A single call that may do real work. |
+/// | **work** | ~300 s | A job with an unbounded-ish middle (LLM streaming). |
+/// | **interactive** | ~1800 s | A human or agent is watching and may run a build. |
+///
+/// Two rules, both meant to be *tested* rather than described:
+///
+/// 1. **Nesting**: an inner deadline is strictly shorter than the outer budget
+///    containing it, so the inner one fires first and names the real culprit.
+/// 2. **Ladders across hops**: when one logical deadline is enforced at
+///    several hops, the hop *closest to the caller* fires first, so the caller
+///    reports a clean failure instead of racing a peer's timeout.
+///
+/// An external bound we do not own but must respect: **Claude Code's hook
+/// timeout is 5 s.** Anything on the hook critical path needs a budget under
+/// that, or CC kills the hook while our side is still patiently waiting.
+pub mod tiers {
+    use std::time::Duration;
+
+    /// Liveness only — is something listening?
+    pub const PROBE: Duration = Duration::from_millis(200);
+    /// One round trip, no real work behind it.
+    pub const HANDSHAKE: Duration = Duration::from_secs(5);
+    /// A single call that may do real work.
+    pub const REQUEST: Duration = Duration::from_secs(30);
+    /// A job with an unbounded-ish middle.
+    pub const WORK: Duration = Duration::from_secs(300);
+    /// A human or agent is watching; may run a build.
+    pub const INTERACTIVE: Duration = Duration::from_secs(1800);
+
+    /// Claude Code's hook timeout. **Not ours to change** — an external
+    /// constraint that binds anything on the hook critical path.
+    pub const CC_HOOK_DEADLINE: Duration = Duration::from_secs(5);
+}
+
+/// The peer-invocation ladder — one logical deadline enforced at three hops.
+///
+/// The client dispatches an invocation, the server forwards it, and the kernel
+/// waits for the reply. Each hop had its own hardcoded constant in its own
+/// crate (two of them function-local and invisible), and the relationship
+/// between them lived only in doc comments — which had already drifted:
+/// `rpc.rs` said "matches the client-side bound (15s)" directly above a
+/// constant reading **20s**, and the client said the kernel side was 30s,
+/// which was true of one of the two server-side constants and not the other.
+///
+/// The intent survived by luck (15 < 20 < 30 still ordered correctly), which
+/// is exactly the failure mode worth removing: nothing would have caught an
+/// edit that inverted it. One source, one test.
+///
+/// Ordering is the contract: **the hop closest to the caller fires first**, so
+/// the client reports a clean `Disconnected` rather than racing the kernel's
+/// `Timeout`.
+pub mod peer {
+    use std::time::Duration;
+
+    /// Client waits for its local consumer (e.g. the Bevy
+    /// `poll_peer_invocations` system) to pick up and reply. Fires first.
+    pub const CLIENT_DISPATCH: Duration = Duration::from_secs(15);
+    /// Server forwards the invocation to the peer's callback.
+    pub const SERVER_FORWARD: Duration = Duration::from_secs(20);
+    /// Kernel waits for the whole round trip. The outermost bound.
+    pub const KERNEL_WAIT: Duration = Duration::from_secs(30);
+}
+
 /// Kernel-wide timeout policy for kaish, LLM, and MCP execution paths.
 ///
 /// All fields are `Duration` in memory; wire/persisted form uses millis.
@@ -97,6 +174,52 @@ mod tests {
         assert!(p.hook_body_timeout < p.rc_script_timeout);
         assert!(p.llm_idle_timeout < p.llm_request_timeout);
         assert!(p.mcp_connect_timeout < p.mcp_call_timeout_default);
+    }
+
+    /// The tier ladder must stay ordered, or "declare a tier" stops meaning
+    /// anything — a knob could claim `handshake` while outlasting `request`.
+    #[test]
+    fn tiers_are_ordered() {
+        use tiers::*;
+        assert!(PROBE < HANDSHAKE);
+        assert!(HANDSHAKE < REQUEST);
+        assert!(REQUEST < WORK);
+        assert!(WORK < INTERACTIVE);
+    }
+
+    /// The peer ladder's whole point: the hop closest to the caller fires
+    /// first, so the caller reports a clean failure instead of racing a
+    /// peer's timeout. This previously held by luck across three hardcoded
+    /// constants in three crates, with two doc comments already drifted off
+    /// the real values.
+    #[test]
+    fn peer_ladder_fires_caller_first() {
+        assert!(
+            peer::CLIENT_DISPATCH < peer::SERVER_FORWARD,
+            "client must give up before the server does, or the client races \
+             the server's timeout and reports the wrong cause"
+        );
+        assert!(
+            peer::SERVER_FORWARD < peer::KERNEL_WAIT,
+            "server must give up before the kernel does, for the same reason"
+        );
+    }
+
+    /// Anything on the Claude Code hook critical path has to finish inside
+    /// CC's own 5s hook timeout — a bound we do not own. A `request`-tier
+    /// deadline is NOT safe there, and this pins the trap: the gap is what
+    /// makes hook-path work need its own budget rather than the default.
+    #[test]
+    fn request_tier_does_not_fit_the_cc_hook_deadline() {
+        assert!(
+            tiers::REQUEST > tiers::CC_HOOK_DEADLINE,
+            "if these ever cross, the hook-path carve-out below is obsolete \
+             and this test should be replaced, not deleted"
+        );
+        assert!(
+            tiers::HANDSHAKE <= tiers::CC_HOOK_DEADLINE,
+            "handshake tier is the largest that may sit on the hook path"
+        );
     }
 
     #[test]

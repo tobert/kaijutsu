@@ -1634,7 +1634,10 @@ impl Kernel {
         params: Vec<u8>,
         label: &str,
     ) -> Result<Vec<u8>, PeerError> {
-        const PEER_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+        // Outermost hop of the peer ladder — see
+        // `kaijutsu_types::timeout::peer`. The client and server bounds fire
+        // before this one, by tested contract.
+        const PEER_INVOKE_TIMEOUT: Duration = kaijutsu_types::timeout::peer::KERNEL_WAIT;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let request = InvokeRequest {

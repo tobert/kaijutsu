@@ -287,13 +287,91 @@ post-`Done` fetch rather than the mirror. So:
   hot path on every `shell` call). `e2e_shell.rs:152` already proves the tool
   survives a dead event feed, so the fallback shape is validated.
 
-**Three decisions this surfaces, wanted before slice 2, not during:**
-principal attribution (blocks carry the MCP session principal today, local
-mode stamps `system()`, server-side authoring would carry the connection
-principal — three answers, and `b356fc45` makes this area sensitive);
-**atomicity** of the ToolCall/ToolResult/status triple, currently one
-mutex-held operation and otherwise three round trips that can orphan a
-`ToolCall` at `Running`; and **latency direction**, which *reverses* — today
-authoring acks after a local insert and pushes fire-and-forget, whereas RPC
-authoring makes the hook wait on the network, against a 5s Claude Code hook
-timeout and a 30s RPC timeout.
+## The three slice-2 decisions — ruled 2026-08-13 (Amy)
+
+Context for why any of this is tangled, in Amy's words: *"we did a lot of
+experiments in mcp before the app really had much to it, and probably didn't
+clean up the mess all the way."* Read the accumulation below as sediment from
+that period, not as design.
+
+**1. Principal attribution — one stable identity per agent session.**
+
+There were four answers, and none of them said who did it. MCP remote mints a
+fresh `PrincipalId::new()` **per process launch** (`mcp/src/lib.rs:804`), so
+one Claude Code session authors under a different principal after every
+`/mcp reconnect`; MCP local stamps `PrincipalId::system()`
+(`hook_listener.rs:519`); server-side authoring would inherit the ephemeral
+one; only `kj`/rc carries the context owner (`b356fc45`). A single context
+therefore accumulates blocks from N anonymous principals — the same defect the
+identity-smear split fixed in drift, in a different place.
+
+**Ruled: derive the principal from the stable session identity** that
+`register_session` already maintains (durability proven by
+`relaunch_reattaches_to_the_same_stable_context`), and use it in both remote
+and local mode. `system()` is reserved for genuinely kernel-originated writes.
+This makes slice 2 *cheaper*: the connection principal then already is the
+session principal, so RPC authoring needs no new decision. It is also a live
+bug worth fixing on its own.
+
+**2. Atomicity — reserve, then flow. Serialization is a per-tool choice.**
+
+The earlier framing here (preserve the mutex-held ToolCall/ToolResult/status
+triple, or add a single `authorToolPair` verb) was wrong. Amy's model: *"a
+tool call & result should have a quick lock at startup, then run independently
+of other tool calls and share little to no state so the async result can flow
+when it's ready. Some tools might require serial requests but I feel that
+should be a choice."*
+
+So the atomic part is only the **reservation**: one short RPC creates the
+ToolCall block and returns its id; the result flows independently whenever it
+is ready. Concurrent tool calls share nothing but their own ids. Crucially,
+**a ToolCall sitting at `Running` is a legitimate pending state, not an
+orphan** — the tool really is still running, and treating a visible pending
+state as corruption was the error in the old framing. Serialization becomes a
+per-tool policy flag rather than a property baked into the authoring path.
+
+This dissolves the atomicity objection to splitting authoring into RPCs. The
+one genuine residue is **liveness** — a completion that never arrives leaves
+the block pending forever — which is a timeout concern, i.e. decision 3.
+
+**3. Timeouts — revamp and align (in progress).**
+
+Amy: *"we've accumulated them with little strategy … do a refactor/revamp and
+alignment."*
+
+The finding is structural rather than a bad set of numbers. Most values are
+individually reasonable and well-commented; what is missing is that **the
+relationships between them live in prose**, and prose rots without anything
+noticing. Two homes that did not know about each other —
+`kaijutsu-types::timeout::TimeoutPolicy` (8 knobs, configurable, wire-shareable)
+and `kaijutsu-client::constants` (12 hardcoded `const`s, not configurable, not
+on the wire) — plus strays in the MCP hook listener and the server's share
+keepalive.
+
+The receipt: **one logical peer-invocation deadline was enforced at three
+hops by three separate hardcoded constants in three crates**, two of them
+function-local, and two of the three doc comments had already drifted off the
+real values — `rpc.rs` read `from_secs(20)` directly beneath a comment saying
+"matches the client-side bound (15s)". The intended ordering survived by luck;
+nothing would have caught an edit that inverted it.
+
+Landed so far:
+
+- A **tier ladder** in `kaijutsu-types::timeout::tiers` — probe ~200 ms,
+  handshake ~5 s, request ~30 s, work ~300 s, interactive ~1800 s — so new
+  knobs declare a tier and the tier carries the rationale, plus
+  `CC_HOOK_DEADLINE` recording Claude Code's 5 s hook timeout as an external
+  bound we do not own but must respect.
+- `kaijutsu-types::timeout::peer` as the single source for the three-hop
+  ladder; the client, server and kernel sites now reference it.
+- **Ten invariant tests** turning the prose into contracts: tier ordering,
+  caller-fires-first across the peer ladder, request-tier-does-not-fit-the-CC-
+  hook-deadline, connect-phase budgets summing inside their total, ping inside
+  its interval, RPC pinger detecting before the SSH backstop, backoff capped
+  under SSH inactivity.
+
+Still to do: fold the remaining client transport constants into a policy so
+they are configurable like the kernel-side ones, sweep the strays, and give
+the hook critical path an explicit sub-5 s budget — which is the prerequisite
+for slice 3, where authoring latency reverses from local-ack-then-push to
+waiting on the network.
