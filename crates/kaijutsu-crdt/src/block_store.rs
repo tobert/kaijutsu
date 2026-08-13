@@ -1803,8 +1803,11 @@ impl SyncPayload {
 ///
 /// docs/crdt-position-2026-08.md Part 1, empirical question 1: how often
 /// does a merged `SyncPayload` see a genuinely concurrent frontier vs. a
-/// fast-forward? Read via [`BlockStore::merge_stats`]. A `kj` verb or an
-/// OTel gauge can consume this later — today it's counters plus logs.
+/// fast-forward? Read via [`BlockStore::merge_stats`]. Exported as the
+/// `kaijutsu.crdt.merge_application` OTel counter from the server's
+/// `push_ops` handler, which classifies one application via
+/// [`MergeStats::outcome_since`]; these in-memory totals remain the local
+/// view and still feed the periodic debug log.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeStats {
     /// Applications where the incoming ops were a pure continuation of
@@ -1816,6 +1819,41 @@ pub struct MergeStats {
     /// actually widened the frontier to represent, then reconcile, two
     /// independent branches.
     pub concurrent_merges: u64,
+}
+
+/// How one applied `SyncPayload` was classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Pure continuation — merge did nothing a plain ordered log could not.
+    FastForward,
+    /// diamond-types reconciled a genuinely concurrent branch.
+    Concurrent,
+}
+
+impl MergeStats {
+    /// Classify the single application that moved `before` to `self`.
+    ///
+    /// Returns `None` when neither counter moved: the payload carried no DTE
+    /// ops at all (headers only), which is not a merge outcome and must not
+    /// be recorded as a fast-forward — doing so would dilute the very ratio
+    /// this measurement exists to establish.
+    ///
+    /// `Concurrent` wins a tie by construction rather than by preference:
+    /// `merge_ops` classifies a whole payload once, so a payload touching
+    /// several blocks counts as concurrent if *any* of them reconciled a real
+    /// branch, and only one of the two counters can move per application. The
+    /// tie case is therefore unreachable through `merge_ops`; the ordering
+    /// here just makes the unreachable case fail safe — toward "merge did
+    /// real work" — rather than silently under-reporting concurrency.
+    pub fn outcome_since(&self, before: &MergeStats) -> Option<MergeOutcome> {
+        if self.concurrent_merges > before.concurrent_merges {
+            Some(MergeOutcome::Concurrent)
+        } else if self.fast_forwards > before.fast_forwards {
+            Some(MergeOutcome::FastForward)
+        } else {
+            None
+        }
+    }
 }
 
 // =========================================================================
@@ -1831,6 +1869,63 @@ mod tests {
 
     fn test_store() -> BlockStore {
         BlockStore::new(ContextId::new(), PrincipalId::new())
+    }
+
+    /// `outcome_since` is what the server's `push_ops` handler turns into the
+    /// `kaijutsu.crdt.merge_application` metric — the empirical answer to
+    /// docs/crdt-position-2026-08.md question 1. A bug here corrupts the one
+    /// measurement the whole Option-2 migration is being judged on, and it
+    /// would corrupt it *quietly*, so it gets real tests rather than trust.
+    #[test]
+    fn outcome_since_reports_a_fast_forward() {
+        let before = MergeStats {
+            fast_forwards: 7,
+            concurrent_merges: 2,
+        };
+        let after = MergeStats {
+            fast_forwards: 8,
+            concurrent_merges: 2,
+        };
+        assert_eq!(after.outcome_since(&before), Some(MergeOutcome::FastForward));
+    }
+
+    #[test]
+    fn outcome_since_reports_a_concurrent_merge() {
+        let before = MergeStats {
+            fast_forwards: 7,
+            concurrent_merges: 2,
+        };
+        let after = MergeStats {
+            fast_forwards: 7,
+            concurrent_merges: 3,
+        };
+        assert_eq!(after.outcome_since(&before), Some(MergeOutcome::Concurrent));
+    }
+
+    /// A header-only payload moves neither counter. Recording it as a
+    /// fast-forward would inflate the denominator and make concurrency look
+    /// rarer than it is — the exact direction of error that would wrongly
+    /// green-light retiring the merge path.
+    #[test]
+    fn outcome_since_reports_nothing_when_no_dte_ops_applied() {
+        let stats = MergeStats {
+            fast_forwards: 7,
+            concurrent_merges: 2,
+        };
+        assert_eq!(stats.outcome_since(&stats), None);
+    }
+
+    /// Unreachable through `merge_ops` (it classifies each payload once), but
+    /// pinned so the tie fails toward "merge did real work" rather than
+    /// silently under-reporting concurrency if that ever changes.
+    #[test]
+    fn outcome_since_prefers_concurrent_when_both_moved() {
+        let before = MergeStats::default();
+        let after = MergeStats {
+            fast_forwards: 1,
+            concurrent_merges: 1,
+        };
+        assert_eq!(after.outcome_since(&before), Some(MergeOutcome::Concurrent));
     }
 
     /// Measure the block-insert hot path at coder scale (append-only, the way a

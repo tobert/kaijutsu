@@ -136,6 +136,69 @@ pub fn record_cwd_restore_failed() {
     CONTEXT_SHELL_METRICS.record_cwd_restore_failed();
 }
 
+/// Wire-merge instruments — the empirical answer to
+/// `docs/crdt-position-2026-08.md` Part 1, empirical question 1: *how often
+/// does a merged `SyncPayload` see a genuinely concurrent frontier vs. a
+/// fast-forward?*
+///
+/// That question decides whether client-side replication is doing real work
+/// or is production-untested risk, and it gates the Option-2 migration
+/// (releasing clients from replication). `BlockStore::merge_stats()` has
+/// counted this since the position review, but only in memory and only into
+/// `log::debug!` — so the counters reset on every kernel restart, which on
+/// this fleet is several times a day, and no answer ever accumulated. These
+/// instruments export the same classification as a time series so a week of
+/// real traffic can answer it.
+///
+/// One counter with an `outcome` attribute rather than two counters: the
+/// question is a *ratio*, and this way a dashboard divides two series of the
+/// same metric instead of correlating two.
+pub struct CrdtMergeMetrics {
+    /// `kaijutsu.crdt.merge_application` — one applied `SyncPayload`, by
+    /// `outcome` (`fast_forward` | `concurrent`). `concurrent` means at least
+    /// one touched block's local frontier had diverged and diamond-types
+    /// actually reconciled two branches; `fast_forward` means the incoming
+    /// ops were a pure continuation and merge did nothing a plain ordered log
+    /// could not have done.
+    merge_application: Counter<u64>,
+}
+
+impl CrdtMergeMetrics {
+    /// Build the instruments from a meter. Public so tests can bind a meter
+    /// backed by an in-memory reader.
+    pub fn new(meter: &Meter) -> Self {
+        let merge_application = meter
+            .u64_counter("kaijutsu.crdt.merge_application")
+            .with_unit("{application}")
+            .with_description(
+                "Applied wire sync payloads, by whether diamond-types \
+                 reconciled a genuinely concurrent frontier",
+            )
+            .build();
+        Self { merge_application }
+    }
+
+    /// Record the outcome of one applied sync payload.
+    pub fn record_merge_application(&self, concurrent: bool) {
+        let outcome = if concurrent {
+            "concurrent"
+        } else {
+            "fast_forward"
+        };
+        self.merge_application
+            .add(1, &[KeyValue::new("outcome", outcome)]);
+    }
+}
+
+static CRDT_MERGE_METRICS: LazyLock<CrdtMergeMetrics> =
+    LazyLock::new(|| CrdtMergeMetrics::new(&global::meter("kaijutsu")));
+
+/// Record one applied wire sync payload to the global meter provider. Cheap
+/// and safe before OTel is initialized (no-op meter), like the recorders above.
+pub fn record_merge_application(concurrent: bool) {
+    CRDT_MERGE_METRICS.record_merge_application(concurrent);
+}
+
 /// Beat-timing instruments (phase-align, `docs/tracks.md`/`docs/midi.md`) —
 /// the empirical tuning loop for the grid/deadband/fold-window knobs
 /// (`beat.rs::GRID_RESEED_AFTER_PERIODS`, `timebase.rs::DEFAULT_PHASE_DEADBAND`,

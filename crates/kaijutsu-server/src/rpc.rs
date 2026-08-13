@@ -4338,6 +4338,17 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        // Snapshot the wire-merge classifier before applying, so this one
+        // application's outcome can be exported as a metric rather than only
+        // accumulating into an in-memory total that dies with the process.
+        // `merge_stats()` is cumulative per document; the delta across the
+        // merge below is exactly what this payload did.
+        // docs/crdt-position-2026-08.md Part 1, empirical question 1.
+        let stats_before = documents
+            .get(context_id)
+            .map(|entry| entry.doc.merge_stats())
+            .unwrap_or_default();
+
         // Merge the sync payload into the document
         let ack_version = match documents.merge_ops(context_id, payload) {
             Ok(version) => version,
@@ -4355,6 +4366,20 @@ impl kernel::Server for KernelImpl {
         // traffic shows up in logs without a log line on every call.
         if let Some(entry) = documents.get(context_id) {
             let stats = entry.doc.merge_stats();
+
+            // Export this application's outcome as a time series. A payload
+            // that moved neither counter carried no DTE ops (headers only)
+            // and is deliberately not recorded — see `outcome_since`.
+            match stats.outcome_since(&stats_before) {
+                Some(kaijutsu_crdt::block_store::MergeOutcome::Concurrent) => {
+                    kaijutsu_telemetry::record_merge_application(true)
+                }
+                Some(kaijutsu_crdt::block_store::MergeOutcome::FastForward) => {
+                    kaijutsu_telemetry::record_merge_application(false)
+                }
+                None => {}
+            }
+
             let total = stats.fast_forwards + stats.concurrent_merges;
             if total > 0 && total % MERGE_STATS_LOG_EVERY == 0 {
                 log::debug!(
