@@ -608,13 +608,14 @@ impl HookListener {
     // -- Block insertion helpers --
     //
     // Remote mode authors over RPC (`authorBlock` / `completeBlock`) — the
-    // kernel is the writer, and `remote.synced` is a read replica that sees
-    // these blocks only when the event feed brings them back. On failure:
-    // still LOUD (`tracing::error!`, not `warn!`; the caller folds the
-    // returned message into the hook's `context` field) but never fails the
-    // hook call itself — recording an event must not block the user's actual
-    // action. Local mode is unchanged (no RPC there;
-    // it writes the in-process `SharedBlockStore` directly, as before).
+    // kernel is the writer, and every reader here reads the kernel back
+    // directly (there is no local mirror; `RemoteState.synced` was deleted
+    // in docs/crdt-position-2026-08.md slice 4). On failure: still LOUD
+    // (`tracing::error!`, not `warn!`; the caller folds the returned message
+    // into the hook's `context` field) but never fails the hook call itself —
+    // recording an event must not block the user's actual action. Local mode
+    // is unchanged (no RPC there; it writes the in-process `SharedBlockStore`
+    // directly, as before).
 
     /// The principal hook-authored blocks belong to: the **agent session**,
     /// derived deterministically from the Claude Code session id.

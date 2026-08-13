@@ -242,103 +242,16 @@ fn session_start_renames_label_once_and_listener_stays_live() {
     });
 }
 
-/// Item 8, remote-mode mirror of the local-mode unit test in
-/// `hook_listener.rs`: a hook-authored `tool.after` must complete the
-/// `ToolCall` block (Status::Done), not leave it Running forever.
-///
-/// **What this proves changed with slice 3.** It used to be a claim about
-/// authoring: `insert_tool_blocks` wrote `remote.synced` synchronously, so
-/// reading the mirror read back this process's own write. Now the hook
-/// authors over RPC and the mirror is a read replica, so the same assertion
-/// is a claim about *round trip* — the kernel accepted the pair, completed
-/// the call, and the event feed carried all of it back here. Strictly more
-/// than it proved before, and no longer redundant with its server-side
-/// sibling below.
-///
-/// The wait had to change with it. The old fixed 100 ms sleep was honest
-/// when the write was local ("scheduling jitter, not a real race"); against
-/// a network round trip it is a coin flip, and the flake it would produce
-/// would look like a product bug. Poll instead, so the test is bounded by a
-/// generous timeout but usually returns as fast as the feed does.
-#[test]
-fn tool_after_completes_the_call_block_remote_mode() {
-    run_local(async {
-        let addr = start_server().await;
-        let mcp = connect_mcp(addr).await;
-        let reg = auto_register_with_retry(&mcp, "hook-tool-e2e").await;
-        assert!(
-            reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
-            "register_session_auto failed: {reg}"
-        );
-
-        let Backend::Remote(remote) = mcp.backend().clone() else {
-            panic!("expected remote backend");
-        };
-        let listener = Arc::new(HookListener::remote(
-            remote.clone(),
-            Arc::clone(&remote.shared_context_id),
-            Arc::clone(mcp.session_id_arc()),
-            None,
-        ));
-        let socket_path = spawn_listener(listener, "toolcall").await;
-
-        let event = serde_json::json!({
-            "event": "tool.after",
-            "source": "claude-code",
-            "tool": {
-                "name": "Bash",
-                "input": {"command": "ls"},
-                "output": "total 0",
-            },
-        })
-        .to_string();
-        send_hook_event(&socket_path, &event).await.unwrap();
-
-        // Poll the mirror until the round trip lands. Two distinct states
-        // are being waited out — the ToolCall appearing at all, and its
-        // status settling to Done — so the loop must not stop at the first.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let call = loop {
-            let found = remote
-                .synced
-                .lock()
-                .as_ref()
-                .unwrap()
-                .blocks()
-                .into_iter()
-                .find(|b| b.kind == BlockKind::ToolCall);
-            match found {
-                Some(call) if call.status == Status::Done => break call,
-                other => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "hook-authored tool call never reached Done in the mirror \
-                         (last seen: {:?}) — the RPC-authored pair did not round-trip \
-                         back through the event feed",
-                        other.map(|b| b.status),
-                    );
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
-        };
-        assert_eq!(
-            call.status,
-            Status::Done,
-            "hook-authored tool call must complete in remote mode too"
-        );
-    });
-}
-
 /// **Slice 0 of the CRDT-position migration** (docs/crdt-position-2026-08.md,
 /// "Build notes"): the acceptance test that has to exist *before* the MCP is
 /// moved off client-side replication.
 ///
 /// **Written before the migration, and it did its job.** At the time, its
-/// sibling `tool_after_completes_the_call_block_remote_mode` was *vacuous
-/// with respect to replication*: it asserted against `remote.synced`, the
-/// process-local mirror `insert_tool_blocks` wrote to synchronously, so it
-/// would have passed even if `push_ops` silently failed and nothing ever
-/// reached the kernel. It proved authoring, not delivery.
+/// sibling `tool_after_completes_the_call_block_remote_mode` (deleted —
+/// see below) asserted against `remote.synced`, the process-local mirror
+/// `insert_tool_blocks` wrote to synchronously, so it would have passed
+/// even if `push_ops` silently failed and nothing ever reached the kernel.
+/// It proved authoring, not delivery.
 ///
 /// This one reads back through `get_all_blocks`, an authoritative **server**
 /// query, so it can only pass if the hook-authored blocks genuinely crossed
@@ -347,9 +260,13 @@ fn tool_after_completes_the_call_block_remote_mode() {
 /// *contract* (hook fires ⇒ server holds a correct ToolCall/ToolResult pair)
 /// rather than the mechanism.
 ///
-/// (The sibling is no longer vacuous either: with the mirror demoted to a
-/// read replica, reaching it now requires the same round trip plus the event
-/// feed. Both tests moved up in strength; only this one was designed to.)
+/// (The sibling is gone now, not just strengthened: once slice 4 of
+/// docs/crdt-position-2026-08.md deleted `RemoteState.synced` entirely,
+/// asserting against it stopped being possible, and its round-trip claim —
+/// "the kernel accepted the pair and the event feed carried it back" — is a
+/// strict subset of what this test already proves via the server-authoritative
+/// read. Keeping both would have meant keeping a mirror alive solely so a
+/// duplicate test had something to assert against.)
 ///
 /// It pins the fields the planned `block_create` route would silently drop:
 /// `tool_name`, `tool_input`, the pair's parent link, and terminal status.
@@ -397,11 +314,12 @@ fn hook_authored_tool_blocks_reach_the_server_not_just_the_mirror() {
         .to_string();
         send_hook_event(&socket_path, &event).await.unwrap();
 
-        // Authoring acks after the LOCAL insert and pushes fire-and-forget
-        // (doc_task.rs), so the ack says nothing about delivery. Poll the
-        // server rather than sleeping a fixed grace period — a sleep would
-        // make this flaky under load and, worse, would make a genuine
-        // delivery failure look like a slow one.
+        // `authorBlock`/`completeBlock` ack once the kernel accepts the RPC,
+        // which says nothing about when (or whether) this listener's own
+        // read of the result becomes visible. Poll the server rather than
+        // sleeping a fixed grace period — a sleep would make this flaky
+        // under load and, worse, would make a genuine delivery failure look
+        // like a slow one.
         let mut server_blocks = Vec::new();
         for _ in 0..50 {
             server_blocks = remote
@@ -711,9 +629,10 @@ fn rpc_authoring_carries_tool_fields_and_completes_independently() {
 /// (no prior context under the stable label — a plain rename). "Process B"
 /// stabilizes second and must SWITCH onto A's now-stably-labeled context
 /// instead of renaming its own placeholder onto a fresh row — proven by:
-/// same final context id, B's synced document carrying A's pre-relaunch
-/// content, and B's original placeholder ending up abandoned (not the
-/// context anyone is left pointing at).
+/// same final context id, the server holding A's pre-relaunch content under
+/// that id when read back through B's connection, and B's original
+/// placeholder ending up abandoned (not the context anyone is left pointing
+/// at).
 #[test]
 fn relaunch_reattaches_to_the_same_stable_context() {
     run_local(async {
@@ -824,12 +743,14 @@ fn relaunch_reattaches_to_the_same_stable_context() {
         let resolved = remote_b.actor.resolve_context_label(&stable_label).await.unwrap();
         assert_eq!(resolved.unwrap().id, placeholder_a_id);
 
-        // B's synced document must carry A's pre-relaunch content — real
-        // reattachment, not a same-id coincidence.
-        let blocks = remote_b.synced.lock().as_ref().unwrap().blocks();
+        // The context B is now joined to must genuinely hold A's pre-relaunch
+        // content — real reattachment, not a same-id coincidence. Read back
+        // through B's own connection, straight from the server (there is no
+        // local mirror to read instead).
+        let blocks = remote_b.actor.get_all_blocks(b_context_id).await.unwrap();
         assert!(
             blocks.iter().any(|b| b.content.contains("hello from process A")),
-            "B's synced document is missing A's history after reattach: {blocks:?}"
+            "the context B reattached to is missing A's history: {blocks:?}"
         );
 
         // B's own placeholder context is abandoned, not migrated — it still

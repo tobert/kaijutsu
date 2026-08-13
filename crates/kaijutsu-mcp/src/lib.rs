@@ -15,7 +15,6 @@
 //! - `helpers`: Parsing and utility functions
 //! - `tree`: DAG visualization as ASCII tree
 
-pub mod doc_task;
 mod helpers;
 pub mod hook_listener;
 pub mod hook_types;
@@ -84,9 +83,7 @@ use kaijutsu_client::{
 };
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
-use tokio::sync::watch;
-
-use doc_task::{DocTaskHandle, spawn_doc_task, spawn_event_bridge};
+use tokio::sync::{broadcast, watch};
 
 // Re-export public types
 use helpers::*;
@@ -346,33 +343,18 @@ pub struct RemoteState {
     pub kernel_id: kaijutsu_crdt::KernelId,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
-    /// The single joined context's synced CRDT document — `None` until
-    /// `register_session`. Owns the `SyncManager`. `parking_lot::Mutex`: the
-    /// guard never poisons (a panic under lock can't cascade-kill every later
-    /// `lock()`) and `lock()` is a cheap non-async critical section — held only
-    /// for fast doc reads/applies, never across an `.await`.
-    pub synced: Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    /// Wake signal: a monotonic generation counter the doc task bumps
-    /// (`send_modify`) after each applied event. Waiters (the shell completion
-    /// poll) `subscribe()` and `await changed()`. Unlike a bare `Notify`, the
-    /// watch channel records the version, so a bump between a waiter's state
-    /// check and its `changed().await` is not lost.
+    /// Wake signal: a monotonic generation counter the pulse task bumps
+    /// (`send_modify`) on every `ServerEvent` for the joined context. Waiters
+    /// (the shell completion poll) `subscribe()` and `await changed()`.
+    /// Unlike a bare `Notify`, the watch channel records the version, so a
+    /// bump between a waiter's state check and its `changed().await` is not
+    /// lost. Purely a hint — every reader treats a bump as "look again", never
+    /// as evidence of what changed; see `spawn_pulse_task`.
     pub change: watch::Sender<u64>,
     /// Joined context state (None until register_session is called)
     pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
     /// Shared context_id for hook listener (updated by register_session)
     pub shared_context_id: Arc<Mutex<Option<kaijutsu_crdt::ContextId>>>,
-    /// Handle to the sole-writer doc task's command channel — `None` until
-    /// `register_session` spawns the task (same lifecycle as `synced`/
-    /// `joined`). Since authoring moved to `authorBlock` RPCs, the only
-    /// remaining producer is `execute_and_poll_shell`'s stall fallback
-    /// (plus the event bridge); reads go straight through the mutex.
-    pub doc_task: Arc<Mutex<Option<DocTaskHandle>>>,
-    /// Per-session principal for block authorship — mirrors
-    /// `KaijutsuMcp::session_principal`, duplicated here so `finish_join`
-    /// (a free function, no `&self`) can build a `SyncedDocument` without
-    /// threading an extra parameter through every caller. `Copy`.
-    pub session_principal: PrincipalId,
 }
 
 /// State for a joined context — created by `register_session`.
@@ -380,31 +362,22 @@ pub struct RemoteState {
 pub struct JoinedContext {
     /// Context ID we joined
     pub context_id: kaijutsu_crdt::ContextId,
-    /// Abort handle for the event bridge (forwards the actor's broadcast
-    /// event/status streams into the doc task's command channel).
-    _bridge_task: Arc<AbortOnDrop>,
-    /// Abort handle for the sole-writer doc task itself. Kept separate from
-    /// `_bridge_task` so `debug_kill_event_listener` (below) can kill
-    /// delivery without killing the task that `execute_and_poll_shell`'s
-    /// stall fallback still needs to be alive and processing `Resync`
-    /// commands.
-    _doc_task: Arc<AbortOnDrop>,
+    /// Abort handle for the pulse task (see `spawn_pulse_task`) — the sole
+    /// remaining consumer of the actor's event broadcast in this process.
+    _pulse_task: Arc<AbortOnDrop>,
 }
 
 impl JoinedContext {
-    /// Testing seam: abort the event bridge (NOT the doc task itself)
-    /// without touching the connection or joined state otherwise.
-    /// `remote.change` then never advances on its own for this context,
-    /// reproducing the client-visible symptom of a server-reaped FlowBus
-    /// bridge (see `SubscriberHealth`) without needing to actually starve a
-    /// real one server-side. The doc task stays alive —
-    /// `execute_and_poll_shell`'s stall fallback still reaches it and can
-    /// still force a resync (which DOES bump `change`, uniformly with every
-    /// other mutation) even with delivery dead. Exists for
-    /// `tests/e2e_shell.rs` to exercise the stall fallback end-to-end;
-    /// production code never calls this.
+    /// Testing seam: abort the pulse task without touching the connection or
+    /// joined state otherwise. `remote.change` then never advances on its own
+    /// for this context, reproducing the client-visible symptom of a
+    /// server-reaped FlowBus bridge (see `SubscriberHealth`) without needing
+    /// to actually starve a real one server-side. Exists for
+    /// `tests/e2e_shell.rs` (`shell_survives_dead_event_feed`) and
+    /// `tests/cold_reads_e2e.rs` to exercise the poll-floor / direct-RPC
+    /// fallback end-to-end; production code never calls this.
     pub fn debug_kill_event_listener(&self) {
-        self._bridge_task.0.abort();
+        self._pulse_task.0.abort();
     }
 }
 
@@ -418,19 +391,61 @@ pub(crate) struct JoinOutcome {
     pub previous_context: Option<serde_json::Value>,
 }
 
+/// Spawn the pulse task — the sole remaining consumer of the actor's event
+/// broadcast in this crate, and everything that replaced the old
+/// doc-task-plus-event-bridge pair (docs/crdt-position-2026-08.md, slice 4).
+/// It applies nothing and holds no document: every `ServerEvent` just bumps
+/// `change`, waking `execute_and_poll_shell`'s completion poll early. A
+/// broadcast `Lagged` bumps too — a lag means events were dropped, so
+/// "something changed" is the only honest signal left, and that's all a
+/// bump ever claimed. `Closed` exits the loop rather than spin: once a
+/// broadcast sender is gone, `recv()` resolves `Closed` immediately on every
+/// subsequent poll.
+///
+/// `actor.subscribe_events()` is already scoped to the single joined context
+/// (`scope_blocks_to_context = true`, set in `connect_with_config`), so every
+/// event received here is for our context — no `context_id` filtering
+/// needed.
+fn spawn_pulse_task(
+    actor: ActorHandle,
+    change: watch::Sender<u64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut event_rx = actor.subscribe_events();
+        loop {
+            match event_rx.recv().await {
+                Ok(_event) => change.send_modify(|g| *g = g.wrapping_add(1)),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!("pulse task: lagged by {n} events, bumping anyway");
+                    change.send_modify(|g| *g = g.wrapping_add(1));
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    tracing::debug!("pulse task: event stream closed, exiting");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 /// The tail of joining a context, shared by every caller that has already
-/// resolved (or created) a `context_id` to join: sync the server snapshot,
-/// build the `SyncedDocument`, spawn the sole-writer doc task + event
-/// bridge, and publish the result via `remote.joined` /
-/// `remote.shared_context_id`.
+/// resolved (or created) a `context_id` to join: spawn the pulse task and
+/// publish the result via `remote.joined` / `remote.shared_context_id`.
+///
+/// There is no server snapshot fetched or document built here anymore —
+/// that was solely to seed the now-deleted `RemoteState.synced` mirror
+/// (docs/crdt-position-2026-08.md, slice 4). Every reader (cold
+/// prompts/resources/completions, and the shell completion poll) reads the
+/// server directly, so joining needs nothing from the server beyond the
+/// pulse task's live subscription.
 ///
 /// Writing a fresh `JoinedContext` into `remote.joined` drops whatever was
-/// there before, and `JoinedContext`'s fields are `AbortOnDrop` — so calling
+/// there before, and `JoinedContext`'s field is `AbortOnDrop` — so calling
 /// this a second time within the same process (as `stabilize_context_label`
 /// does when a hook event reveals this process should really be attached to
-/// an EARLIER process's context) safely tears down the first join's doc
-/// task and event bridge as a side effect of the overwrite. No separate
-/// cancellation dance needed.
+/// an EARLIER process's context) safely tears down the first join's pulse
+/// task as a side effect of the overwrite. No separate cancellation dance
+/// needed.
 async fn finish_join(
     remote: &RemoteState,
     context_id: ContextId,
@@ -438,107 +453,48 @@ async fn finish_join(
     resumed: bool,
     previous_context: Option<serde_json::Value>,
 ) -> Result<JoinOutcome, String> {
-    // 1. Sync initial state from server
-    let sync_state = remote
-        .actor
-        .get_context_sync(context_id)
-        .await
-        .map_err(|e| format!("Error syncing context: {e}"))?;
+    // 1. Spawn the pulse task — bumps `remote.change` on every server event
+    // for this context, so the shell completion poll can wake early instead
+    // of relying purely on its floor cadence. See `spawn_pulse_task`.
+    let pulse_join = spawn_pulse_task(remote.actor.clone(), remote.change.clone());
+    let pulse_abort = pulse_join.abort_handle();
 
-    // 2. Build the synced document from the server snapshot. SyncedDocument
-    // owns the SyncManager and buffers out-of-order events (text ops /
-    // status changes that arrive before their BlockInserted), replaying
-    // them on insert — the fix for the dropped-stdout bug.
-    let synced_doc = SyncedDocument::from_sync_state(&sync_state, remote.session_principal)
-        .map_err(|e| format!("Error building synced document: {e}"))?;
-    {
-        let mut g = remote.synced.lock();
-        *g = Some(synced_doc);
-    }
-
-    // 3. Spawn the sole-writer doc task — the ONLY thing that ever
-    // mutates `remote.synced` from here on. Every mutation (apply,
-    // author, resync) arrives as a `DocCommand` on one mpsc channel;
-    // see `doc_task` module docs for why this replaces the old
-    // three-writer arrangement (background listener + HookListener +
-    // stall fallback, all racing under the same mutex).
-    let (doc_task_handle, doc_task_join) = spawn_doc_task(
-        remote.actor.clone(),
-        context_id,
-        Arc::clone(&remote.synced),
-        remote.change.clone(),
-    );
-    {
-        let mut g = remote.doc_task.lock().unwrap_or_else(|e| e.into_inner());
-        *g = Some(doc_task_handle.clone());
-    }
-
-    // 4. Bridge the actor's block-events and connection-status broadcast
-    // streams into the doc task's command channel — a `NeedsResync`
-    // effect, a broadcast `Lagged`, or a reconnect (`Connected`) becomes
-    // a `Resync` command instead of running inline.
-    let bridge_join = spawn_event_bridge(remote.actor.clone(), doc_task_handle);
-    let bridge_abort = bridge_join.abort_handle();
-    let doc_task_abort = doc_task_join.abort_handle();
-
-    // Supervise both tasks. The doc task is the sole writer of
-    // SyncedDocument; if it panics or its channel closes (impossible in
-    // practice — the handle stored in `remote.doc_task` keeps a sender
-    // alive), the document stops updating. The bridge is delivery only —
-    // if IT dies, the doc task keeps running (the stall fallback can
-    // still reach it), just without live server events. Surface either
-    // loudly instead of a silent hang. Self-terminating: no separate
-    // cancellation needed, they resolve (including on teardown abort)
-    // and the supervisor just logs.
+    // Supervise: not fatal if it exits or panics (the shell poll just falls
+    // back to its own floor cadence with no early-wake hint), but surface it
+    // loudly instead of a silent degradation. Self-terminating: no separate
+    // cancellation needed, it resolves (including on teardown abort) and the
+    // supervisor just logs.
     let sup_ctx = context_id;
     tokio::spawn(async move {
-        match doc_task_join.await {
+        match pulse_join.await {
             Ok(()) => tracing::warn!(
                 context_id = %sup_ctx,
-                "MCP doc task exited (command channel closed); \
-                 synced document will no longer update — reconnect needed",
+                "MCP pulse task exited (event stream closed); shell completion polls \
+                 lose their early-wake hint and fall back to floor cadence — reconnect needed",
             ),
             Err(e) if e.is_cancelled() => tracing::debug!(
                 context_id = %sup_ctx,
-                "MCP doc task cancelled (session teardown)",
+                "MCP pulse task cancelled (session teardown)",
             ),
             Err(e) => tracing::error!(
                 context_id = %sup_ctx,
-                "MCP doc task PANICKED: {e}; synced document frozen — reconnect needed",
-            ),
-        }
-    });
-    tokio::spawn(async move {
-        match bridge_join.await {
-            Ok(()) => tracing::warn!(
-                context_id = %sup_ctx,
-                "MCP event bridge exited (server event stream closed); \
-                 synced document will no longer receive live updates — reconnect needed",
-            ),
-            Err(e) if e.is_cancelled() => tracing::debug!(
-                context_id = %sup_ctx,
-                "MCP event bridge cancelled (session teardown)",
-            ),
-            Err(e) => tracing::error!(
-                context_id = %sup_ctx,
-                "MCP event bridge PANICKED: {e}; synced document will no longer receive \
-                 live updates — reconnect needed",
+                "MCP pulse task PANICKED: {e}; shell completion polls lose their \
+                 early-wake hint — reconnect needed",
             ),
         }
     });
 
-    // 5. Write JoinedContext — dropping whatever was joined before (see
+    // 2. Write JoinedContext — dropping whatever was joined before (see
     // this function's doc comment).
     {
         let mut guard = remote.joined.write().await;
         *guard = Some(JoinedContext {
             context_id,
-            _bridge_task: Arc::new(AbortOnDrop(bridge_abort)),
-            _doc_task: Arc::new(AbortOnDrop(doc_task_abort)),
+            _pulse_task: Arc::new(AbortOnDrop(pulse_abort)),
         });
     }
 
-    // 6. Update shared context_id for hook listener
+    // 3. Update shared context_id for hook listener
     if let Ok(mut ctx) = remote.shared_context_id.lock() {
         *ctx = Some(context_id);
     }
@@ -807,14 +763,12 @@ impl KaijutsuMcp {
             backend: Backend::Remote(RemoteState {
                 kernel_id: kernel_id_typed,
                 actor,
-                // SyncedDocument is built once the context is known, in
-                // register_session. `change` wakes the shell poll on each apply.
-                synced: Arc::new(parking_lot::Mutex::new(None)),
+                // `change` wakes the shell completion poll early on each
+                // server event for the joined context (once register_session
+                // spawns the pulse task — see `spawn_pulse_task`).
                 change: watch::channel(0u64).0,
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
-                doc_task: Arc::new(Mutex::new(None)),
-                session_principal,
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -846,13 +800,13 @@ impl KaijutsuMcp {
     }
 
     // ------------------------------------------------------------------
-    // Cold readers — prompts/resources/completions. These never touch
-    // `RemoteState.synced` (the event-fed mirror): Remote answers every one
-    // of them with an authoritative RPC. The mirror is not gone — it still
-    // backs `execute_and_poll_shell`'s hot `find_terminal` closure, a
-    // separate slice (docs/crdt-position-2026-08.md, slice 1) — but nothing
-    // below reads it. Local is unchanged: same in-process `BlockStore`
-    // lookups as before this migration.
+    // Cold readers — prompts/resources/completions. Remote answers every
+    // one of them with an authoritative RPC. There is no local mirror left
+    // to touch: `RemoteState.synced` (the event-fed replica) is gone —
+    // slices 1 and 4 of docs/crdt-position-2026-08.md moved every reader,
+    // cold and hot alike (`execute_and_poll_shell`'s completion poll
+    // included), off it and onto the server. Local is unchanged: same
+    // in-process `BlockStore` lookups as before this migration.
     // ------------------------------------------------------------------
 
     /// Resident context ids. Local lists the multi-context kernel store.
@@ -971,10 +925,11 @@ impl KaijutsuMcp {
     /// in-process `BlockStore` directly. Remote makes one `get_context_sync`
     /// call — the same RPC `execute_and_poll_shell`'s Phase 2 already uses
     /// to decode an authoritative snapshot — and decodes it into a
-    /// throwaway `SyncedDocument` (never written to `RemoteState.synced`,
-    /// so no race with the mirror's sole-writer doc task). `SyncState`
-    /// already carries `version` on the wire, so that's read straight off
-    /// the RPC reply rather than re-derived from the decoded document.
+    /// throwaway `SyncedDocument` (there is no mirror left to race with —
+    /// `RemoteState.synced` is gone, docs/crdt-position-2026-08.md slice 4).
+    /// `SyncState` already carries `version` on the wire, so that's read
+    /// straight off the RPC reply rather than re-derived from the decoded
+    /// document.
     async fn context_blocks_and_version(
         &self,
         ctx: ContextId,

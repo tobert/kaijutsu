@@ -1691,18 +1691,21 @@ impl ActorHandle {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// DocSyncBackend (test seam for kaijutsu-mcp's sole-writer doc task)
+// DocSyncBackend (fetch/push seam, historically a doc-sync test seam)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Narrow seam over the two RPCs a document-sync task needs: fetch the
 /// server's authoritative snapshot, and push locally-authored ops.
 ///
 /// `ActorHandle` implements this as a thin passthrough to its own
-/// `get_context_sync`/`push_ops` methods. The seam exists so a consumer
-/// (`kaijutsu-mcp`'s `doc_task` module) can be exercised against a fake with
-/// controllable timing and call-counting in unit tests, instead of every
-/// race condition needing a real ephemeral SSH server + kernel. Mirrors the
-/// `CasFetch` seam in `sftp.rs`.
+/// `get_context_sync`/`push_ops` methods. The seam let a generic consumer be
+/// exercised against a fake with controllable timing and call-counting in
+/// unit tests, instead of every race condition needing a real ephemeral SSH
+/// server + kernel — `kaijutsu-mcp`'s sole-writer doc task was that consumer
+/// until docs/crdt-position-2026-08.md slice 4 deleted it along with the
+/// mirror it maintained. Whether this trait itself still earns its keep with
+/// no generic consumer left is an open, separate question (same doc); it is
+/// NOT retired here. Mirrors the `CasFetch` seam in `sftp.rs`.
 #[async_trait::async_trait]
 pub trait DocSyncBackend: Send + Sync {
     async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError>;

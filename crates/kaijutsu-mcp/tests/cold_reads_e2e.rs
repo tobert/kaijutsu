@@ -1,19 +1,26 @@
 //! Slice 1 of `docs/crdt-position-2026-08.md` — the cold readers (prompts,
-//! resources, completions) move off `RemoteState.synced` (the event-fed
-//! mirror) onto authoritative server RPCs. This suite proves it the only
-//! way that actually distinguishes "reads the server" from "reads a cache
-//! that usually agrees with the server": kill this process's event bridge
-//! FIRST (so the mirror provably can never observe what comes next), author
-//! a block straight to the server over a *second*, independent connection,
-//! then call the real prompt handlers and assert they see it anyway.
+//! resources, completions) moved off `RemoteState.synced` (the event-fed
+//! mirror that existed at the time) onto authoritative server RPCs. This
+//! suite was written to prove it the only way that actually distinguishes
+//! "reads the server" from "reads a cache that usually agrees with the
+//! server": kill this process's event listener FIRST (so a mirror, if one
+//! existed, could never observe what comes next), author a block straight
+//! to the server over a *second*, independent connection, then call the
+//! real prompt handlers and assert they see it anyway. It was verified to
+//! fail against the pre-migration code (which read `with_doc`/
+//! `remote.synced` at both these sites) before that migration landed.
 //!
-//! If a cold reader silently fell back to (or was still reading)
-//! `remote.synced`, these tests would see the block go missing — the mirror
-//! never received it and never will, because its event bridge is dead. That
-//! is the failure mode this file is built to catch; it was verified to
-//! fail by running it against the pre-migration code (which read
-//! `with_doc`/`remote.synced` at both these sites) before landing the
-//! migration.
+//! **The mirror itself is gone now** (slice 4 of the same doc deleted
+//! `RemoteState.synced` entirely — there is no client-side replica left in
+//! this crate to regress to). So these tests can no longer catch "silently
+//! fell back to the mirror" — that failure mode no longer has a mechanism to
+//! fail through. What they guard today: the end-to-end read surface
+//! (`search_context`, `analyze_document`) against a real server over a real
+//! SSH connection, which this crate otherwise has no coverage for, and —
+//! because the event listener is killed before the read — that reading still
+//! works with the listener dead, so nobody can reintroduce a client-side
+//! cache and have these tests stay green while it silently disagrees with
+//! the server.
 //!
 //! Mirrors the ephemeral-SSH-server harness in `tests/hook_remote_e2e.rs`
 //! and `tests/e2e_shell.rs` (each file duplicates it rather than sharing —
@@ -87,12 +94,15 @@ async fn auto_register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json:
     panic!("register_session_auto never became ready");
 }
 
-/// Kill `mcp`'s event bridge and return its joined `context_id`. After this
-/// call, `remote.synced` (the mirror) is frozen — nothing authored from now
-/// on will ever reach it, exactly reproducing a server-reaped FlowBus
-/// subscription (`SubscriberHealth`) without needing to actually starve a
-/// live one.
-async fn kill_mirror_and_get_context(mcp: &KaijutsuMcp) -> kaijutsu_crdt::ContextId {
+/// Kill `mcp`'s event listener (the pulse task) and return its joined
+/// `context_id`. After this call, nothing authored from now on will ever
+/// reach this process through the event feed — exactly reproducing a
+/// server-reaped FlowBus subscription (`SubscriberHealth`) without needing
+/// to actually starve a live one. There is no mirror left for this to
+/// freeze; what it proves is that the cold readers below still see the
+/// block, because they read the server directly rather than depending on
+/// event delivery at all.
+async fn kill_event_listener_and_get_context(mcp: &KaijutsuMcp) -> kaijutsu_crdt::ContextId {
     let Backend::Remote(remote) = mcp.backend() else {
         panic!("expected Remote backend");
     };
@@ -116,32 +126,11 @@ fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
         .join("\n")
 }
 
-/// Assert the mirror genuinely does not contain `marker` — the load-bearing
-/// sanity check that keeps this test from being vacuous. If this assertion
-/// ever fails, the test's premise (mirror provably stale) is broken and the
-/// rest of the test proves nothing.
-fn assert_mirror_is_stale(mcp: &KaijutsuMcp, marker: &str) {
-    let Backend::Remote(remote) = mcp.backend() else {
-        panic!("expected Remote backend");
-    };
-    let mirror_has_it = remote
-        .synced
-        .lock()
-        .as_ref()
-        .map(|d| d.blocks().iter().any(|b| b.content.contains(marker)))
-        .unwrap_or(false);
-    assert!(
-        !mirror_has_it,
-        "test setup broken: the mirror should never have observed a block authored \
-         after its event bridge was killed — if it did, this test proves nothing"
-    );
-}
-
 /// `search_context` (site 4 of the migration — `context_blocks`, backed by
 /// `get_all_blocks`) must find a block that only ever existed on the
-/// server, never in this process's mirror.
+/// server, authored after this process's event listener was killed.
 #[test]
-fn search_context_reads_the_server_not_the_stale_mirror() {
+fn search_context_reads_the_server_with_the_event_listener_dead() {
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await;
@@ -151,7 +140,7 @@ fn search_context_reads_the_server_not_the_stale_mirror() {
             "register_session_auto failed: {reg}"
         );
 
-        let context_id = kill_mirror_and_get_context(&mcp).await;
+        let context_id = kill_event_listener_and_get_context(&mcp).await;
 
         let Backend::Remote(remote) = mcp.backend().clone() else {
             panic!("expected Remote backend");
@@ -163,8 +152,6 @@ fn search_context_reads_the_server_not_the_stale_mirror() {
             .author_block(AuthorBlock::text(context_id, principal, Role::User, marker))
             .await
             .expect("author_block");
-
-        assert_mirror_is_stale(&mcp, marker);
 
         let result = mcp
             .search_context(Parameters(SearchContextArgs {
@@ -187,18 +174,18 @@ fn search_context_reads_the_server_not_the_stale_mirror() {
         );
         assert!(
             text.contains(&format!(">>> {marker} <<<")),
-            "search_context must find the server-authored block even though the \
-             mirror never observed it (event bridge was dead before authoring); \
-             got:\n{text}"
+            "search_context must find the server-authored block even though this \
+             process's event listener was dead before authoring; got:\n{text}"
         );
     });
 }
 
 /// `analyze_document` (sites 3/7 of the migration —
 /// `context_blocks_and_version`, backed by `get_context_sync`) must report
-/// both the block and the version of a mutation the mirror never observed.
+/// both the block and the version of a mutation this process's event
+/// listener never observed.
 #[test]
-fn analyze_document_reads_the_server_not_the_stale_mirror() {
+fn analyze_document_reads_the_server_with_the_event_listener_dead() {
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await;
@@ -208,14 +195,14 @@ fn analyze_document_reads_the_server_not_the_stale_mirror() {
             "register_session_auto failed: {reg}"
         );
 
-        let context_id = kill_mirror_and_get_context(&mcp).await;
+        let context_id = kill_event_listener_and_get_context(&mcp).await;
 
         let Backend::Remote(remote) = mcp.backend().clone() else {
             panic!("expected Remote backend");
         };
 
         // Baseline version, straight from the server, before the mutation
-        // the mirror will never see.
+        // this process's dead event listener will never see.
         let before_version = remote
             .actor
             .get_context_sync(context_id)
@@ -231,8 +218,6 @@ fn analyze_document_reads_the_server_not_the_stale_mirror() {
             .await
             .expect("author_block");
 
-        assert_mirror_is_stale(&mcp, marker);
-
         let result = mcp
             .analyze_document(Parameters(AnalyzeDocumentArgs {
                 document_id: context_id.to_hex(),
@@ -243,14 +228,12 @@ fn analyze_document_reads_the_server_not_the_stale_mirror() {
         let text = prompt_text(&result);
         assert!(
             text.contains(marker),
-            "analyze_document must find the server-authored block even though the \
-             mirror never observed it; got:\n{text}"
+            "analyze_document must find the server-authored block even though this \
+             process's event listener never observed it; got:\n{text}"
         );
 
         // The reported version must reflect the post-mutation server state,
-        // not a frozen pre-kill snapshot — a stale mirror would report
-        // `before_version` (or panic looking the context up at all, since
-        // this process's mirror was never populated past registration).
+        // not a frozen pre-kill snapshot.
         let after_version = remote
             .actor
             .get_context_sync(context_id)

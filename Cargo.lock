@@ -6144,7 +6144,6 @@ dependencies = [
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "log",
- "parking_lot",
  "regex",
  "rmcp",
  "schemars 1.2.2",
