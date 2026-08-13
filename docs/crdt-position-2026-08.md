@@ -240,9 +240,13 @@ never renumber — a schema change bounces three separately-built binaries.
    `fast_forward` | `concurrent`) through the already-wired meter provider, so
    the series survives restarts. Classification logic is
    `MergeStats::outcome_since`, tested.
-3. MCP doc-task migration — **not started.** `kaijutsu-mcp` still runs
-   `SyncedDocument`; `doc_task.rs:387` is the single remaining production
-   `push_ops` call site in the system.
+3. MCP doc-task migration — **done.** `kaijutsu-mcp` still holds a
+   `SyncedDocument`, but only as a read replica; the hook path authors over
+   `authorBlock`/`completeBlock`. **`push_ops` now has zero production
+   callers** — what remains is the wire method, its `RpcClient`/`ActorHandle`
+   plumbing, and the `DocSyncBackend` trait slot. Whether to retire the verb
+   itself is a separate decision: the server still implements it, and it is
+   the only way a genuine replica could ever write back.
 4. Plain-projection stream variant — **not started**, and mostly not needed
    yet. Creation, status, metadata, output, delete, move are *already* plain
    (`onBlockInserted` carries a full `BlockSnapshot`). The only DTE-encoded
@@ -283,6 +287,7 @@ post-`Done` fetch rather than the mirror. So:
 - **Slice 2** — the new authoring verb. **Slice 3** — flip `HookListener` to
   it and delete `AuthorBlocks` / `push_new_ops` / `pushed_frontier`; races 3
   and 4 then vanish by construction rather than by guard.
+  **Both shipped 2026-08-13** — see "How slices 2 and 3 actually landed".
 - **Slice 4, separately** — replace the last mirror reader (`find_terminal`,
   hot path on every `shell` call). `e2e_shell.rs:152` already proves the tool
   survives a dead event feed, so the fallback shape is validated.
@@ -371,7 +376,60 @@ Landed so far:
   under SSH inactivity.
 
 Still to do: fold the remaining client transport constants into a policy so
-they are configurable like the kernel-side ones, sweep the strays, and give
-the hook critical path an explicit sub-5 s budget — which is the prerequisite
-for slice 3, where authoring latency reverses from local-ack-then-push to
-waiting on the network.
+they are configurable like the kernel-side ones, and sweep the strays. The
+hook critical path's explicit sub-5 s budget — the named prerequisite for
+slice 3 — landed as `af45445e` (`tiers::HOOK_PATH`, under `CC_HOOK_DEADLINE`).
+
+## How slices 2 and 3 actually landed (2026-08-13)
+
+**Slice 2** is `authorBlock @106` / `completeBlock @107`, appended at the next
+free ordinals with nothing renumbered. `authorBlock` carries `toolName`,
+`toolInput` and `toolKind` as first-class parameters — the fields
+`block_create` silently drops. It refuses two things rather than papering
+over them: an unparseable principal (that default was the silent-authorship
+defect removed twice that day; it does not come back through a new door), and
+a ToolResult without its call's id.
+
+**Slice 3** flipped `HookListener` and deleted the replication machinery. What
+went is `AuthoredBlock`, the `AuthorBlocks` command, `author_blocks_sync`,
+`push_new_ops`, `pushed_frontier`, and the `Insert`/`Flush` error variants —
+`doc_task.rs` from 1075 lines to 610.
+
+**The load-bearing move was reclassifying the mirror, not deleting code.**
+Once authoring leaves the process, `RemoteState.synced` has no local writer
+at all: every mutation is server-sourced. That is what licensed removing the
+pre-fetch flush *and* its abort-on-failure guard. Both existed to protect
+locally-authored blocks from being wiped by `apply_sync_state`'s wholesale
+swap — a hazard that cannot arise when nothing local exists. Races 3 and 4
+are gone by construction, as predicted.
+
+That reasoning is only as good as the invariant, so the invariant now has a
+test: `the_mirror_is_a_read_replica_and_never_pushes` drives the paths that
+used to push and asserts `push_ops` is never called. It was verified to fail
+(injecting one push into the resync path fails it on exactly that assertion).
+Without it, reintroducing a local writer would leave the suite green while
+silently invalidating every deletion above.
+
+**Reserve-then-flow, with one deliberate inefficiency.** A `tool.after` hook
+already knows the outcome, so it could author the call straight to `Done` and
+save a round trip on a latency-budgeted path. It does not, because of what a
+reader sees *between* the two writes: a `Done` ToolCall with no result yet
+looks like the result was lost, while a `Running` one reads as exactly what it
+is. Both intermediate states are transient; only one is honest. The liveness
+residue decision 2 named is handled explicitly — if the result fails to
+author, the call is completed at `Error` rather than left pending forever.
+
+**A test's meaning changed underneath it, and that is worth noticing.**
+`tool_after_completes_the_call_block_remote_mode` asserted against the mirror
+after a fixed 100 ms sleep. That was honest when the write was local
+("scheduling jitter, not a real race"); against a network round trip the same
+sleep is a coin flip, and its flake would have looked like a product bug. It
+now polls, and proves strictly more than before: not that this process wrote
+its own mirror, but that the kernel accepted the pair and the event feed
+carried it back. **The migration changed what an unchanged assertion meant** —
+the slice-0 discipline (write the test against the contract) is what kept it
+meaningful instead of merely passing.
+
+Still open: **slice 4**, the last mirror reader (`find_terminal`, hot on every
+`shell` call). `kaijutsu-acp` also still runs a `SyncedDocument`, so the MCP is
+the last *replicator* but not the last mirror.

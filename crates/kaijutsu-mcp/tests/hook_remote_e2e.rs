@@ -245,6 +245,21 @@ fn session_start_renames_label_once_and_listener_stays_live() {
 /// Item 8, remote-mode mirror of the local-mode unit test in
 /// `hook_listener.rs`: a hook-authored `tool.after` must complete the
 /// `ToolCall` block (Status::Done), not leave it Running forever.
+///
+/// **What this proves changed with slice 3.** It used to be a claim about
+/// authoring: `insert_tool_blocks` wrote `remote.synced` synchronously, so
+/// reading the mirror read back this process's own write. Now the hook
+/// authors over RPC and the mirror is a read replica, so the same assertion
+/// is a claim about *round trip* — the kernel accepted the pair, completed
+/// the call, and the event feed carried all of it back here. Strictly more
+/// than it proved before, and no longer redundant with its server-side
+/// sibling below.
+///
+/// The wait had to change with it. The old fixed 100 ms sleep was honest
+/// when the write was local ("scheduling jitter, not a real race"); against
+/// a network round trip it is a coin flip, and the flake it would produce
+/// would look like a product bug. Poll instead, so the test is bounded by a
+/// generous timeout but usually returns as fast as the feed does.
 #[test]
 fn tool_after_completes_the_call_block_remote_mode() {
     run_local(async {
@@ -279,16 +294,33 @@ fn tool_after_completes_the_call_block_remote_mode() {
         .to_string();
         send_hook_event(&socket_path, &event).await.unwrap();
 
-        // insert_tool_blocks writes into `remote.synced` synchronously
-        // before the socket response is sent; a short grace period guards
-        // against scheduling jitter, not a real race.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let blocks = remote.synced.lock().as_ref().unwrap().blocks();
-        let call = blocks
-            .iter()
-            .find(|b| b.kind == BlockKind::ToolCall)
-            .expect("tool call block inserted");
+        // Poll the mirror until the round trip lands. Two distinct states
+        // are being waited out — the ToolCall appearing at all, and its
+        // status settling to Done — so the loop must not stop at the first.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let call = loop {
+            let found = remote
+                .synced
+                .lock()
+                .as_ref()
+                .unwrap()
+                .blocks()
+                .into_iter()
+                .find(|b| b.kind == BlockKind::ToolCall);
+            match found {
+                Some(call) if call.status == Status::Done => break call,
+                other => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "hook-authored tool call never reached Done in the mirror \
+                         (last seen: {:?}) — the RPC-authored pair did not round-trip \
+                         back through the event feed",
+                        other.map(|b| b.status),
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
         assert_eq!(
             call.status,
             Status::Done,

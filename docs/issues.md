@@ -3958,14 +3958,20 @@ the *remaining* findings, triaged.
 - **Sole-writer command channel SHIPPED 2026-07-17** (`doc_task.rs`; the old
   HIGH hook-authoring-vs-resync entry is RESOLVED — sole writer, dedicated
   pushed frontier, flush→apply window closed by construction, resyncs
-  coalesce, flush-failure aborts the swap). Remaining follow-ups from its
-  kaibo review, all accepted/deferred:
-  - **Hook-ack latency under a long fetch (watch item):** AuthorBlocks
-    queues FIFO behind an in-flight resync fetch (up to the 30s RPC
-    timeout), and the Claude Code adapter hook timeout is 5s — the adapter
-    can move on before the ack; the block still lands afterward. Latency
-    regression only, mirror is ambient by design. If it bites: a
-    hook-backpressure test + possibly acking after local insert before push.
+  coalesce, flush-failure aborts the swap).
+  **SUPERSEDED 2026-08-13 by slice 3 of the CRDT-position migration**
+  (`docs/crdt-position-2026-08.md`): the hook path authors over
+  `authorBlock`/`completeBlock`, so the mirror has no local writer and the
+  pushed frontier, the flush, and the flush-failure abort are all *deleted*
+  rather than fixed. The guarantees above still hold; they are now structural.
+  Keep the entry for the reasoning, not the mechanism. Remaining follow-ups
+  from its kaibo review:
+  - ~~**Hook-ack latency under a long fetch (watch item)**~~ — **moot.**
+    Authoring no longer queues behind a resync fetch at all. The latency
+    concern did not disappear, it *moved*: the hook now waits on three
+    sequential RPCs instead of a local ack, bounded by `tiers::HOOK_PATH`
+    under Claude Code's 5 s deadline (`af45445e`). Same 5 s ceiling, a
+    different thing pressing against it.
   - **`ContextResynced` events ride `ApplyEvent` and are ignored**; the
     bridge could convert them into a direct apply_sync_state and save one
     fetch on reconnect. Optimization, unclaimed.

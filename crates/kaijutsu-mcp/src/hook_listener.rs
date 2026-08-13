@@ -20,8 +20,9 @@ use kaijutsu_crdt::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status
 use kaijutsu_types::timeout::tiers;
 use kaijutsu_kernel::SharedBlockStore;
 
+use kaijutsu_client::AuthorBlock;
+
 use crate::RemoteState;
-use crate::doc_task::AuthoredBlock;
 use crate::hook_types::{
     HookEvent, HookResponse, KAIJUTSU_MCP_TOOLS, PingResponse, normalize_tool_name,
     short_session_suffix,
@@ -265,10 +266,11 @@ impl HookListener {
         // the hook, the user sees a timeout, and whatever we were doing
         // finishes into a void.
         //
-        // Not hypothetical headroom. The RPCs inside `maybe_stabilize_label`
-        // carry the request tier, and `AuthorBlocks` queues FIFO in the doc
-        // task behind a resync whose fetch is bounded the same way — so a
-        // hook that arrives mid-resync can wait far past CC's patience.
+        // Not hypothetical headroom. Every RPC on this path carries the
+        // request tier, and authoring a tool pair is three of them
+        // (reserve, result, complete) on top of `maybe_stabilize_label`'s —
+        // so a slow or reconnecting kernel can hold the hook far past CC's
+        // patience.
         //
         // Degrading here is consistent with what this path already promises
         // for *failure*: the mirror is ambient, so its slowness must not
@@ -299,16 +301,15 @@ impl HookListener {
 
     /// Process a hook event: create blocks, check drift.
     ///
-    /// Block authoring now goes through the doc task's command channel (see
-    /// `crate::doc_task`) and is awaited before this returns — pushing to
-    /// the server happens INSIDE the doc task as a side effect of that, so
-    /// there's no separate "push ops" step here anymore. `author_error`
+    /// In remote mode, block authoring is now direct RPC (`authorBlock` /
+    /// `completeBlock`) awaited before this returns — the kernel is the
+    /// writer, and this process no longer replicates. `author_error`
     /// accumulates the first authoring failure across the event (there's at
     /// most one insertion per event today, but this stays correct if that
-    /// changes): on failure we still return ALLOW (the mirror is ambient —
-    /// its failure must not block the user's action) but make it visible by
-    /// folding an error note into the response's `context` field alongside
-    /// (or instead of) any drift.
+    /// changes): on failure we still return ALLOW — recording what happened
+    /// must not block the user's action — but make it visible by folding an
+    /// error note into the response's `context` field alongside (or instead
+    /// of) any drift.
     async fn process_event(&self, event: &HookEvent) -> HookResponse {
         // 1. Filter self-referential kaijutsu MCP tools. Claude Code reports
         // MCP tool calls as `mcp__<server>__<tool>`, not the bare name.
@@ -614,19 +615,23 @@ impl HookListener {
             }
             return Ok(());
         }
-        if self.remote.is_none() {
-            return Ok(());
-        }
-        let Some(handle) = self.doc_task_handle() else {
-            tracing::debug!("Hook insert_text_block: doc task not ready yet");
+        let Some(remote) = &self.remote else {
             return Ok(());
         };
-        let block = AuthoredBlock::Text { role, content: content.to_string() };
-        match handle.author_blocks(vec![block], self.author_principal()).await {
-            Ok(()) => Ok(()),
+        match remote
+            .actor
+            .author_block(AuthorBlock::text(
+                ctx_id,
+                self.author_principal(),
+                role,
+                content,
+            ))
+            .await
+        {
+            Ok(_id) => Ok(()),
             Err(e) => {
-                tracing::error!("Hook insert_text_block: AuthorBlocks failed — mirror desynced: {e}");
-                Err(format!("failed to mirror text block: {e}"))
+                tracing::error!("Hook insert_text_block: authorBlock failed: {e}");
+                Err(format!("failed to author text block: {e}"))
             }
         }
     }
@@ -694,39 +699,80 @@ impl HookListener {
             }
             return Ok(());
         }
-        if self.remote.is_none() {
-            return Ok(());
-        }
-        let Some(handle) = self.doc_task_handle() else {
-            tracing::debug!("Hook insert_tool_blocks: doc task not ready yet");
+        let Some(remote) = &self.remote else {
             return Ok(());
         };
-        let block = AuthoredBlock::ToolCallResult {
-            tool_name: tool.name.clone(),
-            tool_input: input,
-            result_content: truncated,
-            is_error,
-            tool_kind: Some(ToolKind::Mcp),
-        };
-        match handle.author_blocks(vec![block], self.author_principal()).await {
-            Ok(()) => Ok(()),
+        let principal = self.author_principal();
+
+        // Reserve, then flow (docs/crdt-position-2026-08.md, decision 2).
+        // Three RPCs rather than one, deliberately: the call is reserved at
+        // Running, the result arrives parented to it, and only then does the
+        // call move to its terminal state.
+        //
+        // A `tool.after` hook already knows the outcome, so we could author
+        // the call straight to Done and save a round trip on a path that
+        // answers inside `tiers::HOOK_PATH`. We don't, because of what a
+        // reader sees BETWEEN the two writes: a Done ToolCall with no result
+        // yet looks like the result was lost, while a Running one reads as
+        // exactly what it is. Both intermediate states are transient; only
+        // one of them is honest.
+        let call_id = match remote
+            .actor
+            .author_block(AuthorBlock::tool_call(
+                ctx_id,
+                principal,
+                &tool.name,
+                input,
+                Some(ToolKind::Mcp),
+            ))
+            .await
+        {
+            Ok(id) => id,
             Err(e) => {
-                tracing::error!("Hook insert_tool_blocks: AuthorBlocks failed — mirror desynced: {e}");
-                Err(format!("failed to mirror tool call/result: {e}"))
+                tracing::error!("Hook insert_tool_blocks: authorBlock(call) failed: {e}");
+                return Err(format!("failed to author tool call: {e}"));
+            }
+        };
+
+        let result_err = remote
+            .actor
+            .author_block(AuthorBlock::tool_result(
+                ctx_id,
+                principal,
+                call_id,
+                truncated,
+                is_error,
+                Some(ToolKind::Mcp),
+            ))
+            .await
+            .err();
+
+        // Complete the call either way. If the RESULT failed to author, the
+        // reservation is still out there at Running with nothing coming for
+        // it — the liveness residue reserve-then-flow leaves behind. Landing
+        // it at Error is the truth we actually have: the call happened, and
+        // its result did not reach the kernel.
+        let final_status = if is_error || result_err.is_some() {
+            Status::Error
+        } else {
+            Status::Done
+        };
+        if let Err(e) = remote
+            .actor
+            .complete_block(ctx_id, call_id, final_status, is_error, None)
+            .await
+        {
+            tracing::error!("Hook insert_tool_blocks: completeBlock failed: {e}");
+            return Err(format!("tool call left pending: {e}"));
+        }
+
+        match result_err {
+            None => Ok(()),
+            Some(e) => {
+                tracing::error!("Hook insert_tool_blocks: authorBlock(result) failed: {e}");
+                Err(format!("failed to author tool result: {e}"))
             }
         }
-    }
-
-    /// The doc task's command-channel handle, if `register_session` has
-    /// spawned one yet (remote mode only — `None` in local mode or before
-    /// registration completes).
-    fn doc_task_handle(&self) -> Option<crate::doc_task::DocTaskHandle> {
-        self.remote
-            .as_ref()?
-            .doc_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Stabilize the auto-registered placeholder context onto a label that's

@@ -6,34 +6,37 @@
 //! `doc_mut().insert_*`, then pushed), and `execute_and_poll_shell`'s stall
 //! fallback (called `resync_synced` directly). All three took the same
 //! `parking_lot::Mutex`, so no individual mutation ever corrupted the doc —
-//! but the *sequences* raced: a block authored while a resync's fetch RPC was
-//! in flight could be wiped by `apply_sync_state` replacing the doc wholesale
-//! (the lost-update window), two concurrent resyncs could apply stale-last,
-//! and `flush_local_ops` based its push on the *inbound* sync frontier (which
-//! local authoring never advances), so every push re-sent every local op ever
-//! made. See docs/issues.md, "kaijutsu-mcp — June 2026 SyncedDocument
-//! migration review" (HIGH).
+//! but the *sequences* raced. This module made one task — [`run_doc_task`] —
+//! the TRUE sole writer, with every mutation arriving as a [`DocCommand`] on
+//! one mpsc channel.
 //!
-//! This module makes one task — [`run_doc_task`] — the TRUE sole writer.
-//! Every mutation arrives as a [`DocCommand`] on one mpsc channel: applying a
-//! server event, authoring locally-produced blocks, or running a resync.
-//! Reads still go straight through the shared mutex (`RemoteState.synced`) —
-//! only *mutation* moved to the channel.
+//! **Two of those four races are now gone by construction rather than by
+//! guard.** Since the hook path authors over RPC (`authorBlock` /
+//! `completeBlock`) instead of writing here and pushing, this document has no
+//! local writer at all: the only mutations left are *server-sourced* —
+//! applying a `ServerEvent`, or applying a fetched snapshot. That deleted the
+//! lost-update window (nothing local exists to lose across an
+//! `apply_sync_state` swap) and the re-send bug (nothing is pushed, so no
+//! frontier needs tracking), along with the pre-fetch flush and its
+//! abort-on-failure guard. What remains is the resync coalescing, which is
+//! about not fetching four times, not about correctness of local data.
+//!
+//! The mirror is now a pure read replica. Reads go straight through the
+//! shared mutex (`RemoteState.synced`); mutation stays on the channel so the
+//! apply→bump ordering has exactly one owner. See
+//! `docs/crdt-position-2026-08.md` (slice 3).
 //!
 //! [`DocTaskHandle`] is the producer-side API. [`spawn_event_bridge`] adapts
 //! the actor's broadcast event/status streams into the same channel, so the
 //! task loop only ever has one thing to select on: `rx.recv()`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use kaijutsu_client::{ActorHandle, ConnectionStatus, DocSyncBackend, ServerEvent, SyncEffect, SyncedDocument};
-use kaijutsu_crdt::{
-    BlockId, BlockKind, ContentType, ContextId, Frontier, PrincipalId, Role, Status, ToolKind,
-};
+use kaijutsu_crdt::ContextId;
 
 /// Channel capacity for the doc task's command mpsc. Generous — a burst of
 /// hook events, hydrated resync triggers (Lagged event + Lagged status +
@@ -44,28 +47,6 @@ const DOC_TASK_CHANNEL_CAPACITY: usize = 256;
 // ============================================================================
 // Command / data types
 // ============================================================================
-
-/// Data description of a single locally-authored block insertion.
-///
-/// Replaces what `HookListener::insert_text_block` / `insert_tool_blocks`
-/// used to do *imperatively* against `SyncedDocument` directly. The producer
-/// (HookListener) now just describes what it wants; the doc task is the one
-/// that actually touches the document.
-#[derive(Debug, Clone)]
-pub enum AuthoredBlock {
-    /// A plain text block (session/system/user/model narration).
-    Text { role: Role, content: String },
-    /// A tool call + its result, inserted as a linked pair and immediately
-    /// completed (Done/Error) — mirrors the old `insert_tool_blocks`'s
-    /// two-insert + `set_status` sequence in one atomic-under-the-lock unit.
-    ToolCallResult {
-        tool_name: String,
-        tool_input: serde_json::Value,
-        result_content: String,
-        is_error: bool,
-        tool_kind: Option<ToolKind>,
-    },
-}
 
 /// Why a [`DocCommand::Resync`] was requested — carried for logging /
 /// coalescing visibility only, not branched on inside the resync itself
@@ -96,14 +77,8 @@ pub enum DocTaskError {
     /// has completed (the task is only spawned after the doc is seeded);
     /// defensive.
     NoDocument,
-    /// A block insert into the CRDT store failed.
-    Insert(String),
     /// The resync's server fetch RPC (or the apply of its result) failed.
     Fetch(String),
-    /// A resync's PRE-FETCH flush (pushing unpushed local ops before
-    /// pulling the server's snapshot) failed, so the resync was aborted
-    /// before fetching or applying anything — see `do_coalesced_resync`.
-    Flush(String),
 }
 
 impl std::fmt::Display for DocTaskError {
@@ -111,9 +86,7 @@ impl std::fmt::Display for DocTaskError {
         match self {
             Self::Shutdown => write!(f, "doc task is not running"),
             Self::NoDocument => write!(f, "no synced document"),
-            Self::Insert(e) => write!(f, "block insert failed: {e}"),
             Self::Fetch(e) => write!(f, "resync failed: {e}"),
-            Self::Flush(e) => write!(f, "resync aborted — pre-fetch flush failed: {e}"),
         }
     }
 }
@@ -124,29 +97,9 @@ impl std::error::Error for DocTaskError {}
 pub enum DocCommand {
     /// Apply a server-delivered event (the old background listener's job).
     ApplyEvent(ServerEvent),
-    /// Author one or more blocks locally (HookListener's job). Acked once
-    /// applied to the document — NOT once pushed to the server; push happens
-    /// afterward, best-effort, and its own failure doesn't fail this ack (a
-    /// later push/resync will carry the ops).
-    AuthorBlocks {
-        blocks: Vec<AuthoredBlock>,
-        /// Who these blocks belong to — the **agent session**, resolved by
-        /// the producer at author time (`HookListener::author_principal`).
-        ///
-        /// Travels with the content rather than living as ambient state on
-        /// the document, for two reasons. The document's principal was set
-        /// once at construction from a `PrincipalId::new()` minted per MCP
-        /// *process*, so a session that survived a relaunch authored under a
-        /// different identity each time. And carrying it per-command means
-        /// there is no ordering dependency between "set the principal" and
-        /// "author with it" — the pair cannot get out of step.
-        principal: PrincipalId,
-        done: oneshot::Sender<Result<(), DocTaskError>>,
-    },
-    /// Run a resync: flush unpushed local ops, fetch the server's
-    /// authoritative snapshot, apply it. `done` is `None` for
-    /// fire-and-forget triggers (the event bridge); `Some` when a caller
-    /// wants to know it completed (the stall fallback).
+    /// Run a resync: fetch the server's authoritative snapshot and apply it.
+    /// `done` is `None` for fire-and-forget triggers (the event bridge);
+    /// `Some` when a caller wants to know it completed (the stall fallback).
     Resync {
         reason: ResyncReason,
         done: Option<oneshot::Sender<Result<(), DocTaskError>>>,
@@ -164,24 +117,6 @@ pub struct DocTaskHandle {
 }
 
 impl DocTaskHandle {
-    /// Author blocks and wait for them to be applied to the document.
-    pub async fn author_blocks(
-        &self,
-        blocks: Vec<AuthoredBlock>,
-        principal: PrincipalId,
-    ) -> Result<(), DocTaskError> {
-        let (done, ack) = oneshot::channel();
-        self.tx
-            .send(DocCommand::AuthorBlocks {
-                blocks,
-                principal,
-                done,
-            })
-            .await
-            .map_err(|_| DocTaskError::Shutdown)?;
-        ack.await.map_err(|_| DocTaskError::Shutdown)?
-    }
-
     /// Request a resync and wait for it to complete. Multiple concurrent
     /// callers each get their own ack, but only ONE fetch runs — see
     /// [`do_coalesced_resync`].
@@ -228,8 +163,8 @@ where
     (handle, join)
 }
 
-/// The task loop itself. Owns: apply → bump `change` → push, for every
-/// mutation, uniformly (unlike the old three-writer arrangement, where the
+/// The task loop itself. Owns apply → bump `change` for every mutation,
+/// uniformly (unlike the old three-writer arrangement, where the
 /// stall-fallback resync didn't bump `change`).
 async fn run_doc_task<B: DocSyncBackend>(
     backend: B,
@@ -238,14 +173,6 @@ async fn run_doc_task<B: DocSyncBackend>(
     change: watch::Sender<u64>,
     mut rx: mpsc::Receiver<DocCommand>,
 ) {
-    // Bootstrap: everything currently in the doc (seeded by register_session
-    // from the initial get_context_sync) came FROM the server, so it's
-    // already "pushed" as far as we're concerned.
-    let mut pushed_frontier: HashMap<BlockId, Frontier> = {
-        let guard = synced.lock();
-        guard.as_ref().map(|d| d.doc().frontier()).unwrap_or_default()
-    };
-
     while let Some(cmd) = rx.recv().await {
         match cmd {
             DocCommand::ApplyEvent(event) => {
@@ -258,38 +185,15 @@ async fn run_doc_task<B: DocSyncBackend>(
                         &synced,
                         &change,
                         &mut rx,
-                        &mut pushed_frontier,
                         ResyncReason::NeedsResync,
                         None,
                     )
                     .await;
                 }
             }
-            DocCommand::AuthorBlocks { blocks, principal, done } => {
-                let result = author_blocks_sync(&synced, blocks, principal);
-                bump(&change);
-                let ok = result.is_ok();
-                let _ = done.send(result);
-                if ok {
-                    // Routine "will retry later" on failure — the block is
-                    // already applied and acked; push_new_ops already logs.
-                    // (Unlike do_coalesced_resync's flush, there's no doc
-                    // swap here that a failed push would need to guard.)
-                    let _ = push_new_ops(&backend, &synced, context_id, &mut pushed_frontier).await;
-                }
-            }
             DocCommand::Resync { reason, done } => {
-                do_coalesced_resync(
-                    &backend,
-                    context_id,
-                    &synced,
-                    &change,
-                    &mut rx,
-                    &mut pushed_frontier,
-                    reason,
-                    done,
-                )
-                .await;
+                do_coalesced_resync(&backend, context_id, &synced, &change, &mut rx, reason, done)
+                    .await;
             }
         }
     }
@@ -310,144 +214,28 @@ fn apply_event_sync(
     guard.as_mut().map(|doc| doc.apply_event(event))
 }
 
-/// Apply a batch of [`AuthoredBlock`]s under one lock acquisition. Mirrors
-/// exactly what `HookListener::insert_text_block` / `insert_tool_blocks` did
-/// imperatively before this module existed.
-fn author_blocks_sync(
-    synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    blocks: Vec<AuthoredBlock>,
-    principal: PrincipalId,
-) -> Result<(), DocTaskError> {
-    let mut guard = synced.lock();
-    let Some(doc) = guard.as_mut() else {
-        return Err(DocTaskError::NoDocument);
-    };
-    // Stamp the authoring identity before inserting. The document was
-    // constructed with a per-process `PrincipalId::new()`, which is wrong for
-    // anything hook-authored: it makes one agent session look like a new
-    // principal after every MCP relaunch. Setting it here rather than at
-    // construction keeps the identity attached to the *content* being
-    // authored, and this is the sole-writer task, so no other writer can
-    // observe the store between the stamp and the inserts below.
-    doc.doc_mut().set_principal_id(principal);
-    for block in blocks {
-        match block {
-            AuthoredBlock::Text { role, content } => {
-                doc.doc_mut()
-                    .insert_block(
-                        None,
-                        None,
-                        role,
-                        BlockKind::Text,
-                        content,
-                        Status::Done,
-                        ContentType::Plain,
-                    )
-                    .map_err(|e| DocTaskError::Insert(e.to_string()))?;
-            }
-            AuthoredBlock::ToolCallResult {
-                tool_name,
-                tool_input,
-                result_content,
-                is_error,
-                tool_kind,
-            } => {
-                let call_id = doc
-                    .doc_mut()
-                    .insert_tool_call(None, None, tool_name, tool_input, tool_kind, None)
-                    .map_err(|e| DocTaskError::Insert(e.to_string()))?;
-                doc.doc_mut()
-                    .insert_tool_result_block(&call_id, None, result_content, is_error, None, tool_kind)
-                    .map_err(|e| DocTaskError::Insert(e.to_string()))?;
-                let final_status = if is_error { Status::Error } else { Status::Done };
-                doc.doc_mut()
-                    .set_status(&call_id, final_status)
-                    .map_err(|e| DocTaskError::Insert(e.to_string()))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Push whatever's changed since `pushed_frontier` — NOT since the inbound
-/// sync frontier (the old `flush_local_ops` bug: local authoring never
-/// advances the inbound frontier, so every push re-sent every local op ever
-/// made). Advances `pushed_frontier` to the doc's own current frontier on a
-/// successful push; leaves it alone on failure (returning `Err`) so the next
-/// push naturally retries the same ops (plus anything new) — safe because
-/// server-side CRDT merge is idempotent.
-///
-/// Callers differ on what a failure means: the plain `AuthorBlocks` arm in
-/// the main loop treats it as routine "will retry later" (the block is
-/// already applied and acked either way — only IGNORES the `Result`, relying
-/// on the `warn!` below). `do_coalesced_resync`'s pre-fetch flush is
-/// different: proceeding into a doc-replacing `apply_sync_state` while
-/// holding ops that failed to push would silently lose them, so THAT caller
-/// must abort on `Err` rather than continue.
-async fn push_new_ops<B: DocSyncBackend>(
-    backend: &B,
-    synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    context_id: ContextId,
-    pushed_frontier: &mut HashMap<BlockId, Frontier>,
-) -> Result<(), DocTaskError> {
-    let Some((ops, new_frontier)) = ({
-        let guard = synced.lock();
-        guard.as_ref().map(|doc| {
-            let ops = doc.doc().ops_since(pushed_frontier);
-            let new_frontier = doc.doc().frontier();
-            (ops, new_frontier)
-        })
-    }) else {
-        return Ok(());
-    };
-    if ops.block_ops.is_empty()
-        && ops.new_blocks.is_empty()
-        && ops.updated_headers.is_empty()
-        && ops.deleted_blocks.is_empty()
-    {
-        return Ok(());
-    }
-    let bytes = match kaijutsu_types::codec::encode(&ops) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(%context_id, "doc task: push encode failed: {e}");
-            return Err(DocTaskError::Flush(format!("encode failed: {e}")));
-        }
-    };
-    match backend.push_ops(context_id, &bytes).await {
-        Ok(_ack_version) => {
-            *pushed_frontier = new_frontier;
-            Ok(())
-        }
-        Err(e) => {
-            // pushed_frontier stays put, so the NEXT push (triggered by the
-            // next authoring or resync) naturally re-includes these ops.
-            tracing::warn!(%context_id, "doc task: push failed, will retry: {e}");
-            Err(DocTaskError::Flush(e.to_string()))
-        }
-    }
-}
-
 /// Run one resync, coalescing any additional `Resync` commands ALREADY
 /// sitting in the channel at the moment we start (a burst of Lagged-event +
 /// Lagged-status, or a stall fallback landing right behind a NeedsResync,
-/// shouldn't cost two fetches). `AuthorBlocks`/`ApplyEvent` commands found
-/// in that same pre-fetch drain are applied immediately to the CURRENT
-/// (about-to-be-replaced) doc — harmless *as long as the flush below
-/// actually succeeds*, since a successful flush pushes them before we
-/// fetch, so the snapshot we pull back already reflects them. If the flush
-/// FAILS, the resync aborts entirely (no fetch, no apply, no frontier
-/// reset) rather than proceed into a doc swap that would silently lose
-/// those drained-but-unpushed ops with no way to retry them — see the
-/// flush step below.
+/// shouldn't cost two fetches). `ApplyEvent` commands found in that same
+/// pre-fetch drain are applied immediately to the CURRENT
+/// (about-to-be-replaced) doc, which is harmless: they came from the server,
+/// so the snapshot we are about to fetch already accounts for them.
+///
+/// There is no pre-fetch flush here anymore, and that is a structural change
+/// rather than a simplification. It existed because the drain could apply
+/// *locally authored* blocks that the imminent `apply_sync_state` swap would
+/// wipe — so the resync had to push them first, and abort if that push
+/// failed. Since authoring moved to `authorBlock` RPCs, this document has no
+/// local writer: everything in it came from the server, so the swap cannot
+/// destroy anything the server does not already have. The lost-update window
+/// is gone by construction, not by guard.
 ///
 /// Commands that arrive WHILE the fetch RPC is actually in flight are NOT
 /// caught by the drain (the task isn't polling `rx` during the `.await`) —
 /// they simply wait in the channel and get processed normally by the next
 /// `rx.recv()` after this function returns, against the FRESH post-swap
-/// document. This is the fix for the lost-update window: the old
-/// direct-call `resync_synced` had no way to make a concurrent
-/// `insert_text_block` wait for it.
+/// document.
 ///
 /// Staleness of a *queued* `ApplyEvent` replayed after the swap: verified
 /// safe, not just assumed. `SyncReset` (the only event that signals
@@ -464,14 +252,12 @@ async fn push_new_ops<B: DocSyncBackend>(
 /// makes "apply it after" safe here; see `SyncedDocument::apply_sync_state`
 /// for the sibling case (`pending_events`) where that guarantee does NOT
 /// hold and the buffered events are dropped instead.
-#[allow(clippy::too_many_arguments)]
 async fn do_coalesced_resync<B: DocSyncBackend>(
     backend: &B,
     context_id: ContextId,
     synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
     change: &watch::Sender<u64>,
     rx: &mut mpsc::Receiver<DocCommand>,
-    pushed_frontier: &mut HashMap<BlockId, Frontier>,
     first_reason: ResyncReason,
     first_done: Option<oneshot::Sender<Result<(), DocTaskError>>>,
 ) {
@@ -488,11 +274,6 @@ async fn do_coalesced_resync<B: DocSyncBackend>(
                 if let Some(d) = done {
                     dones.push(d);
                 }
-            }
-            Ok(DocCommand::AuthorBlocks { blocks, principal, done }) => {
-                let result = author_blocks_sync(synced, blocks, principal);
-                bump(change);
-                let _ = done.send(result);
             }
             Ok(DocCommand::ApplyEvent(event)) => {
                 // Ignore the returned effect — even a NeedsResync signal
@@ -512,31 +293,6 @@ async fn do_coalesced_resync<B: DocSyncBackend>(
         "doc task: running resync",
     );
 
-    // Flush anything local not yet pushed — the fetch below pulls a
-    // snapshot, and apply_sync_state replaces the doc wholesale, so any
-    // local op that's neither pushed before this point NOR still queued in
-    // the channel (to be replayed after) would be lost. If the flush ITSELF
-    // fails, that loss is exactly what proceeding would cause: the drained
-    // pre-fetch AuthorBlocks above are sitting in the doc unpushed, and
-    // fetching+applying now would wipe them via the swap AND reset
-    // `pushed_frontier` to the fresh doc's frontier — erasing any record
-    // that a future push needs to retry them. So on flush failure, ABORT
-    // here: no fetch, no apply, no frontier touch. The unflushed ops stay
-    // exactly where `push_new_ops` left them (frontier untouched), so the
-    // NEXT resync's flush picks them up again. Callers recover on their own
-    // schedule — the stall fallback re-fires on its next backoff window, a
-    // Lagged bridge resync re-triggers on the next lag.
-    if let Err(e) = push_new_ops(backend, synced, context_id, pushed_frontier).await {
-        tracing::error!(
-            %context_id,
-            "doc task: {e} — refusing to swap the document while local ops are unflushed",
-        );
-        for done in dones {
-            let _ = done.send(Err(e.clone()));
-        }
-        return;
-    }
-
     let result = match backend.get_context_sync(context_id).await {
         Ok(state) => {
             let mut guard = synced.lock();
@@ -544,15 +300,6 @@ async fn do_coalesced_resync<B: DocSyncBackend>(
                 Some(doc) => match doc.apply_sync_state(&state) {
                     Ok(effect) => {
                         tracing::info!(%context_id, ?effect, "doc task: resync applied");
-                        // CRITICAL: the doc instance was just replaced
-                        // wholesale. Every frontier tracked against the OLD
-                        // instance is meaningless now — but nothing local is
-                        // lost: we flushed before fetching, so the fresh
-                        // doc already reflects everything we'd pushed.
-                        // Reset to the fresh doc's own frontier: "we just
-                        // got this from the server, so the server already
-                        // has all of it."
-                        *pushed_frontier = doc.doc().frontier();
                         Ok(())
                     }
                     Err(e) => Err(DocTaskError::Fetch(e.to_string())),
@@ -628,6 +375,7 @@ pub fn spawn_event_bridge(actor: ActorHandle, doc_task: DocTaskHandle) -> JoinHa
 // Tests
 // ============================================================================
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,8 +385,8 @@ mod tests {
 
     use kaijutsu_client::CallError;
     use kaijutsu_client::rpc::SyncState;
-    use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, SyncPayload};
-    use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
+    use kaijutsu_crdt::{PrincipalId, Role};
     use tokio::sync::Notify;
 
     fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
@@ -646,12 +394,9 @@ mod tests {
     }
 
     /// A fake [`DocSyncBackend`]: `get_context_sync` reads a snapshot of a
-    /// server-side `CrdtBlockStore`; `push_ops` merges the pushed payload
-    /// INTO that same store (so a resync after a push genuinely reflects
-    /// it) and records every call for inspection. `get_context_sync` can
-    /// optionally be gated behind a `Notify` — the fetch signals
-    /// `fetch_entered` then waits on the gate — to deterministically land a
-    /// concurrent command mid-fetch.
+    /// server-side `CrdtBlockStore`. `push_ops` exists only because the trait
+    /// demands it — it records that it was called so a test can assert the
+    /// doc task never calls it, and panics rather than pretending to work.
     #[derive(Clone)]
     struct FakeBackend {
         ctx: ContextId,
@@ -659,10 +404,7 @@ mod tests {
         fetch_gate: Option<Arc<Notify>>,
         fetch_entered: Arc<Notify>,
         fetch_calls: Arc<AtomicUsize>,
-        push_payloads: Arc<parking_lot::Mutex<Vec<SyncPayload>>>,
-        /// Number of upcoming `push_ops` calls that should fail (return
-        /// `Err`) before succeeding again — decremented on each call.
-        push_fail_countdown: Arc<AtomicUsize>,
+        push_calls: Arc<AtomicUsize>,
     }
 
     impl FakeBackend {
@@ -676,35 +418,33 @@ mod tests {
                 fetch_gate: None,
                 fetch_entered: Arc::new(Notify::new()),
                 fetch_calls: Arc::new(AtomicUsize::new(0)),
-                push_payloads: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                push_fail_countdown: Arc::new(AtomicUsize::new(0)),
+                push_calls: Arc::new(AtomicUsize::new(0)),
             }
-        }
-
-        fn with_gate(mut self, gate: Arc<Notify>) -> Self {
-            self.fetch_gate = Some(gate);
-            self
         }
 
         fn fetch_call_count(&self) -> usize {
             self.fetch_calls.load(Ordering::SeqCst)
         }
 
-        fn push_payloads(&self) -> Vec<SyncPayload> {
-            self.push_payloads.lock().clone()
+        fn push_call_count(&self) -> usize {
+            self.push_calls.load(Ordering::SeqCst)
         }
 
-        /// Block until `get_context_sync` has been called at least once and
-        /// is (if gated) currently blocked awaiting its gate.
-        async fn wait_for_fetch_entered(&self) {
-            self.fetch_entered.notified().await;
-        }
-
-        /// Make the next `n` `push_ops` calls fail (return `Err`, touching
-        /// neither `server_doc` nor `push_payloads` — a failed push must
-        /// look exactly like it never happened) before succeeding again.
-        fn fail_next_pushes(&self, n: usize) {
-            self.push_fail_countdown.store(n, Ordering::SeqCst);
+        /// Seed a block into the SERVER's store, so the next fetch brings it
+        /// back — the only way content legitimately enters the mirror now.
+        fn seed_server_block(&self, content: &str) {
+            let mut store = self.server_doc.lock().unwrap();
+            store
+                .insert_block(
+                    None,
+                    None,
+                    Role::User,
+                    kaijutsu_crdt::BlockKind::Text,
+                    content,
+                    kaijutsu_crdt::Status::Done,
+                    kaijutsu_crdt::ContentType::Plain,
+                )
+                .expect("seed server block");
         }
     }
 
@@ -724,20 +464,8 @@ mod tests {
             Ok(SyncState { context_id, version: 1, ops })
         }
 
-        async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError> {
-            assert_eq!(context_id, self.ctx, "fake backend push for wrong context");
-            let remaining = self.push_fail_countdown.load(Ordering::SeqCst);
-            if remaining > 0 {
-                self.push_fail_countdown.store(remaining - 1, Ordering::SeqCst);
-                return Err(CallError::Rpc("simulated push failure".to_string()));
-            }
-            let payload: SyncPayload =
-                kaijutsu_types::codec::decode(ops).expect("decode pushed SyncPayload");
-            {
-                let mut store = self.server_doc.lock().unwrap();
-                store.merge_ops(payload.clone()).expect("merge pushed ops");
-            }
-            self.push_payloads.lock().push(payload);
+        async fn push_ops(&self, _context_id: ContextId, _ops: &[u8]) -> Result<u64, CallError> {
+            self.push_calls.fetch_add(1, Ordering::SeqCst);
             Ok(1)
         }
     }
@@ -762,145 +490,9 @@ mod tests {
             .any(|b| b.content == needle)
     }
 
-    /// TDD item (a): a block authored WHILE a resync's fetch RPC is in
-    /// flight must survive the doc-replacing `apply_sync_state` AND still
-    /// reach the push path. Pins the old direct-call `resync_synced`
-    /// architecture's flush→apply lost-update window (docs/issues.md,
-    /// "kaijutsu-mcp — June 2026 SyncedDocument migration review", HIGH):
-    /// under that architecture, HookListener's `insert_text_block` grabbed
-    /// the mutex and mutated synchronously at ANY time, including the
-    /// window between `resync_synced`'s flush and its `apply_sync_state` —
-    /// a block authored there was silently wiped when `*doc = new_store`
-    /// replaced the document, and never got pushed (the flush that would
-    /// have carried it already ran). This test builds the new
-    /// command-channel machinery specifically so an author can't land in
-    /// that window anymore: it either lands before the flush (and gets
-    /// pushed, so the fetched snapshot already has it) or it queues behind
-    /// the in-flight fetch and gets applied — and pushed — afterward.
-    #[tokio::test]
-    async fn author_during_resync_survives_and_reaches_push() {
-        let ctx = ContextId::new();
-        let synced = seeded_synced(ctx);
-        let (change_tx, _change_rx) = watch::channel(0u64);
-
-        let gate = Arc::new(Notify::new());
-        let backend = FakeBackend::new(ctx).with_gate(Arc::clone(&gate));
-
-        let (tx, rx) = mpsc::channel(DOC_TASK_CHANNEL_CAPACITY);
-        let handle = DocTaskHandle { tx };
-        let task = tokio::spawn(run_doc_task(
-            backend.clone(),
-            ctx,
-            Arc::clone(&synced),
-            change_tx,
-            rx,
-        ));
-
-        // Kick off a resync without awaiting its ack — we need the doc task
-        // stuck inside the (gated) fetch before we author.
-        let resync_handle = handle.clone();
-        let resync_task =
-            tokio::spawn(async move { resync_handle.resync(ResyncReason::NeedsResync).await });
-
-        // Deterministically wait until the fetch is actually in flight
-        // (past the pre-fetch drain AND the flush) rather than racing a
-        // fixed sleep.
-        tokio::time::timeout(Duration::from_secs(5), backend.wait_for_fetch_entered())
-            .await
-            .expect("fetch never entered");
-
-        // Author WHILE the fetch is stuck on the gate. This can't complete
-        // until the resync does (the task is single-threaded and busy
-        // awaiting the fetch), so it must be its own task too — awaiting it
-        // inline here, before releasing the gate, would deadlock the TEST
-        // (not the code under test).
-        let author_handle = handle.clone();
-        let author_task = tokio::spawn(async move {
-            author_handle
-                .author_blocks(vec![AuthoredBlock::Text {
-                    role: Role::User,
-                    content: "hello-mid-fetch".to_string(),
-                }], PrincipalId::for_agent_session("test-session"))
-                .await
-        });
-        // Give the author's send a moment to actually land in the mpsc
-        // buffer before we release the gate — otherwise the release could
-        // in principle race ahead of the send (unlikely given the gate's
-        // own scheduling latency, but let's not lean on luck).
-        tokio::task::yield_now().await;
-
-        // Release the fetch and let the resync (and the queued author,
-        // which the task processes right after) settle.
-        gate.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), resync_task)
-            .await
-            .expect("resync task timed out")
-            .unwrap()
-            .expect("resync itself failed");
-
-        let author_result = tokio::time::timeout(Duration::from_secs(5), author_task)
-            .await
-            .expect("author_blocks timed out — did it deadlock behind the gated fetch?")
-            .unwrap();
-        assert!(author_result.is_ok(), "author_blocks failed: {author_result:?}");
-
-        assert!(
-            doc_contains(&synced, "hello-mid-fetch"),
-            "authored block lost across the resync's flush→apply window"
-        );
-        assert!(
-            backend
-                .push_payloads()
-                .iter()
-                .any(|p| p.new_blocks.iter().any(|b| b.content == "hello-mid-fetch")),
-            "authored block never reached the push path"
-        );
-
-        task.abort();
-    }
-
-    /// TDD item (b): pushing must send only ops NEW since the last push —
-    /// not everything since the (never-advancing-for-local-edits) inbound
-    /// sync frontier. Authors N blocks one at a time; each push must carry
-    /// exactly the one new block, never a re-send of earlier ones.
-    #[tokio::test]
-    async fn push_sends_only_new_ops_each_time() {
-        let ctx = ContextId::new();
-        let synced = seeded_synced(ctx);
-        let (change_tx, _change_rx) = watch::channel(0u64);
-        let backend = FakeBackend::new(ctx);
-
-        let (handle, task) = spawn_doc_task(backend.clone(), ctx, Arc::clone(&synced), change_tx);
-
-        for i in 0..3 {
-            handle
-                .author_blocks(vec![AuthoredBlock::Text {
-                    role: Role::User,
-                    content: format!("msg-{i}"),
-                }], PrincipalId::for_agent_session("test-session"))
-                .await
-                .unwrap();
-        }
-
-        let pushes = backend.push_payloads();
-        assert_eq!(pushes.len(), 3, "expected one push per authored block");
-        for (i, payload) in pushes.iter().enumerate() {
-            assert_eq!(
-                payload.new_blocks.len(),
-                1,
-                "push {i} carried {} new blocks, expected exactly 1 (no re-send): {:?}",
-                payload.new_blocks.len(),
-                payload.new_blocks.iter().map(|b| &b.content).collect::<Vec<_>>(),
-            );
-            assert_eq!(payload.new_blocks[0].content, format!("msg-{i}"));
-        }
-
-        task.abort();
-    }
-
-    /// TDD item (c): N Resync commands already queued by the time the task
-    /// starts processing the first one must coalesce into exactly ONE
-    /// fetch, with every caller's ack completed once it's done.
+    /// N Resync commands already queued by the time the task starts
+    /// processing the first one must coalesce into exactly ONE fetch, with
+    /// every caller's ack completed once it's done.
     #[tokio::test]
     async fn queued_resyncs_coalesce_into_one_fetch() {
         let ctx = ContextId::new();
@@ -956,118 +548,61 @@ mod tests {
         task.abort();
     }
 
-    /// Reviewer-flagged durability bug (second-voice review before merge):
-    /// if `do_coalesced_resync`'s PRE-FETCH `push_new_ops` fails, proceeding
-    /// into `get_context_sync` + `apply_sync_state` anyway would wipe the
-    /// drained local `AuthorBlocks` via the doc-replacing swap AND reset
-    /// `pushed_frontier` to the fresh doc's frontier — erasing any record
-    /// that a future push needs to retry them. The fix: abort the resync
-    /// entirely on flush failure (no fetch, no apply, no frontier touch).
+    /// **The read-replica invariant** (slice 3 of the CRDT-position
+    /// migration). Authoring left this process for `authorBlock` RPCs, so
+    /// the mirror has no local writer: everything in it arrives from the
+    /// server, and it must never push anything back.
     ///
-    /// This test sends a `Resync` THEN an `AuthorBlocks` command
-    /// sequentially into the channel (not as racing concurrent tasks —
-    /// their RELATIVE order matters here) before the loop exists to
-    /// consume either, so the resync's pre-fetch drain — not the plain
-    /// `AuthorBlocks` arm, which has its own harmless "warn and retry
-    /// later" push — is what applies the block and owns the one flush
-    /// that's configured to fail.
+    /// This is the test that fails if someone reintroduces local authoring
+    /// here. That matters more than it looks — the *deletions* this slice
+    /// made safe (the pre-fetch flush, the abort-on-flush-failure guard,
+    /// `pushed_frontier`) are all justified by "nothing local exists to
+    /// lose." A new local write path would silently invalidate that
+    /// reasoning and the data it protects, and without this assertion the
+    /// suite would stay green while doing it: the block would be applied,
+    /// never pushed, and wiped by the next resync's swap.
+    ///
+    /// It drives the task through the paths that would have pushed under
+    /// the old design — a resync, and a server event applied before another
+    /// resync — and asserts `push_ops` was never called, while confirming
+    /// the mirror still converges on the server's content.
     #[tokio::test]
-    async fn resync_aborts_when_the_pre_fetch_flush_fails() {
+    async fn the_mirror_is_a_read_replica_and_never_pushes() {
         let ctx = ContextId::new();
         let synced = seeded_synced(ctx);
         let (change_tx, _change_rx) = watch::channel(0u64);
         let backend = FakeBackend::new(ctx);
+        backend.seed_server_block("from-the-server");
 
-        let (tx, rx) = mpsc::channel(DOC_TASK_CHANNEL_CAPACITY);
+        let (handle, task) = spawn_doc_task(backend.clone(), ctx, Arc::clone(&synced), change_tx);
 
-        let (resync_done, resync_ack) = oneshot::channel();
-        tx.send(DocCommand::Resync {
-            reason: ResyncReason::NeedsResync,
-            done: Some(resync_done),
-        })
-        .await
-        .unwrap();
-
-        let (author_done, author_ack) = oneshot::channel();
-        tx.send(DocCommand::AuthorBlocks {
-            blocks: vec![AuthoredBlock::Text {
-                role: Role::User,
-                content: "unpushed".to_string(),
-            }],
-            principal: PrincipalId::for_agent_session("test-session"),
-            done: author_done,
-        })
-        .await
-        .unwrap();
-
-        // The ONE push this resync's flush will attempt must fail.
-        backend.fail_next_pushes(1);
-
-        let task = tokio::spawn(run_doc_task(
-            backend.clone(),
-            ctx,
-            Arc::clone(&synced),
-            change_tx,
-            rx,
-        ));
-
-        let author_result = tokio::time::timeout(Duration::from_secs(5), author_ack)
+        handle
+            .resync(ResyncReason::Reconnected)
             .await
-            .expect("author ack timed out")
-            .expect("author oneshot dropped");
+            .expect("resync failed");
+
         assert!(
-            author_result.is_ok(),
-            "author, applied during the resync's pre-fetch drain, must still succeed: \
-             {author_result:?}"
+            doc_contains(&synced, "from-the-server"),
+            "the mirror must converge on the server's content"
         );
 
-        let resync_result = tokio::time::timeout(Duration::from_secs(5), resync_ack)
+        // A second round trip, this time with new server-side content, to
+        // cover the apply-then-resync path as well as the bare resync.
+        backend.seed_server_block("also-from-the-server");
+        handle
+            .resync(ResyncReason::StallFallback)
             .await
-            .expect("resync ack timed out")
-            .expect("resync oneshot dropped");
-        assert!(
-            matches!(resync_result, Err(DocTaskError::Flush(_))),
-            "resync must abort with a Flush error when its pre-fetch push fails, got: \
-             {resync_result:?}"
-        );
+            .expect("second resync failed");
 
+        assert!(
+            doc_contains(&synced, "also-from-the-server"),
+            "the mirror must keep converging across resyncs"
+        );
         assert_eq!(
-            backend.fetch_call_count(),
+            backend.push_call_count(),
             0,
-            "an aborted resync must never fetch — proceeding into apply_sync_state while \
-             ops are unflushed is exactly the bug being guarded against"
-        );
-        assert!(
-            doc_contains(&synced, "unpushed"),
-            "the authored block must survive an aborted resync untouched"
-        );
-
-        // A subsequent resync — push now succeeding — must round-trip the
-        // block safely: it reaches the server AND survives the fetch+apply.
-        let handle = DocTaskHandle { tx };
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            handle.resync(ResyncReason::NeedsResync),
-        )
-        .await
-        .expect("second resync timed out")
-        .expect("second resync (push now succeeding) must succeed");
-
-        assert_eq!(
-            backend.fetch_call_count(),
-            1,
-            "the successful resync must fetch exactly once"
-        );
-        assert!(
-            doc_contains(&synced, "unpushed"),
-            "the block must still be present after a successful round-trip"
-        );
-        assert!(
-            backend
-                .push_payloads()
-                .iter()
-                .any(|p| p.new_blocks.iter().any(|b| b.content == "unpushed")),
-            "the block must have reached the server on the successful push"
+            "the mirror must never push — it has no local writer, and the flush this \
+             slice deleted was the only thing protecting local ops from the resync swap"
         );
 
         task.abort();
