@@ -6911,6 +6911,185 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    /// Author one block on behalf of a client that is NOT a CRDT replica —
+    /// migration step 3 of `docs/crdt-position-2026-08.md`.
+    ///
+    /// The reservation half of Amy's reserve-then-flow model: short, holds
+    /// nothing, returns an id. A ToolCall authored here sits at whatever
+    /// status the caller asked for (normally `running`) until a later,
+    /// independent [`Self::complete_block`] moves it — the result is free to
+    /// arrive whenever it is ready, and concurrent tool calls share nothing
+    /// but their own ids.
+    ///
+    /// `principalId` comes from the caller by design (shared-trust model,
+    /// same as `set_context_origin_host`'s self-reported hostname), and the
+    /// `insert_*_as` family this lands on already takes an explicit
+    /// principal. An unparseable one is refused rather than silently
+    /// defaulting to the kernel's own identity — that default is exactly the
+    /// silent-authorship defect `b356fc45` and `821a16f3` removed.
+    fn author_block(
+        self: Rc<Self>,
+        params: kernel::AuthorBlockParams,
+        mut results: kernel::AuthorBlockResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "author_block").entered();
+
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let principal_id = pry!(
+            PrincipalId::try_from_slice(pry!(p.get_principal_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid principal ID".into()))
+        );
+
+        let parent_id = if p.get_has_parent_id() {
+            Some(pry!(parse_block_id_from_reader(&pry!(p.get_parent_id()))))
+        } else {
+            None
+        };
+        let after_id = if p.get_has_after_id() {
+            Some(pry!(parse_block_id_from_reader(&pry!(p.get_after_id()))))
+        } else {
+            None
+        };
+        let tool_kind = if p.get_has_tool_kind() {
+            Some(tool_kind_from_capnp(pry!(p.get_tool_kind())))
+        } else {
+            None
+        };
+
+        let role = role_from_capnp(pry!(p.get_role()));
+        let kind = block_kind_from_capnp(pry!(p.get_kind()));
+        let status = status_from_capnp(pry!(p.get_status()));
+        let content = pry!(pry!(p.get_content()).to_str()).to_owned();
+        let content_type_raw = pry!(pry!(p.get_content_type()).to_str()).to_owned();
+        let content_type = if content_type_raw.is_empty() {
+            ContentType::Plain
+        } else {
+            ContentType::from_mime(&content_type_raw)
+        };
+        let tool_name = pry!(pry!(p.get_tool_name()).to_str()).to_owned();
+        let tool_input_raw = pry!(pry!(p.get_tool_input()).to_str()).to_owned();
+
+        let store = &self.kernel.documents;
+
+        // A ToolCall carries name/input/kind, which `insert_block_as` has no
+        // parameters for — routing it there is precisely how `block_create`
+        // drops them silently. A ToolResult needs its call's id, which the
+        // caller supplies as `parentId`.
+        let result = match kind {
+            BlockKind::ToolCall => {
+                let tool_input: serde_json::Value = if tool_input_raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    match serde_json::from_str(&tool_input_raw) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            results
+                                .get()
+                                .set_error(format!("tool_input is not valid JSON: {e}"));
+                            return Promise::ok(());
+                        }
+                    }
+                };
+                store.insert_tool_call_as(
+                    context_id,
+                    parent_id.as_ref(),
+                    after_id.as_ref(),
+                    tool_name,
+                    tool_input,
+                    tool_kind,
+                    Some(principal_id),
+                    None,
+                    Some(role),
+                )
+            }
+            BlockKind::ToolResult => {
+                let Some(call_id) = parent_id.as_ref() else {
+                    results.get().set_error(
+                        "a ToolResult needs its ToolCall's id as parentId — \
+                         without it the pair is unlinked and the UI cannot \
+                         associate them"
+                            .to_string(),
+                    );
+                    return Promise::ok(());
+                };
+                store.insert_tool_result_as(
+                    context_id,
+                    call_id,
+                    after_id.as_ref(),
+                    content,
+                    status == Status::Error,
+                    None,
+                    tool_kind,
+                    Some(principal_id),
+                    None,
+                )
+            }
+            _ => store.insert_block_as(
+                context_id,
+                parent_id.as_ref(),
+                after_id.as_ref(),
+                role,
+                kind,
+                content,
+                status,
+                content_type,
+                Some(principal_id),
+            ),
+        };
+
+        match result {
+            Ok(block_id) => {
+                let mut out = results.get().init_block_id();
+                set_block_id_builder(&mut out, &block_id);
+            }
+            Err(e) => results.get().set_error(e.to_string()),
+        }
+        Promise::ok(())
+    }
+
+    /// Move an already-authored block to a terminal state — the flow half of
+    /// reserve-then-flow. Called whenever the work finishes, with no lock
+    /// held since the reservation and no ordering relationship to any other
+    /// tool call in flight.
+    fn complete_block(
+        self: Rc<Self>,
+        params: kernel::CompleteBlockParams,
+        mut results: kernel::CompleteBlockResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "complete_block").entered();
+
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let block_id = pry!(parse_block_id_from_reader(&pry!(p.get_block_id())));
+        let status = status_from_capnp(pry!(p.get_status()));
+
+        let store = &self.kernel.documents;
+
+        if p.get_has_exit_code()
+            && let Err(e) = store.set_exit_code(context_id, &block_id, Some(p.get_exit_code()))
+        {
+            results.get().set_success(false);
+            results.get().set_error(format!("set_exit_code failed: {e}"));
+            return Promise::ok(());
+        }
+
+        match store.set_status(context_id, &block_id, status) {
+            Ok(()) => results.get().set_success(true),
+            Err(e) => {
+                results.get().set_success(false);
+                results.get().set_error(e.to_string());
+            }
+        }
+        Promise::ok(())
+    }
+
     /// Archive a single context — the well's single-keystroke archive
     /// action. Unlike the `kj context archive` builtin (latched, recurses
     /// into structural children), this is single-context, not latched, no
@@ -8614,6 +8793,57 @@ fn error_severity_to_capnp(
 }
 
 /// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
+// ── Wire → kernel enum conversions (inbound RPC authoring, @106/@107) ──────
+//
+// The `*_to_capnp` twins below have existed since the server only ever
+// SERIALIZED blocks outward. `authorBlock` is the first verb that accepts
+// them inbound, so these are the inverses. Each is an exhaustive match, so
+// adding a wire variant without giving it a kernel meaning is a compile
+// error rather than a silent mis-mapping.
+
+fn role_from_capnp(role: crate::kaijutsu_capnp::Role) -> Role {
+    match role {
+        crate::kaijutsu_capnp::Role::User => Role::User,
+        crate::kaijutsu_capnp::Role::Model => Role::Model,
+        crate::kaijutsu_capnp::Role::System => Role::System,
+        crate::kaijutsu_capnp::Role::Tool => Role::Tool,
+        crate::kaijutsu_capnp::Role::Asset => Role::Asset,
+    }
+}
+
+fn status_from_capnp(status: crate::kaijutsu_capnp::Status) -> Status {
+    match status {
+        crate::kaijutsu_capnp::Status::Pending => Status::Pending,
+        crate::kaijutsu_capnp::Status::Running => Status::Running,
+        crate::kaijutsu_capnp::Status::Done => Status::Done,
+        crate::kaijutsu_capnp::Status::Error => Status::Error,
+    }
+}
+
+fn tool_kind_from_capnp(tk: crate::kaijutsu_capnp::ToolKind) -> kaijutsu_crdt::ToolKind {
+    match tk {
+        crate::kaijutsu_capnp::ToolKind::Shell => kaijutsu_crdt::ToolKind::Shell,
+        crate::kaijutsu_capnp::ToolKind::Mcp => kaijutsu_crdt::ToolKind::Mcp,
+        crate::kaijutsu_capnp::ToolKind::Builtin => kaijutsu_crdt::ToolKind::Builtin,
+    }
+}
+
+fn block_kind_from_capnp(kind: crate::kaijutsu_capnp::BlockKind) -> BlockKind {
+    match kind {
+        crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
+        crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
+        crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
+        crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+        crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
+        crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+        crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
+        crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
+        crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
+        crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
+        crate::kaijutsu_capnp::BlockKind::Task => BlockKind::Task,
+    }
+}
+
 fn tool_kind_to_capnp(tk: kaijutsu_crdt::ToolKind) -> crate::kaijutsu_capnp::ToolKind {
     match tk {
         kaijutsu_crdt::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,

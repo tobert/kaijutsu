@@ -512,6 +512,137 @@ fn hook_authored_blocks_belong_to_the_agent_session() {
     });
 }
 
+/// RPC authoring, end to end over the real wire — `authorBlock @106` and
+/// `completeBlock @107`, migration step 3 of `docs/crdt-position-2026-08.md`.
+///
+/// This is the surface that replaces client-side replication, so it is
+/// tested against the *server's* view: everything asserted below is read
+/// back with `get_all_blocks`, never from a local mirror.
+///
+/// What it pins is exactly what the tempting shortcut drops. Routing tool
+/// blocks through the existing `block_create` tool would lose `tool_name`
+/// and `tool_input` — that verb parses a `metadata` argument and never reads
+/// it — and would hardcode status and ordering, all without erroring. Every
+/// assertion here is one of those silent losses made loud.
+///
+/// It also exercises reserve-then-flow as its own shape: the call is
+/// authored `Running` and *stays* pending across a separate round trip
+/// before `completeBlock` moves it, which is the model Amy asked for — a
+/// quick reservation, then a result that flows when it is ready.
+#[test]
+fn rpc_authoring_carries_tool_fields_and_completes_independently() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let reg = auto_register_with_retry(&mcp, "rpc-authoring-e2e").await;
+        assert!(
+            reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            "register_session_auto failed: {reg}"
+        );
+
+        let Backend::Remote(remote) = mcp.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let context_id = remote
+            .shared_context_id
+            .lock()
+            .expect("context id mutex")
+            .expect("registered context");
+
+        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("sess-rpc-authoring");
+
+        // Reserve: short call, returns an id, holds nothing.
+        let call_id = remote
+            .actor
+            .author_block(kaijutsu_client::AuthorBlock::tool_call(
+                context_id,
+                principal,
+                "Bash",
+                serde_json::json!({"command": "ls -la /tmp"}),
+                Some(kaijutsu_crdt::ToolKind::Mcp),
+            ))
+            .await
+            .expect("authorBlock(tool_call)");
+
+        // Pending is a legitimate state, observable from the server between
+        // the reservation and the result. Asserting it here is what makes
+        // this a reserve-then-flow test rather than two writes in a trench
+        // coat.
+        let mid = remote
+            .actor
+            .get_all_blocks(context_id)
+            .await
+            .expect("get_all_blocks");
+        let pending = mid
+            .iter()
+            .find(|b| b.id == call_id)
+            .expect("the reserved ToolCall must be visible before its result");
+        assert_eq!(
+            pending.status,
+            Status::Running,
+            "a reserved call is pending until its result flows — not an orphan"
+        );
+        assert_eq!(pending.tool_name.as_deref(), Some("Bash"));
+        assert!(
+            pending
+                .tool_input
+                .as_deref()
+                .is_some_and(|i| i.contains("ls -la /tmp")),
+            "tool_input must survive the wire, got: {:?}",
+            pending.tool_input
+        );
+
+        // Flow: the result arrives later, as its own call, linked to the
+        // reservation.
+        let result_id = remote
+            .actor
+            .author_block(kaijutsu_client::AuthorBlock::tool_result(
+                context_id,
+                principal,
+                call_id,
+                "total 0",
+                false,
+                Some(kaijutsu_crdt::ToolKind::Mcp),
+            ))
+            .await
+            .expect("authorBlock(tool_result)");
+
+        remote
+            .actor
+            .complete_block(context_id, call_id, Status::Done, false, Some(0))
+            .await
+            .expect("completeBlock");
+
+        let after = remote
+            .actor
+            .get_all_blocks(context_id)
+            .await
+            .expect("get_all_blocks");
+
+        let call = after.iter().find(|b| b.id == call_id).expect("call present");
+        assert_eq!(
+            call.status,
+            Status::Done,
+            "completeBlock must move the reservation to its terminal state"
+        );
+        assert_eq!(
+            call.id.principal_id, principal,
+            "RPC-authored blocks carry the caller's principal, not the kernel's"
+        );
+
+        let result = after
+            .iter()
+            .find(|b| b.id == result_id)
+            .expect("result present");
+        assert_eq!(
+            result.parent_id.as_ref(),
+            Some(&call_id),
+            "the result must be linked to its call server-side"
+        );
+        assert_eq!(result.content, "total 0");
+    });
+}
+
 /// docs/issues.md "cc-* hook re-registration mints a new context per MCP
 /// relaunch": an MCP process relaunch (process death + respawn, `/mcp
 /// reconnect`) within the SAME Claude Code session must reattach to the

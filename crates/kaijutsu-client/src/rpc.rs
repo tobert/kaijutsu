@@ -38,6 +38,156 @@ impl Drop for RpcSystemGuardInner {
     }
 }
 
+/// One block to author over RPC (`authorBlock @106`).
+///
+/// A struct rather than fifteen positional arguments, and every optional
+/// field is genuinely optional: `None` parent = root, `None` after = append,
+/// `None` tool fields = not a tool block. Constructors cover the two shapes
+/// that actually occur; build one by hand for anything else.
+#[derive(Debug, Clone)]
+pub struct AuthorBlock {
+    pub context_id: ContextId,
+    /// The authoring identity. Callers pass their agent-session principal
+    /// (`PrincipalId::for_agent_session`) so a block names the agent that
+    /// caused it, and keeps naming it across process restarts.
+    pub principal_id: PrincipalId,
+    pub role: Role,
+    pub kind: BlockKind,
+    pub status: Status,
+    pub content: String,
+    /// MIME hint; `None` = let the kernel's heuristic decide.
+    pub content_type: Option<String>,
+    /// For a ToolResult this is REQUIRED and is the ToolCall's id — the
+    /// server refuses an unlinked result rather than orphaning the pair.
+    pub parent_id: Option<BlockId>,
+    pub after_id: Option<BlockId>,
+    pub tool_name: Option<String>,
+    pub tool_input: Option<serde_json::Value>,
+    pub tool_kind: Option<ToolKind>,
+}
+
+impl AuthorBlock {
+    /// A plain text block, appended.
+    pub fn text(
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        role: Role,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            context_id,
+            principal_id,
+            role,
+            kind: BlockKind::Text,
+            status: Status::Done,
+            content: content.into(),
+            content_type: None,
+            parent_id: None,
+            after_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_kind: None,
+        }
+    }
+
+    /// A tool call, reserved at `Status::Running`.
+    ///
+    /// Running is the honest default: the tool has not finished, and under
+    /// reserve-then-flow the result arrives later on its own schedule. A
+    /// ToolCall sitting at Running is a pending state, not an orphan —
+    /// completing it is [`RpcClient::complete_block`]'s job.
+    pub fn tool_call(
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        tool_name: impl Into<String>,
+        tool_input: serde_json::Value,
+        tool_kind: Option<ToolKind>,
+    ) -> Self {
+        Self {
+            context_id,
+            principal_id,
+            role: Role::Tool,
+            kind: BlockKind::ToolCall,
+            status: Status::Running,
+            content: String::new(),
+            content_type: None,
+            parent_id: None,
+            after_id: None,
+            tool_name: Some(tool_name.into()),
+            tool_input: Some(tool_input),
+            tool_kind,
+        }
+    }
+
+    /// A tool result, linked to the call it answers.
+    pub fn tool_result(
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        call_id: BlockId,
+        content: impl Into<String>,
+        is_error: bool,
+        tool_kind: Option<ToolKind>,
+    ) -> Self {
+        Self {
+            context_id,
+            principal_id,
+            role: Role::Tool,
+            kind: BlockKind::ToolResult,
+            status: if is_error { Status::Error } else { Status::Done },
+            content: content.into(),
+            content_type: None,
+            parent_id: Some(call_id),
+            after_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_kind,
+        }
+    }
+}
+
+fn role_to_capnp(role: Role) -> crate::kaijutsu_capnp::Role {
+    match role {
+        Role::User => crate::kaijutsu_capnp::Role::User,
+        Role::Model => crate::kaijutsu_capnp::Role::Model,
+        Role::System => crate::kaijutsu_capnp::Role::System,
+        Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+        Role::Asset => crate::kaijutsu_capnp::Role::Asset,
+    }
+}
+
+fn status_to_capnp(status: Status) -> crate::kaijutsu_capnp::Status {
+    match status {
+        Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+        Status::Running => crate::kaijutsu_capnp::Status::Running,
+        Status::Done => crate::kaijutsu_capnp::Status::Done,
+        Status::Error => crate::kaijutsu_capnp::Status::Error,
+    }
+}
+
+fn tool_kind_to_capnp(tk: ToolKind) -> crate::kaijutsu_capnp::ToolKind {
+    match tk {
+        ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
+        ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
+        ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
+    }
+}
+
+fn block_kind_to_capnp(kind: BlockKind) -> crate::kaijutsu_capnp::BlockKind {
+    match kind {
+        BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+        BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+        BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+        BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+        BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+        BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+        BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+        BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
+        BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
+        BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+        BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
+    }
+}
+
 /// RPC client wrapper
 ///
 /// Holds the World capability bootstrapped from the server.
@@ -1669,6 +1819,109 @@ impl KernelHandle {
                 .get_error()?
                 .to_str()
                 .unwrap_or("set_context_origin_host failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
+    /// Author one block over RPC — no CRDT replication required.
+    ///
+    /// The client half of migration step 3
+    /// (`docs/crdt-position-2026-08.md`). See [`AuthorBlock`] for the field
+    /// meanings; the reservation/flow split is documented on the schema.
+    #[tracing::instrument(skip(self, req), name = "rpc_client.author_block")]
+    pub async fn author_block(&self, req: &AuthorBlock) -> Result<BlockId, RpcError> {
+        let mut request = self.kernel.author_block_request();
+        {
+            let mut b = request.get();
+            b.set_context_id(req.context_id.as_bytes());
+            b.set_principal_id(req.principal_id.as_bytes());
+            b.set_role(role_to_capnp(req.role));
+            b.set_kind(block_kind_to_capnp(req.kind));
+            b.set_status(status_to_capnp(req.status));
+            b.set_content(&req.content);
+            b.set_content_type(req.content_type.as_deref().unwrap_or(""));
+            b.set_tool_name(req.tool_name.as_deref().unwrap_or(""));
+            let tool_input = req
+                .tool_input
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            b.set_tool_input(&tool_input);
+            b.set_has_tool_kind(req.tool_kind.is_some());
+            if let Some(tk) = req.tool_kind {
+                b.set_tool_kind(tool_kind_to_capnp(tk));
+            }
+            b.set_has_parent_id(req.parent_id.is_some());
+            if let Some(ref id) = req.parent_id {
+                let mut p = b.reborrow().init_parent_id();
+                p.set_context_id(id.context_id.as_bytes());
+                p.set_principal_id(id.principal_id.as_bytes());
+                p.set_seq(id.seq);
+            }
+            b.set_has_after_id(req.after_id.is_some());
+            if let Some(ref id) = req.after_id {
+                let mut a = b.reborrow().init_after_id();
+                a.set_context_id(id.context_id.as_bytes());
+                a.set_principal_id(id.principal_id.as_bytes());
+                a.set_seq(id.seq);
+            }
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = b.init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        let err = reader.get_error()?.to_str().unwrap_or("");
+        if !err.is_empty() {
+            return Err(RpcError::ServerError(err.to_string()));
+        }
+        let id = reader.get_block_id()?;
+        Ok(BlockId {
+            context_id: ContextId::try_from_slice(id.get_context_id()?)
+                .ok_or_else(|| RpcError::ServerError("invalid context_id".into()))?,
+            principal_id: PrincipalId::try_from_slice(id.get_principal_id()?)
+                .ok_or_else(|| RpcError::ServerError("invalid principal_id".into()))?,
+            seq: id.get_seq(),
+        })
+    }
+
+    /// Move an already-authored block to a terminal state — the flow half of
+    /// reserve-then-flow.
+    #[tracing::instrument(skip(self), name = "rpc_client.complete_block")]
+    pub async fn complete_block(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        status: Status,
+        is_error: bool,
+        exit_code: Option<i32>,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.complete_block_request();
+        {
+            let mut b = request.get();
+            b.set_context_id(context_id.as_bytes());
+            b.set_status(status_to_capnp(status));
+            b.set_is_error(is_error);
+            b.set_has_exit_code(exit_code.is_some());
+            b.set_exit_code(exit_code.unwrap_or(0));
+            {
+                let mut id = b.reborrow().init_block_id();
+                id.set_context_id(block_id.context_id.as_bytes());
+                id.set_principal_id(block_id.principal_id.as_bytes());
+                id.set_seq(block_id.seq);
+            }
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = b.init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader.get_error()?.to_str().unwrap_or("complete_block failed");
             Err(RpcError::ServerError(msg.to_string()))
         }
     }

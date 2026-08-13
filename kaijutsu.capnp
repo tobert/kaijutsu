@@ -1867,6 +1867,74 @@ interface Kernel {
   # self-report, and a failed call here is non-fatal to the caller's own
   # registration (log-and-continue, never a hard failure over a hostname).
   setContextOriginHost @105 (contextId :Data, originHost :Text, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # ── RPC authoring (docs/crdt-position-2026-08.md, migration step 3) ───────
+  #
+  # The verbs that let a client author blocks WITHOUT being a CRDT replica.
+  # `kaijutsu-mcp` is the last client that still pushes ops; these replace
+  # that path, after which `pushOps` has zero production callers and the
+  # Option-2 client contract ("consume a projected stream, author via RPC")
+  # is real rather than aspirational.
+  #
+  # Why not the existing `block_create` MCP tool: it hardcodes `after`,
+  # `Status::Done` and `ContentType::Plain`, and its `metadata` argument is
+  # parsed and then never read — so tool blocks routed through it arrive with
+  # no name and no input, and NOTHING errors. That silent-drop is exactly
+  # what these verbs exist to avoid, which is why every tool field below is
+  # a first-class parameter.
+  #
+  # Shape follows Amy's ruling (2026-08-13): a tool call and its result take
+  # "a quick lock at startup, then run independently … so the async result
+  # can flow when it's ready." So authoring is a RESERVATION, not a
+  # transaction. `authorBlock` is short and returns an id; the result arrives
+  # later as its own `authorBlock` (parented to the call) plus a
+  # `completeBlock` on the call. Concurrent tool calls share nothing but their
+  # own ids, and a ToolCall sitting at `running` is a legitimate pending state
+  # — the tool really is still running — not an orphan. Serialization, where a
+  # tool needs it, is that tool's choice rather than a property baked in here.
+
+  # Author one block. `principalId` is supplied by the caller: shared-trust
+  # model, same as `setContextOriginHost`'s self-reported hostname, and the
+  # kernel-side `insert_block_as` this lands on already takes an explicit
+  # principal. Callers pass their agent-session principal
+  # (`PrincipalId::for_agent_session`) so a block names the agent that caused
+  # it and keeps naming it across process restarts.
+  #
+  # Empty `Data`/`Text` means absent: no `parentId` = root, no `afterId` =
+  # append, no `toolName`/`toolInput` = not a tool block. `contentType` is the
+  # MIME hint (empty = heuristic detection), matching `BlockSnapshot`.
+  authorBlock @106 (
+    contextId :Data,
+    principalId :Data,
+    role :Role,
+    kind :BlockKind,
+    status :Status,
+    content :Text,
+    contentType :Text,
+    parentId :BlockId,
+    hasParentId :Bool,
+    afterId :BlockId,
+    hasAfterId :Bool,
+    toolName :Text,
+    toolInput :Text,
+    toolKind :ToolKind,
+    hasToolKind :Bool,
+    trace :TraceContext
+  ) -> (blockId :BlockId, error :Text);
+
+  # Move an already-authored block to a terminal state once its work
+  # finishes. The other half of reserve-then-flow: whoever reserved the block
+  # calls this whenever the result is ready, with no lock held in between and
+  # no ordering relationship to any other tool call in flight.
+  completeBlock @107 (
+    contextId :Data,
+    blockId :BlockId,
+    status :Status,
+    isError :Bool,
+    exitCode :Int32,
+    hasExitCode :Bool,
+    trace :TraceContext
+  ) -> (success :Bool, error :Text);
 }
 
 # ============================================================================

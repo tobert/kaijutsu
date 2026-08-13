@@ -26,7 +26,7 @@ pub use actor::{
     PeerInvocation, spawn_actor,
 };
 pub use rpc::{
-    Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
+    AuthorBlock, Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellValue, SimilarContext, SnapshotNode, SnapshotResult, StagedDriftInfo,

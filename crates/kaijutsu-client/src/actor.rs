@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kaijutsu_crdt::{ContextId, KernelId};
-use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot};
+use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot, Status};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -349,6 +349,22 @@ enum RpcCommand {
     SetContextOriginHost {
         context_id: ContextId,
         origin_host: String,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    /// Author one block over RPC — `authorBlock @106`, the path that lets a
+    /// client write blocks without being a CRDT replica.
+    AuthorBlock {
+        req: Box<crate::rpc::AuthorBlock>,
+        reply: oneshot::Sender<Result<BlockId, CallError>>,
+    },
+    /// Move an already-authored block to a terminal state — `completeBlock
+    /// @107`, the flow half of reserve-then-flow.
+    CompleteBlock {
+        context_id: ContextId,
+        block_id: BlockId,
+        status: Status,
+        is_error: bool,
+        exit_code: Option<i32>,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
     ArchiveContext {
@@ -680,6 +696,8 @@ impl RpcCommand {
             Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextPaused { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextOriginHost { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::AuthorBlock { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::CompleteBlock { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ArchiveContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -951,6 +969,40 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::SetContextOriginHost {
             context_id,
             origin_host: origin_host.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Author one block over RPC. See `crate::rpc::AuthorBlock` for the
+    /// field meanings and `docs/crdt-position-2026-08.md` for why this
+    /// exists.
+    pub async fn author_block(
+        &self,
+        req: crate::rpc::AuthorBlock,
+    ) -> Result<BlockId, CallError> {
+        self.send(|reply| RpcCommand::AuthorBlock {
+            req: Box::new(req),
+            reply,
+        })
+        .await
+    }
+
+    /// Complete an already-authored block.
+    pub async fn complete_block(
+        &self,
+        context_id: ContextId,
+        block_id: BlockId,
+        status: Status,
+        is_error: bool,
+        exit_code: Option<i32>,
+    ) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::CompleteBlock {
+            context_id,
+            block_id,
+            status,
+            is_error,
+            exit_code,
             reply,
         })
         .await
@@ -2858,6 +2910,18 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::SetContextPaused { context_id, paused, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_paused(context_id, paused));
+        }
+        RpcCommand::AuthorBlock { req, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.author_block(&req));
+        }
+        RpcCommand::CompleteBlock { context_id, block_id, status, is_error, exit_code, reply } => {
+            dispatch!(
+                kernel,
+                reply,
+                close_tx,
+                k,
+                k.complete_block(context_id, &block_id, status, is_error, exit_code)
+            );
         }
         RpcCommand::SetContextOriginHost { context_id, origin_host, reply } => {
             dispatch!(
