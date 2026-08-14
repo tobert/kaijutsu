@@ -35,6 +35,19 @@ melted into this doc.
   a library (`claude` 2.1.232 and `gemini` 0.45.0 are installed here;
   `codex` is not) — which is lane (A) below and already works over
   kaijutsu-mcp. Judge the wheel on lanes 2 and 3.
+
+  **Refined 2026-08-14 (same day): the hinge is library vs binary, and the
+  block above overstates the case against the CLI.** Verified since: the
+  Agent SDKs *do* spawn a `claude` binary as their transport — they bundle
+  their own and expose `pathToClaudeCodeExecutable` — so "does not spawn the
+  CLI" was true of *auth* and false of *transport*. Those are separable and
+  had been fused. The quoted policy line governs third-party developers
+  **offering claude.ai login or rate limits for their products**, i.e.
+  productizing someone else's seat; it is not a statement about Amy driving
+  her own logged-in install on her own machine for herself, which is what
+  the 2026-08-09 read described. So that read stands for the binary seam and
+  the paragraph above stands for the library seam. **The policy call remains
+  Amy's** — this only fixes which question the evidence answers.
 - **Notebooks, science, MIDI.** A Jupyter cell that joins a context, reads
   the score, emits blocks.
 - **Sandbox/venv experiment space** for agent-callable Python (see
@@ -77,8 +90,18 @@ work it doesn't do:
   escalation. See `docs/codex-app-backend.md`. The broader policy and exec
   ownership questions remain gated before persistent/action-capable backends.
 
-The wheel is orthogonal to both. It is a *native Python handle* for lanes 2
-and 3 (notebooks, science, MIDI, agent-callable venvs) — build it on that
+- **(C) Neither — kaijutsu *messages* a harness it does not drive.** Added
+  2026-08-14. Claude Code sessions bind a per-session unix socket and accept
+  a message into their inbox; kaijutsu writes to it as a peer. Amy's framing:
+  *"like a drift with `--drive`."* No inference is driven, no auth is touched,
+  and nothing is metered — her sessions spend her seat because she started
+  them herself in a mux. It is the cheapest of the three and the only one
+  with no policy question attached. Protocol measured and design recorded in
+  `docs/issues.md` ("drift --drive"). Note the socket is a **write-only
+  inbox, not an RPC** — read-shaped data comes from the on-disk registry.
+
+The wheel is orthogonal to all three. It is a *native Python handle* for lanes
+2 and 3 (notebooks, science, MIDI, agent-callable venvs) — build it on that
 case or not at all.
 
 ## Shape
