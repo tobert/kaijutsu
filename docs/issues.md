@@ -830,6 +830,15 @@ axes — don't expect one normalized shape to cover both halves.
 
 ## Pythonic player: kaijutsu-py wheel (2026-08-09, Amy: "shape B — the pythonic player")
 
+### Codex app-server backend follow-through (phase 0 shipped 2026-08-14)
+
+The connect-only, read-only protocol checkpoint and target design are in
+`docs/codex-app-backend.md`. Amy authorized one kernel-managed sidecar; next
+is its central lifecycle owner, then durable context↔Codex thread identity,
+context/cwd/trigger BlockId carriage, token usage/interrupt, and a dynamic-tool
+bridge over the broker. Disable Codex's native execution tools; Codex shell
+calls should land on the same EmbeddedKaish-backed tool as every other model.
+
 New crate `crates/kaijutsu-py`: cdylib built by maturin, pyo3 isolated to this
 one crate, wrapping `kaijutsu-client`'s ActorHandle into a `kaijutsu` Python
 package — any Python process becomes a first-class player. Serves three

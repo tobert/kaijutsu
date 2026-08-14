@@ -28,6 +28,7 @@
 //! core at Google's OpenAI-shaped endpoint) when it's needed.
 
 pub mod claude;
+pub mod codex;
 pub mod config;
 pub mod db_config;
 pub mod deepseek;
@@ -53,8 +54,12 @@ pub use stream::{
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 
 use serde::{Deserialize, Serialize};
+use futures::{SinkExt, StreamExt};
+use std::io;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Default model to use when none specified.
 
@@ -408,9 +413,169 @@ pub enum Provider {
     /// lemonade / llama.cpp server, Ollama, or OpenAI itself (see
     /// `llm/openai/`). Auth is optional; the provider name is config-driven.
     OpenAi(openai::Client),
+    /// Experimental Codex app-server daemon, reached over a configured
+    /// `ws://`/`wss://` endpoint. The provider never launches Codex itself.
+    CodexApp(CodexAppClient),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
+}
+
+/// Connect-only Codex app-server backend configuration.
+#[derive(Clone, Debug)]
+pub struct CodexAppClient {
+    name: String,
+    endpoint: String,
+}
+
+struct CodexWsTransport {
+    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+}
+
+impl CodexWsTransport {
+    async fn connect(endpoint: &str) -> codex::Result<Self> {
+        let (socket, _) = connect_async(endpoint).await.map_err(|error| {
+            codex::CodexError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string()))
+        })?;
+        Ok(Self { socket })
+    }
+}
+
+#[async_trait::async_trait]
+impl codex::JsonlTransport for CodexWsTransport {
+    async fn receive(&mut self) -> codex::Result<Option<serde_json::Value>> {
+        loop {
+            match self.socket.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    return Ok(Some(serde_json::from_str(text.as_ref())?));
+                }
+                Some(Ok(WsMessage::Binary(bytes))) => {
+                    return Ok(Some(serde_json::from_slice(&bytes)?));
+                }
+                Some(Ok(WsMessage::Close(_))) | None => return Ok(None),
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => {
+                    return Err(codex::CodexError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        error.to_string(),
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn send(&mut self, value: serde_json::Value) -> codex::Result<()> {
+        let encoded = serde_json::to_string(&value)?;
+        self.socket
+            .send(WsMessage::Text(encoded.into()))
+            .await
+            .map_err(|error| {
+                codex::CodexError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
+            })
+    }
+
+    async fn close(&mut self) -> codex::Result<()> {
+        self.socket.close(None).await.map_err(|error| {
+            codex::CodexError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
+        })
+    }
+}
+
+pub struct CodexStream {
+    client: codex::Client<CodexWsTransport>,
+}
+
+impl CodexAppClient {
+    async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<ProviderStream> {
+        let transport = CodexWsTransport::connect(&self.endpoint)
+            .await
+            .map_err(|error| LlmError::NetworkError(error.to_string()))?;
+        let mut client = codex::Client::new(transport);
+        client
+            .initialize("kaijutsu", env!("CARGO_PKG_VERSION"))
+            .await
+            .map_err(|error| LlmError::ApiError(error.to_string()))?;
+        let thread_id = client
+            .start_thread(codex::ThreadStart {
+                model: Some(opts.model.clone()),
+                developer_instructions: opts.system.clone(),
+                sandbox: Some("read-only".to_string()),
+                approval_policy: Some("untrusted".to_string()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| LlmError::ApiError(error.to_string()))?;
+        client
+            .start_turn(codex::TurnStart {
+                thread_id,
+                text: flatten_codex_messages(&messages),
+                model: Some(opts.model),
+                effort: opts.effort,
+            })
+            .await
+            .map_err(|error| LlmError::ApiError(error.to_string()))?;
+        Ok(ProviderStream::Codex(CodexStream { client }))
+    }
+
+    async fn prompt(&self, model: &str, system: Option<&str>, prompt: &str) -> LlmResult<String> {
+        let mut stream = self
+            .stream(
+                BuildOpts {
+                    model: model.to_string(),
+                    system: system.map(str::to_owned),
+                    ..BuildOpts::new(model)
+                },
+                vec![Message::user(prompt)],
+            )
+            .await?;
+        let mut output = String::new();
+        while let Some(event) = stream.next_event().await {
+            match event {
+                StreamEvent::TextDelta(delta) => output.push_str(&delta),
+                StreamEvent::Done { .. } => break,
+                StreamEvent::Error(error) => return Err(LlmError::ApiError(error)),
+                _ => {}
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn flatten_codex_messages(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let role = match message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            format!("[{role}] {}", flatten_codex_content(&message.content))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn flatten_codex_content(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("tool call {name}: {input}")
+                }
+                ContentBlock::ToolResult { content, is_error, .. } => {
+                    format!("tool result (error={is_error}): {content}")
+                }
+                ContentBlock::Image { hash, media_type, .. } => {
+                    format!("[image {media_type}, CAS {hash}]")
+                }
+                ContentBlock::Reasoning { text, .. } => format!("[reasoning] {text}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 /// Resolve a backend's API key, falling back to a placeholder when
@@ -496,6 +661,22 @@ impl Provider {
                 }
                 Ok(Self::OpenAi(client))
             }
+            BackendKind::CodexApp => {
+                let endpoint = config.base_url.clone().ok_or_else(|| {
+                    LlmError::InvalidRequest(format!(
+                        "backend '{}' has kind 'codex-app', which requires --base-url \
+                         (ws:// or wss:// Codex app-server endpoint)",
+                        config.name
+                    ))
+                })?;
+                if !(endpoint.starts_with("ws://") || endpoint.starts_with("wss://")) {
+                    return Err(LlmError::InvalidRequest(format!(
+                        "backend '{}' codex-app endpoint must use ws:// or wss://, got {}",
+                        config.name, endpoint
+                    )));
+                }
+                Ok(Self::CodexApp(CodexAppClient { name: config.name.clone(), endpoint }))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             BackendKind::Mock => Ok(Self::Mock(MockClient::new(format!(
                 "Mock summary for testing (backend: {}).",
@@ -529,6 +710,7 @@ impl Provider {
             Self::Claude(_) => "anthropic",
             Self::DeepSeek(_) => "deepseek",
             Self::OpenAi(c) => c.provider_name(),
+            Self::CodexApp(c) => &c.name,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
@@ -555,6 +737,7 @@ impl Provider {
             Self::Claude(client) => client.prompt(model, system, prompt).await,
             Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
             Self::OpenAi(client) => client.prompt(model, system, prompt).await,
+            Self::CodexApp(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 if !mock.delay.is_zero() {
@@ -593,6 +776,7 @@ impl Provider {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::OpenAi(stream))
             }
+            Self::CodexApp(client) => client.stream(opts, messages).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 let events = if let Some(script) = &mock.scripted {
@@ -630,6 +814,7 @@ impl Provider {
             Self::Claude(c) => c.available_models(),
             Self::DeepSeek(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
+            Self::CodexApp(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }
@@ -646,6 +831,8 @@ pub enum ProviderStream {
     /// Every OpenAI-compatible provider (DeepSeek and the generic `OpenAi`
     /// variant) streams through the one `openai::Stream`.
     OpenAi(openai::Stream),
+    /// Codex app-server's translated event stream.
+    Codex(CodexStream),
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
@@ -668,6 +855,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.next_event().await,
             Self::OpenAi(s) => s.next_event().await,
+            Self::Codex(s) => s.client.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(state) => match state.events.pop_front() {
                 Some(ev) => Some(ev),
@@ -682,6 +870,9 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.cancel(),
             Self::OpenAi(s) => s.cancel(),
+            // Phase 0 has no synchronous interrupt hook in ProviderStream;
+            // dropping the stream closes the daemon connection at turn end.
+            Self::Codex(_) => {}
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => {}
         }

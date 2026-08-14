@@ -115,6 +115,9 @@ base64 = "0.22"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 eventsource-stream = "0.2"
 bytes = "1"
+# Codex app-server's daemon transport (`--listen ws://...`). The provider is
+# connect-only: launching the daemon remains an external process-owner concern.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 # /r client shares (docs/slash-r.md): ShareFs plays the SFTP *client* role
 # against a client's share server (russh-sftp's role swap).

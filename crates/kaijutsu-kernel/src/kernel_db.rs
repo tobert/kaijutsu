@@ -900,10 +900,12 @@ CREATE TABLE IF NOT EXISTS client_views (
 --
 -- `name` is free-form and unique (the handle you type: `anthropic`, `gpt`,
 -- `ollama`, `zorak`); `kind` is a CLOSED enum owned by code, mapping onto
--- the `Provider` variants (Claude / DeepSeek / OpenAi). The old TOML
+-- the `Provider` variants (Claude / DeepSeek / OpenAi / Codex app-server).
+-- The old TOML
 -- conflated the two — the `[providers.<name>]` table name WAS the type, so
 -- you could not run two Anthropic gateways or name a local server anything
--- but `ollama`/`lemonade`/`local`. `mock` is a test-only kind: the CHECK
+-- but `ollama`/`lemonade`/`local`. `codex-app` is the experimental local
+-- Codex app-server JSONL backend. `mock` is a test-only kind: the CHECK
 -- admits it so the test harness can seed one, but `BackendKind::parse`
 -- rejects it unless the `test-mock` feature is on.
 --
@@ -914,7 +916,7 @@ CREATE TABLE IF NOT EXISTS backends (
     backend_id           BLOB NOT NULL PRIMARY KEY,
     name                 TEXT NOT NULL UNIQUE,
     kind                 TEXT NOT NULL
-        CHECK (kind IN ('anthropic', 'deepseek', 'openai', 'mock')),
+        CHECK (kind IN ('anthropic', 'deepseek', 'openai', 'codex-app', 'mock')),
     base_url             TEXT,
     api_key_env          TEXT,
     api_key_file         TEXT,
@@ -1436,7 +1438,71 @@ impl KernelDb {
         }
         Self::migrate_context_model_rollover(conn)?;
         Self::migrate_preset_cast_narrowing(conn)?;
+        Self::migrate_backends_kind_check(conn)?;
         Ok(())
+    }
+
+    /// Expand the closed `backends.kind` CHECK for databases created before
+    /// the experimental Codex app-server backend existed. SQLite cannot alter
+    /// a CHECK constraint in place, so rebuild the small parent table while
+    /// foreign keys are temporarily disabled. Child tables keep their
+    /// `REFERENCES backends(...)` declarations because the old table is
+    /// dropped (rather than renamed) before the new table takes its name.
+    ///
+    /// The current `SCHEMA` already contains the new CHECK, so this is a
+    /// no-op for fresh databases and is safe to run on every open.
+    fn migrate_backends_kind_check(conn: &Connection) -> KernelDbResult<()> {
+        let sql: Option<String> = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'backends'",
+            [],
+            |row| row.get(0),
+        ).optional()?;
+        let Some(sql) = sql else { return Ok(()); };
+        if sql.to_ascii_lowercase().contains("'codex-app'") {
+            return Ok(());
+        }
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let result = (|| -> SqliteResult<()> {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE backends_codex_migration (
+                     backend_id           BLOB NOT NULL PRIMARY KEY,
+                     name                 TEXT NOT NULL UNIQUE,
+                     kind                 TEXT NOT NULL
+                         CHECK (kind IN ('anthropic', 'deepseek', 'openai', 'codex-app', 'mock')),
+                     base_url             TEXT,
+                     api_key_env          TEXT,
+                     api_key_file         TEXT,
+                     key_optional         INTEGER NOT NULL DEFAULT 0,
+                     request_timeout_secs INTEGER
+                         CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
+                     created_at           INTEGER NOT NULL
+                         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                     created_by           BLOB NOT NULL
+                 );
+                 INSERT INTO backends_codex_migration
+                     (backend_id, name, kind, base_url, api_key_env, api_key_file,
+                      key_optional, request_timeout_secs, created_at, created_by)
+                 SELECT backend_id, name, kind, base_url, api_key_env, api_key_file,
+                        key_optional, request_timeout_secs, created_at, created_by
+                   FROM backends;
+                 DROP TABLE backends;
+                 ALTER TABLE backends_codex_migration RENAME TO backends;
+                 COMMIT;",
+            )
+        })();
+        if result.is_err() {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+        // Do not leave the connection in the permissive migration mode even
+        // when the rebuild failed; the caller must see the original error.
+        let restore = conn.execute_batch("PRAGMA foreign_keys = ON;");
+        match (result, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), _) => Err(e.into()),
+            (Ok(()), Err(e)) => Err(e.into()),
+        }
     }
 
     /// One-shot rollover for the Track A → Track D backend rename (2026-08-03,
@@ -5983,6 +6049,48 @@ mod tests {
         let db = KernelDb::in_memory().unwrap();
         // Apply schema again — should not error.
         db.conn.execute_batch(SCHEMA).unwrap();
+    }
+
+    #[test]
+    fn backends_kind_check_migration_accepts_codex_app_on_an_old_db() {
+        let db = KernelDb::in_memory().unwrap();
+        // Simulate a pre-Codex database: retain all child tables, but replace
+        // only the parent table with its former CHECK constraint. The real
+        // migration runs on open before any backend write occurs.
+        db.conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE backends;
+             CREATE TABLE backends (
+                 backend_id BLOB NOT NULL PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 kind TEXT NOT NULL CHECK (kind IN ('anthropic', 'deepseek', 'openai', 'mock')),
+                 base_url TEXT,
+                 api_key_env TEXT,
+                 api_key_file TEXT,
+                 key_optional INTEGER NOT NULL DEFAULT 0,
+                 request_timeout_secs INTEGER
+                     CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
+                 created_at INTEGER NOT NULL,
+                 created_by BLOB NOT NULL
+             );
+             PRAGMA foreign_keys = ON;",
+        ).unwrap();
+
+        KernelDb::migrate_backends_kind_check(&db.conn).unwrap();
+        let codex = BackendRow {
+            backend_id: BackendId::new(),
+            name: "codex".into(),
+            kind: "codex-app".into(),
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: false,
+            request_timeout_secs: None,
+            created_at: now_millis(),
+            created_by: PrincipalId::system(),
+        };
+        db.upsert_backend(&codex).unwrap();
+        assert_eq!(db.get_backend_by_name("codex").unwrap().unwrap().kind, "codex-app");
     }
 
     /// Stage 1 (time-well): `last_activity_at` is added to `SCHEMA` directly

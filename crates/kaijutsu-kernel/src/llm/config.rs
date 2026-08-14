@@ -49,6 +49,12 @@ pub enum BackendKind {
     /// Ollama, lemonade, llama.cpp, a proxy (`llm/openai/`). `base_url` is
     /// what distinguishes them, which is why it is required for this kind.
     OpenAi,
+    /// The Codex app-server JSONL protocol (`codex app-server --stdio`).
+    /// This is an experimental daemon backend: it has no API key and connects
+    /// to the configured WebSocket endpoint; the daemon must be launched by
+    /// an external process owner.
+    #[serde(rename = "codex-app")]
+    CodexApp,
     /// Canned-response client for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock,
@@ -57,7 +63,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "codex-app"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -66,6 +72,7 @@ impl BackendKind {
             Self::Anthropic => "anthropic",
             Self::DeepSeek => "deepseek",
             Self::OpenAi => "openai",
+            Self::CodexApp => "codex-app",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => "mock",
         }
@@ -79,6 +86,7 @@ impl BackendKind {
             "anthropic" => Ok(Self::Anthropic),
             "deepseek" => Ok(Self::DeepSeek),
             "openai" => Ok(Self::OpenAi),
+            "codex-app" => Ok(Self::CodexApp),
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => Ok(Self::Mock),
             other => Err(unknown_backend_kind_message(other)),
@@ -92,6 +100,7 @@ impl BackendKind {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
             Self::OpenAi => Some("OPENAI_API_KEY"),
+            Self::CodexApp => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
         }
@@ -99,13 +108,15 @@ impl BackendKind {
 
     /// Does this kind require a `base_url`?
     ///
-    /// Only `openai` does: the kind is "some OpenAI-compatible server" and
+    /// `openai` means "some OpenAI-compatible server" and `codex-app` means a
+    /// reachable Codex app-server daemon; both need the endpoint in
+    /// `base_url`. Anthropic
     /// which server is exactly the information `base_url` carries. Anthropic
     /// accepts one as a gateway override; DeepSeek's endpoint is fixed, so a
     /// `base_url` there is accepted-and-ignored rather than silently changing
     /// where a key goes.
     pub fn requires_base_url(&self) -> bool {
-        matches!(self, Self::OpenAi)
+        matches!(self, Self::OpenAi | Self::CodexApp)
     }
 }
 
@@ -158,8 +169,9 @@ pub struct BackendConfig {
     /// Which client speaks for it.
     pub kind: BackendKind,
 
-    /// Endpoint override. Required for [`BackendKind::OpenAi`], optional for
-    /// Anthropic (a gateway), ignored for DeepSeek.
+    /// Endpoint override. Required for [`BackendKind::OpenAi`] and
+    /// [`BackendKind::CodexApp`], optional for Anthropic (a gateway), ignored
+    /// for DeepSeek.
     pub base_url: Option<String>,
 
     /// Environment variable NAME holding the API key. Never the key itself.
@@ -280,10 +292,12 @@ impl BackendConfig {
         if self.kind.requires_base_url() && self.base_url.as_deref().unwrap_or("").trim().is_empty()
         {
             return Err(format!(
-                "backend '{}' has kind 'openai', which needs --base-url \
-                 (e.g. https://api.openai.com/v1 or http://localhost:11434/v1) — \
-                 the kind says 'OpenAI-compatible server', the URL says which one",
-                self.name
+                "backend '{}' has kind '{}', which needs --base-url \
+                 (e.g. https://api.openai.com/v1, http://localhost:11434/v1, or \
+                 ws://127.0.0.1:4500) — the kind says which protocol, the URL \
+                 says which endpoint",
+                self.name,
+                self.kind.as_str(),
             ));
         }
         if let Some(secs) = self.request_timeout_secs
@@ -465,6 +479,17 @@ mod tests {
         // The other kinds have real endpoints of their own.
         assert!(BackendConfig::new("anthropic", BackendKind::Anthropic).validate().is_ok());
         assert!(BackendConfig::new("deepseek", BackendKind::DeepSeek).validate().is_ok());
+    }
+
+    #[test]
+    fn codex_app_kind_is_local_and_keyless() {
+        let config = BackendConfig::new("codex", BackendKind::CodexApp);
+        assert_eq!(config.kind.as_str(), "codex-app");
+        assert_eq!(config.kind.standard_env_var(), None);
+        assert!(config.kind.requires_base_url());
+        assert!(config.validate().is_err());
+        assert!(config.clone().with_base_url("ws://127.0.0.1:4500").validate().is_ok());
+        assert_eq!(config.resolve_api_key(), None);
     }
 
     #[test]

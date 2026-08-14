@@ -71,7 +71,11 @@ work it doesn't do:
   collides with kaish exec ownership (CLAUDE.md: a new exec site is a design
   conversation, not a patch) and resembles the extraction-into-our-own-harness
   shape the policy read ruled out, even without touching OAuth tokens.
-  **Amy's policy read gates this; no code before it.**
+  **Amy authorized a constrained Codex experiment on 2026-08-14.** Phase 0 is
+  now a connect-only, read-only `codex-app` backend; it neither extracts auth
+  nor lets the kernel spawn the vendor harness, and it declines every action
+  escalation. See `docs/codex-app-backend.md`. The broader policy and exec
+  ownership questions remain gated before persistent/action-capable backends.
 
 The wheel is orthogonal to both. It is a *native Python handle* for lanes 2
 and 3 (notebooks, science, MIDI, agent-callable venvs) — build it on that
