@@ -164,8 +164,10 @@ impl KjDispatcher {
             }
         }
         if !scan.errors.is_empty() {
+            // Not only parse failures now: an undetermined liveness lands here
+            // too, so the heading must not claim a specific cause.
             lines.push(format!(
-                "{} descriptor{} failed to parse:",
+                "{} descriptor problem{}:",
                 scan.errors.len(),
                 if scan.errors.len() == 1 { "" } else { "s" }
             ));
@@ -183,6 +185,7 @@ fn reach_label(r: Reachable) -> &'static str {
         Reachable::Alive => "alive",
         Reachable::Stale => "stale",
         Reachable::Gone => "gone",
+        Reachable::Unknown => "unknown",
     }
 }
 
@@ -269,6 +272,16 @@ enum Reachable {
     Stale,
     /// No process with this pid exists at all.
     Gone,
+    /// We could not determine liveness: `/proc/<pid>/stat` was unreadable for
+    /// a reason other than the process being absent, its format was not one we
+    /// recognize, or the descriptor's own `procStart` was not a number.
+    ///
+    /// This variant exists so those cases cannot masquerade as `Gone`. `Gone`
+    /// asserts a fact ("that process is dead"); if a `/proc` format shift or a
+    /// bug in our parser were folded into it, *every* session would report
+    /// dead and the roster would look plausibly empty instead of obviously
+    /// broken — a silent failure that reads as a true answer.
+    Unknown,
 }
 
 /// One descriptor that failed to parse — surfaced by name, never dropped.
@@ -351,7 +364,13 @@ fn scan_sessions_dir(dir: &Path) -> Result<CcScan, String> {
             }
         };
 
-        let reachable = classify_reachability(parsed.pid, &parsed.proc_start);
+        let (reachable, undetermined_why) = classify_reachability(parsed.pid, &parsed.proc_start);
+        if let Some(why) = undetermined_why {
+            scan.errors.push(CcScanError {
+                file: file_name.clone(),
+                message: why,
+            });
+        }
         scan.sessions.push(CcSessionEntry {
             name: parsed.name,
             pid: parsed.pid,
@@ -373,22 +392,49 @@ fn scan_sessions_dir(dir: &Path) -> Result<CcScan, String> {
 
 /// Compare a descriptor's recorded `procStart` against the live process's
 /// current `/proc/<pid>/stat` starttime.
-fn classify_reachability(pid: u32, recorded_proc_start: &str) -> Reachable {
-    let Some(live_start) = read_proc_starttime(pid) else {
-        return Reachable::Gone;
+/// Classify a descriptor's liveness, plus a reason whenever the answer is
+/// [`Reachable::Unknown`]. The reason is not decoration: an undetermined
+/// liveness is reported alongside parse failures so it cannot pass as a quiet
+/// label in a table nobody reads closely.
+fn classify_reachability(pid: u32, recorded_proc_start: &str) -> (Reachable, Option<String>) {
+    let live_start = match probe_proc_starttime(pid) {
+        ProcProbe::Started(s) => s,
+        ProcProbe::NoSuchProcess => return (Reachable::Gone, None),
+        ProcProbe::Undetermined(why) => return (Reachable::Unknown, Some(why)),
     };
     match recorded_proc_start.trim().parse::<u64>() {
-        Ok(recorded) if recorded == live_start => Reachable::Alive,
-        _ => Reachable::Stale,
+        Ok(recorded) if recorded == live_start => (Reachable::Alive, None),
+        Ok(_) => (Reachable::Stale, None),
+        // A non-numeric `procStart` is a corrupt descriptor, not a reused pid.
+        // Calling it `Stale` would assert a specific thing we did not observe.
+        Err(_) => (
+            Reachable::Unknown,
+            Some(format!(
+                "procStart {recorded_proc_start:?} is not a number — corrupt descriptor"
+            )),
+        ),
     }
 }
 
-/// Read field 22 (`starttime`) from `/proc/<pid>/stat`. `None` means no such
-/// process (or its stat line couldn't be read/parsed) — callers treat that
-/// as [`Reachable::Gone`].
-fn read_proc_starttime(pid: u32) -> Option<u64> {
-    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat_starttime(&raw)
+/// Outcome of reading field 22 (`starttime`) from `/proc/<pid>/stat`.
+///
+/// The three cases are kept apart on purpose: only an absent process licenses
+/// [`Reachable::Gone`]. See that variant's note.
+enum ProcProbe {
+    Started(u64),
+    NoSuchProcess,
+    Undetermined(String),
+}
+
+fn probe_proc_starttime(pid: u32) -> ProcProbe {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(raw) => match parse_stat_starttime(&raw) {
+            Some(s) => ProcProbe::Started(s),
+            None => ProcProbe::Undetermined(format!("/proc/{pid}/stat: unrecognized format")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProcProbe::NoSuchProcess,
+        Err(e) => ProcProbe::Undetermined(format!("/proc/{pid}/stat: {e}")),
+    }
 }
 
 /// Extract field 22 (`starttime`) from a raw `/proc/<pid>/stat` line.
@@ -499,12 +545,60 @@ mod tests {
         // Deliberately wrong: one more than the real, live value.
         let wrong = (own_start + 1).to_string();
 
-        let reachable = classify_reachability(own_pid, &wrong);
+        let (reachable, _) = classify_reachability(own_pid, &wrong);
         assert_eq!(
             reachable,
             Reachable::Stale,
             "a live pid whose recorded procStart disagrees with reality must read as Stale"
         );
+    }
+
+    /// Test-only convenience keeping the terser `Option` shape. Production code
+    /// uses [`probe_proc_starttime`] so it can distinguish "no such process"
+    /// from "could not determine"; tests that only want the number don't care.
+    fn read_proc_starttime(pid: u32) -> Option<u64> {
+        match probe_proc_starttime(pid) {
+            ProcProbe::Started(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn corrupt_procstart_is_unknown_not_stale() {
+        // A live pid, but the descriptor's procStart is not a number at all.
+        // That is a corrupt descriptor; calling it Stale would assert a
+        // specific event (pid reuse) that we did not observe.
+        let (reachable, why) = classify_reachability(std::process::id(), "not-a-number");
+        assert_eq!(
+            reachable,
+            Reachable::Unknown,
+            "a non-numeric procStart must not be reported as pid reuse"
+        );
+        // The reason must travel with the verdict, so the caller can report it
+        // rather than leaving a bare "unknown" in a table.
+        let why = why.expect("Unknown must carry a reason");
+        assert!(
+            why.contains("not a number"),
+            "reason should name the actual problem: {why}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_stat_format_does_not_read_as_gone() {
+        // The failure this guards: if /proc's format shifted (or our parser
+        // regressed), folding that into Gone would report every session dead
+        // and the roster would look plausibly empty rather than broken.
+        assert!(
+            parse_stat_starttime("wholly unparseable").is_none(),
+            "precondition: this line must not parse"
+        );
+        match probe_proc_starttime(std::process::id()) {
+            ProcProbe::Started(_) => {}
+            ProcProbe::NoSuchProcess => panic!("our own pid must exist"),
+            ProcProbe::Undetermined(m) => panic!("own stat should parse, got: {m}"),
+        }
+        // And the label set covers the variant, so it can never render blank.
+        assert_eq!(reach_label(Reachable::Unknown), "unknown");
     }
 
     #[test]
@@ -542,7 +636,7 @@ mod tests {
         let never_a_pid: u32 = 4_200_000_000;
         assert_eq!(read_proc_starttime(never_a_pid), None);
         assert_eq!(
-            classify_reachability(never_a_pid, "1"),
+            classify_reachability(never_a_pid, "1").0,
             Reachable::Gone,
             "a pid with no /proc entry at all must read as Gone, not Stale"
         );
@@ -737,4 +831,31 @@ mod tests {
             );
         }
     }
+    /// Manual smoke check against this machine's real registry. Ignored by
+    /// default: it asserts nothing about content (the live roster changes
+    /// constantly) and exists to eyeball real output —
+    /// `cargo test -p kaijutsu-kernel cc::tests::real_registry -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads the real ~/.claude/sessions; run manually"]
+    fn real_registry_smoke() {
+        let home = std::env::var_os("HOME").expect("HOME");
+        let dir = PathBuf::from(home).join(".claude").join("sessions");
+        let scan = scan_sessions_dir(&dir).expect("real scan should not error");
+        println!("sessions: {}  problems: {}", scan.sessions.len(), scan.errors.len());
+        for s in &scan.sessions {
+            println!(
+                "  {:<16} pid={:<8} status={:<8} reach={:<8} proto={} {}",
+                s.name.as_deref().unwrap_or("-"),
+                s.pid,
+                s.status,
+                reach_label(s.reachable),
+                s.peer_protocol,
+                s.cwd
+            );
+        }
+        for e in &scan.errors {
+            println!("  ! {}: {}", e.file, e.message);
+        }
+    }
+
 }
