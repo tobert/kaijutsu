@@ -787,6 +787,20 @@ macOS/Linux) but the wire is not. All of it is same-uid-readable:
   not separate JSON fields. A raw send arrives **anonymous**, as ours did.
   `--drive` must emit the attributed form or every drift looks like it came
   from nowhere.
+- **The wire form is the `<cross-session-message>` tag itself** (probed
+  2026-08-14): a `content` of
+  `<cross-session-message from="uds:<socket>" from-name="<name>"
+  from-mode="prompting">body</cross-session-message>` arrives at the
+  receiving model rendered as attribution, where the same send without the
+  tag arrives anonymous. So the tag is what `--drive` emits.
+- **Attribution is sender-asserted and NOT authenticated.** The probe set
+  `from=` to an arbitrary socket and `from-name=` to an invented string;
+  neither was validated or normalized. Anything holding a session's token can
+  claim any identity to that session. Consistent with the shared-trust
+  doctrine (crosstalk is a feature, boundaries live outside the kernel) — but
+  it means a `--drive` label is a **courtesy, not an identity claim**, and
+  nothing downstream may treat `fromName` as authorization. Do not build a
+  trust decision on it.
 - **Guards to copy, not re-derive**: verify `procStart` against
   `/proc/<pid>/stat` before trusting a PID-named socket (CC's own code ranks
   candidates by this and reports `dead-owner`), and check `peerProtocol` —
@@ -805,7 +819,22 @@ it is scriptable from kaish and viewable in the app. One owner for the framing
 
 **Free first slice, zero protocol risk:** `kj cc list` — live roster with
 name/status/cwd straight from the 0644 JSON. Useful immediately for a mux full
-of sessions and it cannot break when `peerProtocol` moves.
+of sessions and it cannot break when `peerProtocol` moves. Built on branch
+`cc-peer-roster` (worktree `~/src/wt/kj-cc-roster`). Two invariants fixed at
+design time: it reads **only** the 0644 descriptors — never a `.key`, so the
+verb has no token capability by construction — and it validates `procStart`
+against `/proc`, because a PID-named socket with no liveness check will
+confidently address a recycled PID.
+
+**Token handling invariant for the send path (decided before it exists):**
+peer tokens are **read at send time and never stored** — not in the CRDT, not
+in a cache, not in a log. Writing a per-session secret into a durable
+multi-writer log would outlive the session it authenticates and replicate to
+every client, for no gain: the 0600 keyfile is already the durable source of
+truth and is same-uid readable whenever we actually need it. So the hook does
+not need to carry the token at all — its job is consent + identity mapping
+(which sessions opted in, and which kaijutsu context each corresponds to),
+not credential ferrying.
 
 **Delivery observability is necessarily two-sided.** Because the socket never
 acks, a send cannot confirm itself. Receipt is observed on the *receiving*
