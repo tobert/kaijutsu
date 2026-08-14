@@ -860,6 +860,47 @@ side via the hook pipeline that already exists. So the record is sent-row +
 received-row, reconciled — the same ledger shape the approval lane is
 building tooling for.
 
+**KAIJUTSU CAN BE A LISTENER, NO SQUATTING REQUIRED (probed 2026-08-14, Amy:
+*"could we set up a socket to listen on?"*).** This is the finding that makes
+the lane bidirectional, and it arrived cheaply:
+
+- **`SendMessage` delivers to an arbitrary `uds:` path with NO entry in
+  `~/.claude/sessions/`.** Bound a listener in a scratch dir, passed
+  `to: "uds:<that path>"`, and the bytes arrived. So kaijutsu binds its own
+  socket and becomes a first-class **reply target** — we do *not* have to write
+  a fake descriptor into Claude Code's private registry, which was the
+  expensive version of this idea. And `SendMessage`'s documented reply
+  mechanism is "copy the incoming `from` attribute as your `to`", so a real
+  socket makes replies work by CC's own rules rather than by a special case.
+- **The real wire frame is richer than the minimum we send.** Captured verbatim:
+
+      {"msgV":1,"msg_id":"<uuid>","type":"user",
+       "message":{"role":"user","content":"<the cross-session-message tag>"},
+       "priority":"next","from":"uds:/run/user/1000/cc-socks/<pid>.sock"}
+
+  `msgV` is a **framing version** (distinct from the descriptor's
+  `peerProtocol`). `msg_id` is a uuid **equal to the id `SendMessage` returns to
+  its caller** — i.e. a sender-generated correlation key, exactly what the
+  two-sided delivery record needs to join a sent-row to a received-row.
+  `priority: "next"` is observed; the rest of that enum is unknown. `from`
+  appears BOTH top-level and inside the tag.
+- **Auth is not enforced.** The `uds:` send carried **no auth frame at all**,
+  and separately a live CC session accepted a bare `{"type":"user",…}` frame
+  with no auth and no token — the message arrived normally. So the `peerToken`
+  is not currently a gate on inbound delivery. Consequences: **the socket's own
+  file permissions are the real boundary**, not the token; anything on the box
+  that can write the path can inject a turn into any session; and our own
+  listener must therefore treat every inbound message as **unauthenticated
+  input** and live in a 0700 directory. Consistent with shared-trust doctrine
+  (crosstalk is a feature) — but it must be written down rather than assumed
+  otherwise. Keep *sending* auth anyway: a future CC that starts enforcing it
+  would drop our messages **silently**, since there is no ack to notice with.
+- **This flips the `from` decision, conditionally.** Omitting `from` was right
+  *because kaijutsu had no inbox* (see the send-path commit). Once we bind a
+  socket, `from="uds:<our socket>"` becomes truthful and load-bearing — it is
+  what a replying agent uses as an address. The rule to keep: emit `from` if and
+  only if it names a socket we are actually listening on.
+
 **Shape located in existing code (recon 2026-08-14) — build nothing new that
 already exists:**
 
