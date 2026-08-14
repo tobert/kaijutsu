@@ -777,17 +777,36 @@ its subscription. Recorded in kaibo's signoff open threads as shared work.
 New crate `crates/kaijutsu-py`: cdylib built by maturin, pyo3 isolated to this
 one crate, wrapping `kaijutsu-client`'s ActorHandle into a `kaijutsu` Python
 package — any Python process becomes a first-class player. Serves three
-lanes: (1) vendor agent harnesses client-side under their own subscriptions
-(Claude Agent SDK under Amy's own login first — per 2026-08-09 policy read,
-personal SDK-under-own-login is the sanctioned subscription lane and OAuth
-extraction is banned; GPT/Gemini harnesses later, each gets its own policy
-read); (2) notebook/science/MIDI players; (3) an experiment space for python
+lanes: (1) vendor agent harnesses client-side — **lane 1's justification is
+falsified, see below**; (2) notebook/science/MIDI players; (3) an experiment space for python
 sandboxes / uv venvs for agent-callable execution — containment via the
 isotest podman harness, and it must compose with the kaish exec-ownership
 rule, never bypass it. Design principle: players fat in capability, thin in
 derived state (the kernel is the head). Second voices in flight: gemini-pro
 deliberate (batch, durable handle `gemini/batches/pn8p3vcg5faecoeekb8a95s50cm9cb7mkrh8`)
 + deepseek consult; melt results into a design doc before building.
+
+**Status 2026-08-14: still zero code, and lane 1 lost its reason.** The
+design is melted into `docs/python-player.md` (reviewed, both verdicts
+folded). Two things changed today:
+
+- **The subscription justification is falsified.** The Claude Agent SDK
+  authenticates from `ANTHROPIC_API_KEY`, does not inherit a logged-in
+  `claude` CLI's credentials, and its overview explicitly disallows offering
+  claude.ai login/rate limits through it absent prior approval. Managed
+  Agents is API-metered too. So pyo3 buys nothing for seat spend; the
+  subscription surface is the vendor's own harness under Amy's login, which
+  is a *process* and already reachable over kaijutsu-mcp. The wheel must be
+  judged on lanes 2 and 3 alone. Details + the two-directions split (harness
+  drives kaijutsu, vs kaijutsu drives harness) in `docs/python-player.md`.
+- **The go/no-go decision fell out of the fleet queue.** It was
+  `~/exomemory/queue.md` item 5 ("wheel slice 1 go + first consumer");
+  the queue was reborn 08-13 from the daily closeout and renumbered, and
+  the item did not survive the migration — the same rot the queue exists to
+  prevent, on its first move. It now lives here and in python-player.md
+  "Open" only. **Awaiting Amy:** first consumer (notebook/MIDI player vs a
+  second vendor seat over MCP/ACP, which needs no wheel), and whether
+  direction (B) gets a policy read at all.
 
 ## kaish-help and kaish-kernel must be bumped together (2026-08-07, adoption)
 

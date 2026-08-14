@@ -12,12 +12,29 @@ melted into this doc.
 
 ## Why
 
-- **Vendor harnesses as players, client-side.** The Claude Agent SDK runs
-  under Amy's own subscription login (the sanctioned personal-use lane per
-  the 2026-08-09 policy read; OAuth extraction into our own harness is
-  ToS-banned). Later: OpenAI/Gemini harnesses under their own plans, each a
-  separate process with its own credentials and its own per-vendor policy
-  read. The kernel never touches vendor auth — it just sees players.
+- **Vendor harnesses as players, client-side.** Later: OpenAI/Gemini
+  harnesses under their own plans, each a separate process with its own
+  credentials and its own per-vendor policy read. The kernel never touches
+  vendor auth — it just sees players.
+
+  **CONTRADICTED 2026-08-14 — needs Amy's re-read before this lane is
+  built.** This bullet used to read "the Claude Agent SDK runs under Amy's
+  own subscription login (the sanctioned personal-use lane per the
+  2026-08-09 policy read)". Anthropic's current docs say otherwise on both
+  halves: the SDK authenticates from `ANTHROPIC_API_KEY` in the process
+  environment (it does not spawn the `claude` CLI for auth, and does not
+  inherit a logged-in CLI's credentials), and the overview carries an
+  explicit gate — *"Unless previously approved, Anthropic does not allow
+  third party developers to offer claude.ai login or rate limits for their
+  products, including agents built on the Claude Agent SDK."* Managed
+  Agents is the same story: tokens at API rates plus $0.08/session-hour,
+  no subscription path. So the SDK lane is **metered spend, not seat
+  spend**, and pyo3 buys nothing for the subscription question. The
+  OAuth-extraction ban is undisturbed. What survives: the subscription
+  surface is the vendor's *own harness under Amy's login* — a process, not
+  a library (`claude` 2.1.232 and `gemini` 0.45.0 are installed here;
+  `codex` is not) — which is lane (A) below and already works over
+  kaijutsu-mcp. Judge the wheel on lanes 2 and 3.
 - **Notebooks, science, MIDI.** A Jupyter cell that joins a context, reads
   the score, emits blocks.
 - **Sandbox/venv experiment space** for agent-callable Python (see
@@ -34,6 +51,31 @@ melted into this doc.
   kernel is the head.
 - **Players are trusted peers** (shared trust boundary); capabilities
   remain ergonomic nudges.
+
+## Two directions, and only one is solved (named 2026-08-14)
+
+"Use my subscriptions" splits into two shapes the doc had been treating as
+one. Keeping them apart is what stops the wheel from being justified by
+work it doesn't do:
+
+- **(A) The harness drives kaijutsu.** Vendor harness is host, kaijutsu is
+  the instrument it plays — the "reverse ACP" framing above. **This works
+  with zero new code**: `kaijutsu-mcp` + the Claude Code hooks pipeline,
+  live since 2026-07-17. Gemini CLI is the cheap next seat (installed,
+  speaks both MCP and ACP). No wheel required for any of it.
+- **(B) Kaijutsu drives the harness.** Subscription-backed inference as a
+  *backend* for kaijutsu's own contexts, so `kj`-driven turns spend seat
+  instead of API credit. This is what "use my subscriptions" most naturally
+  means for the budget, and it is **not designed**. It would want an LLM
+  backend under `kernel/src/llm/` shelling out to a vendor CLI, which
+  collides with kaish exec ownership (CLAUDE.md: a new exec site is a design
+  conversation, not a patch) and resembles the extraction-into-our-own-harness
+  shape the policy read ruled out, even without touching OAuth tokens.
+  **Amy's policy read gates this; no code before it.**
+
+The wheel is orthogonal to both. It is a *native Python handle* for lanes 2
+and 3 (notebooks, science, MIDI, agent-callable venvs) — build it on that
+case or not at all.
 
 ## Shape
 
@@ -144,8 +186,12 @@ Audit result: the promises hold, with one gap.
 
 ## Open
 
-- First consumer to build: Agent-SDK seat vs notebook toy (Amy's call —
-  decides whether turn-driving or read-mostly ergonomics get polished
-  first).
+- **First consumer to build (Amy's call; the actual blocker — nothing is
+  coded).** Sharpened 2026-08-14 now that "Agent-SDK seat" is known to be a
+  metered lane rather than a seat: is it a notebook/MIDI player (the wheel's
+  real case, read-mostly ergonomics), or a second vendor seat over MCP/ACP
+  (turn-driving, **needs no wheel at all** — Gemini CLI is installed and
+  speaks both)? These are no longer two flavors of the same build.
+- Direction (B) above — does it get a policy read, or is the lane closed?
 - Watch the paused Agent-SDK-credits program (2026-06-15 pause) — if it
   resumes, the subscription seat gets its own metered lane.
