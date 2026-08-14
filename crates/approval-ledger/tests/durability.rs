@@ -20,7 +20,7 @@ fn minimal_ask() -> NewAsk {
         tool: Some("shell".into()),
         hook_id: None,
         description: "rm -rf /tmp/scratch".into(),
-        plan: None,
+        statements: vec![],
         authorized_label: Some("rm scratch".into()),
         rc_run_id: None,
         expires_at: None,
@@ -53,8 +53,8 @@ fn a_created_ask_survives_the_connection_that_created_it_being_dropped() {
 }
 
 #[test]
-fn a_full_plan_tree_also_survives_the_dropped_connection() {
-    use approval_ledger::types::{NewPlan, NewPlanCommand, NewPlanStatement, NewPlanVar, NewPlannedValue, VarBinding};
+fn a_full_statement_tree_also_survives_the_dropped_connection() {
+    use approval_ledger::types::{NewPlanCommand, NewPlanStatement, NewPlanVar, NewPlannedValue, VarBinding};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("ledger.sqlite3");
@@ -64,28 +64,30 @@ fn a_full_plan_tree_also_survives_the_dropped_connection() {
         approval_ledger::migrate(&conn).expect("migrate");
         let mut ask = minimal_ask();
         let digest = "durability-digest".to_string();
-        ask.plan = Some(NewPlan {
-            plan_digest: digest.clone(),
-            statements: vec![NewPlanStatement {
-                rendered: "rm ${TARGET}".into(),
-                statement_kind: "command".into(),
-                commands: vec![NewPlanCommand {
-                    name: "rm".into(),
-                    args: vec![NewPlannedValue::Plain("${TARGET}".into())],
-                    redirects: vec![],
-                    backgrounded: false,
-                }],
-                vars: vec![NewPlanVar { name: "TARGET".into(), binding: VarBinding::Free }],
+        ask.statements = vec![NewPlanStatement {
+            statement_digest: digest.clone(),
+            rendered: "rm ${TARGET}".into(),
+            statement_kind: "command".into(),
+            commands: vec![NewPlanCommand {
+                name: "rm".into(),
+                args: vec![NewPlannedValue::Plain("${TARGET}".into())],
+                redirects: vec![],
+                backgrounded: false,
             }],
-        });
+            vars: vec![NewPlanVar { name: "TARGET".into(), binding: VarBinding::Free }],
+        }];
         let id = approval_ledger::ask::create_ask(&conn, &ask).expect("create_ask");
         (id, digest)
     };
 
     let conn2 = Connection::open(&db_path).expect("reopen db");
-    let row = approval_ledger::ask::get_approval(&conn2, &request_id).unwrap().unwrap();
-    assert_eq!(row.plan_digest.as_deref(), Some(digest.as_str()));
-    let statements = approval_ledger::ask::load_plan(&conn2, &digest).unwrap();
-    assert_eq!(statements.len(), 1);
-    assert_eq!(statements[0].free_vars, vec!["TARGET".to_string()]);
+    let linked = approval_ledger::ask::load_ask_statements(&conn2, &request_id).unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].statement.statement_digest, digest);
+    assert_eq!(linked[0].statement.free_vars, vec!["TARGET".to_string()]);
+
+    // Directly by digest, too — the content-addressed body is its own
+    // durable fact, independent of any one ask that references it.
+    let statement = approval_ledger::ask::load_statement(&conn2, &digest).unwrap().unwrap();
+    assert_eq!(statement.free_vars, vec!["TARGET".to_string()]);
 }

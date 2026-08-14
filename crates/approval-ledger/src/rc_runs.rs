@@ -74,7 +74,7 @@ fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RcRunRow> {
 }
 
 /// Store a script body content-addressed (same pattern as `hook_scripts`
-/// in `kernel_db.rs` and `approval_plans` in this crate): identical text
+/// in `kernel_db.rs` and `approval_statements` in this crate): identical text
 /// across many runs stores once. Returns the sha256 hex digest, computed
 /// here — callers never supply their own hash, so it can't disagree with
 /// what's actually stored.

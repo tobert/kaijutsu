@@ -10,68 +10,107 @@
 //! table keyed on `request_id`. That duplicates the entire statement/
 //! command/arg/redirect/var AST on every single ask, even when the exact
 //! same shell text is asked about a hundred times (which is the *common*
-//! case — a rule exists precisely to answer "have we seen this exact plan
-//! before?"). It also cannot express "a late answer arrived after timeout
-//! without silently overwriting `expired`" using one mutable `status` row.
+//! case — a rule exists precisely to answer "have we seen this exact
+//! statement before?"). It also cannot express "a late answer arrived
+//! after timeout without silently overwriting `expired`" using one
+//! mutable `status` row. Both are fixed below.
 //!
-//! This version fixes both, informed by reading kaish 0.14's actual
-//! `ast::plan` / `kaish_types::plan` types (not just their names):
+//! ## The content-addressed unit is the STATEMENT, not the ask (2026-08-14)
 //!
-//! 1. **The plan tree is re-rooted on `plan_digest`, not `request_id`.**
-//!    `PlanDigest` (kaish-types) is a content hash over `rendered` text with
-//!    credentials stripped — the plan is an immutable document, produced
-//!    once by `plan_program` and never edited. Rooting `approval_plans` (and
-//!    everything under it) on that digest makes storing it content-
-//!    addressed, exactly like this workspace's own `script_bodies` table
-//!    below and `kaijutsu-cas` elsewhere: `create_ask` only inserts the tree
-//!    the first time a digest is seen, and every later ask referencing the
-//!    same digest just points `approvals.plan_digest` at the existing row.
-//!    `approval_plans.has_free_vars` is computed once at that first insert
-//!    (from `approval_plan_vars`) and cached, so guarantee 3's trigger
-//!    (below) is a cheap point lookup instead of an `EXISTS` scan on every
-//!    `BEGIN IMMEDIATE` rule-creation transaction.
+//! Amy's ruling, carried here because it explains the whole shape:
+//! *"that's why we have lfm2d in the works, to reduce that fatigue while
+//! providing some adaptable guardrails."* Generalization granularity IS
+//! the point of a rule — a digest keyed on a whole (possibly
+//! multi-statement) ask only ever matches a verbatim repeat of that exact
+//! ask (`ls` and `ls; pwd` are unrelated asks under that scheme), which is
+//! allowlist fatigue in a new costume. A digest keyed on one statement
+//! generalizes at command-shape granularity (QwenPaw's
+//! ASK→approve→**generalize**), and the classifier this crate doesn't
+//! build yet exists to make THAT safe, not to make prompting bearable.
 //!
-//! 2. **`approval_events` is an append-only ledger alongside the mutable
-//!    `approvals` snapshot, not instead of it.** `approvals.status` /
-//!    `claimed_at` / `decided_at` / … stay as real columns — there is
-//!    exactly one row's worth of these per ask, so the write-amplification
-//!    argument that justifies de-duplicating the (large, repeated) plan
-//!    tree does not apply to them, and the hot "what's pending right now"
-//!    query stays a plain indexed `SELECT`, not a "last-event-wins" derived
-//!    read. But guarantee 6 explicitly requires a late answer after
-//!    timeout to be *recorded*, and a single mutable row cannot represent
-//!    both "this is what happened" and "this is what was rejected" —
-//!    `approval_events` is where every claim/decide/expire/abandon
-//!    *attempt* lands, success or not, so nothing about the ask's real
-//!    history is ever lost to a later overwrite. `decide()`/`claim()` write
-//!    both: the snapshot (if the attempt wins) and an event row (always).
+//! This also aligns the schema with what kaish's own source already gives
+//! us, not just its names: `plan_program` returns `Vec<PlannedStatement>`,
+//! and `Plan::free_variables`/`bound_variables` are per-statement — there
+//! was never a coherent "whole program" digest to begin with, only a
+//! per-statement one (kaish-types' `PlanDigest` doc comment: a hash over
+//! ONE statement's rendered text).
+//!
+//! - `approval_statements` is the content-addressed root — one row per
+//!   distinct `statement_digest`, carrying `rendered` / `statement_kind` /
+//!   `has_free_vars` directly. This collapses the earlier two-table split
+//!   (a `approval_plans` root plus a child keyed `(plan_digest, stmt_seq)`)
+//!   that only existed because an ask-level digest could carry more than
+//!   one statement; a statement-level digest never does — a statement IS
+//!   its digest now, one row, not a row-per-(digest, position).
+//! - `approval_statement_commands` / `_args` / `_redirects` / `_vars` hang
+//!   off `statement_digest` alone — no `stmt_seq` in any of their keys.
+//!   `stmt_seq` belonged to the old ask-level rooting; it has no meaning
+//!   inside a statement's own timeless identity.
+//! - `approval_ask_statements` is the new many-to-many join carrying an
+//!   ask's ORDERED statement list: `(request_id, stmt_seq) →
+//!   statement_digest`. This is where order lives now — the statement
+//!   content itself has none, the same way a paragraph doesn't know which
+//!   page it's quoted on.
+//! - `approvals.plan_digest` is GONE, and deliberately not replaced by a
+//!   cached ask-level digest: that would be a second source of truth for
+//!   "what was asked" alongside `approval_ask_statements`, and a value
+//!   that can only ever be re-derived from another table is exactly the
+//!   kind of thing that drifts. Read an ask's statement set through the
+//!   join table (`ask::load_ask_statements`).
+//! - `approval_rules.plan_digest` → `statement_digest`: a rule is now a
+//!   standing verdict on ONE statement shape. An ask composed of several
+//!   statements is auto-decidable only if EVERY one of them is covered by
+//!   an active rule (`rules::redeem` / `AskVerdict`) — any statement
+//!   covered by a `deny` rule denies the whole ask outright; a partially
+//!   covered ask is never partially applied, it escalates.
+//!
+//! Nothing was deployed when this landed — no callers, no data anywhere —
+//! so this is a straight schema change: no migration ladder, no
+//! compatibility shim, written as if it had always been this shape.
 //!
 //! Two things a forward port would not have caught, from reading kaish's
 //! real types directly:
 //!
 //! - `PlannedRedirect::target` is a `PlannedValue`, the exact same
 //!   plain/redacted enum as a command argument — so
-//!   `approval_plan_redirects` reuses the args table's `value_kind` /
+//!   `approval_statement_redirects` reuses the args table's `value_kind` /
 //!   `value_text` / `redact_kind` / `fingerprint` shape instead of a
 //!   bespoke `target_kind`/`target_text` pair that would collide in name
 //!   with the *redirect operator* kind (`>`, `>>`, `2>`, …).
 //! - Free/bound variable analysis in kaish lives at the *statement* level
 //!   (`Plan::free_variables` / `bound_variables`), never per-command — so
-//!   `approval_plan_vars` is keyed `(plan_digest, stmt_seq, name)` with no
+//!   `approval_statement_vars` is keyed `(statement_digest, name)` with no
 //!   `cmd_seq`, matching the real shape instead of inventing a finer grain
 //!   nothing produces.
 //!
 //! Where this deliberately does **not** follow a second-opinion review
-//! (`gemini-pro`, consulted on this exact question before writing this
-//! file): args and redirect targets stay in normalized child tables, not
-//! flattened to a JSON column on `approval_plan_commands`. That would trade
-//! away exactly the two things this schema needs from them — a `CHECK`
-//! that a redacted value never carries `value_text`, and a queryable
-//! `fingerprint` column for "has this same secret shown up under a
-//! different digest" auditing — for a query pattern (regex over a JSON
-//! blob) nobody asked for. `feedback_sql_schema.md`'s own stated exception
-//! ("JSON only when the relational model adds cost with zero query
-//! benefit") does not hold here.
+//! (`gemini-pro`, consulted on this exact question before the schema was
+//! first written): args and redirect targets stay in normalized child
+//! tables, not flattened to a JSON column on `approval_statement_commands`.
+//! That would trade away exactly the two things this schema needs from
+//! them — a `CHECK` that a redacted value never carries `value_text`, and
+//! a queryable `fingerprint` column for "has this same secret shown up
+//! under a different digest" auditing — for a query pattern (regex over a
+//! JSON blob) nobody asked for. `feedback_sql_schema.md`'s own stated
+//! exception ("JSON only when the relational model adds cost with zero
+//! query benefit") does not hold here.
+//!
+//! ## `approval_events` is an append-only ledger alongside the mutable
+//! `approvals` snapshot, not instead of it
+//!
+//! `approvals.status` / `claimed_at` / `decided_at` / … stay as real
+//! columns — there is exactly one row's worth of these per ask, so the
+//! write-amplification argument that justifies de-duplicating the (large,
+//! repeated) statement tree does not apply to them, and the hot "what's
+//! pending right now" query stays a plain indexed `SELECT`, not a
+//! "last-event-wins" derived read. But guarantee 6 explicitly requires a
+//! late answer after timeout to be *recorded*, and a single mutable row
+//! cannot represent both "this is what happened" and "this is what was
+//! rejected" — `approval_events` is where every claim/decide/expire/
+//! abandon *attempt* lands, success or not, so nothing about the ask's
+//! real history is ever lost to a later overwrite. `decide()`/`claim()`
+//! write both: the snapshot (if the attempt wins) and an event row
+//! (always).
 
 use rusqlite::{Connection, Result as SqliteResult};
 
@@ -82,56 +121,52 @@ use rusqlite::{Connection, Result as SqliteResult};
 /// there is, so far, exactly one schema generation (kernel_db's
 /// ALTER-TABLE ladder is the pattern to reach for if that changes).
 const DDL: &str = r#"
--- ── Plan documents (content-addressed, immutable, shared) ───────────────
--- A `Plan` (kaish 0.14 `plan_program`) rendered UNEXPANDED: `${HOME}` and
--- `$(...)` stay as written, because the point is to show a human what was
--- *asked*, before anything it names has resolved. `plan_digest` is the
+-- ── Statement documents (content-addressed, immutable, shared) ─────────
+-- A `PlannedStatement` (kaish 0.14 `plan_program` returns one per
+-- top-level statement) rendered UNEXPANDED: `${HOME}` and `$(...)` stay
+-- as written, because the point is to show a human what was *asked*,
+-- before anything it names has resolved. `statement_digest` is the
 -- caller's content hash over that rendered text with confirmation
 -- credentials stripped (kaish's `strip_confirm_tokens` + the caller's own
 -- hasher — this crate never computes a digest, only stores and matches
--- the one it's given). One row per distinct digest, regardless of how many
--- `approvals` rows later ask about the identical plan.
-CREATE TABLE IF NOT EXISTS approval_plans (
-    plan_digest   TEXT    NOT NULL PRIMARY KEY,
-    -- Cached at first insert from this plan's own `approval_plan_vars`
-    -- rows: 1 iff ANY statement in the plan has a `binding = 'free'`
+-- the one it's given). One row per distinct digest, regardless of how
+-- many asks (or how many statements within one ask) reference it —
+-- generalization is per-statement, so the same `rm ${TARGET}` shape
+-- appearing in ten different asks, and possibly twice in one multi-line
+-- ask, still stores its statement body exactly once.
+CREATE TABLE IF NOT EXISTS approval_statements (
+    statement_digest TEXT    NOT NULL PRIMARY KEY,
+    rendered          TEXT    NOT NULL,
+    -- kaish's open vocabulary ("command", "pipeline", "for", "and_chain",
+    -- …) — never CHECK-constrained here because kaish, not this crate,
+    -- owns that list and adds to it.
+    statement_kind    TEXT    NOT NULL,
+    -- Cached at first insert from this statement's own
+    -- `approval_statement_vars` rows: 1 iff it has a `binding = 'free'`
     -- variable. This is guarantee 3's fast path — the
-    -- `approval_rules_reject_free_variable_plans` trigger below reads this
-    -- one column instead of re-scanning `approval_plan_vars` on every rule
-    -- insert. Never recomputed after insert: the plan is immutable, so the
-    -- answer can't change under it.
-    has_free_vars INTEGER NOT NULL CHECK (has_free_vars IN (0, 1)),
-    created_at    INTEGER NOT NULL
+    -- `approval_rules_reject_free_variable_allow_rules` trigger below
+    -- reads this one column instead of re-scanning
+    -- `approval_statement_vars` on every allow-rule insert. Never
+    -- recomputed after insert: the statement is immutable, so the answer
+    -- can't change under it.
+    has_free_vars     INTEGER NOT NULL CHECK (has_free_vars IN (0, 1)),
+    created_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
-);
-
--- One row per top-level statement in the plan (kaish plans a whole
--- program; a multi-statement ask carries more than one). `rendered` is the
--- unexpanded text; `statement_kind` is kaish's open vocabulary
--- ("command", "pipeline", "for", "and_chain", …) — never CHECK-constrained
--- here because kaish, not this crate, owns that list and adds to it.
-CREATE TABLE IF NOT EXISTS approval_plan_statements (
-    plan_digest    TEXT    NOT NULL REFERENCES approval_plans(plan_digest),
-    stmt_seq       INTEGER NOT NULL,
-    rendered       TEXT    NOT NULL,
-    statement_kind TEXT    NOT NULL,
-    PRIMARY KEY (plan_digest, stmt_seq)
 );
 
 -- Every command a statement would run — control-structure bodies, `if`
 -- conditions, and `$(...)` substitutions included, because kaish's own
 -- `plan_program` doc comment is explicit that each of those is a command
 -- the statement runs. `backgrounded` is INTEGER 0/1 (SQLite has no BOOLEAN
--- affinity); matches kaish's `PlannedCommand::background`.
-CREATE TABLE IF NOT EXISTS approval_plan_commands (
-    plan_digest  TEXT    NOT NULL,
-    stmt_seq     INTEGER NOT NULL,
-    cmd_seq      INTEGER NOT NULL,
-    name         TEXT    NOT NULL,
-    backgrounded INTEGER NOT NULL CHECK (backgrounded IN (0, 1)),
-    PRIMARY KEY (plan_digest, stmt_seq, cmd_seq),
-    FOREIGN KEY (plan_digest, stmt_seq)
-        REFERENCES approval_plan_statements(plan_digest, stmt_seq)
+-- affinity); matches kaish's `PlannedCommand::background`. Keyed on
+-- `statement_digest` alone — no `stmt_seq`, since a statement's identity
+-- IS its digest now (see file header).
+CREATE TABLE IF NOT EXISTS approval_statement_commands (
+    statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
+    cmd_seq          INTEGER NOT NULL,
+    name             TEXT    NOT NULL,
+    backgrounded     INTEGER NOT NULL CHECK (backgrounded IN (0, 1)),
+    PRIMARY KEY (statement_digest, cmd_seq)
 );
 
 -- One command's argv, in order. `value_kind` mirrors kaish's
@@ -144,18 +179,17 @@ CREATE TABLE IF NOT EXISTS approval_plan_commands (
 -- without ever holding it. The CHECK keeps the two shapes from being
 -- storable in an inconsistent half-state (a `redacted` row with leftover
 -- `value_text`, or a `plain` row silently missing its text).
-CREATE TABLE IF NOT EXISTS approval_plan_args (
-    plan_digest  TEXT    NOT NULL,
-    stmt_seq     INTEGER NOT NULL,
-    cmd_seq      INTEGER NOT NULL,
-    arg_seq      INTEGER NOT NULL,
-    value_kind   TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
-    value_text   TEXT,
-    redact_kind  TEXT,
-    fingerprint  TEXT,
-    PRIMARY KEY (plan_digest, stmt_seq, cmd_seq, arg_seq),
-    FOREIGN KEY (plan_digest, stmt_seq, cmd_seq)
-        REFERENCES approval_plan_commands(plan_digest, stmt_seq, cmd_seq),
+CREATE TABLE IF NOT EXISTS approval_statement_args (
+    statement_digest TEXT    NOT NULL,
+    cmd_seq          INTEGER NOT NULL,
+    arg_seq          INTEGER NOT NULL,
+    value_kind       TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
+    value_text       TEXT,
+    redact_kind      TEXT,
+    fingerprint      TEXT,
+    PRIMARY KEY (statement_digest, cmd_seq, arg_seq),
+    FOREIGN KEY (statement_digest, cmd_seq)
+        REFERENCES approval_statement_commands(statement_digest, cmd_seq),
     CHECK (
         (value_kind = 'plain'    AND value_text IS NOT NULL AND redact_kind IS NULL)
         OR
@@ -165,29 +199,26 @@ CREATE TABLE IF NOT EXISTS approval_plan_args (
 
 -- A command's redirects (`>`, `>>`, `2>`, `<`, …). `op` is the operator as
 -- kaish rendered it — a merge redirect (`2>&1`) has no target, so `op`
--- alone is `2>&1` and the value columns are the `redacted`-with-no-target
--- shape isn't quite right for that case either; callers store a
--- `plain` empty-string target for a merge redirect rather than invent a
--- third value_kind, since kaish's own `PlannedRedirect` always carries a
--- `PlannedValue` target (never `Option`). Target reuses the SAME
--- plain/redacted vocabulary as args (see file header: `PlannedRedirect`'s
--- `target` field is literally a `PlannedValue`, not a bespoke type) rather
--- than the `target_kind`/`target_text` shape an earlier draft of this
--- schema used — that pairing invited confusion between "redirect operator
--- kind" and "value redaction kind".
-CREATE TABLE IF NOT EXISTS approval_plan_redirects (
-    plan_digest  TEXT    NOT NULL,
-    stmt_seq     INTEGER NOT NULL,
-    cmd_seq      INTEGER NOT NULL,
-    redir_seq    INTEGER NOT NULL,
-    op           TEXT    NOT NULL,
-    value_kind   TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
-    value_text   TEXT,
-    redact_kind  TEXT,
-    fingerprint  TEXT,
-    PRIMARY KEY (plan_digest, stmt_seq, cmd_seq, redir_seq),
-    FOREIGN KEY (plan_digest, stmt_seq, cmd_seq)
-        REFERENCES approval_plan_commands(plan_digest, stmt_seq, cmd_seq),
+-- alone is `2>&1` and callers store a `plain` empty-string target for it
+-- rather than invent a third value_kind, since kaish's own
+-- `PlannedRedirect` always carries a `PlannedValue` target (never
+-- `Option`). Target reuses the SAME plain/redacted vocabulary as args
+-- (see file header: `PlannedRedirect::target` is literally a
+-- `PlannedValue`, not a bespoke type) rather than a `target_kind`/
+-- `target_text` pairing that would collide in name with "redirect
+-- operator kind". Keyed on `statement_digest` alone, same as commands/args.
+CREATE TABLE IF NOT EXISTS approval_statement_redirects (
+    statement_digest TEXT    NOT NULL,
+    cmd_seq          INTEGER NOT NULL,
+    redir_seq        INTEGER NOT NULL,
+    op               TEXT    NOT NULL,
+    value_kind       TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
+    value_text       TEXT,
+    redact_kind      TEXT,
+    fingerprint      TEXT,
+    PRIMARY KEY (statement_digest, cmd_seq, redir_seq),
+    FOREIGN KEY (statement_digest, cmd_seq)
+        REFERENCES approval_statement_commands(statement_digest, cmd_seq),
     CHECK (
         (value_kind = 'plain'    AND value_text IS NOT NULL AND redact_kind IS NULL)
         OR
@@ -196,23 +227,21 @@ CREATE TABLE IF NOT EXISTS approval_plan_redirects (
 );
 
 -- The statement-level variable analysis (`Plan::free_variables` /
--- `bound_variables` in kaish-types) — NOT per-command, because kaish's own
--- analysis isn't: a name is free or bound for the whole statement it
--- appears in. THIS is the table guarantee 3 reads: any row here with
--- `binding = 'free'` for a plan's statement means that plan must never
--- back a standing allow-always rule (`rm "$TARGET"` — the plan is
+-- `bound_variables` in kaish-types). THIS is the table guarantee 3 reads:
+-- a row here with `binding = 'free'` means this statement must never back
+-- a standing allow-always rule (`rm "$TARGET"` — the statement is
 -- pre-resolution by design, so the digest can never be made safe by
--- resolving it later). `approval_plans.has_free_vars` is the cached
--- OR-reduction of this table, computed once when the plan is first
--- inserted.
-CREATE TABLE IF NOT EXISTS approval_plan_vars (
-    plan_digest TEXT NOT NULL,
-    stmt_seq    INTEGER NOT NULL,
-    name        TEXT NOT NULL,
-    binding     TEXT NOT NULL CHECK (binding IN ('free', 'bound')),
-    PRIMARY KEY (plan_digest, stmt_seq, name),
-    FOREIGN KEY (plan_digest, stmt_seq)
-        REFERENCES approval_plan_statements(plan_digest, stmt_seq)
+-- resolving it later — see the trigger below for the allow/deny
+-- asymmetry). `approval_statements.has_free_vars` is the cached
+-- OR-reduction of this table, computed once when the statement is first
+-- inserted. No `stmt_seq` — a variable belongs to the statement, not to
+-- any one ask's use of it.
+CREATE TABLE IF NOT EXISTS approval_statement_vars (
+    statement_digest TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    binding          TEXT NOT NULL CHECK (binding IN ('free', 'bound')),
+    PRIMARY KEY (statement_digest, name),
+    FOREIGN KEY (statement_digest) REFERENCES approval_statements(statement_digest)
 );
 
 -- ── Approvals (the ask) ───────────────────────────────────────────────
@@ -222,17 +251,21 @@ CREATE TABLE IF NOT EXISTS approval_plan_vars (
 -- Deliberately NO foreign key on `context_id`: an audit row must outlive
 -- the context that spawned it (contexts get archived/wiped; this ledger
 -- does not — "retained forever with timestamps for later windowing").
--- `plan_digest` / `rc_run_id` ARE real foreign keys because their targets
--- (`approval_plans`, `rc_runs`) share this crate's own never-pruned
--- retention policy, so there's no equivalent outlive-the-parent hazard.
--- `status` plus its own timestamp/actor columns stay a plain mutable
--- snapshot (not folded into `approval_events`) because there is exactly
--- one of each per ask — no duplication to fight — and the hottest query
--- this ledger serves ("what's pending right now") wants a direct indexed
--- read, not a last-event-wins derivation. `approval_events` below carries
--- the history a single mutable row cannot: every claim/decide/expire/
--- abandon *attempt*, including the ones this table's own immutability
--- trigger rejects.
+-- `rc_run_id` IS a real foreign key because its target (`rc_runs`) shares
+-- this crate's own never-pruned retention policy, so there's no
+-- equivalent outlive-the-parent hazard. There is deliberately NO
+-- `plan_digest` column here any more — an ask's statement set is
+-- many-to-many via `approval_ask_statements` below, and caching a
+-- derived "ask digest" here would be a second, driftable source of truth
+-- for the same fact (see file header). `status` plus its own timestamp/
+-- actor columns stay a plain mutable snapshot (not folded into
+-- `approval_events`) because there is exactly one of each per ask — no
+-- duplication to fight — and the hottest query this ledger serves
+-- ("what's pending right now") wants a direct indexed read, not a
+-- last-event-wins derivation. `approval_events` below carries the
+-- history a single mutable row cannot: every claim/decide/expire/abandon
+-- *attempt*, including the ones this table's own immutability trigger
+-- rejects.
 CREATE TABLE IF NOT EXISTS approvals (
     request_id       TEXT    NOT NULL PRIMARY KEY,
     context_id       BLOB    NOT NULL,
@@ -242,7 +275,6 @@ CREATE TABLE IF NOT EXISTS approvals (
     tool             TEXT,
     hook_id          TEXT,
     description      TEXT    NOT NULL,
-    plan_digest      TEXT    REFERENCES approval_plans(plan_digest),
     -- The label-not-id anchor (guarantee 4): what this ask NAMED, not an id
     -- that could later resolve elsewhere. NULL is legal here (not every
     -- ask names a single reusable thing) but NOT NULL on `approval_rules`
@@ -272,8 +304,25 @@ CREATE INDEX IF NOT EXISTS idx_approvals_status_created
     ON approvals(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_approvals_context_created
     ON approvals(context_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_approvals_plan_digest
-    ON approvals(plan_digest);
+
+-- An ask's ORDERED statement list — the many-to-many join between an
+-- ephemeral `approvals` row and the shared, content-addressed
+-- `approval_statements`. This is where `stmt_seq` (ask-relative position)
+-- lives now; a statement's own tables (`approval_statement_*`) carry none,
+-- because the same statement body can sit at position 0 in one ask and
+-- position 2 in another. CASCADE on `request_id` is correct here (unlike
+-- `approval_statement_*`, which are never cascaded): this join row is
+-- wholly OWNED by the ask, not shared — deleting an ask (never expected in
+-- practice, but not disallowed) should drop its ordered-list links without
+-- touching the statement content other asks may still reference.
+CREATE TABLE IF NOT EXISTS approval_ask_statements (
+    request_id       TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+    stmt_seq         INTEGER NOT NULL,
+    statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
+    PRIMARY KEY (request_id, stmt_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_ask_statements_digest
+    ON approval_ask_statements(statement_digest);
 
 -- A decided ask's status is a one-way ratchet into a terminal state
 -- (guarantee 6). This is enforced at the single Rust write site
@@ -306,8 +355,12 @@ CREATE TABLE IF NOT EXISTS approval_options (
 -- ── Approval signals ─────────────────────────────────────────────────
 -- Advisory annotations attached to an ask (a rule that almost matched, a
 -- classifier's risk score on one command) — informational, never itself a
--- gate. `stmt_seq`/`cmd_seq` are nullable: a signal can speak to the whole
--- ask rather than one command within it.
+-- gate. `stmt_seq`/`cmd_seq` point at THIS ASK's statement position (via
+-- `approval_ask_statements`), not at a statement's timeless identity — a
+-- signal is tied to the occasion it fired on, not to the statement body,
+-- so it stays ask-relative even though the plan tree itself moved to
+-- digest-keying. Both nullable: a signal can speak to the whole ask
+-- rather than one command within it.
 CREATE TABLE IF NOT EXISTS approval_signals (
     request_id  TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
     seq         INTEGER NOT NULL,
@@ -347,26 +400,27 @@ CREATE TABLE IF NOT EXISTS approval_events (
 );
 
 -- ── Approval rules (standing "remember this" policy) ────────────────
--- A rule generalized from one decided approval (`learned_from`), matched
--- by (`plan_digest`, `authorized_label`) against FUTURE asks. Deliberately
--- its own table, not a wider-scope row in `approvals`: a rule has no
--- options list, no claim/decide lifecycle, no single originating plan
--- tree of its own (many future asks with different `request_id`s can
--- match the same rule) — folding it into `approvals` would mean every
--- approvals row grows nullable rule-only columns and every rule grows
--- nullable ask-only columns, for two things that are read by completely
--- different queries (the human-prompt queue vs. the redemption
--- fast-path). `learned_from` intentionally has NO cascade: the rule is
--- meant to outlive the one ask that spawned it.
+-- A rule generalized from one statement of one decided approval
+-- (`learned_from`), matched by (`statement_digest`, `authorized_label`)
+-- against FUTURE asks' statements. Deliberately its own table, not a
+-- wider-scope row in `approvals`: a rule has no options list, no
+-- claim/decide lifecycle, no single originating ask (many future asks'
+-- statements, across many different `request_id`s, can match the same
+-- rule) — folding it into `approvals` would mean every approvals row
+-- grows nullable rule-only columns and every rule grows nullable
+-- ask-only columns, for two things read by completely different queries
+-- (the human-prompt queue vs. the per-statement redemption fast-path).
+-- `learned_from` intentionally has NO cascade: the rule is meant to
+-- outlive the one ask that spawned it.
 --
--- `plan_digest` and `authorized_label` are BOTH `NOT NULL` — tighter than
--- `approvals`, on purpose: a rule keyed on an unknown digest or an unnamed
--- label wouldn't be a guard that can fail closed, it would be a guard that
--- can never fire at all, which is a worse silent failure mode than
--- refusing to create it.
+-- `statement_digest` and `authorized_label` are BOTH `NOT NULL` — tighter
+-- than `approvals`, on purpose: a rule keyed on an unknown digest or an
+-- unnamed label wouldn't be a guard that can fail closed, it would be a
+-- guard that can never fire at all, which is a worse silent failure mode
+-- than refusing to create it.
 CREATE TABLE IF NOT EXISTS approval_rules (
     rule_id          TEXT    NOT NULL PRIMARY KEY,
-    plan_digest      TEXT    NOT NULL REFERENCES approval_plans(plan_digest),
+    statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
     authorized_label TEXT    NOT NULL,
     context_id       BLOB,
     principal_id     BLOB,
@@ -378,30 +432,38 @@ CREATE TABLE IF NOT EXISTS approval_rules (
     learned_from     TEXT    REFERENCES approvals(request_id),
     revoked_at       INTEGER
 );
--- The redemption fast-path: "is there a live rule for this digest+label?"
--- Partial (WHERE revoked_at IS NULL) so a revoked rule never shadows —or
--- gets confused with— a later live one keyed the same way.
+-- The redemption fast-path: "is there a live rule for this statement's
+-- digest+label?" Partial (WHERE revoked_at IS NULL) so a revoked rule
+-- never shadows — or gets confused with — a later live one keyed the
+-- same way.
 CREATE INDEX IF NOT EXISTS idx_approval_rules_active
-    ON approval_rules(plan_digest, authorized_label) WHERE revoked_at IS NULL;
+    ON approval_rules(statement_digest, authorized_label) WHERE revoked_at IS NULL;
 
--- Guarantee 3's schema-level backstop: refuse the INSERT outright when the
--- referenced plan is known to carry a free variable, or when the plan is
--- NOT known at all. The `COALESCE(..., 1)` is deliberate — a missing
--- `approval_plans` row (e.g. `PRAGMA foreign_keys` was left off, so the
--- `REFERENCES` above didn't actually block it) must fail CLOSED exactly
--- like an unrecognized status must (guarantee 2), not fall through as "no
--- free vars found, so allow it". The single Rust write site
--- (`rules::learn_from_approval`) checks this first and returns a specific,
--- readable `FreeVariableRule` error naming the offending statement and
--- variable; this trigger is what still stops it if a future write path
--- ever bypasses that function.
-CREATE TRIGGER IF NOT EXISTS approval_rules_reject_free_variable_plans
+-- Guarantee 3's schema-level backstop: refuse an ALLOW-rule INSERT
+-- outright when the referenced statement is known to carry a free
+-- variable, or when the statement is NOT known at all. Gated on
+-- `NEW.allow = 1` on purpose (fixed 2026-08-14, filed as the second
+-- open item from the first build): a standing DENY rule for a
+-- free-variable statement is strictly safety-increasing — it can only
+-- ever make the gate MORE conservative for that shape — so blocking it
+-- has no safety argument and was over-reach. Only an allow-always rule
+-- can turn "the human never saw what this resolved to" into "nobody gets
+-- asked again", which is the actual hazard. The `COALESCE(..., 1)` is
+-- deliberate — a missing `approval_statements` row (e.g. `PRAGMA
+-- foreign_keys` was left off, so the `REFERENCES` above didn't actually
+-- block it) must fail CLOSED exactly like an unrecognized status must
+-- (guarantee 2), not fall through as "no free vars found, so allow it".
+-- The single Rust write site (`rules::learn_from_approval`) checks this
+-- first — same `allow`-only gate — and returns a specific, readable
+-- `FreeVariableRule` error naming the offending variable; this trigger is
+-- what still stops it if a future write path ever bypasses that function.
+CREATE TRIGGER IF NOT EXISTS approval_rules_reject_free_variable_allow_rules
 BEFORE INSERT ON approval_rules
-FOR EACH ROW WHEN COALESCE(
-    (SELECT has_free_vars FROM approval_plans WHERE plan_digest = NEW.plan_digest), 1
+FOR EACH ROW WHEN NEW.allow = 1 AND COALESCE(
+    (SELECT has_free_vars FROM approval_statements WHERE statement_digest = NEW.statement_digest), 1
 ) = 1
 BEGIN
-    SELECT RAISE(ABORT, 'refusing an allow-always rule: plan has a free variable, or its digest is unrecorded (guarantee 3, fail-closed)');
+    SELECT RAISE(ABORT, 'refusing an allow-always rule: statement has a free variable, or its digest is unrecorded (guarantee 3, fail-closed)');
 END;
 
 -- ── rc run log (the "checklist of what ran") ────────────────────────
@@ -424,9 +486,10 @@ CREATE INDEX IF NOT EXISTS idx_rc_runs_context_started
     ON rc_runs(context_id, started_at);
 
 -- One row per script the run executed, in order, pointing at its
--- content-addressed body. CASCADE is correct here (unlike `approval_plan_*`
--- above): a run's script log is wholly owned by that run, not shared
--- across runs the way a plan can be shared across asks.
+-- content-addressed body. CASCADE is correct here (unlike
+-- `approval_statement_*` above): a run's script log is wholly owned by
+-- that run, not shared across runs the way a statement can be shared
+-- across asks.
 CREATE TABLE IF NOT EXISTS rc_run_scripts (
     run_id      TEXT    NOT NULL REFERENCES rc_runs(run_id) ON DELETE CASCADE,
     seq         INTEGER NOT NULL,
@@ -440,10 +503,10 @@ CREATE TABLE IF NOT EXISTS rc_run_scripts (
 );
 
 -- Content-addressed rc script bodies (same pattern as `hook_scripts` in
--- kernel_db.rs and `approval_plans` above): identical script text across
--- many runs stores once. No cascade target — a body must survive even a
--- run row's own (never-expected-in-practice) deletion, since other runs
--- may share it.
+-- kernel_db.rs and `approval_statements` above): identical script text
+-- across many runs stores once. No cascade target — a body must survive
+-- even a run row's own (never-expected-in-practice) deletion, since other
+-- runs may share it.
 CREATE TABLE IF NOT EXISTS script_bodies (
     sha256       TEXT    NOT NULL PRIMARY KEY,
     body         TEXT    NOT NULL,
@@ -477,13 +540,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         for table in [
-            "approval_plans",
-            "approval_plan_statements",
-            "approval_plan_commands",
-            "approval_plan_args",
-            "approval_plan_redirects",
-            "approval_plan_vars",
+            "approval_statements",
+            "approval_statement_commands",
+            "approval_statement_args",
+            "approval_statement_redirects",
+            "approval_statement_vars",
             "approvals",
+            "approval_ask_statements",
             "approval_options",
             "approval_signals",
             "approval_events",
@@ -520,5 +583,47 @@ mod tests {
             .execute("UPDATE approvals SET status = 'sideways' WHERE request_id = 'r1'", [])
             .unwrap_err();
         assert!(err.to_string().contains("CHECK"), "expected a CHECK violation, got: {err}");
+    }
+
+    /// The other filed item, fixed here: a DENY rule for a free-variable
+    /// statement must be permitted at the schema level too (Rust-side
+    /// coverage lives in `rules::tests`) — a standing deny can only ever
+    /// make the gate more conservative for that shape.
+    #[test]
+    fn trigger_permits_a_deny_rule_for_a_free_variable_statement() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm ${TARGET}', 'command', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, scope, allow)
+             VALUES ('r1', 'd1', 'rm target', 'always', 0)",
+            [],
+        )
+        .expect("a deny rule for a free-variable statement must be permitted");
+    }
+
+    #[test]
+    fn trigger_still_refuses_an_allow_rule_for_a_free_variable_statement() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm ${TARGET}', 'command', 1)",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, scope, allow)
+                 VALUES ('r1', 'd1', 'rm target', 'always', 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("guarantee 3"), "expected the trigger's message, got: {err}");
     }
 }

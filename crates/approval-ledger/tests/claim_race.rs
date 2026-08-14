@@ -24,7 +24,7 @@ fn minimal_ask() -> NewAsk {
         tool: Some("shell".into()),
         hook_id: None,
         description: "rm -rf /tmp/scratch".into(),
-        plan: None,
+        statements: vec![],
         authorized_label: Some("rm scratch".into()),
         rc_run_id: None,
         expires_at: None,

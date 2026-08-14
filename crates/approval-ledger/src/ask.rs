@@ -1,28 +1,31 @@
 //! Creating and reading back an ask.
 //!
 //! `create_ask` is guarantee 1: it returns only after everything —
-//! the `approvals` row, its plan tree (first time a digest is seen),
-//! options, and signals — is committed to disk. There is no code path
-//! that hands back a `request_id` before the row exists durably; a caller
-//! that crashes between `create_ask` returning and showing a prompt loses
-//! nothing but the prompt, and the row is there, `pending`, on restart.
+//! the `approvals` row, its ordered statement list (each statement's tree
+//! inserted the first time its digest is seen), options, and signals — is
+//! committed to disk. There is no code path that hands back a
+//! `request_id` before the row exists durably; a caller that crashes
+//! between `create_ask` returning and showing a prompt loses nothing but
+//! the prompt, and the row is there, `pending`, on restart.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use rusqlite::Transaction;
 
 use crate::error::{LedgerError, Result};
 use crate::types::{
-    ApprovalRow, EventKind, EventRow, NewAsk, NewPlan, NewPlannedValue, Origin, OptionRow,
-    PlanCommandRow, PlanRedirectRow, PlanStatementRow, PlannedValueRow, SignalRow,
-    SignalSourceKind, SignalVerdict, ValueKind, VarBinding, parse_enum,
+    ApprovalRow, AskStatementRow, EventKind, EventRow, NewAsk, NewPlanStatement, NewPlannedValue,
+    Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow, PlannedValueRow,
+    SignalRow, SignalSourceKind, SignalVerdict, ValueKind, VarBinding, parse_enum,
 };
 
 /// Durably record one ask and return its `request_id`. Commits before
 /// returning — see the module doc for why that is the whole point.
 ///
-/// If `req.plan` is `Some`, its tree is inserted only the first time its
-/// `plan_digest` is seen (content-addressed — `schema.rs` header); a
-/// repeat digest just links `approvals.plan_digest` to the existing rows.
+/// Each entry in `req.statements` is inserted only the first time its
+/// `statement_digest` is seen (content-addressed — `schema.rs` header); a
+/// repeat digest just adds a new `approval_ask_statements` join row
+/// pointing at the existing tree. Position in `req.statements` becomes
+/// `stmt_seq`.
 pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
     let request_id = uuid::Uuid::now_v7().to_string();
     // DEFERRED is fine here (not the claim path's contested `BEGIN
@@ -30,15 +33,11 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
     // function hands it back, so there is no race to lose.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
 
-    if let Some(plan) = &req.plan {
-        insert_plan_if_new(&tx, plan)?;
-    }
-
     tx.execute(
         "INSERT INTO approvals (
             request_id, context_id, principal_id, origin, instance, tool, hook_id,
-            description, plan_digest, authorized_label, rc_run_id, expires_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            description, authorized_label, rc_run_id, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             request_id,
             req.context_id,
@@ -48,12 +47,20 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
             req.tool,
             req.hook_id,
             req.description,
-            req.plan.as_ref().map(|p| p.plan_digest.as_str()),
             req.authorized_label,
             req.rc_run_id,
             req.expires_at,
         ],
     )?;
+
+    for (stmt_seq, stmt) in req.statements.iter().enumerate() {
+        insert_statement_if_new(&tx, stmt)?;
+        tx.execute(
+            "INSERT INTO approval_ask_statements (request_id, stmt_seq, statement_digest)
+             VALUES (?1, ?2, ?3)",
+            params![request_id, stmt_seq as i64, stmt.statement_digest],
+        )?;
+    }
 
     for (seq, opt) in req.options.iter().enumerate() {
         tx.execute(
@@ -89,16 +96,16 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
     Ok(request_id)
 }
 
-/// Insert `plan`'s tree, but only if `plan.plan_digest` isn't already
+/// Insert `stmt`'s tree, but only if `stmt.statement_digest` isn't already
 /// recorded — content-addressed dedup (see `schema.rs` header). `tx`
 /// derefs to `&Connection`, so this shares the outer transaction; a
 /// failure here rolls back the whole `create_ask` call, never a
-/// half-written plan.
-fn insert_plan_if_new(tx: &Transaction, plan: &NewPlan) -> Result<()> {
+/// half-written statement.
+fn insert_statement_if_new(tx: &Transaction, stmt: &NewPlanStatement) -> Result<()> {
     let already_known: Option<i64> = tx
         .query_row(
-            "SELECT 1 FROM approval_plans WHERE plan_digest = ?1",
-            params![plan.plan_digest],
+            "SELECT 1 FROM approval_statements WHERE statement_digest = ?1",
+            params![stmt.statement_digest],
             |row| row.get(0),
         )
         .optional()?;
@@ -106,53 +113,35 @@ fn insert_plan_if_new(tx: &Transaction, plan: &NewPlan) -> Result<()> {
         return Ok(());
     }
 
-    let has_free_vars = plan
-        .statements
-        .iter()
-        .any(|s| s.vars.iter().any(|v| v.binding == VarBinding::Free));
+    let has_free_vars = stmt.vars.iter().any(|v| v.binding == VarBinding::Free);
     tx.execute(
-        "INSERT INTO approval_plans (plan_digest, has_free_vars) VALUES (?1, ?2)",
-        params![plan.plan_digest, has_free_vars as i64],
+        "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![stmt.statement_digest, stmt.rendered, stmt.statement_kind, has_free_vars as i64],
     )?;
 
-    for (stmt_seq, stmt) in plan.statements.iter().enumerate() {
-        let stmt_seq = stmt_seq as i64;
+    for (cmd_seq, cmd) in stmt.commands.iter().enumerate() {
+        let cmd_seq = cmd_seq as i64;
         tx.execute(
-            "INSERT INTO approval_plan_statements (plan_digest, stmt_seq, rendered, statement_kind)
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
              VALUES (?1, ?2, ?3, ?4)",
-            params![plan.plan_digest, stmt_seq, stmt.rendered, stmt.statement_kind],
+            params![stmt.statement_digest, cmd_seq, cmd.name, cmd.backgrounded as i64],
         )?;
 
-        for (cmd_seq, cmd) in stmt.commands.iter().enumerate() {
-            let cmd_seq = cmd_seq as i64;
-            tx.execute(
-                "INSERT INTO approval_plan_commands (plan_digest, stmt_seq, cmd_seq, name, backgrounded)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![plan.plan_digest, stmt_seq, cmd_seq, cmd.name, cmd.backgrounded as i64],
-            )?;
-
-            for (arg_seq, arg) in cmd.args.iter().enumerate() {
-                insert_planned_value_as_arg(tx, &plan.plan_digest, stmt_seq, cmd_seq, arg_seq as i64, arg)?;
-            }
-            for (redir_seq, redir) in cmd.redirects.iter().enumerate() {
-                insert_planned_value_as_redirect(
-                    tx,
-                    &plan.plan_digest,
-                    stmt_seq,
-                    cmd_seq,
-                    redir_seq as i64,
-                    redir,
-                )?;
-            }
+        for (arg_seq, arg) in cmd.args.iter().enumerate() {
+            insert_planned_value_as_arg(tx, &stmt.statement_digest, cmd_seq, arg_seq as i64, arg)?;
         }
-
-        for var in &stmt.vars {
-            tx.execute(
-                "INSERT INTO approval_plan_vars (plan_digest, stmt_seq, name, binding)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![plan.plan_digest, stmt_seq, var.name, var.binding.as_str()],
-            )?;
+        for (redir_seq, redir) in cmd.redirects.iter().enumerate() {
+            insert_planned_value_as_redirect(tx, &stmt.statement_digest, cmd_seq, redir_seq as i64, redir)?;
         }
+    }
+
+    for var in &stmt.vars {
+        tx.execute(
+            "INSERT INTO approval_statement_vars (statement_digest, name, binding)
+             VALUES (?1, ?2, ?3)",
+            params![stmt.statement_digest, var.name, var.binding.as_str()],
+        )?;
     }
 
     Ok(())
@@ -160,38 +149,35 @@ fn insert_plan_if_new(tx: &Transaction, plan: &NewPlan) -> Result<()> {
 
 fn insert_planned_value_as_arg(
     tx: &Transaction,
-    plan_digest: &str,
-    stmt_seq: i64,
+    statement_digest: &str,
     cmd_seq: i64,
     arg_seq: i64,
     value: &NewPlannedValue,
 ) -> Result<()> {
     let (value_text, redact_kind, fingerprint) = split_value(value);
     tx.execute(
-        "INSERT INTO approval_plan_args (
-            plan_digest, stmt_seq, cmd_seq, arg_seq, value_kind, value_text, redact_kind, fingerprint
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![plan_digest, stmt_seq, cmd_seq, arg_seq, value.kind().as_str(), value_text, redact_kind, fingerprint],
+        "INSERT INTO approval_statement_args (
+            statement_digest, cmd_seq, arg_seq, value_kind, value_text, redact_kind, fingerprint
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![statement_digest, cmd_seq, arg_seq, value.kind().as_str(), value_text, redact_kind, fingerprint],
     )?;
     Ok(())
 }
 
 fn insert_planned_value_as_redirect(
     tx: &Transaction,
-    plan_digest: &str,
-    stmt_seq: i64,
+    statement_digest: &str,
     cmd_seq: i64,
     redir_seq: i64,
     redir: &crate::types::NewPlanRedirect,
 ) -> Result<()> {
     let (value_text, redact_kind, fingerprint) = split_value(&redir.target);
     tx.execute(
-        "INSERT INTO approval_plan_redirects (
-            plan_digest, stmt_seq, cmd_seq, redir_seq, op, value_kind, value_text, redact_kind, fingerprint
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO approval_statement_redirects (
+            statement_digest, cmd_seq, redir_seq, op, value_kind, value_text, redact_kind, fingerprint
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
-            plan_digest,
-            stmt_seq,
+            statement_digest,
             cmd_seq,
             redir_seq,
             redir.op,
@@ -219,7 +205,7 @@ fn split_value(value: &NewPlannedValue) -> (Option<&str>, Option<&str>, Option<&
 pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<ApprovalRow>> {
     conn.query_row(
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
-                description, plan_digest, authorized_label, rc_run_id, status, created_at,
+                description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason
          FROM approvals WHERE request_id = ?1",
@@ -232,7 +218,7 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
 
 pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRow> {
     let origin_raw: String = row.get(3)?;
-    let status_raw: String = row.get(11)?;
+    let status_raw: String = row.get(10)?;
     Ok(ApprovalRow {
         request_id: row.get(0)?,
         context_id: row.get(1)?,
@@ -242,19 +228,18 @@ pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalR
         tool: row.get(5)?,
         hook_id: row.get(6)?,
         description: row.get(7)?,
-        plan_digest: row.get(8)?,
-        authorized_label: row.get(9)?,
-        rc_run_id: row.get(10)?,
+        authorized_label: row.get(8)?,
+        rc_run_id: row.get(9)?,
         status: parse_enum::<crate::types::ApprovalStatus>("status", &status_raw).map_err(sql_err)?,
-        created_at: row.get(12)?,
-        expires_at: row.get(13)?,
-        claimed_at: row.get(14)?,
-        claimed_by: row.get(15)?,
-        decided_at: row.get(16)?,
-        decided_by: row.get(17)?,
-        decided_option: row.get(18)?,
-        remember_scope: row.get(19)?,
-        auto_reason: row.get(20)?,
+        created_at: row.get(11)?,
+        expires_at: row.get(12)?,
+        claimed_at: row.get(13)?,
+        claimed_by: row.get(14)?,
+        decided_at: row.get(15)?,
+        decided_by: row.get(16)?,
+        decided_option: row.get(17)?,
+        remember_scope: row.get(18)?,
+        auto_reason: row.get(19)?,
     })
 }
 
@@ -340,46 +325,73 @@ pub fn list_events(conn: &Connection, request_id: &str) -> Result<Vec<EventRow>>
     Ok(rows)
 }
 
-/// Reconstruct a plan tree by its digest — every statement (ordered), each
-/// with its commands (ordered, each with its args and redirects ordered)
-/// and its free/bound variable lists. Returns an empty `Vec` for an
-/// unknown digest (not an error: a `kj_verb`-origin ask may carry no plan
-/// at all — see `NoPlanRecorded` in `error.rs` for the one place that
-/// distinction is load-bearing).
-pub fn load_plan(conn: &Connection, plan_digest: &str) -> Result<Vec<PlanStatementRow>> {
+/// Reconstruct one statement by its digest: its commands (ordered, each
+/// with its args and redirects ordered) and its free/bound variable
+/// lists. `Ok(None)` for an unknown digest — not an error, since a
+/// caller may probe speculatively (e.g. before deciding whether to call
+/// `create_ask` at all).
+pub fn load_statement(conn: &Connection, statement_digest: &str) -> Result<Option<PlanStatementRow>> {
+    let header: Option<(String, String)> = conn
+        .query_row(
+            "SELECT rendered, statement_kind FROM approval_statements WHERE statement_digest = ?1",
+            params![statement_digest],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((rendered, statement_kind)) = header else {
+        return Ok(None);
+    };
+
+    let commands = load_commands(conn, statement_digest)?;
+    let (free_vars, bound_vars) = load_vars(conn, statement_digest)?;
+    Ok(Some(PlanStatementRow {
+        statement_digest: statement_digest.to_string(),
+        rendered,
+        statement_kind,
+        commands,
+        free_vars,
+        bound_vars,
+    }))
+}
+
+/// An ask's ordered statement list, each joined against its
+/// content-addressed body — replaces reading a `plan_digest` off
+/// `approvals` (which no longer exists; see `schema.rs` header).
+pub fn load_ask_statements(conn: &Connection, request_id: &str) -> Result<Vec<AskStatementRow>> {
     let mut stmt_q = conn.prepare(
-        "SELECT stmt_seq, rendered, statement_kind FROM approval_plan_statements
-         WHERE plan_digest = ?1 ORDER BY stmt_seq",
+        "SELECT stmt_seq, statement_digest FROM approval_ask_statements
+         WHERE request_id = ?1 ORDER BY stmt_seq",
     )?;
-    let statements: Vec<(i64, String, String)> = stmt_q
-        .query_map(params![plan_digest], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+    let links: Vec<(i64, String)> = stmt_q
+        .query_map(params![request_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut out = Vec::with_capacity(statements.len());
-    for (stmt_seq, rendered, statement_kind) in statements {
-        let commands = load_commands(conn, plan_digest, stmt_seq)?;
-        let (free_vars, bound_vars) = load_vars(conn, plan_digest, stmt_seq)?;
-        out.push(PlanStatementRow {
-            stmt_seq,
-            rendered,
-            statement_kind,
-            commands,
-            free_vars,
-            bound_vars,
-        });
+    let mut out = Vec::with_capacity(links.len());
+    for (stmt_seq, statement_digest) in links {
+        let statement = load_statement(conn, &statement_digest)?.ok_or_else(|| {
+            // The join row's FK target vanished — only possible if a
+            // caller wrote around this crate's API (or ran with FK
+            // enforcement off and deleted a shared statement out from
+            // under a still-live ask). Surface as a DB error rather than
+            // silently dropping the statement from the ask's list.
+            LedgerError::Db(rusqlite::Error::InvalidColumnType(
+                0,
+                format!("approval_ask_statements references unknown statement_digest {statement_digest:?}"),
+                rusqlite::types::Type::Text,
+            ))
+        })?;
+        out.push(AskStatementRow { stmt_seq, statement });
     }
     Ok(out)
 }
 
-fn load_commands(conn: &Connection, plan_digest: &str, stmt_seq: i64) -> Result<Vec<PlanCommandRow>> {
+fn load_commands(conn: &Connection, statement_digest: &str) -> Result<Vec<PlanCommandRow>> {
     let mut cmd_q = conn.prepare(
-        "SELECT cmd_seq, name, backgrounded FROM approval_plan_commands
-         WHERE plan_digest = ?1 AND stmt_seq = ?2 ORDER BY cmd_seq",
+        "SELECT cmd_seq, name, backgrounded FROM approval_statement_commands
+         WHERE statement_digest = ?1 ORDER BY cmd_seq",
     )?;
     let commands: Vec<(i64, String, bool)> = cmd_q
-        .query_map(params![plan_digest, stmt_seq], |row| {
+        .query_map(params![statement_digest], |row| {
             let backgrounded: i64 = row.get(2)?;
             Ok((row.get(0)?, row.get(1)?, backgrounded != 0))
         })?
@@ -389,28 +401,21 @@ fn load_commands(conn: &Connection, plan_digest: &str, stmt_seq: i64) -> Result<
     for (cmd_seq, name, backgrounded) in commands {
         let args = load_values(
             conn,
-            "SELECT value_kind, value_text, redact_kind, fingerprint FROM approval_plan_args
-             WHERE plan_digest = ?1 AND stmt_seq = ?2 AND cmd_seq = ?3 ORDER BY arg_seq",
-            plan_digest,
-            stmt_seq,
+            "SELECT value_kind, value_text, redact_kind, fingerprint FROM approval_statement_args
+             WHERE statement_digest = ?1 AND cmd_seq = ?2 ORDER BY arg_seq",
+            statement_digest,
             cmd_seq,
         )?;
-        let redirects = load_redirects(conn, plan_digest, stmt_seq, cmd_seq)?;
+        let redirects = load_redirects(conn, statement_digest, cmd_seq)?;
         out.push(PlanCommandRow { cmd_seq, name, args, redirects, backgrounded });
     }
     Ok(out)
 }
 
-fn load_values(
-    conn: &Connection,
-    sql: &str,
-    plan_digest: &str,
-    stmt_seq: i64,
-    cmd_seq: i64,
-) -> Result<Vec<PlannedValueRow>> {
+fn load_values(conn: &Connection, sql: &str, statement_digest: &str, cmd_seq: i64) -> Result<Vec<PlannedValueRow>> {
     let mut q = conn.prepare(sql)?;
     let rows = q
-        .query_map(params![plan_digest, stmt_seq, cmd_seq], row_to_planned_value)?
+        .query_map(params![statement_digest, cmd_seq], row_to_planned_value)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -429,14 +434,14 @@ fn row_to_planned_value(row: &rusqlite::Row) -> rusqlite::Result<PlannedValueRow
     }
 }
 
-fn load_redirects(conn: &Connection, plan_digest: &str, stmt_seq: i64, cmd_seq: i64) -> Result<Vec<PlanRedirectRow>> {
+fn load_redirects(conn: &Connection, statement_digest: &str, cmd_seq: i64) -> Result<Vec<PlanRedirectRow>> {
     let mut q = conn.prepare(
         "SELECT redir_seq, op, value_kind, value_text, redact_kind, fingerprint
-         FROM approval_plan_redirects
-         WHERE plan_digest = ?1 AND stmt_seq = ?2 AND cmd_seq = ?3 ORDER BY redir_seq",
+         FROM approval_statement_redirects
+         WHERE statement_digest = ?1 AND cmd_seq = ?2 ORDER BY redir_seq",
     )?;
     let rows = q
-        .query_map(params![plan_digest, stmt_seq, cmd_seq], |row| {
+        .query_map(params![statement_digest, cmd_seq], |row| {
             let redir_seq: i64 = row.get(0)?;
             let op: String = row.get(1)?;
             let target = row_to_planned_value_offset(row, 2)?;
@@ -463,15 +468,15 @@ fn row_to_planned_value_offset(row: &rusqlite::Row, base: usize) -> rusqlite::Re
     }
 }
 
-fn load_vars(conn: &Connection, plan_digest: &str, stmt_seq: i64) -> Result<(Vec<String>, Vec<String>)> {
+fn load_vars(conn: &Connection, statement_digest: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut q = conn.prepare(
-        "SELECT name, binding FROM approval_plan_vars
-         WHERE plan_digest = ?1 AND stmt_seq = ?2 ORDER BY name",
+        "SELECT name, binding FROM approval_statement_vars
+         WHERE statement_digest = ?1 ORDER BY name",
     )?;
     let mut free = Vec::new();
     let mut bound = Vec::new();
     let rows = q
-        .query_map(params![plan_digest, stmt_seq], |row| {
+        .query_map(params![statement_digest], |row| {
             let name: String = row.get(0)?;
             let binding_raw: String = row.get(1)?;
             Ok((name, binding_raw))
@@ -488,10 +493,8 @@ fn load_vars(conn: &Connection, plan_digest: &str, stmt_seq: i64) -> Result<(Vec
 
 #[cfg(test)]
 mod tests {
-    use crate::fixtures::{ask_with_plan, minimal_ask, open_memory};
-    use crate::types::{
-        ApprovalStatus, NewPlanRedirect, NewPlannedValue, PlannedValueRow, VarBinding,
-    };
+    use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
+    use crate::types::{ApprovalStatus, NewPlanRedirect, NewPlannedValue, PlannedValueRow, VarBinding};
 
     use super::*;
 
@@ -508,9 +511,9 @@ mod tests {
         assert_eq!(row.origin, ask.origin);
         assert_eq!(row.description, ask.description);
         assert_eq!(row.authorized_label, ask.authorized_label);
-        assert!(row.plan_digest.is_none());
         assert!(row.claimed_at.is_none());
         assert!(row.decided_at.is_none());
+        assert!(load_ask_statements(&conn, &request_id).unwrap().is_empty());
     }
 
     #[test]
@@ -533,25 +536,25 @@ mod tests {
     }
 
     #[test]
-    fn plan_tree_round_trips_including_free_vars_and_redaction() {
+    fn statement_tree_round_trips_including_free_vars_and_redaction() {
         let conn = open_memory();
-        let mut ask = ask_with_plan("digest-1", VarBinding::Free, "rm target");
+        let mut ask = ask_with_statement("digest-1", VarBinding::Free, "rm target");
         // Add a redacted arg and a redirect to exercise every branch of the
-        // value_kind CHECK, not just the plain path `plan_with_var` covers.
-        ask.plan.as_mut().unwrap().statements[0].commands[0].args.push(
+        // value_kind CHECK, not just the plain path `statement_with_var` covers.
+        ask.statements[0].commands[0].args.push(
             NewPlannedValue::Redacted { redact_kind: "confirm-key".into(), fingerprint: Some("abcd".into()) },
         );
-        ask.plan.as_mut().unwrap().statements[0].commands[0].redirects.push(NewPlanRedirect {
+        ask.statements[0].commands[0].redirects.push(NewPlanRedirect {
             op: ">".into(),
             target: NewPlannedValue::Plain("${LOG}".into()),
         });
         let request_id = create_ask(&conn, &ask).unwrap();
-        let row = get_approval(&conn, &request_id).unwrap().unwrap();
-        let digest = row.plan_digest.expect("plan_digest recorded");
 
-        let statements = load_plan(&conn, &digest).unwrap();
-        assert_eq!(statements.len(), 1);
-        let stmt = &statements[0];
+        let linked = load_ask_statements(&conn, &request_id).unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].stmt_seq, 0);
+        let stmt = &linked[0].statement;
+        assert_eq!(stmt.statement_digest, "digest-1");
         assert_eq!(stmt.rendered, "rm ${TARGET}");
         assert_eq!(stmt.statement_kind, "command");
         assert_eq!(stmt.free_vars, vec!["TARGET".to_string()]);
@@ -569,29 +572,72 @@ mod tests {
         assert_eq!(cmd.redirects.len(), 1);
         assert_eq!(cmd.redirects[0].op, ">");
         assert_eq!(cmd.redirects[0].target, PlannedValueRow::Plain("${LOG}".to_string()));
+
+        // load_statement gives the identical content directly by digest.
+        let direct = load_statement(&conn, "digest-1").unwrap().unwrap();
+        assert_eq!(direct, *stmt);
     }
 
     #[test]
-    fn identical_plan_digest_is_stored_once_across_two_asks() {
+    fn load_statement_on_unknown_digest_is_none_not_an_error() {
         let conn = open_memory();
-        let ask_a = ask_with_plan("shared-digest", VarBinding::Bound, "label a");
-        let ask_b = ask_with_plan("shared-digest", VarBinding::Bound, "label b");
+        assert!(load_statement(&conn, "no-such-digest").unwrap().is_none());
+    }
+
+    #[test]
+    fn identical_statement_digest_is_stored_once_across_two_asks() {
+        let conn = open_memory();
+        let ask_a = ask_with_statement("shared-digest", VarBinding::Bound, "label a");
+        let ask_b = ask_with_statement("shared-digest", VarBinding::Bound, "label b");
         create_ask(&conn, &ask_a).unwrap();
         create_ask(&conn, &ask_b).unwrap();
 
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM approval_plan_statements WHERE plan_digest = ?1",
+                "SELECT COUNT(*) FROM approval_statements WHERE statement_digest = ?1",
                 params!["shared-digest"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "the statement tree must not be duplicated for a repeat digest");
+        assert_eq!(count, 1, "the statement body must not be duplicated for a repeat digest");
 
-        let plans: i64 = conn
-            .query_row("SELECT COUNT(*) FROM approval_plans", [], |row| row.get(0))
+        let links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM approval_ask_statements WHERE statement_digest = 'shared-digest'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(plans, 1);
+        assert_eq!(links, 2, "each ask still gets its own join row");
+    }
+
+    /// A multi-statement ask (a small kaish script) links every statement
+    /// in order — this is the shape `rules::redeem`'s coverage tests build
+    /// on.
+    #[test]
+    fn a_multi_statement_ask_preserves_order() {
+        let conn = open_memory();
+        let mut ask = ask_with_statement("digest-a", VarBinding::Bound, "two-statement ask");
+        ask.statements.push(crate::types::NewPlanStatement {
+            statement_digest: "digest-b".into(),
+            rendered: "pwd".into(),
+            statement_kind: "command".into(),
+            commands: vec![crate::types::NewPlanCommand {
+                name: "pwd".into(),
+                args: vec![],
+                redirects: vec![],
+                backgrounded: false,
+            }],
+            vars: vec![],
+        });
+        let request_id = create_ask(&conn, &ask).unwrap();
+
+        let linked = load_ask_statements(&conn, &request_id).unwrap();
+        assert_eq!(linked.len(), 2);
+        assert_eq!(linked[0].stmt_seq, 0);
+        assert_eq!(linked[0].statement.statement_digest, "digest-a");
+        assert_eq!(linked[1].stmt_seq, 1);
+        assert_eq!(linked[1].statement.statement_digest, "digest-b");
     }
 
     #[test]

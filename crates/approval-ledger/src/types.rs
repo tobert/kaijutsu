@@ -220,7 +220,7 @@ impl fmt::Display for SignalVerdict {
 pub enum RuleScope {
     /// Only within the `context_id`/`principal_id` the rule recorded.
     Session,
-    /// Any context/principal presenting the same `plan_digest` + label.
+    /// Any context/principal presenting the same `statement_digest` + label.
     Always,
 }
 
@@ -363,22 +363,20 @@ pub struct NewPlanVar {
     pub binding: VarBinding,
 }
 
-/// One top-level statement, ready to insert.
+/// One top-level statement, ready to insert, carrying its own
+/// content-addressed identity. Since Amy's 2026-08-14 ruling (see
+/// `schema.rs` header), the digest lives on the statement itself, not on
+/// a wrapping "plan" — `NewAsk::statements` is simply an ordered `Vec` of
+/// these, the same shape `options`/`signals` already use (position in the
+/// `Vec` becomes `stmt_seq`). `create_ask` inserts a statement's tree only
+/// the first time its `statement_digest` is seen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewPlanStatement {
+    pub statement_digest: String,
     pub rendered: String,
     pub statement_kind: String,
     pub commands: Vec<NewPlanCommand>,
     pub vars: Vec<NewPlanVar>,
-}
-
-/// A full plan tree plus the digest that identifies it, ready to insert
-/// (content-addressed — see `schema.rs` header). `create_ask` inserts the
-/// tree only the first time a `plan_digest` is seen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewPlan {
-    pub plan_digest: String,
-    pub statements: Vec<NewPlanStatement>,
 }
 
 // ============================================================================
@@ -409,7 +407,10 @@ pub struct NewSignal {
 }
 
 /// Everything `ask::create_ask` needs to durably record one ask before any
-/// human is prompted (guarantee 1).
+/// human is prompted (guarantee 1). `statements` is the ask's ORDERED
+/// statement list — empty for an ask with no shell plan at all (e.g. a
+/// `kj_verb`-origin ask), position in the `Vec` becomes `stmt_seq` in
+/// `approval_ask_statements`, same as `options`/`signals`.
 #[derive(Clone, Debug)]
 pub struct NewAsk {
     pub context_id: Vec<u8>,
@@ -419,7 +420,7 @@ pub struct NewAsk {
     pub tool: Option<String>,
     pub hook_id: Option<String>,
     pub description: String,
-    pub plan: Option<NewPlan>,
+    pub statements: Vec<NewPlanStatement>,
     pub authorized_label: Option<String>,
     pub rc_run_id: Option<String>,
     pub expires_at: Option<i64>,
@@ -431,7 +432,10 @@ pub struct NewAsk {
 // Row types — what a read gives back
 // ============================================================================
 
-/// One `approvals` row.
+/// One `approvals` row. No `plan_digest` field — an ask's statement set
+/// is many-to-many via `approval_ask_statements`
+/// (`ask::load_ask_statements`); see `schema.rs` header for why this
+/// crate refuses to cache a derived ask-level digest here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApprovalRow {
     pub request_id: String,
@@ -442,7 +446,6 @@ pub struct ApprovalRow {
     pub tool: Option<String>,
     pub hook_id: Option<String>,
     pub description: String,
-    pub plan_digest: Option<String>,
     pub authorized_label: Option<String>,
     pub rc_run_id: Option<String>,
     pub status: ApprovalStatus,
@@ -524,11 +527,15 @@ pub struct PlanCommandRow {
     pub backgrounded: bool,
 }
 
-/// One reconstructed `approval_plan_statements` row, joined with its
-/// commands and variables. What `load_plan` returns, per statement.
+/// One reconstructed `approval_statements` row, joined with its commands
+/// and variables. What `ask::load_statement` returns — a statement's
+/// content is self-contained now (identified by `statement_digest`, not
+/// by any one ask's use of it), so this carries the digest instead of a
+/// `stmt_seq`; see [`AskStatementRow`] for the ask-relative wrapper
+/// `ask::load_ask_statements` returns.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStatementRow {
-    pub stmt_seq: i64,
+    pub statement_digest: String,
     pub rendered: String,
     pub statement_kind: String,
     pub commands: Vec<PlanCommandRow>,
@@ -536,11 +543,21 @@ pub struct PlanStatementRow {
     pub bound_vars: Vec<String>,
 }
 
+/// One statement in an ask's ORDERED list (`approval_ask_statements`),
+/// joined against its content-addressed body. What
+/// `ask::load_ask_statements` returns, one per statement, in `stmt_seq`
+/// order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskStatementRow {
+    pub stmt_seq: i64,
+    pub statement: PlanStatementRow,
+}
+
 /// One `approval_rules` row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuleRow {
     pub rule_id: String,
-    pub plan_digest: String,
+    pub statement_digest: String,
     pub authorized_label: String,
     pub context_id: Option<Vec<u8>>,
     pub principal_id: Option<Vec<u8>>,
@@ -550,6 +567,65 @@ pub struct RuleRow {
     pub created_by: Option<Vec<u8>>,
     pub learned_from: Option<String>,
     pub revoked_at: Option<i64>,
+}
+
+/// One statement's coverage result within `rules::redeem` — guarantee 4
+/// preserved at per-statement granularity: `Uncovered` (no rule at all —
+/// clean cache miss) is never conflated with a rule that exists but
+/// disagrees on label (that path is a loud [`crate::error::LedgerError::LabelMismatch`],
+/// not a `StatementVerdict` variant, so it can never be silently folded
+/// into "uncovered").
+#[derive(Clone, Debug)]
+pub enum StatementVerdict {
+    /// Covered by an active `allow` rule matching the presented label.
+    Allow(RuleRow),
+    /// Covered by an active `deny` rule matching the presented label.
+    Deny(RuleRow),
+    /// No active rule at all covers this statement in this scope.
+    Uncovered,
+}
+
+/// The composed result of checking a whole ask's statement set against
+/// active rules (`rules::redeem`). Generalization is per-statement (Amy,
+/// 2026-08-14 — see `schema.rs` header), so an ask's own verdict is a
+/// composition, not a single lookup: `verdict()` denies if ANY statement
+/// is covered by a deny rule (deny short-circuits, strictly
+/// safety-increasing), allows only if EVERY statement is covered by an
+/// allow rule, and escalates otherwise — a partially-covered ask is never
+/// partially applied.
+#[derive(Clone, Debug)]
+pub struct AskCoverage {
+    /// One entry per statement digest passed to `redeem`, same order.
+    pub per_statement: Vec<StatementVerdict>,
+}
+
+/// The composed auto-decision outcome for a whole ask. See
+/// [`AskCoverage::verdict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskVerdict {
+    /// At least one statement is covered by an active `deny` rule.
+    Deny,
+    /// Every statement (at least one) is covered by an active `allow`
+    /// rule and none are denied.
+    Allow,
+    /// Not fully covered and not denied — including an empty statement
+    /// set, which is never vacuously `Allow` (nothing to check is not the
+    /// same as everything checked out). Ask a human.
+    Escalate,
+}
+
+impl AskCoverage {
+    pub fn verdict(&self) -> AskVerdict {
+        if self.per_statement.iter().any(|v| matches!(v, StatementVerdict::Deny(_))) {
+            return AskVerdict::Deny;
+        }
+        if !self.per_statement.is_empty()
+            && self.per_statement.iter().all(|v| matches!(v, StatementVerdict::Allow(_)))
+        {
+            return AskVerdict::Allow;
+        }
+        AskVerdict::Escalate
+    }
 }
 
 /// One `rc_runs` row.

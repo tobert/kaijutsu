@@ -6,34 +6,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## `approval-ledger` — two open items from the build (2026-08-14)
-
-The crate landed (storage + invariants only; no kaish, no classifier, no `kj`
-verbs, no wire types). Two things deliberately left open.
-
-**1. `plan_digest` granularity is UNRESOLVED, and it decides whether the ledger
-actually beats allowlist fatigue.** kaish documents `PlanDigest` as a digest
-over ONE statement's rendered text; the schema currently treats it as one value
-per **ask**, which may span several statements. Per-ask digests only match a
-verbatim-repeated command — `ls` and `ls; pwd` are unrelated, so every
-variation re-prompts, which is allowlist fatigue in a new costume. Per-statement
-digests generalize at command-shape granularity (QwenPaw's
-ASK→approve→**generalize**, `issues.md` "Graduated trust"), but make ask↔plan
-**many-to-many** rather than today's single FK, and change rule matching to
-"allowed only if every statement is covered." **This is a schema-shape decision,
-not a wiring detail — make it before there are dependents.** Lean: per-statement,
-since the gate is all-or-nothing per statement anyway (kaish has no per-command
-interception hook).
-
-**2. The free-variable refusal over-blocks, and its message lies about it.**
-`approval_rules_reject_free_variable_plans` fires on **every** insert for a
-free-variable plan — including `scope='session'` and including `allow=0` deny
-rules — while its message says "refusing an allow-always rule". A standing
-DENY is strictly safety-increasing, so over-blocking is the safe direction and
-this is not urgent; nothing creates deny rules yet. But the message will
-mislead whoever first hits it. Fix the message, and decide whether deny rules
-should be exempt, when the first caller appears.
-
 ## kaish 0.14 bump — a confirmation-subsystem replacement, and it unpins `kaish-help` (2026-08-13)
 
 > **Read the approvals ruling first.** Amy already decided the shape on

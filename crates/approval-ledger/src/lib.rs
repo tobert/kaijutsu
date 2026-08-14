@@ -34,13 +34,19 @@
 //!    unparseable status all read `false` through it.
 //! 3. **Free variables are never eligible for allow-always** —
 //!    [`rules::learn_from_approval`] is the one write site that creates a
-//!    rule, and it refuses when the approval's plan has any
-//!    `binding = 'free'` variable; `schema.rs`'s
-//!    `approval_rules_reject_free_variable_plans` trigger backstops it.
+//!    rule, and it refuses to create an ALLOW rule when the targeted
+//!    statement has any `binding = 'free'` variable (a DENY rule for the
+//!    same statement is fine — it's strictly safety-increasing);
+//!    `schema.rs`'s `approval_rules_reject_free_variable_allow_rules`
+//!    trigger backstops it. Generalization is per-statement, not per-ask
+//!    (Amy, 2026-08-14 — see `schema.rs` header), so an ask composed of
+//!    several statements is auto-decidable only if EVERY one of them is
+//!    covered ([`types::AskCoverage::verdict`]); any statement covered by
+//!    a deny rule denies the whole ask.
 //! 4. **Label-not-id scoping** — [`rules::redeem`] never conflates "no
-//!    rule for this digest" with "a rule exists but for a different
-//!    label"; the second case is a distinct, loud
-//!    [`error::LedgerError::LabelMismatch`].
+//!    rule for this statement" with "a rule exists but for a different
+//!    label", at every statement in the set it's asked to check; the
+//!    second case is a distinct, loud [`error::LedgerError::LabelMismatch`].
 //! 5. **Exactly one answerer wins** — [`claim::claim`] /
 //!    [`claim::claim_next`] use `BEGIN IMMEDIATE` plus one atomic
 //!    `UPDATE ... WHERE status = 'pending' ... RETURNING`.
@@ -69,7 +75,7 @@ pub use error::{LedgerError, Result};
 pub use schema::migrate;
 
 /// Shared test fixtures — a fresh in-memory migrated `Connection`, and the
-/// minimal `NewAsk`/`NewPlan` builders every module's unit tests start
+/// minimal `NewAsk`/`NewPlanStatement` builders every module's unit tests start
 /// from, so each guarantee's test is about the guarantee, not about
 /// re-deriving a valid ask from scratch. Integration tests under `tests/`
 /// (which only see the public API, and need an on-disk file rather than
@@ -81,8 +87,8 @@ pub(crate) mod fixtures {
     use rusqlite::Connection;
 
     use crate::types::{
-        NewAsk, NewOption, NewPlan, NewPlanCommand, NewPlanStatement, NewPlanVar, NewPlannedValue,
-        Origin, VarBinding,
+        NewAsk, NewOption, NewPlanCommand, NewPlanStatement, NewPlanVar, NewPlannedValue, Origin,
+        VarBinding,
     };
 
     pub(crate) fn open_memory() -> Connection {
@@ -100,7 +106,7 @@ pub(crate) mod fixtures {
             tool: Some("shell".into()),
             hook_id: None,
             description: "rm -rf ${TARGET}".into(),
-            plan: None,
+            statements: vec![],
             authorized_label: Some("rm target".into()),
             rc_run_id: None,
             expires_at: None,
@@ -112,29 +118,28 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// One statement, one command (`rm ${TARGET}`), one variable tagged
-    /// `binding` — the fixture guarantee 3's tests are built on: a `Free`
-    /// binding must block rule creation, a `Bound` one must not.
-    pub(crate) fn plan_with_var(digest: &str, binding: VarBinding) -> NewPlan {
-        NewPlan {
-            plan_digest: digest.to_string(),
-            statements: vec![NewPlanStatement {
-                rendered: "rm ${TARGET}".into(),
-                statement_kind: "command".into(),
-                commands: vec![NewPlanCommand {
-                    name: "rm".into(),
-                    args: vec![NewPlannedValue::Plain("${TARGET}".into())],
-                    redirects: vec![],
-                    backgrounded: false,
-                }],
-                vars: vec![NewPlanVar { name: "TARGET".into(), binding }],
+    /// One statement (`rm ${TARGET}`), digest-identified, one command, one
+    /// variable tagged `binding` — the fixture guarantee 3's tests are
+    /// built on: a `Free` binding must block an allow-rule, a `Bound` one
+    /// must not (and neither blocks a deny-rule — see `rules::tests`).
+    pub(crate) fn statement_with_var(digest: &str, binding: VarBinding) -> NewPlanStatement {
+        NewPlanStatement {
+            statement_digest: digest.to_string(),
+            rendered: "rm ${TARGET}".into(),
+            statement_kind: "command".into(),
+            commands: vec![NewPlanCommand {
+                name: "rm".into(),
+                args: vec![NewPlannedValue::Plain("${TARGET}".into())],
+                redirects: vec![],
+                backgrounded: false,
             }],
+            vars: vec![NewPlanVar { name: "TARGET".into(), binding }],
         }
     }
 
-    pub(crate) fn ask_with_plan(digest: &str, binding: VarBinding, label: &str) -> NewAsk {
+    pub(crate) fn ask_with_statement(digest: &str, binding: VarBinding, label: &str) -> NewAsk {
         let mut ask = minimal_ask();
-        ask.plan = Some(plan_with_var(digest, binding));
+        ask.statements = vec![statement_with_var(digest, binding)];
         ask.authorized_label = Some(label.to_string());
         ask
     }
