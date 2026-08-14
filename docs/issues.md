@@ -744,6 +744,90 @@ another vendor harness for the code-enabled-player pattern
 (docs/python-player.md) — same per-vendor policy read applies before wiring
 its subscription. Recorded in kaibo's signoff open threads as shared work.
 
+## `drift --drive`: kaijutsu messaging live Claude Code sessions (2026-08-14)
+
+Amy's framing, on learning CC sessions bind per-session unix sockets: *"I can
+start my claude code sessions in a mux and maybe we can message them from
+within kaijutsu? that would be like a drift with --drive, really cool and a
+neat compromise."* Drift already means "inject into a mailbox, flush at the
+next turn" — this is that primitive with an **external** target, so `--drive`
+is a sink, not a subsystem. Also hers: *"another kinda lightweight actor on
+the unix sockets"*, and *"we can observe delivery and stuff, and I can view
+it in the app."*
+
+**Why it's the compromise:** it spends neither seat nor API credit (pure local
+IPC), touches no vendor auth, and needs no CLI wrapping / ACP client / pyo3.
+Amy's own CC sessions burn her seat because *she* started them under her own
+login; kaijutsu only coordinates. Sidesteps the whole library-vs-binary policy
+tangle in `docs/python-player.md`. The reverse direction already works
+(CC → kaijutsu over `kaijutsu-mcp`, live 2026-07-17), so this closes the loop.
+
+**Protocol, measured live 2026-08-14 against CC 2.1.232** (probe: authed to
+our own socket, sent a message to ourselves, it arrived). Undocumented by
+Anthropic — the *feature* is public (cross-session messaging, v2.1.224,
+macOS/Linux) but the wire is not. All of it is same-uid-readable:
+
+- **Socket**: `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, 0600, one LISTEN per
+  interactive session. Falls back to `/tmp/cc-socks-<uid>/<pid>.sock` only
+  when the path would exceed the `sun_path` limit — which is why third-party
+  write-ups all say `/tmp` and are wrong on this box.
+- **Registry**: `~/.claude/sessions/<pid>.json` (**0644**) carries `name`,
+  `status`, `cwd`, `sessionId`, `messagingSocketPath`, `version`,
+  `peerProtocol: 1`, `procStart`. `<pid>.<64-hex>.key` (**0600**) carries
+  `{peerToken, procStart}`; source generates a `childToken` too, and **which
+  token you present picks your role** (`"peer"` vs `"child"`).
+- **Frames**: newline-delimited JSON. `{"type":"auth","token":…}` then
+  `{"type":"user","message":{"role":"user","content":…}}`. The binary ships
+  this as a `socat` usage example, so it is at least product-visible. Note the
+  message envelope **is the `--input-format stream-json` shape** — one
+  implementation serves both seams.
+- **No wire ack.** Fire-and-forget; our probe got zero bytes back.
+- **Attribution rides *inside* the payload** (`from`, `fromName`,
+  `fromSession`, `fromMode`, `hopChain`, `body`), regex-parsed on receipt —
+  not separate JSON fields. A raw send arrives **anonymous**, as ours did.
+  `--drive` must emit the attributed form or every drift looks like it came
+  from nowhere.
+- **Guards to copy, not re-derive**: verify `procStart` against
+  `/proc/<pid>/stat` before trusting a PID-named socket (CC's own code ranks
+  candidates by this and reports `dead-owner`), and check `peerProtocol` —
+  **fail closed** on a bump rather than guessing.
+
+**Shape.** Amy asked whether hook tooling can capture what's needed and
+"stuff it somewhere discoverable" — yes, and it beats parsing `~/.claude`:
+hooks execute *inside* the CC process, so they see
+`CLAUDE_CODE_MESSAGING_SOCKET`, `_TOKEN`, `_SESSION_ID` directly. That is the
+deliberately-exported seam, it survives on-disk layout churn, and it makes
+sessions **self-registering** — kaijutsu learns only about sessions that opted
+in by being hooked, which is consent-shaped rather than enforcement-shaped.
+Land the roster in the VFS (the shared-state path since KV was demolished) so
+it is scriptable from kaish and viewable in the app. One owner for the framing
++ version check; it is IPC, not exec, so kaish's `ExternalExec` does not own it.
+
+**Free first slice, zero protocol risk:** `kj cc list` — live roster with
+name/status/cwd straight from the 0644 JSON. Useful immediately for a mux full
+of sessions and it cannot break when `peerProtocol` moves.
+
+**Delivery observability is necessarily two-sided.** Because the socket never
+acks, a send cannot confirm itself. Receipt is observed on the *receiving*
+side via the hook pipeline that already exists. So the record is sent-row +
+received-row, reconciled — the same ledger shape the approval lane is
+building tooling for.
+
+**DEFERRED, Amy's call, her words:** *"I should think about and decide on
+ledger gating `--drive` later."* Open question is whether `--drive` routes
+through the approval gate, since it sends instructions to an agent that will
+act on them. Not blocking the probe or the roster; decide before there are
+dependents. One relevant safety fact: inbound peer messages **cannot** approve
+a pending permission prompt, change config, or run slash commands in the
+receiving session, so `--drive` cannot launder a permission decision past a CC
+session's own gate.
+
+**Contrast with `codex-app`** (the other lane's Phase 0, `docs/codex-app-backend.md`):
+Codex's `app-server` is a *documented* JSON-RPC/JSONL **drive-the-agent**
+surface built for embedding. CC's socket is a **peer-coordination bus** between
+already-running sessions, and CC has no embedding protocol at all. Different
+axes — don't expect one normalized shape to cover both halves.
+
 ## Pythonic player: kaijutsu-py wheel (2026-08-09, Amy: "shape B — the pythonic player")
 
 New crate `crates/kaijutsu-py`: cdylib built by maturin, pyo3 isolated to this
