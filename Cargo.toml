@@ -44,6 +44,7 @@ kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
+approval-ledger = { path = "crates/approval-ledger" }
 
 # Kaish (execution engine + client) — pinned to published 0.12.
 # `subprocess` compiles in host external-command execution; whether a given

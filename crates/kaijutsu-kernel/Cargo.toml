@@ -46,6 +46,11 @@ parking_lot = { workspace = true }
 # Persistence
 rusqlite.workspace = true
 
+# Durable human-in-the-loop approval ledger for the `kj approve` gate
+# (docs/issues.md — approval ledger slice 1a). DB-injected: KernelDb hands
+# the ledger crate its own `&Connection`, same pattern as `hook_scripts`.
+approval-ledger.workspace = true
+
 # Enum string conversion
 strum = { workspace = true }
 

@@ -6088,6 +6088,7 @@ name = "kaijutsu-kernel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "approval-ledger",
  "async-broadcast",
  "async-stream",
  "async-trait",

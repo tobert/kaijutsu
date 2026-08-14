@@ -6,6 +6,45 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Gate slice 1a — three findings from the research pass (2026-08-14)
+
+Slice 1a (gate the six destructive `kj` verbs, ledger via `KernelDb`,
+`kj approve` CLI) stopped at the manifest wiring when the day ended. The
+research pass found three things worth having before anyone resumes.
+
+**1. kaish's own watchdog will kill a blocking gate — this is the trap.**
+`kaish_request_timeout` (default 1800s, but **30s/15s/10s** for rc/hook/init
+paths) bounds any `kj` builtin call independently of whatever timeout the gate
+uses. A multi-minute human-answer wait gets killed by kaish before the gate's
+own deadline ever fires. The fix pattern already exists in `kj_builtin.rs` —
+`ctx.patient(budget)`, used today by the distill verbs. Wants a
+`gate_wait_timeout` on `kaijutsu_types::TimeoutPolicy` (where
+`llm_request_timeout` lives) so the patient-hold and the gate's poll deadline
+read **one shared number** rather than two that can drift apart.
+**Why it would have hurt:** the gate passes tests and dies in production rc
+paths, where the budget is 10–30s rather than 1800s.
+
+**2. Blocking at the six sites makes `KjResult::Latch` dead at runtime, and
+five existing tests assert the opposite.** The six producers are the only ones
+in the crate (grepped). Once the gate blocks there, nothing constructs a
+`Latch` — the enum and nonce infra stay compiled but unreachable. The
+`.is_latch()` assertions at `kj/workspace.rs:538`, `kj/doc.rs:876`,
+`kj/context.rs:2619,3040`, `kj/preset.rs:525` **cannot pass alongside the
+gate** and must be rewritten to assert gate behavior. Budget them into 1a, not
+into the 0.14 bump.
+
+**3. `authorized_label` must be the RAW typed reference, not the resolved
+label.** The existing latch resolves `ctx_ref` → id → current DB label and uses
+*that* as its nonce scope. Per Amy's label-not-id ruling the gate must use what
+the caller actually typed, for both the statement's rendered text and
+`authorized_label` — a deliberate divergence from the latch, and easy to
+"fix" back by accident while reading the old code.
+
+**Loose end:** `approval_ledger::ask::list_pending` was added and compiles but
+has **no test** — undertested in a crate whose whole premise is tested
+guarantees. `rules::list_rules` doesn't exist yet and `kj approve rules` needs
+it. Both are first work on resume.
+
 ## kaish 0.14 bump — a confirmation-subsystem replacement, and it unpins `kaish-help` (2026-08-13)
 
 > **Read the approvals ruling first.** Amy already decided the shape on

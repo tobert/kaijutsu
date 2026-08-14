@@ -254,6 +254,25 @@ fn sql_err(e: LedgerError) -> rusqlite::Error {
     }
 }
 
+/// Every `pending` ask, oldest first — the CLI-answerer's queue
+/// (`kj approve list`). Same ordering as [`crate::claim::claim_next`]'s
+/// `ORDER BY created_at`, so "what's next" reads the same whether a caller
+/// claims one at a time or lists the whole backlog at once. Deliberately
+/// `pending` only, not `claimed` too: a claimed-but-undecided row already
+/// has an answerer working it (guarantee 5), and surfacing it in the same
+/// queue would invite a second answerer to step on the first one's claim.
+pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+                description, authorized_label, rc_run_id, status, created_at,
+                expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
+                remember_scope, auto_reason
+         FROM approvals WHERE status = 'pending' ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The choices offered on this ask, in presentation order.
 pub fn list_options(conn: &Connection, request_id: &str) -> Result<Vec<OptionRow>> {
     let mut stmt = conn.prepare(
