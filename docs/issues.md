@@ -6,7 +6,22 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## kaish 0.14 bump — blocked on a latch-surface port, and it unpins `kaish-help` (2026-08-13)
+## kaish 0.14 bump — a confirmation-subsystem replacement, and it unpins `kaish-help` (2026-08-13)
+
+> **Read the approvals ruling first.** Amy already decided the shape on
+> 2026-08-12 — see *Drive gates* below, "kaish latches are going away —
+> approvals become ours, bespoke". That entry correctly called this a
+> **removal** (not a `LatchRequest` change), enumerated the latched verbs, and
+> set the steer: kaish's command-visibility tools are the substrate, not a
+> reimplementation of latches. It also carries a property to KEEP — the nonce
+> is scoped to the **label, not the id**, so confirming names what it
+> authorizes and an id-keyed batch fails loudly on scope mismatch.
+>
+> This entry disagreed with that one for two days and a 2026-08-14 session
+> corrected *this* one without finding *that* one. Two entries in one file
+> disagreeing is the real defect; they are cross-linked now. One addition from
+> the re-probe: the filed verb list omits `kj doc delete` (`kj/doc.rs:434`),
+> so there are **six** producer sites, not five.
 
 We pin **kaish 0.13** (`Cargo.toml`). **0.14 removes the latch surface**
 (`latch_request()`, `LatchRequest`, `.nonce`) — flagged by the kaish lead as
@@ -2584,6 +2599,25 @@ Remaining, in order:
   mismatch". Keep that property. Amy's steer is that kaish's new
   command-visibility tools are the substrate, not a reimplementation of
   latches.
+  **Substrate identified 2026-08-14: it is kaish 0.14's `plan_program`** —
+  per-statement, rendered UNEXPANDED, one entry per command the statement
+  would run (control-flow bodies and `$( )` included), plus the variables it
+  reads and writes. See the 0.14 bump entry at the top of this file for the
+  measured scope and the `PlanDigest` notes.
+  **Amy 2026-08-14 rulings on the rebuild:** one gate system covering the
+  `shell` tool AND these `kj` verbs; a durable SQL approval ledger, retained
+  forever with timestamps for later windowing; **kj + CLI first**, then ACP
+  inline, then an `-app` omni-view; built as a **crate with the DB injected**
+  and tested hard rather than as an MVP subset; plus a **checklist table of
+  the rc scripts that ran**, snapshotted (which would have made this morning's
+  silently-inert assistant seat visible on run one). Prior-art search found no
+  usable Rust crate — closest designs are Vault control groups and QwenPaw's
+  `governance/policy.py` (ASK→approve→**generalize**, to fight allowlist
+  fatigue). Two build constraints: SQLite has no `SKIP LOCKED`, so single-
+  answerer claim must be `BEGIN IMMEDIATE` + one atomic `UPDATE … RETURNING`;
+  and the digest CANNOT be computed post-resolution (the plan is
+  pre-resolution by design), so a plan with free variables must never be
+  eligible for allow-always — the other half of the label-not-id guard.
 - **Sweep jobs for trash contexts — LATER, explicitly not now** (Amy,
   2026-08-12: "we can add sweep jobs later to clean up trash contexts, but not
   now"). The one-shot sweep ran; do not build recurring automation for it yet.
