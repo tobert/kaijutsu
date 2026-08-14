@@ -785,256 +785,51 @@ its subscription. Recorded in kaibo's signoff open threads as shared work.
 
 ## `drift --drive`: kaijutsu messaging live Claude Code sessions (2026-08-14)
 
-Amy's framing, on learning CC sessions bind per-session unix sockets: *"I can
-start my claude code sessions in a mux and maybe we can message them from
-within kaijutsu? that would be like a drift with --drive, really cool and a
-neat compromise."* Drift already means "inject into a mailbox, flush at the
-next turn" — this is that primitive with an **external** target, so `--drive`
-is a sink, not a subsystem. Also hers: *"another kinda lightweight actor on
-the unix sockets"*, and *"we can observe delivery and stuff, and I can view
-it in the app."*
+**Design + measured protocol moved to `docs/cc-peer.md`** — that is canonical,
+with per-claim provenance (probed / read-from-binary / inferred). This entry
+keeps only what is not in the code yet.
 
-**Why it's the compromise:** it spends neither seat nor API credit (pure local
-IPC), touches no vendor auth, and needs no CLI wrapping / ACP client / pyo3.
-Amy's own CC sessions burn her seat because *she* started them under her own
-login; kaijutsu only coordinates. Sidesteps the whole library-vs-binary policy
-tangle in `docs/python-player.md`. The reverse direction already works
-(CC → kaijutsu over `kaijutsu-mcp`, live 2026-07-17), so this closes the loop.
+Amy's framing: *"like a drift with `--drive`"* — drift already means inject into
+a mailbox, so `--drive` is a sink, not a subsystem. Spends neither seat nor API
+credit: pure local IPC, her sessions burn her seat because she started them
+herself in a mux.
 
-**Protocol, measured live 2026-08-14 against CC 2.1.232** (probe: authed to
-our own socket, sent a message to ourselves, it arrived). Undocumented by
-Anthropic — the *feature* is public (cross-session messaging, v2.1.224,
-macOS/Linux) but the wire is not. All of it is same-uid-readable:
+**Shipped on branch `cc-peer-roster` (worktree `~/src/wt/kj-cc-roster`), not
+merged:** `kj cc list`, `kj cc send [--dry-run]`, 43 tests, attribution
+validated against a real receiver.
 
-- **Socket**: `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, 0600, one LISTEN per
-  interactive session. Falls back to `/tmp/cc-socks-<uid>/<pid>.sock` only
-  when the path would exceed the `sun_path` limit — which is why third-party
-  write-ups all say `/tmp` and are wrong on this box.
-- **Registry**: `~/.claude/sessions/<pid>.json` (**0644**) carries `name`,
-  `status`, `cwd`, `sessionId`, `messagingSocketPath`, `version`,
-  `peerProtocol: 1`, `procStart`. `<pid>.<64-hex>.key` (**0600**) carries
-  `{peerToken, procStart}`; source generates a `childToken` too, and **which
-  token you present picks your role** (`"peer"` vs `"child"`).
-- **Frames**: newline-delimited JSON. `{"type":"auth","token":…}` then
-  `{"type":"user","message":{"role":"user","content":…}}`. The binary ships
-  this as a `socat` usage example, so it is at least product-visible. Note the
-  message envelope **is the `--input-format stream-json` shape** — one
-  implementation serves both seams.
-- **No wire ack.** Fire-and-forget; our probe got zero bytes back.
-- **Attribution rides *inside* the payload** (`from`, `fromName`,
-  `fromSession`, `fromMode`, `hopChain`, `body`), regex-parsed on receipt —
-  not separate JSON fields. A raw send arrives **anonymous**, as ours did.
-  `--drive` must emit the attributed form or every drift looks like it came
-  from nowhere.
-- **The wire form is the `<cross-session-message>` tag, and its grammar is
-  STRICT.** Extracted from the parser regex (not guessed):
+**Not built yet:**
 
-      ^<cross-session-message(?: from="…")?(?: from-session="…")?
-       (?: hop-chain="…")?(?: from-name="[^"<>\n\r]+")?
-       (?: from-mode="…")?>\n([\s\S]*)\n</cross-session-message>$
+- **Inbox** — kaijutsu binds its own socket and becomes a reply target. Proven
+  viable: `SendMessage` delivers to an arbitrary `uds:` path with no registry
+  entry, so no squatting in `~/.claude/sessions/` is needed.
+- **Full outbound frame** — `msgV`, `msg_id`, `priority`, and a truthful `from`
+  (emit it *only* once we are listening).
+- **`crates/claude-code-peer`** — protocol-only crate, no `kaijutsu-*` deps,
+  `approval-ledger` precedent. Actor stays in the kernel.
+- **Presence at `/run/cc`** — build as a *source* for Amy's general live roster,
+  not a CC-specific store (see `signoff.md`).
+- **Per-peer inbox paths + kernel-stamped principals** — turns an
+  unauthenticated channel into a capability-authenticated one.
+- **Hook registration** — consent + session↔context mapping; also closes the
+  transcript-scraping identity bug (`CLAUDE_CODE_SESSION_ID`).
+- **Fan-out** — last, behind the gate decision.
 
-  Three traps in that: attributes are **order-sensitive** (`from`,
-  `from-session`, `hop-chain`, `from-name`, `from-mode`), the body **must**
-  be newline-delimited inside the tag (`>\n … \n</`), and the parser
-  **re-serializes what it extracted and rejects the parse unless it exactly
-  equals the input** — a canonicalization check that blocks duplicate or
-  reordered attributes.
-- **A sloppy serializer degrades SILENTLY.** Our first probe omitted the
-  mandatory newlines, so it never parsed — it was passed through and merely
-  *looked* attributed because we had written the text ourselves. Nothing
-  errored; the message still delivered, just unattributed. `--drive` must
-  emit the canonical form exactly, and slice 3 owes a unit test that
-  round-trips our serializer through this regex. A silent attribution
-  downgrade is precisely the failure class the house rules reject.
-- **Attribution is sender-asserted and NOT authenticated** — re-established
-  2026-08-14 on valid evidence after the first attempt proved nothing. A
-  *well-formed* tag naming a `from=` socket that does not exist and a
-  `from-name` that is a flat lie reaches the receiving model intact. The
-  canonical round-trip check polices **format, not identity**. So anything
-  holding a session's token can claim any identity to it: consistent with the
-  shared-trust doctrine (crosstalk is a feature; the real boundaries live
-  outside the kernel), but a `--drive` label is a **courtesy, not an identity
-  claim** and nothing downstream may treat `fromName` as authorization.
-  Honest limit on this: from inside a receiving session we observe the
-  payload the model is shown, so we cannot tell whether the harness *also*
-  parses the tag for its own UI. The claim is about what the model sees.
-- **Guards to copy, not re-derive**: verify `procStart` against
-  `/proc/<pid>/stat` before trusting a PID-named socket (CC's own code ranks
-  candidates by this and reports `dead-owner`), and check `peerProtocol` —
-  **fail closed** on a bump rather than guessing.
+**`kj cc` is scaffolding (Amy):** *"kj cc is a temporary thing"* — hooks give us
+contexts, then drift works on a CC session like any other and the verb retires.
+Amendments: the introspection melts into the VFS rather than vanishing (a
+context exists only for a session that opted in; the registry sees every
+session, which is what you need when one *isn't* wired up), and a CC context
+**cannot be clocked** — `--drive` is deliver-and-clock natively but
+deliver-and-hope here. Surface that in the UI rather than let it read as a bug.
 
-**Shape.** Amy asked whether hook tooling can capture what's needed and
-"stuff it somewhere discoverable" — yes, and it beats parsing `~/.claude`:
-hooks execute *inside* the CC process, so they see
-`CLAUDE_CODE_MESSAGING_SOCKET`, `_TOKEN`, `_SESSION_ID` directly. That is the
-deliberately-exported seam, it survives on-disk layout churn, and it makes
-sessions **self-registering** — kaijutsu learns only about sessions that opted
-in by being hooked, which is consent-shaped rather than enforcement-shaped.
-Land the roster in the VFS (the shared-state path since KV was demolished) so
-it is scriptable from kaish and viewable in the app. One owner for the framing
-+ version check; it is IPC, not exec, so kaish's `ExternalExec` does not own it.
-
-**Free first slice, zero protocol risk:** `kj cc list` — live roster with
-name/status/cwd straight from the 0644 JSON. Useful immediately for a mux full
-of sessions and it cannot break when `peerProtocol` moves. Built on branch
-`cc-peer-roster` (worktree `~/src/wt/kj-cc-roster`). Two invariants fixed at
-design time: it reads **only** the 0644 descriptors — never a `.key`, so the
-verb has no token capability by construction — and it validates `procStart`
-against `/proc`, because a PID-named socket with no liveness check will
-confidently address a recycled PID.
-
-**Token handling invariant for the send path (decided before it exists):**
-peer tokens are **read at send time and never stored** — not in the CRDT, not
-in a cache, not in a log. Writing a per-session secret into a durable
-multi-writer log would outlive the session it authenticates and replicate to
-every client, for no gain: the 0600 keyfile is already the durable source of
-truth and is same-uid readable whenever we actually need it. So the hook does
-not need to carry the token at all — its job is consent + identity mapping
-(which sessions opted in, and which kaijutsu context each corresponds to),
-not credential ferrying.
-
-**Delivery observability is necessarily two-sided.** Because the socket never
-acks, a send cannot confirm itself. Receipt is observed on the *receiving*
-side via the hook pipeline that already exists. So the record is sent-row +
-received-row, reconciled — the same ledger shape the approval lane is
-building tooling for.
-
-**KAIJUTSU CAN BE A LISTENER, NO SQUATTING REQUIRED (probed 2026-08-14, Amy:
-*"could we set up a socket to listen on?"*).** This is the finding that makes
-the lane bidirectional, and it arrived cheaply:
-
-- **`SendMessage` delivers to an arbitrary `uds:` path with NO entry in
-  `~/.claude/sessions/`.** Bound a listener in a scratch dir, passed
-  `to: "uds:<that path>"`, and the bytes arrived. So kaijutsu binds its own
-  socket and becomes a first-class **reply target** — we do *not* have to write
-  a fake descriptor into Claude Code's private registry, which was the
-  expensive version of this idea. And `SendMessage`'s documented reply
-  mechanism is "copy the incoming `from` attribute as your `to`", so a real
-  socket makes replies work by CC's own rules rather than by a special case.
-- **The real wire frame is richer than the minimum we send.** Captured verbatim:
-
-      {"msgV":1,"msg_id":"<uuid>","type":"user",
-       "message":{"role":"user","content":"<the cross-session-message tag>"},
-       "priority":"next","from":"uds:/run/user/1000/cc-socks/<pid>.sock"}
-
-  `msgV` is a **framing version** (distinct from the descriptor's
-  `peerProtocol`). `msg_id` is a uuid **equal to the id `SendMessage` returns to
-  its caller** — i.e. a sender-generated correlation key, exactly what the
-  two-sided delivery record needs to join a sent-row to a received-row.
-  `priority: "next"` is observed; the rest of that enum is unknown. `from`
-  appears BOTH top-level and inside the tag.
-- **Auth is not enforced.** The `uds:` send carried **no auth frame at all**,
-  and separately a live CC session accepted a bare `{"type":"user",…}` frame
-  with no auth and no token — the message arrived normally. So the `peerToken`
-  is not currently a gate on inbound delivery. Consequences: **the socket's own
-  file permissions are the real boundary**, not the token; anything on the box
-  that can write the path can inject a turn into any session; and our own
-  listener must therefore treat every inbound message as **unauthenticated
-  input** and live in a 0700 directory. Consistent with shared-trust doctrine
-  (crosstalk is a feature) — but it must be written down rather than assumed
-  otherwise. Keep *sending* auth anyway: a future CC that starts enforcing it
-  would drop our messages **silently**, since there is no ack to notice with.
-- **This flips the `from` decision, conditionally.** Omitting `from` was right
-  *because kaijutsu had no inbox* (see the send-path commit). Once we bind a
-  socket, `from="uds:<our socket>"` becomes truthful and load-bearing — it is
-  what a replying agent uses as an address. The rule to keep: emit `from` if and
-  only if it names a socket we are actually listening on.
-
-**Shape located in existing code (recon 2026-08-14) — build nothing new that
-already exists:**
-
-- **The VFS view copies `MidiPresenceFs`** (`kaijutsu-kernel/src/midi_presence.rs`,
-  mounted `/run/midi` at `kaijutsu-server/src/rpc.rs:1817`). Same problem one
-  domain over: ephemeral-by-construction, read-only by construction, `BTreeMap`
-  + an `AtomicU64` generation, and its rule that **a missing entry reads as
-  *unknown*, never as absent**. Roster lands at `/run/cc`, which retires
-  `kj cc list` in favour of `cat` exactly as Amy asked.
-- **The peer registry already exists**: `PeerRegistry`
-  (`kaijutsu-kernel/src/peers.rs:103`), in-memory under a tokio `RwLock` on the
-  `Kernel`, and **an MCP session already self-registers into it**
-  (`kaijutsu-mcp/src/lib.rs:1665-1700`). A CC session becomes a `PeerConfig`
-  there — nick from its stable `cc-*` label, `instance` from
-  `CLAUDE_CODE_SESSION_ID` — not a fourth parallel map.
-- **Durability line, already drawn by practice:** hooks and contexts are
-  DB-first (SQLite authoritative, hydrated from it); presence/peers/shares are
-  deliberately not durable at all, because a remembered liveness fact is a lie.
-  That puts session↔context *identity* on the durable side (it is already
-  there, as `contexts.label`) and liveness/socket/token on the in-memory side —
-  independently agreeing with the read-at-send-time token rule above.
-
-**Four traps, all cheap to avoid and expensive to discover:**
-
-1. **`freeze_mounts()` is a hard ordering constraint** (`rpc.rs:1844`). The
-   mount must join the block at `rpc.rs:1649-1840`; afterwards `mount` logs a
-   warning and returns false. And frozen means **one backend for the whole
-   subtree** — copy `ShareFs`'s "one backend routes internally to N sessions",
-   never a mount-per-session.
-2. **`getattr` sizes the body, and `read_all` reads exactly `attr.size`.** A
-   roster that renders differently between the `getattr` and the `read`
-   silently truncates. Render deterministically, ordered, and bump
-   `generation` so the app's re-`stat` sees freshness.
-3. **`PeerRegistry` resets on kernel restart.** `ActorHandle` already replays
-   `peer_registration` on reconnect (`kaijutsu-client/src/actor.rs:1836`), so
-   ride that replay — otherwise a CC session sits registered-and-invisible
-   until its *next* hook fires, for possibly a whole turn.
-4. **Three files move together for a hook field**: `HookEvent`
-   (`kaijutsu-mcp/src/hook_types.rs:14`) has no env slot, the jq map
-   (`contrib/adapters/claude-to-kaijutsu.jq`) would need `$ENV.CLAUDE_CODE_*`,
-   and `kaijutsu-mcp/tests/adapter_mapping.rs` asserts no field is silently
-   dropped. Also: the per-hook budget is **5s** (`contrib/claude-hooks.json`)
-   and expiry degrades permissive, so registration must be one-shot
-   (`Mutex::take`, as `maybe_stabilize_label` does), never per-event.
-
-**Bonus: this fixes a known bug rather than only adding a feature.** Nothing in
-the tree reads `CLAUDE_CODE_*` today — agent identity comes from *scraping the
-newest transcript file*, which at MCP-spawn time can belong to a **previous**
-session (the weakness noted in `kaijutsu-mcp/src/main.rs:176-183`, and recorded
-in memory as the startup-detection gotcha). `CLAUDE_CODE_SESSION_ID` is the
-authoritative value that removes the guess.
-
-**`kj cc` is scaffolding, not the destination (Amy, 2026-08-14).** Her words:
-*"I'd like to melt `kj cc` if things work well, we should have the hooks get us
-contexts and a view into what cc is doing and then we should be able to do a
-drift like it was any other context. so imo `kj cc` is a temporary thing, but I
-can be talked out of that."* This is the right end state and it is the
-`agent-emerges-not-a-noun` doctrine applied: a CC session that registers as a
-context needs no special verb, because `drift`/`fork`/`attach` already work on
-contexts. Two amendments rather than a counter-argument:
-
-- **The capability melts into the VFS; it does not disappear.** One thing a
-  context genuinely cannot cover: sessions that have *not* opted in. A context
-  exists only for a hooked session, but the on-disk registry sees every session
-  on the box — and the moment you need that is exactly when one *isn't* wired
-  up and you are debugging why. Same for reachability: liveness is a property
-  of a host process, not of a context, so something must reconcile a live
-  context against a dead pid, and that reconciliation does not belong in the
-  drift path. Both wants are satisfied by the roster becoming a **VFS view**
-  (`cat` instead of a verb), which is also exactly Amy's "a view into what cc is
-  doing". So: retire the *verb*, keep the *introspection*, and the VFS is where
-  it lands.
-- **The sharp edge: a CC context is one we cannot clock.** `kj drift` into a
-  native context queues into a mailbox that flushes when *we* drive the turn;
-  `kj drive` clocks it. For a CC session, CC alone decides when it reads its
-  inbox. So `--drive` means "deliver and clock" on a native target and "deliver
-  and hope" on a CC target — the flag's meaning diverges by target type, and a
-  uniform interface will paper over that. Name it in the UI rather than let it
-  read as a bug. Related: a CC context's identity is weaker than a native one,
-  because peer attribution is sender-asserted (above).
-
-**DEFERRED, Amy's call, her words:** *"I should think about and decide on
-ledger gating `--drive` later."* Open question is whether `--drive` routes
-through the approval gate, since it sends instructions to an agent that will
-act on them. Not blocking the probe or the roster; decide before there are
-dependents. One relevant safety fact: inbound peer messages **cannot** approve
-a pending permission prompt, change config, or run slash commands in the
-receiving session, so `--drive` cannot launder a permission decision past a CC
+**DEFERRED, Amy's call, her words:** *"I should think about and decide on ledger
+gating `--drive` later."* Whether `--drive` routes through the approval gate,
+since it sends instructions to an agent that will act on them. Fine while sends
+are deliberate and manual; **pressing before fan-out exists**. Relevant safety
+fact: inbound peer messages cannot approve a pending prompt, change config, or
+run slash commands, so this cannot launder a permission decision past a
 session's own gate.
-
-**Contrast with `codex-app`** (the other lane's Phase 0, `docs/codex-app-backend.md`):
-Codex's `app-server` is a *documented* JSON-RPC/JSONL **drive-the-agent**
-surface built for embedding. CC's socket is a **peer-coordination bus** between
-already-running sessions, and CC has no embedding protocol at all. Different
-axes — don't expect one normalized shape to cover both halves.
 
 ## Pythonic player: kaijutsu-py wheel (2026-08-09, Amy: "shape B — the pythonic player")
 
