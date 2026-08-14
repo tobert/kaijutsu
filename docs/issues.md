@@ -12,13 +12,51 @@ We pin **kaish 0.13** (`Cargo.toml`). **0.14 removes the latch surface**
 (`latch_request()`, `LatchRequest`, `.nonce`) — flagged by the kaish lead as
 the translation-site port predicted during the cut, now concrete.
 
-**Scope, probed rather than taken on report: one production call site.** The
-lead counted six references; that is right for the whole tree, but five are
-tests. Production is `crates/kaijutsu-kernel/src/mcp/servers/shell.rs:467`
-(`result.latch_request()`). The rest construct `LatchRequest` literals in test
-modules (`shell.rs` ~764, `kj_builtin.rs` ~2326–2377). So this is a small port
-with a test-fixture tail, not a six-site sweep — worth knowing before anyone
-budgets it as the larger job.
+**Scope — CORRECTED 2026-08-14, and the earlier correction was itself wrong.**
+
+The first pass here read: "one production call site
+(`shell.rs:467`), five test fixtures — a small port, not a six-site sweep."
+That is accurate *for the symbol it counted* (`latch_request()`) and wrong for
+the work. It missed that **kaijutsu built its own confirmation subsystem on
+kaish's `nonce` primitives**, which 0.14 deletes outright (not renames):
+`kaish_kernel::nonce`, `NonceStore`, `ExecContext::verify_nonce`,
+`ExecContext::latch_result`, `ExecResult.latch`, `JobStatus::Latched`.
+
+Verified in-tree 2026-08-14:
+- `kernel.rs:107` — `nonce_stores: DashMap<ContextId, kaish_kernel::nonce::NonceStore>`
+- `kernel.rs:1435-1448` — per-context mint/lookup accessor
+- `runtime/kj_builtin.rs:596-597` (`--confirm` extract), `:649`
+  (`ctx.verify_nonce`), `:744` (`ctx.latch_result`)
+- `kj/mod.rs:127-138,149,157` — `KjResult::Latch` + `is_latch()`
+- **six producers**: `kj/context.rs:1672,1908,2020` (archive/remove/retag),
+  `kj/workspace.rs:322`, `kj/doc.rs:434`, `kj/preset.rs:303`
+- `mcp/servers/shell.rs:467,495` — the MCP envelope's `"latch"` key
+
+So this is a subsystem replacement, not a port. **The lesson filed in
+`signoff.md` about this entry — "say what a number means for the work" —
+recursed: a correction praised for good framing was framed against the wrong
+symbol.** A count is only as good as the question it answers; check that the
+symbol you counted is the one the work is about.
+
+**kaish removed the gate on purpose.** `~/src/kaish/docs/EMBEDDING.md:793-812`:
+no kernel-held decision, no nonce, no interception hook. The embedder calls
+`plan_program(source)`, judges, and executes or doesn't. So the replacement is
+**ours to own end-to-end** — and it should be ONE path shared with the
+permission-Ask seam (`HookAction::Ask`, `mcp/permission.rs`,
+`subscribePermissionEvents @103`) rather than a second bespoke confirmation.
+Six `kj` verbs and the `shell` tool gate want the same thing.
+
+**Free win in the same bump:** 0.14 adds
+`KernelConfig::with_job_manager(Arc<JobManager>)` — that is blocker #1 of the
+three listed under *Background exec → kaish's job system*. The other two
+(mid-run output forwarding, PDEATHSIG) are unchecked.
+
+**Plan-API constraints worth knowing before designing against it:** there is no
+execute-a-Plan API and no per-command interception hook (grepped for
+specifically) — you re-submit the original source text, so a gate is
+**all-or-nothing per statement**. And `presented_keys` / `--confirm` redaction
+in the plan surface is vestigial: nothing in 0.14 mints or redeems a confirm
+key (only `kaish-trash empty` keeps a bare no-nonce `--confirm` flag).
 
 **It also closes an open TODO.** `kaish-help` is pinned to a git rev (not
 crates.io) because published 0.13 forces an "Overlay mode" paragraph into every
@@ -28,11 +66,50 @@ in **0.14.0**, so the TODO's own stated exit condition is met: flip
 `kaish-help` to `"0.14"` in the same bump (`docs/composable-help.md` step 4).
 The two are coupled — the help unpin is the reward for doing the latch port.
 
-**Also from the same exchange — one kaish gotcha of ours is now FIXED and one
-is not a bug.** `${var:0:N}` no longer fails silently: kaish 0.14 (`d129cb5`)
-slices with `${s[0:5]}` (bracket form, start:end, end-exclusive, character-
-counting, negatives and open bounds free) and makes the bash `:offset:length`
-spelling a loud error naming the kaish form. Worth knowing *why* it got
+**`${var:0:N}` is NOT fixed by pinning crates.io `"0.14"` — MEASURED
+2026-08-14, correcting this entry's original claim.** The fix is real but lives
+in the **12 unreleased commits past the `v0.14.0` tag** (`d129cb5`). Built the
+tag in a throwaway worktree and probed it directly:
+
+| probe | published `v0.14.0` | HEAD `d129cb5` |
+|---|---|---|
+| `echo "${d:0:4}/file"` | **`/file`, exit 0, no diagnostic** | loud parse error naming `${d[0:4]}` |
+| `echo "[${d:0:4}]"` | `[]`, exit 0 | loud parse error |
+| `echo "[${d[0:4]}]"` | `cannot subscript a string` | `[/hom]` ✓ |
+
+So on the published tag the trap is **live** (silent wrong path — the data-
+corruption shape, not the missing-value shape) **and the documented replacement
+syntax does not work on strings at all**. Pinning `"0.14"` from crates.io buys
+nothing here.
+
+**RESOLVED — Amy 2026-08-14: "the string range stuff will be in kaish 0.14.1."**
+So: **no git-rev pin.** Do the bump against `"0.14"` (the confirmation-subsystem
+replacement is the long pole and is independent of slice syntax), then flip the
+pin to `"0.14.1"` when it is cut. The `${var:0:N}` trap stays live in the
+interim, which is exactly the status quo on 0.13 — no regression, and a rev pin
+would have re-created the very problem this bump retires by unpinning
+`kaish-help`.
+
+**Probes 4–6 showed no tag-vs-HEAD delta**, so these are unaffected by the pin
+choice: `||` after a `$()` assignment still never fires (also absent from the
+unreleased changelog — nobody upstream is tracking it).
+
+**The leading-zero trap is BROADER than filed, not narrower.** A first probe
+(`x=007; case $x in 007)`) matched, which looked like evidence the loss was
+`for`-only — it is not, and the probe was under-designed: it normalizes BOTH
+sides, so a match cannot distinguish "neither normalized" from "both
+normalized". The decisive forms:
+
+```sh
+case "03" in 03) …      # NO-MATCH — the PATTERN normalizes
+x=007; echo "[$x]"      # [7]    — bare-numeric ASSIGNMENT normalizes too
+for i in 007; …         # [7]
+```
+
+Assignment was not previously recorded anywhere. So any rc script doing
+`hour=08` — not just `case`/`for` — silently holds a different value than it
+reads. Ruled INTENDED upstream, so plan around it permanently: **quote the
+literal** (`x="007"`) whenever a leading zero is data. Worth knowing *why* it got
 prioritized: our report said the expansion yielded empty, but the receiving
 lane's re-probe found the word vanishes from the AST entirely — so inside
 quotes it produced a **wrong path, not a missing one** (`"${d:0:4}/file"` →
