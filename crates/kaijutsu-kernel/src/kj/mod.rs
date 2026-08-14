@@ -17,6 +17,7 @@ pub mod block;
 pub mod cache;
 pub mod cas;
 pub mod cast;
+pub mod cc;
 pub mod cp;
 pub mod config;
 pub mod context;
@@ -432,6 +433,12 @@ impl KjDispatcher {
         // (a human at the shell has no context to require).
         if cmd == "roster" {
             return self.dispatch_roster(&argv[1..], caller).await;
+        }
+        // `kj cc` reads Claude Code's own on-disk session registry
+        // (~/.claude/sessions/) — a host-filesystem roster, not a kaijutsu
+        // context — same exemption rationale as `kj audio`/`kj midi`.
+        if cmd == "cc" {
+            return self.dispatch_cc(&argv[1..], caller);
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
@@ -856,6 +863,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(cast::CastArgs::command())
         .subcommand(alias::AliasArgs::command())
         .subcommand(cas::CasArgs::command())
+        .subcommand(cc::CcArgs::command())
         .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())
         .subcommand(midi::MidiArgs::command())

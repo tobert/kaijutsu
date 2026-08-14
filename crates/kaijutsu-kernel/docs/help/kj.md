@@ -62,6 +62,8 @@ cast            list, show, create, remove, set, slot set|remove — named model
                 ensembles (role → backend/model + tunables); role is a
                 context_type; `set --desc` edits the description after create
                 ("" clears it to NULL)
+cc              list — roster of live Claude Code sessions on this machine,
+                read from ~/.claude/sessions/*.json (never reads *.key files)
 config          list, show, set, edit, reset — CRDT-owned config at /etc/config
                 (system.md, theme.toml, mcp.toml) + per-client at /etc/client
 context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,
