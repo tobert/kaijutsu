@@ -85,7 +85,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use kaijutsu_types::{ContentType, KernelId};
+use kaijutsu_types::ContentType;
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 
@@ -253,14 +253,7 @@ impl KjDispatcher {
             _ => return KjResult::Err("kj cc send: $HOME is not set".to_string()),
         };
         let sessions_dir = home.join(".claude").join("sessions");
-        cc_send_inner(
-            &sessions_dir,
-            &our_identity(self.kernel_id()),
-            FROM_NAME,
-            target,
-            message,
-            dry_run,
-        )
+        cc_send_inner(&sessions_dir, FROM_NAME, target, message, dry_run)
     }
 }
 
@@ -551,31 +544,49 @@ fn parse_stat_starttime(stat_line: &str) -> Option<u64> {
 /// boundary ambiguous rather than erroring loudly. Reject it outright.
 const CLOSING_TAG: &str = "</cross-session-message>";
 
-/// Our identity for the envelope's `from` attribute. Kaijutsu is not itself
-/// a Claude Code session with a real `uds:`-addressable socket, but the
-/// shape observed live from a real sender was `uds:<identity>` — this
-/// mirrors that shape with the kernel id so sends from different kaijutsu
-/// kernels to the same target are distinguishable.
-fn our_identity(kernel_id: KernelId) -> String {
-    format!("uds:kaijutsu-kernel-{}", kernel_id.short())
-}
-
-/// The `from-name` attribute value. Constant, not user-supplied, so it can
-/// never itself trip the `[^"<>\n\r]+` charset the receiver's parser expects
-/// for that attribute.
+/// The `from-name` attribute value.
 const FROM_NAME: &str = "kaijutsu";
+
+/// Characters the receiver's `from-name` charset (`[^"<>\n\r]+`) forbids.
+/// A name containing any of them makes the envelope fail to match, which
+/// **delivers anyway and silently drops attribution** — so this is rejected
+/// rather than escaped. Escaping would produce a name that round-trips
+/// through the parser's canonicalization check as *different* text, which is
+/// the same silent downgrade wearing a disguise.
+const FROM_NAME_FORBIDDEN: [char; 4] = ['"', '<', '>', '\n'];
 
 /// Build the canonical attributed envelope Claude Code's receiver expects —
 /// the regex measured live against CC 2.1.232 (module docs / `docs/issues.md`
-/// "`drift --drive`"). Attribute order is load-bearing (`from`, `from-name`,
-/// `from-mode`, in that relative order — the shape a real observed sender
-/// used) and the body must be newline-delimited *inside* the tag: `>\n` …
-/// `\n</`. `from-mode="prompting"` is the only value ever observed live;
-/// hardcoded here rather than modeled as an enum with one variant.
-fn build_envelope(from: &str, from_name: &str, body: &str) -> String {
-    format!(
-        "<cross-session-message from=\"{from}\" from-name=\"{from_name}\" from-mode=\"prompting\">\n{body}\n</cross-session-message>"
-    )
+/// "`drift --drive`").
+///
+/// **We deliberately omit `from`.** The attribute is optional in the grammar,
+/// and it is the address the receiving agent is told to reply to. Kaijutsu is
+/// not a Claude Code session and owns no `uds:`-addressable inbox, so any
+/// value we invent is an invitation to a reply that cannot arrive — and a
+/// fabricated `uds:` path is worse than an absent one, because that string is
+/// what the peer tooling treats as a destination. Probed live: with `from`
+/// omitted the message still renders attributed by `from-name`, and the
+/// receiver simply has no address to try. Callers who want a reply must say
+/// so in the body, over a channel that exists (the hook/MCP path).
+///
+/// Attribute order is load-bearing, the body must be newline-delimited
+/// *inside* the tag (`>\n` … `\n</`), and `from-mode="prompting"` is the only
+/// value ever observed live — hardcoded rather than modeled as a one-variant
+/// enum.
+fn build_envelope(from_name: &str, body: &str) -> Result<String, String> {
+    if from_name.is_empty() {
+        return Err("from-name must not be empty".to_string());
+    }
+    if let Some(bad) = from_name.chars().find(|c| FROM_NAME_FORBIDDEN.contains(c)) {
+        return Err(format!(
+            "from-name {from_name:?} contains {bad:?}, which the receiver's \
+             from-name charset forbids — refusing: the envelope would deliver \
+             but silently lose attribution"
+        ));
+    }
+    Ok(format!(
+        "<cross-session-message from-name=\"{from_name}\" from-mode=\"prompting\">\n{body}\n</cross-session-message>"
+    ))
 }
 
 /// Refuse an empty body and refuse an envelope-injection attempt. Kept
@@ -708,11 +719,10 @@ fn read_peer_token(path: &Path) -> Result<String, String> {
 
 /// The real logic behind `kj cc send`, taking an injected `sessions_dir` so
 /// tests never touch `~/.claude` or a real session's socket — same shape as
-/// [`scan_sessions_dir`]. `from`/`from_name` are the envelope's attribution;
+/// [`scan_sessions_dir`]. `from_name` is the envelope's attribution;
 /// `target`/`message`/`dry_run` are the parsed CLI args.
 fn cc_send_inner(
     sessions_dir: &Path,
-    from: &str,
     from_name: &str,
     target: &str,
     message: &str,
@@ -734,7 +744,10 @@ fn cc_send_inner(
         return KjResult::Err(format!("kj cc send: {e}"));
     }
 
-    let envelope = build_envelope(from, from_name, message);
+    let envelope = match build_envelope(from_name, message) {
+        Ok(e) => e,
+        Err(e) => return KjResult::Err(format!("kj cc send: {e}")),
+    };
     let user_frame = serde_json::json!({
         "type": "user",
         "message": {"role": "user", "content": envelope}
@@ -1178,12 +1191,15 @@ mod tests {
 
         #[test]
         fn envelope_round_trips_through_the_regex() {
-            let envelope = build_envelope("uds:kaijutsu-kernel-abcd1234", "kaijutsu", "hello there");
+            let envelope = build_envelope("kaijutsu", "hello there").expect("valid from-name");
             let re = envelope_regex();
             let caps = re
                 .captures(&envelope)
                 .expect("a well-formed envelope must match the parser regex");
-            assert_eq!(&caps[1], "uds:kaijutsu-kernel-abcd1234");
+            // `from` is deliberately omitted — see build_envelope's docs. The
+            // grammar makes it optional, and inventing an unreachable reply
+            // address is worse than offering none.
+            assert!(caps.get(1).is_none(), "from must not be emitted");
             assert!(caps.get(2).is_none(), "from-session was never emitted");
             assert!(caps.get(3).is_none(), "hop-chain was never emitted");
             assert_eq!(&caps[4], "kaijutsu");
@@ -1194,12 +1210,33 @@ mod tests {
         #[test]
         fn body_with_newlines_quotes_angle_brackets_and_non_ascii_round_trips() {
             let body = "line one\nline \"two\" <tag> — 日本語 😀\nline three";
-            let envelope = build_envelope("uds:test", "kaijutsu", body);
+            let envelope = build_envelope("kaijutsu", body).expect("valid from-name");
             let re = envelope_regex();
             let caps = re
                 .captures(&envelope)
                 .expect("a body with newlines/quotes/angle-brackets/non-ASCII must still match");
             assert_eq!(&caps[6], body, "captured body must equal the original exactly");
+        }
+
+        #[test]
+        fn a_from_name_outside_the_receiver_charset_is_rejected_not_escaped() {
+            // Today FROM_NAME is a constant, but this becomes a context label
+            // once `kj cc` melts into `kj drift` — at which point it is
+            // user-controlled. A name carrying a quote would deliver and
+            // silently lose attribution, so it must error here instead.
+            for bad in ["say \"hi\"", "a<b", "a>b", "two\nlines"] {
+                let err = build_envelope(bad, "body").expect_err(&format!(
+                    "from-name {bad:?} must be rejected, not escaped or passed through"
+                ));
+                assert!(
+                    err.contains("from-name"),
+                    "error should name the offending attribute: {err}"
+                );
+            }
+            // And a name that only *looks* exotic is still fine.
+            let ok = build_envelope("kaijutsu-ctx-7f3a — 会術", "body")
+                .expect("non-ASCII without forbidden chars is allowed");
+            assert!(envelope_regex().is_match(&ok));
         }
 
         // ── deliberately malformed variants must NOT match ─────────────────
@@ -1452,7 +1489,6 @@ mod tests {
 
             let result = cc_send_inner(
                 dir.path(),
-                "uds:test-kernel",
                 "kaijutsu",
                 "tok-target",
                 "hi there",
@@ -1508,7 +1544,6 @@ mod tests {
 
             let result = cc_send_inner(
                 dir.path(),
-                "uds:test-kernel",
                 "kaijutsu",
                 "no-key-here",
                 "hi",
@@ -1531,7 +1566,6 @@ mod tests {
             // into any error string this function can produce.
             let result = cc_send_inner(
                 dir.path(),
-                "uds:test-kernel",
                 "kaijutsu",
                 "tok-target",
                 "",
@@ -1542,7 +1576,6 @@ mod tests {
 
             let result = cc_send_inner(
                 dir.path(),
-                "uds:test-kernel",
                 "kaijutsu",
                 "no-such-target",
                 "hi",
@@ -1623,7 +1656,6 @@ mod tests {
 
             let result = cc_send_inner(
                 dir.path(),
-                "uds:test-kernel",
                 "kaijutsu",
                 "tok-target",
                 "hello there",
@@ -1650,8 +1682,13 @@ mod tests {
                 .as_str()
                 .expect("content must be a string");
             assert!(content.starts_with(
-                "<cross-session-message from=\"uds:test-kernel\" from-name=\"kaijutsu\" from-mode=\"prompting\">\n"
+                "<cross-session-message from-name=\"kaijutsu\" from-mode=\"prompting\">\n"
             ));
+            assert!(
+                !content.contains(" from=\""),
+                "no `from` attribute may be emitted: it is the reply address, \
+                 and kaijutsu has no inbox to receive one — {content}"
+            );
             assert!(content.ends_with("\n</cross-session-message>"));
             assert!(content.contains("hello there"));
 
@@ -1739,6 +1776,29 @@ mod tests {
         for e in &scan.errors {
             println!("  ! {}: {}", e.file, e.message);
         }
+    }
+
+    /// End-to-end against this machine's real registry and a real live Claude
+    /// Code session — the only test that validates our serializer against the
+    /// *actual* receiver rather than against our own copy of its regex.
+    /// Ignored: it needs a live session and it delivers a real message.
+    /// `cargo test -p kaijutsu-kernel cc::tests::real_send -- --ignored --nocapture`
+    #[test]
+    #[ignore = "sends a real message to a live Claude Code session; run manually"]
+    fn real_send_to_a_live_session() {
+        let home = std::env::var_os("HOME").expect("HOME");
+        let dir = PathBuf::from(home).join(".claude").join("sessions");
+        let target = std::env::var("KJ_CC_TARGET").unwrap_or_else(|_| "kaijutsu-chan".to_string());
+        let result = cc_send_inner(
+            &dir,
+            FROM_NAME,
+            &target,
+            "REAL SEND via kj cc send: if this arrives attributed to kaijutsu, \
+             the canonical serializer is validated against the real receiver.",
+            false,
+        );
+        println!("result: {:?}", result.message());
+        assert!(result.is_ok(), "real send failed: {}", result.message());
     }
 
 }
