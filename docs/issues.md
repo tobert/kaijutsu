@@ -860,6 +860,58 @@ side via the hook pipeline that already exists. So the record is sent-row +
 received-row, reconciled — the same ledger shape the approval lane is
 building tooling for.
 
+**Shape located in existing code (recon 2026-08-14) — build nothing new that
+already exists:**
+
+- **The VFS view copies `MidiPresenceFs`** (`kaijutsu-kernel/src/midi_presence.rs`,
+  mounted `/run/midi` at `kaijutsu-server/src/rpc.rs:1817`). Same problem one
+  domain over: ephemeral-by-construction, read-only by construction, `BTreeMap`
+  + an `AtomicU64` generation, and its rule that **a missing entry reads as
+  *unknown*, never as absent**. Roster lands at `/run/cc`, which retires
+  `kj cc list` in favour of `cat` exactly as Amy asked.
+- **The peer registry already exists**: `PeerRegistry`
+  (`kaijutsu-kernel/src/peers.rs:103`), in-memory under a tokio `RwLock` on the
+  `Kernel`, and **an MCP session already self-registers into it**
+  (`kaijutsu-mcp/src/lib.rs:1665-1700`). A CC session becomes a `PeerConfig`
+  there — nick from its stable `cc-*` label, `instance` from
+  `CLAUDE_CODE_SESSION_ID` — not a fourth parallel map.
+- **Durability line, already drawn by practice:** hooks and contexts are
+  DB-first (SQLite authoritative, hydrated from it); presence/peers/shares are
+  deliberately not durable at all, because a remembered liveness fact is a lie.
+  That puts session↔context *identity* on the durable side (it is already
+  there, as `contexts.label`) and liveness/socket/token on the in-memory side —
+  independently agreeing with the read-at-send-time token rule above.
+
+**Four traps, all cheap to avoid and expensive to discover:**
+
+1. **`freeze_mounts()` is a hard ordering constraint** (`rpc.rs:1844`). The
+   mount must join the block at `rpc.rs:1649-1840`; afterwards `mount` logs a
+   warning and returns false. And frozen means **one backend for the whole
+   subtree** — copy `ShareFs`'s "one backend routes internally to N sessions",
+   never a mount-per-session.
+2. **`getattr` sizes the body, and `read_all` reads exactly `attr.size`.** A
+   roster that renders differently between the `getattr` and the `read`
+   silently truncates. Render deterministically, ordered, and bump
+   `generation` so the app's re-`stat` sees freshness.
+3. **`PeerRegistry` resets on kernel restart.** `ActorHandle` already replays
+   `peer_registration` on reconnect (`kaijutsu-client/src/actor.rs:1836`), so
+   ride that replay — otherwise a CC session sits registered-and-invisible
+   until its *next* hook fires, for possibly a whole turn.
+4. **Three files move together for a hook field**: `HookEvent`
+   (`kaijutsu-mcp/src/hook_types.rs:14`) has no env slot, the jq map
+   (`contrib/adapters/claude-to-kaijutsu.jq`) would need `$ENV.CLAUDE_CODE_*`,
+   and `kaijutsu-mcp/tests/adapter_mapping.rs` asserts no field is silently
+   dropped. Also: the per-hook budget is **5s** (`contrib/claude-hooks.json`)
+   and expiry degrades permissive, so registration must be one-shot
+   (`Mutex::take`, as `maybe_stabilize_label` does), never per-event.
+
+**Bonus: this fixes a known bug rather than only adding a feature.** Nothing in
+the tree reads `CLAUDE_CODE_*` today — agent identity comes from *scraping the
+newest transcript file*, which at MCP-spawn time can belong to a **previous**
+session (the weakness noted in `kaijutsu-mcp/src/main.rs:176-183`, and recorded
+in memory as the startup-detection gotcha). `CLAUDE_CODE_SESSION_ID` is the
+authoritative value that removes the guess.
+
 **`kj cc` is scaffolding, not the destination (Amy, 2026-08-14).** Her words:
 *"I'd like to melt `kj cc` if things work well, we should have the hooks get us
 contexts and a view into what cc is doing and then we should be able to do a
