@@ -860,6 +860,35 @@ side via the hook pipeline that already exists. So the record is sent-row +
 received-row, reconciled — the same ledger shape the approval lane is
 building tooling for.
 
+**`kj cc` is scaffolding, not the destination (Amy, 2026-08-14).** Her words:
+*"I'd like to melt `kj cc` if things work well, we should have the hooks get us
+contexts and a view into what cc is doing and then we should be able to do a
+drift like it was any other context. so imo `kj cc` is a temporary thing, but I
+can be talked out of that."* This is the right end state and it is the
+`agent-emerges-not-a-noun` doctrine applied: a CC session that registers as a
+context needs no special verb, because `drift`/`fork`/`attach` already work on
+contexts. Two amendments rather than a counter-argument:
+
+- **The capability melts into the VFS; it does not disappear.** One thing a
+  context genuinely cannot cover: sessions that have *not* opted in. A context
+  exists only for a hooked session, but the on-disk registry sees every session
+  on the box — and the moment you need that is exactly when one *isn't* wired
+  up and you are debugging why. Same for reachability: liveness is a property
+  of a host process, not of a context, so something must reconcile a live
+  context against a dead pid, and that reconciliation does not belong in the
+  drift path. Both wants are satisfied by the roster becoming a **VFS view**
+  (`cat` instead of a verb), which is also exactly Amy's "a view into what cc is
+  doing". So: retire the *verb*, keep the *introspection*, and the VFS is where
+  it lands.
+- **The sharp edge: a CC context is one we cannot clock.** `kj drift` into a
+  native context queues into a mailbox that flushes when *we* drive the turn;
+  `kj drive` clocks it. For a CC session, CC alone decides when it reads its
+  inbox. So `--drive` means "deliver and clock" on a native target and "deliver
+  and hope" on a CC target — the flag's meaning diverges by target type, and a
+  uniform interface will paper over that. Name it in the UI rather than let it
+  read as a bug. Related: a CC context's identity is weaker than a native one,
+  because peer attribution is sender-asserted (above).
+
 **DEFERRED, Amy's call, her words:** *"I should think about and decide on
 ledger gating `--drive` later."* Open question is whether `--drive` routes
 through the approval gate, since it sends instructions to an agent that will
