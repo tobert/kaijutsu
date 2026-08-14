@@ -119,10 +119,15 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
     let list = Arc::clone(&bridge);
     let prompt = Arc::clone(&bridge);
     let cancel = Arc::clone(&bridge);
+    let permission = Arc::clone(&bridge);
 
     Agent
         .builder()
         .name("kaijutsu-acp")
+        .with_spawned(move |cx| async move {
+            permission::start_permission_pump(&permission, cx).await;
+            Ok(())
+        })
         .on_receive_request(
             async move |req: InitializeRequest, responder, _cx| {
                 handle_initialize(&init, req, responder)

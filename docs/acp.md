@@ -42,7 +42,7 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/update` text/thought | `BlockKind::Text`/`Thinking` char deltas off the CRDT mirror | built |
 | `session/update` tool_call / tool_call_update | `BlockKind::ToolCall` create, then patch; `ToolResult` patches the call it links to | built |
 | `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
-| `session/request_permission` | **auto-allow stub** (`permission.rs`); `HookAction::Ask` not built | STUB |
+| `session/request_permission` | `ActorHandle::take_permission_asks` → `permission::run_permission_pump` → `contextId` → ACP session (`rank::session_id_of`) → real round trip; fail-closed on no session/client error/timeout | built |
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the CRDT mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
@@ -189,7 +189,7 @@ src/bridge.rs      kernel side: connect, resolve/create/join, prompt, interrupt
 src/session.rs     SessionRegistry + the per-session event pump + the turn wait
 src/update.rs      PURE: BlockSnapshot → SessionUpdate (the mapping layer)
 src/rank.rs        PURE: ContextInfo[] → the rank → SessionInfo[]
-src/permission.rs  the auto-allow STUB + the shaped Ask seam
+src/permission.rs  the live Ask pathway: pump, option shaping, answer mapping
 src/lib.rs         the six ACP handlers + version negotiation
 src/main.rs        clap, stderr tracing, LocalSet, --connect
 tests/dispatch.rs  the six-handler chain actually dispatches by type
@@ -233,12 +233,28 @@ sessions take `context_type=coder` (the model-facing stance bundle), not
   that into a message naming the likely cause. Found by the first live smoke
   test, against a kernel too old to serve `subscribeTurnEvents`.
 
-**Permission stub.** `permission.rs` allows everything and never asks; the
-module header says so in capitals. The Ask-side code that *will* be needed —
-option shaping, outcome interpretation, deny-on-anything-unrecognised — is
-written and unit-tested; only the kernel→bridge transport is missing, and this
-crate does not own the wire schema. Do not point an untrusted client at this
-bridge until gap #2 lands.
+**Permission asks, wired live.** `permission.rs`'s Ask pathway is real: the
+`.with_spawned` task registered in `serve_stdio`
+(`permission::start_permission_pump`) drains
+`ActorHandle::take_permission_asks()` — a kernel-wide envelope stream
+`kaijutsu-client` re-arms best-effort on every reconnect
+(`actor.rs::connect_handshake` step 3.7) — resolves each envelope's
+`contextId` to an ACP session (`rank::session_id_of`, no side table), and
+drives a real `session/request_permission` round trip if (and only if) a
+session is live for that context. Every failure mode denies: no live
+session, a client error, a client timeout
+(`permission::PERMISSION_ASK_TIMEOUT`, mirrors the kernel's own 30s default
+as defense in depth — the kernel's own timeout is the actual authority), or
+a selected option this bridge can't place. `AutoAllow`/`PermissionPolicy`
+(the old always-allow stub) are gone — there is no configured opt-in bypass
+to keep. `PermissionOption.kind` is free text on the wire
+(`kaijutsu.capnp`); `permission::map_kind` places the four strings the
+kernel's doc comment promises (`allow_once`/`allow_always`/`reject_once`/
+`reject_always`) and treats anything else as `RejectOnce` — the safest
+reading, not the most permissive. `AskSpec` carries no options today (v1's
+rule syntax is a plain description), so the empty-options synthesis path
+(`build_options`, a plain Allow/Deny pair) is what every real ask exercises
+in practice.
 
 **Gaps found while building** (also in issues.md):
 

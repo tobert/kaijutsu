@@ -1294,13 +1294,23 @@ wins model switching, semantic memory, OTel, and CRDT-native state; the gaps:
 Ordered roughly by how much they hurt. Full context in `docs/acp.md`, "The
 adapter, as built".
 
-- **`session/request_permission` is stubbed to auto-allow** —
-  `kaijutsu-acp/src/permission.rs`, marked in capitals. Blocked on
-  `HookAction::Ask` + a `PermissionEvents` server→client callback (acp.md
-  gap #2). The bridge-side half — option shaping, outcome interpretation,
-  deny-on-anything-unrecognised — is written and unit-tested; only the
-  kernel→bridge transport is missing. **Do not point an untrusted client at
-  the bridge until this lands.**
+- ~~**`session/request_permission` is stubbed to auto-allow**~~ **SHIPPED**
+  — `HookAction::Ask` + `PermissionEvents` landed (gap #2, `232c99c9`), then
+  the bridge itself was rewired to use it. `kaijutsu-client::ActorHandle`
+  gained a kernel-wide permission-ask stream (`take_permission_asks`,
+  re-armed best-effort on every reconnect, `actor.rs`'s `connect_handshake`
+  step 3.7); `kaijutsu-acp`'s `.with_spawned` task
+  (`permission::start_permission_pump`, `lib.rs::serve_stdio`) drains it,
+  resolves `contextId` → ACP session via `rank::session_id_of` (no side
+  table), and drives a real `session/request_permission` round trip. Fails
+  closed on every path: no live session for the context, a client error, a
+  client timeout (`PERMISSION_ASK_TIMEOUT`, mirrors the kernel's own
+  30s default), or an unrecognised selected option. `AutoAllow`/
+  `PermissionPolicy` deleted — nothing configures an opt-in bypass.
+  Tests: `permission.rs`'s unit suite (option-kind mapping, empty-options
+  synthesis, response mapping) plus `tests/permission_ask.rs`'s in-memory
+  round trips (allow, deny, richer kernel options, no-session, client
+  timeout, cancelled prompt).
 - ~~**No catch-up after a resync.**~~ **SHIPPED 2026-08-05** after it ate a
   live answer on toad flight two (FlowBus lag mid-turn; the client rendered
   the tool call, then silence over a finished report). `resync` now keeps
@@ -1330,24 +1340,14 @@ adapter, as built".
   flatten via pre-order DFS with a `"↳ "` nesting prefix on `content`;
   priority defaults to `Medium` (no kernel-side priority field exists, none
   invented). Full writeup: `docs/acp.md` "Task → plan". Found while
-  building: `session::run_pump`'s `BlockDeleted` arm calls `mapper.forget`
-  and `continue`s WITHOUT ever calling `doc.apply_event(&event)` — the live
-  `SyncedDocument` mirror never drops a deleted block, only a resync
-  rebuilds it away. Pre-existing, affects every block kind (not
-  Task-specific), not fixed here — noted as a follow-up below.
-- **`session::run_pump`'s `BlockDeleted` arm never updates the `SyncedDocument`
-  mirror.** Found 2026-08-05 while wiring Task → `plan`. The early-return
-  branch (`kaijutsu-acp/src/session.rs`, the `if let ServerEvent::BlockDeleted
-  ... continue` a few lines into the event-loop arm) calls `mapper.forget`
-  and `continue`s before `doc.apply_event(&event)` runs, even though
-  `SyncedDocument::apply_event_inner` has a real `BlockDeleted` handler
-  (`synced_document.rs` — `sync.apply_delete`). A block deleted mid-session
-  lingers in the live mirror (and so in `doc.blocks()`, and so in a rebuilt
-  Task plan) until the next resync/reconnect throws the mirror away and
-  rebuilds it fresh. Affects every block kind's live rendering, not just
-  Task's plan — worth a one-line fix (call `doc.apply_event` for
-  `BlockDeleted` too, same as every other per-block event) plus a
-  regression test once someone's in that file for another reason.
+  building: `session::run_pump`'s `BlockDeleted` arm called `mapper.forget`
+  and `continue`d WITHOUT ever calling `doc.apply_event(&event)` — the live
+  `SyncedDocument` mirror never dropped a deleted block, only a resync
+  rebuilt it away. Pre-existing, affected every block kind (not
+  Task-specific). ~~Not fixed here~~ **fixed in `833f951c`** (2026-08-07):
+  the arm now applies the event (honouring `NeedsResync`) before rebuilding
+  the plan, pinned by `build_plan_re_emits_when_a_task_disappears` /
+  `build_plan_stays_quiet_when_a_non_task_disappears` in `update.rs`.
 - **Client-identity presets on connect** (Amy, 2026-08-05 evening, first
   toad day): ACP `initialize` carries `clientInfo` (Implementation
   name+version) and capabilities — enough to recognize *which* frontend

@@ -781,7 +781,7 @@ pub struct PermissionAskEnvelope {
 }
 
 /// The consumer's verdict on a [`PermissionAskEnvelope`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionAskAnswer {
     pub allow: bool,
     pub selected_option_id: Option<String>,

@@ -78,8 +78,9 @@ use crate::rpc::{
     StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
-    BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, ResourceEventsForwarder,
-    ServerEvent, TurnEventsForwarder, VfsActivityEventsForwarder,
+    BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, PermissionAskEnvelope,
+    ResourceEventsForwarder, ServerEvent, TurnEventsForwarder, VfsActivityEventsForwarder,
+    permission_events_channel,
 };
 use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 
@@ -97,6 +98,14 @@ const EVENT_BROADCAST_CAPACITY: usize = 256;
 
 /// Broadcast capacity for connection status events.
 const STATUS_BROADCAST_CAPACITY: usize = 16;
+
+/// Capacity of the kernel-wide permission-ask stream (D-57, docs/acp.md gap
+/// #2). Asks are rare and interactive — one hook firing mid-turn, a human
+/// answering it — so this is generous headroom, not a throughput budget. The
+/// kernel's own `DEFAULT_PERMISSION_ASK_TIMEOUT` (30s) is the real backstop
+/// against a saturated channel: a consumer that falls behind just means asks
+/// queue briefly before the kernel gives up and fails them closed on its own.
+const PERMISSION_ASK_CHANNEL_CAPACITY: usize = 16;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Errors (public API)
@@ -793,6 +802,12 @@ pub struct ActorHandle {
     /// block-events forwarder this actor builds — including the ones a
     /// reconnect rebuilds — so installing once survives reconnects.
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
+    /// The kernel-wide permission-ask stream (D-57), handed out exactly
+    /// once via [`Self::take_permission_asks`]. `Some` until taken;
+    /// `std::sync::Mutex` (not `parking_lot`, matching nothing else in this
+    /// file — a plain `Option::take()` under a lock, never held across an
+    /// await) because this is the only mutex-shaped field on the struct.
+    permission_asks: Arc<std::sync::Mutex<Option<mpsc::Receiver<PermissionAskEnvelope>>>>,
 }
 
 impl ActorHandle {
@@ -822,6 +837,22 @@ impl ActorHandle {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Take ownership of this actor's kernel-wide permission-ask stream
+    /// (`HookAction::Ask`, D-57, docs/acp.md gap #2). At most one consumer:
+    /// unlike [`Self::subscribe_events`]'s broadcast fan-out, every envelope
+    /// carries a one-shot answer channel that only one drainer can honor, so
+    /// a second call — after the first already took it — returns `None`
+    /// rather than a second copy of the stream.
+    ///
+    /// The returned receiver stays valid across reconnects: `connect_handshake`
+    /// best-effort re-subscribes on every successful (re)connect (see there)
+    /// and forwards into the SAME channel this method hands out once, so a
+    /// kernel restart or network blip doesn't require the caller to notice
+    /// and re-subscribe.
+    pub fn take_permission_asks(&self) -> Option<mpsc::Receiver<PermissionAskEnvelope>> {
+        self.permission_asks.lock().unwrap().take()
     }
 
     pub fn subscribe_status(&self) -> broadcast::Receiver<ConnectionStatus> {
@@ -1820,6 +1851,12 @@ struct RpcActor {
     /// Rebuilding the forwarder on reconnect therefore never loses the
     /// installed sink.
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
+    /// Sink for the permission-ask forwarding task `connect_handshake`
+    /// (re)builds on every connect (D-57). Cloned into that task, never into
+    /// `RpcActor` state that changes — unlike `vfs_activity_interval_ms`
+    /// there's no opt-in toggle to persist, this subscription is attempted
+    /// unconditionally every time.
+    permission_tx: mpsc::Sender<PermissionAskEnvelope>,
 
     /// Owned during `Connected`. Replaced atomically on successful handshake.
     connection: Option<ConnectionState>,
@@ -1860,6 +1897,7 @@ impl RpcActor {
         status_tx: broadcast::Sender<ConnectionStatus>,
         status_watch_tx: watch::Sender<ConnectionStatus>,
         midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
+        permission_tx: mpsc::Sender<PermissionAskEnvelope>,
     ) -> Self {
         let (close_tx, close_rx) = mpsc::channel(1);
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
@@ -1874,6 +1912,7 @@ impl RpcActor {
             peer_registration: None,
             vfs_activity_interval_ms: None,
             midi_exchange,
+            permission_tx,
             connection: None,
             ping_task: None,
             connecting_task: None,
@@ -1946,6 +1985,7 @@ impl RpcActor {
             self.peer_registration.clone(),
             self.vfs_activity_interval_ms,
             self.midi_exchange.clone(),
+            self.permission_tx.clone(),
         );
         self.connecting_task = Some(task);
         self.broadcast_state();
@@ -2546,6 +2586,7 @@ fn spawn_handshake(
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
+    permission_tx: mpsc::Sender<PermissionAskEnvelope>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
         connect_handshake(
@@ -2557,6 +2598,7 @@ fn spawn_handshake(
             peer_registration,
             vfs_activity_interval_ms,
             midi_exchange,
+            permission_tx,
         )
         .await
     })
@@ -2604,6 +2646,7 @@ async fn connect_handshake(
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
+    permission_tx: mpsc::Sender<PermissionAskEnvelope>,
 ) -> ConnectOutcome {
     // 1. SSH dial + auth + channel open (with per-phase deadline).
     let client = match tokio::time::timeout(SSH_DIAL_TIMEOUT, connect_ssh(config)).await {
@@ -2717,6 +2760,53 @@ async fn connect_handshake(
             Ok(Ok(())) => log::info!("Re-subscribed vfs activity on connect"),
             Ok(Err(e)) => log::warn!("vfs activity re-subscribe failed (non-fatal): {e}"),
             Err(_) => log::warn!("vfs activity re-subscribe timed out (non-fatal)"),
+        }
+    }
+
+    // 3.7. Re-subscribe to the kernel-wide permission-ask stream (D-57,
+    //      docs/acp.md gap #2). Unconditional on every (re)connect — unlike
+    //      vfs_activity there is no opt-in toggle to persist across
+    //      reconnects; every client wants this armed from the start.
+    //      BEST-EFFORT, same reasoning as the peer re-attach and vfs
+    //      activity above, but for a different reason: `mcp::permission`'s
+    //      no-subscriber policy already fails an `Ask` closed (Deny, loud
+    //      `warn!`) when nobody answers, so a failed subscribe here just
+    //      widens that same fail-closed default rather than leaving a hole
+    //      — it must not abort an otherwise-healthy handshake.
+    //
+    //      `permission_events_channel` mints a fresh callback + receiver
+    //      pair every reconnect (the server dedupes by (principal, instance),
+    //      so a fresh callback client replaces rather than stacks); a small
+    //      forwarding task relays each envelope into the ONE persistent
+    //      `permission_tx` a caller took via `ActorHandle::take_permission_asks`
+    //      — so that receiver stays valid across the reconnect instead of
+    //      being invalidated by it.
+    {
+        let (perm_client, mut perm_rx) = permission_events_channel(PERMISSION_ASK_CHANNEL_CAPACITY);
+        match tokio::time::timeout(RPC_CALL_TIMEOUT, kernel.subscribe_permission_events(perm_client))
+            .await
+        {
+            Ok(Ok(())) => {
+                let sink = permission_tx.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(envelope) = perm_rx.recv().await {
+                        if sink.send(envelope).await.is_err() {
+                            // Nobody ever called `take_permission_asks()`, or
+                            // the caller dropped what it took. Either way
+                            // there's no one left to forward to; let this
+                            // reconnect's subscription die quietly. The
+                            // kernel-side `on_ask` still resolves the ask —
+                            // its own dropped-receiver handling
+                            // (`subscriptions.rs`'s `PermissionAskForwarder`)
+                            // is what actually denies it.
+                            break;
+                        }
+                    }
+                });
+                log::info!("Re-subscribed permission events on connect");
+            }
+            Ok(Err(e)) => log::warn!("permission events subscribe failed (non-fatal): {e}"),
+            Err(_) => log::warn!("permission events subscribe timed out (non-fatal)"),
         }
     }
 
@@ -3328,6 +3418,13 @@ pub fn spawn_actor(
     // MIDI-capable client installs its worker).
     let midi_exchange = crate::midi_exchange::MidiExchangeSlot::new();
 
+    // Created once, outside the reconnect loop — `connect_handshake` rebuilds
+    // the kernel-side subscription (and the forwarding task feeding this
+    // sink) on every (re)connect, but `permission_rx` itself survives a
+    // reconnect untouched, same as `event_tx`/`status_tx`.
+    let (permission_tx, permission_rx) =
+        mpsc::channel::<PermissionAskEnvelope>(PERMISSION_ASK_CHANNEL_CAPACITY);
+
     let actor = RpcActor::new(
         config,
         context_id,
@@ -3338,6 +3435,7 @@ pub fn spawn_actor(
         status_tx.clone(),
         status_watch_tx,
         midi_exchange.clone(),
+        permission_tx,
     );
     tokio::task::spawn_local(actor.run());
 
@@ -3347,6 +3445,7 @@ pub fn spawn_actor(
         status_tx,
         status_watch_rx,
         midi_exchange,
+        permission_asks: Arc::new(std::sync::Mutex::new(Some(permission_rx))),
     }
 }
 
@@ -3407,6 +3506,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(8);
         let (status_tx, _) = broadcast::channel(8);
         let (status_watch_tx, _) = watch::channel(ConnectionStatus::Idle);
+        let (permission_tx, _) = mpsc::channel(8);
         RpcActor::new(
             SshConfig::default(),
             None,
@@ -3417,6 +3517,7 @@ mod tests {
             status_tx,
             status_watch_tx,
             crate::midi_exchange::MidiExchangeSlot::new(),
+            permission_tx,
         )
     }
 
