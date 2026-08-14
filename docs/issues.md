@@ -799,14 +799,23 @@ folded). Two things changed today:
   is a *process* and already reachable over kaijutsu-mcp. The wheel must be
   judged on lanes 2 and 3 alone. Details + the two-directions split (harness
   drives kaijutsu, vs kaijutsu drives harness) in `docs/python-player.md`.
-- **The go/no-go decision fell out of the fleet queue.** It was
-  `~/exomemory/queue.md` item 5 ("wheel slice 1 go + first consumer");
-  the queue was reborn 08-13 from the daily closeout and renumbered, and
-  the item did not survive the migration — the same rot the queue exists to
-  prevent, on its first move. It now lives here and in python-player.md
-  "Open" only. **Awaiting Amy:** first consumer (notebook/MIDI player vs a
-  second vendor seat over MCP/ACP, which needs no wheel), and whether
-  direction (B) gets a policy read at all.
+- **The go/no-go decision fell out of the fleet queue, at a step two
+  migrations earlier than first reported.** Last seen at
+  `~/exomemory/daily/2026-08-11.md:39`, verbatim: *"5. Wheel slice 1 go +
+  first consumer (agent-SDK seat vs notebook)"* — in that daily's inline
+  queue. It appears in **no** later exomemory revision. The 08-11 → 08-12
+  daily hand-copy is where it died: 08-12 carries a ~20-item inline queue
+  with no wheel item, its closeout compressed those to 8, and the 08-13
+  `queue.md` rebirth then carried those 8 faithfully (items 1–8 identical,
+  item 5 = memory-pressure backstop in both). Two wrong attributions were
+  filed before the right one — the rebirth (mine, from misremembering the
+  file) and the closeout compression (the kaijutsu lane's) — so if this is
+  ever audited, **audit the daily-to-daily hand-copy**, which is precisely
+  the mechanism `queue.md`'s own birth note names as the rot it exists to
+  stop. The queue was right about its own hazard. The decision now lives
+  here and in python-player.md "Open" only. **Awaiting Amy:** first
+  consumer (notebook/MIDI player vs a second vendor seat over MCP/ACP,
+  which needs no wheel), and whether direction (B) gets a policy read.
 
 ## kaish-help and kaish-kernel must be bumped together (2026-08-07, adoption)
 
