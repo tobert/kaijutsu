@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::llm::StreamEvent;
+use crate::llm::{InlineToolResult, StreamEvent};
 
 /// The version-neutral error surface for this experimental protocol bridge.
 #[derive(Debug, Error)]
@@ -136,6 +136,108 @@ pub struct ThreadStart {
     /// Codex approval policy. Phase 0 pins this to `untrusted` instead of
     /// inheriting a possibly more permissive sidecar default.
     pub approval_policy: Option<String>,
+    /// Experimental app-server dynamic tools. Sending these requires the
+    /// initialize handshake to opt into `experimentalApi`.
+    pub dynamic_tools: Vec<DynamicToolSpec>,
+    /// App-server configuration overrides. Native host-exec features are
+    /// forcibly disabled when this is serialized; kaish remains their owner.
+    pub config: Option<Value>,
+}
+
+/// A Codex app-server `dynamicTools` entry on `thread/start`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DynamicToolSpec {
+    Function(DynamicToolFunction),
+    Namespace {
+        name: String,
+        description: String,
+        tools: Vec<DynamicToolFunction>,
+    },
+}
+
+/// The function shape shared by top-level and namespace dynamic tools.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicToolFunction {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub defer_loading: bool,
+}
+
+impl DynamicToolSpec {
+    fn as_json(&self) -> Value {
+        match self {
+            Self::Function(tool) => tool.as_json(),
+            Self::Namespace { name, description, tools } => json!({
+                "type": "namespace",
+                "name": name,
+                "description": description,
+                "tools": tools.iter().map(DynamicToolFunction::as_json).collect::<Vec<_>>(),
+            }),
+        }
+    }
+}
+
+impl DynamicToolFunction {
+    fn as_json(&self) -> Value {
+        json!({
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.input_schema,
+            "deferLoading": self.defer_loading,
+        })
+    }
+}
+
+fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<()> {
+    const RESERVED_NAMESPACES: &[&str] = &[
+        "functions", "multi_tool_use", "file_search", "web", "browser", "image_gen",
+        "computer", "container", "terminal", "python", "python_user_visible", "api_tool",
+        "tool_search", "submodel_delegator",
+    ];
+    for spec in tools {
+        match spec {
+            DynamicToolSpec::Function(tool) => {
+                validate_tool_name(&tool.name, 128, "dynamic tool")?;
+                if tool.defer_loading {
+                    return Err(CodexError::Protocol(format!(
+                        "top-level dynamic tool {:?} cannot defer loading; deferred tools require a namespace",
+                        tool.name
+                    )));
+                }
+            }
+            DynamicToolSpec::Namespace { name, description, tools } => {
+                validate_tool_name(name, 64, "dynamic tool namespace")?;
+                if RESERVED_NAMESPACES.contains(&name.as_str()) {
+                    return Err(CodexError::Protocol(format!(
+                        "dynamic tool namespace {name:?} is reserved by Codex"
+                    )));
+                }
+                if description.len() > 1024 {
+                    return Err(CodexError::Protocol(format!(
+                        "dynamic tool namespace {name:?} description exceeds 1024 characters"
+                    )));
+                }
+                for tool in tools {
+                    validate_tool_name(&tool.name, 128, "dynamic tool")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_name(name: &str, max_len: usize, kind: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > max_len
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(CodexError::Protocol(format!(
+            "{kind} name {name:?} must be 1..={max_len} ASCII letters, digits, '_' or '-'"
+        )));
+    }
+    Ok(())
 }
 
 /// Parameters used to begin a single text turn.
@@ -158,6 +260,14 @@ pub struct Client<T> {
     pending: VecDeque<StreamEvent>,
     text_open: bool,
     thinking_open: bool,
+    terminal_emitted: bool,
+    experimental_api: bool,
+    inline_tool: Option<InlineToolCall>,
+}
+
+struct InlineToolCall {
+    event_id: String,
+    request_id: Value,
 }
 
 impl<T: JsonlTransport> Client<T> {
@@ -168,6 +278,9 @@ impl<T: JsonlTransport> Client<T> {
             pending: VecDeque::new(),
             text_open: false,
             thinking_open: false,
+            terminal_emitted: false,
+            experimental_api: false,
+            inline_tool: None,
         }
     }
 
@@ -183,21 +296,40 @@ impl<T: JsonlTransport> Client<T> {
 
     /// Negotiate the app-server session, then signal `initialized`.
     pub async fn initialize(&mut self, client_name: &str, client_version: &str) -> Result<Value> {
+        self.initialize_with_experimental_api(client_name, client_version, false)
+            .await
+    }
+
+    /// Negotiate the session, optionally opting into documented experimental
+    /// app-server fields such as `thread/start.dynamicTools`.
+    pub async fn initialize_with_experimental_api(
+        &mut self,
+        client_name: &str,
+        client_version: &str,
+        experimental_api: bool,
+    ) -> Result<Value> {
         let response = self
             .call(
                 "initialize",
                 json!({
                     "clientInfo": { "name": client_name, "version": client_version },
-                    "capabilities": { "experimentalApi": false },
+                    "capabilities": { "experimentalApi": experimental_api },
                 }),
             )
             .await?;
         self.notify("initialized", Value::Null).await?;
+        self.experimental_api = experimental_api;
         Ok(response)
     }
 
     /// Start a new Codex thread and return its app-server thread id.
     pub async fn start_thread(&mut self, start: ThreadStart) -> Result<String> {
+        if !start.dynamic_tools.is_empty() && !self.experimental_api {
+            return Err(CodexError::Protocol(
+                "thread/start.dynamicTools requires initialize capabilities.experimentalApi=true".into(),
+            ));
+        }
+        validate_dynamic_tools(&start.dynamic_tools)?;
         let mut params = json!({});
         if let Some(cwd) = start.cwd {
             params["cwd"] = Value::String(cwd);
@@ -217,6 +349,25 @@ impl<T: JsonlTransport> Client<T> {
         if let Some(approval_policy) = start.approval_policy {
             params["approvalPolicy"] = Value::String(approval_policy);
         }
+        if !start.dynamic_tools.is_empty() {
+            params["dynamicTools"] = Value::Array(
+                start.dynamic_tools.iter().map(DynamicToolSpec::as_json).collect(),
+            );
+        }
+        let mut config = start.config.unwrap_or_else(|| json!({}));
+        let config_object = config.as_object_mut().ok_or_else(|| {
+            CodexError::Protocol("thread/start config must be a JSON object".into())
+        })?;
+        let features = config_object
+            .entry("features")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| CodexError::Protocol("thread/start config.features must be an object".into()))?;
+        features.insert("shell_tool".into(), Value::Bool(false));
+        features.insert("unified_exec".into(), Value::Bool(false));
+        features.insert("apply_patch_freeform".into(), Value::Bool(false));
+        config_object.insert("experimental_use_unified_exec_tool".into(), Value::Bool(false));
+        params["config"] = config;
         let response = self
             .call("thread/start", params)
             .await?;
@@ -249,25 +400,51 @@ impl<T: JsonlTransport> Client<T> {
             .ok_or_else(|| CodexError::Protocol("turn/start response omitted turn.id".into()))
     }
 
-    /// Return the next translated stream event.  `None` means the app-server
-    /// connection closed; normal end-of-turn is [`StreamEvent::Done`].
+    /// Return the next translated stream event. A normal turn must finish with
+    /// [`StreamEvent::Done`] or [`StreamEvent::Error`]; EOF first is itself an
+    /// error rather than a quietly truncated assistant message.
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         if let Some(event) = self.pending.pop_front() {
+            if event.is_terminal() {
+                self.terminal_emitted = true;
+            }
             return Some(event);
+        }
+        if self.terminal_emitted {
+            return None;
+        }
+        if self.inline_tool.is_some() {
+            return Some(StreamEvent::Error(
+                "Codex app-server is waiting for an inline tool result".into(),
+            ));
         }
         loop {
             let packet = match self.transport.receive().await {
                 Ok(Some(packet)) => packet,
-                Ok(None) => return None,
-                Err(error) => return Some(StreamEvent::Error(error.to_string())),
+                Ok(None) => {
+                    self.terminal_emitted = true;
+                    return Some(StreamEvent::Error(
+                        "Codex app-server closed before turn/completed".into(),
+                    ));
+                }
+                Err(error) => {
+                    self.terminal_emitted = true;
+                    return Some(StreamEvent::Error(error.to_string()));
+                }
             };
             match self.handle_packet(packet).await {
                 Ok(()) => {
                     if let Some(event) = self.pending.pop_front() {
+                        if event.is_terminal() {
+                            self.terminal_emitted = true;
+                        }
                         return Some(event);
                     }
                 }
-                Err(error) => return Some(StreamEvent::Error(error.to_string())),
+                Err(error) => {
+                    self.terminal_emitted = true;
+                    return Some(StreamEvent::Error(error.to_string()));
+                }
             }
         }
     }
@@ -278,6 +455,30 @@ impl<T: JsonlTransport> Client<T> {
         self.call("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn_id }))
             .await?;
         Ok(())
+    }
+
+    /// Answer the most recently emitted `item/tool/call` request.
+    ///
+    /// `id` is the `InlineToolUse.id` the caller received. The JSON-RPC
+    /// request id is retained internally so numeric and string wire ids round
+    /// trip without coercion.
+    pub async fn respond_inline_tool(&mut self, id: &str, result: InlineToolResult) -> Result<()> {
+        let pending = self.inline_tool.take().ok_or_else(|| {
+            CodexError::Protocol("no Codex inline tool request is pending".into())
+        })?;
+        if pending.event_id != id {
+            self.inline_tool = Some(pending);
+            return Err(CodexError::Protocol(format!(
+                "inline tool result id {id:?} does not match pending callback"
+            )));
+        }
+        self.transport.send(json!({
+            "id": pending.request_id,
+            "result": {
+                "success": !result.is_error,
+                "contentItems": [{ "type": "inputText", "text": result.content }],
+            },
+        })).await
     }
 
     /// Relinquish this connection.  A process-backed transport must also reap
@@ -326,6 +527,9 @@ impl<T: JsonlTransport> Client<T> {
 
     async fn handle_packet(&mut self, packet: Value) -> Result<()> {
         if packet.get("method").is_some() && packet.get("id").is_some() {
+            if packet.get("method").and_then(Value::as_str) == Some("item/tool/call") {
+                return self.enqueue_inline_tool(packet);
+            }
             return self.decline_server_request(packet).await;
         }
         let Some(method) = packet.get("method").and_then(Value::as_str) else {
@@ -333,6 +537,41 @@ impl<T: JsonlTransport> Client<T> {
         };
         let params = packet.get("params").cloned().unwrap_or(Value::Null);
         self.translate_notification(method, &params);
+        Ok(())
+    }
+
+    fn enqueue_inline_tool(&mut self, packet: Value) -> Result<()> {
+        if self.inline_tool.is_some() {
+            return Err(CodexError::Protocol(
+                "Codex sent a second inline tool request before the first was answered".into(),
+            ));
+        }
+        let request_id = packet.get("id").cloned().ok_or_else(|| {
+            CodexError::Protocol("inline tool request omitted JSON-RPC id".into())
+        })?;
+        let params = packet.get("params").ok_or_else(|| {
+            CodexError::Protocol("inline tool request omitted params".into())
+        })?;
+        let call_id = params.get("callId").and_then(Value::as_str).ok_or_else(|| {
+            CodexError::Protocol("inline tool request omitted callId".into())
+        })?;
+        let tool = params.get("tool").and_then(Value::as_str).ok_or_else(|| {
+            CodexError::Protocol("inline tool request omitted tool".into())
+        })?;
+        let name = match params.get("namespace").and_then(Value::as_str) {
+            Some(namespace) => format!("{namespace}.{tool}"),
+            None => tool.to_owned(),
+        };
+        let input = params.get("arguments").cloned().ok_or_else(|| {
+            CodexError::Protocol("inline tool request omitted arguments".into())
+        })?;
+        self.close_open_blocks();
+        self.inline_tool = Some(InlineToolCall { event_id: call_id.to_owned(), request_id });
+        self.pending.push_back(StreamEvent::InlineToolUse {
+            id: call_id.to_owned(),
+            name,
+            input,
+        });
         Ok(())
     }
 
@@ -411,7 +650,7 @@ impl<T: JsonlTransport> Client<T> {
                 self.close_open_blocks();
                 let turn = params.get("turn").unwrap_or(params);
                 let status = turn.get("status").and_then(Value::as_str);
-                if status.is_some_and(|status| status != "completed") {
+                if status != Some("completed") {
                     let detail = turn
                         .get("error")
                         .map(Value::to_string)
@@ -542,10 +781,115 @@ mod tests {
             "method": "item/commandExecution/requestApproval", "params": {}
         });
         let mut client = Client::new(FakeTransport::new([request]));
-        assert!(client.next_event().await.is_none());
+        assert!(matches!(client.next_event().await, Some(StreamEvent::Error(detail))
+            if detail.contains("closed before turn/completed")));
         assert_eq!(client.transport.sent, vec![json!({
             "id": "approval-1", "result": { "decision": "decline" }
         })]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_call_emits_inline_event_and_preserves_rpc_id_on_response() {
+        let request = json!({
+            "id": "tool-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "callId": "call-1",
+                "namespace": "kaijutsu", "tool": "shell", "arguments": { "command": "pwd" },
+            },
+        });
+        let mut client = Client::new(FakeTransport::new([request]));
+        assert_eq!(
+            client.next_event().await,
+            Some(StreamEvent::InlineToolUse {
+                id: "call-1".into(),
+                name: "kaijutsu.shell".into(),
+                input: json!({ "command": "pwd" }),
+            })
+        );
+        client.respond_inline_tool("call-1", InlineToolResult {
+            content: "the workspace".into(),
+            is_error: false,
+        }).await.unwrap();
+        assert_eq!(client.transport.sent, vec![json!({
+            "id": "tool-1",
+            "result": {
+                "success": true,
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "the workspace",
+                }],
+            },
+        })]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_tools_are_experimental_and_native_exec_is_disabled() {
+        let mut client = Client::new(FakeTransport::new([
+            json!({ "id": 1, "result": {} }),
+            json!({ "id": 2, "result": { "thread": { "id": "thread-1" } } }),
+        ]));
+        client.initialize_with_experimental_api("kaijutsu", "0.1", true).await.unwrap();
+        client.start_thread(ThreadStart {
+            dynamic_tools: vec![DynamicToolSpec::Namespace {
+                name: "builtin".into(),
+                description: "Kaijutsu builtin tools".into(),
+                tools: vec![DynamicToolFunction {
+                    name: "shell".into(),
+                    description: "Run a Kaijutsu shell command".into(),
+                    input_schema: json!({ "type": "object" }),
+                    defer_loading: true,
+                }],
+            }],
+            config: Some(json!({ "model_reasoning_effort": "high" })),
+            ..ThreadStart::default()
+        }).await.unwrap();
+        let sent = &client.transport.sent;
+        assert_eq!(sent[0]["params"]["capabilities"]["experimentalApi"], true);
+        assert_eq!(sent[2]["params"]["dynamicTools"], json!([{
+            "type": "namespace", "name": "builtin", "description": "Kaijutsu builtin tools",
+            "tools": [{
+                "type": "function", "name": "shell", "description": "Run a Kaijutsu shell command",
+                "inputSchema": { "type": "object" }, "deferLoading": true,
+            }],
+        }]));
+        assert_eq!(sent[2]["params"]["config"]["features"]["shell_tool"], false);
+        assert_eq!(sent[2]["params"]["config"]["features"]["unified_exec"], false);
+        assert_eq!(sent[2]["params"]["config"]["features"]["apply_patch_freeform"], false);
+        assert_eq!(sent[2]["params"]["config"]["experimental_use_unified_exec_tool"], false);
+        assert_eq!(sent[2]["params"]["config"]["model_reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn dynamic_tools_require_experimental_initialize() {
+        let mut client = Client::new(FakeTransport::new([]));
+        let error = client.start_thread(ThreadStart {
+            dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunction {
+                name: "echo".into(), description: "Echo text".into(),
+                input_schema: json!({}), defer_loading: false,
+            })],
+            ..ThreadStart::default()
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("experimentalApi=true"));
+    }
+
+    #[tokio::test]
+    async fn eof_before_terminal_is_an_error_once() {
+        let mut client = Client::new(FakeTransport::new([]));
+        assert_eq!(
+            client.next_event().await,
+            Some(StreamEvent::Error("Codex app-server closed before turn/completed".into()))
+        );
+        assert_eq!(client.next_event().await, None);
+    }
+
+    #[tokio::test]
+    async fn completion_without_completed_status_is_an_error() {
+        let mut client = Client::new(FakeTransport::new([json!({
+            "method": "turn/completed", "params": { "turn": {} },
+        })]));
+        assert!(matches!(client.next_event().await, Some(StreamEvent::Error(detail)) if detail.contains("status None")));
+        assert_eq!(client.next_event().await, None);
     }
 
     #[tokio::test]

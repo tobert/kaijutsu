@@ -30,7 +30,8 @@ use super::config::SlotTunables;
 ///
 /// 1. `ThinkingStart` → `ThinkingDelta(_)*` → `ThinkingEnd` (extended thinking)
 /// 2. `TextStart` → `TextDelta(_)*` → `TextEnd` (interleavable with thinking)
-/// 3. `ToolUse { … }` (zero or more, atomic once emitted)
+/// 3. `ToolUse { … }` (zero or more, atomic once emitted), or
+///    `InlineToolUse { … }` followed by a provider callback result
 /// 4. `Done { … }` or `Error(_)` — terminal
 ///
 /// The CRDT block writer relies on `*Start` / `*End` bracketing each
@@ -70,6 +71,27 @@ pub enum StreamEvent {
         input: serde_json::Value,
     },
 
+    /// A tool request that must be answered before the provider can continue
+    /// this stream.
+    ///
+    /// Most completion APIs end a response at `ToolUse`; kaijutsu writes the
+    /// tool result and starts a fresh completion.  Agent runtimes such as the
+    /// Codex app-server instead send a bidirectional request while their turn
+    /// is still live.  The server handles this event synchronously through
+    /// the ordinary broker and calls [`crate::llm::ProviderStream::respond_inline_tool`]
+    /// before it polls the next event.  That preserves the one broker/kaish
+    /// ownership path while retaining the runtime's single live turn.
+    ///
+    /// Providers must close any open text/thinking run before emitting this
+    /// event, just as they do for [`Self::ToolUse`].
+    InlineToolUse {
+        /// Provider callback identifier.  It is opaque to Kaijutsu and is
+        /// returned unchanged to the provider in `InlineToolResult`.
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+
     /// Tool execution result (produced by the runtime, not the model).
     /// Reserved on the wire for symmetry with [`ToolUse`]; the server
     /// generates these locally and does not see them on the stream.
@@ -98,6 +120,17 @@ pub enum StreamEvent {
     /// Error during generation. Carries a human-readable string; Phase 2
     /// will switch to a typed [`StreamError`] variant.
     Error(String),
+}
+
+/// Result returned to a provider for [`StreamEvent::InlineToolUse`].
+///
+/// This deliberately carries only the portable tool-result shape.  A
+/// provider owns its wire-specific callback envelope (Codex uses
+/// `contentItems`); kaijutsu owns execution and its durable CRDT blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InlineToolResult {
+    pub content: String,
+    pub is_error: bool,
 }
 
 impl StreamEvent {

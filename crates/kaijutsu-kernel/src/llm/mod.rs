@@ -49,7 +49,7 @@ pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
-    StreamError, StreamEvent, UsageExtra, apply_slot_tunables,
+    InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_slot_tunables,
 };
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 
@@ -426,18 +426,23 @@ pub enum Provider {
 pub struct CodexAppClient {
     name: String,
     endpoint: String,
+    timeout: std::time::Duration,
 }
 
 struct CodexWsTransport {
     socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    timeout: std::time::Duration,
 }
 
 impl CodexWsTransport {
-    async fn connect(endpoint: &str) -> codex::Result<Self> {
-        let (socket, _) = connect_async(endpoint).await.map_err(|error| {
+    async fn connect(endpoint: &str, timeout: std::time::Duration) -> codex::Result<Self> {
+        let connected = tokio::time::timeout(timeout, connect_async(endpoint)).await.map_err(|_| {
+            codex::CodexError::Io(io::Error::new(io::ErrorKind::TimedOut, "timed out connecting to Codex app-server"))
+        })?;
+        let (socket, _) = connected.map_err(|error| {
             codex::CodexError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string()))
         })?;
-        Ok(Self { socket })
+        Ok(Self { socket, timeout })
     }
 }
 
@@ -445,12 +450,36 @@ impl CodexWsTransport {
 impl codex::JsonlTransport for CodexWsTransport {
     async fn receive(&mut self) -> codex::Result<Option<serde_json::Value>> {
         loop {
-            match self.socket.next().await {
+            let message = tokio::time::timeout(self.timeout, self.socket.next())
+                .await
+                .map_err(|_| {
+                    codex::CodexError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for Codex app-server",
+                    ))
+                })?;
+            match message {
                 Some(Ok(WsMessage::Text(text))) => {
                     return Ok(Some(serde_json::from_str(text.as_ref())?));
                 }
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     return Ok(Some(serde_json::from_slice(&bytes)?));
+                }
+                Some(Ok(WsMessage::Ping(payload))) => {
+                    tokio::time::timeout(self.timeout, self.socket.send(WsMessage::Pong(payload)))
+                        .await
+                        .map_err(|_| {
+                            codex::CodexError::Io(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "timed out replying to Codex app-server ping",
+                            ))
+                        })?
+                        .map_err(|error| {
+                            codex::CodexError::Io(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                error.to_string(),
+                            ))
+                        })?;
                 }
                 Some(Ok(WsMessage::Close(_))) | None => return Ok(None),
                 Some(Ok(_)) => continue,
@@ -466,16 +495,29 @@ impl codex::JsonlTransport for CodexWsTransport {
 
     async fn send(&mut self, value: serde_json::Value) -> codex::Result<()> {
         let encoded = serde_json::to_string(&value)?;
-        self.socket
-            .send(WsMessage::Text(encoded.into()))
+        tokio::time::timeout(self.timeout, self.socket.send(WsMessage::Text(encoded.into())))
             .await
+            .map_err(|_| {
+                codex::CodexError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out sending to Codex app-server",
+                ))
+            })?
             .map_err(|error| {
                 codex::CodexError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
             })
     }
 
     async fn close(&mut self) -> codex::Result<()> {
-        self.socket.close(None).await.map_err(|error| {
+        tokio::time::timeout(self.timeout, self.socket.close(None))
+            .await
+            .map_err(|_| {
+                codex::CodexError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out closing Codex app-server connection",
+                ))
+            })?
+            .map_err(|error| {
             codex::CodexError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
         })
     }
@@ -487,12 +529,28 @@ pub struct CodexStream {
 
 impl CodexAppClient {
     async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<ProviderStream> {
-        let transport = CodexWsTransport::connect(&self.endpoint)
+        let transport = CodexWsTransport::connect(&self.endpoint, self.timeout)
             .await
             .map_err(|error| LlmError::NetworkError(error.to_string()))?;
         let mut client = codex::Client::new(transport);
+        let dynamic_tools = opts
+            .tools
+            .iter()
+            .map(|tool| {
+                codex::DynamicToolSpec::Function(codex::DynamicToolFunction {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.input_schema.clone(),
+                    defer_loading: false,
+                })
+            })
+            .collect::<Vec<_>>();
         client
-            .initialize("kaijutsu", env!("CARGO_PKG_VERSION"))
+            .initialize_with_experimental_api(
+                "kaijutsu",
+                env!("CARGO_PKG_VERSION"),
+                !dynamic_tools.is_empty(),
+            )
             .await
             .map_err(|error| LlmError::ApiError(error.to_string()))?;
         let thread_id = client
@@ -501,6 +559,7 @@ impl CodexAppClient {
                 developer_instructions: opts.system.clone(),
                 sandbox: Some("read-only".to_string()),
                 approval_policy: Some("untrusted".to_string()),
+                dynamic_tools,
                 ..Default::default()
             })
             .await
@@ -675,7 +734,11 @@ impl Provider {
                         config.name, endpoint
                     )));
                 }
-                Ok(Self::CodexApp(CodexAppClient { name: config.name.clone(), endpoint }))
+                Ok(Self::CodexApp(CodexAppClient {
+                    name: config.name.clone(),
+                    endpoint,
+                    timeout: resolve_request_timeout(config),
+                }))
             }
             #[cfg(any(test, feature = "test-mock"))]
             BackendKind::Mock => Ok(Self::Mock(MockClient::new(format!(
@@ -862,6 +925,34 @@ impl ProviderStream {
                 None if state.hangs_when_exhausted => std::future::pending().await,
                 None => None,
             },
+        }
+    }
+
+    /// Return the result of a provider-owned, in-flight tool request.
+    ///
+    /// Ordinary `ToolUse` calls end an LLM completion and are driven by the
+    /// server's existing agentic loop.  This narrow seam is for runtimes that
+    /// keep one turn alive while asking their client to execute a dynamic
+    /// tool.  Unsupported providers fail loudly rather than dropping a tool
+    /// result and leaving their turn hung.
+    pub async fn respond_inline_tool(
+        &mut self,
+        id: &str,
+        result: InlineToolResult,
+    ) -> Result<(), String> {
+        match self {
+            Self::Codex(s) => s
+                .client
+                .respond_inline_tool(id, result)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Claude(_) | Self::OpenAi(_) => Err(format!(
+                "provider does not support inline tool response for callback {id}"
+            )),
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => Err(format!(
+                "mock provider does not support inline tool response for callback {id}"
+            )),
         }
     }
 

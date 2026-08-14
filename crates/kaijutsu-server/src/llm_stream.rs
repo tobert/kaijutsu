@@ -18,7 +18,9 @@ use tokio::sync::RwLock as TokioRwLock;
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::kernel_db::KernelDb;
-use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent, apply_slot_tunables};
+use kaijutsu_kernel::llm::stream::{
+    BuildOpts, CacheTarget, InlineToolResult, StreamEvent, apply_slot_tunables,
+};
 use kaijutsu_kernel::llm::SlotTunables;
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
 use kaijutsu_kernel::mcp::{McpError, PolicyError};
@@ -976,6 +978,134 @@ async fn dispatch_and_map_tool_result(
     map_tool_dispatch_result(tool_name, result)
 }
 
+/// Execute a provider-owned, in-flight tool callback through Kaijutsu's one
+/// broker path, while materializing the same durable ToolCall/ToolResult pair
+/// an ordinary `StreamEvent::ToolUse` gets.
+///
+/// Unlike ordinary tool use, the provider is waiting on this function's
+/// return before it can continue the current turn.  Keep it sequential: that
+/// preserves callback ordering and lets `last_block_id` remain the anchor for
+/// the provider's next streamed item.
+async fn dispatch_inline_tool_result(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    last_block_id: &mut kaijutsu_crdt::BlockId,
+    kernel: &Arc<Kernel>,
+    tool_name: &str,
+    input: serde_json::Value,
+    tool_ctx: &kaijutsu_kernel::ExecContext,
+    cancel: tokio_util::sync::CancellationToken,
+    tool_use_id: &str,
+) -> InlineToolResult {
+    // Tool kind no longer has a registry category at this layer.  This is the
+    // same conservative marker ordinary streamed tool calls use.
+    let tool_kind = TypesToolKind::Builtin;
+    let tool_call_block_id = match documents.insert_tool_call_as(
+        context_id,
+        None,
+        Some(last_block_id),
+        tool_name,
+        input.clone(),
+        Some(tool_kind),
+        Some(PrincipalId::system()),
+        Some(tool_use_id.to_owned()),
+        None,
+    ) {
+        Ok(id) => {
+            *last_block_id = id;
+            id
+        }
+        Err(error) => {
+            log::error!(
+                "Failed to insert inline tool call block for {} ({}): {}",
+                tool_name,
+                tool_use_id,
+                error
+            );
+            return InlineToolResult {
+                content: format!(
+                    "Internal error: failed to create ToolCall block for {}. The tool was not executed.",
+                    tool_name
+                ),
+                is_error: true,
+            };
+        }
+    };
+
+    let result_block_id = match documents.insert_tool_result_as(
+        context_id,
+        &tool_call_block_id,
+        Some(&tool_call_block_id),
+        "",
+        false,
+        None,
+        Some(tool_kind),
+        Some(PrincipalId::system()),
+        Some(tool_use_id.to_owned()),
+    ) {
+        Ok(id) => {
+            let _ = documents.set_status(context_id, &id, Status::Running);
+            Some(id)
+        }
+        Err(error) => {
+            // Match the ordinary agentic path: execute and return a real
+            // result even when the UI block could not be created, but make the
+            // missing durable representation loud in logs.
+            log::warn!(
+                "Failed to insert inline tool result block for {} ({}): {}",
+                tool_name,
+                tool_use_id,
+                error
+            );
+            None
+        }
+    };
+
+    // Let the client observe the running ToolResult before it completes.
+    tokio::task::yield_now().await;
+
+    let (content, is_error, error_payload) = dispatch_and_map_tool_result(
+        kernel,
+        tool_name,
+        &input.to_string(),
+        tool_ctx,
+        cancel,
+    )
+    .await;
+
+    let final_status = if is_error { Status::Error } else { Status::Done };
+    if let Some(result_block_id) = result_block_id {
+        if !content.is_empty()
+            && let Err(error) = documents.edit_text_as(
+                context_id,
+                &result_block_id,
+                0,
+                &content,
+                0,
+                Some(PrincipalId::system()),
+            )
+        {
+            log::error!("Failed to write inline tool result text: {}", error);
+        }
+        let _ = documents.set_status(context_id, &result_block_id, final_status);
+        if let Some(payload) = error_payload
+            && let Err(error) = documents.insert_error_block_as(
+                context_id,
+                &result_block_id,
+                &payload,
+                payload.summary_line(),
+                Some(PrincipalId::system()),
+            )
+        {
+            log::warn!("Failed to insert inline tool error block for {}: {}", tool_name, error);
+        }
+        *last_block_id = result_block_id;
+    }
+    let _ = documents.set_status(context_id, &tool_call_block_id, final_status);
+
+    InlineToolResult { content, is_error }
+}
+
 /// Process LLM streaming in a background task with agentic loop.
 ///
 /// Handles all stream events, executes tools, and loops until the model signals
@@ -1612,6 +1742,67 @@ async fn process_llm_stream(
                             log::error!("Failed to insert tool call block for {}: {}", name, e);
                             tool_call_blocks.insert(id.clone(), None);
                         }
+                    }
+                }
+
+                StreamEvent::InlineToolUse { id, name, input } => {
+                    // A bidirectional agent runtime (currently Codex's
+                    // `item/tool/call`) cannot continue its live turn until
+                    // this callback receives a result.  It must arrive at a
+                    // content boundary; still close a malformed open block
+                    // defensively so the CRDT never leaves it Running.
+                    if let Some(block_id) = current_block_id.take() {
+                        log::warn!(
+                            "inline tool {} arrived with an open content block; closing it defensively",
+                            id
+                        );
+                        let _ = documents.set_status(context_id, &block_id, Status::Done);
+                    }
+
+                    let result = dispatch_inline_tool_result(
+                        &documents,
+                        context_id,
+                        &mut last_block_id,
+                        &kernel,
+                        &name,
+                        input,
+                        &tool_ctx,
+                        interrupt.cancel.clone(),
+                        &id,
+                    )
+                    .await;
+
+                    // Reply only after the durable blocks have reached their
+                    // final states.  A failed reply is fatal: continuing to
+                    // consume this stream would leave the provider waiting on
+                    // a callback it never received.
+                    if let Err(error) = stream.respond_inline_tool(&id, result).await {
+                        let detail = format!(
+                            "failed to return inline tool result for {name} ({id}): {error}"
+                        );
+                        log::error!("{}", detail);
+                        let payload = kaijutsu_types::ErrorPayload {
+                            category: kaijutsu_types::ErrorCategory::Stream,
+                            severity: kaijutsu_types::ErrorSeverity::Error,
+                            code: Some("stream.inline_tool_reply".into()),
+                            detail: Some(detail.clone()),
+                            span: None,
+                            source_kind: Some(BlockKind::ToolResult),
+                        };
+                        let _ = documents.insert_error_block_as(
+                            context_id,
+                            &last_block_id,
+                            &payload,
+                            payload.summary_line(),
+                            Some(PrincipalId::system()),
+                        );
+                        kernel.turn_flows().publish(TurnFlow::Failed {
+                            context_id,
+                            principal_id: user_principal_id,
+                            error: detail,
+                            origin,
+                        });
+                        return;
                     }
                 }
 

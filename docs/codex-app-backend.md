@@ -1,6 +1,6 @@
 # Experimental Codex app-server backend
 
-> **Status (2026-08-14): phase 0, connect-only transport checkpoint.** The
+> **Status (2026-08-14): phase 0, connect-only backend with broker tools.** The
 > wire and provider are implemented against `codex-cli 0.147.0`. Amy
 > authorized a kernel-managed sidecar as the target; lifecycle ownership and
 > the context-session adapter are the next slice. The backend is deliberately
@@ -19,10 +19,15 @@ kj backend model set codex <model-id>
 The provider opens a fresh connection per Kaijutsu completion, performs
 `initialize` / `initialized`, starts a Codex thread and turn, and translates
 agent-message and reasoning-summary deltas into Kaijutsu `StreamEvent`s.
-Unknown notifications are tolerated. All server-initiated approval,
-permission, elicitation, and user-input requests are declined; the thread is
-explicitly requested with `sandbox=read-only` and
-`approvalPolicy=untrusted`, rather than inheriting sidecar defaults.
+Unknown notifications are tolerated. All context-visible broker tools are
+registered through app-server's experimental `dynamicTools` API. An
+`item/tool/call` pauses the Codex stream while the server writes the ordinary
+ToolCall/ToolResult pair and dispatches through the context-bound broker; in
+particular, the shell tool still reaches `EmbeddedKaish`. Other
+server-initiated approval, permission, elicitation, and user-input requests
+are declined. The thread is requested with `sandbox=read-only` and
+`approvalPolicy=untrusted`, and its config forcibly disables Codex's native
+shell, unified-exec, and freeform patch tools.
 
 ## Phase-0 semantics
 
@@ -33,8 +38,9 @@ Codex session projection:
   input for every completion. A fresh Codex thread is created each time.
 - The Kaijutsu system/rc prompt maps to Codex `developerInstructions`; this augments
   Codex's own instruction stack and is not byte-identical provider semantics.
-- Model and reasoning effort are forwarded. Temperature, top-p, maximum output
-  tokens, cache breakpoints, images, and Kaijutsu tool definitions are not.
+- Model, reasoning effort, and Kaijutsu tool definitions are forwarded.
+  Temperature, top-p, maximum output tokens, cache breakpoints, and images are
+  not.
 - Raw Codex reasoning is ignored; only reasoning-summary deltas are projected.
 - Cancellation currently drops the connection when the outer turn is torn
   down; `ProviderStream::cancel()` cannot yet send the asynchronous
@@ -53,12 +59,13 @@ sidecar. That is a deliberate expansion of the process-owner design, not
 permission for providers to grow arbitrary `Command::new` sites: one sidecar
 supervisor must own launch, readiness, restart, stderr, and reaping.
 
-The target tool path is stronger than merely approving Codex's native shell:
-disable Codex's built-in shell/unified-exec/patch tools through its thread
-config, advertise Kaijutsu's context-bound broker tools as app-server
-`dynamicTools`, and answer `item/tool/call` by invoking the broker. This gives
-Codex the same shell implementation as every other model—`builtin.shell`
-through EmbeddedKaish—without spawning a loopback `kaijutsu-mcp` process.
+The implemented tool path is stronger than merely approving Codex's native
+shell: Codex's built-in shell/unified-exec/patch tools are disabled through
+its thread config, Kaijutsu's context-bound broker tools are advertised as
+app-server `dynamicTools`, and `item/tool/call` is answered by invoking the
+broker. This gives Codex the same shell implementation as every other
+model—`builtin.shell` through EmbeddedKaish—without spawning a loopback
+`kaijutsu-mcp` process.
 `kaijutsu-mcp` remains the equivalent external-harness surface; dynamic tools
 are the in-kernel adapter over the same definitions and calls.
 
@@ -72,9 +79,8 @@ are the in-kernel adapter over the same definitions and calls.
    `thread/fork` rather than flattening history.
 3. Carry context identity, host cwd, and triggering block identity through the
    provider request seam; use the block id as Codex `clientUserMessageId`.
-4. Project context-bound broker tools as Codex dynamic tools, disabling its
-   native shell/unified-exec/patch surfaces. Route calls through the broker so
-   shell execution remains kaish-owned.
+4. Add a live app-server integration test for the experimental dynamic-tool
+   round trip, including interruption while a broker call is in flight.
 5. Add usage projection from `thread/tokenUsage/updated` and asynchronous
    `turn/interrupt` cancellation.
 6. Replace stateless history flattening with boundary-aware Codex thread
