@@ -2,8 +2,8 @@
 
 > **Status (2026-08-14): phase 0, connect-only backend with broker tools.** The
 > wire and provider are implemented against `codex-cli 0.147.0`. Amy
-> authorized a kernel-managed sidecar as the target; lifecycle ownership and
-> the context-session adapter are the next slice. The backend is deliberately
+> authorized a persistent sidecar as the target; systemd now owns its lifecycle
+> and the context-session adapter is the next slice. The backend is deliberately
 > not seeded or selected by default yet.
 
 Kaijutsu can use a user-managed Codex app-server as an experimental LLM
@@ -15,6 +15,19 @@ codex app-server --listen ws://127.0.0.1:4500
 kj backend set codex --kind codex-app --base-url ws://127.0.0.1:4500
 kj backend model set codex <model-id>
 ```
+
+On a persistent Linux host, install the repo-owned systemd user unit instead
+of keeping that command in a terminal:
+
+```sh
+./contrib/install-codex-app-server-systemd.sh
+```
+
+The generated unit resolves the currently active `codex` binary, listens only
+on `127.0.0.1:4500`, and exports Codex OTel logs, traces, and metrics over
+OTLP/gRPC to the local collector on port 4317. Raw user-prompt logging remains
+disabled. The unit owns sidecar restart and reaping; the kernel remains a
+client of a configured local service.
 
 The provider opens a fresh connection per Kaijutsu completion, performs
 `initialize` / `initialized`, starts a Codex thread and turn, and translates
@@ -54,10 +67,8 @@ approval. Spawning it from the provider would also create a second ad-hoc host
 exec site. Both conflict with Kaijutsu's rule that kaish owns host execution,
 whose only existing process-launch exception is config-driven MCP stdio
 servers. Phase 0 therefore connects to a separately owned sidecar and refuses
-all action escalation. The authorized target is one kernel-owned Codex
-sidecar. That is a deliberate expansion of the process-owner design, not
-permission for providers to grow arbitrary `Command::new` sites: one sidecar
-supervisor must own launch, readiness, restart, stderr, and reaping.
+all action escalation. A systemd user unit owns launch, restart, logs, and
+reaping; providers do not grow arbitrary `Command::new` sites.
 
 The implemented tool path is stronger than merely approving Codex's native
 shell: Codex's built-in shell/unified-exec/patch tools are disabled through
@@ -71,18 +82,15 @@ are the in-kernel adapter over the same definitions and calls.
 
 ## Next slices
 
-1. Add one kernel sidecar supervisor, enabled only when a `codex-app` backend
-   exists: launch/reap app-server, wait for readiness, restart with bounded
-   backoff, and expose one authenticated loopback endpoint.
-2. Add durable `(context, backend) -> Codex thread` identity, then map context
+1. Add durable `(context, backend) -> Codex thread` identity, then map context
    create/resume/fork boundaries to `thread/start` / `thread/resume` /
    `thread/fork` rather than flattening history.
-3. Carry context identity, host cwd, and triggering block identity through the
+2. Carry context identity, host cwd, and triggering block identity through the
    provider request seam; use the block id as Codex `clientUserMessageId`.
-4. Add a live app-server integration test for the experimental dynamic-tool
+3. Add a live app-server integration test for the experimental dynamic-tool
    round trip, including interruption while a broker call is in flight.
-5. Add usage projection from `thread/tokenUsage/updated` and asynchronous
+4. Add usage projection from `thread/tokenUsage/updated` and asynchronous
    `turn/interrupt` cancellation.
-6. Replace stateless history flattening with boundary-aware Codex thread
+5. Replace stateless history flattening with boundary-aware Codex thread
    start/resume/fork. The Kaijutsu block list remains the durable shared model;
    a Codex thread is a live projection, not a second authority over it.

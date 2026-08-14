@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex app-server sidecar for Kaijutsu
+Documentation=https://developers.openai.com/codex/app-server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@CODEX_BIN@ app-server --listen ws://127.0.0.1:4500 -c 'otel.environment="zorak"' -c 'otel.exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c 'otel.trace_exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c 'otel.metrics_exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c otel.log_user_prompt=false
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=mixed
+
+# Codex stores auth, configuration, and thread state below ~/.codex. The
+# app-server listens only on loopback; Kaijutsu disables its native exec tools
+# per thread and routes dynamic tools through the context-bound broker/kaish.
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
