@@ -787,20 +787,38 @@ macOS/Linux) but the wire is not. All of it is same-uid-readable:
   not separate JSON fields. A raw send arrives **anonymous**, as ours did.
   `--drive` must emit the attributed form or every drift looks like it came
   from nowhere.
-- **The wire form is the `<cross-session-message>` tag itself** (probed
-  2026-08-14): a `content` of
-  `<cross-session-message from="uds:<socket>" from-name="<name>"
-  from-mode="prompting">body</cross-session-message>` arrives at the
-  receiving model rendered as attribution, where the same send without the
-  tag arrives anonymous. So the tag is what `--drive` emits.
-- **Attribution is sender-asserted and NOT authenticated.** The probe set
-  `from=` to an arbitrary socket and `from-name=` to an invented string;
-  neither was validated or normalized. Anything holding a session's token can
-  claim any identity to that session. Consistent with the shared-trust
-  doctrine (crosstalk is a feature, boundaries live outside the kernel) — but
-  it means a `--drive` label is a **courtesy, not an identity claim**, and
-  nothing downstream may treat `fromName` as authorization. Do not build a
-  trust decision on it.
+- **The wire form is the `<cross-session-message>` tag, and its grammar is
+  STRICT.** Extracted from the parser regex (not guessed):
+
+      ^<cross-session-message(?: from="…")?(?: from-session="…")?
+       (?: hop-chain="…")?(?: from-name="[^"<>\n\r]+")?
+       (?: from-mode="…")?>\n([\s\S]*)\n</cross-session-message>$
+
+  Three traps in that: attributes are **order-sensitive** (`from`,
+  `from-session`, `hop-chain`, `from-name`, `from-mode`), the body **must**
+  be newline-delimited inside the tag (`>\n … \n</`), and the parser
+  **re-serializes what it extracted and rejects the parse unless it exactly
+  equals the input** — a canonicalization check that blocks duplicate or
+  reordered attributes.
+- **A sloppy serializer degrades SILENTLY.** Our first probe omitted the
+  mandatory newlines, so it never parsed — it was passed through and merely
+  *looked* attributed because we had written the text ourselves. Nothing
+  errored; the message still delivered, just unattributed. `--drive` must
+  emit the canonical form exactly, and slice 3 owes a unit test that
+  round-trips our serializer through this regex. A silent attribution
+  downgrade is precisely the failure class the house rules reject.
+- **Attribution is sender-asserted and NOT authenticated** — re-established
+  2026-08-14 on valid evidence after the first attempt proved nothing. A
+  *well-formed* tag naming a `from=` socket that does not exist and a
+  `from-name` that is a flat lie reaches the receiving model intact. The
+  canonical round-trip check polices **format, not identity**. So anything
+  holding a session's token can claim any identity to it: consistent with the
+  shared-trust doctrine (crosstalk is a feature; the real boundaries live
+  outside the kernel), but a `--drive` label is a **courtesy, not an identity
+  claim** and nothing downstream may treat `fromName` as authorization.
+  Honest limit on this: from inside a receiving session we observe the
+  payload the model is shown, so we cannot tell whether the harness *also*
+  parses the tag for its own UI. The claim is about what the model sees.
 - **Guards to copy, not re-derive**: verify `procStart` against
   `/proc/<pid>/stat` before trusting a PID-named socket (CC's own code ranks
   candidates by this and reports `dead-owner`), and check `peerProtocol` —
