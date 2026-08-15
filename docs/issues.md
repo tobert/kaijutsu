@@ -59,6 +59,46 @@ a fresh `instance` or the same one?) outside this task's scope.
 
 ---
 
+## Janitors and librarians — long-running contexts that tend the kernel (Amy, 2026-08-15)
+
+Amy's direction, prompted by finding 195 idle contexts behind the roster:
+**cleanup will eventually happen from within kaijutsu**, by contexts rather
+than by a sweeper we bolt on. Her words:
+
+> "We'll have a bunch of musician-like contexts that are janitors (cleaning up
+> old contexts) and librarians (indexing, summarizing, and filing away).
+> Similar shaped problem — stuff that runs forever and has a log-like
+> structure to its observability."
+
+Three things that ruling settles, worth not re-deriving:
+
+1. **Musician-shaped, not cron-shaped.** These are contexts attached to
+   something that runs, in the `docs/chameleon.md` sense — players, not
+   scripts we schedule. That distinguishes them from "Grooming tracks —
+   kaijutsu-style cron" below, which is the *scheduling* substrate; a janitor
+   might ride it, but the janitor is a context.
+2. **The observability shape is the shared problem, and it is log-like.**
+   Anything that runs forever produces a stream, not a state — so the
+   interesting question is what its *observability* looks like, not what its
+   return value is. Same shape as the roster's own "history is otel, not a
+   table" ruling: current state in one place, the narrative in the stream.
+   Solve it once for the class.
+3. **Two roles, deliberately distinct.** A janitor *removes* (archiving stale
+   contexts); a librarian *preserves in cheaper form* (indexing, summarizing,
+   filing). They fail in opposite directions, so they should not be one agent
+   with a policy flag. Cross-refs already in this file: "Archive-time
+   summaries, written by a local model" is librarian work; "Context lifecycle:
+   'done for now' marker" is the signal a janitor would read.
+
+Not scheduled, no slices cut. The immediate pressure is relieved — the roster
+no longer renders the pile (see below) — so this is the durable answer, not
+the urgent one. **What is still true and unaddressed: nothing archives
+contexts, and `kj context list` is 195 lines on this kernel.** Filtering the
+roster fixed the symptom on one surface; the pile itself is untouched, and a
+janitor is what actually retires it.
+
+---
+
 ## Live roster — push-on-attach is the remaining unwired half (2026-08-14)
 
 Slices 1–4 (`crates/kaijutsu-kernel/src/roster.rs`, `roster_sources.rs`,
