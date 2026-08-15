@@ -131,6 +131,26 @@ impl RosterEntity {
             _ => None,
         }
     }
+
+    /// The full hex id — what a read surface (`kj roster list`'s `.data`,
+    /// `/run/roster`) names a row by. Never truncated: kj's own convention
+    /// is full ids only in structured data (truncation is a display-only
+    /// nicety, never something a caller round-trips).
+    pub fn to_hex(&self) -> String {
+        match self {
+            RosterEntity::Principal(p) => p.to_hex(),
+            RosterEntity::Context(c) => c.to_hex(),
+        }
+    }
+
+    /// A short, human-scannable id for table display only — never round-
+    /// tripped.
+    pub fn short(&self) -> String {
+        match self {
+            RosterEntity::Principal(p) => p.short(),
+            RosterEntity::Context(c) => c.short(),
+        }
+    }
 }
 
 /// How liveness is known for one presence row. See the module doc's table.

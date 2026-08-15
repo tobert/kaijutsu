@@ -42,6 +42,13 @@ enum RosterCommand {
         #[arg(long)]
         availability: Option<String>,
     },
+    /// List the current roster — who's around right now.
+    #[command(alias = "ls")]
+    List {
+        /// Emit a JSON array of row objects instead of a labelled table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl KjDispatcher {
@@ -66,7 +73,76 @@ impl KjDispatcher {
             RosterCommand::Status { text, availability } => {
                 self.roster_status(&text, availability.as_deref(), caller).await
             }
+            RosterCommand::List { json } => self.roster_list(json).await,
         }
+    }
+
+    /// **Boot rule** (`crate::roster` module doc): a row persisted before
+    /// this process's first refresh must never render as current. Rather
+    /// than depend on `roster_sources::spawn_periodic_refresh` having been
+    /// started somewhere (it isn't wired into production boot yet — see
+    /// `roster_sources.rs`'s module doc), a read surface satisfies the rule
+    /// itself: run one refresh pass inline the first time anything reads the
+    /// roster, then rely on the periodic loop (once it exists) for ongoing
+    /// freshness. Idempotent to call on every `kj roster list` — a no-op
+    /// once `refreshed_at()` is set.
+    async fn ensure_refreshed(&self) -> KjResult {
+        if self.roster().refreshed_at().is_none() {
+            let peers = self.kernel().list_peers().await;
+            if let Err(e) =
+                crate::roster_sources::refresh_once(self.kernel_db(), self.roster(), &peers)
+            {
+                return KjResult::Err(format!("kj roster: initial refresh failed: {e}"));
+            }
+        }
+        KjResult::ok("")
+    }
+
+    async fn roster_list(&self, json: bool) -> KjResult {
+        if let KjResult::Err(e) = self.ensure_refreshed().await {
+            return KjResult::Err(e);
+        }
+        let rows = match self.roster().snapshot() {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj roster list: {e}")),
+        };
+
+        let data = serde_json::Value::Array(rows.iter().map(row_to_json).collect());
+        if json {
+            return KjResult::ok_with_data(data.to_string(), data);
+        }
+        if rows.is_empty() {
+            return KjResult::ok_with_data("(nobody on the roster yet)".to_string(), data);
+        }
+
+        let kind_w = rows.iter().map(|r| r.entity.kind_str().len()).max().unwrap_or(0);
+        let label_w = rows
+            .iter()
+            .map(|r| r.label.as_deref().unwrap_or("").len())
+            .max()
+            .unwrap_or(0);
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let kind = r.entity.kind_str();
+                let id = r.entity.short();
+                let label = r.label.as_deref().unwrap_or("");
+                let liveness = match (r.liveness_kind, r.live) {
+                    (Some(k), Some(true)) => format!("{} live", k.as_str()),
+                    (Some(k), Some(false)) => format!("{} idle", k.as_str()),
+                    (Some(k), None) => k.as_str().to_string(),
+                    (None, _) => "unknown".to_string(),
+                };
+                let status = match (&r.status_text, r.availability) {
+                    (Some(t), Some(a)) => format!("  \"{t}\" ({})", a.as_str()),
+                    (Some(t), None) => format!("  \"{t}\""),
+                    (None, Some(a)) => format!("  ({})", a.as_str()),
+                    (None, None) => String::new(),
+                };
+                format!("  {kind:<kind_w$} {id}  {label:<label_w$}  {liveness}{status}")
+            })
+            .collect();
+        KjResult::ok_with_data(lines.join("\n"), data)
     }
 
     /// `kj roster status <text> [--availability <state>]`. `caller` is the
@@ -120,6 +196,29 @@ impl KjDispatcher {
 
         KjResult::ok(format!("status posted: \"{text}\" ({})", availability.as_str()))
     }
+}
+
+/// One roster row as `.data`/`--json` render it. Full ids only (`entity_id`
+/// is the row's whole hex form) — a caller that wants to act on a row
+/// programmatically (e.g. `kj roster status` for itself, or a future
+/// approval-omni-view lookup) never has to round-trip a truncated display
+/// id.
+fn row_to_json(row: &crate::roster::RosterRow) -> serde_json::Value {
+    serde_json::json!({
+        "entity_kind": row.entity.kind_str(),
+        "entity_id": row.entity.to_hex(),
+        "label": row.label,
+        "liveness_kind": row.liveness_kind.map(|k| k.as_str()),
+        "live": row.live,
+        "source": row.source,
+        "host": row.host,
+        "observed_at": row.observed_at,
+        "recorded_at": row.recorded_at,
+        "status_text": row.status_text,
+        "availability": row.availability.map(|a| a.as_str()),
+        "status_observed_at": row.status_observed_at,
+        "status_recorded_at": row.status_recorded_at,
+    })
 }
 
 #[cfg(test)]
@@ -237,5 +336,71 @@ mod tests {
             )
             .await;
         assert!(matches!(result, KjResult::Err(_)), "expected an unrecognized-flag error, got {result:?}");
+    }
+
+    // ── list (slice 4) ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_on_a_fresh_kernel_is_empty_but_ok() {
+        let d = test_dispatcher().await;
+        let caller = caller_with_context(PrincipalId::new(), None);
+        let result = d.dispatch(&[s("roster"), s("list")], &caller).await;
+        let KjResult::Ok { message, data, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(message.contains("nobody"));
+        assert_eq!(data, Some(serde_json::json!([])));
+        // The boot rule must have run even though nothing exists yet.
+        assert!(d.roster().refreshed_at().is_some());
+    }
+
+    /// `list` triggers the boot-rule refresh itself: a status post alone
+    /// doesn't run any source reconciliation, but the entity still shows up
+    /// once `list` runs (status-only visibility, the slice 3 fix) — this
+    /// pins that `list` doesn't require a bound/recent source to have fired
+    /// first.
+    #[tokio::test]
+    async fn list_surfaces_a_status_only_entity_and_full_ids_round_trip() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let caller = caller_with_context(principal, None);
+        d.dispatch(&[s("roster"), s("status"), s("hi"), s("--availability"), s("idle")], &caller)
+            .await;
+
+        let result = d.dispatch(&[s("roster"), s("list"), s("--json")], &caller).await;
+        let KjResult::Ok { data: Some(serde_json::Value::Array(rows)), .. } = result else {
+            panic!("expected a JSON array, got {result:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["entity_kind"], "principal");
+        // Full id, never truncated — a caller must be able to act on this
+        // value without re-deriving it.
+        assert_eq!(rows[0]["entity_id"], principal.to_hex());
+        assert_eq!(rows[0]["status_text"], "hi");
+        assert_eq!(rows[0]["availability"], "idle");
+        assert_eq!(rows[0]["liveness_kind"], serde_json::Value::Null);
+        assert_eq!(rows[0]["live"], serde_json::Value::Null);
+    }
+
+    /// The human-table render must not blow up on a mix of status-only and
+    /// presence-carrying rows, and must include both.
+    #[tokio::test]
+    async fn list_human_table_renders_both_kinds_of_row() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("agent-ctx"), None, principal);
+        d.dispatch(
+            &[s("roster"), s("status"), s("thinking")],
+            &caller_with_context(principal, None),
+        )
+        .await;
+
+        let result = d.dispatch(&[s("roster"), s("list")], &caller_with_context(principal, None)).await;
+        let KjResult::Ok { message, .. } = result else { panic!("expected Ok, got {result:?}") };
+        assert!(message.contains("thinking"), "message: {message}");
+
+        // The recent source picks up the registered context once refreshed.
+        let snap = d.roster().snapshot().unwrap();
+        assert!(snap.iter().any(|r| r.entity == RosterEntity::Context(ctx)));
     }
 }
