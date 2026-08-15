@@ -107,6 +107,25 @@ has one meaning.
 kinds. A list of tool names is not a safe rule: an earlier draft listed one tool
 and missed four. Content comparison cannot miss a producer.
 
+**The census that proves it** (verified 2026-08-15; keep it as evidence, never as
+the rule). Non-append producers reaching *conversation* blocks:
+
+| producer | site |
+|---|---|
+| MCP `block_edit` | `kernel/src/mcp/servers/block.rs` (~`:877-969`) |
+| MCP `block_splice` | `kernel/src/mcp/servers/block.rs:414-421` — a *separate* tool |
+| `kj block edit` | `kernel/src/kj/block.rs:858-963` |
+| kaish VFS write to `/docs/<ctx>/<block>` | `kernel/src/runtime/kaish_backend.rs:348-382` |
+| ~~`pushOps` / `merge_ops`~~ | **deleted 2026-08-15** (`7df29be8`) |
+
+And a producer that *looks* like a splice and is an append: MCP `block_append`
+writes through `edit_text_as` at `char_offset = content.chars().count()`
+(`block.rs:362`). A provenance rule would misclassify it in the other direction.
+
+The LLM streaming path is 100% `append_text_as` (`server/src/llm_stream.rs:1626,
+1696`); the `edit_text_as` calls at `llm_stream.rs:1079,2191` are degenerate
+(`pos=0, delete=0`) writes into a just-created empty block.
+
 ### Batching
 
 12. The server MAY place many events for many blocks in one delivery.

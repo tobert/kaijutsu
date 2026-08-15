@@ -1589,3 +1589,98 @@ result block, permanently, while its status still reads as done. Wrong data, at
 rest, wearing a healthy status — filed rather than patched, because the fix
 belongs with whoever also makes that test's dependence on the host's mount table
 explicit instead of incidental.
+
+## The day the wire stopped being a storage engine (August 15, later)
+
+The melt's first day ended somewhere its plan had not imagined, because the
+constraint the plan was written under turned out to be optional.
+
+Everything until then assumed the wire was near-frozen: additive changes only,
+freeze a method before deleting it, negotiate a capability bit so old and new
+clients could coexist. Amy lifted it in a sentence — the protocol is not locked,
+flag-day changes are fine where they reduce technical debt, every client is
+in-repo and rebuilt together. Later she added that the app could break and be
+rebuilt, and that ACP could break too, since it is still experimental.
+
+Three things fell out immediately, and the third was the one that mattered.
+
+The first was that freezing collapsed into deleting. `pushOps` and
+`pushInputOps` let a client push raw CRDT operations into kernel documents; they
+had no production callers and had not for some time. Deleting them removed about
+a thousand lines.
+
+The second was that the deletion was worth more than its line count. The
+kernel's `merge_ops` had exactly one caller — the `pushOps` handler. Oplog replay
+does not use it; replay applies a document's own history in order and never
+reconciles a concurrent branch. So removing that handler did not merely retire
+dead code, it made concurrent merge into kernel documents **impossible**. The
+migration plan had listed, as the gate on replacing the CRDT text engine, an
+instrumentation task to measure whether non-trivial merge ever happened inside
+the kernel. That instrument had been built earlier the same day. It was deleted
+a few hours later, along with a sibling counter in the same position, because a
+structural impossibility is a better answer than a metric reading zero forever —
+and an unreachable instrument is worse than none, since it implies something was
+measured.
+
+### The design that was right in shape and wrong in placement
+
+The third consequence took two reviews and a wrong turn to find.
+
+Replacing the raw-operation text projection needed a replacement, and the first
+proposal was two events: append a suffix, or replace the whole content, chosen
+structurally by whether the new text starts with the old. A DeepSeek review
+confirmed the shape and refuted the reasoning — the document claimed one tool
+could produce a non-append change and there were five, and it never said *how*
+the server would classify. The safe rule is content comparison, not a list of
+tool names, because a list can be wrong and a comparison cannot.
+
+Then a Gemini review, asked specifically to counter our anchoring now that the
+additive constraint was gone, found the deeper error. Classification had been
+specified *at the wire*, against a per-subscription record of the last text sent.
+That is impossible and expensive at once: the internal event carries opaque CRDT
+bytes, so a bridge cannot classify without linking the very library being
+removed, and per-subscription tracking means one string buffer per block per
+subscriber. Classification belongs inside the mutation lock, where both texts are
+already in hand.
+
+The same review found that gap recovery could not be implemented at all as
+written, because the snapshot query returns no version — so a client cannot know
+whether a queued append is already included, and applying it twice corrupts the
+text.
+
+And it argued for something larger: not two events bolted onto an interface of
+thirteen, but one ordered per-context change feed carrying a list of events and
+the version they bring the client to. That shape gets three things the pair
+cannot. Coalescing becomes native, so the batching special-case that exists today
+disappears rather than being reimplemented. A tool's final output and its
+completion status arrive in one delivery, closing a race where a client renders a
+finished tool with no output. And two clocks — an operation counter and a
+delivery counter — collapse into one version.
+
+Amy took it immediately: *"it's been creeping around my thoughts and is the right
+move."*
+
+One hazard came from the house's own doctrine rather than from any review. Two of
+the thirteen events are musical: render cues and beat sync. Batching trades
+latency for fewer messages, and the timebase doctrine forbids exactly that trade
+for timing artifacts. They keep their own path, written into the specification as
+its own rule rather than left to be remembered.
+
+### What the day was actually about
+
+Three bugs found that day shared a shape. A block's `excluded` flag and its
+`created_at` were written by the server and never read by the client, harmless
+only because the clients that would care still read a different path — and the
+migration was about to move them onto the path where it stopped being harmless. A
+shell command that printed more than eight kilobytes recorded a failure code on
+its durable record while its status still read as done. And an ACP session
+watching a spliced block appended a bogus suffix to stale text, rendering
+characters no one wrote.
+
+None of the three was visible as a failure. Each was a place where the system
+said something confidently and wrongly, and stayed plausible while doing it. The
+instrument's own stances are about being able to say who is in the room and what
+happened; a projection that quietly disagrees with the kernel is that promise
+failing quietly. The wire changes are the interesting engineering, but the reason
+to make them is that the fewer things a client has to reconstruct, the fewer
+places it can be confidently wrong.
