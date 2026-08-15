@@ -1459,7 +1459,13 @@ interface Kernel {
   # ==========================================================================
   # Blocks: queries & CRDT sync
   # ==========================================================================
-  getContextState @34 (contextId :Data, trace :TraceContext) -> (state :ContextState);
+  # @34 retired (2026-08-15 flag day, docs/crdt-position-2026-08.md): was
+  # getContextState, already a tombstone handler returning "removed: use
+  # getBlocks @35 + getContextVersion @110" before this — this just formalizes
+  # the ordinal as unusable at the schema level too. Cap'n Proto requires
+  # interface method ordinals to be sequential with no holes (see @79-@83
+  # below), so it stays a stub, not a hole.
+  retired34 @34 ();
 
   # Fetch blocks by query: all, byIds, or byFilter
   getBlocks @35 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
@@ -1472,9 +1478,15 @@ interface Kernel {
   # clients use it for staleness/gap detection without decoding DTE.
   getContextVersion @110 (contextId :Data, trace :TraceContext) -> (version :UInt64);
 
-  # Push CRDT operations from client to server for bidirectional sync.
-  # Returns ack version so client knows ops were accepted and ordered.
-  pushOps @37 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+  # @37 retired (2026-08-15 flag day, docs/crdt-position-2026-08.md): was
+  # pushOps, letting a client push raw diamond-types operations into a kernel
+  # document. Zero production callers (verified independently three times) —
+  # its deletion is what makes concurrent merge into kernel documents
+  # structurally impossible: `BlockStore::merge_ops` (kernel-level,
+  # kaijutsu-kernel/src/block_store.rs) had exactly one caller, this handler,
+  # and is deleted with it. Clients neither author nor decode CRDT operations;
+  # the kernel is the sole sequencer. Stub, not a hole — see @79-@83.
+  retired37 @37 ();
 
   # Compact a context's oplog, bumping sync generation.
   # Connected clients will receive onSyncReset and must re-fetch full state.
@@ -1523,8 +1535,12 @@ interface Kernel {
   # Full state fetch for join/reconnect recovery
   getInputState @45 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
 
-  # Raw DTE ops for CRDT-aware clients
-  pushInputOps @46 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+  # @46 retired (2026-08-15 flag day, docs/crdt-position-2026-08.md): was
+  # pushInputOps, the input-document twin of `pushOps` (raw DTE ops from a
+  # CRDT-aware client). Same zero-production-callers finding, same reasoning:
+  # clients edit via `editInput`'s high-level insert/delete, never by
+  # authoring CRDT ops themselves. Stub, not a hole — see @79-@83.
+  retired46 @46 ();
 
   # Atomic submit: read input, create block, clear input.
   # Mode is explicit — no prefix detection.
@@ -1876,10 +1892,12 @@ interface Kernel {
   # ── RPC authoring (docs/crdt-position-2026-08.md, migration step 3) ───────
   #
   # The verbs that let a client author blocks WITHOUT being a CRDT replica.
-  # `kaijutsu-mcp` is the last client that still pushes ops; these replace
-  # that path, after which `pushOps` has zero production callers and the
-  # Option-2 client contract ("consume a projected stream, author via RPC")
-  # is real rather than aspirational.
+  # `kaijutsu-mcp` was the last client that still pushed ops; these verbs
+  # replaced that path, and the 2026-08-15 flag day then retired `pushOps`
+  # (@37, zero production callers) outright — the Option-2 client contract
+  # ("consume a projected stream, author via RPC") is real rather than
+  # aspirational, and concurrent merge into kernel documents is now
+  # structurally impossible rather than merely unused.
   #
   # Why not the existing `block_create` MCP tool: it hardcodes `after`,
   # `Status::Done` and `ContentType::Plain`, and its `metadata` argument is

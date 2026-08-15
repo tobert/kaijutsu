@@ -412,11 +412,6 @@ enum RpcCommand {
     },
 
     // ── CRDT Sync ────────────────────────────────────────────────────────
-    PushOps {
-        context_id: ContextId,
-        ops: Vec<u8>,
-        reply: oneshot::Sender<Result<u64, CallError>>,
-    },
     GetBlocks {
         context_id: ContextId,
         query: BlockQuery,
@@ -522,11 +517,6 @@ enum RpcCommand {
     GetInputState {
         context_id: ContextId,
         reply: oneshot::Sender<Result<InputState, CallError>>,
-    },
-    PushInputOps {
-        context_id: ContextId,
-        ops: Vec<u8>,
-        reply: oneshot::Sender<Result<u64, CallError>>,
     },
     SubmitInput {
         context_id: ContextId,
@@ -741,7 +731,6 @@ impl RpcCommand {
             Self::GetClusters { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ResolveContextLabel { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -763,7 +752,6 @@ impl RpcCommand {
             Self::GetClientView { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInputState { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CommitCapture { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1150,16 +1138,6 @@ impl ActorHandle {
 
     // ── CRDT Sync ────────────────────────────────────────────────────────
 
-    #[tracing::instrument(skip(self, ops))]
-    pub async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError> {
-        self.send(|reply| RpcCommand::PushOps {
-            context_id,
-            ops: ops.to_vec(),
-            reply,
-        })
-        .await
-    }
-
     #[tracing::instrument(skip(self, query))]
     pub async fn get_blocks_query(
         &self,
@@ -1420,20 +1398,6 @@ impl ActorHandle {
     pub async fn get_input_state(&self, context_id: ContextId) -> Result<InputState, CallError> {
         self.send(|reply| RpcCommand::GetInputState { context_id, reply })
             .await
-    }
-
-    #[tracing::instrument(skip(self, ops))]
-    pub async fn push_input_ops(
-        &self,
-        context_id: ContextId,
-        ops: &[u8],
-    ) -> Result<u64, CallError> {
-        self.send(|reply| RpcCommand::PushInputOps {
-            context_id,
-            ops: ops.to_vec(),
-            reply,
-        })
-        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -1801,35 +1765,33 @@ impl ActorHandle {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// DocSyncBackend (fetch/push seam, historically a doc-sync test seam)
+// DocSyncBackend (fetch seam, historically a doc-sync test seam)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Narrow seam over the two RPCs a document-sync task needs: fetch the
-/// server's authoritative snapshot, and push locally-authored ops.
+/// Narrow seam over the one RPC a document-sync task needs: fetch the
+/// server's authoritative snapshot.
 ///
 /// `ActorHandle` implements this as a thin passthrough to its own
-/// `get_context_sync`/`push_ops` methods. The seam let a generic consumer be
-/// exercised against a fake with controllable timing and call-counting in
-/// unit tests, instead of every race condition needing a real ephemeral SSH
-/// server + kernel — `kaijutsu-mcp`'s sole-writer doc task was that consumer
-/// until docs/crdt-position-2026-08.md slice 4 deleted it along with the
-/// mirror it maintained. Whether this trait itself still earns its keep with
-/// no generic consumer left is an open, separate question (same doc); it is
-/// NOT retired here. Mirrors the `CasFetch` seam in `sftp.rs`.
+/// `get_context_sync` method. The seam let a generic consumer be exercised
+/// against a fake with controllable timing and call-counting in unit tests,
+/// instead of every race condition needing a real ephemeral SSH server +
+/// kernel — `kaijutsu-mcp`'s sole-writer doc task was that consumer until
+/// docs/crdt-position-2026-08.md slice 4 deleted it along with the mirror it
+/// maintained. Its `push_ops` twin was dropped in the 2026-08-15 flag day
+/// that retired `pushOps` itself (zero production callers; concurrent merge
+/// into kernel documents is now structurally impossible). Whether this trait
+/// itself still earns its keep with no generic consumer left is an open,
+/// separate question (same doc); it is NOT retired here. Mirrors the
+/// `CasFetch` seam in `sftp.rs`.
 #[async_trait::async_trait]
 pub trait DocSyncBackend: Send + Sync {
     async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError>;
-    async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError>;
 }
 
 #[async_trait::async_trait]
 impl DocSyncBackend for ActorHandle {
     async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError> {
         ActorHandle::get_context_sync(self, context_id).await
-    }
-
-    async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError> {
-        ActorHandle::push_ops(self, context_id, ops).await
     }
 }
 
@@ -3201,13 +3163,6 @@ async fn dispatch_kernel_command(
         }
 
         // ── CRDT Sync ──
-        RpcCommand::PushOps {
-            context_id,
-            ops,
-            reply,
-        } => {
-            dispatch!(kernel, reply, close_tx, k, k.push_ops(context_id, &ops));
-        }
         RpcCommand::GetBlocks {
             context_id,
             query,
@@ -3313,13 +3268,6 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetInputState { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_input_state(context_id));
-        }
-        RpcCommand::PushInputOps {
-            context_id,
-            ops,
-            reply,
-        } => {
-            dispatch!(kernel, reply, close_tx, k, k.push_input_ops(context_id, &ops));
         }
         RpcCommand::SubmitInput {
             context_id,

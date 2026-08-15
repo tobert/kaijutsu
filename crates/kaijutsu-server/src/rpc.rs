@@ -3584,21 +3584,6 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn get_context_state(
-        self: Rc<Self>,
-        _params: kernel::GetContextStateParams,
-        _results: kernel::GetContextStateResults,
-    ) -> Promise<(), capnp::Error> {
-        // Tombstoned: use getBlocks @35 for blocks and getContextVersion @110
-        // for the revision. `getContextSync @36` also carries a version, but it
-        // ships the whole oplog to do it and is itself on the way out — prefer
-        // the projected read. Schema ordinal @34 is preserved for wire
-        // compatibility.
-        Promise::err(capnp::Error::failed(
-            "getContextState removed: use getBlocks @35 + getContextVersion @110".into(),
-        ))
-    }
-
     // =========================================================================
     // LLM operations
     // =========================================================================
@@ -4485,110 +4470,6 @@ impl kernel::Server for KernelImpl {
         result_builder.set_ok(true);
         result_builder.set_stdout(&[]);
         result_builder.set_stderr("");
-        Promise::ok(())
-    }
-
-    fn push_ops(
-        self: Rc<Self>,
-        params: kernel::PushOpsParams,
-        mut results: kernel::PushOpsResults,
-    ) -> Promise<(), capnp::Error> {
-        /// Log a per-context `merge_stats()` summary every this-many
-        /// `push_ops` applications (fast-forwards + concurrent merges
-        /// combined) — a cheap modulo check, not a log line per call.
-        const MERGE_STATS_LOG_EVERY: u64 = 100;
-
-        let params_reader = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(params_reader.get_trace(), "push_ops").entered();
-        let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-        let ops_data = pry!(params_reader.get_ops()).to_vec();
-
-        log::debug!(
-            "push_ops called for context {} with {} bytes",
-            context_id,
-            ops_data.len()
-        );
-
-        let _ctx_span = if let Some(drift) = self.kernel.kernel.drift().try_read() {
-            let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
-            Some(kaijutsu_telemetry::context_root_span(&trace_id, "push_ops").entered())
-        } else {
-            None
-        };
-
-        let documents = &self.kernel.documents;
-
-        // Deserialize the sync payload
-        let payload: kaijutsu_crdt::block_store::SyncPayload =
-            match kaijutsu_types::codec::decode(&ops_data)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                return Promise::err(capnp::Error::failed(format!(
-                    "failed to deserialize sync payload: {}",
-                    e
-                )));
-            }
-        };
-
-        // Snapshot the wire-merge classifier before applying, so this one
-        // application's outcome can be exported as a metric rather than only
-        // accumulating into an in-memory total that dies with the process.
-        // `merge_stats()` is cumulative per document; the delta across the
-        // merge below is exactly what this payload did.
-        // docs/crdt-position-2026-08.md Part 1, empirical question 1.
-        let stats_before = documents
-            .get(context_id)
-            .map(|entry| entry.doc.merge_stats())
-            .unwrap_or_default();
-
-        // Merge the sync payload into the document
-        let ack_version = match documents.merge_ops(context_id, payload) {
-            Ok(version) => version,
-            Err(e) => {
-                return Promise::err(capnp::Error::failed(format!("failed to merge ops: {}", e)));
-            }
-        };
-
-        log::debug!("push_ops merged successfully, new version: {}", ack_version);
-
-        // Wire-merge classifier summary — docs/crdt-position-2026-08.md Part 1,
-        // empirical question 1. Fast-forwards/concurrent-merges are already
-        // logged/counted inside `BlockStore::merge_ops`; this is just a cheap
-        // periodic reminder of the running per-context totals so `push_ops`
-        // traffic shows up in logs without a log line on every call.
-        if let Some(entry) = documents.get(context_id) {
-            let stats = entry.doc.merge_stats();
-
-            // Export this application's outcome as a time series. A payload
-            // that moved neither counter carried no DTE ops (headers only)
-            // and is deliberately not recorded — see `outcome_since`.
-            match stats.outcome_since(&stats_before) {
-                Some(kaijutsu_crdt::block_store::MergeOutcome::Concurrent) => {
-                    kaijutsu_telemetry::record_merge_application(true)
-                }
-                Some(kaijutsu_crdt::block_store::MergeOutcome::FastForward) => {
-                    kaijutsu_telemetry::record_merge_application(false)
-                }
-                None => {}
-            }
-
-            let total = stats.fast_forwards + stats.concurrent_merges;
-            if total > 0 && total % MERGE_STATS_LOG_EVERY == 0 {
-                log::debug!(
-                    "push_ops merge_stats for context {}: {} fast-forwards, {} concurrent merges ({} applications)",
-                    context_id,
-                    stats.fast_forwards,
-                    stats.concurrent_merges,
-                    total
-                );
-            }
-        }
-        results.get().set_ack_version(ack_version);
         Promise::ok(())
     }
 
@@ -6032,39 +5913,6 @@ impl kernel::Server for KernelImpl {
         }
     }
 
-    fn push_input_ops(
-        self: Rc<Self>,
-        params: kernel::PushInputOpsParams,
-        mut results: kernel::PushInputOpsResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "push_input_ops").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-        let ops_data = pry!(p.get_ops()).to_vec();
-
-        log::debug!(
-            "push_input_ops: context={}, ops_len={}",
-            context_id,
-            ops_data.len()
-        );
-
-        let documents = &self.kernel.documents;
-
-        match documents.merge_input_ops(context_id, &ops_data) {
-            Ok(version) => {
-                results.get().set_ack_version(version);
-                Promise::ok(())
-            }
-            Err(e) => Promise::err(capnp::Error::failed(format!(
-                "push_input_ops failed: {}",
-                e
-            ))),
-        }
-    }
 
     fn submit_input(
         self: Rc<Self>,

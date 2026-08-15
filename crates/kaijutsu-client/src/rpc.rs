@@ -1019,28 +1019,6 @@ impl KernelHandle {
     // Block-based CRDT sync methods
     // =========================================================================
 
-    // Blocks sync via pushOps (SerializedOps). See BlockStore::ops_since()
-    // and apply_ops().
-
-    /// Push CRDT operations to the server for bidirectional sync.
-    ///
-    /// Returns the acknowledged version so the client knows ops were accepted.
-    /// The ops should be serialized using serde_json from SerializedOpsOwned.
-    #[tracing::instrument(skip(self, ops), name = "rpc_client.push_ops")]
-    pub async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, RpcError> {
-        let mut request = self.kernel.push_ops_request();
-        request.get().set_context_id(context_id.as_bytes());
-        request.get().set_ops(ops);
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        Ok(response.get()?.get_ack_version())
-    }
-
     /// Get document state (blocks and CRDT oplog)
     /// Compact a document's oplog, returning new size and sync generation.
     #[tracing::instrument(skip(self), name = "rpc_client.compact_context")]
@@ -2461,25 +2439,6 @@ impl KernelHandle {
             ops: result.get_ops().map(|d| d.to_vec()).unwrap_or_default(),
             version: result.get_version(),
         })
-    }
-
-    /// Push raw CRDT operations to the input document.
-    ///
-    /// For CRDT-aware clients that maintain their own DTE document.
-    /// Returns the acknowledged version.
-    #[tracing::instrument(skip(self, ops), name = "rpc_client.push_input_ops")]
-    pub async fn push_input_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, RpcError> {
-        let mut request = self.kernel.push_input_ops_request();
-        request.get().set_context_id(context_id.as_bytes());
-        request.get().set_ops(ops);
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        Ok(response.get()?.get_ack_version())
     }
 
     /// Submit the input document: snapshot to conversation block and clear.

@@ -2101,138 +2101,6 @@ impl BlockStore {
         Ok(entry.doc.ops_since(frontier))
     }
 
-    /// Merge a sync payload into a document.
-    pub fn merge_ops(&self, context_id: ContextId, payload: SyncPayload) -> BlockStoreResult<u64> {
-        let (version, events, ops) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let before = entry.doc.blocks_ordered();
-            let frontier_before = entry.doc.frontier();
-            entry.doc.merge_ops(payload)?;
-            let version = entry.doc.version();
-            entry.version.store(version, Ordering::SeqCst);
-            let after = entry.doc.blocks_ordered();
-            let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (
-                version,
-                self.diff_block_events(context_id, &before, &after, ops_bytes),
-                ops,
-            )
-        };
-        for event in events {
-            self.emit(event);
-        }
-        self.journal_op(context_id, ops)?;
-        Ok(version)
-    }
-
-    /// Compare block snapshots before/after a merge and produce BlockFlow events.
-    ///
-    /// Detects new blocks (Inserted), removed blocks (Deleted), status changes,
-    /// output changes (OutputChanged — output is not DTE-tracked so it rides its
-    /// own event), collapsed changes, and text changes. All events carry
-    /// `OpSource::Remote` and share the same ops blob (CRDT dedup handles
-    /// multiple merges).
-    fn diff_block_events(
-        &self,
-        context_id: ContextId,
-        before: &[BlockSnapshot],
-        after: &[BlockSnapshot],
-        ops: Vec<u8>,
-    ) -> Vec<BlockFlow> {
-        use std::collections::HashMap;
-
-        let before_map: HashMap<&BlockId, &BlockSnapshot> =
-            before.iter().map(|b| (&b.id, b)).collect();
-        let after_map: HashMap<&BlockId, &BlockSnapshot> =
-            after.iter().map(|b| (&b.id, b)).collect();
-
-        // Shared Arc for ops — all events from this diff share the same allocation
-        let ops: Arc<[u8]> = Arc::from(ops);
-        let mut events = Vec::new();
-
-        // New blocks
-        for (i, snap) in after.iter().enumerate() {
-            if !before_map.contains_key(&snap.id) {
-                let after_id = if i > 0 { Some(after[i - 1].id) } else { None };
-                events.push(BlockFlow::Inserted {
-                    context_id,
-                    block: Arc::new(snap.clone()),
-                    after_id,
-                    ops: ops.clone(),
-                    source: OpSource::Remote,
-                });
-            }
-        }
-
-        // Deleted blocks
-        for snap in before {
-            if !after_map.contains_key(&snap.id) {
-                events.push(BlockFlow::Deleted {
-                    context_id,
-                    block_id: snap.id,
-                    source: OpSource::Remote,
-                });
-            }
-        }
-
-        // Changes to existing blocks
-        for snap in after {
-            if let Some(old) = before_map.get(&snap.id) {
-                if old.status != snap.status {
-                    events.push(BlockFlow::StatusChanged {
-                        context_id,
-                        block_id: snap.id,
-                        status: snap.status,
-                        source: OpSource::Remote,
-                    });
-                }
-                if old.output != snap.output {
-                    events.push(BlockFlow::OutputChanged {
-                        context_id,
-                        block_id: snap.id,
-                        output: snap.output.clone(),
-                        source: OpSource::Remote,
-                    });
-                }
-                if old.collapsed != snap.collapsed {
-                    events.push(BlockFlow::CollapsedChanged {
-                        context_id,
-                        block_id: snap.id,
-                        collapsed: snap.collapsed,
-                        source: OpSource::Remote,
-                    });
-                }
-                // `docs/crdt-melt.md` step 7's gate: replacing DTE-backed block
-                // text with a plain representation is only safe once this
-                // answers whether non-trivial merge (a mid-content splice,
-                // shrink, or replace — not a pure tail append) ever actually
-                // happens here. `TextChangeShape::classify` is a cheap
-                // length-plus-prefix check (see its doc comment) riding the
-                // same `old.content`/`snap.content` borrows this diff already
-                // holds — no extra allocation, and every event from this diff
-                // is `OpSource::Remote` (this is the wire-merge path), so
-                // `remote` is hardcoded `true` here.
-                let shape = kaijutsu_telemetry::TextChangeShape::classify(&old.content, &snap.content);
-                kaijutsu_telemetry::record_merge_text_shape(shape, true);
-                if shape != kaijutsu_telemetry::TextChangeShape::NoOp {
-                    events.push(BlockFlow::TextOps {
-                        context_id,
-                        block_id: snap.id,
-                        ops: ops.clone(),
-                        source: OpSource::Remote,
-                        seq_num: self.next_block_text_seq(context_id),
-                    });
-                }
-            }
-        }
-
-        events
-    }
-
     /// Get the current frontier for a document (per-block frontiers).
     pub fn frontier(&self, context_id: ContextId) -> BlockStoreResult<HashMap<BlockId, Frontier>> {
         let entry = self
@@ -2906,37 +2774,6 @@ impl BlockStore {
         entry
             .ops_since(frontier)
             .map_err(BlockStoreError::Serialization)
-    }
-
-    /// Merge remote ops into an input document.
-    pub fn merge_input_ops(
-        &self,
-        context_id: ContextId,
-        ops_bytes: &[u8],
-    ) -> BlockStoreResult<u64> {
-        let mut entry = self
-            .input_docs
-            .get_mut(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-
-        entry
-            .merge_ops(ops_bytes)
-            .map_err(BlockStoreError::Serialization)?;
-
-        let version = entry.version();
-        drop(entry);
-
-        self.journal_and_maybe_compact_input(context_id, ops_bytes)?;
-
-        let seq_num = self.next_input_text_seq(context_id);
-        self.emit_input(InputDocFlow::TextOps {
-            context_id,
-            ops: Arc::from(ops_bytes.to_vec()),
-            source: crate::flows::OpSource::Remote,
-            seq_num,
-        });
-
-        Ok(version)
     }
 
     /// Clear the input document for a context.
@@ -4635,140 +4472,6 @@ mod tests {
         assert_eq!(snapshot.content, "Hello World!");
     }
 
-    /// Test that merge_ops emits BlockFlow events for new blocks.
-    #[tokio::test]
-    async fn test_merge_ops_emits_inserted_event() {
-        let (server, bus) = store_with_flows();
-        let mut sub = bus.subscribe("block.>");
-        let ctx = ContextId::new();
-
-        server
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-
-        // Snapshot before insert
-        let initial_snapshot = {
-            let entry = server.get(ctx).unwrap();
-            codec::encode(&entry.doc.snapshot()).unwrap()
-        };
-
-        let frontier_before = server.frontier(ctx).unwrap();
-
-        let _block_id = server
-            .insert_block(
-                ctx,
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "hello from remote",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        let msg = sub
-            .try_recv()
-            .expect("should get Inserted from insert_block");
-        assert!(matches!(msg.payload, BlockFlow::Inserted { .. }));
-
-        let ops = server.ops_since(ctx, &frontier_before).unwrap();
-
-        // Create receiver from initial snapshot
-        let (receiver, recv_bus) = store_with_flows();
-        let mut recv_sub = recv_bus.subscribe("block.>");
-
-        receiver
-            .create_document_from_snapshot(ctx, DocumentKind::Conversation, None, &initial_snapshot)
-            .unwrap();
-
-        receiver.merge_ops(ctx, ops).unwrap();
-
-        let msg = recv_sub
-            .try_recv()
-            .expect("merge_ops should emit Inserted event");
-        match msg.payload {
-            BlockFlow::Inserted {
-                context_id, block, ..
-            } => {
-                assert_eq!(context_id, ctx);
-                assert_eq!(block.content, "hello from remote");
-                assert_eq!(block.kind, BlockKind::Text);
-            }
-            other => panic!("expected Inserted, got {:?}", other),
-        }
-    }
-
-    /// Test that merge_ops emits StatusChanged and TextOps events for existing blocks.
-    #[tokio::test]
-    async fn test_merge_ops_emits_status_and_text_events() {
-        let ctx = ContextId::new();
-
-        let (server_a, _) = store_with_flows();
-        server_a
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-
-        let block_id = server_a
-            .insert_block(
-                ctx,
-                None,
-                None,
-                Role::Model,
-                BlockKind::Text,
-                "initial",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Receiver syncs via proper protocol: empty document + ops_since
-        let (receiver, recv_bus) = store_with_flows();
-        receiver
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-        let initial_ops = server_a.ops_since(ctx, &HashMap::new()).unwrap();
-        receiver.merge_ops(ctx, initial_ops).unwrap();
-
-        let recv_frontier = receiver.frontier(ctx).unwrap();
-
-        // Modify block on A
-        server_a
-            .set_status(ctx, &block_id, Status::Running)
-            .unwrap();
-        server_a
-            .edit_text(ctx, &block_id, 7, " content", 0)
-            .unwrap();
-
-        // Compute diff — frontier types differ (per-block vs per-block), but both stores
-        // use HashMap<BlockId, Frontier>, so we can pass receiver's frontier to server A
-        let diff_ops = server_a.ops_since(ctx, &recv_frontier).unwrap();
-
-        let mut recv_sub = recv_bus.subscribe("block.>");
-        receiver.merge_ops(ctx, diff_ops).unwrap();
-
-        let mut events = Vec::new();
-        while let Some(msg) = recv_sub.try_recv() {
-            events.push(msg.payload);
-        }
-
-        let has_status = events.iter().any(|e| {
-            matches!(
-                e,
-                BlockFlow::StatusChanged {
-                    status: Status::Running,
-                    ..
-                }
-            )
-        });
-        let has_text = events
-            .iter()
-            .any(|e| matches!(e, BlockFlow::TextOps { .. }));
-
-        assert!(has_status, "should emit StatusChanged, got: {:?}", events);
-        assert!(has_text, "should emit TextOps, got: {:?}", events);
-    }
-
     /// Integration test: stream → finalize → verify content preserved.
     #[tokio::test]
     async fn test_streaming_lifecycle() {
@@ -4894,106 +4597,6 @@ mod tests {
         store.set_status(ctx, &block_id, Status::Done).unwrap();
         let row2 = db.lock().get_context(ctx).unwrap().unwrap();
         assert!(row2.last_activity_at.unwrap() >= t1);
-    }
-
-    /// Prove that merge_ops persists merged content to the database.
-    ///
-    /// This simulates the push_ops RPC flow: a remote client builds a
-    /// SyncPayload from its local mutations and the server merges it.
-    /// The server's DB must contain the merged content afterward.
-    #[test]
-    fn test_merge_ops_persists_to_db() {
-        use crate::kernel_db::{DocumentRow, KernelDb};
-        use kaijutsu_types::now_millis;
-
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let creator = PrincipalId::system();
-
-        let ws_id = {
-            let db_guard = db.lock();
-            db_guard
-                .get_or_create_default_workspace(creator)
-                .unwrap()
-        };
-
-        // "Server" store — DB-backed, will receive merged ops.
-        let server_store = BlockStore::with_db(db.clone(), ws_id, creator);
-        let ctx = ContextId::new();
-        {
-            let db_guard = db.lock();
-            db_guard
-                .insert_document(&DocumentRow {
-                    document_id: ctx,
-                                        workspace_id: ws_id,
-                    doc_kind: DocumentKind::Conversation,
-                    language: None,
-                    path: None,
-                    created_at: now_millis() as i64,
-                    created_by: creator,
-                })
-                .unwrap();
-        }
-        server_store
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-
-        // "Client" store — no DB, generates mutations.
-        let client_store = BlockStore::new(creator);
-        client_store
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-
-        // Client inserts a block with content.
-        let empty_frontier = HashMap::new();
-        client_store
-            .insert_block(
-                ctx,
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "merge_ops persistence test",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Build sync payload from client (all ops since empty frontier).
-        let payload = client_store.ops_since(ctx, &empty_frontier).unwrap();
-        assert!(!payload.new_blocks.is_empty(), "payload should contain the new block");
-
-        // Server merges the payload — this is the code path under test.
-        let version = server_store.merge_ops(ctx, payload).unwrap();
-        assert!(version > 0);
-
-        // In-memory content should have the merged block.
-        let content = server_store.get_content(ctx).unwrap();
-        assert!(
-            content.contains("merge_ops persistence test"),
-            "in-memory content after merge_ops should contain the block, got: {:?}",
-            content,
-        );
-
-        // DB should have oplog entries from journal_op.
-        let db_guard = db.lock();
-        let oplog_entries = db_guard.load_oplog_since(ctx, 0).unwrap();
-        assert!(
-            !oplog_entries.is_empty(),
-            "merge_ops should journal ops to the oplog",
-        );
-
-        // Verify the oplog can be replayed to reconstruct the merged content.
-        let mut replay_store = CrdtBlockStore::new(ctx, creator);
-        for (_seq, payload_bytes) in &oplog_entries {
-            let payload: SyncPayload = codec::decode(payload_bytes).unwrap();
-            replay_store.merge_ops(payload).unwrap();
-        }
-        let replayed_content = replay_store.full_text();
-        assert!(
-            replayed_content.contains("merge_ops persistence test"),
-            "Replayed oplog should produce merged content, got: {:?}",
-            replayed_content,
-        );
     }
 
     /// A store that declares persistence (`with_db*`) but reaches a journaling
@@ -5444,36 +5047,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_journal_row_per_merge_ops() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
-
-        // Create a second (non-DB) store and insert a block in it
-        let client = BlockStore::new(PrincipalId::system());
-        client
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-        client
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "from remote", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        let payload = client.ops_since(ctx, &HashMap::new()).unwrap();
-        store.merge_ops(ctx, payload).unwrap();
-
-        let db_guard = db.lock();
-        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
-        assert_eq!(
-            entries.len(),
-            1,
-            "merge_ops should produce 1 oplog row, got {}",
-            entries.len()
-        );
-    }
-
     // ====================================================================
     // 3. Compaction
     // ====================================================================
@@ -5552,76 +5125,6 @@ mod tests {
             content_after, expected,
             "compacted + post-compaction ops should all survive reload"
         );
-    }
-
-    // ====================================================================
-    // 4. Mixed Operations
-    // ====================================================================
-
-    #[test]
-    fn test_mixed_local_and_remote_ops() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store_a, ctx, ws) = fresh_db_store(dir.path());
-
-        // A inserts a block locally
-        store_a
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "local-1", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        // B (no DB) inserts a block
-        let store_b = BlockStore::new(PrincipalId::new());
-        store_b
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-        store_b
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "remote-b", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        // Merge B's ops into A
-        let payload = store_b.ops_since(ctx, &HashMap::new()).unwrap();
-        store_a.merge_ops(ctx, payload).unwrap();
-
-        // A inserts another block locally
-        store_a
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "local-2", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        let content_before = store_a.get_content(ctx).unwrap();
-        assert!(content_before.contains("local-1"));
-        assert!(content_before.contains("remote-b"));
-        assert!(content_before.contains("local-2"));
-
-        drop(store_a);
-
-        let store2 = drop_and_reload(db, ws);
-        let content_after = store2.get_content(ctx).unwrap();
-        assert!(
-            content_after.contains("local-1"),
-            "local-1 missing after reload: {:?}",
-            content_after
-        );
-        assert!(
-            content_after.contains("remote-b"),
-            "remote-b missing after reload: {:?}",
-            content_after
-        );
-        assert!(
-            content_after.contains("local-2"),
-            "local-2 missing after reload: {:?}",
-            content_after
-        );
-
-        let blocks = store2.block_snapshots(ctx).unwrap();
-        assert_eq!(blocks.len(), 3, "should have 3 blocks after reload");
     }
 
     #[test]
@@ -5796,7 +5299,7 @@ mod tests {
     }
 
     // ====================================================================
-    // 5. Lamport Clock
+    // 4. Lamport Clock
     // ====================================================================
 
     #[test]
@@ -5843,7 +5346,7 @@ mod tests {
     }
 
     // ====================================================================
-    // 6. Input Documents
+    // 5. Input Documents
     // ====================================================================
 
     #[test]
@@ -5975,7 +5478,7 @@ mod tests {
     }
 
     // ====================================================================
-    // 7. Forks
+    // 6. Forks
     // ====================================================================
 
     #[test]
