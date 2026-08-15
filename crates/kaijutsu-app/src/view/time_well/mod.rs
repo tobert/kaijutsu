@@ -119,12 +119,9 @@ impl Plugin for TimeWellPlugin {
                         scene::spin_rings,
                         scene::move_cards_toward_target,
                         scene::billboard_cards,
-                        // Ambient, not ungated (unlike its sibling
-                        // `tick_ring_activity`): needs live `Card`/`CardTarget`
-                        // entities to resolve an event's ring angle, and those
-                        // only exist while the well's furniture is spawned
-                        // (Screen::Room).
-                        scene::accumulate_ring_activity,
+                        // `scene::accumulate_ring_activity` was here. The
+                        // glow's event ingest is DISABLED pending a redesign
+                        // (Amy, 2026-08-15) — see `activity::RingActivity`.
                         scene::sync_deck_material,
                         live::sync_card_live_uniforms,
                         // Moved here from dived-only (freeze-fix slice,

@@ -1970,29 +1970,6 @@ pub fn apply_horizon_label_lod(
     }
 }
 
-/// Ingest the kernel-wide event stream into the well's pulse. Every block event
-/// (token streaming weighs most — see [`super::activity::event_signal`]) raises
-/// the global energy and fires a **ripple at the producing context's ring
-/// angle** (`atan2(card.y, card.x)`), so a busy conversation throws a wavefront
-/// out from its direction on the deck. Events for contexts not currently shown
-/// still raise the global energy (ripple fired at angle 0).
-pub fn accumulate_ring_activity(
-    mut events: MessageReader<crate::connection::ServerEventMessage>,
-    mut activity: ResMut<super::activity::RingActivity>,
-    cards: Query<(&Card, &CardTarget)>,
-) {
-    for crate::connection::ServerEventMessage(ev) in events.read() {
-        if let Some((ctx, weight)) = super::activity::event_signal(ev) {
-            let angle = cards
-                .iter()
-                .find(|(c, _)| c.context_id == ctx)
-                .map(|(_, t)| t.0.y.atan2(t.0.x))
-                .unwrap_or(0.0);
-            activity.record(ctx, angle, weight);
-        }
-    }
-}
-
 /// The `RingActivity` decay tick alone — split out of the old
 /// `tick_and_sync_rings` (Slice C, `lovely-swimming-prism.md`) so it can run
 /// **fully ungated**, mirroring `live::ingest_live_events`'s own ungated

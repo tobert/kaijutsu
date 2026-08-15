@@ -1,10 +1,33 @@
 //! The well's pulse: a pure-ish activity model for the base ring deck.
 //!
-//! The app already receives the **kernel-wide** `ServerEvent` stream (every
-//! block insert / text-op / status change across *all* contexts — see
-//! `connection::actor_plugin`). Each event is a heartbeat of "the kernel /
-//! message bus is doing something." This model ingests those heartbeats, decays
-//! them over time, and exposes:
+//! # DISABLED — nothing feeds this today (Amy, 2026-08-15)
+//!
+//! The model below is live, correct, and unit-tested. **No system calls
+//! [`RingActivity::record`]**, so the energy sits at zero and the rings render
+//! calm. That is deliberate and temporary, and it is stated here rather than
+//! left for someone to discover by wondering why the well never lights up.
+//!
+//! What it used to do: ingest the **kernel-wide** `ServerEvent` stream and
+//! weigh each block event as a heartbeat — token streaming loudest, because it
+//! means a model is writing right now. That worked, and it cost the whole
+//! event stream: the app received every token of every context in order to
+//! choose a brightness. It was also the last consumer of the raw CRDT wire
+//! events (docs/change-feed.md), which is how it came up.
+//!
+//! Amy's call: *"we should temporarily disable that activity glow in the app
+//! pending a redesign. we'll be doing embeddings for a lot of that content
+//! kernel side and maybe we can emit something more useful and derived."* So
+//! the signal is meant to come back richer and from the kernel — not "how many
+//! events went by" but something about what is actually happening — and the
+//! decay/ripple math here is kept precisely because it is the part that will
+//! still be right when it does.
+//!
+//! To bring it back: feed [`RingActivity::record`] from whatever the kernel
+//! emits, and re-register an ingest system in `time_well/mod.rs`.
+//!
+//! ---
+//!
+//! It decays recorded heartbeats over time and exposes:
 //!
 //! - a smoothed global **energy** level (drives the ring brightness + flow speed
 //!   + core spin in `well_rings.wgsl`),
@@ -20,17 +43,18 @@
 use std::collections::HashMap;
 
 use bevy::prelude::Resource;
-use kaijutsu_client::ServerEvent;
-use kaijutsu_types::{ContextId, Status};
+use kaijutsu_types::ContextId;
 
 /// Max simultaneous ripples the shader renders (must match the array length in
 /// `WellRingsMaterial`/`well_rings.wgsl`). A busy system keeps the freshest.
 pub const MAX_RIPPLES: usize = 8;
 
 /// Energy a unit-weight event injects (scaled by the event's weight).
+#[allow(dead_code)] // Unfed while the glow is disabled — see the module doc.
 const ENERGY_PER_EVENT: f32 = 0.34;
 /// Energy ceiling (well past 1.0 so a flurry pins the rings bright; the shader
 /// reads `energy` directly and the HDR bloom soft-clamps the visual).
+#[allow(dead_code)] // Unfed while the glow is disabled — see the module doc.
 const ENERGY_MAX: f32 = 4.0;
 /// Global energy exponential decay rate (per second). Higher = quicker calm.
 const ENERGY_DECAY: f32 = 1.6;
@@ -78,6 +102,7 @@ impl RingActivity {
     /// Bumps global energy + the per-context level and fires a ripple. At the
     /// ripple cap the **oldest** ripple is evicted so the freshest wavefronts
     /// survive a flurry.
+    #[allow(dead_code)] // The disabled glow's entry point — see the module doc.
     pub fn record(&mut self, ctx: ContextId, angle: f32, weight: f32) {
         self.energy = (self.energy + ENERGY_PER_EVENT * weight).min(ENERGY_MAX);
 
@@ -126,31 +151,6 @@ impl RingActivity {
     /// this by [`CONTEXT_MAX`] into the card material's `dim.y` lane.
     pub fn context_energy(&self, ctx: &ContextId) -> f32 {
         self.per_context.get(ctx).copied().unwrap_or(0.0)
-    }
-}
-
-/// Map a kernel event to `(context, weight)`, or `None` for events that aren't
-/// "activity" (collapse/exclude/delete/sync/context-switch/resource churn).
-/// Token streaming ([`ServerEvent::BlockTextOps`]) is the loudest live signal —
-/// it's a model writing right now — so it weighs the most.
-pub fn event_signal(ev: &ServerEvent) -> Option<(ContextId, f32)> {
-    match ev {
-        ServerEvent::BlockTextOps { context_id, .. } => Some((*context_id, 1.0)),
-        ServerEvent::BlockInserted { context_id, .. } => Some((*context_id, 0.8)),
-        ServerEvent::BlockOutputChanged { context_id, .. } => Some((*context_id, 0.6)),
-        ServerEvent::BlockStatusChanged {
-            context_id, status, ..
-        } => {
-            let w = match status {
-                Status::Running => 0.5,
-                Status::Error => 0.9,
-                _ => 0.2,
-            };
-            Some((*context_id, w))
-        }
-        ServerEvent::BlockMetadataChanged { context_id, .. } => Some((*context_id, 0.25)),
-        ServerEvent::BlockMoved { context_id, .. } => Some((*context_id, 0.2)),
-        _ => None,
     }
 }
 
@@ -261,22 +261,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_running_and_error_are_activity_streaming_is_loudest() {
-        let bid = kaijutsu_crdt::BlockId::new(ctx(1), kaijutsu_types::PrincipalId::nil(), 0);
-        let running = ServerEvent::BlockStatusChanged {
-            context_id: ctx(1),
-            block_id: bid,
-            status: Status::Running,
-        };
-        let textops = ServerEvent::BlockTextOps {
-            context_id: ctx(1),
-            block_id: bid,
-            ops: vec![],
-            seq_num: 0,
-        };
-        let (_, run_w) = event_signal(&running).expect("status is activity");
-        let (_, tops_w) = event_signal(&textops).expect("text ops are activity");
-        assert!(tops_w > run_w, "token streaming weighs more than a status flip");
-    }
 }
