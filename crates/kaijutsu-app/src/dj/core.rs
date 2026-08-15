@@ -550,6 +550,17 @@ impl DjCore {
         };
         let cur = beat.position(now);
         let tempo = beat.tempo_bps();
+        // Not `!(tempo > 0.0)` (contrast midi_clock.rs's `--bpm`, which is
+        // user input and where `f64::from_str` accepts the literal "NaN"):
+        // `tempo_bps()` traces back to `ClockEstimator::tempo_bps()` =
+        // `1e9 / (period_ema_ns * PULSES_PER_BEAT)`, an EMA seeded and
+        // updated only from `u64` pulse-interval deltas (always finite,
+        // never negative) and only ever set once known `> 0.0` — so `tempo`
+        // here can be zero or negative (an unlearned/degenerate estimator)
+        // but never NaN, and the plain `<=` reads correctly. If this ever
+        // gets hardened further: neither form alone catches `+inf` (which
+        // `period_ema_ns == 0` would produce) — that needs an explicit
+        // `is_finite()` check, not just flipping the comparison.
         if tempo <= 0.0 {
             return Vec::new();
         }
@@ -597,6 +608,8 @@ impl DjCore {
     pub fn next_wake(&self, now: Instant, horizon: Duration) -> Option<Instant> {
         let beat = self.beat.as_ref()?;
         let tempo = beat.tempo_bps();
+        // Plain `<=`, not negated — see `schedule_due`'s comment above for
+        // why `tempo_bps()` can never be NaN here.
         if tempo <= 0.0 {
             return None;
         }
@@ -676,6 +689,8 @@ impl DjCore {
             return DueCues { due: Vec::new(), dropped_cues: 0, transition: None };
         };
         let tempo = beat.tempo_bps();
+        // Plain `<=`, not negated — see `schedule_due`'s comment above for
+        // why `tempo_bps()` can never be NaN here.
         if tempo <= 0.0 {
             return DueCues { due: Vec::new(), dropped_cues: 0, transition: None };
         }
@@ -710,6 +725,8 @@ impl DjCore {
         }
         let beat = self.beat.as_ref()?;
         let tempo = beat.tempo_bps();
+        // Plain `<=`, not negated — see `schedule_due`'s comment above for
+        // why `tempo_bps()` can never be NaN here.
         if tempo <= 0.0 {
             return None;
         }
