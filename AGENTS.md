@@ -20,9 +20,18 @@ one owner, no host file, no write-through; embedded defaults under
 `assets/defaults/rc/` (the in-repo seed). See `docs/config-crdt-ownership.md`.
 
 *Migration in flight:* rc/config are stored as CRDT documents today and are being
-melted into a kernel-owned git worktree of plain files. **Single kernel ownership is
-the invariant that survives the change** — whatever the storage, config must never
-have two competing sources of truth.
+melted toward plain files. **Single kernel ownership is the invariant that
+survives the change** — whatever the storage, config must never have two
+competing sources of truth.
+
+**Permission to get simpler** (Amy, 2026-08-15): *"If the agent can see the
+files and edit them, that's fine, we don't need to complicate it just because
+it's config."* Config is not a special category deserving its own machinery. If
+plain files plus the tools every player already has (kaish, the file tools, the
+editor) do the job, that is the answer — a reseed tool for the shipped defaults,
+and git as a skill reachable through rc or the help system rather than something
+the kernel performs. Prefer deleting a mechanism to generalizing it. This is
+explicit permission to reduce scope, not merely to avoid adding to it.
 
 **Shared trust, crosstalk-as-feature.** Every player — human, model, connected
 app, sibling context — is *inside* the trust boundary; the kernel runs as one
