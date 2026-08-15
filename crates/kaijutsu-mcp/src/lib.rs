@@ -17,6 +17,7 @@
 
 mod helpers;
 pub mod hook_listener;
+pub mod hook_adapter;
 pub mod hook_types;
 mod models;
 mod tree;

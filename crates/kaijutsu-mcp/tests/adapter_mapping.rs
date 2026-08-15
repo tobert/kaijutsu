@@ -1,11 +1,8 @@
 //! Adapter field-mapping round-trip.
 //!
-//! The hook adapters (`contrib/adapters/*.sh`) reshape a source tool's hook
-//! JSON into a kaijutsu `HookEvent`. The field map lives in a standalone jq
-//! filter so it is testable without the socket round-trip. This test pipes
-//! real Claude Code and Codex CLI payloads through the *actual* filters their
-//! adapters use and deserializes the result into `HookEvent`, asserting that
-//! fields survive.
+//! `kaijutsu-mcp hook claude|codex` reshapes source hook JSON into a
+//! kaijutsu `HookEvent`. These tests run real source fixtures through the
+//! Rust adapters and assert that fields survive.
 //!
 //! It exists to fail loudly on adapter↔core drift — e.g. a core field rename
 //! (`agent_id` → `principal_id`) or a source-field change
@@ -16,96 +13,31 @@
 //! that runs them has it.
 
 use std::path::PathBuf;
-use std::process::Command;
-
+use kaijutsu_mcp::hook_adapter::HookSource;
 use kaijutsu_mcp::hook_types::HookEvent;
 
 /// Run the Claude field-map filter over a fixture, return the parsed HookEvent.
 fn map_claude(fixture: &str, kj_event: &str) -> HookEvent {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let filter = manifest.join("../../contrib/adapters/claude-to-kaijutsu.jq");
     let fixture_path = manifest.join("tests/fixtures/claude").join(fixture);
-
-    let payload = std::fs::read(&fixture_path)
+    let payload = std::fs::read_to_string(&fixture_path)
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", fixture_path.display()));
-
-    let out = Command::new("jq")
-        .arg("--arg")
-        .arg("event")
-        .arg(kj_event)
-        .arg("-f")
-        .arg(&filter)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&payload)?;
-            child.wait_with_output()
-        })
-        .expect("spawn jq (is jq installed?)");
-
-    assert!(
-        out.status.success(),
-        "jq failed on {fixture}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    serde_json::from_slice::<HookEvent>(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "deserialize HookEvent from {fixture}: {e}\njq output: {}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    })
+    let native = serde_json::from_str(&payload).expect("parse fixture");
+    let event = HookSource::Claude.adapt(native).expect("recognized Claude event");
+    assert_eq!(event.event, kj_event);
+    event
 }
 
 /// Run the Codex field-map filter over a fixture, return the parsed HookEvent.
 fn map_codex(fixture: &str, kj_event: &str) -> HookEvent {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let filter = manifest.join("../../contrib/adapters/codex-to-kaijutsu.jq");
     let fixture_path = manifest.join("tests/fixtures/codex").join(fixture);
-
-    let payload = std::fs::read(&fixture_path)
+    let payload = std::fs::read_to_string(&fixture_path)
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", fixture_path.display()));
-
-    let out = Command::new("jq")
-        .arg("--arg")
-        .arg("event")
-        .arg(kj_event)
-        .arg("-f")
-        .arg(&filter)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&payload)?;
-            child.wait_with_output()
-        })
-        .expect("spawn jq (is jq installed?)");
-
-    assert!(
-        out.status.success(),
-        "jq failed on {fixture}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    serde_json::from_slice::<HookEvent>(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "deserialize HookEvent from {fixture}: {e}\njq output: {}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    })
+    let native = serde_json::from_str(&payload).expect("parse fixture");
+    let event = HookSource::Codex.adapt(native).expect("recognized Codex event");
+    assert_eq!(event.event, kj_event);
+    event
 }
 
 #[test]
@@ -142,19 +74,17 @@ fn post_tool_use_carries_tool_response() {
 }
 
 #[test]
-fn adapter_script_emits_single_line_json() {
+fn claude_native_adapter_emits_single_line_json() {
     // The hook socket listener reads exactly ONE line per event. The filter
     // alone can't prove the script sends compact JSON, so run the real
     // adapter in dry-run mode and assert its stdout is a single parseable
-    // line. Guards the `jq -c` in claude.sh.
+    // line. Guards the native adapter's compact serialization.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = manifest.join("../../contrib/adapters/claude.sh");
     let fixture = manifest.join("tests/fixtures/claude/post_tool_use_response.json");
     let payload = std::fs::read(&fixture).expect("read fixture");
 
-    let out = Command::new("bash")
-        .arg(&script)
-        .env("KJ_HOOK_DRYRUN", "1")
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kaijutsu-mcp"))
+        .args(["hook", "claude", "--dry-run"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -164,11 +94,11 @@ fn adapter_script_emits_single_line_json() {
             child.stdin.take().unwrap().write_all(&payload)?;
             child.wait_with_output()
         })
-        .expect("run claude.sh");
+        .expect("run native Claude adapter");
 
     assert!(
         out.status.success(),
-        "claude.sh failed: {}",
+        "native Claude adapter failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
@@ -176,7 +106,7 @@ fn adapter_script_emits_single_line_json() {
     assert!(
         !trimmed.is_empty() && !trimmed.contains('\n'),
         "adapter output is not a single line (listener reads one line per \
-         event; claude.sh must use jq -c):\n{stdout}"
+         event):\n{stdout}"
     );
     let ev: HookEvent = serde_json::from_str(trimmed).expect("parse adapter output");
     assert_eq!(ev.event, "tool.after");
@@ -272,15 +202,13 @@ fn codex_lifecycle_fields_survive() {
 }
 
 #[test]
-fn codex_adapter_script_emits_single_line_json() {
+fn codex_native_adapter_emits_single_line_json() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = manifest.join("../../contrib/adapters/codex.sh");
     let fixture = manifest.join("tests/fixtures/codex/post_tool_use.json");
     let payload = std::fs::read(&fixture).expect("read fixture");
 
-    let out = Command::new("bash")
-        .arg(&script)
-        .env("KJ_HOOK_DRYRUN", "1")
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kaijutsu-mcp"))
+        .args(["hook", "codex", "--dry-run"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -290,11 +218,11 @@ fn codex_adapter_script_emits_single_line_json() {
             child.stdin.take().unwrap().write_all(&payload)?;
             child.wait_with_output()
         })
-        .expect("run codex.sh");
+        .expect("run native Codex adapter");
 
     assert!(
         out.status.success(),
-        "codex.sh failed: {}",
+        "native Codex adapter failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");

@@ -1345,6 +1345,18 @@ that inversion without being fixed.
 With the last reader gone the mirror was write-only — maintained for nobody —
 and 624 lines of replica machinery went with it.
 
+The same consolidation later reached the hook boundary. Claude Code and Codex
+hooks had entered through two Bash programs and two jq maps before reaching a
+Rust client that already owned compaction, socket discovery, session matching,
+transport, and deny handling. `kaijutsu-mcp hook claude|codex` absorbed both
+native protocols, including their response envelopes, and the wrappers
+disappeared. The identity distinction stayed explicit at that boundary:
+`session_id` is the hosting conversation/thread used to select and stabilize a
+listener, while `agent_id`/`subagent_id` is only the principal acting inside
+that session. Collapsing those two would route a subagent event to a different
+conversation; preserving them made the adapter deletion an ownership cleanup,
+not a protocol change.
+
 **What the day was really about was tests that cannot fail.** Every defect found
 passed careful reading and died on execution, and there were five. A cancellation
 leak the refactor itself created: `with_hook_budget` is `tokio::time::timeout`,

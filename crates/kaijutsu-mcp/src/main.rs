@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -85,11 +85,22 @@ struct ServeArgs {
 /// Hook client arguments.
 #[derive(Args, Debug)]
 struct HookArgs {
+    /// Native hook protocol. Omit for an already-normalized HookEvent.
+    #[arg(value_enum)]
+    source: Option<NativeHookSource>,
+
     /// Socket path to connect to.
     /// Default: $XDG_RUNTIME_DIR/kaijutsu/hook-{ppid}.sock
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Print the normalized HookEvent without contacting the listener.
+    #[arg(long)]
+    dry_run: bool,
 }
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum NativeHookSource { Claude, Codex }
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -318,13 +329,27 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Adapters may pipe pretty-printed JSON, but the socket listener reads
-    // exactly one line. Parse-and-recompact; never forward something that
-    // didn't parse as JSON.
-    let Some((compact, event_session_id)) = normalize_hook_input(input) else {
+    let native: serde_json::Value = match serde_json::from_str(input) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let native_event = native.get("hook_event_name").and_then(|v| v.as_str()).map(String::from);
+    let normalized = match args.source {
+        Some(NativeHookSource::Claude) => kaijutsu_mcp::hook_adapter::HookSource::Claude.adapt(native),
+        Some(NativeHookSource::Codex) => kaijutsu_mcp::hook_adapter::HookSource::Codex.adapt(native),
+        None => serde_json::from_value(native).ok(),
+    };
+    let Some(event) = normalized else {
         tracing::debug!("Hook stdin is not valid JSON, failing open");
         return Ok(());
     };
+    let event_session_id = event.session_id.clone();
+    let compact = serde_json::to_string(&event)?;
+
+    if args.dry_run {
+        print!("{compact}");
+        return Ok(());
+    }
 
     // Resolve which of the (possibly many stale) sockets in the runtime dir
     // is actually ours: ping every live candidate and match on session_id,
@@ -353,10 +378,17 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
                 if let Ok(parsed) =
                     serde_json::from_str::<kaijutsu_mcp::hook_types::HookResponse>(response)
                 {
-                    print!("{response}");
                     if parsed.is_deny() {
+                        eprintln!("{}", parsed.reason.as_deref().unwrap_or("blocked by kaijutsu"));
                         std::process::exit(2);
                     }
+                    if let (Some(source), Some(native_event)) = (args.source, native_event.as_deref()) {
+                        let source = match source {
+                            NativeHookSource::Claude => kaijutsu_mcp::hook_adapter::HookSource::Claude,
+                            NativeHookSource::Codex => kaijutsu_mcp::hook_adapter::HookSource::Codex,
+                        };
+                        if let Some(output) = source.response(native_event, &parsed) { print!("{output}"); }
+                    } else { print!("{response}"); }
                 } else {
                     print!("{response}");
                 }
@@ -378,6 +410,7 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
 /// Parse hook stdin as JSON and re-serialize compact (single line), also
 /// extracting `session_id` (if present) for socket resolution. `None` if
 /// `input` isn't valid JSON — the caller must never forward garbage.
+#[cfg(test)]
 fn normalize_hook_input(input: &str) -> Option<(String, Option<String>)> {
     let value: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = value

@@ -232,9 +232,9 @@ rides.
 3. **`PeerRegistry` resets on kernel restart**; `ActorHandle` already replays
    `peer_registration` on reconnect. Ride that replay or a session sits
    registered-and-invisible until its next hook fires.
-4. **A new hook field moves three files at once** — `HookEvent`
-   (`kaijutsu-mcp/src/hook_types.rs`), the jq map
-   (`contrib/adapters/claude-to-kaijutsu.jq`), and
+4. **A new hook field moves three places at once** — `HookEvent`
+   (`kaijutsu-mcp/src/hook_types.rs`), the native source map
+   (`kaijutsu-mcp/src/hook_adapter.rs`), and
    `kaijutsu-mcp/tests/adapter_mapping.rs`, which asserts no field is silently
    dropped. The per-hook budget is **5s** and expiry degrades permissive, so
    registration must be one-shot (`Mutex::take`), never per-event.

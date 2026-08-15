@@ -41,11 +41,15 @@ env_vars = ["CODEX_THREAD_ID", "XDG_RUNTIME_DIR"]
 socket; without it the MCP tool surface still works, but lifecycle events have
 no local transport.
 
-For lifecycle mirroring, install `contrib/adapters/codex.sh` together with
-`codex-to-kaijutsu.jq`, then merge the `hooks` object from
-`contrib/codex-hooks.json` into `~/.codex/hooks.json`. Set `KJ_MCP_BIN` in the
-hook command if `kaijutsu-mcp` is not on `PATH`. Codex requires project hook
+For lifecycle mirroring, merge the `hooks` object from
+`contrib/codex-hooks.json` into `~/.codex/hooks.json` and replace
+`/path/to/kaijutsu-mcp` with the installed binary. The native
+`kaijutsu-mcp hook codex` adapter reads Codex's hook JSON from stdin; no shell
+script or `jq` installation is needed. Codex requires project hook
 configurations to be trusted explicitly through `/hooks`.
+
+Claude Code uses the corresponding `kaijutsu-mcp hook claude` command shown
+in `contrib/claude-hooks.json`.
 
 ## Tools
 

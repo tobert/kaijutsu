@@ -1042,7 +1042,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 /// `/tmp` to avoid socket permission issues on shared systems.
 pub fn default_socket_path() -> Option<PathBuf> {
     let ppid = std::os::unix::process::parent_id();
-    let runtime_dir = dirs::runtime_dir()?;
+    let runtime_dir = hook_runtime_dir()?;
     Some(
         runtime_dir
             .join("kaijutsu")
@@ -1078,10 +1078,25 @@ fn list_hook_sockets_in(dir: &Path) -> Vec<PathBuf> {
 /// when an intermediate shell layer changes the PPID).
 /// Returns empty if `$XDG_RUNTIME_DIR` is not set.
 pub fn discover_sockets() -> Vec<PathBuf> {
-    let Some(runtime_dir) = dirs::runtime_dir() else {
+    let Some(runtime_dir) = hook_runtime_dir() else {
         return Vec::new();
     };
     list_hook_sockets_in(&runtime_dir.join("kaijutsu"))
+}
+
+/// Runtime directory for hook transport. Command-hook hosts sometimes pass a
+/// minimal environment, so on Linux recover the conventional user runtime
+/// directory without requiring a shell wrapper to export XDG_RUNTIME_DIR.
+fn hook_runtime_dir() -> Option<PathBuf> {
+    if let Some(path) = dirs::runtime_dir() { return Some(path); }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata("/proc/self").ok()?.uid();
+        let candidate = PathBuf::from(format!("/run/user/{uid}"));
+        if candidate.is_dir() { return Some(candidate); }
+    }
+    None
 }
 
 /// Merge candidate socket paths in priority order, de-duplicated (first
