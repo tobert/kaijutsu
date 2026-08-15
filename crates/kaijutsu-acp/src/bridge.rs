@@ -128,7 +128,6 @@ impl KernelBridge {
             .list_contexts()
             .await
             .context("list contexts")
-            .map_err(Into::into)
     }
 
     /// Resolve-or-create a context for a label, then join it.
@@ -238,7 +237,6 @@ impl KernelBridge {
             .interrupt_context(context_id, immediate)
             .await
             .context("interrupt context")
-            .map_err(Into::into)
     }
 
     /// Probe `base`, `base-2`, `base-3`, … for a label nothing holds.

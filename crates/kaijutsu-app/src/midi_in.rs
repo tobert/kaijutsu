@@ -606,7 +606,7 @@ fn capture_loop(
             _ => None,
         };
         if let Some(ce) = clock_event {
-            let est = clocks.entry(source.clone()).or_insert_with(ClockEstimator::new);
+            let est = clocks.entry(source.clone()).or_default();
             if let Some(estimate) = est.observe(ce) {
                 let msg = EarEvent::Clock {
                     source: source.clone(),

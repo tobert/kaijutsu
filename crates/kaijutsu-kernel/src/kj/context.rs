@@ -4211,7 +4211,7 @@ mod tests {
                 let arr = v.as_array().expect("data must be a JSON array");
                 let handles: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
                 assert!(
-                    handles.iter().any(|h| *h == "alpha"),
+                    handles.contains(&"alpha"),
                     "labeled context should appear by label: {handles:?}"
                 );
                 let full_hex = unlabeled.to_hex();

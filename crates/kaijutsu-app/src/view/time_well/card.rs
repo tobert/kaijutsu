@@ -977,7 +977,7 @@ mod tests {
             let (radius, depth) = rings[i];
             assert_eq!((radius, depth), band_ring(band), "ring {i} == band_ring({band:?})");
             assert!(
-                radius >= SPIRAL_R_THROAT - 1e-3 && radius <= SPIRAL_R_MOUTH + 1e-3,
+                (SPIRAL_R_THROAT - 1e-3..=SPIRAL_R_MOUTH + 1e-3).contains(&radius),
                 "ring {i} radius {radius} must sit within [{SPIRAL_R_THROAT}, {SPIRAL_R_MOUTH}]"
             );
         }

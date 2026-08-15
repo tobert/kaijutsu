@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn anchor_single_line_replace() {
         let content = "one\ntwo\nthree\n";
-        let plan = plan_anchor_edit(&content, &anchor_for(content, 2), "TWO").unwrap();
+        let plan = plan_anchor_edit(content, &anchor_for(content, 2), "TWO").unwrap();
         assert_eq!(plan.expected, "one\nTWO\nthree\n");
         assert_eq!(plan.replacements, 1);
     }
@@ -1579,28 +1579,28 @@ mod tests {
             let l = content.lines().nth(2).unwrap();
             format!("3:{}", line_hash(l))
         });
-        let plan = plan_anchor_edit(&content, &anchor, "X\nY").unwrap();
+        let plan = plan_anchor_edit(content, &anchor, "X\nY").unwrap();
         assert_eq!(plan.expected, "a\nX\nY\nd\n");
     }
 
     #[test]
     fn anchor_empty_new_deletes_the_line() {
         let content = "keep\ndrop\nkeep2\n";
-        let plan = plan_anchor_edit(&content, &anchor_for(content, 2), "").unwrap();
+        let plan = plan_anchor_edit(content, &anchor_for(content, 2), "").unwrap();
         assert_eq!(plan.expected, "keep\nkeep2\n");
     }
 
     #[test]
     fn anchor_last_line_without_trailing_newline() {
         let content = "a\nb\nc"; // no final newline
-        let plan = plan_anchor_edit(&content, &anchor_for(content, 3), "C").unwrap();
+        let plan = plan_anchor_edit(content, &anchor_for(content, 3), "C").unwrap();
         assert_eq!(plan.expected, "a\nb\nC");
     }
 
     #[test]
     fn anchor_multibyte_line_replace() {
         let content = "α\n改善\nz\n";
-        let plan = plan_anchor_edit(&content, &anchor_for(content, 2), "kaizen").unwrap();
+        let plan = plan_anchor_edit(content, &anchor_for(content, 2), "kaizen").unwrap();
         assert_eq!(plan.expected, "α\nkaizen\nz\n");
     }
 
@@ -1608,7 +1608,7 @@ mod tests {
     fn anchor_stale_hash_fails_loud() {
         let content = "one\ntwo\nthree\n";
         let stale = "2:dead";
-        let err = plan_anchor_edit(&content, stale, "X").unwrap_err();
+        let err = plan_anchor_edit(content, stale, "X").unwrap_err();
         assert!(err.contains("stale"), "got: {err}");
         assert!(err.contains(&line_hash("two")), "should show current hash: {err}");
     }
@@ -1616,14 +1616,14 @@ mod tests {
     #[test]
     fn anchor_crlf_preserves_line_endings() {
         let content = "a\r\nb\r\nc\r\n";
-        let plan = plan_anchor_edit(&content, &anchor_for(content, 2), "B").unwrap();
+        let plan = plan_anchor_edit(content, &anchor_for(content, 2), "B").unwrap();
         assert_eq!(plan.expected, "a\r\nB\r\nc\r\n");
     }
 
     #[test]
     fn anchor_crlf_delete_consumes_full_terminator() {
         let content = "a\r\nb\r\nc\r\n";
-        let plan = plan_anchor_edit(&content, &anchor_for(content, 2), "").unwrap();
+        let plan = plan_anchor_edit(content, &anchor_for(content, 2), "").unwrap();
         assert_eq!(plan.expected, "a\r\nc\r\n");
     }
 
@@ -1636,16 +1636,16 @@ mod tests {
     #[test]
     fn anchor_out_of_range_is_an_error() {
         let content = "a\nb\n";
-        let err = plan_anchor_edit(&content, "9:abcd", "x").unwrap_err();
+        let err = plan_anchor_edit(content, "9:abcd", "x").unwrap_err();
         assert!(err.contains("past end"), "got: {err}");
     }
 
     #[test]
     fn anchor_malformed_is_an_error() {
         let content = "a\nb\n";
-        assert!(plan_anchor_edit(&content, "nope", "x").is_err());
-        assert!(plan_anchor_edit(&content, "0:abcd", "x").is_err());
-        assert!(plan_anchor_edit(&content, "2:", "x").is_err());
+        assert!(plan_anchor_edit(content, "nope", "x").is_err());
+        assert!(plan_anchor_edit(content, "0:abcd", "x").is_err());
+        assert!(plan_anchor_edit(content, "2:", "x").is_err());
     }
 
     #[test]
@@ -1655,7 +1655,7 @@ mod tests {
             let l = content.lines().next().unwrap();
             format!("1:{}", line_hash(l))
         });
-        let err = plan_anchor_edit(&content, &anchor, "x").unwrap_err();
+        let err = plan_anchor_edit(content, &anchor, "x").unwrap_err();
         assert!(err.contains("after end"), "got: {err}");
     }
 

@@ -775,7 +775,7 @@ struct SubscriberSlot<T> {
 
 impl<T: Clone> SubscriberSlot<T> {
     fn matches(&self, topic: &str) -> bool {
-        self.topics.iter().any(|t| *t == topic)
+        self.topics.contains(&topic)
     }
 
     /// Enqueue one message. Returns true if it was accepted (a drop-oldest

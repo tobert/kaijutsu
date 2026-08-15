@@ -583,7 +583,7 @@ pub fn detect_rich_content_typed(
                 .value
                 .into_iter()
                 .next()
-                .unwrap_or_else(kaijutsu_abc::Tune::default);
+                .unwrap_or_default();
             return Some(RichContent {
                 kind: RichContentKind::Abc {
                     source: Arc::new(text.to_string()),

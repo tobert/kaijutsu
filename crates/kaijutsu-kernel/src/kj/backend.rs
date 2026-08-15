@@ -530,7 +530,7 @@ impl KjDispatcher {
         // A NULL knob prints as "(provider default)", not as a number we made
         // up: "unset" is a real answer here.
         let opt = |v: Option<String>| v.unwrap_or_else(|| "(provider default)".to_string());
-        let lines = vec![
+        let lines = [
             format!("Default backend: {}", d.default_backend),
             format!("Default model: {}", d.default_model),
             format!("max_tokens: {}", opt(d.max_tokens.map(|v| v.to_string()))),

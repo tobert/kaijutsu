@@ -3094,7 +3094,7 @@ impl BlockStore {
             entry
                 .doc
                 .get_block_snapshot(block_id)
-                .ok_or_else(|| BlockStoreError::BlockNotFoundAfterInsert)?
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?
         };
 
         let new_errors = match snap.content_type {
@@ -3335,7 +3335,7 @@ impl BlockStore {
 /// (`kaijutsu-server`, which re-exports this fn) both call the same logic —
 /// there is exactly one place this derivation is written.
 pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
-    if statuses_in_order.iter().any(|s| *s == Status::Running) {
+    if statuses_in_order.contains(&Status::Running) {
         Status::Running
     } else if statuses_in_order.last() == Some(&Status::Error) {
         Status::Error

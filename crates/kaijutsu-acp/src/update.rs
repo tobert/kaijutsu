@@ -78,7 +78,7 @@ pub fn acp_tool_kind(kind: Option<KjToolKind>, name: Option<&str>) -> AcpToolKin
         // Match on the last path-ish segment so `builtin.file.read`,
         // `kaijutsu:read` and `read` all land the same way.
         let leaf = name
-            .rsplit(|c| c == '.' || c == ':' || c == '/' || c == '_')
+            .rsplit(['.', ':', '/', '_'])
             .next()
             .unwrap_or(name)
             .to_ascii_lowercase();

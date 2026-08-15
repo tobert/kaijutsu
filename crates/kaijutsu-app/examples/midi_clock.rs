@@ -104,7 +104,7 @@ fn main() -> Result<(), String> {
         }
         send(EventType::Clock)?;
         pulse += 1;
-        if pulse % (24 * 16) == 0 {
+        if pulse.is_multiple_of(24 * 16) {
             println!("beat {} at {current_bpm:.2} BPM", pulse / 24);
         }
     }

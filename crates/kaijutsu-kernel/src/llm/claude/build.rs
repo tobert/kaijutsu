@@ -678,7 +678,7 @@ mod tests {
             Some(CacheControl::extended()),
             "Extended TTL must produce the 1h-flavored cache_control"
         );
-        let cc = serde_json::to_value(&req.tools[0].cache_control).unwrap();
+        let cc = serde_json::to_value(req.tools[0].cache_control).unwrap();
         assert_eq!(cc["ttl"], "1h");
     }
 
