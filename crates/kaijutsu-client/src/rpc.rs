@@ -1176,6 +1176,37 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Subscribe to one context's change feed (docs/change-feed.md).
+    ///
+    /// Subscribe **before** fetching a snapshot with
+    /// [`Self::get_blocks_versioned`], buffer what arrives meanwhile, and let
+    /// [`ContextMirror`](crate::ContextMirror) sort out the overlap — fetching
+    /// first loses whatever lands in the gap.
+    ///
+    /// The feed ends when the observer capability is dropped; there is no
+    /// unsubscribe call.
+    #[tracing::instrument(skip(self, observer), name = "rpc_client.subscribe_context")]
+    pub async fn subscribe_context(
+        &self,
+        context_id: ContextId,
+        observer: crate::kaijutsu_capnp::context_observer::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_context_request();
+        {
+            let mut params = request.get();
+            params.set_context_id(context_id.as_bytes());
+            params.set_observer(observer);
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
     /// Subscribe to block events with server-side filtering.
     ///
     /// `instance` is the client's stable per-session UUID. The server uses

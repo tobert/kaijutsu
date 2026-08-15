@@ -41,7 +41,7 @@ interface ContextObserver {
 
 struct ContextEvent {
   union {
-    blockInserted     @0 :BlockSnapshot;
+    blockInserted     @0 :BlockInsert;   # snapshot + afterId
     blockDeleted      @1 :BlockId;
     blockMoved        @2 :BlockMove;
     textAppended      @3 :TextAppend;    # blockId + suffix only
@@ -216,6 +216,16 @@ Flag day. Every client is in-repo and rebuilt together.
   task-plan rendering needs blocks in DAG order, which the CRDT maintained for
   free. ACP must maintain that ordering itself from `blockInserted` /
   `blockMoved` / `blockDeleted`.
+
+  **Corrected while implementing (2026-08-15).** The sketch above originally
+  had `blockInserted` carry a bare `BlockSnapshot`, which cannot support that:
+  the wire `BlockSnapshot` has **no ordering key** — no `orderKey`, no `tick`
+  that ordinarily applies — so a client receiving one learns that a block
+  exists and not where it goes. `getBlocks` hides this because the kernel
+  returns blocks already ordered. Hence `BlockInsert { block, afterId,
+  hasAfterId }`, mirroring `BlockMove` and the old `onBlockInserted`. The
+  alternative — putting `orderKey` on `BlockSnapshot` so any snapshot sorts
+  itself — is the tidier answer and a wider change; it stays open.
 - **The Bevy app cannot ingest plain text into its CRDT mirror.** `DocumentCache`
   wraps a `SyncedDocument`; appending a raw `String` to a CRDT is not a supported
   operation. That cache is rewritten, not toggled.

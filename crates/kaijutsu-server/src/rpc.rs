@@ -3116,6 +3116,51 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    /// Subscribe to one context's change feed (docs/change-feed.md).
+    ///
+    /// The replacement for `subscribe_blocks`, which forwards thirteen methods
+    /// and two flavors of raw CRDT operations. Here the client receives
+    /// classified domain facts in ordered batches with the version they bring
+    /// it to, and never links the text engine.
+    fn subscribe_context(
+        self: Rc<Self>,
+        params: kernel::SubscribeContextParams,
+        _results: kernel::SubscribeContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "subscribe_context").entered();
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let observer = pry!(p.get_observer());
+
+        let block_flows = self.kernel.kernel.block_flows().clone();
+        let kernel_id = self.kernel.id;
+        let (conn_cancel, disconnect) = {
+            let conn = self.connection.borrow();
+            (conn.cancel_token(), conn.disconnect_token())
+        };
+
+        // Cap'n Proto callbacks are not Send, so spawn_local.
+        tokio::task::spawn_local(async move {
+            // `block.*` is a superset: the feed's own filter decides what it
+            // carries, and filtering by pattern here would silently drop an
+            // event kind the feed later learns to carry.
+            let sub = block_flows.subscribe("block.*");
+            crate::context_feed::run_context_feed(
+                observer,
+                context_id,
+                sub,
+                kernel_id,
+                conn_cancel,
+                disconnect,
+            )
+            .await;
+        });
+        Promise::ok(())
+    }
+
     // ── In-app editor sessions (the vi/edit builtin; see docs/vi.md) ────────
     // Thin wire wrappers over the kernel's `editor_*` primitives. Session ids
     // are global; the path resolves the owning CRDT block. Edits mirror onto
@@ -7719,7 +7764,7 @@ fn build_output_node(
     }
 }
 
-fn build_output_data(
+pub(crate) fn build_output_data(
     mut builder: crate::kaijutsu_capnp::output_data::Builder<'_>,
     data: &kaijutsu_types::OutputData,
 ) {
@@ -7905,7 +7950,7 @@ mod build_output_data_tests {
 }
 
 /// Fill a Cap'n Proto `BlockMetadata` builder from the typed metadata.
-fn build_block_metadata(
+pub(crate) fn build_block_metadata(
     mut builder: crate::kaijutsu_capnp::block_metadata::Builder<'_>,
     meta: &kaijutsu_types::BlockMetadata,
 ) {
@@ -8784,7 +8829,7 @@ fn parse_block_id_from_reader(
 }
 
 /// Set BlockId fields on a Cap'n Proto builder (binary format).
-fn set_block_id_builder(
+pub(crate) fn set_block_id_builder(
     builder: &mut crate::kaijutsu_capnp::block_id::Builder,
     block_id: &kaijutsu_crdt::BlockId,
 ) {
@@ -8818,7 +8863,7 @@ fn turn_origin_to_capnp(origin: TurnOrigin) -> crate::kaijutsu_capnp::TurnOrigin
 }
 
 /// Set BlockSnapshot fields on a Cap'n Proto builder.
-fn set_block_snapshot(
+pub(crate) fn set_block_snapshot(
     builder: &mut crate::kaijutsu_capnp::block_snapshot::Builder,
     block: &kaijutsu_crdt::BlockSnapshot,
 ) {
@@ -8847,12 +8892,7 @@ fn set_block_snapshot(
     });
 
     // Set status
-    builder.set_status(match block.status {
-        kaijutsu_crdt::Status::Pending => crate::kaijutsu_capnp::Status::Pending,
-        kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,
-        kaijutsu_crdt::Status::Done => crate::kaijutsu_capnp::Status::Done,
-        kaijutsu_crdt::Status::Error => crate::kaijutsu_capnp::Status::Error,
-    });
+    builder.set_status(status_to_capnp(block.status));
 
     // Set kind
     builder.set_kind(match block.kind {
@@ -10291,7 +10331,10 @@ const VFS_ACTIVITY_DEFAULT_INTERVAL_MS: u32 = 1000;
 const VFS_ACTIVITY_DIGEST_MAX_ENTRIES: usize = 256;
 
 /// Convert a CRDT Status to Cap'n Proto Status.
-fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
+///
+/// Shared with the change feed's `statusChanged` arm, so the two cannot drift:
+/// one exhaustive mapping, and a new status is a compile error in both places.
+pub(crate) fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
     match status {
         kaijutsu_crdt::Status::Pending => crate::kaijutsu_capnp::Status::Pending,
         kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,

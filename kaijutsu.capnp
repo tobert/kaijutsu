@@ -564,6 +564,125 @@ enum SubscriptionEndReason {
   superseded @2;
 }
 
+# ============================================================================
+# The context change feed (docs/change-feed.md)
+# ============================================================================
+#
+# One ordered feed per context, replacing the thirteen separate `BlockEvents`
+# methods and — the point of the exercise — the serialized diamond-types
+# operations they carried. A client applies domain facts here; it never decodes
+# a storage engine's encoding of them, and therefore never links the CRDT.
+#
+# `BlockEvents` still exists while the clients migrate. It goes away with them,
+# in a flag day; see the "Deleted by this change" table in the design.
+
+# Text added at the END of a block's text. The kernel decided this was an
+# append while it held the mutation lock — coordinates only, never the name of
+# the tool or function that made the edit — so the client's whole job is to
+# append `suffix` to what it already holds.
+struct TextAppend {
+  blockId @0 :BlockId;
+  suffix @1 :Text;
+}
+
+# A block's text changed in a way that was not an append. Carries the whole
+# after-text: an insert in the middle, a delete, and a splice are all this.
+# NEVER compare character counts to decide whether anything changed — a replace
+# can keep the count, and ACP rendered corrupted text by making exactly that
+# assumption.
+struct TextReplace {
+  blockId @0 :BlockId;
+  content @1 :Text;
+}
+
+# A block was authored, with the position it landed at.
+#
+# The position is not redundant with the snapshot: the wire `BlockSnapshot`
+# carries no ordering key, so a client that received only the snapshot would
+# know the block exists and not where it goes. That is precisely what ACP used
+# the CRDT for — document order, not text — and it has to come from somewhere
+# once the CRDT is gone. `hasAfterId` false means "at the beginning".
+struct BlockInsert {
+  block @0 :BlockSnapshot;
+  afterId @1 :BlockId;
+  hasAfterId @2 :Bool;
+}
+
+# A block moved. `hasAfterId` false means "to the beginning".
+struct BlockMove {
+  blockId @0 :BlockId;
+  afterId @1 :BlockId;
+  hasAfterId @2 :Bool;
+}
+
+struct BlockStatusChange {
+  blockId @0 :BlockId;
+  status @1 :Status;
+}
+
+# One boolean flag flipped. Which flag is carried by the `ContextEvent` union
+# arm (`collapsedChanged` / `excludedChanged`), not by a field here, so an
+# unhandled arm is a compile error rather than a silently ignored flag name.
+struct BlockFlagChange {
+  blockId @0 :BlockId;
+  value @1 :Bool;
+}
+
+struct BlockMetadataChange {
+  blockId @0 :BlockId;
+  metadata @1 :BlockMetadata;
+}
+
+struct BlockOutputChange {
+  blockId @0 :BlockId;
+  output @1 :OutputData;
+}
+
+# One accepted change to a context. Deliberately a union of domain facts:
+# blocks authored, edited, completed, excluded — Kaijutsu's vocabulary, not a
+# text engine's.
+struct ContextEvent {
+  union {
+    blockInserted     @0 :BlockInsert;
+    blockDeleted      @1 :BlockId;
+    blockMoved        @2 :BlockMove;
+    textAppended      @3 :TextAppend;
+    textReplaced      @4 :TextReplace;
+    statusChanged     @5 :BlockStatusChange;
+    collapsedChanged  @6 :BlockFlagChange;
+    excludedChanged   @7 :BlockFlagChange;
+    metadataChanged   @8 :BlockMetadataChange;
+    outputChanged     @9 :BlockOutputChange;
+  }
+}
+
+# The client's end of the feed.
+interface ContextObserver {
+  # One delivery carries an ordered batch of changes and the version they
+  # bring the client to: applying `events` in order makes the client's state
+  # exactly the context at `version`.
+  #
+  # Batching is native here — it is not the special case `onBlockTextOpsBatch`
+  # had to be — so a burst of streamed tokens is one call, and a tool's final
+  # output text and its `Done` status arrive together instead of racing.
+  #
+  # Order is the contract. Events are in kernel-accepted order across ALL
+  # blocks in the delivery; an event for one block is never moved ahead of an
+  # earlier event for another. A delivery is a window, never a reordering.
+  #
+  # Timing artifacts (render cues, beat sync) do NOT ride this feed. Batching
+  # trades latency for fewer messages and docs/midi.md forbids that trade for
+  # anything on the musical timebase.
+  onContextChanged @0 (contextId :Data, events :List(ContextEvent),
+                       version :UInt64);
+
+  # This feed is over and was not resumable — the subscriber could not keep up,
+  # or the server is going away. `deliveredVersion` is the last version this
+  # observer was actually brought to. Do not patch forward from it: re-subscribe
+  # and fetch a fresh snapshot with `getBlocks` (which returns its own version).
+  onTerminated @1 (reason :SubscriptionEndReason, deliveredVersion :UInt64);
+}
+
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).
 # Carries everything a renderer draws; see docs/vi.md.
@@ -1515,6 +1634,21 @@ interface Kernel {
   # Like subscribeBlocks but the server applies the filter before sending,
   # reducing bandwidth and client CPU during high-throughput streaming.
   subscribeBlocksFiltered @40 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
+
+  # Subscribe to ONE context's change feed (docs/change-feed.md). The
+  # replacement for the two methods above, and for the raw-operation events
+  # they carry; they remain only until the in-repo clients migrate.
+  #
+  # Ordering with the snapshot matters and is the client's job: subscribe
+  # FIRST, buffer what arrives, then `getBlocks` and read the version it
+  # returns, discard every buffered delivery at or below that version, and
+  # apply the rest in order. Fetching first loses an event that lands in the
+  # gap; applying first corrupts the text; the version resolves the overlap.
+  #
+  # One subscription is one context, because the version is one context's
+  # counter. Watching several means several subscriptions. The feed ends when
+  # the observer capability is dropped — there is no unsubscribe call.
+  subscribeContext @113 (contextId :Data, observer :ContextObserver, trace :TraceContext);
 
   # ==========================================================================
   # Blocks: mutation & curation

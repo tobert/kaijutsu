@@ -1643,6 +1643,22 @@ impl BlockSnapshot {
         }
     }
 
+    /// Apply the scalar metadata carried by a `MetadataChanged` event.
+    ///
+    /// The exact inverse of [`Self::metadata`], and deliberately written beside
+    /// it: a client following the change feed has to fold this event into the
+    /// block it holds, and every client doing that field-by-field is one more
+    /// place to forget a field the extractor already knows about.
+    pub fn apply_metadata(&mut self, metadata: &BlockMetadata) {
+        self.exit_code = metadata.exit_code;
+        self.is_error = metadata.is_error;
+        self.content_type = metadata.content_type;
+        self.ephemeral = metadata.ephemeral;
+        self.tool_use_id = metadata.tool_use_id.clone();
+        self.stderr = metadata.stderr.clone();
+        self.task_status = metadata.task_status;
+    }
+
     /// Create a new text block snapshot.
     pub fn text(
         id: BlockId,
