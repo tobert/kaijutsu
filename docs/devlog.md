@@ -1393,3 +1393,104 @@ path* rather than a missing one. A report describes what was visible from where
 you stood; a probe finds the shape.
 
 An untested mechanism is a claim, however carefully its prose is worded.
+
+## The instrument could not say who was in the room (August 15)
+
+The day's first task was a function that was correct, tested, and called from
+nowhere. `roster_sources::spawn_periodic_refresh` had shipped with the live
+roster the evening before — unit-tested against `refresh_once`, and never
+wired into the server's boot, because the branch that built it could not start
+a live kernel and declined to add an unverified call. That is a shape unit
+tests structurally cannot catch: the function is right, its caller is absent,
+and every test of the function still passes.
+
+So the test that fixes it reads no roster surface at all. Both read paths
+self-heal the boot rule inline, which means a test that touched one would have
+passed with the spawn deleted — the only honest assertion is the one that
+refuses to look. Proof it ticks came from the live kernel rather than the
+suite: sampling `/run/roster/index` at twelve-second intervals returned
+`recorded_at` values exactly ten thousand milliseconds apart. The samples land
+on the loop's own grid instead of on the read times, which is the difference
+between scheduled-periodic and read-triggered, and no unit test can show it.
+
+Then a `cat` of that index returned exit code 3, and the thread it pulled ran
+all day.
+
+kaish caps captured output by replacing it with a preview and remapping the
+exit code — deliberately, so an embedder can tell. The remap is right. Its
+*audience* was wrong: it also reaches the running script's `$?`, so inside a
+kaish program a command that succeeded and merely printed a lot reads as
+failed, and `set -e` and `cmd || fallback` both take the error branch. Our MCP
+tool already unwrapped it correctly; rc bodies and hook bodies did not — and
+the approval gate's classifier escalator is designed to be an rc script that
+branches on a captured response. It would have escalated on a *good* long
+answer.
+
+The fix was to stop asking "how much do we trust this caller" and start asking
+**who consumes this output**. Model-facing shells keep the cap, because bounded
+output is the point there. rc bodies, hook bodies, and the editor's `:r !cmd`
+splice — which pastes command output into a document, where a head-and-tail
+preview is not truncation but forgery — get a runaway backstop instead. The
+test pins both halves, including kaish's current wrong behaviour, so that when
+upstream fixes it the test fails and says the workaround can go.
+
+The same investigation falsified our own filed report in both directions. We
+had recorded that truncation set no failure code (it does) and that command
+substitution silently truncated at 8 KB (108896 bytes now round-trip intact).
+The correction deliberately does not conclude the original was imagined —
+someone watched that happen, and a negative probe is a claim about the probe.
+
+The roster's size turned out not to be a leak but a shape: its `recent` source
+is one row per non-archived context, so it rendered 199 rows to report three
+live entities, over the model-facing output cap, which is how a model asking
+who was around got a truncated splice of mostly-dead rows. Filtering it to
+"who is around" — hiding only what we positively know is dead, because
+`live == None` means *unknown* and a status-only entity has exactly that shape
+— dropped it to four rows. And the filter immediately exposed a bug the 195
+idle rows had been burying: the CLI rendered the same principal twice, because
+presence rows are per-connection and the VFS had always grouped by entity while
+the CLI never did. Two surfaces disagreeing about the same data is how "the
+roster is flaky" starts.
+
+**The part worth keeping is what the machine could not do.** Clearing 194
+stale contexts needed a safety filter, and roster liveness looked like exactly
+the right one. It is not: `recent` means "appended a block in fifteen minutes",
+not "someone is attached". It reported four live contexts while twenty-four had
+been active that day and a Codex lane sat mid-review, connected and thinking.
+Archiving on roster-idle would have soft-deleted attached sessions' contexts.
+Nothing in the instrument said so. Amy did — *"there should be moltar app, this
+claude code, maybe subagents, and a codex session working on acp"* — and
+checking that against the process table found every one of them. The rule that
+came out is dull and the way it arrived is not: **use last-activity age, and
+treat "attached" as a question the roster currently cannot answer.**
+
+Replacing ROOT then made the same point structurally. ROOT is special by
+convention — a label plus a promotion — while every generic mechanism treats it
+as an ordinary context. The three-hour sweep would have taken it at 29 days
+idle. Label uniqueness locked its own name against reuse, reporting the label
+both "already in use" and "not found". And archive cascades to structural
+children, so parenting the new root under the old one for honest lineage and
+then archiving the old one destroyed the new one — the confirm prompt had said
+`1 children`, which is inventory where it needed to be consequence. None of
+those are bugs in those mechanisms. Each is correct for an ordinary context.
+
+Amy settled the shape: *"I had thought to make it a dag but the data is
+naturally a forest and drifts create cycles if you count them."* The code
+already agreed — `insert_edge` cycle-checks `Structural` edges only, leaving
+drift exempt by construction. Checking that invariant was actually enforced
+turned up a real bug: `kj context move` deletes the old parent edge before
+inserting the new one, with no transaction and with cycle detection inside the
+insert, so a *refused* move orphans the context it refused to move. Which is
+also, wryly, the only way to make a detached context from `kj` today.
+
+Anchors are the answer, and their justification is not tidiness but fork cost:
+an anchor is what you fork from, and forks copy history, so every block that
+lands in one is paid for again by every descendant forever. The old ROOT
+carried ninety.
+
+Two lessons, and they are the same lesson from opposite ends. A mechanism can
+be correct in isolation and wrong in place — a function with no caller, a
+signal aimed at the wrong audience, a specialness that lives only in a label.
+And the loop is not decoration: the fact that prevented the day's one
+irreversible mistake was held by the human, because the instrument had no way
+to represent it.
