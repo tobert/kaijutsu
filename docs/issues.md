@@ -4414,12 +4414,16 @@ the *remaining* findings, triaged.
   `b103f8b1`). Underneath it, `cargo clippy -p kaijutsu-app --all-targets`
   reports **51 warnings (31 duplicates)**, ~20 real: `field_reassign_with_default`
   in `view/time_well/scene.rs` tests, items-after-test-module, and 4 with
-  machine-applicable fixes. Not urgent and *not* a `--fix` sweep candidate
-  while three lanes are in flight. The real question is whether we want a
-  workspace `[lints.clippy]` floor at all — that's a standard we'd be adopting,
-  so it wants a decision, not a drive-by. Note `rustfmt` is disabled repo-wide
+  machine-applicable fixes. **Amy 2026-08-14: a subagent cleans this up on the
+  morning of 08-15.** Two things for whoever briefs it. (1) Do it *after* the
+  in-flight lanes merge — a `--fix` sweep across three branches is how you get
+  a bad merge, and the warnings are not going anywhere. (2) **A cleanup without
+  a floor rots**: 20 warnings come back the same way they arrived. Land a
+  workspace `[lints.clippy]` floor with the sweep, or the next lane re-files
+  this entry. Which lints belong in that floor is still Amy's call — the
+  cleanup is decided, the standard is not. Note `rustfmt` is disabled repo-wide
   on purpose (README "Code Style"); clippy is a separate question and the
-  rustfmt rationale does not automatically carry over.
+  rustfmt rationale does not carry over.
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
 - **`vfs::backends::local::tests::test_normal_paths_succeed` is flaky under
