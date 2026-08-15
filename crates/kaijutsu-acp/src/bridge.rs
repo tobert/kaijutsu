@@ -9,11 +9,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use kaijutsu_client::{
-    ActorHandle, ContextInfo, PeerConfig, PeerInvocation, SshConfig, SyncedDocument, connect_ssh,
-    spawn_actor,
+    ActorHandle, ContextInfo, ContextMirror, FeedEvent, PeerConfig, PeerInvocation, SshConfig,
+    connect_ssh, spawn_actor,
 };
 use kaijutsu_client::rpc::{KjCommandInfo, KjExecutionResult};
-use kaijutsu_crdt::{BlockId, ContextId, PrincipalId};
+use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_types::BlockQuery;
+use tokio::sync::mpsc;
 
 /// Per-process subscription identity.
 ///
@@ -54,7 +56,6 @@ pub fn peer_nick_for_client(name: &str) -> String {
 #[derive(Clone)]
 pub struct KernelBridge {
     actor: ActorHandle,
-    principal: PrincipalId,
     context_type: String,
 }
 
@@ -133,7 +134,6 @@ impl KernelBridge {
 
         Ok(Self {
             actor,
-            principal: PrincipalId::new(),
             context_type,
         })
     }
@@ -299,11 +299,60 @@ impl KernelBridge {
         Ok(info)
     }
 
-    /// Build a CRDT mirror of a context's blocks.
-    pub async fn synced(&self, context_id: ContextId) -> Result<SyncedDocument> {
-        let state = self.actor.get_context_sync(context_id).await?;
-        SyncedDocument::from_sync_state(&state, self.principal)
-            .with_context(|| format!("build synced document for {}", context_id.short()))
+    /// Subscribe to a context's change feed and hydrate a fresh
+    /// [`ContextMirror`] over it: subscribe first, then fetch a snapshot with
+    /// `getBlocks`, then apply it. Keep both halves the caller gets back:
+    /// apply later deliveries straight to the mirror, and redo this whole
+    /// dance on `FeedEvent::Resubscribed` (via [`Self::rehydrate_context`] —
+    /// no new subscription needed, the actor already re-subscribed) or
+    /// `FeedEvent::Terminated` (call this method again — the old receiver is
+    /// dead, nothing published on it during the outage is recoverable).
+    pub async fn hydrate_context(
+        &self,
+        context_id: ContextId,
+    ) -> Result<(ContextMirror, mpsc::Receiver<FeedEvent>)> {
+        let rx = self
+            .actor
+            .subscribe_context(context_id)
+            .await
+            .with_context(|| format!("subscribe to context feed for {}", context_id.short()))?;
+        let mirror = self.hydrate_mirror(context_id).await?;
+        Ok((mirror, rx))
+    }
+
+    /// Rebuild a fresh mirror after `FeedEvent::Resubscribed`. The actor has
+    /// already re-subscribed by the time that event arrives — there is no new
+    /// receiver to hand back, only a fresh mirror to fetch and hydrate; the
+    /// caller keeps reading the same `feed_rx` it already has.
+    pub async fn rehydrate_context(&self, context_id: ContextId) -> Result<ContextMirror> {
+        self.hydrate_mirror(context_id).await
+    }
+
+    /// Fetch a snapshot and hydrate a fresh mirror with it. Plain sequential
+    /// order — subscribe (by the caller, before this runs), fetch, apply —
+    /// and deliberately does NOT touch the feed receiver.
+    ///
+    /// That used to require racing `getBlocks` against the receiver in a
+    /// `select!`, to dodge a spurious `VersionWentBackwards` on a delivery
+    /// that landed mid-fetch and turned out to already be in the snapshot.
+    /// `ContextMirror::receive` no longer errors on that case — a delivery at
+    /// or below the snapshot version is now silently discarded, since the
+    /// snapshot was read AT that version and provably already contains it
+    /// (see `receive`'s doc comment in `kaijutsu-client`). So whatever piles
+    /// up on the receiver while this fetch is in flight — including a
+    /// straggler already covered by the snapshot — sorts itself out
+    /// correctly the first time the caller reads it, with no race needed.
+    async fn hydrate_mirror(&self, context_id: ContextId) -> Result<ContextMirror> {
+        let mut mirror = ContextMirror::new(context_id);
+        let (blocks, version) = self
+            .actor
+            .get_blocks_versioned(context_id, BlockQuery::All)
+            .await
+            .with_context(|| format!("get_blocks_versioned for {}", context_id.short()))?;
+        mirror
+            .apply_snapshot(blocks, version)
+            .with_context(|| format!("apply initial snapshot for {}", context_id.short()))?;
+        Ok(mirror)
     }
 
     /// Write `text` into the context's input doc and submit it as a chat turn.

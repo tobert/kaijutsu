@@ -1,7 +1,11 @@
 # The context change feed
 
-Status: **accepted design, not yet built** (Amy, 2026-08-15 — *"yes change feed,
-it's been creeping around my thoughts and is the right move"*).
+Status: **built and in use** (Amy, 2026-08-15 — *"yes change feed, it's been
+creeping around my thoughts and is the right move"*). The kernel classifies, the
+`ContextObserver` feed ships, `kaijutsu-client` carries the shared applier
+(`ContextMirror`), and ACP consumes it. The old `BlockEvents` block surface still
+exists alongside it until the flag day; see "Deleted by this change" for exactly
+what that removes and what it deliberately does not.
 
 Authority: `docs/crdt-position-2026-08.md` (one authoritative kernel sequencer,
 no client dependency on DTE). This document specifies the wire surface that

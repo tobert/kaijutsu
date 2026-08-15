@@ -6,15 +6,16 @@
 //! session should instead *follow* a context through fork rolls is still open
 //! — see docs/acp.md, "Open questions".
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{SessionId, SessionNotification, StopReason};
+use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate, StopReason};
 use agent_client_protocol::{Client, ConnectionTo};
-use kaijutsu_client::{ConnectionStatus, ServerEvent, SyncedDocument, TurnOrigin};
+use kaijutsu_client::{ContextChange, ContextDelivery, ContextMirror, FeedEvent, ServerEvent, TurnOrigin};
 use kaijutsu_client::rpc::KjCommandInfo;
 use kaijutsu_crdt::{BlockId, ContextId};
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use crate::bridge::KernelBridge;
 use crate::update::{UpdateMapper, acp_stop_reason};
@@ -110,38 +111,6 @@ impl SessionRegistry {
     }
 }
 
-/// The block id an event is about, if any.
-fn event_block(event: &ServerEvent) -> Option<BlockId> {
-    match event {
-        ServerEvent::BlockInserted { block, .. } => Some(block.id),
-        ServerEvent::BlockTextOps { block_id, .. }
-        | ServerEvent::BlockStatusChanged { block_id, .. }
-        | ServerEvent::BlockOutputChanged { block_id, .. }
-        | ServerEvent::BlockMetadataChanged { block_id, .. }
-        | ServerEvent::BlockCollapsedChanged { block_id, .. }
-        | ServerEvent::BlockExcludedChanged { block_id, .. }
-        | ServerEvent::BlockMoved { block_id, .. } => Some(*block_id),
-        _ => None,
-    }
-}
-
-/// The context id an event names, if any.
-fn event_context(event: &ServerEvent) -> Option<ContextId> {
-    match event {
-        ServerEvent::BlockInserted { context_id, .. }
-        | ServerEvent::BlockTextOps { context_id, .. }
-        | ServerEvent::BlockStatusChanged { context_id, .. }
-        | ServerEvent::BlockOutputChanged { context_id, .. }
-        | ServerEvent::BlockMetadataChanged { context_id, .. }
-        | ServerEvent::BlockDeleted { context_id, .. }
-        | ServerEvent::BlockCollapsedChanged { context_id, .. }
-        | ServerEvent::BlockExcludedChanged { context_id, .. }
-        | ServerEvent::BlockMoved { context_id, .. }
-        | ServerEvent::SyncReset { context_id, .. } => Some(*context_id),
-        _ => None,
-    }
-}
-
 /// Stream one context's blocks to an ACP client as `session/update`
 /// notifications, forever.
 ///
@@ -153,7 +122,8 @@ pub async fn run_pump(
     session: Arc<Session>,
     session_id: SessionId,
     cx: ConnectionTo<Client>,
-    mut doc: SyncedDocument,
+    mut mirror: ContextMirror,
+    mut feed_rx: mpsc::Receiver<FeedEvent>,
     replay_history: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     let context_id = session.context_id;
@@ -166,20 +136,15 @@ pub async fn run_pump(
         return Ok(());
     }
 
-    // Subscribe before the first read so nothing that lands during setup is
-    // lost between the snapshot and the stream.
-    let mut events = bridge.actor().subscribe_events();
-    let mut status = bridge.actor().subscribe_status();
-
     // `session/load` wants the conversation replayed as updates so the client
     // can render history. `session/new` does not — a brand-new context has
     // nothing to say, and an rc-seeded one should not narrate its own
     // bootstrap.
     {
         let mut mapper = session.mapper.lock();
-        let blocks = doc.blocks();
+        let blocks = mirror.blocks();
         if replay_history {
-            for block in &blocks {
+            for block in blocks {
                 for update in mapper.observe(block) {
                     let _ = cx.send_notification(SessionNotification::new(
                         session_id.clone(),
@@ -190,34 +155,29 @@ pub async fn run_pump(
             // One plan, once, after the transcript — not per Task block
             // touched during replay. `build_plan` is idempotent (diffs
             // against `last_plan`, `None` on first call), so this is exactly
-            // the same rebuild-and-emit path the live pump and resync use,
-            // just called once at the end instead of per event.
-            if let Some(update) = mapper.build_plan(&blocks) {
+            // the same rebuild-and-emit path the live pump and a rehydrate
+            // catch-up use, just called once at the end instead of per event.
+            if let Some(update) = mapper.build_plan(blocks) {
                 let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
             }
         } else {
-            for block in &blocks {
+            for block in blocks {
                 mapper.mark_seen(block);
             }
             // Silent baseline — an rc-seeded Task block should not be
             // narrated at a client that just opened `session/new`, same
             // reasoning as `mark_seen` for every other kind.
-            mapper.baseline_plan(&blocks);
+            mapper.baseline_plan(blocks);
         }
     }
 
-    // Trailing-edge catch-up: the kernel's FlowBus drops events server-side
-    // under load (upstream of SSH — no client `Lagged` ever fires), so a
-    // gap in OUR context's stream is invisible to the arms below. After any
-    // burst of activity touching this context, one sweep re-observes the
-    // rebuilt doc; the mapper's marks make it emit exactly what was missed
-    // (usually nothing). Idle sessions never sweep. Third live victim
-    // 2026-08-05: final tool-status patches + answer text dropped → toad
-    // rendered perpetually-running tool calls over a finished turn.
-    let mut sweep = tokio::time::interval(std::time::Duration::from_secs(5));
-    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut dirty = false;
-
+    // No trailing-edge sweep here on purpose. The old firehose (kernel-wide
+    // `ServerEvent` broadcast) could silently drop events under load —
+    // upstream of SSH, invisible to this side — so a 5s poll existed purely
+    // to paper over that. The change feed cannot do that: a subscriber that
+    // falls behind gets `FeedEvent::Terminated` (loud), never a silent gap
+    // (docs/change-feed.md, the `mpsc` doc comment on `context_feed.rs`). The
+    // `Resubscribed`/`Terminated` arms below are what replace the sweep.
     loop {
         tokio::select! {
             biased;
@@ -227,111 +187,55 @@ pub async fn run_pump(
                     return Ok(());
                 }
             }
-            _ = sweep.tick() => {
-                if dirty {
-                    dirty = false;
-                    resync(&bridge, &session, &session_id, &cx, &mut doc, "post-burst sweep").await;
+            incoming = feed_rx.recv() => match incoming {
+                Some(FeedEvent::Changed(delivery)) => {
+                    apply_delivery(&session, &session_id, &cx, &mut mirror, delivery);
                 }
-            }
-            incoming = events.recv() => match incoming {
-                Ok(event) => {
-                    if event_context(&event) != Some(context_id) {
-                        continue;
-                    }
-                    dirty = true;
-                    if let ServerEvent::BlockDeleted { block_id, .. } = &event {
-                        let deleted = *block_id;
-                        // Apply to the mirror BEFORE returning. This arm used
-                        // to `continue` straight past `doc.apply_event`, so a
-                        // block deleted mid-session lived on in the live
-                        // `SyncedDocument` (and so in `doc.blocks()`, and so in
-                        // any rebuilt Task plan) until a resync threw the
-                        // mirror away — `apply_event_inner` has had a real
-                        // `BlockDeleted` handler the whole time, it was just
-                        // never reached. Affects every block kind's live
-                        // rendering, not only Task.
-                        let effect = doc.apply_event(&event);
-                        if matches!(effect, kaijutsu_client::SyncEffect::NeedsResync) {
-                            resync(&bridge, &session, &session_id, &cx, &mut doc, "sync reset").await;
-                            continue;
+                Some(FeedEvent::Resubscribed) => {
+                    // The actor already re-subscribed on `feed_rx`'s behalf;
+                    // nothing published during the outage rides it. Throw the
+                    // mirror away and rehydrate on the SAME receiver.
+                    tracing::warn!(
+                        session = %session_id,
+                        "context feed resubscribed after a reconnect; rehydrating"
+                    );
+                    match bridge.rehydrate_context(context_id).await {
+                        Ok(fresh) => {
+                            mirror = fresh;
+                            catch_up(&session, &session_id, &cx, &mirror, "reconnected");
                         }
-                        // Deleting a Task changes the plan. `build_plan`
-                        // returns `None` when the rebuilt entries match what
-                        // was last emitted, so calling it after any deletion
-                        // is self-deduplicating — a non-Task delete sends
-                        // nothing. One lock scope, deliberately: two chained
-                        // `.lock()` calls in a single `if` condition share a
-                        // temporary scope and self-deadlock (parking_lot is
-                        // not reentrant) — the bug fixed in 183eeaff.
-                        let plan = {
-                            let mut mapper = session.mapper.lock();
-                            mapper.forget(deleted);
-                            mapper.build_plan(&doc.blocks())
-                        };
-                        if let Some(update) = plan {
-                            let _ = cx.send_notification(SessionNotification::new(
-                                session_id.clone(),
-                                update,
-                            ));
+                        Err(e) => tracing::error!(
+                            session = %session_id,
+                            error = %e,
+                            "rehydrate after resubscribe failed; this session's stream is now stale"
+                        ),
+                    }
+                }
+                Some(FeedEvent::Terminated { reason, delivered_version }) => {
+                    // Rule 28: the subscriber fell behind and the feed will
+                    // not resume on this receiver — re-subscribe from
+                    // scratch, on a brand-new receiver, and rehydrate.
+                    tracing::warn!(
+                        session = %session_id,
+                        ?reason,
+                        delivered_version,
+                        "context feed terminated (subscriber fell behind); re-subscribing"
+                    );
+                    match bridge.hydrate_context(context_id).await {
+                        Ok((fresh, new_rx)) => {
+                            mirror = fresh;
+                            feed_rx = new_rx;
+                            catch_up(&session, &session_id, &cx, &mirror, "feed terminated");
                         }
-                        continue;
-                    }
-                    let effect = doc.apply_event(&event);
-                    if matches!(effect, kaijutsu_client::SyncEffect::NeedsResync) {
-                        resync(&bridge, &session, &session_id, &cx, &mut doc, "sync reset").await;
-                        continue;
-                    }
-                    let Some(block_id) = event_block(&event) else { continue };
-                    let Some(block) = doc.get_block(&block_id) else { continue };
-                    let updates = session.mapper.lock().observe(&block);
-                    for update in updates {
-                        let _ = cx.send_notification(SessionNotification::new(
-                            session_id.clone(),
-                            update,
-                        ));
-                    }
-                    // `note_task` is a no-op (returns false) for anything
-                    // that isn't a changed Task block, so this is safe to
-                    // call unconditionally rather than gating on `block.kind`
-                    // here too. ONE lock scope for note_task + build_plan:
-                    // two `.lock()` calls chained in a single `if` condition
-                    // share one temporary scope, so the first guard is still
-                    // alive when the second acquires — a self-deadlock on the
-                    // first live task event (parking_lot is not reentrant).
-                    let plan = {
-                        let mut mapper = session.mapper.lock();
-                        if mapper.note_task(&block) {
-                            mapper.build_plan(&doc.blocks())
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(update) = plan {
-                        let _ = cx.send_notification(SessionNotification::new(
-                            session_id.clone(),
-                            update,
-                        ));
+                        Err(e) => tracing::error!(
+                            session = %session_id,
+                            error = %e,
+                            "re-subscribe after termination failed; this session's stream is now stale"
+                        ),
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(session = %session_id, dropped = n, "event stream lagged");
-                    resync(&bridge, &session, &session_id, &cx, &mut doc, "events lagged").await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    tracing::info!(session = %session_id, "event stream closed; pump exiting");
-                    return Ok(());
-                }
-            },
-            change = status.recv() => match change {
-                Ok(ConnectionStatus::Connected { .. }) => {
-                    resync(&bridge, &session, &session_id, &cx, &mut doc, "reconnected").await;
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    resync(&bridge, &session, &session_id, &cx, &mut doc, "status lagged").await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    tracing::info!(session = %session_id, "status stream closed; pump exiting");
+                None => {
+                    tracing::info!(session = %session_id, "context feed closed; pump exiting");
                     return Ok(());
                 }
             },
@@ -339,67 +243,132 @@ pub async fn run_pump(
     }
 }
 
-/// Rebuild the CRDT mirror and **catch the client up on the gap**.
-///
-/// The mapper's high-water marks are kept (pruned only for blocks that no
-/// longer exist), and every block in the rebuilt doc is re-observed —
-/// `observe()` emits exactly each block's unseen tail plus any tool-call
-/// create/patch not yet announced, so the client receives what the gap
-/// dropped and nothing twice. First live victim of the old
-/// swallow-the-gap behavior (2026-08-05): a FlowBus lag mid-turn ate the
-/// final report text — toad rendered the tool call, then silence, over a
-/// finished answer.
-async fn resync(
-    bridge: &KernelBridge,
+/// Apply one delivery to the mirror and send whatever `session/update`s it
+/// produces. Thin I/O wrapper over [`deliver_updates`], which does the actual
+/// work and is pure — see its doc comment.
+fn apply_delivery(
     session: &Arc<Session>,
     session_id: &SessionId,
     cx: &ConnectionTo<Client>,
-    doc: &mut SyncedDocument,
-    reason: &str,
+    mirror: &mut ContextMirror,
+    delivery: ContextDelivery,
 ) {
-    match bridge.synced(session.context_id).await {
-        Ok(fresh) => {
-            *doc = fresh;
-            let updates: Vec<_> = {
-                let mut mapper = session.mapper.lock();
-                let blocks = doc.blocks();
-                let live: std::collections::HashSet<BlockId> =
-                    blocks.iter().map(|b| b.id).collect();
-                mapper.retain_marks(|id| live.contains(id));
-                let mut updates: Vec<_> = blocks.iter().flat_map(|b| mapper.observe(b)).collect();
-                // Same idempotence contract as `observe()`: rebuilding the
-                // plan from unchanged task state is a no-op, so a resync over
-                // a gap with no task activity stays silent, matching
-                // `resync_sweep_emits_exactly_the_gap`'s "second sweep must
-                // be silent" contract for every other block kind.
-                if let Some(plan) = mapper.build_plan(&blocks) {
-                    updates.push(plan);
-                }
-                updates
-            };
-            let emitted = updates.len();
-            for update in updates {
-                let _ = cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    update,
-                ));
-            }
-            tracing::warn!(
-                context = %session.context_id.short(),
-                reason,
-                emitted,
-                "resynced; emitted catch-up updates covering the gap"
-            );
-        }
-        Err(e) => {
-            tracing::error!(
-                context = %session.context_id.short(),
-                reason,
-                error = %e,
-                "resync failed; this session's stream is now stale"
-            );
+    for update in deliver_updates(session, session_id, mirror, delivery) {
+        let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+    }
+}
+
+/// Apply one delivery to the mirror, then translate every block it touched
+/// into the `session/update`s the client hasn't seen — one `observe()` call
+/// per touched block, made AFTER the whole delivery lands rather than one
+/// per individual `ContextChange`. That is what gives a tool's final output
+/// text and its `Done` status a single combined patch instead of a race: they
+/// are two events in one delivery (docs/change-feed.md rule 15), and
+/// `observe_tool_result` already folds status+content into one update when it
+/// sees both at once.
+///
+/// No I/O and no `ConnectionTo` — this is the piece worth unit-testing
+/// without a kernel, mirroring `UpdateMapper::observe`'s "pure" design in
+/// `update.rs`. [`apply_delivery`] is the thin wrapper that sends the result.
+fn deliver_updates(
+    session: &Arc<Session>,
+    session_id: &SessionId,
+    mirror: &mut ContextMirror,
+    delivery: ContextDelivery,
+) -> Vec<SessionUpdate> {
+    let mut deleted = Vec::new();
+    let mut touched = Vec::new();
+    for change in &delivery.events {
+        match change {
+            ContextChange::BlockDeleted { block_id } => deleted.push(*block_id),
+            ContextChange::BlockInserted { block, .. } => touched.push(block.id),
+            ContextChange::BlockMoved { block_id, .. }
+            | ContextChange::TextAppended { block_id, .. }
+            | ContextChange::TextReplaced { block_id, .. }
+            | ContextChange::StatusChanged { block_id, .. }
+            | ContextChange::CollapsedChanged { block_id, .. }
+            | ContextChange::ExcludedChanged { block_id, .. }
+            | ContextChange::MetadataChanged { block_id, .. }
+            | ContextChange::OutputChanged { block_id, .. } => touched.push(*block_id),
         }
     }
+
+    if let Err(e) = mirror.receive(delivery) {
+        tracing::error!(
+            session = %session_id,
+            error = %e,
+            "context mirror refused a delivery; this session's stream is now stale"
+        );
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    touched.retain(|id| seen.insert(*id));
+    // A deletion always makes the plan worth rebuilding. `build_plan` is
+    // self-deduplicating (see its doc comment), so a non-Task delete costs
+    // one no-op diff and sends nothing.
+    let mut plan_dirty = !deleted.is_empty();
+
+    let mut mapper = session.mapper.lock();
+    for id in &deleted {
+        mapper.forget(*id);
+    }
+    let mut updates = Vec::new();
+    for id in &touched {
+        let Some(block) = mirror.block(id) else { continue };
+        updates.extend(mapper.observe(block));
+        if mapper.note_task(block) {
+            plan_dirty = true;
+        }
+    }
+    if plan_dirty
+        && let Some(plan) = mapper.build_plan(mirror.blocks())
+    {
+        updates.push(plan);
+    }
+    updates
+}
+
+/// Catch the client up after a fresh mirror replaces a stale one
+/// (`FeedEvent::Resubscribed` or `Terminated`).
+///
+/// The mapper's high-water marks are kept (pruned only for blocks no longer
+/// live), and every block in the fresh mirror is re-observed — `observe()`
+/// emits exactly each block's unseen tail plus any tool-call create/patch not
+/// yet announced, so the client receives whatever the gap held and nothing
+/// twice.
+fn catch_up(
+    session: &Arc<Session>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    mirror: &ContextMirror,
+    reason: &str,
+) {
+    let blocks = mirror.blocks();
+    let updates: Vec<_> = {
+        let mut mapper = session.mapper.lock();
+        let live: HashSet<BlockId> = blocks.iter().map(|b| b.id).collect();
+        mapper.retain_marks(|id| live.contains(id));
+        let mut updates: Vec<_> = blocks.iter().flat_map(|b| mapper.observe(b)).collect();
+        // Same idempotence contract as `observe()`: rebuilding the plan from
+        // unchanged task state is a no-op, so a rehydrate over a gap with no
+        // task activity stays silent.
+        if let Some(plan) = mapper.build_plan(blocks) {
+            updates.push(plan);
+        }
+        updates
+    };
+    let emitted = updates.len();
+    for update in updates {
+        let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+    }
+    tracing::warn!(
+        session = %session_id,
+        context = %session.context_id.short(),
+        reason,
+        emitted,
+        "rehydrated the context mirror; emitted catch-up updates covering the gap"
+    );
 }
 
 /// Why a turn wait ended.
@@ -487,8 +456,8 @@ pub async fn run_turn(
             Ok(r) => r,
             Err(_quiet) => {
                 // Stream is quiet — poll ground truth.
-                match bridge.synced(context_id).await {
-                    Ok(doc) if turn_ran_and_settled(&doc.blocks(), &block_id) => {
+                match bridge.actor().get_all_blocks(context_id).await {
+                    Ok(blocks) if turn_ran_and_settled(&blocks, &block_id) => {
                         tracing::warn!(
                             context = %context_id.short(),
                             "turn wait resolved by quiet-poll: turn ran and settled \
@@ -550,13 +519,15 @@ pub async fn run_turn(
 /// Let the pump's delivery catch up with the kernel before the prompt
 /// responds.
 ///
-/// Turn events and block events ride separate ordered lanes (FlowBus
-/// rework), so `TurnCompleted` can beat the last text chunks to the bridge.
-/// Responding at that instant makes the client finalize its message widget
-/// and drop the tail — a truncated final answer (first live hit 2026-08-05,
-/// toad). Poll the mapper's high-water marks against the kernel's snapshot;
-/// bounded, because the pump's 5s trailing-edge sweep repairs anything a
-/// grace window this size somehow misses, after the response.
+/// Turn events ride `ServerEvent`'s broadcast; block text rides the context
+/// change feed — two genuinely separate lanes, so `TurnCompleted` can beat
+/// the last text chunks to the bridge. Responding at that instant makes the
+/// client finalize its message widget and drop the tail — a truncated final
+/// answer (first live hit 2026-08-05, toad). Poll the mapper's high-water
+/// marks against the kernel's snapshot; bounded, because the change feed
+/// itself never drops a delivery (docs/change-feed.md) — a timeout here just
+/// means the pump's own `feed_rx` processing hasn't caught up yet, and it
+/// will, on its own schedule, whether or not anything is still watching.
 pub(crate) async fn settle_delivery(
     bridge: &KernelBridge,
     session: &Arc<Session>,
@@ -565,9 +536,9 @@ pub(crate) async fn settle_delivery(
     const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
     const SETTLE_MAX_POLLS: u32 = 20; // 2s ceiling
     for _ in 0..SETTLE_MAX_POLLS {
-        match bridge.synced(context_id).await {
-            Ok(doc) => {
-                if session.mapper.lock().caught_up_with(&doc.blocks()) {
+        match bridge.actor().get_all_blocks(context_id).await {
+            Ok(blocks) => {
+                if session.mapper.lock().caught_up_with(&blocks) {
                     return;
                 }
             }
@@ -585,7 +556,7 @@ pub(crate) async fn settle_delivery(
     tracing::warn!(
         context = %context_id.short(),
         "prompt response sent before delivery fully settled (2s ceiling); \
-         the pump's trailing-edge sweep will deliver the remainder"
+         the pump will still deliver the remainder as it drains the feed"
     );
 }
 
@@ -599,12 +570,12 @@ pub(crate) async fn settle_command_delivery(
     const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
     const SETTLE_MAX_POLLS: u32 = 20;
     for _ in 0..SETTLE_MAX_POLLS {
-        match bridge.synced(session.context_id).await {
-            Ok(doc) => {
+        match bridge.actor().get_all_blocks(session.context_id).await {
+            Ok(blocks) => {
                 if session
                     .mapper
                     .lock()
-                    .delivered_tool_result(&doc.blocks(), command_block_id)
+                    .delivered_tool_result(&blocks, command_block_id)
                 {
                     return;
                 }
@@ -679,38 +650,55 @@ mod tests {
         assert!(reg.unbind(&id).is_none(), "retrying an unbind is harmless");
     }
 
+    /// The whole point of the migration (docs/change-feed.md): ACP's
+    /// rendering path takes typed `ContextChange`s off the change feed and a
+    /// `kaijutsu_client::ContextMirror` — never a `SyncedDocument`, never a
+    /// diamond-types op byte. This drives exactly that path — subscribe,
+    /// snapshot, deliver — and checks the ACP `SessionUpdate` it produces,
+    /// with no CRDT type in scope anywhere in the test.
     #[test]
-    fn events_are_routed_by_the_context_they_name() {
-        let mine = ctx();
-        let theirs = ctx();
-        let block = BlockSnapshotBuilder::new(
-            BlockId::new(mine, PrincipalId::new(), 1),
-            BlockKind::Text,
-        )
-        .role(Role::Model)
-        .build();
-
-        let ev = ServerEvent::BlockInserted {
-            context_id: mine,
-            block: Box::new(block.clone()),
-            ops: Vec::new(),
-        };
-        assert_eq!(event_context(&ev), Some(mine));
-        assert_ne!(event_context(&ev), Some(theirs));
-        assert_eq!(event_block(&ev), Some(block.id));
-    }
-
-    #[test]
-    fn per_block_events_name_their_block() {
+    fn a_text_change_reaches_acp_rendering_with_no_crdt_involved() {
         let c = ctx();
-        let b = BlockId::new(c, PrincipalId::new(), 7);
-        let ev = ServerEvent::BlockStatusChanged {
+        let snap = BlockSnapshotBuilder::new(BlockId::new(c, PrincipalId::new(), 1), BlockKind::Text)
+            .role(Role::Model)
+            .content("")
+            .build();
+        let id = snap.id;
+
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![snap], 1).unwrap();
+
+        let s = Arc::new(session(c));
+        let sid = SessionId::new("s");
+        let delivery = ContextDelivery {
             context_id: c,
-            block_id: b,
-            status: kaijutsu_types::Status::Done,
+            version: 2,
+            events: vec![
+                ContextChange::TextAppended {
+                    block_id: id,
+                    suffix: "hello from the feed".into(),
+                },
+                ContextChange::StatusChanged {
+                    block_id: id,
+                    status: kaijutsu_types::Status::Done,
+                },
+            ],
         };
-        assert_eq!(event_context(&ev), Some(c));
-        assert_eq!(event_block(&ev), Some(b));
+
+        let updates = deliver_updates(&s, &sid, &mut mirror, delivery);
+        assert_eq!(updates.len(), 1, "one agent-message chunk: {updates:?}");
+        let SessionUpdate::AgentMessageChunk(chunk) = &updates[0] else {
+            panic!("expected an agent message chunk, got {:?}", updates[0]);
+        };
+        let agent_client_protocol::schema::v1::ContentBlock::Text(text) = &chunk.content else {
+            panic!("expected text content, got {:?}", chunk.content);
+        };
+        assert_eq!(text.text, "hello from the feed");
+
+        // The mirror itself now holds the kernel's text — reached purely by
+        // applying typed `ContextChange`s, never by decoding a CRDT op.
+        assert_eq!(mirror.block(&id).unwrap().content, "hello from the feed");
+        assert_eq!(mirror.version(), 2);
     }
 
     /// Lag recovery's ground-truth check: a context with any Running or
@@ -779,22 +767,4 @@ mod tests {
         assert!(!turn_ran_and_settled(&[prompt, stale], &prompt_id));
     }
 
-    #[test]
-    fn turn_events_carry_no_block_and_are_not_pump_traffic() {
-        // The pump ignores them; `run_turn` owns them off its own receiver.
-        let c = ctx();
-        let ev = ServerEvent::TurnCompleted {
-            context_id: c,
-            principal_id: kaijutsu_types::PrincipalId::new(),
-            output_block_id: None,
-            stop_reason: kaijutsu_client::TurnCompletedStopReason::EndTurn,
-            origin: TurnOrigin::Interactive,
-        };
-        assert_eq!(event_block(&ev), None);
-        assert_eq!(
-            event_context(&ev),
-            None,
-            "turn events are handled by run_turn, not routed by the pump"
-        );
-    }
 }

@@ -384,9 +384,9 @@ async fn start_session(
         return Ok(());
     }
     let commands = bridge.kernel.kj_command_catalog(context_id).await.map_err(internal)?;
-    let doc = bridge
+    let (mirror, feed_rx) = bridge
         .kernel
-        .synced(context_id)
+        .hydrate_context(context_id)
         .await
         .map_err(internal)?;
 
@@ -407,7 +407,7 @@ async fn start_session(
     let pump_cx = cx.clone();
     let pump_id = session_id.clone();
     cx.spawn(async move {
-        run_pump(kernel, session, pump_id, pump_cx, doc, replay_history).await
+        run_pump(kernel, session, pump_id, pump_cx, mirror, feed_rx, replay_history).await
     })?;
     Ok(())
 }

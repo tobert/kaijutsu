@@ -6,16 +6,19 @@
 //! I/O, no clock — so it is unit-testable without a kernel, which is where the
 //! tests for this crate live.
 //!
-//! ## Why "observe a snapshot" rather than "translate an event"
+//! ## Why "observe a snapshot" rather than "translate a change"
 //!
-//! kaijutsu's block events are CRDT deltas (`BlockTextOps` carries opaque ops,
-//! not text). Decoding them means owning a `SyncedDocument` anyway, and once
-//! you own one the block's *current* content is a cheap lookup. So the pump
-//! applies the event to the document and then hands the resulting snapshot
-//! here; this type keeps a per-block high-water mark of what it already
-//! emitted and diffs against it. That makes the translation naturally
-//! idempotent — observing an unchanged block twice yields no updates — which
-//! also covers replaying history on `session/load` with the same code path.
+//! The pump keeps a `kaijutsu_client::ContextMirror` (docs/change-feed.md): it
+//! applies each delivery's already-classified `ContextChange`s —
+//! `textAppended` carries a suffix, `textReplaced` carries the full content,
+//! never opaque CRDT ops — and maintains document order for free. This type
+//! does not react to those changes directly, though; the pump hands it the
+//! block's CURRENT snapshot after a delivery lands, and this type diffs that
+//! against a per-block high-water mark of what it already emitted. That keeps
+//! the translation naturally idempotent — observing an unchanged block twice
+//! yields no updates — which also covers replaying history on `session/load`
+//! and rehydrating after `FeedEvent::Resubscribed`/`Terminated` with the same
+//! code path.
 //!
 //! ## Create + patch
 //!
@@ -639,9 +642,9 @@ fn task_status_to_plan_status(status: TaskStatus) -> Option<PlanEntryStatus> {
 const SUBTASK_PREFIX: &str = "↳ ";
 
 /// Build the ACP plan entries for the CURRENT state of every Task block in
-/// `blocks`. `blocks` MUST be in document order (`SyncedDocument::blocks()`/
-/// `block_ids_ordered()`) — a raw `BTreeMap` iteration is principal-major
-/// and would scramble both subtask nesting and plan order.
+/// `blocks`. `blocks` MUST be in document order (`ContextMirror::blocks()`) —
+/// a raw `BTreeMap`/id-keyed iteration is principal-major and would scramble
+/// both subtask nesting and plan order.
 ///
 /// Semantics (docs/acp.md "Task → plan" has the full writeup):
 /// - **Cancelled tasks are omitted.** ACP's plan is "what the agent intends
