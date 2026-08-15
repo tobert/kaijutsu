@@ -459,12 +459,45 @@ pub struct SharedKernelState {
     /// connection's bridge task ended) is pruned reactively by the bridge.
     pub permission_subscribers:
         Arc<TokioRwLock<Vec<tokio::sync::mpsc::Sender<PermissionAskChannelMsg>>>>,
+    /// The live roster's materialized view (`kaijutsu_kernel::roster`). The
+    /// SAME instance the `/run/roster` mount and `KjDispatcher`'s `kj roster`
+    /// verbs hold — three handles, one store, because a second store would
+    /// carry its own generation counter and silently desync the two readers
+    /// (see `KjDispatcher::new_with_roster`).
+    ///
+    /// Held here so the server owns a handle independent of the dispatcher:
+    /// the scheduled-periodic refresh below needs one, and push-on-peer-
+    /// attach/detach (docs/issues.md, the roster's remaining unwired half)
+    /// will need one from the RPC layer.
+    pub roster: Arc<kaijutsu_kernel::roster::RosterStore>,
+    /// Cancellation for kernel-lifetime background tasks — those whose owner
+    /// is the server process itself rather than a connection (which has
+    /// `conn_cancel`) or a prompt (which gets a fresh interrupt token). The
+    /// roster's scheduled-periodic refresh loop is the first and, today, only
+    /// subscriber.
+    ///
+    /// Fired from `Drop`, with exactly the same reach as the WAL checkpoint
+    /// there: it runs when the LAST `Arc<SharedKernelState>` drops — a clean
+    /// process exit or a test teardown — and **not** on SIGKILL/SIGTERM,
+    /// where the process dies without unwinding. That is acceptable for a
+    /// task whose only cost on abrupt death is its own tokio task going away
+    /// with the runtime; it would NOT be acceptable for anything that must
+    /// flush. The SIGTERM gap is the same one filed under
+    /// "graceful-shutdown WAL checkpoint" in docs/issues.md.
+    pub shutdown: CancellationToken,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
 
 impl Drop for SharedKernelState {
     fn drop(&mut self) {
+        // Stop kernel-lifetime background tasks before the checkpoint below,
+        // so nothing is still touching `kernel_db` while we checkpoint it.
+        // The roster refresh loop holds its own clones of the `Kernel` and
+        // `KernelDb` Arcs — deliberately NOT an `Arc<SharedKernelState>`,
+        // which would be a cycle that kept this `Drop` from ever running.
+        self.shutdown.cancel();
+
         // Best-effort WAL checkpoint on clean teardown so the main `.db` file
         // doesn't linger behind committed history after exit. This fires only
         // when the LAST `Arc<SharedKernelState>` drops — a clean process exit
@@ -2078,13 +2111,15 @@ pub async fn create_shared_kernel(
 
     // Create kj dispatcher — shared across all connections. Takes the SAME
     // `roster_store` the /run/roster mount above uses (`new_with_roster`),
-    // not a freshly constructed one.
+    // not a freshly constructed one. (Cloned, not moved, because the periodic
+    // refresh loop spawned below needs that same third handle — all three are
+    // one store, which is the whole point of `new_with_roster`.)
     let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new_with_roster(
         kernel_arc.drift().clone(),
         documents.clone(),
         kernel_db_arc.clone(),
         kernel_arc.clone(),
-        roster_store,
+        roster_store.clone(),
     ));
     // Stash a Weak<Self> on the dispatcher so internal paths (rc
     // lifecycle, kaish hook bodies) can construct KjBuiltin without
@@ -2102,6 +2137,36 @@ pub async fn create_shared_kernel(
         .set_kj_dispatcher(&kj_dispatcher)
         .await;
 
+    // Kernel-lifetime task cancellation; see `SharedKernelState::shutdown`.
+    let shutdown = CancellationToken::new();
+
+    // Drive the roster's scheduled-periodic reconcile (`roster_sources`
+    // module doc; design record in signoff/`docs/issues.md`). Spawned here
+    // rather than left to the read surfaces because `kj/roster.rs`'s
+    // `ensure_refreshed` only self-heals the boot rule *on a read* — without
+    // this loop, staleness between reads grows unbounded past the ~10s design
+    // target, and `/run/roster` would report presence that stopped being true
+    // whenever nobody happened to be looking.
+    //
+    // `tokio::time::interval` fires its first tick immediately, so this also
+    // satisfies the boot rule proactively: the first `refresh_once` lands at
+    // spawn time, not one interval later. `ensure_refreshed` stays as the
+    // belt-and-braces path for a read that beats this task to the DB.
+    //
+    // Scheduled-periodic, never chase-the-clock — `MissedTickBehavior::Delay`
+    // is set inside `spawn_periodic_refresh`, so a slow refresh delays the
+    // next tick rather than queuing a burst to "catch up" (CLAUDE.md "Time").
+    let roster_refresh = kaijutsu_kernel::roster_sources::spawn_periodic_refresh(
+        kernel_arc.clone(),
+        kernel_db_arc.clone(),
+        roster_store.clone(),
+        kaijutsu_kernel::roster_sources::DEFAULT_REFRESH_INTERVAL,
+        shutdown.clone(),
+    );
+    // The loop only ends via `shutdown` (fired in `Drop`), so nothing joins
+    // this handle; dropping it detaches the task, which is what we want.
+    drop(roster_refresh);
+
     let shared = SharedKernelState {
         id,
         name: id_str,
@@ -2116,6 +2181,8 @@ pub async fn create_shared_kernel(
         session_contexts,
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         permission_subscribers: Arc::new(TokioRwLock::new(Vec::new())),
+        roster: roster_store,
+        shutdown,
     };
 
     // Wire the permission-ask bridge (D-57) onto the broker so

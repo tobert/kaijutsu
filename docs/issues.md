@@ -59,38 +59,29 @@ a fresh `instance` or the same one?) outside this task's scope.
 
 ---
 
-## Live roster — two things landed without, on purpose (2026-08-14)
+## Live roster — push-on-attach is the remaining unwired half (2026-08-14)
 
 Slices 1–4 (`crates/kaijutsu-kernel/src/roster.rs`, `roster_sources.rs`,
 `kj/roster.rs`, `vfs/backends/roster.rs`) shipped in full: schema+store,
 sources+refresh, `kj roster status`, `kj roster list` + `/run/roster`. Two
 things were deliberately built but not wired into the running server,
-because this branch could not start or verify a live kernel:
+because that branch could not start or verify a live kernel. **The first
+shipped 2026-08-15** — `spawn_periodic_refresh` is now called from
+`create_shared_kernel`, cancelled by `SharedKernelState::shutdown` on drop,
+and covered by `tests/roster_refresh_boot.rs` (which reads no roster surface
+on purpose, so the read path's inline `ensure_refreshed` cannot mask a
+missing spawn). This one is still open:
 
-**1. `roster_sources::spawn_periodic_refresh` is not called from
-`kaijutsu-server`'s boot (`rpc.rs::create_shared_kernel`).** The function is
-built and unit-tested against `refresh_once` directly. The read surfaces
-(`kj roster list`, `/run/roster`) self-heal the boot-rule case by running one
-refresh inline on first read (`kj/roster.rs::ensure_refreshed`), so
-correctness doesn't depend on this being spawned — but without it, staleness
-between reads can grow past the ~10s design target after the first read. Add
-one `tokio::spawn(roster_sources::spawn_periodic_refresh(kernel_arc.clone(),
-kernel_db_arc.clone(), roster_store.clone(), roster_sources::
-DEFAULT_REFRESH_INTERVAL, <a cancellation token scoped to server
-shutdown>))` near the `roster_store` construction in `rpc.rs`, once someone
-can watch it run against a live kernel. (The `/run/roster` VFS mount itself
-IS wired in — read-only and inert until read, a different risk profile.)
-
-**2. Push-based refresh on peer attach/detach isn't wired.** The design
+**Push-based refresh on peer attach/detach isn't wired.** The design
 record calls for pushing "where events already exist: peer attach/detach,
 status post." Status-post is push-based today (`RosterStore::write_status`
 writes immediately). Peer attach/detach still only reconciles on the next
-pull tick (once #1 above is spawned) or on-demand via `ensure_refreshed`.
-Correct either way (a `bound` peer is never wrong for longer than one
-refresh interval), just not the lowest-latency version the design allows.
-Would need a call from wherever `kaijutsu-server`'s RPC layer currently
-calls `PeerRegistry::attach`/`detach` into a narrow single-peer reconcile (or
-just `refresh_once`).
+pull tick or on-demand via `ensure_refreshed`. Correct either way (a `bound`
+peer is never wrong for longer than one ~10s refresh interval), just not the
+lowest-latency version the design allows. Would need a call from wherever
+`kaijutsu-server`'s RPC layer currently calls `PeerRegistry::attach`/`detach`
+into a narrow single-peer reconcile (or just `refresh_once`) — the server now
+holds its own handle for exactly this, `SharedKernelState::roster`.
 
 Also worth a look, not urgent: `roster_sources::RECENT_LIVE_WINDOW_MS` (15
 minutes) is a v1 starting guess, not tuned against real usage — a config
