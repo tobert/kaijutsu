@@ -142,7 +142,45 @@ first and the janitor inherits its safety rule for free.
   destroyed a context today — but only once A exists.
 
 Recommendation: **A now, B when there is a second reason to want it** ("start
-with less, it's easier to add more than take away"). Not scheduled.
+with less, it's easier to add more than take away").
+
+### QUEUED by Amy 2026-08-15: *"when we're done with other things let's do the anchors and related fixups and guardrails"*
+
+Slices, in dependency order. Slice 1 is worth doing even if the anchor design
+changes — those are plain bugs, and two of them are what make the current
+tree fragile.
+
+**Slice 1 — guardrails (no new concept, all independently correct).**
+- `kj context move` in ONE transaction, or cycle-check before deleting the old
+  edge. Today a refused move orphans the context (edge 2b above, proved live).
+- The archive latch prints a **consequence**, not an inventory: "this will also
+  archive N descendant context(s)" instead of `1 children`. This is the line
+  that cost a context today.
+- Free the label on archive, or make the conflict error say the holder is
+  archived and name `retag`. Right now "already in use" and "not found"
+  contradict each other and neither points anywhere.
+
+**Slice 2 — the anchor bit.** A column (`anchored_at`, same shape as
+`promoted_at`/`archived_at`) plus three behaviours: **parentless by
+construction**, **cascade stops** (never archived as a descendant), **never
+swept by age**. `kj context create --detached` sets it. Genesis marks ROOT.
+Multiple anchors allowed — the forest falls out rather than being designed.
+Both layers, per the approval-ledger/roster precedent: a schema CHECK or
+trigger that refuses a structural parent edge into an anchored context, *and*
+the Rust check for the typed-error contract.
+
+**Slice 3 — enforcement, pending Amy's ruling.** Does `anchored` imply the
+no-drive restriction (making "leave anchors unused" structural rather than
+habitual)? Argument for is fork cost, above. Note the `director` loadout
+already provides most of it, so this may be "anchored implies director-ish"
+rather than new machinery.
+
+**Slice 4 — `kj root`/`kj anchor` verbs.** Only once 1–3 exist.
+
+**Migration, do it in slice 2:** the current ROOT (`f0a66870`) is a structural
+child of a `cc-kaijutsu-*` session context. Nothing sweeps automatically today
+so it is not urgent, but it is the live instance of the landmine — anchoring it
+must also detach it.
 
 ---
 
