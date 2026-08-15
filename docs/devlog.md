@@ -1714,6 +1714,35 @@ hole in a lane whose whole contract is that a hole means the subscription died.
 The fix was to drop them at ingress rather than at send time — an event nobody
 sends still does damage while it waits in line.
 
+The feed itself followed the same evening, additive, so nothing broke yet. Two
+things it taught while being built are worth more than the code.
+
+The design had said an insert event carries the block's snapshot. Writing the
+client half showed that a snapshot is not enough: the wire's `BlockSnapshot` has
+no ordering key, so a client receiving one learns that a block exists and not
+where it goes. The snapshot query hides this by returning blocks already
+ordered. That is precisely the thing ACP had been using the CRDT for — document
+order, not text — so the insert event now carries a position, like the move
+event beside it and like the old event it replaces.
+
+The other was a question the tests could not avoid asking: how does a *client*
+edit a block's text? It cannot. `pushOps` was the only path and it was deleted
+that morning; text edits reach the kernel through tools, `kj`, the shell, and
+the model's own stream, all of them kernel-side. Nothing is broken by that today
+because no client edits text — but "all authoring goes through rich RPC" had
+been written as though the verbs existed, and they do not.
+
+The client half ended up larger than plumbing, deliberately. Following a context
+correctly is a short list of rules — apply in order, append a suffix, replace on
+a replace, never compare lengths, subscribe before fetching, discard what the
+snapshot already has — and every one of those rules exists because ignoring it
+corrupted something real. Written three times, in ACP and MCP and the app, it
+would be three chances to get one subtly wrong. So it is written once, tested
+once, and it refuses rather than guesses: a foreign context, an unknown anchor,
+and a version that fails to advance are all errors. Its own tests immediately
+caught a stale-index bug in the move path, which is the argument for building it
+that way, made without anyone having to make it.
+
 A third thing happened alongside, prompted by Amy reading the test output rather
 than the code: *"did I see tests accessing my ~ XDG path?"* She had. The shipped
 default `mcp.toml` carried a server entry pointing at her own kaibo build, and
