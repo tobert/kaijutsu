@@ -6,6 +6,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## A context's version is unobservable from `kj` (2026-08-15)
+
+The context version is now load-bearing: it is the client's hydration anchor
+(docs/change-feed.md rules 21-26), it survives restarts as of `e0bb2076`, and
+Amy wants it as the coordinate a repair replay is addressed by. There is no way
+to read it from the operator surface.
+
+- `kj context` has no `inspect`/`show` verb at all (only the tip "a similar
+  subcommand exists: 'unset'").
+- `kj block history <id>` reports version info but demands a full
+  `context_principal_seq` id, which `kj block list` does not print — it prints
+  the short display form (`45d6b370#6`), and `--data` returned empty.
+
+Found trying to verify on the live kernel, after the flag-day restart, that a
+long-lived context resumed its real version rather than restarting near zero.
+The fix landed with unit tests and **has still not been checked against
+production data**, because there is no way to ask.
+
+Wanted: a `kj context inspect <ref>` (version, block count, seq range, live
+status) — the `getContextVersion` RPC already exists and is what it would read.
+It also gives the "did the version resume?" check a one-line answer after any
+restart.
+
 ## `kaijutsu-mcp --connect serve` silently runs local (2026-08-15)
 
 `kaijutsu-mcp --connect` attaches to the server. `kaijutsu-mcp --connect serve`
