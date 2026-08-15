@@ -1824,11 +1824,20 @@ impl SyncPayload {
 ///
 /// docs/crdt-position-2026-08.md Part 1, empirical question 1: how often
 /// does a merged `SyncPayload` see a genuinely concurrent frontier vs. a
-/// fast-forward? Read via [`BlockStore::merge_stats`]. Exported as the
-/// `kaijutsu.crdt.merge_application` OTel counter from the server's
-/// `push_ops` handler, which classifies one application via
-/// [`MergeStats::outcome_since`]; these in-memory totals remain the local
-/// view and still feed the periodic debug log.
+/// fast-forward? Read via [`BlockStore::merge_stats`].
+///
+/// **That question has been answered by construction, not by measurement**
+/// (2026-08-15). The `push_ops` handler that exported this as the
+/// `kaijutsu.crdt.merge_application` counter is deleted, and with it the
+/// kernel's wire-merge path: the only remaining caller of `merge_ops` is
+/// oplog replay, which applies a document's own history in order and never
+/// reconciles a concurrent branch. So concurrent merge into kernel documents
+/// is now impossible rather than merely unobserved, and the counter was
+/// removed rather than left reading zero forever.
+///
+/// This type survives because replay still classifies, and because a future
+/// caller would want the same accounting. It has **no production consumer
+/// today** — see `docs/change-feed.md`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeStats {
     /// Applications where the incoming ops were a pure continuation of
@@ -1892,11 +1901,15 @@ mod tests {
         BlockStore::new(ContextId::new(), PrincipalId::new())
     }
 
-    /// `outcome_since` is what the server's `push_ops` handler turns into the
-    /// `kaijutsu.crdt.merge_application` metric — the empirical answer to
-    /// docs/crdt-position-2026-08.md question 1. A bug here corrupts the one
-    /// measurement the whole Option-2 migration is being judged on, and it
-    /// would corrupt it *quietly*, so it gets real tests rather than trust.
+    /// `outcome_since` classifies one merge application as a fast-forward or a
+    /// concurrent reconcile. It used to feed the `kaijutsu.crdt.merge_application`
+    /// metric from the server's `push_ops` handler; both are deleted, because
+    /// removing that handler made concurrent merge structurally impossible
+    /// rather than merely unobserved (see [`MergeStats`]).
+    ///
+    /// The tests stay. The classification is still the thing that would tell us
+    /// if that structural claim ever stopped being true, and it would go wrong
+    /// *quietly*, so it gets real tests rather than trust.
     #[test]
     fn outcome_since_reports_a_fast_forward() {
         let before = MergeStats {
