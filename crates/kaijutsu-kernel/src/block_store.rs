@@ -2194,7 +2194,19 @@ impl BlockStore {
                         source: OpSource::Remote,
                     });
                 }
-                if old.content != snap.content {
+                // `docs/crdt-melt.md` step 7's gate: replacing DTE-backed block
+                // text with a plain representation is only safe once this
+                // answers whether non-trivial merge (a mid-content splice,
+                // shrink, or replace — not a pure tail append) ever actually
+                // happens here. `TextChangeShape::classify` is a cheap
+                // length-plus-prefix check (see its doc comment) riding the
+                // same `old.content`/`snap.content` borrows this diff already
+                // holds — no extra allocation, and every event from this diff
+                // is `OpSource::Remote` (this is the wire-merge path), so
+                // `remote` is hardcoded `true` here.
+                let shape = kaijutsu_telemetry::TextChangeShape::classify(&old.content, &snap.content);
+                kaijutsu_telemetry::record_merge_text_shape(shape, true);
+                if shape != kaijutsu_telemetry::TextChangeShape::NoOp {
                     events.push(BlockFlow::TextOps {
                         context_id,
                         block_id: snap.id,

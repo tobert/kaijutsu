@@ -153,6 +153,19 @@ pub fn record_cwd_restore_failed() {
 /// One counter with an `outcome` attribute rather than two counters: the
 /// question is a *ratio*, and this way a dashboard divides two series of the
 /// same metric instead of correlating two.
+///
+/// `merge_text_shape` is the twin instrument the position review's coda asked
+/// for ("merge_ops concurrency counter + kernel-internal 'did merge do
+/// non-trivial work' twin", `docs/crdt-position-2026-08.md`) and the gate
+/// `docs/crdt-melt.md` step 7 names directly: DTE-backed block text may only
+/// be replaced with a plain representation "after instrumentation answers
+/// whether non-trivial merge ever occurs inside the kernel." `concurrent` /
+/// `fast_forward` above answers whether diamond-types ever reconciles two
+/// divergent *frontiers* — that can be true even when the resulting *text*
+/// change is one a plain string would have produced identically (two clients
+/// both only ever appending). `merge_text_shape` answers the text-level
+/// question directly, at the same site `BlockStore::merge_ops` already visits
+/// to build `BlockFlow::TextOps`.
 pub struct CrdtMergeMetrics {
     /// `kaijutsu.crdt.merge_application` — one applied `SyncPayload`, by
     /// `outcome` (`fast_forward` | `concurrent`). `concurrent` means at least
@@ -161,6 +174,15 @@ pub struct CrdtMergeMetrics {
     /// ops were a pure continuation and merge did nothing a plain ordered log
     /// could not have done.
     merge_application: Counter<u64>,
+    /// `kaijutsu.crdt.merge_text_shape` — one touched block's content
+    /// comparison within an applied merge, by `shape` (`no_op` |
+    /// `tail_append` | `non_append`) and `source` (`local` | `remote`).
+    /// `tail_append` means `after.starts_with(before)`: a plain
+    /// `String::push_str` reproduces the result exactly. `non_append` is the
+    /// case that needs a real splice (mid-content edit, shrink, replace) —
+    /// this is the count that, if it stays at or near zero across real
+    /// traffic, clears step 7's gate.
+    merge_text_shape: Counter<u64>,
 }
 
 impl CrdtMergeMetrics {
@@ -175,7 +197,20 @@ impl CrdtMergeMetrics {
                  reconciled a genuinely concurrent frontier",
             )
             .build();
-        Self { merge_application }
+        let merge_text_shape = meter
+            .u64_counter("kaijutsu.crdt.merge_text_shape")
+            .with_unit("{block}")
+            .with_description(
+                "Touched-block content comparisons within applied merges, by \
+                 shape (no_op/tail_append/non_append) and source \
+                 (local/remote) — the DTE-replacement gate from \
+                 docs/crdt-melt.md step 7",
+            )
+            .build();
+        Self {
+            merge_application,
+            merge_text_shape,
+        }
     }
 
     /// Record the outcome of one applied sync payload.
@@ -188,6 +223,66 @@ impl CrdtMergeMetrics {
         self.merge_application
             .add(1, &[KeyValue::new("outcome", outcome)]);
     }
+
+    /// Record the content-shape classification of one touched block within
+    /// an applied merge. `remote` is `true` for the wire-merge path
+    /// (`BlockStore::merge_ops`, where every event carries `OpSource::Remote`
+    /// today) and would be `false` for a local-origin classifier, if one is
+    /// ever added alongside it.
+    pub fn record_merge_text_shape(&self, shape: TextChangeShape, remote: bool) {
+        let source = if remote { "remote" } else { "local" };
+        self.merge_text_shape.add(
+            1,
+            &[
+                KeyValue::new("shape", shape.as_str()),
+                KeyValue::new("source", source),
+            ],
+        );
+    }
+}
+
+/// Content-shape classification for one touched block within an applied
+/// merge — see [`CrdtMergeMetrics::record_merge_text_shape`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextChangeShape {
+    /// `after.content == before.content`: the merge touched this block's
+    /// header/status/other fields but not its text.
+    NoOp,
+    /// `after.content` is `before.content` with bytes appended at the end
+    /// (`after.starts_with(before)`). Trivial: `String::push_str` reproduces
+    /// it exactly, no CRDT merge machinery needed.
+    TailAppend,
+    /// Content changed and is not a pure tail append — mid-content splice,
+    /// shrink, or full replace. The case that needs something stronger than
+    /// append-only text.
+    NonAppend,
+}
+
+impl TextChangeShape {
+    fn as_str(self) -> &'static str {
+        match self {
+            TextChangeShape::NoOp => "no_op",
+            TextChangeShape::TailAppend => "tail_append",
+            TextChangeShape::NonAppend => "non_append",
+        }
+    }
+
+    /// Classify a content change from a cheap length-plus-prefix check
+    /// rather than a full diff. `before`/`after` are borrowed, not
+    /// allocated, and `str::starts_with` bails out in O(1) the moment a
+    /// length or byte mismatch is found — no worse than the `!=` comparison
+    /// the caller already pays for on this hot streaming path, and often
+    /// cheaper (a tail-append `starts_with` only walks `before`'s length,
+    /// not `after`'s).
+    pub fn classify(before: &str, after: &str) -> Self {
+        if before == after {
+            TextChangeShape::NoOp
+        } else if after.starts_with(before) {
+            TextChangeShape::TailAppend
+        } else {
+            TextChangeShape::NonAppend
+        }
+    }
 }
 
 static CRDT_MERGE_METRICS: LazyLock<CrdtMergeMetrics> =
@@ -197,6 +292,14 @@ static CRDT_MERGE_METRICS: LazyLock<CrdtMergeMetrics> =
 /// and safe before OTel is initialized (no-op meter), like the recorders above.
 pub fn record_merge_application(concurrent: bool) {
     CRDT_MERGE_METRICS.record_merge_application(concurrent);
+}
+
+/// Record one touched block's content-shape classification to the global
+/// meter provider — see [`CrdtMergeMetrics::record_merge_text_shape`]. Cheap
+/// and safe before OTel is initialized (no-op meter), like the recorders
+/// above.
+pub fn record_merge_text_shape(shape: TextChangeShape, remote: bool) {
+    CRDT_MERGE_METRICS.record_merge_text_shape(shape, remote);
 }
 
 /// Beat-timing instruments (phase-align, `docs/tracks.md`/`docs/midi.md`) —
@@ -742,6 +845,103 @@ mod tests {
             counter_sum(&rm, "kaijutsu.dj.cue_dropped", "reason", "flush"),
             1,
             "the flush-reason drop is discoverable separately from the stale one"
+        );
+    }
+
+    // ========================================================================
+    // CrdtMergeMetrics
+    // ========================================================================
+
+    /// `TextChangeShape::classify` is the actual "did merge do non-trivial
+    /// work" answer the metric exports — pin its three cases directly so a
+    /// classification regression fails here, not only via a missing/miscounted
+    /// exported row.
+    #[test]
+    fn classify_text_change_shapes() {
+        assert_eq!(
+            TextChangeShape::classify("hello", "hello"),
+            TextChangeShape::NoOp
+        );
+        assert_eq!(
+            TextChangeShape::classify("hello", "hello world"),
+            TextChangeShape::TailAppend
+        );
+        assert_eq!(
+            TextChangeShape::classify("", "anything"),
+            TextChangeShape::TailAppend,
+            "empty-to-nonempty is a pure append"
+        );
+        assert_eq!(
+            TextChangeShape::classify("hello world", "hello"),
+            TextChangeShape::NonAppend,
+            "a shrink is not an append even though it's a prefix of the old content"
+        );
+        assert_eq!(
+            TextChangeShape::classify("hello", "jello"),
+            TextChangeShape::NonAppend,
+            "same length, different content — a splice/replace"
+        );
+        assert_eq!(
+            TextChangeShape::classify("hello", "helXo world"),
+            TextChangeShape::NonAppend,
+            "longer but not a prefix match — a mid-content splice, not append"
+        );
+    }
+
+    /// Both `CrdtMergeMetrics` instruments produce the expected exported
+    /// rows: `merge_application` by `outcome`, `merge_text_shape` by `shape`
+    /// and `source`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn records_crdt_merge_metrics_rows_per_instrument() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = CrdtMergeMetrics::new(&provider.meter("test"));
+
+        metrics.record_merge_application(true);
+        metrics.record_merge_application(false);
+        metrics.record_merge_application(false);
+
+        metrics.record_merge_text_shape(TextChangeShape::NoOp, true);
+        metrics.record_merge_text_shape(TextChangeShape::TailAppend, true);
+        metrics.record_merge_text_shape(TextChangeShape::TailAppend, true);
+        metrics.record_merge_text_shape(TextChangeShape::NonAppend, true);
+        metrics.record_merge_text_shape(TextChangeShape::TailAppend, false);
+
+        provider.force_flush().expect("flush");
+        let rm = exporter.get_finished_metrics().expect("metrics exported");
+
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_application", "outcome", "concurrent"),
+            1
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_application", "outcome", "fast_forward"),
+            2
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_text_shape", "shape", "no_op"),
+            1
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_text_shape", "shape", "tail_append"),
+            3,
+            "two remote + one local tail_append all count toward the shape total"
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_text_shape", "shape", "non_append"),
+            1
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_text_shape", "source", "remote"),
+            4,
+            "one no_op + two tail_append + one non_append, all remote"
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.crdt.merge_text_shape", "source", "local"),
+            1,
+            "the local-origin tail_append is discoverable by source too"
         );
     }
 }
