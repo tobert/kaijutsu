@@ -1947,7 +1947,12 @@ mod tests {
         assert_eq!(rects.len(), layout.lines().count());
     }
 
+    /// The reversed `3..1` is the point of the test, not a typo: a caller that
+    /// computes a range backwards must get nothing back rather than a panic or
+    /// a wrapped span. Clippy can't tell a deliberate degenerate range from a
+    /// mistake, so the lint is silenced here and nowhere else.
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
     fn an_empty_range_has_no_rects() {
         let layout = laid_out("aaaa", None);
         assert!(layout_rects(&layout, 2..2).is_empty());
