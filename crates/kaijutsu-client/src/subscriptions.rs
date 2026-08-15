@@ -20,8 +20,8 @@ use crate::kaijutsu_capnp::{
     vfs_activity_events,
 };
 use crate::rpc::{
-    EditorState, SyncState, VfsActivityEntry, parse_block_id, parse_block_snapshot,
-    parse_editor_state, parse_vfs_activity_entry,
+    EditorState, VfsActivityEntry, parse_block_id, parse_block_snapshot, parse_editor_state,
+    parse_vfs_activity_entry,
 };
 
 // ============================================================================
@@ -55,16 +55,6 @@ pub enum ServerEvent {
         context_id: ContextId,
         block: Box<BlockSnapshot>,
         ops: Vec<u8>,
-    },
-    /// CRDT text operations applied to a block's content.
-    BlockTextOps {
-        context_id: ContextId,
-        block_id: BlockId,
-        ops: Vec<u8>,
-        /// Per-context monotonic seq (M2-B2). Consumers can detect gaps
-        /// by tracking the last-seen seq per context and triggering an
-        /// `ops_since` re-fetch when the next seq is non-consecutive.
-        seq_num: u64,
     },
     /// A block's execution status changed (Pending → Running → Done/Error).
     BlockStatusChanged {
@@ -109,14 +99,6 @@ pub enum ServerEvent {
         context_id: ContextId,
         block_id: BlockId,
         after_id: Option<BlockId>,
-    },
-    /// The document's CRDT oplog was compacted (generation bump) — client
-    /// must re-sync from the full oplog. Not to be confused with the
-    /// (deleted) LLM auto-summarization feature — this is oplog compaction,
-    /// a still-live, unrelated mechanism.
-    SyncReset {
-        context_id: ContextId,
-        generation: u64,
     },
     /// CRDT text operations applied to a context's input document.
     InputTextOps {
@@ -164,16 +146,13 @@ pub enum ServerEvent {
     /// than re-deriving it downstream from the `ConnectionStatus` stream).
     ///
     /// This is the *coarse* signal: it marks every cached doc stale so a
-    /// non-joined context re-syncs when next viewed. The actor also eagerly
-    /// re-fetches its joined context and delivers it as [`ServerEvent::ContextResynced`].
+    /// non-joined context re-syncs when next viewed. The finer-grained catch-up
+    /// for the context the client was actively on rides `subscribe_context`'s
+    /// change feed instead (`FeedEvent::Resubscribed` — docs/change-feed.md):
+    /// the eager CRDT-oplog resync push this doc comment used to describe
+    /// (`ServerEvent::ContextResynced`) was deleted in the 2026-08-15 wire flag
+    /// day, superseded by that feed-native path.
     Reconnected,
-    /// The actor re-fetched a context's full CRDT state after a reconnect and is
-    /// delivering it for renderers to merge (`apply_sync_state`) — the eager
-    /// catch-up for the context the client was on, so work done during the outage
-    /// converges without waiting for a view-driven staleness re-fetch. The
-    /// orchestration lives in the actor (which owns the reconnect); the renderer
-    /// just applies. `sync.context_id` names the target.
-    ContextResynced { sync: SyncState },
     /// Render a cue (`kj play`, later the track render seam; docs/pcm.md,
     /// docs/midi.md "Render is a wire cue"). A kernel directive, not a
     /// block-log event — it names no block. A render sink (the Bevy app today)
@@ -1265,82 +1244,6 @@ impl block_events::Server for BlockEventsForwarder {
         Promise::ok(())
     }
 
-    fn on_block_text_ops(
-        self: Rc<Self>,
-        params: block_events::OnBlockTextOpsParams,
-        _results: block_events::OnBlockTextOpsResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
-        self.note_ordered_seq(params.get_sub_seq());
-
-        let context_id = match params.get_context_id() {
-            Ok(s) => match parse_context_id_data(s) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(e),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let block_id = match params.get_block_id() {
-            Ok(b) => match parse_block_id(&b) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(rpc_to_capnp(e)),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let ops = match params.get_ops() {
-            Ok(data) => data.to_vec(),
-            Err(e) => return Promise::err(e),
-        };
-
-        let seq_num = params.get_seq_num();
-        let event = ServerEvent::BlockTextOps {
-            context_id,
-            block_id,
-            ops,
-            seq_num,
-        };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockTextOps event");
-        }
-        Promise::ok(())
-    }
-
-    fn on_sync_reset(
-        self: Rc<Self>,
-        params: block_events::OnSyncResetParams,
-        _results: block_events::OnSyncResetResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
-        self.note_ordered_seq(params.get_sub_seq());
-
-        let context_id = match params.get_context_id() {
-            Ok(s) => match parse_context_id_data(s) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(e),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let generation = params.get_generation();
-
-        let event = ServerEvent::SyncReset {
-            context_id,
-            generation,
-        };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping SyncReset event");
-        }
-        Promise::ok(())
-    }
-
     fn on_input_text_ops(
         self: Rc<Self>,
         params: block_events::OnInputTextOpsParams,
@@ -1561,60 +1464,6 @@ impl block_events::Server for BlockEventsForwarder {
                 Err(e) => Err(capnp::Error::failed(e)),
             }
         })
-    }
-
-    /// Coalesced text ops for one block (the firehose fix). Applying them in
-    /// order is byte-for-byte what the individual `onBlockTextOps` calls would
-    /// have produced — the server batched the CALLS, not the buffers, because
-    /// each blob is an independently-encoded DTE op set.
-    fn on_block_text_ops_batch(
-        self: Rc<Self>,
-        params: block_events::OnBlockTextOpsBatchParams,
-        _results: block_events::OnBlockTextOpsBatchResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
-        self.note_ordered_seq(params.get_sub_seq());
-
-        let context_id = match params.get_context_id() {
-            Ok(s) => match parse_context_id_data(s) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(e),
-            },
-            Err(e) => return Promise::err(e),
-        };
-        let block_id = match params.get_block_id() {
-            Ok(b) => match parse_block_id(&b) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(rpc_to_capnp(e)),
-            },
-            Err(e) => return Promise::err(e),
-        };
-        let ops_list = match params.get_ops() {
-            Ok(l) => l,
-            Err(e) => return Promise::err(e),
-        };
-        let first_seq_num = params.get_first_seq_num();
-
-        for i in 0..ops_list.len() {
-            let ops = match ops_list.get(i) {
-                Ok(d) => d.to_vec(),
-                Err(e) => return Promise::err(e),
-            };
-            let event = ServerEvent::BlockTextOps {
-                context_id,
-                block_id,
-                ops,
-                seq_num: first_seq_num.saturating_add(i as u64),
-            };
-            if self.event_tx.send(event).is_err() {
-                tracing::warn!("Event channel closed, dropping batched BlockTextOps event");
-                break;
-            }
-        }
-        Promise::ok(())
     }
 
     /// THE LAG KICK. The kernel cut this subscription because we could not

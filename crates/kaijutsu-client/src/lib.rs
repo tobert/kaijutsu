@@ -13,8 +13,6 @@ pub mod sftp;
 pub mod share_server;
 pub mod ssh;
 pub mod subscriptions;
-pub mod sync;
-pub mod synced_document;
 pub mod synced_input;
 
 // Generated Cap'n Proto code
@@ -23,16 +21,15 @@ pub mod kaijutsu_capnp {
 }
 
 pub use actor::{
-    ActorHandle, CallError, DocSyncBackend, NotReadyReason, PeerAttachResult, PeerConfig,
-    PeerInvocation, spawn_actor,
+    ActorHandle, CallError, NotReadyReason, PeerAttachResult, PeerConfig, PeerInvocation,
+    spawn_actor,
 };
 pub use rpc::{
     AuthorBlock, Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellValue, SimilarContext, SnapshotNode, SnapshotResult, StagedDriftInfo,
-    SubmitResult, SyncState, ToolResult, ToolSchema, TrackInfo, VersionSnapshot, VfsActivityEntry,
-    VfsFileType,
+    SubmitResult, ToolResult, ToolSchema, TrackInfo, VersionSnapshot, VfsActivityEntry, VfsFileType,
 };
 pub use context_feed::{
     ContextChange, ContextDelivery, ContextMirror, FeedEvent, MirrorError, VersionedChange,
@@ -53,8 +50,6 @@ pub use subscriptions::{
 pub use midi_exchange::{
     MidiExchangeReceiver, MidiExchangeRequest, MidiExchangeSender, MidiExchangeSlot,
 };
-pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
-pub use synced_document::{SyncEffect, SyncedDocument};
 pub use synced_input::SyncedInput;
 
 /// Connect to a server via SSH and return an RPC client

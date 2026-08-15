@@ -6,48 +6,49 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## The last consumer of raw CRDT ops is a heat map (2026-08-15)
+## The well's activity glow wants a derived signal (2026-08-15)
 
-The change feed's flag day is blocked on one thing, and it is not a migration.
+The glow is **disabled**, not broken: `RingActivity`'s decay/ripple math is live
+and unit-tested, and nothing calls `record` (see the module doc in
+`kaijutsu-app/src/view/time_well/activity.rs`).
 
-After ACP, MCP and the app moved onto the feed, **no production code anywhere
-decodes a CRDT operation off the wire**. `SyncedDocument` — the only type that
-can — has zero production callers left: a re-export, its own tests, and one
-`kaijutsu-server` reconnect test.
+What it did before was count kernel events as a pulse — token streaming loudest,
+because it means a model is writing right now. True, and it cost the entire
+kernel-wide event stream to learn: the app received every token of every context
+to choose a brightness. It was also the last consumer of the raw CRDT wire, which
+is how it surfaced.
 
-But `onBlockTextOps` cannot be deleted yet, because of this
-(`kaijutsu-app/src/view/time_well/activity.rs:138`):
+Amy: *"we'll be doing embeddings for a lot of that content kernel side and maybe
+we can emit something more useful and derived."* So the replacement is not the
+same signal on a new pipe. Sketch of the shape, not a decision:
 
-```rust
-ServerEvent::BlockTextOps { context_id, .. } => Some((*context_id, 1.0)),
-```
+- a kernel-wide, low-rate event carrying `(contextId, weight)` at minimum —
+  a **hint**, so it rides the directive path beside `onRenderCue`/`onBeatSync`
+  rather than the change feed; a dropped pulse costs a dimmer glow, never a
+  wrong document, and it must never be batched (docs/midi.md's trade);
+- weight derived from what a context is *about* rather than how chatty it is —
+  embeddings make "these two contexts are working on the same thing" expressible,
+  and the ripple machinery is angle-based, so anything yielding `(context,
+  weight)` drops straight in;
+- the per-context decay ceiling (`CONTEXT_MAX`) and `RIPPLE_LIFETIME` are already
+  Amy-tunable constants; a derived signal should keep them meaningful.
 
-The time well's activity heat uses block events as a **pulse**. It never looks
-at the operations; it counts that one arrived and weights it. Streaming is the
-loudest signal (1.0) precisely because it means a model is writing right now.
-`view/room/activity.rs` and `connection/drift.rs` consume the same events the
-same way.
+To re-enable: feed `RingActivity::record` and re-register an ingest system in
+`time_well/mod.rs`.
 
-So the app currently receives **every token of every context, kernel-wide, to
-draw a glow**. That is worse than it sounds: it is the single largest remaining
-consumer of the wire, and it is spending a firehose on a scalar.
+## `connection/drift.rs` still reads block events off the kernel-wide stream
 
-**The fix is a small event, not a migration.** The feed is deliberately
-per-context (one version counter per context), and the time well is deliberately
-kernel-wide — those do not meet, and should not. What the time well wants is a
-kernel-wide, low-rate *activity* signal: `(contextId, weight)` and nothing else,
-riding the directive path beside `onRenderCue`/`onBeatSync` rather than the
-change feed, since it is a hint and not a fact — a dropped pulse costs a dimmer
-glow, never a wrong document.
+Drift-arrival notifications detect `ServerEvent::BlockInserted` with
+`kind == Drift`. That is a real feature, not decoration, so it kept its source
+through the flag day — the per-block *semantic* events are not CRDT-carrying and
+were not part of that deletion.
 
-Sequence once that exists: emit the activity signal → move
-`time_well/activity.rs`, `room/activity.rs`, `connection/drift.rs` onto it →
-delete `onBlockTextOps`/`onBlockTextOpsBatch`/`onSyncReset`/the per-block
-`BlockEvents` methods/`getContextSync`/`declareEventCapabilities` → compact the
-ordinals with `contrib/compact-capnp-ordinals.py` → delete `SyncedDocument` and
-`SyncManager` (but NOT `SyncedInput`; the compose input is still CRDT-backed by
-design). `BlockEvents` survives, reduced, for the timing directives and MIDI
-exchange — see `docs/change-feed.md`.
+Moving it onto the change feed has a genuine question in it rather than being
+mechanical: the feed is per-context, so only contexts the app follows would
+notify. Today a drift into any context pops a notification. Decide whether that
+scope change is wanted before doing the move — it may be an improvement (drift
+into something you are not watching is arguably not urgent), but it is a
+behavior change, not a port.
 
 ## Two findings from the change-feed step-1 review (2026-08-15, kaibo/DeepSeek)
 

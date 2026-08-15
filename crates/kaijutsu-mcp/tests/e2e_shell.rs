@@ -6,13 +6,15 @@
 //! layer that had no coverage — the in-`src` unit tests only exercise the
 //! local (no-server) input path, and the server-side integration tests use the
 //! raw `kernel.subscribe_output()` channel rather than the MCP's
-//! SyncManager-backed store replica + `execute_and_poll_shell`.
+//! `execute_and_poll_shell`.
 //!
 //! The motivating bug: `shell` returned an empty `stdout` even though
-//! the server produced output, because the completion poll read the store the
-//! instant it saw `Done` — before the background sync listener had applied the
-//! preceding text ops. A faithful e2e is the only thing that catches that
-//! class of replication/ordering regression.
+//! the server produced output, because the completion poll read a local CRDT
+//! mirror the instant it saw `Done` — before the background sync listener had
+//! applied the preceding text ops. `execute_and_poll_shell` now reads
+//! completion straight from the server instead of trusting any local mirror
+//! (see its doc comment), but a faithful e2e is still the only thing that
+//! would catch a regression back into that class of replication/ordering bug.
 
 use std::net::SocketAddr;
 

@@ -37,6 +37,7 @@ use kaijutsu_client::{AuthorBlock, KeySource, SshConfig};
 use kaijutsu_crdt::{PrincipalId, Role};
 use kaijutsu_mcp::{AnalyzeDocumentArgs, Backend, KaijutsuMcp, SearchContextArgs};
 use kaijutsu_server::{SshServer, SshServerConfig};
+use kaijutsu_types::BlockQuery;
 
 /// capnp-rpc requires a current-thread runtime with a LocalSet.
 fn run_local<F: std::future::Future<Output = ()>>(f: F) {
@@ -82,6 +83,7 @@ async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
 /// Auto-register with retry — the freshly-spawned actor needs a moment to
 /// finish connecting before RPCs succeed.
 async fn auto_register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json::Value {
+    let mut last = String::new();
     for _ in 0..100 {
         let raw = mcp
             .register_session_auto(Some(label.to_string()), None)
@@ -89,9 +91,13 @@ async fn auto_register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json:
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             return v;
         }
+        last = raw;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("register_session_auto never became ready");
+    // Carry the last response into the failure: a bare "never became ready"
+    // hides whether the actor was slow, refused, or errored — and this test
+    // spends five seconds proving nothing if it cannot say which.
+    panic!("register_session_auto never became ready; last response: {last}");
 }
 
 /// Kill `mcp`'s event listener (the pulse task) and return its joined
@@ -206,19 +212,23 @@ fn analyze_document_reads_the_server_with_the_event_listener_dead() {
         // Baseline version, straight from the server, before the mutations
         // this process's dead event listener will never see. Read via both
         // RPCs the projected `get_context_version` is meant to agree with.
-        let before_sync = remote
+        // `get_context_sync` (the CRDT-oplog RPC this cross-check used to read
+        // against) was deleted in the 2026-08-15 wire flag day
+        // (docs/change-feed.md); `get_blocks_versioned` reads the same
+        // single-guard version, without an oplog decode anywhere.
+        let (_, before_sync_version) = remote
             .actor
-            .get_context_sync(context_id)
+            .get_blocks_versioned(context_id, BlockQuery::All)
             .await
-            .expect("get_context_sync (before)");
+            .expect("get_blocks_versioned (before)");
         let before_version = remote
             .actor
             .get_context_version(context_id)
             .await
             .expect("get_context_version (before)");
         assert_eq!(
-            before_version, before_sync.version,
-            "get_context_version must agree with get_context_sync's version field"
+            before_version, before_sync_version,
+            "get_context_version must agree with get_blocks_versioned's version"
         );
 
         let principal = PrincipalId::for_agent_session("sess-cold-read-analyze");
@@ -266,19 +276,19 @@ fn analyze_document_reads_the_server_with_the_event_listener_dead() {
         // The reported version must reflect the post-mutation server state,
         // not a frozen pre-kill snapshot, and both version RPCs must still
         // agree after the mutations.
-        let after_sync = remote
+        let (_, after_sync_version) = remote
             .actor
-            .get_context_sync(context_id)
+            .get_blocks_versioned(context_id, BlockQuery::All)
             .await
-            .expect("get_context_sync (after)");
+            .expect("get_blocks_versioned (after)");
         let after_version = remote
             .actor
             .get_context_version(context_id)
             .await
             .expect("get_context_version (after)");
         assert_eq!(
-            after_version, after_sync.version,
-            "get_context_version must still agree with get_context_sync after mutations"
+            after_version, after_sync_version,
+            "get_context_version must still agree with get_blocks_versioned after mutations"
         );
         assert!(
             after_version > before_version,

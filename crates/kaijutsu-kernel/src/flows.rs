@@ -220,7 +220,6 @@ pub trait FlowTopics {
 impl FlowTopics for BlockFlow {
     const TOPICS: &[&'static str] = &[
         "block.inserted",
-        "block.text_ops",
         "block.text_appended",
         "block.text_replaced",
         "block.deleted",
@@ -228,7 +227,6 @@ impl FlowTopics for BlockFlow {
         "block.collapsed",
         "block.excluded",
         "block.moved",
-        "block.sync_reset",
         "block.output",
         "block.metadata",
         "block.context_switched",
@@ -297,34 +295,8 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-    /// CRDT operations for a block's text content.
-    /// Clients should use merge_ops() to apply these.
-    TextOps {
-        /// The context ID.
-        context_id: ContextId,
-        /// The block that was edited.
-        block_id: BlockId,
-        /// Serialized CRDT operations (diamond-types format).
-        /// Arc-wrapped to avoid per-subscriber deep cloning.
-        ops: Arc<[u8]>,
-        /// The context's mutation version **after** this edit, captured
-        /// inside the mutation lock. Lets the server bridge order concurrent
-        /// writers' events before delivery.
-        #[serde(default)]
-        version: u64,
-        /// Origin of this operation (Local or Remote).
-        #[serde(default)]
-        source: OpSource,
-        /// Per-context monotonic sequence number (M2-B2). Lets clients
-        /// detect dropped events when the broadcast channel overflows;
-        /// CRDT data is never lost — only the realtime notification.
-        #[serde(default)]
-        seq_num: u64,
-    },
-
-    /// Text was added at the end of a block's text — the classified,
-    /// CRDT-free replacement for [`BlockFlow::TextOps`] on the append path
-    /// (docs/change-feed.md).
+    /// Text was added at the end of a block's text — a classified, CRDT-free
+    /// event (docs/change-feed.md).
     ///
     /// A subscriber applies this by appending `suffix` to the text it already
     /// holds. It never inspects operation bytes, so it never links the text
@@ -347,8 +319,8 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-    /// A block's text changed in a way that is not an append — the classified,
-    /// CRDT-free replacement for [`BlockFlow::TextOps`] on every other path.
+    /// A block's text changed in a way that is not an append — a classified,
+    /// CRDT-free event (docs/change-feed.md) for every non-append path.
     ///
     /// Carries the whole after-text: a subscriber replaces what it holds. An
     /// insert in the middle, a delete, and a splice are all this variant.
@@ -454,17 +426,6 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-    /// The document's CRDT oplog was compacted (generation bump) — clients
-    /// must re-sync from the full oplog. Not to be confused with the
-    /// (deleted) LLM auto-summarization feature — this is oplog compaction,
-    /// a still-live, unrelated mechanism.
-    SyncReset {
-        /// The context ID.
-        context_id: ContextId,
-        /// New sync generation after compaction.
-        generation: u64,
-    },
-
     /// Block output data changed.
     OutputChanged {
         /// The context ID.
@@ -544,7 +505,6 @@ impl BlockFlow {
     pub fn subject(&self) -> &'static str {
         match self {
             Self::Inserted { .. } => "block.inserted",
-            Self::TextOps { .. } => "block.text_ops",
             Self::TextAppended { .. } => "block.text_appended",
             Self::TextReplaced { .. } => "block.text_replaced",
             Self::Deleted { .. } => "block.deleted",
@@ -552,7 +512,6 @@ impl BlockFlow {
             Self::CollapsedChanged { .. } => "block.collapsed",
             Self::ExcludedChanged { .. } => "block.excluded",
             Self::Moved { .. } => "block.moved",
-            Self::SyncReset { .. } => "block.sync_reset",
             Self::OutputChanged { .. } => "block.output",
             Self::MetadataChanged { .. } => "block.metadata",
             Self::ContextSwitched { .. } => "block.context_switched",
@@ -565,7 +524,6 @@ impl BlockFlow {
     pub fn context_id(&self) -> ContextId {
         match self {
             Self::Inserted { context_id, .. }
-            | Self::TextOps { context_id, .. }
             | Self::TextAppended { context_id, .. }
             | Self::TextReplaced { context_id, .. }
             | Self::Deleted { context_id, .. }
@@ -573,7 +531,6 @@ impl BlockFlow {
             | Self::CollapsedChanged { context_id, .. }
             | Self::ExcludedChanged { context_id, .. }
             | Self::Moved { context_id, .. }
-            | Self::SyncReset { context_id, .. }
             | Self::OutputChanged { context_id, .. }
             | Self::MetadataChanged { context_id, .. }
             | Self::ContextSwitched { context_id, .. }
@@ -586,8 +543,7 @@ impl BlockFlow {
     pub fn block_id(&self) -> Option<&BlockId> {
         match self {
             Self::Inserted { block, .. } => Some(&block.id),
-            Self::TextOps { block_id, .. }
-            | Self::TextAppended { block_id, .. }
+            Self::TextAppended { block_id, .. }
             | Self::TextReplaced { block_id, .. }
             | Self::Deleted { block_id, .. }
             | Self::StatusChanged { block_id, .. }
@@ -596,24 +552,19 @@ impl BlockFlow {
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
             | Self::MetadataChanged { block_id, .. } => Some(block_id),
-            Self::SyncReset { .. }
-            | Self::ContextSwitched { .. }
-            | Self::RenderCue { .. }
-            | Self::BeatSync { .. } => None,
+            Self::ContextSwitched { .. } | Self::RenderCue { .. } | Self::BeatSync { .. } => None,
         }
     }
 
     /// Get the context's post-mutation version for this event, if it carries
-    /// one. `None` for the compaction-generation bump ([`Self::SyncReset`])
-    /// and the three non-block-mutation directives ([`Self::ContextSwitched`],
-    /// [`Self::RenderCue`], [`Self::BeatSync`]) — the server bridge uses this
-    /// to sort a delivery's block-mutation events into publish order before
-    /// sending, since the kernel captures the version under the document
-    /// guard but publishes after releasing it.
+    /// one. `None` for the three non-block-mutation directives
+    /// ([`Self::ContextSwitched`], [`Self::RenderCue`], [`Self::BeatSync`]) —
+    /// the server bridge uses this to sort a delivery's block-mutation events
+    /// into publish order before sending, since the kernel captures the
+    /// version under the document guard but publishes after releasing it.
     pub fn version(&self) -> Option<u64> {
         match self {
             Self::Inserted { version, .. }
-            | Self::TextOps { version, .. }
             | Self::TextAppended { version, .. }
             | Self::TextReplaced { version, .. }
             | Self::Deleted { version, .. }
@@ -623,10 +574,7 @@ impl BlockFlow {
             | Self::Moved { version, .. }
             | Self::OutputChanged { version, .. }
             | Self::MetadataChanged { version, .. } => Some(*version),
-            Self::SyncReset { .. }
-            | Self::ContextSwitched { .. }
-            | Self::RenderCue { .. }
-            | Self::BeatSync { .. } => None,
+            Self::ContextSwitched { .. } | Self::RenderCue { .. } | Self::BeatSync { .. } => None,
         }
     }
 
@@ -642,7 +590,6 @@ impl BlockFlow {
     pub fn source(&self) -> OpSource {
         match self {
             Self::Inserted { source, .. }
-            | Self::TextOps { source, .. }
             | Self::TextAppended { source, .. }
             | Self::TextReplaced { source, .. }
             | Self::Deleted { source, .. }
@@ -652,10 +599,9 @@ impl BlockFlow {
             | Self::Moved { source, .. }
             | Self::OutputChanged { source, .. }
             | Self::MetadataChanged { source, .. } => *source,
-            Self::SyncReset { .. }
-            | Self::ContextSwitched { .. }
-            | Self::RenderCue { .. }
-            | Self::BeatSync { .. } => OpSource::Local,
+            Self::ContextSwitched { .. } | Self::RenderCue { .. } | Self::BeatSync { .. } => {
+                OpSource::Local
+            }
         }
     }
 
@@ -673,7 +619,6 @@ impl BlockFlow {
     pub fn kind(&self) -> BlockFlowKind {
         match self {
             Self::Inserted { .. } => BlockFlowKind::Inserted,
-            Self::TextOps { .. } => BlockFlowKind::TextOps,
             Self::TextAppended { .. } => BlockFlowKind::TextAppended,
             Self::TextReplaced { .. } => BlockFlowKind::TextReplaced,
             Self::Deleted { .. } => BlockFlowKind::Deleted,
@@ -681,7 +626,6 @@ impl BlockFlow {
             Self::CollapsedChanged { .. } => BlockFlowKind::CollapsedChanged,
             Self::ExcludedChanged { .. } => BlockFlowKind::ExcludedChanged,
             Self::Moved { .. } => BlockFlowKind::Moved,
-            Self::SyncReset { .. } => BlockFlowKind::SyncReset,
             Self::OutputChanged { .. } => BlockFlowKind::OutputChanged,
             Self::MetadataChanged { .. } => BlockFlowKind::MetadataChanged,
             Self::ContextSwitched { .. } => BlockFlowKind::ContextSwitched,
@@ -1411,8 +1355,11 @@ pub enum InputDocFlow {
         ops: Arc<[u8]>,
         /// Origin of this operation.
         source: OpSource,
-        /// Per-context monotonic sequence number (M2-B2). Mirrors the
-        /// same gap-detection idiom on `BlockFlow::TextOps`.
+        /// Per-context monotonic sequence number (M2-B2), for the same
+        /// gap-detection idiom the block flow used before its wire event
+        /// (`BlockFlow::TextOps`) was deleted in the 2026-08-15 flag day
+        /// (docs/change-feed.md). The input document is still CRDT-backed by
+        /// design, so this counter stays live.
         #[serde(default)]
         seq_num: u64,
     },
@@ -1916,7 +1863,7 @@ mod tests {
     // Topic isolation — the core design property
     // ====================================================================
 
-    /// Subscribe to "block.status", publish TextOps + StatusChanged,
+    /// Subscribe to "block.status", publish TextAppended + StatusChanged,
     /// assert only StatusChanged received. No discard loop.
     #[tokio::test]
     async fn test_topic_isolation() {
@@ -1926,15 +1873,14 @@ mod tests {
         let ctx = ContextId::new();
         let id = BlockId::new(ctx, PrincipalId::new(), 1);
 
-        // Publish 10 TextOps (high-throughput noise)
+        // Publish 10 TextAppended (high-throughput noise)
         for _ in 0..10 {
-            bus.publish(BlockFlow::TextOps {
+            bus.publish(BlockFlow::TextAppended {
                 context_id: ctx,
                 block_id: id,
-                ops: Arc::from(vec![1u8, 2, 3]),
+                suffix: Arc::from("x"),
                 version: 1,
                 source: OpSource::Local,
-                seq_num: 0,
             });
         }
 
@@ -1947,7 +1893,7 @@ mod tests {
             source: OpSource::Local,
         });
 
-        // status_sub should see exactly 1 message (no TextOps noise)
+        // status_sub should see exactly 1 message (no TextAppended noise)
         let msg = status_sub.try_recv().expect("should receive StatusChanged");
         assert_eq!(msg.topic, "block.status");
         assert!(
@@ -1974,13 +1920,12 @@ mod tests {
             version: 1,
             source: OpSource::Local,
         });
-        bus.publish(BlockFlow::TextOps {
+        bus.publish(BlockFlow::TextAppended {
             context_id: ctx,
             block_id: id,
-            ops: Arc::from(vec![1u8]),
+            suffix: Arc::from("x"),
             version: 2,
             source: OpSource::Local,
-            seq_num: 0,
         });
         bus.publish(BlockFlow::Deleted {
             context_id: ctx,
@@ -2009,9 +1954,12 @@ mod tests {
             version: 6,
             source: OpSource::Local,
         });
-        bus.publish(BlockFlow::SyncReset {
+        bus.publish(BlockFlow::TextReplaced {
             context_id: ctx,
-            generation: 1,
+            block_id: id,
+            content: Arc::from("y"),
+            version: 7,
+            source: OpSource::Local,
         });
 
         // All 7 variants should be received
@@ -2022,7 +1970,7 @@ mod tests {
         assert_eq!(count, 7, "wildcard should receive all 7 topic variants");
     }
 
-    /// Subscribe to "block.inserted", publish 1000 TextOps + 1 Inserted,
+    /// Subscribe to "block.inserted", publish 1000 TextAppended + 1 Inserted,
     /// assert exactly 1 message received.
     #[tokio::test]
     async fn test_exact_subscribe_zero_overhead() {
@@ -2033,13 +1981,12 @@ mod tests {
         let id = BlockId::new(ctx, PrincipalId::new(), 1);
 
         for _ in 0..1000 {
-            bus.publish(BlockFlow::TextOps {
+            bus.publish(BlockFlow::TextAppended {
                 context_id: ctx,
                 block_id: id,
-                ops: Arc::from(vec![0u8]),
+                suffix: Arc::from("x"),
                 version: 1,
                 source: OpSource::Local,
-                seq_num: 0,
             });
         }
 
@@ -2053,7 +2000,7 @@ mod tests {
             source: OpSource::Local,
         });
 
-        // Should get exactly 1 message — no TextOps noise
+        // Should get exactly 1 message — no TextAppended noise
         let msg = sub.try_recv().expect("should receive Inserted");
         assert_eq!(msg.topic, "block.inserted");
         assert!(sub.try_recv().is_none());
@@ -2113,13 +2060,13 @@ mod tests {
 
         // Per-topic interest: the exact subscriber plus the wildcard.
         assert_eq!(bus.topic_subscribers("block.inserted"), 2);
-        assert_eq!(bus.topic_subscribers("block.text_ops"), 1);
+        assert_eq!(bus.topic_subscribers("block.text_appended"), 1);
         assert_eq!(bus.topic_subscribers("nope.nothing"), 0);
 
         // Dropping a subscription reaps it.
         drop(s3);
         assert_eq!(bus.subscriber_count(), 2);
-        assert_eq!(bus.topic_subscribers("block.text_ops"), 0);
+        assert_eq!(bus.topic_subscribers("block.text_appended"), 0);
     }
 
     /// Subscribe to a pattern that matches no topics.
@@ -2557,14 +2504,6 @@ mod tests {
                 version: 1,
                 source: OpSource::Local,
             },
-            BlockFlow::TextOps {
-                context_id: ctx,
-                block_id: id,
-                ops: Arc::from(Vec::<u8>::new()),
-                version: 1,
-                source: OpSource::Local,
-                seq_num: 0,
-            },
             BlockFlow::Deleted {
                 context_id: ctx,
                 block_id: id,
@@ -2598,10 +2537,6 @@ mod tests {
                 after_id: None,
                 version: 1,
                 source: OpSource::Local,
-            },
-            BlockFlow::SyncReset {
-                context_id: ctx,
-                generation: 1,
             },
             BlockFlow::OutputChanged {
                 context_id: ctx,
@@ -2647,7 +2582,6 @@ mod tests {
         for v in &variants {
             match v {
                 BlockFlow::Inserted { .. }
-                | BlockFlow::TextOps { .. }
                 | BlockFlow::TextAppended { .. }
                 | BlockFlow::TextReplaced { .. }
                 | BlockFlow::Deleted { .. }
@@ -2655,7 +2589,6 @@ mod tests {
                 | BlockFlow::CollapsedChanged { .. }
                 | BlockFlow::ExcludedChanged { .. }
                 | BlockFlow::Moved { .. }
-                | BlockFlow::SyncReset { .. }
                 | BlockFlow::OutputChanged { .. }
                 | BlockFlow::MetadataChanged { .. }
                 | BlockFlow::ContextSwitched { .. }
@@ -2762,13 +2695,12 @@ mod tests {
     // ====================================================================
 
     fn text_op(ctx: ContextId, id: BlockId, byte: u8) -> BlockFlow {
-        BlockFlow::TextOps {
+        BlockFlow::TextAppended {
             context_id: ctx,
             block_id: id,
-            ops: Arc::from(vec![byte]),
+            suffix: Arc::from(char::from(byte).to_string()),
             version: byte as u64,
             source: OpSource::Local,
-            seq_num: 0,
         }
     }
 
@@ -2784,8 +2716,8 @@ mod tests {
     #[tokio::test]
     async fn slow_subscriber_is_terminated_and_fast_one_loses_nothing() {
         let bus: FlowBus<BlockFlow> = FlowBus::with_capacities(32, 8);
-        let mut fast = bus.subscribe("block.text_ops");
-        let mut slow = bus.subscribe("block.text_ops");
+        let mut fast = bus.subscribe("block.text_appended");
+        let mut slow = bus.subscribe("block.text_appended");
 
         let ctx = ContextId::new();
         let id = BlockId::new(ctx, PrincipalId::new(), 1);
@@ -2804,10 +2736,14 @@ mod tests {
                         "per-subscription seq is contiguous — no silent gap"
                     );
                     match msg.payload {
-                        BlockFlow::TextOps { ref ops, .. } => {
-                            assert_eq!(ops[0], (i % 251) as u8, "content arrives intact, in order")
+                        BlockFlow::TextAppended { ref suffix, .. } => {
+                            assert_eq!(
+                                suffix.chars().next(),
+                                Some(char::from((i % 251) as u8)),
+                                "content arrives intact, in order"
+                            )
                         }
-                        ref other => panic!("expected TextOps, got {other:?}"),
+                        ref other => panic!("expected TextAppended, got {other:?}"),
                     }
                 }
                 FlowRecv::Terminated(info) => {
@@ -2828,7 +2764,7 @@ mod tests {
         let ev = slow.recv_event().await.expect("a termination is reported");
         match ev {
             FlowRecv::Terminated(info) => {
-                assert_eq!(info.topic, "block.text_ops");
+                assert_eq!(info.topic, "block.text_appended");
                 assert_eq!(info.capacity, 32);
             }
             FlowRecv::Message(_) => panic!("a terminated subscription reports the kick first"),
@@ -2846,7 +2782,7 @@ mod tests {
     #[tokio::test]
     async fn terminated_reads_as_end_of_stream_on_the_option_surface() {
         let bus: FlowBus<BlockFlow> = FlowBus::with_capacities(4, 4);
-        let mut sub = bus.subscribe("block.text_ops");
+        let mut sub = bus.subscribe("block.text_appended");
         let ctx = ContextId::new();
         let id = BlockId::new(ctx, PrincipalId::new(), 1);
         for i in 0..64 {
@@ -2932,7 +2868,7 @@ mod tests {
             );
         }
         let msg = sub.try_recv().expect("then the ordered backlog");
-        assert_eq!(msg.topic, "block.text_ops");
+        assert_eq!(msg.topic, "block.text_appended");
     }
 
     /// One FIFO per subscription means global publish order is preserved
@@ -2971,8 +2907,8 @@ mod tests {
             seen,
             vec![
                 "block.inserted",
-                "block.text_ops",
-                "block.text_ops",
+                "block.text_appended",
+                "block.text_appended",
                 "block.status"
             ],
             "a status patch never overtakes the text ops it follows"
@@ -2985,13 +2921,13 @@ mod tests {
     #[tokio::test]
     async fn seq_is_per_subscription_and_starts_at_one() {
         let bus: FlowBus<BlockFlow> = FlowBus::new(64);
-        let mut early = bus.subscribe("block.text_ops");
+        let mut early = bus.subscribe("block.text_appended");
         let ctx = ContextId::new();
         let id = BlockId::new(ctx, PrincipalId::new(), 1);
 
         bus.publish(text_op(ctx, id, 1));
         bus.publish(text_op(ctx, id, 2));
-        let mut late = bus.subscribe("block.text_ops");
+        let mut late = bus.subscribe("block.text_appended");
         bus.publish(text_op(ctx, id, 3));
 
         let early_seqs: Vec<u64> = std::iter::from_fn(|| early.try_recv().map(|m| m.seq)).collect();
@@ -3011,7 +2947,7 @@ mod tests {
     #[tokio::test]
     async fn termination_is_announced_once_not_once_per_publish() {
         let bus: FlowBus<BlockFlow> = FlowBus::with_capacities(4, 4);
-        let sub = bus.subscribe("block.text_ops");
+        let sub = bus.subscribe("block.text_appended");
         let ctx = ContextId::new();
         let id = BlockId::new(ctx, PrincipalId::new(), 1);
 
@@ -3045,7 +2981,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_bus_ends_waiting_subscriptions() {
         let bus: FlowBus<BlockFlow> = FlowBus::new(8);
-        let mut sub = bus.subscribe("block.text_ops");
+        let mut sub = bus.subscribe("block.text_appended");
         let handle = tokio::spawn(async move { sub.recv().await.is_none() });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(bus);

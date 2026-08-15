@@ -85,7 +85,7 @@ const CONTEXT_FEED_QUEUE: usize = 256;
 use crate::rpc::{
     Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
     KernelInfo, LlmConfigInfo, McpResource, McpToolResult, PeerInfo, ShellValue, SimilarContext,
-    StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
+    StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, PermissionAskEnvelope,
@@ -443,10 +443,6 @@ enum RpcCommand {
         query: BlockQuery,
         reply: oneshot::Sender<Result<(Vec<BlockSnapshot>, u64), CallError>>,
     },
-    GetContextSync {
-        context_id: ContextId,
-        reply: oneshot::Sender<Result<SyncState, CallError>>,
-    },
     GetContextVersion {
         context_id: ContextId,
         reply: oneshot::Sender<Result<u64, CallError>>,
@@ -760,7 +756,6 @@ impl RpcCommand {
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocksVersioned { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubscribeContext { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Execute { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1264,14 +1259,7 @@ impl ActorHandle {
             .await
     }
 
-    #[tracing::instrument(skip(self))]
-    pub async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError> {
-        self.send(|reply| RpcCommand::GetContextSync { context_id, reply })
-            .await
-    }
-
     /// Projected revision of a context's block document, no oplog bytes.
-    /// See `get_context_sync`'s doc comment for the seam this replaces.
     #[tracing::instrument(skip(self))]
     pub async fn get_context_version(&self, context_id: ContextId) -> Result<u64, CallError> {
         self.send(|reply| RpcCommand::GetContextVersion { context_id, reply })
@@ -1837,37 +1825,6 @@ impl ActorHandle {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// DocSyncBackend (fetch seam, historically a doc-sync test seam)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Narrow seam over the one RPC a document-sync task needs: fetch the
-/// server's authoritative snapshot.
-///
-/// `ActorHandle` implements this as a thin passthrough to its own
-/// `get_context_sync` method. The seam let a generic consumer be exercised
-/// against a fake with controllable timing and call-counting in unit tests,
-/// instead of every race condition needing a real ephemeral SSH server +
-/// kernel — `kaijutsu-mcp`'s sole-writer doc task was that consumer until
-/// docs/crdt-position-2026-08.md slice 4 deleted it along with the mirror it
-/// maintained. Its `push_ops` twin was dropped in the 2026-08-15 flag day
-/// that retired `pushOps` itself (zero production callers; concurrent merge
-/// into kernel documents is now structurally impossible). Whether this trait
-/// itself still earns its keep with no generic consumer left is an open,
-/// separate question (same doc); it is NOT retired here. Mirrors the
-/// `CasFetch` seam in `sftp.rs`.
-#[async_trait::async_trait]
-pub trait DocSyncBackend: Send + Sync {
-    async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError>;
-}
-
-#[async_trait::async_trait]
-impl DocSyncBackend for ActorHandle {
-    async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError> {
-        ActorHandle::get_context_sync(self, context_id).await
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // RpcActor (internal, !Send, runs in spawn_local)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -2221,36 +2178,19 @@ impl RpcActor {
         // Tell renderers a reconnect happened so they re-sync the view the
         // re-subscribed stream can't backfill. Best-effort: no subscribers
         // (e.g. a headless client) is fine.
+        //
+        // The eager CRDT-oplog resync push that used to live here
+        // (`get_context_sync` → `ServerEvent::ContextResynced { sync: SyncState }`)
+        // was deleted in the 2026-08-15 wire flag day (docs/change-feed.md) —
+        // it is superseded, not merely removed. `subscribe_context`'s change
+        // feed already re-subscribes on every new connection and sends
+        // `FeedEvent::Resubscribed` first (see its doc comment), which is the
+        // consumer's cue to throw away its stale `ContextMirror` and refetch a
+        // snapshot with `get_blocks_versioned` — the same "converge on what the
+        // stream missed during the outage" job, without decoding a CRDT
+        // oplog. `document_store.rs` already implements that path.
         if is_reconnect {
             let _ = self.event_tx.send(ServerEvent::Reconnected);
-
-            // Eagerly re-fetch the joined context's full CRDT state and deliver
-            // it, so renderers converge on what the stream missed during the
-            // outage without waiting for a view-driven staleness re-fetch. The
-            // actor owns the reconnect, so this orchestration belongs here. The
-            // block stream was already re-subscribed in the handshake, so the
-            // fetch reflects the current truth. Fire-and-forget on the new
-            // connection; a failure just falls back to the coarse `Reconnected`
-            // signal renderers already react to.
-            if let Some(ctx) = self.joined_context_id {
-                let kernel = self
-                    .connection
-                    .as_ref()
-                    .expect("connection set above")
-                    .kernel
-                    .clone();
-                let event_tx = self.event_tx.clone();
-                tokio::task::spawn_local(async move {
-                    match kernel.get_context_sync(ctx).await {
-                        Ok(sync) => {
-                            let _ = event_tx.send(ServerEvent::ContextResynced { sync });
-                        }
-                        Err(e) => {
-                            log::warn!("post-reconnect resync fetch failed for {ctx}: {e}")
-                        }
-                    }
-                });
-            }
         }
 
         self.broadcast_state();
@@ -3134,15 +3074,6 @@ async fn connect_handshake(
     let turn_client: crate::kaijutsu_capnp::turn_events::Client =
         capnp_rpc::new_client(turn_fwd);
 
-    // Declare our push capabilities BEFORE subscribing: a bridge reads the
-    // flags when it starts, so a late declaration would leave this connection's
-    // stream in the conservative shape for its whole life. Non-fatal on
-    // failure — an older kernel simply doesn't have the method, and everything
-    // still works, just without coalescing.
-    if let Err(e) = kernel.declare_event_capabilities(true, true).await {
-        log::debug!("declare_event_capabilities unavailable (older kernel?): {e}");
-    }
-
     let subscribe_block = kernel.subscribe_blocks_filtered(block_client, &filter, &instance);
     let subscribe_resource = kernel.subscribe_mcp_resources(resource_client, &instance);
     let subscribe_editor = kernel.subscribe_editor(editor_client);
@@ -3349,9 +3280,6 @@ async fn dispatch_kernel_command(
                 k,
                 k.get_blocks_versioned(context_id, &query)
             );
-        }
-        RpcCommand::GetContextSync { context_id, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.get_context_sync(context_id));
         }
         RpcCommand::GetContextVersion { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_context_version(context_id));

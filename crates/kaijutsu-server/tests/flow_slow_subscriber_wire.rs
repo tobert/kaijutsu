@@ -32,14 +32,19 @@ use capnp::capability::Promise;
 use common::{connect_client, run_local, start_server};
 use kaijutsu_client::kaijutsu_capnp::block_events;
 
-const RC_PATH: &str = "/etc/rc/coder/create/S00-stance.kai";
-
 /// Shrunk so a modest burst can overflow it. The production default is 8192
 /// (see `kaijutsu_kernel::flows::DEFAULT_ORDERED_QUEUE_DEPTH`).
 const TEST_QUEUE_DEPTH: &str = "24";
 
 /// Comfortably more than `TEST_QUEUE_DEPTH`, so the queue must overflow.
-const BURST_KEYS: usize = 120;
+///
+/// One `authorBlock` per burst unit — `onBlockInserted` events, not text
+/// edits: the 2026-08-15 wire flag day (docs/change-feed.md) stopped
+/// classified text changes from riding the `BlockEvents` bridge at all (they
+/// go out on `ContextObserver` instead, which this test's victim never
+/// subscribes to), so a burst of per-character edits no longer reaches this
+/// queue and can't be the overflow driver anymore.
+const BURST_BLOCKS: usize = 120;
 
 #[derive(Default)]
 struct Kick {
@@ -59,14 +64,6 @@ impl block_events::Server for WedgedClient {
     /// Never resolves. The server's per-callback timeout eventually gives up on
     /// each one, but events keep piling into our queue in the meantime — which
     /// is the whole point.
-    fn on_block_text_ops(
-        self: Rc<Self>,
-        _params: block_events::OnBlockTextOpsParams,
-        _results: block_events::OnBlockTextOpsResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::from_future(std::future::pending())
-    }
-
     fn on_block_inserted(
         self: Rc<Self>,
         _params: block_events::OnBlockInsertedParams,
@@ -127,13 +124,12 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
     run_local(async {
         let addr = start_server().await;
 
-        // The victim: subscribes, then never answers a push.
+        // The victim: subscribes, then never answers a push. No capability
+        // negotiation anymore (the flag day deleted `declareEventCapabilities`
+        // — a client that implements `BlockEvents` is assumed to implement
+        // `onSubscriptionTerminated`, so the kick is unconditional now).
         let victim = connect_client(addr).await;
         let (victim_kernel, _) = victim.bind_kernel().await.unwrap();
-        victim_kernel
-            .declare_event_capabilities(false, true)
-            .await
-            .expect("declare — we want the kick, not the batching");
 
         let kick = Rc::new(RefCell::new(Kick::default()));
         let callback: block_events::Client = capnp_rpc::new_client(WedgedClient { kick: kick.clone() });
@@ -151,21 +147,32 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
         let driver = connect_client(addr).await;
         let (driver_kernel, _) = driver.bind_kernel().await.unwrap();
 
-        let opened = driver_kernel.editor_open(RC_PATH).await.expect("editor_open");
-        let session = opened.session;
-        driver_kernel
-            .editor_keys(session, "i")
+        let context_id = driver_kernel
+            .create_context("flow-slow-subscriber-burst")
             .await
-            .expect("insert mode");
-        let chars: Vec<String> = (0..BURST_KEYS)
-            .map(|i| char::from(b'a' + (i % 26) as u8).to_string())
+            .expect("create_context");
+        driver_kernel
+            .join_context(context_id, "flow-slow-subscriber-burst")
+            .await
+            .expect("join_context");
+        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("flow-slow-subscriber-burst");
+        // Materialize the owned `AuthorBlock`s first so they outlive the
+        // futures borrowing them across the batched `join_all` below —
+        // building each `AuthorBlock` inline inside the future expression
+        // borrows a temporary that would be dropped before the await.
+        let blocks: Vec<_> = (0..BURST_BLOCKS)
+            .map(|i| {
+                kaijutsu_client::AuthorBlock::text(
+                    context_id,
+                    principal,
+                    kaijutsu_crdt::Role::User,
+                    format!("burst block {i}"),
+                )
+            })
             .collect();
-        let calls: Vec<_> = chars
-            .iter()
-            .map(|ch| driver_kernel.editor_keys(session, ch))
-            .collect();
+        let calls: Vec<_> = blocks.iter().map(|b| driver_kernel.author_block(b)).collect();
         for r in futures::future::join_all(calls).await {
-            r.expect("editor_keys");
+            r.expect("author_block");
         }
 
         // The bridge is parked on a callback that never resolves; it discovers
@@ -198,7 +205,7 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
                 "the kick must name the reason, not just vanish"
             );
             assert_eq!(
-                k.topic, "block.text_ops",
+                k.topic, "block.inserted",
                 "the kick names the topic whose event could not be enqueued"
             );
             assert_eq!(
@@ -220,6 +227,5 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
             .list_contexts()
             .await
             .expect("the healthy connection keeps working");
-        driver_kernel.editor_quit(session).await.expect("cleanup");
     });
 }

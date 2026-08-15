@@ -1241,15 +1241,19 @@ fn test_active_ring_cap_enforced_over_rpc() {
 }
 
 /// `getContextVersion` (docs/crdt-position-2026-08.md) is the projected,
-/// oplog-free counterpart to `getContextSync`'s `version` field — added so a
-/// caller that only needs staleness/gap detection never has to decode a
-/// `SyncState` it would otherwise throw away. The two must never diverge:
-/// they both read `DocumentEntry::version()` off the same `BlockStore` entry
-/// (`documents.version()` vs `documents.context_sync_state()`), so this
-/// equality assertion is the one that would actually fail if a future change
-/// split them onto different sources of truth.
+/// oplog-free counterpart to `getBlocks`'s `version` field — added so a
+/// caller that only needs staleness/gap detection never has to fetch (or, in
+/// the pre-flag-day world, decode) anything it would otherwise throw away.
+/// The two must never diverge: they both read `DocumentEntry::version()` off
+/// the same `BlockStore` entry (`documents.version()` vs
+/// `documents.query_versioned()`), so this equality assertion is the one that
+/// would actually fail if a future change split them onto different sources
+/// of truth. (Originally cross-checked against the now-deleted
+/// `getContextSync`'s version field — 2026-08-15 wire flag day,
+/// docs/change-feed.md — `get_blocks_versioned` is the surviving surface with
+/// the same property.)
 #[test]
-fn test_get_context_version_matches_get_context_sync() {
+fn test_get_context_version_matches_get_blocks_versioned() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
@@ -1262,10 +1266,13 @@ fn test_get_context_version_matches_get_context_sync() {
             .unwrap();
 
         let v0 = kernel.get_context_version(context_id).await.unwrap();
-        let sync0 = kernel.get_context_sync(context_id).await.unwrap();
+        let (_, blocks_v0) = kernel
+            .get_blocks_versioned(context_id, &kaijutsu_types::BlockQuery::All)
+            .await
+            .unwrap();
         assert_eq!(
-            v0, sync0.version,
-            "a fresh context's getContextVersion must match getContextSync's version field"
+            v0, blocks_v0,
+            "a fresh context's getContextVersion must match getBlocksVersioned's version field"
         );
 
         // A block-mutating op must bump the version, and both RPCs must
@@ -1282,14 +1289,17 @@ fn test_get_context_version_matches_get_context_sync() {
             .unwrap();
 
         let v1 = kernel.get_context_version(context_id).await.unwrap();
-        let sync1 = kernel.get_context_sync(context_id).await.unwrap();
+        let (_, blocks_v1) = kernel
+            .get_blocks_versioned(context_id, &kaijutsu_types::BlockQuery::All)
+            .await
+            .unwrap();
         assert!(
             v1 >= v0,
             "version must be monotonically non-decreasing across a block-mutating op: {v0} -> {v1}"
         );
         assert_eq!(
-            v1, sync1.version,
-            "getContextVersion must still match getContextSync's version after a mutation \
+            v1, blocks_v1,
+            "getContextVersion must still match getBlocksVersioned's version after a mutation \
              — the point of this test is that it would fail if the two diverged"
         );
     });

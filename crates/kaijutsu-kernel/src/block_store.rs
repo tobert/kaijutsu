@@ -201,9 +201,6 @@ pub struct BlockStore {
     input_journal_seqs: DashMap<ContextId, AtomicU64>,
     /// Per-input-doc uncompacted op counts (for compaction trigger).
     input_uncompacted: DashMap<ContextId, AtomicU64>,
-    /// Per-context monotonic seq for `BlockFlow::TextOps` (M2-B2).
-    /// Allocated on first emit; lets clients detect overflow gaps.
-    block_text_seqs: DashMap<ContextId, AtomicU64>,
     /// Per-context monotonic seq for `InputDocFlow::TextOps` (M2-B2).
     input_text_seqs: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
@@ -249,7 +246,6 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: None,
             persistent: false,
@@ -270,7 +266,6 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: None,
             persistent: false,
@@ -295,7 +290,6 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: Some(db),
             persistent: true,
@@ -326,7 +320,6 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: Some(db),
             persistent: true,
@@ -376,19 +369,10 @@ impl BlockStore {
         }
     }
 
-    /// Allocate the next monotonic seq number for `BlockFlow::TextOps` in
-    /// the given context. Per-context (not per-block) — gap detection is
-    /// at context granularity, which is enough to trigger an `ops_since`
+    /// Allocate the next monotonic seq number for `InputDocFlow::TextOps` in
+    /// the given context. Per-context (not per-block) — gap detection is at
+    /// context granularity, which is enough to trigger an `ops_since`
     /// re-fetch when the broadcast channel overflows.
-    fn next_block_text_seq(&self, context_id: ContextId) -> u64 {
-        let counter = self
-            .block_text_seqs
-            .entry(context_id)
-            .or_insert_with(|| AtomicU64::new(0));
-        counter.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Same as `next_block_text_seq` but for input-doc text ops.
     fn next_input_text_seq(&self, context_id: ContextId) -> u64 {
         let counter = self
             .input_text_seqs
@@ -1631,7 +1615,7 @@ impl BlockStore {
         delete: usize,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let (ops, ops_bytes, change, after_text, version) = {
+        let (ops, change, after_text, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1658,24 +1642,13 @@ impl BlockStore {
                 )),
             };
             let version = entry.version();
-            // Get ops since frontier (the edit we just applied)
+            // Get ops since frontier (the edit we just applied) — journaled
+            // for the durable oplog; never shipped to the wire.
             let ops = entry.doc.ops_since(&frontier);
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (ops, ops_bytes, change, after_text, version)
+            (ops, change, after_text, version)
         };
         self.journal_op(context_id, ops)?;
 
-        // Emit CRDT ops for proper sync
-        let seq_num = self.next_block_text_seq(context_id);
-        self.emit(BlockFlow::TextOps {
-            context_id,
-            block_id: *block_id,
-            ops: Arc::from(ops_bytes),
-            version,
-            source: OpSource::Local,
-            seq_num,
-        });
         self.emit_text_change(context_id, block_id, change, after_text, insert, version);
 
         Ok(())
@@ -2085,7 +2058,7 @@ impl BlockStore {
         text: &str,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let (ops, ops_bytes, version) = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2096,24 +2069,13 @@ impl BlockStore {
             entry.doc.append_text(block_id, text)?;
             entry.touch(effective_agent);
             let version = entry.version();
-            // Get ops since frontier (the append we just applied)
+            // Get ops since frontier (the append we just applied) — journaled
+            // for the durable oplog; never shipped to the wire.
             let ops = entry.doc.ops_since(&frontier);
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (ops, ops_bytes, version)
+            (ops, version)
         };
         self.journal_op(context_id, ops)?;
 
-        // Emit CRDT ops for proper sync
-        let seq_num = self.next_block_text_seq(context_id);
-        self.emit(BlockFlow::TextOps {
-            context_id,
-            block_id: *block_id,
-            ops: Arc::from(ops_bytes),
-            version,
-            source: OpSource::Local,
-            seq_num,
-        });
         // Classified as an append *by construction*, not by this function's
         // name (docs/change-feed.md rules 4-5): the primitive underneath
         // computes the end position and deletes nothing, so it satisfies
@@ -2335,17 +2297,6 @@ impl BlockStore {
             .get(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok(snapshots_by_filter(&entry.doc, filter))
-    }
-
-    /// Get CRDT sync state (serialized ops + version) without blocks.
-    pub fn context_sync_state(&self, context_id: ContextId) -> BlockStoreResult<(Vec<u8>, u64)> {
-        let entry = self
-            .get(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        let snapshot = entry.doc.snapshot();
-        let bytes = codec::encode(&snapshot)
-            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-        Ok((bytes, entry.version()))
     }
 
     /// Get the full text content of a document.
@@ -3857,33 +3808,28 @@ mod tests {
     }
 
     #[test]
-    fn test_text_ops_seq_monotonic_per_context() {
-        // M2-B2: each emitted TextOps event carries a per-context monotonic
-        // seq so clients can detect dropped broadcasts.
+    fn test_input_text_ops_seq_monotonic_per_context() {
+        // M2-B2: each emitted InputDocFlow::TextOps event carries a
+        // per-context monotonic seq so clients can detect dropped
+        // broadcasts. (The parallel BlockFlow::TextOps counter was deleted
+        // in the 2026-08-15 wire flag day along with the event itself —
+        // docs/change-feed.md.)
         let store = BlockStore::new(test_agent());
         let ctx = ContextId::new();
         store
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
-        let s0 = store.next_block_text_seq(ctx);
-        let s1 = store.next_block_text_seq(ctx);
-        let s2 = store.next_block_text_seq(ctx);
-        assert_eq!(s0, 0);
-        assert_eq!(s1, 1);
-        assert_eq!(s2, 2);
+        let i0 = store.next_input_text_seq(ctx);
+        let i1 = store.next_input_text_seq(ctx);
+        assert_eq!(i0, 0);
+        assert_eq!(i1, 1);
 
         // Different context starts at 0 again.
         let other = ContextId::new();
         store
             .create_document(other, DocumentKind::Conversation, None)
             .unwrap();
-        assert_eq!(store.next_block_text_seq(other), 0);
-
-        // Input text seq is its own counter.
-        let i0 = store.next_input_text_seq(ctx);
-        let i1 = store.next_input_text_seq(ctx);
-        assert_eq!(i0, 0);
-        assert_eq!(i1, 1);
+        assert_eq!(store.next_input_text_seq(other), 0);
     }
 
     #[test]
@@ -4671,14 +4617,11 @@ mod tests {
             let client_frontier = client.frontier();
             store.append_text(ctx, &block_id, chunk).unwrap();
 
-            // An append publishes two events while the CRDT wire path and the
-            // classified change feed coexist: the `TextOps` this test is about,
-            // and the `TextAppended` the feed will carry. Both, in that order.
-            let msg = sub.try_recv().expect("should receive event");
-            match msg.payload {
-                BlockFlow::TextOps { .. } => {}
-                _ => panic!("expected TextOps event, got {:?}", msg.payload),
-            }
+            // An append publishes the classified `TextAppended` event (the
+            // `TextOps` wire event this test used to check alongside it was
+            // deleted in the 2026-08-15 flag day, docs/change-feed.md — the
+            // CRDT ops below are still journaled for `ops_since`/`merge_ops`,
+            // just no longer shipped as a wire event).
             let msg = sub.try_recv().expect("should receive the classified event");
             match msg.payload {
                 BlockFlow::TextAppended { ref suffix, .. } => assert_eq!(&**suffix, chunk),
@@ -6037,8 +5980,8 @@ mod tests {
         Replaced { content: String, version: u64 },
     }
 
-    /// Pull every classified text event a subscription has queued, dropping the
-    /// `TextOps` events that still ride alongside them until the feed lands.
+    /// Pull every classified text event a subscription has queued (ignoring
+    /// any other `BlockFlow` variant on the same subscription).
     fn drain_text_changes(
         sub: &mut crate::flows::Subscription<BlockFlow>,
         block_id: &BlockId,
@@ -6473,14 +6416,11 @@ mod tests {
     /// Drain every event the bus has queued right now, assert they all carry
     /// the SAME version and that it exceeds `last_version`, and return it.
     ///
-    /// A mutation that emits more than one event today (a text edit's
-    /// `TextOps` and its classified `TextAppended`/`TextReplaced` sibling,
-    /// docs/change-feed.md) legitimately shares one version between them —
-    /// they are captured under a single `entry.touch()` inside a single
-    /// mutation-lock guard, i.e. one accepted mutation, not two. That pairing
-    /// is deliberate and expected to diverge in a later slice; this helper
-    /// pins today's actual behavior rather than a version-per-event
-    /// assumption that would be wrong right now.
+    /// A mutation that emits more than one event legitimately shares one
+    /// version between them — they are captured under a single
+    /// `entry.touch()` inside a single mutation-lock guard, i.e. one accepted
+    /// mutation, not two. This helper pins that behavior rather than a
+    /// version-per-event assumption that would be wrong.
     fn drain_one_mutation(
         sub: &mut crate::flows::Subscription<BlockFlow>,
         last_version: u64,
@@ -6572,13 +6512,11 @@ mod tests {
         store.set_output(ctx, &a, Some(&output)).unwrap();
         last_version = drain_one_mutation(&mut sub, last_version, "set_output");
 
-        // Ends at the current character count — classified as an append, one
-        // event pair (`TextOps` + `TextAppended`), one version.
+        // Ends at the current character count — classified as an append.
         store.append_text(ctx, &a, "!").unwrap();
         last_version = drain_one_mutation(&mut sub, last_version, "append_text");
 
-        // Inserts at position 0, not the end — classified as a replace, one
-        // event pair (`TextOps` + `TextReplaced`), one version.
+        // Inserts at position 0, not the end — classified as a replace.
         store.edit_text(ctx, &a, 0, "X", 0).unwrap();
         last_version = drain_one_mutation(&mut sub, last_version, "edit_text");
 

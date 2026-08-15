@@ -1037,7 +1037,7 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // Block Queries (getBlocks / getContextSync)
+    // Block Queries
     // =========================================================================
 
     /// Fetch blocks by query (all, byIds, or byFilter).
@@ -1087,33 +1087,8 @@ impl KernelHandle {
         Ok((blocks, version))
     }
 
-    /// Fetch CRDT sync state (ops + version) without blocks.
-    #[tracing::instrument(skip(self), name = "rpc_client.get_context_sync")]
-    pub async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, RpcError> {
-        let mut request = self.kernel.get_context_sync_request();
-        request.get().set_context_id(context_id.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let r = response.get()?;
-        let context_id = parse_context_id(r.get_context_id()?)?;
-        let ops = r.get_ops().map(|d| d.to_vec()).unwrap_or_default();
-        let version = r.get_version();
-        Ok(SyncState {
-            context_id,
-            ops,
-            version,
-        })
-    }
-
-    /// Fetch just the projected revision of a context's block document — the
-    /// semantic counterpart to `get_context_sync`'s `version` field, without
-    /// the oplog bytes. For callers that only need staleness/gap detection
-    /// and would otherwise decode a `SyncState` just to throw the ops away.
+    /// Fetch just the projected revision of a context's block document, with
+    /// no oplog bytes. For callers that only need staleness/gap detection.
     #[tracing::instrument(skip(self), name = "rpc_client.get_context_version")]
     pub async fn get_context_version(&self, context_id: ContextId) -> Result<u64, RpcError> {
         let mut request = self.kernel.get_context_version_request();
@@ -1230,31 +1205,6 @@ impl KernelHandle {
             let mut fb = params.reborrow().init_filter();
             set_block_event_filter_builder(&mut fb, filter);
             params.set_instance(instance);
-        }
-        request.send().promise.await?;
-        Ok(())
-    }
-
-    /// Declare what this client's push subscriptions can handle.
-    ///
-    /// Call BEFORE subscribing — a server-side bridge reads the flags once,
-    /// when it starts. Opt-in by design: a kernel that never hears from us
-    /// sends the conservative event shapes, which is exactly what keeps an
-    /// older binary working against a newer kernel and vice versa.
-    ///
-    /// This build implements both `onBlockTextOpsBatch` (coalesced text ops)
-    /// and `onSubscriptionTerminated` (the lag kick), so it declares both.
-    #[tracing::instrument(skip(self), name = "rpc_client.declare_event_capabilities")]
-    pub async fn declare_event_capabilities(
-        &self,
-        text_ops_batch: bool,
-        subscription_terminated: bool,
-    ) -> Result<(), RpcError> {
-        let mut request = self.kernel.declare_event_capabilities_request();
-        {
-            let mut params = request.get();
-            params.set_text_ops_batch(text_ops_batch);
-            params.set_subscription_terminated(subscription_terminated);
         }
         request.send().promise.await?;
         Ok(())
@@ -3041,9 +2991,6 @@ fn set_block_event_filter_builder(
                     kaijutsu_types::BlockFlowKind::Inserted => {
                         crate::kaijutsu_capnp::BlockFlowKind::Inserted
                     }
-                    kaijutsu_types::BlockFlowKind::TextOps => {
-                        crate::kaijutsu_capnp::BlockFlowKind::TextOps
-                    }
                     kaijutsu_types::BlockFlowKind::TextAppended => {
                         crate::kaijutsu_capnp::BlockFlowKind::TextAppended
                     }
@@ -3064,9 +3011,6 @@ fn set_block_event_filter_builder(
                     }
                     kaijutsu_types::BlockFlowKind::Moved => {
                         crate::kaijutsu_capnp::BlockFlowKind::Moved
-                    }
-                    kaijutsu_types::BlockFlowKind::SyncReset => {
-                        crate::kaijutsu_capnp::BlockFlowKind::SyncReset
                     }
                     kaijutsu_types::BlockFlowKind::OutputChanged => {
                         crate::kaijutsu_capnp::BlockFlowKind::OutputChanged
@@ -4079,16 +4023,6 @@ pub enum ShellValue {
 // ============================================================================
 // Block Types
 // ============================================================================
-
-/// CRDT sync state (ops + version, no blocks).
-///
-/// Used by `get_context_sync` for lightweight CRDT bootstrapping and resync.
-#[derive(Debug, Clone)]
-pub struct SyncState {
-    pub context_id: ContextId,
-    pub ops: Vec<u8>,
-    pub version: u64,
-}
 
 /// Result from submitting the input document (submitInput @78).
 #[derive(Debug, Clone)]

@@ -717,11 +717,14 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
 /// Spawn the server-lifetime editor reconciler — the remote-merge half of the
 /// editor push channel (docs/vi.md step 1b).
 ///
-/// It drains the kernel's `block.text_ops` FlowBus and, for each edited block,
-/// reconciles any open editor session bound to that block against the block's
-/// merged text and pushes the new state. A session's own mirror write is a
-/// no-op (its buffer already equals the block), so this only fires for *other*
-/// writers — a sibling editor session, an MCP file edit, a streaming turn.
+/// It drains the kernel's classified text-change topics
+/// (`block.text_appended` / `block.text_replaced`, docs/change-feed.md — the
+/// wire-deleted `block.text_ops` used to carry this) and, for each edited
+/// block, reconciles any open editor session bound to that block against the
+/// block's merged text and pushes the new state. A session's own mirror write
+/// is a no-op (its buffer already equals the block), so this only fires for
+/// *other* writers — a sibling editor session, an MCP file edit, a streaming
+/// turn.
 ///
 /// One reconciler for the whole server: the block flow is a broadcast, so a
 /// per-connection subscriber would reconcile each edit once per connection. The
@@ -743,21 +746,36 @@ pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
             let kernel = &registry.kernel;
-            let mut sub = kernel.kernel.block_flows().subscribe("block.text_ops");
+            let mut appended_sub = kernel.kernel.block_flows().subscribe("block.text_appended");
+            let mut replaced_sub = kernel.kernel.block_flows().subscribe("block.text_replaced");
             log::info!("Editor reconciler online");
-            while let Some(msg) = sub.recv().await {
-                if let BlockFlow::TextOps {
-                    context_id,
-                    ref block_id,
-                    ..
-                } = msg.payload
-                {
-                    kernel
-                        .kernel
-                        .editor_reconcile_block(context_id, *block_id, &kernel.documents);
-                }
+            loop {
+                let (context_id, block_id) = tokio::select! {
+                    msg = appended_sub.recv() => {
+                        let Some(msg) = msg else {
+                            log::warn!("Editor reconciler: text_appended flow closed, exiting");
+                            break;
+                        };
+                        let BlockFlow::TextAppended { context_id, block_id, .. } = msg.payload else {
+                            continue;
+                        };
+                        (context_id, block_id)
+                    }
+                    msg = replaced_sub.recv() => {
+                        let Some(msg) = msg else {
+                            log::warn!("Editor reconciler: text_replaced flow closed, exiting");
+                            break;
+                        };
+                        let BlockFlow::TextReplaced { context_id, block_id, .. } = msg.payload else {
+                            continue;
+                        };
+                        (context_id, block_id)
+                    }
+                };
+                kernel
+                    .kernel
+                    .editor_reconcile_block(context_id, block_id, &kernel.documents);
             }
-            log::warn!("Editor reconciler: block flow closed, exiting");
         });
     }) {
         log::error!("Failed to spawn editor-reconciler thread: {e}");
@@ -802,9 +820,6 @@ pub struct ConnectionState {
     /// the actor's existing reconnect-with-full-resync path is already the
     /// tested route back to a consistent view.
     disconnect: CancellationToken,
-    /// What this connection's push subscriptions can handle, as declared via
-    /// `declareEventCapabilities`. Conservative until the client says otherwise.
-    event_caps: EventCapabilities,
     /// The kernel's MIDI presence store, attached the first time this
     /// connection reports presence (`docs/midi-next.md` "Presence is
     /// sink-fed"). Held so `Drop` can reap what this connection claimed —
@@ -837,7 +852,6 @@ impl ConnectionState {
             elicitation_subscribers: Vec::new(),
             conn_cancel: CancellationToken::new(),
             disconnect: CancellationToken::new(),
-            event_caps: EventCapabilities::default(),
             midi_presence: None,
             midi_exchange: None,
         }
@@ -883,17 +897,6 @@ impl ConnectionState {
     /// [`ConnectionState::disconnect`]). `run_rpc` awaits it.
     pub fn disconnect_token(&self) -> CancellationToken {
         self.disconnect.clone()
-    }
-
-    /// What this connection's push subscriptions can handle.
-    pub fn event_capabilities(&self) -> EventCapabilities {
-        self.event_caps
-    }
-
-    /// Record the client's declared push capabilities. Read when a bridge
-    /// starts, so a client must declare before it subscribes.
-    pub fn set_event_capabilities(&mut self, caps: EventCapabilities) {
-        self.event_caps = caps;
     }
 
     /// Get the connection's active context, or error if none joined.
@@ -3085,13 +3088,9 @@ impl kernel::Server for KernelImpl {
             // fires it to take the whole connection down when this subscriber
             // falls behind, which is what makes the client reconnect and
             // resync.
-            let (conn_cancel, disconnect, caps) = {
+            let (conn_cancel, disconnect) = {
                 let conn = self.connection.borrow();
-                (
-                    conn.cancel_token(),
-                    conn.disconnect_token(),
-                    conn.event_capabilities(),
-                )
+                (conn.cancel_token(), conn.disconnect_token())
             };
 
             // Cap'n Proto callbacks are not Send, so spawn_local.
@@ -3104,7 +3103,6 @@ impl kernel::Server for KernelImpl {
                     block_sub,
                     input_sub,
                     None,
-                    caps,
                     kernel_id,
                     conn_cancel,
                     disconnect,
@@ -4578,32 +4576,6 @@ impl kernel::Server for KernelImpl {
     /// RPC. A dead entry (channel closed) is pruned reactively by the
     /// bridge on its next failed send — see `PermissionAskBridge`'s doc
     /// comment.
-    /// Record what this connection's push subscriptions can handle.
-    ///
-    /// Explicit opt-in rather than probing: a client that never calls this
-    /// keeps receiving exactly the event shapes it already understands, so the
-    /// app binary on moltar works unchanged against a kernel that gained
-    /// coalescing. Call it before subscribing — a bridge reads the flags once,
-    /// when it starts.
-    fn declare_event_capabilities(
-        self: Rc<Self>,
-        params: kernel::DeclareEventCapabilitiesParams,
-        _results: kernel::DeclareEventCapabilitiesResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let caps = EventCapabilities {
-            text_ops_batch: p.get_text_ops_batch(),
-            subscription_terminated: p.get_subscription_terminated(),
-        };
-        log::debug!(
-            "client declared event capabilities: batch={} kick={}",
-            caps.text_ops_batch,
-            caps.subscription_terminated,
-        );
-        self.connection.borrow_mut().set_event_capabilities(caps);
-        Promise::ok(())
-    }
-
     fn subscribe_permission_events(
         self: Rc<Self>,
         params: kernel::SubscribePermissionEventsParams,
@@ -5862,9 +5834,12 @@ impl kernel::Server for KernelImpl {
 
         // Per-block DTE stores don't need compaction — each block's DTE
         // is already minimal. This is intentionally a no-op; sync_generation
-        // stays 0 and SyncReset is never emitted. If compaction is ever
-        // reintroduced, bump DocumentEntry.sync_generation and emit
-        // BlockFlow::SyncReset so clients can resync their frontier.
+        // stays 0. (The wire event this comment used to say to emit on
+        // reintroduction, `BlockFlow::SyncReset`, was deleted in the
+        // 2026-08-15 flag day — docs/change-feed.md: oplog compaction is
+        // server maintenance and a client holding materialized state is
+        // unaffected by it, so a revived compaction path would not need a
+        // client notification at all.)
         let mut r = results.get();
         r.set_new_size(0);
         r.set_generation(0);
@@ -6302,39 +6277,9 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn get_context_sync(
-        self: Rc<Self>,
-        params: kernel::GetContextSyncParams,
-        mut results: kernel::GetContextSyncResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_sync").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        let documents = &self.kernel.documents;
-        let (ops, version) = pry!(
-            documents
-                .context_sync_state(context_id)
-                .map_err(|e| capnp::Error::failed(e.to_string()))
-        );
-
-        let mut r = results.get();
-        r.set_context_id(context_id.as_bytes());
-        r.set_ops(&ops);
-        r.set_version(version);
-
-        Promise::ok(())
-    }
-
-    /// Semantic counterpart to `get_context_sync`'s `version` field, minus
-    /// the oplog bytes: reads `DocumentEntry::version()` directly and
-    /// serializes nothing else. Clients that only need staleness/gap
-    /// detection use this instead of decoding a `SyncState` they'd otherwise
-    /// throw away — see `docs/crdt-position-2026-08.md`.
+    /// Reads `DocumentEntry::version()` directly and serializes nothing
+    /// else. Clients use this for staleness/gap detection without decoding
+    /// DTE — see `docs/crdt-position-2026-08.md`.
     fn get_context_version(
         self: Rc<Self>,
         params: kernel::GetContextVersionParams,
@@ -6410,12 +6355,11 @@ impl kernel::Server for KernelImpl {
             let block_flows = self.kernel.kernel.block_flows().clone();
             let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
-            let (conn_cancel, disconnect, caps, principal_id, session_id) = {
+            let (conn_cancel, disconnect, principal_id, session_id) = {
                 let conn = self.connection.borrow();
                 (
                     conn.cancel_token(),
                     conn.disconnect_token(),
-                    conn.event_capabilities(),
                     conn.principal.id,
                     conn.session_id,
                 )
@@ -6429,19 +6373,16 @@ impl kernel::Server for KernelImpl {
                 let input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 log::debug!(
                     "Started filtered FlowBus subscription for kernel {} (filter_active={}, \
-                     pattern={}, batch={}, kick={})",
+                     pattern={})",
                     kernel_id.to_hex(),
                     has_filter,
                     subscribe_pattern,
-                    caps.text_ops_batch,
-                    caps.subscription_terminated,
                 );
                 run_block_bridge(
                     callback,
                     block_sub,
                     input_sub,
                     wire_filter,
-                    caps,
                     kernel_id,
                     conn_cancel,
                     disconnect,
@@ -9358,9 +9299,6 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockFlowKind::Inserted => {
                                 kaijutsu_types::BlockFlowKind::Inserted
                             }
-                            crate::kaijutsu_capnp::BlockFlowKind::TextOps => {
-                                kaijutsu_types::BlockFlowKind::TextOps
-                            }
                             crate::kaijutsu_capnp::BlockFlowKind::TextAppended => {
                                 kaijutsu_types::BlockFlowKind::TextAppended
                             }
@@ -9381,9 +9319,6 @@ fn parse_block_event_filter(
                             }
                             crate::kaijutsu_capnp::BlockFlowKind::Moved => {
                                 kaijutsu_types::BlockFlowKind::Moved
-                            }
-                            crate::kaijutsu_capnp::BlockFlowKind::SyncReset => {
-                                kaijutsu_types::BlockFlowKind::SyncReset
                             }
                             crate::kaijutsu_capnp::BlockFlowKind::OutputChanged => {
                                 kaijutsu_types::BlockFlowKind::OutputChanged
@@ -9468,21 +9403,21 @@ fn set_editor_state(
 // `subscribe_blocks_filtered`, which used to carry two ~250-line copies of the
 // same per-variant dispatch.
 //
-// Three properties it owes the client (2026-08-05 backpressure rework):
+// Two properties it owes the client (2026-08-05 backpressure rework):
 //
 //  1. **Lossless or loud.** The kernel bus hands this task a terminated
 //     subscription rather than a hole; the bridge relays that as
 //     `onSubscriptionTerminated` and then drops the connection, so the client
 //     reconnects and resyncs instead of rendering a stale turn forever.
-//  2. **Coalesced firehose.** Consecutive per-token text ops for one block are
-//     merged over a ~15 ms window into a single `onBlockTextOpsBatch` — the
-//     round-trip per token was the reason the queue backed up at all. Content
-//     is preserved exactly: the ops ride as a list, applied in order, because
-//     each blob is an independently-encoded DTE op set and concatenating the
-//     bytes would be corruption.
-//  3. **Musical time is never delayed.** The coalescing window closes the
-//     instant anything that is not a text op arrives, and the bus already
-//     drains the timing lane ahead of the ordered one.
+//  2. **Musical time is never delayed.** The bus already drains the timing
+//     lane ahead of the ordered one, so a beat or render cue is never stuck
+//     behind a run of ordinary block events.
+//
+// (The per-token text-op coalescing this bridge used to do —
+// `onBlockTextOpsBatch` — was deleted in the 2026-08-15 wire flag day along
+// with the raw-CRDT-ops event it batched; classified text changes ride the
+// `ContextObserver` change feed instead, which batches natively —
+// docs/change-feed.md.)
 
 /// Per-callback wall-clock bound for a block bridge.
 ///
@@ -9493,36 +9428,8 @@ fn set_editor_state(
 /// healthy peer and short enough that one stuck callback can't pin the LocalSet.
 const BLOCK_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long the bridge lingers collecting more text ops for the same block
-/// before flushing them as one batch.
-///
-/// 15 ms is below the threshold where a human reads streaming text as anything
-/// but continuous, and at typical token rates it merges tens of ops into one
-/// call. It is a *ceiling*, not a fixed delay: anything that is not a text op
-/// closes the window immediately, and a batch that fills flushes at once.
-const TEXT_OPS_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(15);
-
-/// Most ops merged into one `onBlockTextOpsBatch` call. Bounds the size of a
-/// single capnp message so a long stall can't produce one enormous frame.
-const TEXT_OPS_COALESCE_MAX: usize = 512;
-
 /// Most events pulled off the bus in one drain pass before we start sending.
 const BRIDGE_DRAIN_MAX: usize = 1024;
-
-/// What a connection's push subscriptions can handle, as the client declared it
-/// via `declareEventCapabilities`.
-///
-/// Defaults are the conservative shape on purpose: a binary that predates the
-/// rework never declares anything, so it keeps receiving exactly the events it
-/// already understands. No probing, no unimplemented-error fallback, no
-/// guessing from a version string.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EventCapabilities {
-    /// Client implements `BlockEvents.onBlockTextOpsBatch`.
-    pub text_ops_batch: bool,
-    /// Client implements `BlockEvents.onSubscriptionTerminated`.
-    pub subscription_terminated: bool,
-}
 
 /// Per-subscription delivery counters handed to the client as `subSeq`.
 ///
@@ -9673,37 +9580,6 @@ async fn send_block_event(
             }
             await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
         }
-        BlockFlow::TextOps {
-            context_id,
-            block_id,
-            ops,
-            seq_num,
-            ..
-        } => {
-            let mut req = callback.on_block_text_ops_request();
-            {
-                let mut params = req.get();
-                params.set_context_id(context_id.as_bytes());
-                params.set_ops(ops);
-                params.set_seq_num(*seq_num);
-                params.set_sub_seq(sub_seq);
-                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-            }
-            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
-        }
-        BlockFlow::SyncReset {
-            context_id,
-            generation,
-        } => {
-            let mut req = callback.on_sync_reset_request();
-            {
-                let mut params = req.get();
-                params.set_context_id(context_id.as_bytes());
-                params.set_generation(*generation);
-                params.set_sub_seq(sub_seq);
-            }
-            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
-        }
         BlockFlow::OutputChanged {
             context_id,
             block_id,
@@ -9788,35 +9664,6 @@ async fn send_block_event(
     }
 }
 
-/// Forward a run of consecutive text ops for ONE block as a single call.
-///
-/// Applying `ops` in order is byte-for-byte identical to the individual
-/// `onBlockTextOps` calls it replaces — this trades N round trips for one, it
-/// does not merge, reorder, or rewrite content.
-async fn send_text_ops_batch(
-    callback: &block_events::Client,
-    context_id: ContextId,
-    block_id: &kaijutsu_crdt::BlockId,
-    ops: &[std::sync::Arc<[u8]>],
-    first_seq_num: u64,
-    sub_seq: u64,
-    kernel_id: impl std::fmt::Display + Copy,
-) -> bool {
-    let mut req = callback.on_block_text_ops_batch_request();
-    {
-        let mut params = req.get();
-        params.set_context_id(context_id.as_bytes());
-        params.set_first_seq_num(first_seq_num);
-        params.set_sub_seq(sub_seq);
-        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-        let mut list = params.init_ops(ops.len() as u32);
-        for (i, blob) in ops.iter().enumerate() {
-            list.set(i as u32, blob);
-        }
-    }
-    await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
-}
-
 /// Forward one input-doc (compose scratchpad) event.
 async fn send_input_event(
     callback: &block_events::Client,
@@ -9859,13 +9706,13 @@ async fn send_input_event(
 /// Best-effort and short-deadline on purpose: the client we are talking to is
 /// by definition not draining well, so we must not spend the full callback
 /// budget explaining ourselves. Dropping the connection is what actually makes
-/// the client recover — the courtesy call only tells it *why*, and an older
-/// binary that never declared the capability recovers just the same, via the
-/// ordinary reconnect path.
+/// the client recover — the courtesy call only tells it *why*. Every in-repo
+/// client implements `onSubscriptionTerminated` (the flag day removed the
+/// capability-negotiation RPC that used to gate this — docs/change-feed.md),
+/// so the notice is sent unconditionally.
 async fn kick_slow_subscriber(
     callback: &block_events::Client,
     info: &kaijutsu_kernel::flows::FlowTermination,
-    caps: EventCapabilities,
     kernel_id: impl std::fmt::Display + Copy,
     label: &str,
 ) {
@@ -9878,34 +9725,20 @@ async fn kick_slow_subscriber(
         "client fell behind its event queue — terminating the subscription and \
          dropping the connection so it resyncs (no lossy delivery)"
     );
-    if caps.subscription_terminated {
-        const KICK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-        let mut req = callback.on_subscription_terminated_request();
-        {
-            let mut p = req.get();
-            p.set_reason(crate::kaijutsu_capnp::SubscriptionEndReason::SlowSubscriber);
-            p.set_topic(info.topic);
-            p.set_delivered(info.delivered);
-            p.set_capacity(info.capacity as u64);
-        }
-        if tokio::time::timeout(KICK_TIMEOUT, req.send().promise)
-            .await
-            .is_err()
-        {
-            log::debug!("slow subscriber did not even accept its termination notice");
-        }
+    const KICK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut req = callback.on_subscription_terminated_request();
+    {
+        let mut p = req.get();
+        p.set_reason(crate::kaijutsu_capnp::SubscriptionEndReason::SlowSubscriber);
+        p.set_topic(info.topic);
+        p.set_delivered(info.delivered);
+        p.set_capacity(info.capacity as u64);
     }
-}
-
-/// Is this message a text-op event (the coalescable one)?
-fn text_ops_parts(msg: &FlowMessage<BlockFlow>) -> Option<(ContextId, kaijutsu_crdt::BlockId)> {
-    match &msg.payload {
-        BlockFlow::TextOps {
-            context_id,
-            block_id,
-            ..
-        } => Some((*context_id, *block_id)),
-        _ => None,
+    if tokio::time::timeout(KICK_TIMEOUT, req.send().promise)
+        .await
+        .is_err()
+    {
+        log::debug!("slow subscriber did not even accept its termination notice");
     }
 }
 
@@ -9922,7 +9755,6 @@ async fn run_block_bridge(
     mut block_sub: kaijutsu_kernel::flows::Subscription<BlockFlow>,
     mut input_sub: Option<kaijutsu_kernel::flows::Subscription<InputDocFlow>>,
     filter: Option<kaijutsu_types::BlockEventFilter>,
-    caps: EventCapabilities,
     kernel_id: kaijutsu_types::KernelId,
     conn_cancel: CancellationToken,
     disconnect: CancellationToken,
@@ -9937,14 +9769,12 @@ async fn run_block_bridge(
     /// Does this block event have a `BlockEvents` wire method today?
     ///
     /// The classified text changes do not: their wire is the
-    /// `ContextObserver` change feed (docs/change-feed.md), and until that
-    /// lands the kernel publishes them *alongside* the `TextOps` this bridge
-    /// carries. They are dropped here, at ingress, rather than at send time,
-    /// because merely sitting in the queue does damage: an item between two
-    /// `TextOps` for one block breaks the run the batch path collapses, and a
-    /// `sub_seq` allocated for an event that is never sent punches a hole in
-    /// the ordered lane — which a client reports as a kernel bug, correctly,
-    /// since the bus promises lossless-or-terminated.
+    /// `ContextObserver` change feed (docs/change-feed.md), not this one.
+    /// They are dropped here, at ingress, rather than at send time, because
+    /// merely sitting in the queue does damage: a `sub_seq` allocated for an
+    /// event that is never sent punches a hole in the ordered lane — which a
+    /// client reports as a kernel bug, correctly, since the bus promises
+    /// lossless-or-terminated.
     fn bridge_carries(m: &FlowMessage<BlockFlow>) -> bool {
         !matches!(
             m.payload,
@@ -9998,7 +9828,7 @@ async fn run_block_bridge(
         match drain_ready!() {
             Ok(_) => {}
             Err(info) => {
-                kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                kick_slow_subscriber(&callback, &info, kernel_id, label).await;
                 disconnect.cancel();
                 break;
             }
@@ -10037,7 +9867,7 @@ async fn run_block_bridge(
                 Woke::Input(FlowRecv::Message(m)) => pending.push(BridgeItem::Input(m)),
                 Woke::Block(FlowRecv::Terminated(info))
                 | Woke::Input(FlowRecv::Terminated(info)) => {
-                    kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                    kick_slow_subscriber(&callback, &info, kernel_id, label).await;
                     disconnect.cancel();
                     break;
                 }
@@ -10045,56 +9875,14 @@ async fn run_block_bridge(
             match drain_ready!() {
                 Ok(_) => {}
                 Err(info) => {
-                    kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                    kick_slow_subscriber(&callback, &info, kernel_id, label).await;
                     disconnect.cancel();
                     break;
                 }
             }
         }
 
-        // 3. Coalescing window. Only when the batch currently ENDS in a text op
-        //    and the client can accept a batch — otherwise there is nothing to
-        //    merge and no reason to wait. Anything that is not a text op closes
-        //    the window at once, so a beat, a status patch, or a render cue is
-        //    never held back (docs/midi.md: musical time is latency-first).
-        if caps.text_ops_batch
-            && pending.len() < TEXT_OPS_COALESCE_MAX
-            && matches!(pending.last(), Some(BridgeItem::Block(m)) if text_ops_parts(m).is_some())
-        {
-            let deadline = tokio::time::Instant::now() + TEXT_OPS_COALESCE_WINDOW;
-            while pending.len() < TEXT_OPS_COALESCE_MAX {
-                let next = tokio::select! {
-                    _ = conn_cancel.cancelled() => break,
-                    ev = tokio::time::timeout_at(deadline, block_sub.recv_event()) => ev,
-                };
-                match next {
-                    // Window expired — flush what we have.
-                    Err(_) => break,
-                    Ok(None) => break,
-                    Ok(Some(FlowRecv::Terminated(info))) => {
-                        kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
-                        disconnect.cancel();
-                        break 'outer;
-                    }
-                    Ok(Some(FlowRecv::Message(m))) => {
-                        // A change-feed event the bridge does not carry must
-                        // not close the coalescing window either — it is not
-                        // "something other than a text op arrived", it is an
-                        // event this wire cannot see at all.
-                        if !bridge_carries(&m) {
-                            continue;
-                        }
-                        let still_ops = text_ops_parts(&m).is_some();
-                        pending.push(BridgeItem::Block(m));
-                        if !still_ops {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Ship the batch, preserving publish order exactly.
+        // 3. Ship everything drained, preserving publish order exactly.
         let mut i = 0;
         while i < pending.len() {
             let success = match &pending[i] {
@@ -10112,58 +9900,10 @@ async fn run_block_bridge(
                         i += 1;
                         continue;
                     }
-                    match text_ops_parts(msg) {
-                        // A run of consecutive ops for the SAME block collapses
-                        // into one call. `caps.text_ops_batch` gates it, so an
-                        // older client still gets one call per op.
-                        Some((ctx, block_id)) if caps.text_ops_batch => {
-                            let mut ops: Vec<std::sync::Arc<[u8]>> = Vec::new();
-                            let mut first_seq_num = 0u64;
-                            let mut j = i;
-                            while j < pending.len() {
-                                let BridgeItem::Block(m) = &pending[j] else {
-                                    break;
-                                };
-                                let Some((c, b)) = text_ops_parts(m) else {
-                                    break;
-                                };
-                                if c != ctx || b != block_id {
-                                    break;
-                                }
-                                if let BlockFlow::TextOps { ops: o, seq_num, .. } = &m.payload {
-                                    if ops.is_empty() {
-                                        first_seq_num = *seq_num;
-                                    }
-                                    ops.push(o.clone());
-                                }
-                                j += 1;
-                            }
-                            let s = seq.next("block.text_ops");
-                            let ok = if ops.len() == 1 {
-                                send_block_event(&callback, &pending[i].block_payload(), s, kernel_id)
-                                    .await
-                            } else {
-                                send_text_ops_batch(
-                                    &callback,
-                                    ctx,
-                                    &block_id,
-                                    &ops,
-                                    first_seq_num,
-                                    s,
-                                    kernel_id,
-                                )
-                                .await
-                            };
-                            i = j;
-                            ok
-                        }
-                        _ => {
-                            let s = seq.next(msg.topic);
-                            let ok = send_block_event(&callback, &msg.payload, s, kernel_id).await;
-                            i += 1;
-                            ok
-                        }
-                    }
+                    let s = seq.next(msg.topic);
+                    let ok = send_block_event(&callback, &msg.payload, s, kernel_id).await;
+                    i += 1;
+                    ok
                 }
             };
 
@@ -10185,16 +9925,6 @@ async fn run_block_bridge(
     }
 
     log::debug!("{label} bridge task for kernel {} ended", kernel_id.to_hex());
-}
-
-impl BridgeItem {
-    /// The block payload, for the single-op fast path inside the batcher.
-    fn block_payload(&self) -> BlockFlow {
-        match self {
-            BridgeItem::Block(m) => m.payload.clone(),
-            BridgeItem::Input(_) => unreachable!("block_payload on an input item"),
-        }
-    }
 }
 
 /// Await an editor-callback round-trip with the shared callback timeout,
@@ -11134,10 +10864,11 @@ mod filtered_subscribe_pattern_tests {
 
     #[test]
     fn single_non_directive_filter_widens_to_catch_directives() {
-        // The old inline code narrowed these to "block.status" / "block.text_ops"
-        // and silently dropped RenderCue directives — this is the regression guard.
+        // The old inline code narrowed these to "block.status" /
+        // "block.text_appended" and silently dropped RenderCue directives —
+        // this is the regression guard.
         assert_eq!(filtered_subscribe_pattern(&[StatusChanged]), "block.*");
-        assert_eq!(filtered_subscribe_pattern(&[TextOps]), "block.*");
+        assert_eq!(filtered_subscribe_pattern(&[TextAppended]), "block.*");
         assert_eq!(filtered_subscribe_pattern(&[Inserted]), "block.*");
     }
 
