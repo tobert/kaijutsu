@@ -368,6 +368,10 @@ pub struct ContextMirror {
     /// `block_id` -> index into `blocks`, rebuilt on any positional change.
     index: HashMap<BlockId, usize>,
     version: u64,
+    /// The version the snapshot was read at. Everything at or below it is
+    /// provably already in `blocks`, so a delivery that old is a duplicate to
+    /// discard rather than a fault to report — see `receive`.
+    snapshot_version: u64,
     /// Deliveries received before the snapshot arrived.
     buffered: Vec<ContextDelivery>,
     snapshot_applied: bool,
@@ -382,6 +386,7 @@ impl ContextMirror {
             blocks: Vec::new(),
             index: HashMap::new(),
             version: 0,
+            snapshot_version: 0,
             buffered: Vec::new(),
             snapshot_applied: false,
         }
@@ -412,7 +417,17 @@ impl ContextMirror {
 
     /// Take a delivery. Before the snapshot it is buffered; after, applied.
     ///
-    /// This is the only entry point a client needs in the steady state.
+    /// This is the only entry point a client needs, and it is safe to call in
+    /// any order relative to [`Self::apply_snapshot`]. A straggler that was
+    /// already in the snapshot is **discarded**, not reported: the snapshot was
+    /// read at a version, so everything at or below it is provably included,
+    /// and a client should not have to race its fetch against the channel to
+    /// avoid a spurious error.
+    ///
+    /// (It used to be an error, and the first client to migrate had to write a
+    /// `select!` racing `getBlocks` against the receiver to dodge it. That is
+    /// the kind of thing this type exists to hold once rather than three
+    /// times.)
     pub fn receive(&mut self, delivery: ContextDelivery) -> Result<(), MirrorError> {
         if delivery.context_id != self.context_id {
             return Err(MirrorError::WrongContext {
@@ -422,6 +437,10 @@ impl ContextMirror {
         }
         if !self.snapshot_applied {
             self.buffered.push(delivery);
+            return Ok(());
+        }
+        if delivery.version <= self.snapshot_version {
+            // Already in the snapshot. Applying it would double an append.
             return Ok(());
         }
         self.apply(delivery)
@@ -440,6 +459,7 @@ impl ContextMirror {
         self.blocks = blocks;
         self.reindex();
         self.version = version;
+        self.snapshot_version = version;
         self.snapshot_applied = true;
 
         let mut buffered = std::mem::take(&mut self.buffered);
@@ -454,6 +474,12 @@ impl ContextMirror {
     }
 
     /// Apply one delivery to a hydrated mirror, in order.
+    ///
+    /// A delivery that does not advance the version and is NOT covered by the
+    /// snapshot is still an error, and deliberately so: it means a delivery
+    /// this mirror never applied arrived after a later one: an inversion. Both
+    /// applying it (out of order) and dropping it (losing a change) corrupt,
+    /// so the honest move is to refuse and let the caller refetch.
     fn apply(&mut self, delivery: ContextDelivery) -> Result<(), MirrorError> {
         if delivery.version <= self.version {
             return Err(MirrorError::VersionWentBackwards {
@@ -671,32 +697,92 @@ mod tests {
         assert_eq!(mirror.version(), 6);
     }
 
-    /// A delivery that does not advance the version means this mirror is not
-    /// following one ordered feed. Refuse it — applying it corrupts text, and
-    /// ignoring it hides the fault.
+    /// The straggler case: a delivery that raced the snapshot fetch and lost.
+    ///
+    /// A client is allowed to fetch first and drain after — it should not have
+    /// to race `getBlocks` against its receiver to avoid a spurious error. The
+    /// snapshot was read AT a version, so anything at or below it is provably
+    /// already applied, and the only correct thing to do is drop it.
     #[test]
-    fn a_version_that_does_not_advance_is_refused() {
+    fn a_delivery_the_snapshot_already_includes_is_discarded_not_refused() {
         let c = ctx();
-        let b = block(c, 1, "x");
+        let b = block(c, 1, "abc");
         let id = b.id;
         let mut mirror = ContextMirror::new(c);
-        mirror.apply_snapshot(vec![b], 7).unwrap();
+        mirror.apply_snapshot(vec![b], 5).unwrap();
 
-        let err = mirror
+        // Arrived late, on the wire, after the snapshot was installed.
+        mirror
+            .receive(delivery(
+                c,
+                5,
+                vec![ContextChange::TextAppended {
+                    block_id: id,
+                    suffix: "c".into(),
+                }],
+            ))
+            .expect("a straggler the snapshot covers is not an error");
+        mirror
+            .receive(delivery(
+                c,
+                3,
+                vec![ContextChange::TextAppended {
+                    block_id: id,
+                    suffix: "b".into(),
+                }],
+            ))
+            .expect("an older straggler likewise");
+
+        assert_eq!(
+            mirror.block(&id).unwrap().content,
+            "abc",
+            "neither straggler may be applied — that would double the text"
+        );
+        assert_eq!(mirror.version(), 5);
+    }
+
+    /// The distinction that makes the discard above safe: once the mirror has
+    /// advanced PAST the snapshot under its own steam, a delivery that fails to
+    /// advance is an inversion — a change that arrived after a later one and
+    /// was never applied. Applying it is out of order and dropping it loses a
+    /// change, so it must be refused.
+    #[test]
+    fn an_inversion_above_the_snapshot_is_still_refused() {
+        let c = ctx();
+        let b = block(c, 1, "abc");
+        let id = b.id;
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![b], 5).unwrap();
+
+        mirror
             .receive(delivery(
                 c,
                 7,
                 vec![ContextChange::TextAppended {
                     block_id: id,
-                    suffix: "y".into(),
+                    suffix: "d".into(),
+                }],
+            ))
+            .unwrap();
+
+        // Version 6 never arrived before 7 did. It is not in the snapshot
+        // (which stopped at 5) and it was not applied, so this mirror is
+        // missing a change no matter what it does with this delivery.
+        let err = mirror
+            .receive(delivery(
+                c,
+                6,
+                vec![ContextChange::TextAppended {
+                    block_id: id,
+                    suffix: "MISSING".into(),
                 }],
             ))
             .unwrap_err();
         assert_eq!(
             err,
-            MirrorError::VersionWentBackwards { have: 7, got: 7 }
+            MirrorError::VersionWentBackwards { have: 7, got: 6 }
         );
-        assert_eq!(mirror.block(&id).unwrap().content, "x");
+        assert_eq!(mirror.block(&id).unwrap().content, "abcd");
     }
 
     /// Document order comes from the feed's positions, not from any ordering
