@@ -2758,6 +2758,10 @@ pub enum BlockQuery {
 pub enum BlockFlowKind {
     Inserted,
     TextOps,
+    /// A classified append: block text grew by a suffix (docs/change-feed.md).
+    TextAppended,
+    /// A classified non-append text change: the block's whole text follows.
+    TextReplaced,
     Deleted,
     StatusChanged,
     CollapsedChanged,

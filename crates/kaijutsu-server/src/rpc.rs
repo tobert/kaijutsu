@@ -6219,27 +6219,13 @@ impl kernel::Server for KernelImpl {
         let query_reader = pry!(p.get_query());
         let query = pry!(parse_block_query(&query_reader));
 
-        let documents = &self.kernel.documents;
-
-        let blocks = match query {
-            kaijutsu_types::BlockQuery::All => {
-                pry!(
-                    documents
-                        .block_snapshots(context_id)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))
-                )
-            }
-            kaijutsu_types::BlockQuery::ByIds(ids) => {
-                if ids.is_empty() {
-                    return Promise::err(capnp::Error::failed(
-                        "byIds requires at least one block ID".into(),
-                    ));
-                }
-                pry!(
-                    documents
-                        .get_blocks_by_ids(context_id, &ids)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))
-                )
+        // Validate before reading: an invalid query must fail as a query
+        // error, not read a document first.
+        match &query {
+            kaijutsu_types::BlockQuery::ByIds(ids) if ids.is_empty() => {
+                return Promise::err(capnp::Error::failed(
+                    "byIds requires at least one block ID".into(),
+                ));
             }
             kaijutsu_types::BlockQuery::ByFilter(filter) => {
                 pry!(
@@ -6247,15 +6233,22 @@ impl kernel::Server for KernelImpl {
                         .validate()
                         .map_err(|e| capnp::Error::failed(e.to_string()))
                 );
-                pry!(
-                    documents
-                        .query_blocks(context_id, &filter)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))
-                )
             }
-        };
+            _ => {}
+        }
 
-        let mut block_list = results.get().init_blocks(blocks.len() as u32);
+        // Blocks and version come from one guard — the atomicity the change
+        // feed's recovery protocol rests on (docs/change-feed.md rules 21-26).
+        let (blocks, version) = pry!(
+            self.kernel
+                .documents
+                .query_versioned(context_id, &query)
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        );
+
+        let mut r = results.get();
+        r.set_version(version);
+        let mut block_list = r.init_blocks(blocks.len() as u32);
         for (i, block) in blocks.iter().enumerate() {
             let mut block_builder = block_list.reborrow().get(i as u32);
             set_block_snapshot(&mut block_builder, block);
@@ -9328,6 +9321,12 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockFlowKind::TextOps => {
                                 kaijutsu_types::BlockFlowKind::TextOps
                             }
+                            crate::kaijutsu_capnp::BlockFlowKind::TextAppended => {
+                                kaijutsu_types::BlockFlowKind::TextAppended
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::TextReplaced => {
+                                kaijutsu_types::BlockFlowKind::TextReplaced
+                            }
                             crate::kaijutsu_capnp::BlockFlowKind::Deleted => {
                                 kaijutsu_types::BlockFlowKind::Deleted
                             }
@@ -9731,6 +9730,21 @@ async fn send_block_event(
             }
             await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
         }
+        // Unreachable by contract: `bridge_carries` drops the classified text
+        // changes before they ever enter the bridge queue, because this wire
+        // has no method for them (docs/change-feed.md). Reported as accepted
+        // rather than panicking — `false` here would tear down a live
+        // subscription over an event nobody was owed — and asserted in debug so
+        // a future path that reaches this arm is found in tests, not in the
+        // field.
+        BlockFlow::TextAppended { .. } | BlockFlow::TextReplaced { .. } => {
+            debug_assert!(
+                false,
+                "classified text change reached the BlockEvents bridge; \
+                 bridge_carries should have dropped it at ingress"
+            );
+            true
+        }
     }
 }
 
@@ -9880,6 +9894,24 @@ async fn run_block_bridge(
     let mut seq = BridgeSeq::default();
     let mut pending: Vec<BridgeItem> = Vec::new();
 
+    /// Does this block event have a `BlockEvents` wire method today?
+    ///
+    /// The classified text changes do not: their wire is the
+    /// `ContextObserver` change feed (docs/change-feed.md), and until that
+    /// lands the kernel publishes them *alongside* the `TextOps` this bridge
+    /// carries. They are dropped here, at ingress, rather than at send time,
+    /// because merely sitting in the queue does damage: an item between two
+    /// `TextOps` for one block breaks the run the batch path collapses, and a
+    /// `sub_seq` allocated for an event that is never sent punches a hole in
+    /// the ordered lane — which a client reports as a kernel bug, correctly,
+    /// since the bus promises lossless-or-terminated.
+    fn bridge_carries(m: &FlowMessage<BlockFlow>) -> bool {
+        !matches!(
+            m.payload,
+            BlockFlow::TextAppended { .. } | BlockFlow::TextReplaced { .. }
+        )
+    }
+
     // Drain everything already queued, without waiting. Returns Err(term) if
     // the bus terminated us, Ok(false) if a stream closed.
     macro_rules! drain_ready {
@@ -9887,7 +9919,11 @@ async fn run_block_bridge(
             let mut outcome: Result<bool, kaijutsu_kernel::flows::FlowTermination> = Ok(true);
             while pending.len() < BRIDGE_DRAIN_MAX {
                 match block_sub.try_recv_event() {
-                    Some(FlowRecv::Message(m)) => pending.push(BridgeItem::Block(m)),
+                    Some(FlowRecv::Message(m)) => {
+                        if bridge_carries(&m) {
+                            pending.push(BridgeItem::Block(m));
+                        }
+                    }
                     Some(FlowRecv::Terminated(info)) => {
                         outcome = Err(info);
                         break;
@@ -9953,7 +9989,11 @@ async fn run_block_bridge(
             };
             match woke {
                 Woke::Closed => break,
-                Woke::Block(FlowRecv::Message(m)) => pending.push(BridgeItem::Block(m)),
+                Woke::Block(FlowRecv::Message(m)) => {
+                    if bridge_carries(&m) {
+                        pending.push(BridgeItem::Block(m));
+                    }
+                }
                 Woke::Input(FlowRecv::Message(m)) => pending.push(BridgeItem::Input(m)),
                 Woke::Block(FlowRecv::Terminated(info))
                 | Woke::Input(FlowRecv::Terminated(info)) => {
@@ -9997,6 +10037,13 @@ async fn run_block_bridge(
                         break 'outer;
                     }
                     Ok(Some(FlowRecv::Message(m))) => {
+                        // A change-feed event the bridge does not carry must
+                        // not close the coalescing window either — it is not
+                        // "something other than a text op arrived", it is an
+                        // event this wire cannot see at all.
+                        if !bridge_carries(&m) {
+                            continue;
+                        }
                         let still_ops = text_ops_parts(&m).is_some();
                         pending.push(BridgeItem::Block(m));
                         if !still_ops {

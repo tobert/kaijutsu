@@ -1294,3 +1294,66 @@ fn test_get_context_version_matches_get_context_sync() {
         );
     });
 }
+
+/// `getBlocks` answers with the version its blocks were read at
+/// (docs/change-feed.md rules 23-25). A client joins a snapshot to the live
+/// feed by discarding every buffered delivery at or below this number, so it
+/// has to be the same counter the feed's events carry — `getContextVersion`
+/// reads that counter, and this asserts the two agree before and after a
+/// mutation. It also has to travel over the wire: the version is a new return
+/// field, and an unread field is the failure mode this migration has already
+/// been bitten by twice.
+#[test]
+fn test_get_blocks_returns_the_version_it_read_at() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let context_id = kernel.create_context("get-blocks-version").await.unwrap();
+        kernel
+            .join_context(context_id, "get-blocks-version-test")
+            .await
+            .unwrap();
+
+        let (blocks0, v0) = kernel
+            .get_blocks_versioned(context_id, &kaijutsu_types::BlockQuery::All)
+            .await
+            .unwrap();
+        assert_eq!(
+            v0,
+            kernel.get_context_version(context_id).await.unwrap(),
+            "getBlocks must report the same counter getContextVersion does"
+        );
+
+        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("get-blocks-version-author");
+        kernel
+            .author_block(&kaijutsu_client::AuthorBlock::text(
+                context_id,
+                principal,
+                kaijutsu_crdt::Role::User,
+                "a block that moves the version",
+            ))
+            .await
+            .unwrap();
+
+        let (blocks1, v1) = kernel
+            .get_blocks_versioned(context_id, &kaijutsu_types::BlockQuery::All)
+            .await
+            .unwrap();
+        assert!(
+            v1 > v0,
+            "authoring a block must move the version getBlocks reports: {v0} -> {v1}"
+        );
+        assert_eq!(
+            blocks1.len(),
+            blocks0.len() + 1,
+            "the blocks and the version must describe the same instant"
+        );
+        assert_eq!(
+            v1,
+            kernel.get_context_version(context_id).await.unwrap(),
+            "getBlocks and getContextVersion must not drift apart after a mutation"
+        );
+    });
+}

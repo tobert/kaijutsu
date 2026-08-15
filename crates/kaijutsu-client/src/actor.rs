@@ -417,6 +417,14 @@ enum RpcCommand {
         query: BlockQuery,
         reply: oneshot::Sender<Result<Vec<BlockSnapshot>, CallError>>,
     },
+    /// Same query, but keeping the context version the blocks were read at —
+    /// the snapshot half of the change feed's recovery protocol
+    /// (docs/change-feed.md rules 21-26).
+    GetBlocksVersioned {
+        context_id: ContextId,
+        query: BlockQuery,
+        reply: oneshot::Sender<Result<(Vec<BlockSnapshot>, u64), CallError>>,
+    },
     GetContextSync {
         context_id: ContextId,
         reply: oneshot::Sender<Result<SyncState, CallError>>,
@@ -732,6 +740,7 @@ impl RpcCommand {
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ResolveContextLabel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetBlocksVersioned { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1145,6 +1154,25 @@ impl ActorHandle {
         query: BlockQuery,
     ) -> Result<Vec<BlockSnapshot>, CallError> {
         self.send(|reply| RpcCommand::GetBlocks {
+            context_id,
+            query,
+            reply,
+        })
+        .await
+    }
+
+    /// Query blocks and keep the version they were read at, atomically.
+    ///
+    /// A caller joining a snapshot to a live subscription needs this one:
+    /// blocks and version come from a single kernel guard, so no mutation can
+    /// slip between them (docs/change-feed.md rules 21-26).
+    #[tracing::instrument(skip(self, query))]
+    pub async fn get_blocks_versioned(
+        &self,
+        context_id: ContextId,
+        query: BlockQuery,
+    ) -> Result<(Vec<BlockSnapshot>, u64), CallError> {
+        self.send(|reply| RpcCommand::GetBlocksVersioned {
             context_id,
             query,
             reply,
@@ -3169,6 +3197,19 @@ async fn dispatch_kernel_command(
             reply,
         } => {
             dispatch!(kernel, reply, close_tx, k, k.get_blocks(context_id, &query));
+        }
+        RpcCommand::GetBlocksVersioned {
+            context_id,
+            query,
+            reply,
+        } => {
+            dispatch!(
+                kernel,
+                reply,
+                close_tx,
+                k,
+                k.get_blocks_versioned(context_id, &query)
+            );
         }
         RpcCommand::GetContextSync { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_context_sync(context_id));

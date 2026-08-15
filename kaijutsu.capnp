@@ -311,6 +311,12 @@ enum BlockFlowKind {
   # phasor, docs/midi.md "The relative-lead timebase, analyzed"). Also a
   # directive — bypasses `matches_filter` like `renderCue`.
   beatSync @12;
+  # Classified text changes (docs/change-feed.md). The kernel decides append
+  # vs replace inside its mutation lock and publishes one of these instead of
+  # opaque operation bytes; `textOps` above is what they replace. Filterable
+  # like any other block-level event.
+  textAppended @13;
+  textReplaced @14;
 }
 
 # Server-side filter for block event subscriptions.
@@ -1467,8 +1473,16 @@ interface Kernel {
   # below), so it stays a stub, not a hole.
   retired34 @34 ();
 
-  # Fetch blocks by query: all, byIds, or byFilter
-  getBlocks @35 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
+  # Fetch blocks by query: all, byIds, or byFilter.
+  #
+  # `version` is the context's mutation counter **at the instant the blocks
+  # were read** — both come from one guard, so no mutation can slip between
+  # them. It is what joins a snapshot to the change feed: a client subscribes,
+  # fetches here, then discards every buffered delivery at or below this
+  # version and applies the rest (docs/change-feed.md rules 21-26). Without it
+  # a client cannot tell whether a buffered append is already included, and
+  # applying one twice corrupts the text.
+  getBlocks @35 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot), version :UInt64);
 
   # Fetch CRDT sync state only (ops + version, no blocks)
   getContextSync @36 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);

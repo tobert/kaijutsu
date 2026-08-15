@@ -23,8 +23,8 @@ use kaijutsu_crdt::block_store::{
 use kaijutsu_crdt::{
     BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, TaskStatus, ToolKind,
 };
-use kaijutsu_types::BlockFilter;
 use kaijutsu_types::codec;
+use kaijutsu_types::{BlockFilter, BlockQuery};
 use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
 
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
@@ -1621,7 +1621,7 @@ impl BlockStore {
         delete: usize,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let (ops, ops_bytes) = {
+        let (ops, ops_bytes, change, after_text, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1629,13 +1629,30 @@ impl BlockStore {
             entry.doc.set_principal_id(effective_agent);
             // Capture frontier before edit
             let frontier = entry.doc.frontier();
+            // Classify inside the mutation lock (docs/change-feed.md): the
+            // before-length is only knowable here, and only here is it stable
+            // against another writer.
+            let len_before = entry.doc.block_content_len(block_id);
             entry.doc.edit_text(block_id, pos, insert, delete)?;
             entry.touch(effective_agent);
+            let len_before = len_before.expect(
+                "block must exist: the edit against it just succeeded under this same guard",
+            );
+            let change = classify_text_edit(len_before, pos, delete);
+            // A replace ships the whole after-text; an append ships only the
+            // inserted suffix, so it never reads the block back.
+            let after_text = match change {
+                TextChange::Appended => None,
+                TextChange::Replaced => Some(entry.doc.block_text(block_id).expect(
+                    "block must exist: the edit against it just succeeded under this same guard",
+                )),
+            };
+            let version = entry.version();
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (ops, ops_bytes)
+            (ops, ops_bytes, change, after_text, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1648,8 +1665,46 @@ impl BlockStore {
             source: OpSource::Local,
             seq_num,
         });
+        self.emit_text_change(context_id, block_id, change, after_text, insert, version);
 
         Ok(())
+    }
+
+    /// Publish the classified text change for a mutation that has already been
+    /// journaled — commit first, publish second (docs/change-feed.md).
+    ///
+    /// `after_text` is `Some` exactly when `change` is
+    /// [`TextChange::Replaced`]; `inserted` is the suffix for an append.
+    fn emit_text_change(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        change: TextChange,
+        after_text: Option<String>,
+        inserted: &str,
+        version: u64,
+    ) {
+        let flow = match change {
+            TextChange::Appended => BlockFlow::TextAppended {
+                context_id,
+                block_id: *block_id,
+                suffix: Arc::from(inserted),
+                version,
+                source: OpSource::Local,
+            },
+            TextChange::Replaced => BlockFlow::TextReplaced {
+                context_id,
+                block_id: *block_id,
+                content: Arc::from(
+                    after_text
+                        .expect("a replace classification always carries the after-text")
+                        .as_str(),
+                ),
+                version,
+                source: OpSource::Local,
+            },
+        };
+        self.emit(flow);
     }
 
     /// Set the ephemeral flag on a block (excluded from LLM hydration).
@@ -2000,7 +2055,7 @@ impl BlockStore {
         text: &str,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let (ops, ops_bytes) = {
+        let (ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2010,11 +2065,12 @@ impl BlockStore {
             let frontier = entry.doc.frontier();
             entry.doc.append_text(block_id, text)?;
             entry.touch(effective_agent);
+            let version = entry.version();
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (ops, ops_bytes)
+            (ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2027,6 +2083,22 @@ impl BlockStore {
             source: OpSource::Local,
             seq_num,
         });
+        // Classified as an append *by construction*, not by this function's
+        // name (docs/change-feed.md rules 4-5): the primitive underneath
+        // computes the end position and deletes nothing, so it satisfies
+        // `classify_text_edit`'s predicate for every input. Measuring the
+        // before-length here to re-derive that would materialize the whole
+        // block on every streamed token — the O(n²) the streaming path exists
+        // to avoid. `append_emits_exact_suffix` pins the claim against the
+        // engine's real behavior instead.
+        self.emit_text_change(
+            context_id,
+            block_id,
+            TextChange::Appended,
+            None,
+            text,
+            version,
+        );
 
         Ok(())
     }
@@ -2121,6 +2193,31 @@ impl BlockStore {
         Ok(entry.doc.blocks_ordered())
     }
 
+    /// Answer a block query **and** report the context version the answer was
+    /// read at, both under one guard.
+    ///
+    /// The change feed's recovery protocol (docs/change-feed.md rules 21-26)
+    /// rests on this atomicity: a client subscribes, fetches this snapshot, and
+    /// discards every buffered delivery at or below `version`. Reading the
+    /// blocks and the version through two separate calls would let a mutation
+    /// land between them — and the client would then either drop a change it
+    /// never had or apply one it already has.
+    pub fn query_versioned(
+        &self,
+        context_id: ContextId,
+        query: &BlockQuery,
+    ) -> BlockStoreResult<(Vec<BlockSnapshot>, u64)> {
+        let entry = self
+            .get(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let blocks = match query {
+            BlockQuery::All => entry.doc.blocks_ordered(),
+            BlockQuery::ByIds(ids) => snapshots_by_ids(&entry.doc, ids),
+            BlockQuery::ByFilter(filter) => snapshots_by_filter(&entry.doc, filter),
+        };
+        Ok((blocks, entry.version()))
+    }
+
     /// Stage 1 (time-well) incremental live-status read: the cached
     /// per-context reducer over block statuses that drives the time-well
     /// pulse (Running = working, Error = last turn failed), bumped as a side
@@ -2182,13 +2279,7 @@ impl BlockStore {
         let entry = self
             .get(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        let mut result = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(snap) = entry.doc.get_block_snapshot(id) {
-                result.push(snap);
-            }
-        }
-        Ok(result)
+        Ok(snapshots_by_ids(&entry.doc, ids))
     }
 
     /// Query blocks matching a filter.
@@ -2203,38 +2294,7 @@ impl BlockStore {
         let entry = self
             .get(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-
-        // If parent_id is set, compute descendant set via BFS
-        let descendant_ids = if let Some(ref root_id) = filter.parent_id {
-            Some(compute_descendants(&entry.doc, root_id, filter.max_depth))
-        } else {
-            None
-        };
-
-        let mut result = Vec::new();
-        let limit = if filter.limit > 0 {
-            filter.limit as usize
-        } else {
-            usize::MAX
-        };
-
-        for block in entry.doc.blocks_ordered() {
-            // If we have a descendant set, check membership
-            if let Some(ref descendants) = descendant_ids
-                && !descendants.contains(&block.id)
-            {
-                continue;
-            }
-
-            if filter.matches(&block) {
-                result.push(block);
-                if result.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        Ok(result)
+        Ok(snapshots_by_filter(&entry.doc, filter))
     }
 
     /// Get CRDT sync state (serialized ops + version) without blocks.
@@ -3203,6 +3263,92 @@ pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
         Status::Error
     } else {
         Status::Pending
+    }
+}
+
+/// Snapshots for specific block IDs, in the order asked for; unknown IDs are
+/// skipped. Takes the document so a caller holding one guard can answer a query
+/// and read the version without releasing it.
+fn snapshots_by_ids(doc: &CrdtBlockStore, ids: &[BlockId]) -> Vec<BlockSnapshot> {
+    let mut result = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(snap) = doc.get_block_snapshot(id) {
+            result.push(snap);
+        }
+    }
+    result
+}
+
+/// Snapshots matching a filter, in document order.
+///
+/// If `filter.parent_id` is set, only descendants (up to `max_depth`) are
+/// considered. Otherwise iterates all blocks in order, applying the predicate.
+fn snapshots_by_filter(doc: &CrdtBlockStore, filter: &BlockFilter) -> Vec<BlockSnapshot> {
+    // If parent_id is set, compute descendant set via BFS
+    let descendant_ids = filter
+        .parent_id
+        .as_ref()
+        .map(|root_id| compute_descendants(doc, root_id, filter.max_depth));
+
+    let mut result = Vec::new();
+    let limit = if filter.limit > 0 {
+        filter.limit as usize
+    } else {
+        usize::MAX
+    };
+
+    for block in doc.blocks_ordered() {
+        // If we have a descendant set, check membership
+        if let Some(ref descendants) = descendant_ids
+            && !descendants.contains(&block.id)
+        {
+            continue;
+        }
+
+        if filter.matches(&block) {
+            result.push(block);
+            if result.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    result
+}
+
+/// How a text mutation changed a block's text (docs/change-feed.md).
+///
+/// Decided while the mutation lock is held, because that is the only place the
+/// before-text and the edit coordinates are both in hand. Downstream the change
+/// is opaque operation bytes, and a bridge that classified those bytes would
+/// have to link the text engine this migration exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextChange {
+    /// The after-text starts with the before-text; the feed ships the suffix.
+    Appended,
+    /// Anything else; the feed ships the whole after-text.
+    Replaced,
+}
+
+/// Classify a text edit from its coordinates against the block's pre-edit
+/// character length.
+///
+/// **Never classify by the name of the function or the tool that made the
+/// edit** (docs/change-feed.md rules 4 and 5). `edit_text_as` makes appends —
+/// MCP `block_append` is one — and an earlier draft that listed producers named
+/// one of five. Coordinates cannot miss a producer.
+///
+/// Deliberately conservative in one direction: an edit that deletes text and
+/// re-inserts it verbatim (`pos=0, delete=3, insert="abc"` over `"abc…"`) is
+/// reported as a replace even though the after-text does start with the
+/// before-text. That costs bandwidth and can never corrupt. The opposite
+/// mistake — reporting a replace as an append — is the one that corrupts a
+/// client's text, and these coordinates cannot produce it.
+pub(crate) fn classify_text_edit(len_before: usize, pos: usize, delete: usize) -> TextChange {
+    if delete == 0 && pos == len_before {
+        TextChange::Appended
+    } else {
+        TextChange::Replaced
     }
 }
 
@@ -4455,10 +4601,18 @@ mod tests {
             let client_frontier = client.frontier();
             store.append_text(ctx, &block_id, chunk).unwrap();
 
+            // An append publishes two events while the CRDT wire path and the
+            // classified change feed coexist: the `TextOps` this test is about,
+            // and the `TextAppended` the feed will carry. Both, in that order.
             let msg = sub.try_recv().expect("should receive event");
             match msg.payload {
                 BlockFlow::TextOps { .. } => {}
                 _ => panic!("expected TextOps event, got {:?}", msg.payload),
+            }
+            let msg = sub.try_recv().expect("should receive the classified event");
+            match msg.payload {
+                BlockFlow::TextAppended { ref suffix, .. } => assert_eq!(&**suffix, chunk),
+                _ => panic!("expected TextAppended event, got {:?}", msg.payload),
             }
 
             // Use frontier-based sync for incremental ops
@@ -5794,6 +5948,310 @@ mod tests {
         assert!(
             store.get(new_id).is_none(),
             "a path-conflicting document must not be inserted into memory"
+        );
+    }
+
+    // ========================================================================
+    // CHANGE FEED — text mutation classification (docs/change-feed.md)
+    // ========================================================================
+    //
+    // The kernel decides append-vs-replace inside its mutation lock and
+    // publishes an already-classified event. These tests hold that line: they
+    // compare the events against the block's *real* text, never against the
+    // name of the call that produced them.
+
+    /// What a classified text event says happened, flattened for assertions.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SeenChange {
+        Appended { suffix: String, version: u64 },
+        Replaced { content: String, version: u64 },
+    }
+
+    /// Pull every classified text event a subscription has queued, dropping the
+    /// `TextOps` events that still ride alongside them until the feed lands.
+    fn drain_text_changes(
+        sub: &mut crate::flows::Subscription<BlockFlow>,
+        block_id: &BlockId,
+    ) -> Vec<SeenChange> {
+        let mut seen = Vec::new();
+        while let Some(msg) = sub.try_recv() {
+            match msg.payload {
+                BlockFlow::TextAppended {
+                    block_id: id,
+                    suffix,
+                    version,
+                    ..
+                } if id == *block_id => seen.push(SeenChange::Appended {
+                    suffix: suffix.to_string(),
+                    version,
+                }),
+                BlockFlow::TextReplaced {
+                    block_id: id,
+                    content,
+                    version,
+                    ..
+                } if id == *block_id => seen.push(SeenChange::Replaced {
+                    content: content.to_string(),
+                    version,
+                }),
+                _ => {}
+            }
+        }
+        seen
+    }
+
+    /// A context with one empty text block, and a subscription drained of the
+    /// insert event.
+    fn feed_fixture() -> (
+        BlockStore,
+        crate::flows::Subscription<BlockFlow>,
+        ContextId,
+        BlockId,
+    ) {
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        while sub.try_recv().is_some() {}
+        (store, sub, ctx, block_id)
+    }
+
+    /// The predicate itself, in the four shapes that matter. Coordinates only —
+    /// no function or tool ever enters this decision (rules 4 and 5).
+    #[test]
+    fn classify_text_edit_reads_coordinates_only() {
+        // An insert at the end with nothing deleted is the append.
+        assert_eq!(classify_text_edit(5, 5, 0), TextChange::Appended);
+        // Into an empty block, the end is position 0.
+        assert_eq!(classify_text_edit(0, 0, 0), TextChange::Appended);
+        // Anywhere before the end is not.
+        assert_eq!(classify_text_edit(5, 4, 0), TextChange::Replaced);
+        assert_eq!(classify_text_edit(5, 0, 0), TextChange::Replaced);
+        // A delete is never an append, not even one that ends at the tail.
+        assert_eq!(classify_text_edit(5, 5, 1), TextChange::Replaced);
+        assert_eq!(classify_text_edit(5, 0, 5), TextChange::Replaced);
+    }
+
+    /// `append_text_as` claims append-by-construction rather than measuring the
+    /// before-length on every streamed token. This is the test that keeps the
+    /// claim honest: the suffix it publishes must be exactly what the text
+    /// engine actually added.
+    #[tokio::test]
+    async fn append_emits_exact_suffix() {
+        let (store, mut sub, ctx, block_id) = feed_fixture();
+
+        let mut expected = String::new();
+        for chunk in ["Hello", ", ", "世界", "!"] {
+            store.append_text(ctx, &block_id, chunk).unwrap();
+            let seen = drain_text_changes(&mut sub, &block_id);
+            let version = store.version(ctx).unwrap();
+            assert_eq!(
+                seen,
+                vec![SeenChange::Appended {
+                    suffix: chunk.to_string(),
+                    version,
+                }],
+                "an append must publish exactly the characters it added"
+            );
+            expected.push_str(chunk);
+        }
+
+        let text = store
+            .get_block_snapshot(ctx, &block_id)
+            .unwrap()
+            .unwrap()
+            .content;
+        assert_eq!(text, expected);
+    }
+
+    /// The MCP `block_append` shape: an *edit* whose position is the current
+    /// character count. A provenance rule would call this a splice; the
+    /// coordinates say append, and the coordinates are right.
+    #[tokio::test]
+    async fn edit_at_the_end_is_an_append() {
+        let (store, mut sub, ctx, block_id) = feed_fixture();
+        store.append_text(ctx, &block_id, "日本語").unwrap();
+        let _ = drain_text_changes(&mut sub, &block_id);
+
+        let len = store
+            .get_block_snapshot(ctx, &block_id)
+            .unwrap()
+            .unwrap()
+            .content
+            .chars()
+            .count();
+        store.edit_text(ctx, &block_id, len, "です", 0).unwrap();
+
+        assert_eq!(
+            drain_text_changes(&mut sub, &block_id),
+            vec![SeenChange::Appended {
+                suffix: "です".to_string(),
+                version: store.version(ctx).unwrap(),
+            }],
+            "an edit landing at the character count is an append, whatever tool made it"
+        );
+    }
+
+    /// Every non-append shape publishes the whole after-text. The mid-insert
+    /// case is the one that corrupts a client if it is called an append.
+    #[tokio::test]
+    async fn non_append_edits_publish_the_whole_text() {
+        for (before, pos, insert, delete, after) in [
+            // insert in the middle
+            ("abcdef", 3, "XY", 0, "abcXYdef"),
+            // insert at the very start
+            ("abcdef", 0, "Z", 0, "Zabcdef"),
+            // pure delete at the tail — ends at the length, still not an append
+            ("abcdef", 4, "", 2, "abcd"),
+            // splice: delete and insert together
+            ("abcdef", 1, "QQ", 3, "aQQef"),
+            // a replace that keeps the character count — the case a
+            // count-comparing client reports as "no change" (rule 19)
+            ("abcdef", 0, "ABC", 3, "ABCdef"),
+        ] {
+            let (store, mut sub, ctx, block_id) = feed_fixture();
+            store.append_text(ctx, &block_id, before).unwrap();
+            let _ = drain_text_changes(&mut sub, &block_id);
+
+            store
+                .edit_text(ctx, &block_id, pos, insert, delete)
+                .unwrap();
+
+            let text = store
+                .get_block_snapshot(ctx, &block_id)
+                .unwrap()
+                .unwrap()
+                .content;
+            assert_eq!(text, after, "fixture disagrees with the text engine");
+            assert_eq!(
+                drain_text_changes(&mut sub, &block_id),
+                vec![SeenChange::Replaced {
+                    content: after.to_string(),
+                    version: store.version(ctx).unwrap(),
+                }],
+                "edit(pos={pos}, insert={insert:?}, delete={delete}) must publish the after-text"
+            );
+        }
+    }
+
+    /// The property the whole feed exists for: a subscriber that only appends
+    /// suffixes and swaps in replacements — never touching operation bytes —
+    /// ends up with the kernel's text, character for character. Multibyte
+    /// throughout, because the addressing is characters and the trap is bytes.
+    #[tokio::test]
+    async fn replaying_classified_events_reproduces_the_text() {
+        let (store, mut sub, ctx, block_id) = feed_fixture();
+        let mut mirror = String::new();
+        let mut last_version = 0u64;
+
+        // A deliberately mixed sequence: streaming appends, a correction in the
+        // middle, a deletion, an append onto the corrected text.
+        store.append_text(ctx, &block_id, "こんにちは").unwrap();
+        store.append_text(ctx, &block_id, "、世界").unwrap();
+        store.edit_text(ctx, &block_id, 0, "はい、", 0).unwrap();
+        store.edit_text(ctx, &block_id, 3, "", 5).unwrap();
+        store.append_text(ctx, &block_id, "！").unwrap();
+        store.edit_text(ctx, &block_id, 2, "🎵", 1).unwrap();
+
+        for change in drain_text_changes(&mut sub, &block_id) {
+            match change {
+                SeenChange::Appended { suffix, version } => {
+                    mirror.push_str(&suffix);
+                    assert!(
+                        version > last_version,
+                        "versions must strictly increase: {version} after {last_version}"
+                    );
+                    last_version = version;
+                }
+                SeenChange::Replaced { content, version } => {
+                    mirror = content;
+                    assert!(
+                        version > last_version,
+                        "versions must strictly increase: {version} after {last_version}"
+                    );
+                    last_version = version;
+                }
+            }
+        }
+
+        let (blocks, version) = store.query_versioned(ctx, &BlockQuery::All).unwrap();
+        assert_eq!(
+            mirror, blocks[0].content,
+            "replaying the classified feed must reproduce the kernel's text exactly"
+        );
+        assert_eq!(
+            version, last_version,
+            "the version a snapshot reports must be the version the last event delivered"
+        );
+    }
+
+    /// `query_versioned` is what joins a snapshot to the feed, so its version
+    /// must be the same counter the events carry — and must move with every
+    /// mutation, text or not.
+    #[tokio::test]
+    async fn query_versioned_tracks_every_mutation() {
+        let (store, _sub, ctx, block_id) = feed_fixture();
+
+        let (_, v0) = store.query_versioned(ctx, &BlockQuery::All).unwrap();
+        store.append_text(ctx, &block_id, "x").unwrap();
+        let (_, v1) = store.query_versioned(ctx, &BlockQuery::All).unwrap();
+        store.set_status(ctx, &block_id, Status::Done).unwrap();
+        let (blocks, v2) = store.query_versioned(ctx, &BlockQuery::All).unwrap();
+
+        assert!(v0 < v1, "a text append must move the version");
+        assert!(v1 < v2, "a status change must move the version too");
+        assert_eq!(
+            v2,
+            store.version(ctx).unwrap(),
+            "the versioned query must report the same counter as `version`"
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content, "x");
+        assert_eq!(blocks[0].status, Status::Done);
+    }
+
+    /// The version rides on the event, not on the delivery, so a subscriber can
+    /// tell whether a buffered change is already in a snapshot it holds
+    /// (rule 25). An empty append is still a mutation and still moves it.
+    #[tokio::test]
+    async fn every_text_event_carries_the_post_mutation_version() {
+        let (store, mut sub, ctx, block_id) = feed_fixture();
+
+        store.append_text(ctx, &block_id, "a").unwrap();
+        let after_first = store.version(ctx).unwrap();
+        store.append_text(ctx, &block_id, "").unwrap();
+        let after_empty = store.version(ctx).unwrap();
+
+        assert!(
+            after_empty > after_first,
+            "an empty append is still an accepted mutation"
+        );
+        assert_eq!(
+            drain_text_changes(&mut sub, &block_id),
+            vec![
+                SeenChange::Appended {
+                    suffix: "a".to_string(),
+                    version: after_first,
+                },
+                SeenChange::Appended {
+                    suffix: String::new(),
+                    version: after_empty,
+                },
+            ]
         );
     }
 }

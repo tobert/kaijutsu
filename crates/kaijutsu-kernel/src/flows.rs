@@ -221,6 +221,8 @@ impl FlowTopics for BlockFlow {
     const TOPICS: &[&'static str] = &[
         "block.inserted",
         "block.text_ops",
+        "block.text_appended",
+        "block.text_replaced",
         "block.deleted",
         "block.status",
         "block.collapsed",
@@ -308,6 +310,50 @@ pub enum BlockFlow {
         /// CRDT data is never lost — only the realtime notification.
         #[serde(default)]
         seq_num: u64,
+    },
+
+    /// Text was added at the end of a block's text — the classified,
+    /// CRDT-free replacement for [`BlockFlow::TextOps`] on the append path
+    /// (docs/change-feed.md).
+    ///
+    /// A subscriber applies this by appending `suffix` to the text it already
+    /// holds. It never inspects operation bytes, so it never links the text
+    /// engine. Classification happens inside the kernel's mutation lock, where
+    /// the before-text length and the edit coordinates are both in hand — the
+    /// wire cannot classify, because by then the change is opaque bytes.
+    TextAppended {
+        /// The context ID.
+        context_id: ContextId,
+        /// The block whose text grew.
+        block_id: BlockId,
+        /// The characters added after the block's previous text.
+        suffix: Arc<str>,
+        /// The context's mutation version **after** this change. A client that
+        /// holds a snapshot at version V discards any delivery at or below V,
+        /// which is what makes replaying a buffered append safe.
+        version: u64,
+        /// Origin of this operation (Local or Remote).
+        #[serde(default)]
+        source: OpSource,
+    },
+
+    /// A block's text changed in a way that is not an append — the classified,
+    /// CRDT-free replacement for [`BlockFlow::TextOps`] on every other path.
+    ///
+    /// Carries the whole after-text: a subscriber replaces what it holds. An
+    /// insert in the middle, a delete, and a splice are all this variant.
+    TextReplaced {
+        /// The context ID.
+        context_id: ContextId,
+        /// The block whose text changed.
+        block_id: BlockId,
+        /// The block's full text after the mutation.
+        content: Arc<str>,
+        /// The context's mutation version **after** this change.
+        version: u64,
+        /// Origin of this operation (Local or Remote).
+        #[serde(default)]
+        source: OpSource,
     },
 
     /// A block was deleted.
@@ -454,6 +500,8 @@ impl BlockFlow {
         match self {
             Self::Inserted { .. } => "block.inserted",
             Self::TextOps { .. } => "block.text_ops",
+            Self::TextAppended { .. } => "block.text_appended",
+            Self::TextReplaced { .. } => "block.text_replaced",
             Self::Deleted { .. } => "block.deleted",
             Self::StatusChanged { .. } => "block.status",
             Self::CollapsedChanged { .. } => "block.collapsed",
@@ -473,6 +521,8 @@ impl BlockFlow {
         match self {
             Self::Inserted { context_id, .. }
             | Self::TextOps { context_id, .. }
+            | Self::TextAppended { context_id, .. }
+            | Self::TextReplaced { context_id, .. }
             | Self::Deleted { context_id, .. }
             | Self::StatusChanged { context_id, .. }
             | Self::CollapsedChanged { context_id, .. }
@@ -492,6 +542,8 @@ impl BlockFlow {
         match self {
             Self::Inserted { block, .. } => Some(&block.id),
             Self::TextOps { block_id, .. }
+            | Self::TextAppended { block_id, .. }
+            | Self::TextReplaced { block_id, .. }
             | Self::Deleted { block_id, .. }
             | Self::StatusChanged { block_id, .. }
             | Self::CollapsedChanged { block_id, .. }
@@ -519,6 +571,8 @@ impl BlockFlow {
         match self {
             Self::Inserted { source, .. }
             | Self::TextOps { source, .. }
+            | Self::TextAppended { source, .. }
+            | Self::TextReplaced { source, .. }
             | Self::Deleted { source, .. }
             | Self::StatusChanged { source, .. }
             | Self::CollapsedChanged { source, .. }
@@ -548,6 +602,8 @@ impl BlockFlow {
         match self {
             Self::Inserted { .. } => BlockFlowKind::Inserted,
             Self::TextOps { .. } => BlockFlowKind::TextOps,
+            Self::TextAppended { .. } => BlockFlowKind::TextAppended,
+            Self::TextReplaced { .. } => BlockFlowKind::TextReplaced,
             Self::Deleted { .. } => BlockFlowKind::Deleted,
             Self::StatusChanged { .. } => BlockFlowKind::StatusChanged,
             Self::CollapsedChanged { .. } => BlockFlowKind::CollapsedChanged,
@@ -2460,6 +2516,20 @@ mod tests {
                 metadata: kaijutsu_types::BlockMetadata::default(),
                 source: OpSource::Local,
             },
+            BlockFlow::TextAppended {
+                context_id: ctx,
+                block_id: id,
+                suffix: Arc::from("!"),
+                version: 1,
+                source: OpSource::Local,
+            },
+            BlockFlow::TextReplaced {
+                context_id: ctx,
+                block_id: id,
+                content: Arc::from("hello"),
+                version: 2,
+                source: OpSource::Local,
+            },
             BlockFlow::ContextSwitched { context_id: ctx },
             BlockFlow::RenderCue {
                 context_id: ctx,
@@ -2477,6 +2547,8 @@ mod tests {
             match v {
                 BlockFlow::Inserted { .. }
                 | BlockFlow::TextOps { .. }
+                | BlockFlow::TextAppended { .. }
+                | BlockFlow::TextReplaced { .. }
                 | BlockFlow::Deleted { .. }
                 | BlockFlow::StatusChanged { .. }
                 | BlockFlow::CollapsedChanged { .. }

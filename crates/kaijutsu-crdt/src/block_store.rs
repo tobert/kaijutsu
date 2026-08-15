@@ -211,6 +211,32 @@ impl BlockStore {
             .map(|b| b.snapshot())
     }
 
+    /// Get one block's text content, without building a full snapshot.
+    ///
+    /// The change feed's `textReplaced` payload needs exactly this and nothing
+    /// else (docs/change-feed.md); going through `get_block_snapshot` would
+    /// clone every metadata field to throw all but one away.
+    pub fn block_text(&self, id: &BlockId) -> Option<String> {
+        self.blocks
+            .get(id)
+            .filter(|b| !b.is_deleted())
+            .map(|b| b.text())
+    }
+
+    /// Get one block's content length in characters.
+    ///
+    /// This is the "before text" measurement the kernel classifies a text
+    /// mutation against (docs/change-feed.md). It materializes the text
+    /// internally — the same cost `Document::edit_text`'s own bounds check
+    /// already pays — so it belongs on the edit path, never on the streaming
+    /// append path.
+    pub fn block_content_len(&self, id: &BlockId) -> Option<usize> {
+        self.blocks
+            .get(id)
+            .filter(|b| !b.is_deleted())
+            .map(|b| b.content_len())
+    }
+
     /// Get block IDs in document order (sorted by order_key, BlockId tiebreak).
     pub fn block_ids_ordered(&self) -> Vec<BlockId> {
         let mut ordered: Vec<_> = self

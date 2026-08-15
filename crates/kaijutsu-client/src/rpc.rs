@@ -1041,12 +1041,32 @@ impl KernelHandle {
     // =========================================================================
 
     /// Fetch blocks by query (all, byIds, or byFilter).
+    ///
+    /// Drops the version the kernel answered with. A caller that is joining
+    /// this snapshot to a live subscription must use
+    /// [`Self::get_blocks_versioned`] instead — without the version it cannot
+    /// tell whether a buffered append is already included here, and applying
+    /// one twice corrupts the text (docs/change-feed.md rule 24).
     #[tracing::instrument(skip(self), name = "rpc_client.get_blocks")]
     pub async fn get_blocks(
         &self,
         context_id: ContextId,
         query: &BlockQuery,
     ) -> Result<Vec<BlockSnapshot>, RpcError> {
+        self.get_blocks_versioned(context_id, query)
+            .await
+            .map(|(blocks, _version)| blocks)
+    }
+
+    /// Fetch blocks by query together with the context version they were read
+    /// at — the snapshot half of the change feed's recovery protocol
+    /// (docs/change-feed.md rules 21-26).
+    #[tracing::instrument(skip(self), name = "rpc_client.get_blocks_versioned")]
+    pub async fn get_blocks_versioned(
+        &self,
+        context_id: ContextId,
+        query: &BlockQuery,
+    ) -> Result<(Vec<BlockSnapshot>, u64), RpcError> {
         let mut request = self.kernel.get_blocks_request();
         request.get().set_context_id(context_id.as_bytes());
         set_block_query_builder(request.get().init_query(), query);
@@ -1057,12 +1077,14 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let blocks_reader = response.get()?.get_blocks()?;
+        let r = response.get()?;
+        let version = r.get_version();
+        let blocks_reader = r.get_blocks()?;
         let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
         for block in blocks_reader.iter() {
             blocks.push(parse_block_snapshot(&block)?);
         }
-        Ok(blocks)
+        Ok((blocks, version))
     }
 
     /// Fetch CRDT sync state (ops + version) without blocks.
@@ -2990,6 +3012,12 @@ fn set_block_event_filter_builder(
                     }
                     kaijutsu_types::BlockFlowKind::TextOps => {
                         crate::kaijutsu_capnp::BlockFlowKind::TextOps
+                    }
+                    kaijutsu_types::BlockFlowKind::TextAppended => {
+                        crate::kaijutsu_capnp::BlockFlowKind::TextAppended
+                    }
+                    kaijutsu_types::BlockFlowKind::TextReplaced => {
+                        crate::kaijutsu_capnp::BlockFlowKind::TextReplaced
                     }
                     kaijutsu_types::BlockFlowKind::Deleted => {
                         crate::kaijutsu_capnp::BlockFlowKind::Deleted
