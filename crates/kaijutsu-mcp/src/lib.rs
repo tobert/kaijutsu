@@ -1666,9 +1666,11 @@ impl KaijutsuMcp {
             }
         }
 
-        // 3-8: sync, build SyncedDocument, spawn doc task + event bridge,
-        // publish JoinedContext / shared_context_id — shared with
-        // `stabilize_context_label`'s reattach case (see `finish_join`).
+        // Spawn the pulse task, then publish JoinedContext /
+        // shared_context_id — shared with `stabilize_context_label`'s reattach
+        // case (see `finish_join`). No replica is built and no doc task runs:
+        // reads are authoritative queries, and the pulse only supplies an
+        // early-wake hint.
         let outcome = match finish_join(remote, context_id, label, resumed, previous_context).await
         {
             Ok(outcome) => outcome,

@@ -3589,10 +3589,13 @@ impl kernel::Server for KernelImpl {
         _params: kernel::GetContextStateParams,
         _results: kernel::GetContextStateResults,
     ) -> Promise<(), capnp::Error> {
-        // Tombstoned: use getBlocks @82 + getContextSync @83 instead.
-        // Schema ordinal @14 is preserved for wire compatibility.
+        // Tombstoned: use getBlocks @35 for blocks and getContextVersion @110
+        // for the revision. `getContextSync @36` also carries a version, but it
+        // ships the whole oplog to do it and is itself on the way out — prefer
+        // the projected read. Schema ordinal @34 is preserved for wire
+        // compatibility.
         Promise::err(capnp::Error::failed(
-            "getContextState removed: use getBlocks @82 + getContextSync @83".into(),
+            "getContextState removed: use getBlocks @35 + getContextVersion @110".into(),
         ))
     }
 
