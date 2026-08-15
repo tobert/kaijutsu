@@ -6,6 +6,59 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Reconnect follow-ups from the auto-reconnect + backoff task (2026-08-14)
+
+Landed: indefinite reconnect with jittered exponential backoff
+(`crates/kaijutsu-client/src/actor.rs`'s `backoff_for_attempt_jittered`), and
+a single post-reconnect re-init path in the app for the theme/metronome/
+scroll config trio (`crates/kaijutsu-app/src/connection/actor_plugin.rs`'s
+`refetch_config_on_reconnect` → `fetch_startup_configs_with`, triggered off
+the same `ServerEvent::Reconnected` `bump_sync_generation_on_reconnect`
+already used). Two things came up during that pass that were out of scope
+for "reconnect correctness" and are recorded here instead of fixed in place:
+
+**1. `SyncedInput` is never resynced after a reconnect, only after a fresh
+context join.** `crates/kaijutsu-app/src/view/sync.rs`'s
+`handle_block_events` only builds `cached.input` when
+`RpcResultMessage::InputStateReceived` arrives AND `cached.input.is_none()`
+(line ~140-168) — true on the initial `ContextJoined`, never true again once
+an input doc exists. Unlike the block CRDT (which gets a real resync via
+`get_context_sync` → `ContextResynced`, fired eagerly in
+`RpcActor::enter_connected` on every reconnect — `crates/kaijutsu-client/src/actor.rs`
+line ~2038-2064), an `EditInput`/`SubmitInput` a peer issued *during* the
+outage never reaches this client's `SyncedInput` after it reconnects: the
+input-ops stream rides the same block-events subscription (which the actor
+does re-subscribe on every reconnect), so *future* edits are fine, but
+whatever happened while this client was disconnected is a gap nothing
+backfills. Fixing it isn't a one-line add — `get_input_state` exists as an
+RPC, but `SyncedInput` has no `apply_sync_state`-equivalent reconciliation
+method the way `SyncedDocument` does (see `synced_document.rs`
+`apply_sync_state`), so wiring a raw re-fetch into the existing
+`cached.input.is_none()` guard would either no-op (guard blocks it) or, if
+the guard is loosened, risks clobbering in-flight local edits — exactly the
+"crashing preferred over data corruption" case, not a silent-patch case.
+Left alone rather than rushed.
+
+**2. `poll_connection_status`'s comment about `periodic_reconnect` describes
+a system that does not exist.** `crates/kaijutsu-app/src/connection/actor_plugin.rs`
+(`poll_connection_status`, ~line 750 and ~line 795): "removes the `RpcActor`
+resource so `periodic_reconnect` can spawn a fresh one." Grepped the whole
+app crate — there is no `periodic_reconnect` fn, and `BootstrapCommand::SpawnActor`
+is sent exactly once, from `ActorPlugin::build`. In practice this is dead
+code, not a live bug: the actor's own FSM (`crates/kaijutsu-client/src/actor.rs`)
+already retries indefinitely on every transient failure without ever exiting
+`run()` or closing the status broadcast, so a normal kernel bounce never hits
+this path. It would only matter if the actor's own tokio task panicked
+outright (a real bug elsewhere, not a bounce) — in which case the app
+currently has **no** recovery short of a restart, despite the stale comment
+implying one exists. Worth either writing the `periodic_reconnect` system
+the comment describes, or correcting the comment to say "there is currently
+no recovery from this — restart the app" — but that's a design call
+(does an actor-task panic deserve auto-respawn, and does a fresh actor need
+a fresh `instance` or the same one?) outside this task's scope.
+
+---
+
 ## Gate slice 1a — three findings from the research pass (2026-08-14)
 
 Slice 1a (gate the six destructive `kj` verbs, ledger via `KernelDb`,

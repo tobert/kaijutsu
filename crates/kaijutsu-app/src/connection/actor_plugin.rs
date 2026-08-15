@@ -13,7 +13,8 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::{
-    ActorHandle, ContextMembership, Identity, KernelInfo, ServerEvent, SnapshotResult, SshConfig,
+    ActorHandle, CallError, ContextMembership, Identity, KernelInfo, ServerEvent, SnapshotResult,
+    SshConfig,
 };
 use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
@@ -269,6 +270,7 @@ impl Plugin for ActorPlugin {
                 poll_rpc_results,
                 update_connection_state,
                 bump_sync_generation_on_reconnect,
+                refetch_config_on_reconnect,
                 restore_context_on_message,
                 apply_theme_from_rpc,
             )
@@ -305,6 +307,389 @@ fn bump_sync_generation_on_reconnect(
                 generation
             );
         }
+    }
+}
+
+/// Re-fetch the theme/metronome/scroll config trio whenever the actor
+/// reports a reconnect. Uses the SAME [`ServerEvent::Reconnected`] trigger as
+/// [`bump_sync_generation_on_reconnect`] just above — the actor's one
+/// canonical "we came back from an outage" signal — rather than adding a
+/// second reconnect-detection mechanism alongside it.
+///
+/// Before this system existed, [`fetch_startup_configs`] only ran once, from
+/// `poll_bootstrap_results`'s `ActorReady` arm. That is correct for cold
+/// start but leaves the app silently running whatever theme/metronome/scroll
+/// config it booted with even after a kernel bounce onto a fresh or edited
+/// CRDT config (`kj rc reset`, a config wipe, a different kernel instance on
+/// the same port during dev) — reconnected at the transport layer but not
+/// re-initialized at the domain layer, the exact bug this task exists to
+/// close. `ServerEvent::Reconnected` is never emitted for the first connect
+/// (see `RpcActor::enter_connected`), so cold start and reconnect never
+/// double-fetch.
+fn refetch_config_on_reconnect(
+    mut server_events: MessageReader<ServerEventMessage>,
+    actor: Option<Res<RpcActor>>,
+    result_channel: Res<RpcResultChannel>,
+    client_id: Res<crate::connection::client_id::ClientId>,
+) {
+    let Some(actor) = actor else { return };
+    let reconnected = server_events
+        .read()
+        .any(|ServerEventMessage(event)| matches!(event, ServerEvent::Reconnected));
+    if !reconnected {
+        return;
+    }
+    log::info!("reconnect signalled — refetching theme/metronome/scroll config");
+    let h = actor.handle.clone();
+    let tx = result_channel.sender();
+    let client_id = client_id.0.to_string();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            // `visible_on_failure = true`: unlike cold start, a failure here
+            // means we just had a live config and lost track of whether it's
+            // still current — that must be visible, not a silent fallback to
+            // stale state (project directive).
+            fetch_startup_configs(h, client_id, tx, true).await;
+        })
+        .detach();
+}
+
+/// Fetch the CRDT-owned per-client config trio (theme, metronome, scroll)
+/// and forward each into its existing `RpcResultMessage` sink
+/// (`apply_theme_from_rpc` below; `dj::thread`'s `MetronomeConfigReceived`
+/// handler; `input::scroll_config::apply_scroll_config`).
+///
+/// The ONE fetch path for this trio — called from both the initial
+/// `ActorReady` bootstrap (cold start, `visible_on_failure = false`) and
+/// [`refetch_config_on_reconnect`] (every actor-internal reconnect,
+/// `visible_on_failure = true`). See that fn's doc comment for why a
+/// reconnect must re-run this rather than trusting whatever was fetched at
+/// boot. Thin wrapper over [`fetch_startup_configs_with`] that supplies the
+/// live `ActorHandle::get_config` as the fetch — see that fn for why the
+/// split exists.
+async fn fetch_startup_configs(
+    h: ActorHandle,
+    client_id: String,
+    tx: mpsc::UnboundedSender<RpcResultMessage>,
+    visible_on_failure: bool,
+) {
+    let fetch = |path: String| {
+        let h = h.clone();
+        async move { h.get_config(path).await }
+    };
+    fetch_startup_configs_with(&fetch, &client_id, &tx, visible_on_failure).await;
+}
+
+/// Same fetch/fallback/visibility logic as [`fetch_startup_configs`], with
+/// the RPC call itself injected as `fetch` rather than going through a live
+/// `ActorHandle`. `ActorHandle` can't be constructed as a test double from
+/// outside `kaijutsu-client` (its fields are private to that crate, and
+/// building a real one means a real capnp connection) — injecting the fetch
+/// dependency here does for this config-refresh logic what
+/// `backoff_for_attempt_jittered` does for the RNG in `actor.rs`: tests drive
+/// the two-layer-fallback / failure-visibility branches with a canned async
+/// closure instead of asserting against live I/O.
+async fn fetch_startup_configs_with<F, Fut>(
+    fetch: &F,
+    client_id: &str,
+    tx: &mpsc::UnboundedSender<RpcResultMessage>,
+    visible_on_failure: bool,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, CallError>>,
+{
+    match fetch("theme.toml".to_string()).await {
+        Ok(toml) => {
+            let _ = tx.send(RpcResultMessage::ThemeReceived(toml));
+        }
+        Err(e) => {
+            log::warn!("theme fetch over RPC failed: {e}; keeping current theme");
+            if visible_on_failure {
+                let _ = tx.send(RpcResultMessage::RpcError {
+                    operation: "theme.toml refetch after reconnect".into(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    fetch_layered_config(
+        fetch,
+        client_id,
+        "metronome.toml",
+        tx,
+        visible_on_failure,
+        RpcResultMessage::MetronomeConfigReceived,
+    )
+    .await;
+
+    fetch_layered_config(
+        fetch,
+        client_id,
+        "scroll.toml",
+        tx,
+        visible_on_failure,
+        RpcResultMessage::ScrollConfigReceived,
+    )
+    .await;
+}
+
+/// Shared two-layer (`/etc/client/<id>/<name>` then `/etc/client/<name>`)
+/// config fetch used by both the metronome and scroll-gain legs of
+/// [`fetch_startup_configs_with`]. Only surfaces a failure (log + optional
+/// toast) when at least one layer actually errored — both layers coming back
+/// empty is the expected, silent common case (a bare kernel with no
+/// per-client overrides at all), not a failure.
+async fn fetch_layered_config<F, Fut>(
+    fetch: &F,
+    client_id: &str,
+    name: &str,
+    tx: &mpsc::UnboundedSender<RpcResultMessage>,
+    visible_on_failure: bool,
+    wrap: impl Fn(String) -> RpcResultMessage,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, CallError>>,
+{
+    let mut last_err: Option<String> = None;
+    for path in [
+        kaijutsu_types::paths::client_config_path(Some(client_id), name),
+        kaijutsu_types::paths::client_config_path(None, name),
+    ] {
+        match fetch(path.clone()).await {
+            Ok(toml) if !toml.trim().is_empty() => {
+                let _ = tx.send(wrap(toml));
+                return;
+            }
+            // Empty body: try the next (shared) layer.
+            Ok(_) => {}
+            // Absent override (common) / read error: fall through.
+            Err(e) => {
+                log::debug!("{name} config {path} unavailable: {e}");
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        log::warn!("{name} config unavailable on both layers: {e}");
+        if visible_on_failure {
+            let _ = tx.send(RpcResultMessage::RpcError {
+                operation: format!("{name} refetch after reconnect"),
+                error: e,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_config_refetch_tests {
+    use super::*;
+
+    /// Drain every message currently buffered on an unbounded receiver
+    /// without blocking — the tests below await the fetch future to
+    /// completion first, so everything it sent is already queued.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<RpcResultMessage>) -> Vec<RpcResultMessage> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn theme_fetch_success_sends_theme_received() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // `fetch_startup_configs_with` calls this for theme, then metronome,
+        // then scroll — only theme.toml gets real content here, so the
+        // others fall through both layers to an empty/silent no-op.
+        let fetch = |path: String| async move {
+            if path == "theme.toml" {
+                Ok("scheme = \"dark\"".to_string())
+            } else {
+                Ok(String::new())
+            }
+        };
+        fetch_startup_configs_with(&fetch, "client-1", &tx, false).await;
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, RpcResultMessage::ThemeReceived(t) if t == "scheme = \"dark\"")
+            ),
+            "expected a ThemeReceived among: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_fetch_failure_is_silent_when_not_visible() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |_: String| async { Err(CallError::Shutdown) };
+        fetch_startup_configs_with(&fetch, "client-1", &tx, false).await;
+        let msgs = drain(&mut rx);
+        assert!(
+            !msgs.iter().any(|m| matches!(m, RpcResultMessage::RpcError { .. })),
+            "cold start must not toast a theme-fetch failure: {msgs:?}"
+        );
+    }
+
+    /// The project directive under test: a post-reconnect re-init failure
+    /// must be visible, not a silent fallback. `visible_on_failure = true`
+    /// (what `refetch_config_on_reconnect` always passes) must turn a fetch
+    /// error into an app-visible `RpcError`, on top of the log line that
+    /// always fires.
+    #[tokio::test]
+    async fn theme_fetch_failure_is_visible_on_reconnect() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |_: String| async { Err(CallError::Shutdown) };
+        fetch_startup_configs_with(&fetch, "client-1", &tx, true).await;
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                RpcResultMessage::RpcError { operation, .. }
+                    if operation.contains("theme.toml")
+            )),
+            "reconnect must surface a theme-fetch failure, got: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn layered_config_prefers_the_per_client_override() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |path: String| async move {
+            if path.contains("client-1") {
+                Ok("line_gain = 9.0".to_string())
+            } else {
+                Ok("line_gain = 1.0".to_string())
+            }
+        };
+        fetch_layered_config(
+            &fetch,
+            "client-1",
+            "scroll.toml",
+            &tx,
+            true,
+            RpcResultMessage::ScrollConfigReceived,
+        )
+        .await;
+        let msgs = drain(&mut rx);
+        assert_eq!(msgs.len(), 1, "must stop at the first non-empty layer: {msgs:?}");
+        assert!(matches!(
+            &msgs[0],
+            RpcResultMessage::ScrollConfigReceived(t) if t == "line_gain = 9.0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn layered_config_falls_back_to_the_shared_default_when_the_override_is_empty() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |path: String| async move {
+            if path.contains("client-1") {
+                Ok(String::new()) // per-client override absent
+            } else {
+                Ok("line_gain = 1.0".to_string())
+            }
+        };
+        fetch_layered_config(
+            &fetch,
+            "client-1",
+            "scroll.toml",
+            &tx,
+            true,
+            RpcResultMessage::ScrollConfigReceived,
+        )
+        .await;
+        let msgs = drain(&mut rx);
+        assert!(matches!(
+            &msgs[0],
+            RpcResultMessage::ScrollConfigReceived(t) if t == "line_gain = 1.0"
+        ));
+    }
+
+    /// Both layers empty (no override anywhere, bare kernel) is the normal
+    /// case — never a failure toast even when `visible_on_failure` is set.
+    #[tokio::test]
+    async fn layered_config_both_layers_empty_is_silent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |_: String| async { Ok(String::new()) };
+        fetch_layered_config(
+            &fetch,
+            "client-1",
+            "scroll.toml",
+            &tx,
+            true,
+            RpcResultMessage::ScrollConfigReceived,
+        )
+        .await;
+        let msgs = drain(&mut rx);
+        assert!(msgs.is_empty(), "both-empty must not toast: {msgs:?}");
+    }
+
+    /// Both layers erroring (not just empty) IS a failure — and per the
+    /// project directive it must be visible on reconnect.
+    #[tokio::test]
+    async fn layered_config_both_layers_erroring_is_visible_on_reconnect() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |_: String| async { Err(CallError::Shutdown) };
+        fetch_layered_config(
+            &fetch,
+            "client-1",
+            "scroll.toml",
+            &tx,
+            true,
+            RpcResultMessage::ScrollConfigReceived,
+        )
+        .await;
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                RpcResultMessage::RpcError { operation, .. } if operation.contains("scroll.toml")
+            )),
+            "both layers erroring must surface on reconnect, got: {msgs:?}"
+        );
+    }
+
+    /// Same both-erroring case at the cold-start callsite (`visible_on_failure
+    /// = false`): must stay silent, matching the original bootstrap behavior
+    /// this refactor must not regress.
+    #[tokio::test]
+    async fn layered_config_both_layers_erroring_is_silent_at_cold_start() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |_: String| async { Err(CallError::Shutdown) };
+        fetch_layered_config(
+            &fetch,
+            "client-1",
+            "scroll.toml",
+            &tx,
+            false,
+            RpcResultMessage::ScrollConfigReceived,
+        )
+        .await;
+        let msgs = drain(&mut rx);
+        assert!(msgs.is_empty(), "cold start must not toast: {msgs:?}");
+    }
+
+    /// The full trio in one call, exercising `fetch_startup_configs_with`
+    /// end to end with a single fetch closure that answers all three names.
+    #[tokio::test]
+    async fn fetch_startup_configs_with_delivers_all_three_on_success() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fetch = |path: String| async move {
+            if path == "theme.toml" {
+                Ok("scheme = \"dark\"".to_string())
+            } else if path.contains("metronome") {
+                Ok("enabled = true".to_string())
+            } else if path.contains("scroll") {
+                Ok("line_gain = 2.0".to_string())
+            } else {
+                Ok(String::new())
+            }
+        };
+        fetch_startup_configs_with(&fetch, "client-1", &tx, false).await;
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m, RpcResultMessage::ThemeReceived(_))));
+        assert!(msgs.iter().any(|m| matches!(m, RpcResultMessage::MetronomeConfigReceived(_))));
+        assert!(msgs.iter().any(|m| matches!(m, RpcResultMessage::ScrollConfigReceived(_))));
     }
 }
 
@@ -483,70 +868,13 @@ fn poll_bootstrap_results(
                             }
                         }
 
-                        // 0. Fetch the CRDT-owned theme over RPC. The app no
-                        // longer reads a host theme.toml (slice 2): the kernel
-                        // is the sole owner. Best-effort — a failure keeps the
-                        // default theme already in place. Done before the
-                        // context branches below (both of which can `return`).
-                        match h.get_config("theme.toml".to_string()).await {
-                            Ok(toml) => {
-                                let _ = tx.send(RpcResultMessage::ThemeReceived(toml));
-                            }
-                            Err(e) => {
-                                log::warn!("theme fetch over RPC failed: {e}; keeping default theme")
-                            }
-                        }
-
-                        // 0b. Fetch the per-client metronome config (per-client
-                        // /etc/client/<id>/metronome.toml first, then the shared
-                        // /etc/client/metronome.toml default). Best-effort — a
-                        // miss keeps the compiled-in click already on the
-                        // Metronome resource. Runs before the context branches
-                        // (which can `return`) so it always fires.
-                        for path in [
-                            kaijutsu_types::paths::client_config_path(
-                                Some(&client_id),
-                                "metronome.toml",
-                            ),
-                            kaijutsu_types::paths::client_config_path(None, "metronome.toml"),
-                        ] {
-                            match h.get_config(path.clone()).await {
-                                Ok(toml) if !toml.trim().is_empty() => {
-                                    let _ = tx
-                                        .send(RpcResultMessage::MetronomeConfigReceived(toml));
-                                    break;
-                                }
-                                // Empty body: try the next (shared) layer.
-                                Ok(_) => {}
-                                // Absent override (common) / read error: fall through.
-                                Err(e) => log::debug!("metronome config {path} unavailable: {e}"),
-                            }
-                        }
-
-                        // 0c. Fetch the per-client scroll-gain config (per-client
-                        // /etc/client/<id>/scroll.toml first, then the shared
-                        // /etc/client/scroll.toml default). Best-effort — a miss
-                        // keeps the compiled-in gains already on the ScrollConfig
-                        // resource. Runs before the context branches (which can
-                        // `return`) so it always fires.
-                        for path in [
-                            kaijutsu_types::paths::client_config_path(
-                                Some(&client_id),
-                                "scroll.toml",
-                            ),
-                            kaijutsu_types::paths::client_config_path(None, "scroll.toml"),
-                        ] {
-                            match h.get_config(path.clone()).await {
-                                Ok(toml) if !toml.trim().is_empty() => {
-                                    let _ = tx.send(RpcResultMessage::ScrollConfigReceived(toml));
-                                    break;
-                                }
-                                // Empty body: try the next (shared) layer.
-                                Ok(_) => {}
-                                // Absent override (common) / read error: fall through.
-                                Err(e) => log::debug!("scroll config {path} unavailable: {e}"),
-                            }
-                        }
+                        // 0/0b/0c. Fetch the CRDT-owned theme + per-client
+                        // metronome/scroll configs over RPC. Shared with
+                        // `refetch_config_on_reconnect` — see that fn's doc
+                        // comment for why cold start and reconnect must run
+                        // the exact same fetch, not two copies of it.
+                        fetch_startup_configs(h.clone(), client_id.clone(), tx.clone(), false)
+                            .await;
 
                         // 1. whoami — now guaranteed not to be NotReady
                         let identity = match h.whoami().await {

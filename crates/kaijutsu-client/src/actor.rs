@@ -3364,11 +3364,33 @@ async fn dispatch_kernel_command(
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Full jitter applied under the exponential-capped envelope. A bounced
+/// kernel is a many-clients event (every app window, every MCP session,
+/// every peer dials back at once) — without jitter every one of them lands
+/// on the same 1s/2s/4s/.../30s clock ticks and the reconnect wave itself
+/// becomes a small thundering herd against the kernel that just came back up.
+/// `JITTER_FLOOR` keeps a retry from ever collapsing to ~0s (which would
+/// defeat backoff entirely): the realized delay is always at least this
+/// fraction of the exponential-capped value, uniformly up to the full value.
+const JITTER_FLOOR: f64 = 0.5;
+
 fn backoff_for_attempt(attempt: u32) -> Duration {
-    let exp = (BACKOFF_BASE.as_secs_f64()
-        * 2.0_f64.powi(attempt.saturating_sub(1) as i32))
-    .min(BACKOFF_MAX.as_secs_f64());
-    Duration::from_secs_f64(exp)
+    backoff_for_attempt_jittered(attempt, || {
+        rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..1.0)
+    })
+}
+
+/// Same exponential-capped schedule as `backoff_for_attempt`, but the jitter
+/// unit (expected in `[0.0, 1.0)`) comes from `jitter_source` instead of the
+/// OS RNG. Lets tests assert exact bounds (e.g. `0.0` / `1.0` sources) rather
+/// than asserting on random output — the RNG itself isn't what we're
+/// verifying, the *shape* of the jitter envelope is.
+fn backoff_for_attempt_jittered(attempt: u32, jitter_source: impl FnOnce() -> f64) -> Duration {
+    let base = (BACKOFF_BASE.as_secs_f64() * 2.0_f64.powi(attempt.saturating_sub(1) as i32))
+        .min(BACKOFF_MAX.as_secs_f64());
+    let unit = jitter_source().clamp(0.0, 1.0);
+    let factor = JITTER_FLOOR + unit * (1.0 - JITTER_FLOOR);
+    Duration::from_secs_f64(base * factor)
 }
 
 fn system_now_ms() -> u64 {
@@ -3457,16 +3479,67 @@ pub fn spawn_actor(
 mod tests {
     use super::*;
 
+    /// The exponential-capped *shape* of the schedule, isolated from jitter
+    /// by pinning the jitter source at its top (`1.0` ⇒ `factor == 1.0`, no
+    /// reduction) so this test still pins exact values.
     #[test]
     fn backoff_curve_caps_at_max() {
-        assert_eq!(backoff_for_attempt(1).as_secs(), 1);
-        assert_eq!(backoff_for_attempt(2).as_secs(), 2);
-        assert_eq!(backoff_for_attempt(3).as_secs(), 4);
-        assert_eq!(backoff_for_attempt(4).as_secs(), 8);
-        assert_eq!(backoff_for_attempt(5).as_secs(), 16);
+        assert_eq!(backoff_for_attempt_jittered(1, || 1.0).as_secs(), 1);
+        assert_eq!(backoff_for_attempt_jittered(2, || 1.0).as_secs(), 2);
+        assert_eq!(backoff_for_attempt_jittered(3, || 1.0).as_secs(), 4);
+        assert_eq!(backoff_for_attempt_jittered(4, || 1.0).as_secs(), 8);
+        assert_eq!(backoff_for_attempt_jittered(5, || 1.0).as_secs(), 16);
         // 32s capped to 30s
-        assert_eq!(backoff_for_attempt(6).as_secs(), 30);
-        assert_eq!(backoff_for_attempt(20).as_secs(), 30);
+        assert_eq!(backoff_for_attempt_jittered(6, || 1.0).as_secs(), 30);
+        assert_eq!(backoff_for_attempt_jittered(20, || 1.0).as_secs(), 30);
+    }
+
+    /// Jitter never collapses a retry toward zero: the floor keeps every
+    /// realized delay at least `JITTER_FLOOR` of the exponential-capped
+    /// value, even when the jitter source returns the minimum unit.
+    #[test]
+    fn jitter_floor_bounds_the_minimum_delay() {
+        let base = backoff_for_attempt_jittered(4, || 1.0); // 8s, no reduction
+        let floored = backoff_for_attempt_jittered(4, || 0.0); // minimum jitter unit
+        assert_eq!(floored.as_secs_f64(), base.as_secs_f64() * JITTER_FLOOR);
+    }
+
+    /// Jitter never exceeds the exponential-capped envelope — the unit source
+    /// is clamped even if a (misbehaving) source returns something outside
+    /// `[0.0, 1.0)`.
+    #[test]
+    fn jitter_never_exceeds_the_unjittered_envelope() {
+        let base = backoff_for_attempt_jittered(6, || 1.0); // at the 30s cap
+        let over = backoff_for_attempt_jittered(6, || 5.0); // out-of-range source
+        assert_eq!(over.as_secs_f64(), base.as_secs_f64());
+    }
+
+    /// Two different jitter units at the same attempt produce two different
+    /// delays — this is the actual thundering-herd fix: without jitter every
+    /// client reconnecting to the same bounced kernel lands on the identical
+    /// 1s/2s/4s/.../30s tick.
+    #[test]
+    fn jitter_spreads_same_attempt_across_a_range() {
+        let a = backoff_for_attempt_jittered(5, || 0.0);
+        let b = backoff_for_attempt_jittered(5, || 1.0);
+        assert!(a < b, "jitter should spread delays at a fixed attempt: {a:?} vs {b:?}");
+    }
+
+    /// The production entry point (`backoff_for_attempt`, OS-RNG-backed)
+    /// always stays within the `[floor, envelope]` bounds regardless of what
+    /// the RNG draws — run enough samples that a bug producing an
+    /// out-of-bounds factor would show up virtually every run.
+    #[test]
+    fn backoff_for_attempt_stays_within_jitter_bounds() {
+        let envelope = backoff_for_attempt_jittered(4, || 1.0).as_secs_f64();
+        let floor = envelope * JITTER_FLOOR;
+        for _ in 0..200 {
+            let d = backoff_for_attempt(4).as_secs_f64();
+            assert!(
+                (floor..=envelope).contains(&d),
+                "backoff {d} outside [{floor}, {envelope}]"
+            );
+        }
     }
 
     #[test]
@@ -3614,5 +3687,94 @@ mod tests {
         actor.start_closing(CloseCause::Shutdown);
         actor.finish_closing();
         assert!(matches!(actor.state, ActorState::Terminal { .. }));
+    }
+
+    /// Reconnect must be indefinite: a still-down kernel (every handshake
+    /// keeps returning `ConnectOutcome::Transient` — connection refused,
+    /// exactly what `SshError::ConnectionFailed`/`Disconnected` produce
+    /// during a rebuild window) never settles `Terminal` no matter how many
+    /// attempts pile up. Only a `ConnectOutcome::Permanent` result (auth
+    /// rejected, missing context) is allowed to give up — see
+    /// `on_connect_outcome`. This drives 200 Connecting→Transient cycles
+    /// (a kernel down for minutes at capped 30s backoff is ~4-5 attempts/min,
+    /// so 200 covers well over half an hour) and asserts every one lands
+    /// back in `Cooldown`, climbing `next_attempt`, never `Terminal`.
+    #[test]
+    fn reconnect_never_gives_up_while_the_kernel_stays_down() {
+        let mut actor = test_actor();
+        for i in 1..=200u32 {
+            actor.state = ActorState::Connecting {
+                attempt: i,
+                started_at: Instant::now(),
+            };
+            actor.on_connect_outcome(ConnectOutcome::Transient("connection refused".into()));
+            match &actor.state {
+                ActorState::Cooldown { next_attempt, .. } => {
+                    assert_eq!(
+                        *next_attempt,
+                        i + 1,
+                        "attempt count should climb by exactly one per cycle"
+                    );
+                }
+                other => panic!(
+                    "reconnect gave up after {i} attempts against a still-down kernel: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Regression guard for the re-init contract `connect_handshake` relies
+    /// on: it reads `peer_registration`, `vfs_activity_interval_ms`, and
+    /// `context_id` off the actor to decide what to re-attach/re-subscribe/
+    /// re-join on every (re)connect (see `connect_handshake` steps 3, 3.5,
+    /// 3.6 and `tech_debt_peer_reattach_on_reconnect`). None of those fields
+    /// is state a close→cooldown cycle should ever touch — if a future
+    /// refactor accidentally cleared one in `start_closing`/`finish_closing`,
+    /// the corresponding re-init would silently stop happening on the next
+    /// successful handshake, with nothing failing loudly until a dev noticed
+    /// their peer registration (or VFS heat, or joined context) gone after a
+    /// kernel bounce. This can't exercise `connect_handshake` itself (it
+    /// does real capnp RPC against a live kernel — no mock transport exists
+    /// in this crate), so it pins the state-survival half of the contract at
+    /// the FSM level, matching this file's existing no-I/O state tests.
+    #[test]
+    fn reconnect_state_survives_a_full_close_cooldown_cycle() {
+        let mut actor = test_actor();
+        let (peer_tx, _peer_rx) = std::sync::mpsc::channel();
+        actor.peer_registration = Some((
+            PeerConfig {
+                nick: "amy".into(),
+                instance: "inst-1".into(),
+            },
+            peer_tx,
+        ));
+        actor.vfs_activity_interval_ms = Some(500);
+        actor.context_id = Some(ContextId::new());
+        actor.state = ActorState::Connected {
+            since: Instant::now(),
+        };
+
+        actor.start_closing(CloseCause::RpcError("disconnected".into()));
+        actor.finish_closing();
+
+        assert!(
+            matches!(actor.state, ActorState::Cooldown { .. }),
+            "expected Cooldown, got {:?}",
+            actor.state
+        );
+        assert!(
+            actor.peer_registration.is_some(),
+            "peer registration must survive close→cooldown so connect_handshake re-attaches"
+        );
+        assert_eq!(actor.peer_registration.as_ref().unwrap().0.nick, "amy");
+        assert_eq!(
+            actor.vfs_activity_interval_ms,
+            Some(500),
+            "VFS activity subscription request must survive close→cooldown"
+        );
+        assert!(
+            actor.context_id.is_some(),
+            "context_id must survive close→cooldown so connect_handshake re-joins it"
+        );
     }
 }
