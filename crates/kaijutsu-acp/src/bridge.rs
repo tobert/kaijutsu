@@ -12,6 +12,7 @@ use kaijutsu_client::{
     ActorHandle, ContextInfo, PeerConfig, PeerInvocation, SshConfig, SyncedDocument, connect_ssh,
     spawn_actor,
 };
+use kaijutsu_client::rpc::{KjCommandInfo, KjExecutionResult};
 use kaijutsu_crdt::{BlockId, ContextId, PrincipalId};
 
 /// Per-process subscription identity.
@@ -205,6 +206,27 @@ impl KernelBridge {
             .archive_context(context_id)
             .await
             .context("archive context")
+    }
+
+    /// Read the context's authoritative, loadout-filtered `kj` command surface.
+    pub async fn kj_command_catalog(&self, context_id: ContextId) -> Result<Vec<KjCommandInfo>> {
+        self.actor
+            .get_kj_command_catalog(context_id)
+            .await
+            .context("get kj command catalog")
+    }
+
+    /// Execute structured `kj` argv against the context without changing the
+    /// actor connection's ambient context.
+    pub async fn execute_kj(
+        &self,
+        context_id: ContextId,
+        argv: Vec<String>,
+    ) -> Result<KjExecutionResult> {
+        self.actor
+            .execute_kj(context_id, argv)
+            .await
+            .context("execute addressed kj command")
     }
 
     /// Resolve-or-create a context for a label, then join it.

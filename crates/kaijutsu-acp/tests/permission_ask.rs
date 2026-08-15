@@ -43,6 +43,7 @@ fn session_registry_with(context_id: ContextId) -> SessionRegistry {
         context_id,
         "test".into(),
         UpdateMapper::new(session_id.clone()),
+        Vec::new(),
     );
     assert!(reg.bind(session_id, session).is_some());
     reg

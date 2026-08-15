@@ -33,12 +33,14 @@ pub mod update;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, DeleteSessionRequest, DeleteSessionResponse, Error, Implementation,
+    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    DeleteSessionRequest, DeleteSessionResponse, Error, Implementation,
     InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId,
-    SessionDeleteCapabilities, SessionListCapabilities, SessionResumeCapabilities,
+    SessionDeleteCapabilities, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, UnstructuredCommandInput,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::ContentBlock;
@@ -46,7 +48,7 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use parking_lot::Mutex;
 
 use bridge::{KernelBridge, new_session_label};
-use session::{Session, SessionRegistry, TurnOutcome, run_pump, run_turn};
+use session::{Session, SessionRegistry, TurnOutcome, run_pump, run_turn, settle_command_delivery};
 use update::UpdateMapper;
 
 /// Shared state behind every ACP handler.
@@ -376,21 +378,30 @@ async fn start_session(
     cx: &ConnectionTo<Client>,
     replay_history: bool,
 ) -> Result<(), Error> {
-    if bridge.sessions.get(session_id).is_some() {
+    if let Some(session) = bridge.sessions.get(session_id) {
         tracing::info!(session = %session_id, "session already bound; keeping its pump");
+        refresh_command_catalog(bridge, session_id, &session, cx, true).await?;
         return Ok(());
     }
+    let commands = bridge.kernel.kj_command_catalog(context_id).await.map_err(internal)?;
     let doc = bridge
         .kernel
         .synced(context_id)
         .await
         .map_err(internal)?;
 
-    let session = Session::new(context_id, label, UpdateMapper::new(session_id.clone()));
+    let session = Session::new(
+        context_id,
+        label,
+        UpdateMapper::new(session_id.clone()),
+        commands,
+    );
     let Some(session) = bridge.sessions.bind(session_id.clone(), session) else {
         // Lost a race with a concurrent bind; the winner's pump is running.
         return Ok(());
     };
+
+    send_command_catalog(session_id, &session.commands(), cx)?;
 
     let kernel = bridge.kernel.clone();
     let pump_cx = cx.clone();
@@ -398,6 +409,57 @@ async fn start_session(
     cx.spawn(async move {
         run_pump(kernel, session, pump_id, pump_cx, doc, replay_history).await
     })?;
+    Ok(())
+}
+
+fn available_commands(commands: &[kaijutsu_client::rpc::KjCommandInfo]) -> Vec<AvailableCommand> {
+    commands
+        .iter()
+        .map(|command| {
+            let available = AvailableCommand::new(&command.name, &command.description);
+            if command.input_hint.is_empty() {
+                available
+            } else {
+                available.input(AvailableCommandInput::Unstructured(
+                    UnstructuredCommandInput::new(&command.input_hint),
+                ))
+            }
+        })
+        .collect()
+}
+
+fn send_command_catalog(
+    session_id: &SessionId,
+    commands: &[kaijutsu_client::rpc::KjCommandInfo],
+    cx: &ConnectionTo<Client>,
+) -> Result<(), Error> {
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+            available_commands(commands),
+        )),
+    ))
+}
+
+/// Refresh only at a request boundary, never while a prompt is executing.
+/// This keeps the advertised names in step with loadout changes without
+/// allowing a catalog mutation to reinterpret an in-flight prompt.
+async fn refresh_command_catalog(
+    bridge: &AcpBridge,
+    session_id: &SessionId,
+    session: &Arc<Session>,
+    cx: &ConnectionTo<Client>,
+    force_send: bool,
+) -> Result<(), Error> {
+    let commands = bridge
+        .kernel
+        .kj_command_catalog(session.context_id)
+        .await
+        .map_err(internal)?;
+    let changed = session.replace_commands(commands);
+    if changed || force_send {
+        send_command_catalog(session_id, &session.commands(), cx)?;
+    }
     Ok(())
 }
 
@@ -463,6 +525,7 @@ fn handle_prompt(
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
+    let prompt_cx = cx.clone();
     cx.spawn(async move {
         let Some(session) = bridge.sessions.get(&req.session_id) else {
             return responder.respond_with_error(
@@ -472,6 +535,70 @@ fn handle_prompt(
                 ))),
             );
         };
+        if let Err(e) = refresh_command_catalog(
+            &bridge,
+            &req.session_id,
+            &session,
+            &prompt_cx,
+            false,
+        )
+        .await
+        {
+            return responder.respond_with_error(e);
+        }
+
+        match classify_command(&req.prompt, &session.commands()) {
+            Ok(Some(command)) => {
+                let result = match bridge
+                    .kernel
+                    .execute_kj(session.context_id, command.argv)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => return responder.respond_with_error(internal(e)),
+                };
+                settle_command_delivery(
+                    &bridge.kernel,
+                    &session,
+                    result.command_block_id,
+                )
+                .await;
+                if let Some(latch) = result.latch {
+                    return responder.respond_with_error(
+                        Error::internal_error().data(serde_json::json!({
+                            "reason": format!(
+                                "kj command requires explicit confirmation: {}",
+                                latch.message
+                            ),
+                            "latch": {
+                                "command": latch.command,
+                                "target": latch.target,
+                            },
+                            "confirmation": "not performed; submit an explicit follow-up command",
+                        })),
+                    );
+                }
+                if result.exit_code != 0 {
+                    return responder.respond_with_error(
+                        Error::internal_error().data(serde_json::json!({
+                            "reason": "kj command failed",
+                            "exitCode": result.exit_code,
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                        })),
+                    );
+                }
+                return responder.respond(PromptResponse::new(
+                    agent_client_protocol::schema::v1::StopReason::EndTurn,
+                ));
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                return responder.respond_with_error(
+                    Error::invalid_params().data(serde_json::json!({ "reason": reason })),
+                );
+            }
+        }
         let text = prompt_text(&req.prompt);
         match run_turn(&bridge.kernel, &session, &text).await {
             Ok(TurnOutcome::Stopped(stop)) => responder.respond(PromptResponse::new(stop)),
@@ -484,6 +611,46 @@ fn handle_prompt(
             Err(e) => responder.respond_with_error(internal(e)),
         }
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommandPrompt {
+    argv: Vec<String>,
+}
+
+/// Recognize only the exact shape ACP clients use for an invoked advertised
+/// command. Everything else remains ordinary model chat, including unknown
+/// slash text and prompts carrying a second content block.
+fn classify_command(
+    prompt: &[ContentBlock],
+    commands: &[kaijutsu_client::rpc::KjCommandInfo],
+) -> Result<Option<CommandPrompt>, String> {
+    let [ContentBlock::Text(text)] = prompt else {
+        return Ok(None);
+    };
+    let Some(body) = text.text.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let (name, input) = match body.find(' ') {
+        Some(boundary) => (&body[..boundary], Some(&body[boundary + 1..])),
+        None => (body, None),
+    };
+    let Some(command) = commands.iter().find(|command| command.name == name) else {
+        return Ok(None);
+    };
+
+    let mut argv = command.argv_prefix.clone();
+    let input = input.unwrap_or("");
+    if command.input_hint.is_empty() {
+        if !input.trim().is_empty() {
+            return Err(format!("/{name} does not accept input"));
+        }
+    } else if !input.trim().is_empty() {
+        let parsed = shell_words::split(input)
+            .map_err(|e| format!("invalid input for /{name}: {e}"))?;
+        argv.extend(parsed);
+    }
+    Ok(Some(CommandPrompt { argv }))
 }
 
 /// `session/cancel` — soft interrupt.
@@ -518,6 +685,19 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ResourceLink, TextContent};
 
+    fn command(
+        name: &str,
+        hint: &str,
+        prefix: &[&str],
+    ) -> kaijutsu_client::rpc::KjCommandInfo {
+        kaijutsu_client::rpc::KjCommandInfo {
+            name: name.into(),
+            description: format!("Run {name}"),
+            input_hint: hint.into(),
+            argv_prefix: prefix.iter().map(|part| (*part).to_string()).collect(),
+        }
+    }
+
     #[test]
     fn text_blocks_join_with_newlines() {
         let blocks = vec![
@@ -550,6 +730,87 @@ mod tests {
     #[test]
     fn an_empty_prompt_is_empty_not_a_stray_newline() {
         assert_eq!(prompt_text(&[]), "");
+    }
+
+    #[test]
+    fn catalog_projects_names_descriptions_and_only_real_input_hints() {
+        let commands = available_commands(&[
+            command("models", "", &["models"]),
+            command("context-info", "[context]", &["context", "info"]),
+        ]);
+        assert_eq!(commands[0].name, "models");
+        assert_eq!(commands[0].description, "Run models");
+        assert!(commands[0].input.is_none());
+        assert!(matches!(
+            &commands[1].input,
+            Some(AvailableCommandInput::Unstructured(input))
+                if input.hint == "[context]"
+        ));
+    }
+
+    #[test]
+    fn advertised_slash_command_builds_structured_argv() {
+        let commands = [command(
+            "context-info",
+            "[context]",
+            &["context", "info"],
+        )];
+        let prompt = [ContentBlock::Text(TextContent::new(
+            "/context-info 'label with spaces'",
+        ))];
+        assert_eq!(
+            classify_command(&prompt, &commands).unwrap(),
+            Some(CommandPrompt {
+                argv: vec!["context".into(), "info".into(), "label with spaces".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn command_splits_only_at_first_ascii_space() {
+        let commands = [command("model", "[--context <context>]", &["model"])];
+        let prompt = [ContentBlock::Text(TextContent::new(
+            "/model --context 'alpha beta'",
+        ))];
+        assert_eq!(
+            classify_command(&prompt, &commands).unwrap().unwrap().argv,
+            ["model", "--context", "alpha beta"]
+        );
+
+        let tab = [ContentBlock::Text(TextContent::new("/model\t--context alpha"))];
+        assert_eq!(classify_command(&tab, &commands).unwrap(), None);
+    }
+
+    #[test]
+    fn unknown_slash_and_multiblock_prompts_remain_chat() {
+        let commands = [command("models", "", &["models"])];
+        let unknown = [ContentBlock::Text(TextContent::new("/not-a-command hello"))];
+        assert_eq!(classify_command(&unknown, &commands).unwrap(), None);
+
+        let multi = [
+            ContentBlock::Text(TextContent::new("/models")),
+            ContentBlock::ResourceLink(ResourceLink::new("notes", "file:///notes")),
+        ];
+        assert_eq!(classify_command(&multi, &commands).unwrap(), None);
+    }
+
+    #[test]
+    fn no_input_commands_reject_arguments_and_bad_quotes_are_clear() {
+        let no_input = [command("models", "", &["models"])];
+        let extra = [ContentBlock::Text(TextContent::new("/models surprise"))];
+        assert!(
+            classify_command(&extra, &no_input)
+                .unwrap_err()
+                .contains("does not accept input")
+        );
+
+        let with_input = [command("context-info", "[context]", &["context", "info"])];
+        let unclosed = [ContentBlock::Text(TextContent::new("/context-info 'oops"))];
+        assert!(
+            classify_command(&unclosed, &with_input)
+                .unwrap_err()
+                .contains("invalid input")
+        );
     }
 
     #[test]

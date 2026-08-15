@@ -12,6 +12,7 @@ use std::sync::Arc;
 use agent_client_protocol::schema::v1::{SessionId, SessionNotification, StopReason};
 use agent_client_protocol::{Client, ConnectionTo};
 use kaijutsu_client::{ConnectionStatus, ServerEvent, SyncedDocument, TurnOrigin};
+use kaijutsu_client::rpc::KjCommandInfo;
 use kaijutsu_crdt::{BlockId, ContextId};
 use parking_lot::Mutex;
 
@@ -25,20 +26,43 @@ pub struct Session {
     /// Shared with the pump task: the pump emits through it, the prompt
     /// handler arms echo suppression on it.
     pub mapper: Arc<Mutex<UpdateMapper>>,
+    /// Exact command surface most recently advertised to this ACP session.
+    /// Prompt classification never accepts a name outside this snapshot.
+    commands: Mutex<Vec<KjCommandInfo>>,
     /// Closing this binding stops its event pump. The durable context remains
     /// in the kernel; ACP `session/delete` archives it separately.
     pump_stop: tokio::sync::watch::Sender<bool>,
 }
 
 impl Session {
-    pub fn new(context_id: ContextId, label: String, mapper: UpdateMapper) -> Self {
+    pub fn new(
+        context_id: ContextId,
+        label: String,
+        mapper: UpdateMapper,
+        commands: Vec<KjCommandInfo>,
+    ) -> Self {
         let (pump_stop, _) = tokio::sync::watch::channel(false);
         Self {
             context_id,
             label,
             mapper: Arc::new(Mutex::new(mapper)),
+            commands: Mutex::new(commands),
             pump_stop,
         }
+    }
+
+    pub fn commands(&self) -> Vec<KjCommandInfo> {
+        self.commands.lock().clone()
+    }
+
+    /// Replace the advertised snapshot, returning whether it changed.
+    pub fn replace_commands(&self, commands: Vec<KjCommandInfo>) -> bool {
+        let mut current = self.commands.lock();
+        if *current == commands {
+            return false;
+        }
+        *current = commands;
+        true
     }
 
     fn stop_pump(&self) {
@@ -533,7 +557,11 @@ pub async fn run_turn(
 /// toad). Poll the mapper's high-water marks against the kernel's snapshot;
 /// bounded, because the pump's 5s trailing-edge sweep repairs anything a
 /// grace window this size somehow misses, after the response.
-async fn settle_delivery(bridge: &KernelBridge, session: &Arc<Session>, context_id: ContextId) {
+pub(crate) async fn settle_delivery(
+    bridge: &KernelBridge,
+    session: &Arc<Session>,
+    context_id: ContextId,
+) {
     const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
     const SETTLE_MAX_POLLS: u32 = 20; // 2s ceiling
     for _ in 0..SETTLE_MAX_POLLS {
@@ -561,6 +589,44 @@ async fn settle_delivery(bridge: &KernelBridge, session: &Arc<Session>, context_
     );
 }
 
+/// Let the event pump publish a kj command's ToolResult before the ACP prompt
+/// response closes the client's turn widget.
+pub(crate) async fn settle_command_delivery(
+    bridge: &KernelBridge,
+    session: &Arc<Session>,
+    command_block_id: BlockId,
+) {
+    const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    const SETTLE_MAX_POLLS: u32 = 20;
+    for _ in 0..SETTLE_MAX_POLLS {
+        match bridge.synced(session.context_id).await {
+            Ok(doc) => {
+                if session
+                    .mapper
+                    .lock()
+                    .delivered_tool_result(&doc.blocks(), command_block_id)
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context = %session.context_id.short(),
+                    error = %e,
+                    "command settle-delivery poll failed"
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+    tracing::warn!(
+        context = %session.context_id.short(),
+        command = %command_block_id,
+        "command response sent before its tool result was delivered (2s ceiling)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +642,7 @@ mod tests {
             context_id,
             "test".into(),
             UpdateMapper::new(SessionId::new("s")),
+            Vec::new(),
         )
     }
 

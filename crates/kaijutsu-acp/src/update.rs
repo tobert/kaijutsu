@@ -468,6 +468,17 @@ impl UpdateMapper {
         })
     }
 
+    /// Whether the result linked to a tool call has reached the ACP mapper.
+    /// Unlike message tails, tool output is a replace-style patch and needs
+    /// its own delivery fence before a command prompt may finish.
+    pub fn delivered_tool_result(&self, blocks: &[BlockSnapshot], call_id: BlockId) -> bool {
+        blocks.iter().any(|block| {
+            block.kind == BlockKind::ToolResult
+                && block.tool_call_id == Some(call_id)
+                && self.emitted.contains_key(&block.id)
+        })
+    }
+
     /// The not-yet-emitted suffix of a block's content, advancing the mark.
     /// `None` when nothing is new.
     fn take_delta(&mut self, block: &BlockSnapshot) -> Option<String> {

@@ -38,6 +38,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+shell-words = "1.1"
 # RFC3339 stamps for ACP `SessionInfo::updated_at`. Already in the lock via
 # schemars' chrono04 feature; taken as a direct dep here rather than
 # hand-rolling a date formatter.

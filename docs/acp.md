@@ -47,7 +47,8 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/request_permission` | `ActorHandle::take_permission_asks` → `permission::run_permission_pump` → `contextId` → ACP session (`rank::session_id_of`) → real round trip; fail-closed on no session/client error/timeout | built |
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the CRDT mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
-| `session/update` commands / usage / mode / config | kj actions, context usage, casts/presets/config | planned |
+| `session/update` commands | curated, loadout-aware kj catalog; exact single-text `/name input` prompts execute addressed kj | built |
+| `session/update` usage / mode / config | context usage, casts/presets/config | planned |
 | `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
 
 ## Direction: ordinary ACP clients should just work
@@ -121,13 +122,22 @@ respect to the named context instead of ambient connection state; no injected
 ### Commands, modes, and configuration
 
 ACP `available_commands_update` is a natural projection of kj's human-facing
-command surface. Publish a **curated, loadout-aware catalog**, not a blind
-dump of every administrative verb. Likely first commands are context/fork,
-cast, model, tasks, archive, and help. Invocation should reach the same kj
-operation and shared approval gate as every other surface; ACP does not grow
-a second command or permission system. Command descriptions and arguments
-should ultimately derive from kj's command metadata so the two help surfaces
-cannot drift.
+command surface. The first slice now publishes a **curated, loadout-aware
+catalog** from the kernel and executes its structured argv through the same
+materialized kaish `kj` builtin as every other surface. The bridge recognizes
+only an exact one-text-block `/name input` prompt whose name was most recently
+advertised; unknown slash text and multi-block prompts remain ordinary chat.
+Input is shell-word decoded after the first ASCII space and appended to the
+catalog's argv prefix. Commands with no input hint reject arguments. A latch
+is reported as a command failure requiring an explicit follow-up — the bridge
+never auto-confirms. The ACP session remains pinned even when kj reports a
+switch, and fork appears separately in the session browser.
+
+The catalog currently covers conservative read/navigation and model commands,
+plus fork only when the context binding permits it. It deliberately excludes
+ambient `attach`/`context switch` and administrative verbs. Descriptions,
+input hints, and argv prefixes originate at the kernel seam so ACP does not
+grow a second command vocabulary.
 
 Keep the three ACP affordances distinct:
 
@@ -189,9 +199,9 @@ a Toad flight before the next one needs to start.
 3. **Client identity and presence.** Retain `clientInfo`, attach `acp/<name>`
    as a peer, and feed the client-config/preset machinery with parity to the
    native Claude Code and Codex integrations where appropriate.
-4. **Commands and usage.** Emit a curated kj-backed command catalog and usage
-   updates. Route invoked actions through the existing kj implementation and
-   shared approval gate.
+4. **Commands and usage — commands shipped, usage remains.** The curated
+   kj-backed catalog and slash invocation path are built. Next project the
+   kernel's context-window usage without fabricating cumulative cost.
 5. **Client-declared MCP servers.** Call the already-built external MCP
    substrate for `mcpServers` on new/load/resume; define lifecycle, reconnect,
    duplicate-name, and teardown semantics before advertising transports.

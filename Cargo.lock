@@ -5863,6 +5863,7 @@ dependencies = [
  "kaijutsu-viz",
  "parking_lot",
  "serde_json",
+ "shell-words",
  "tokio",
  "tracing",
  "tracing-subscriber",
