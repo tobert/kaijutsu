@@ -148,6 +148,9 @@ pub struct HookListener {
     max_block_size: usize,
     /// Shared session ID — updated from hook events when detected.
     session_id: Arc<Mutex<Option<String>>>,
+    /// Shared hosting-agent name — bootstrapped from hook event `source` when
+    /// startup detection could not identify the MCP host.
+    agent_name: Arc<Mutex<Option<String>>>,
     /// Remote-only: the auto-register label's stable prefix
     /// (`auto_register_base` in `main.rs` — repo name, no launch
     /// timestamp), present only when the initial join used a placeholder
@@ -185,6 +188,7 @@ impl HookListener {
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             session_id: Arc::new(Mutex::new(None)),
+            agent_name: Arc::new(Mutex::new(None)),
             pending_label_base: Mutex::new(None),
             context_model_set: Mutex::new(false),
         }
@@ -206,6 +210,24 @@ impl HookListener {
         session_id: Arc<Mutex<Option<String>>>,
         pending_label_base: Option<String>,
     ) -> Self {
+        Self::remote_with_agent(
+            remote,
+            shared_context_id,
+            session_id,
+            Arc::new(Mutex::new(None)),
+            pending_label_base,
+        )
+    }
+
+    /// Create a remote listener sharing both session and host-agent identity
+    /// with the MCP tool surface.
+    pub fn remote_with_agent(
+        remote: RemoteState,
+        shared_context_id: Arc<Mutex<Option<ContextId>>>,
+        session_id: Arc<Mutex<Option<String>>>,
+        agent_name: Arc<Mutex<Option<String>>>,
+        pending_label_base: Option<String>,
+    ) -> Self {
         Self {
             local_store: None,
             shared_context_id,
@@ -213,6 +235,7 @@ impl HookListener {
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             session_id,
+            agent_name,
             pending_label_base: Mutex::new(pending_label_base),
             context_model_set: Mutex::new(false),
         }
@@ -315,18 +338,25 @@ impl HookListener {
             }
         }
 
-        // Everything from here to the response is on Claude Code's hook
-        // critical path, and CC gives up at `tiers::CC_HOOK_DEADLINE`. Bound
-        // the whole span by our own shorter `tiers::HOOK_PATH` so WE answer
-        // first: if CC's deadline lands while we are still working it kills
-        // the hook, the user sees a timeout, and whatever we were doing
-        // finishes into a void.
+        // Hook source is authoritative when startup agent detection was not
+        // available. SessionStart may also replace stale startup metadata.
+        if !event.source.is_empty()
+            && let Ok(mut guard) = self.agent_name.lock()
+            && (guard.is_none() || event.event == "session.start")
+        {
+            *guard = Some(event.source.clone());
+        }
+
+        // Everything from here to the response is on the source agent's hook
+        // critical path. Claude Code uses `tiers::HOOK_PATH`, held below its
+        // five-second ceiling. Every Codex event uses the tighter
+        // `tiers::CODEX_HOOK_PATH`, which also fits its shortest hard ceiling.
         //
         // Not hypothetical headroom. Every RPC on this path carries the
         // request tier, and authoring a tool pair is three of them
         // (reserve, result, complete) on top of `maybe_stabilize_label`'s —
-        // so a slow or reconnecting kernel can hold the hook far past CC's
-        // patience.
+        // so a slow or reconnecting kernel can hold the hook far past the
+        // source agent's patience.
         //
         // Degrading here is consistent with what this path already promises
         // for *failure*: the mirror is ambient, so its slowness must not
@@ -334,8 +364,8 @@ impl HookListener {
         // permissive response and say what happened in `context` rather than
         // going silent.
         let hook_work = async {
-            // Stabilize the placeholder label onto a Claude-Code-session-stable
-            // one now that we (may) know the true session id — BEFORE authoring
+            // Stabilize the placeholder label onto a source-session-stable one
+            // now that we (may) know the true session id — BEFORE authoring
             // this event's own block, so a relaunch-reattach switch lands it in
             // the right context. One-shot per process (`pending_label_base`'s
             // `Mutex::take`); a no-op on every event after the first that finds
@@ -346,7 +376,12 @@ impl HookListener {
             self.process_event(&event).await
         };
 
-        let response = with_hook_budget(tiers::HOOK_PATH, &event.event, hook_work).await;
+        let budget = if event.source == "codex" {
+            tiers::CODEX_HOOK_PATH
+        } else {
+            tiers::HOOK_PATH
+        };
+        let response = with_hook_budget(budget, &event.event, hook_work).await;
 
         let json = serde_json::to_string(&response).unwrap_or_default();
         writer.write_all(json.as_bytes()).await?;
@@ -367,8 +402,8 @@ impl HookListener {
     /// error note into the response's `context` field alongside (or instead
     /// of) any drift.
     async fn process_event(&self, event: &HookEvent) -> HookResponse {
-        // 1. Filter self-referential kaijutsu MCP tools. Claude Code reports
-        // MCP tool calls as `mcp__<server>__<tool>`, not the bare name.
+        // 1. Filter self-referential kaijutsu MCP tools. Adapters normalize
+        // source-specific tool names before they reach this listener.
         if let Some(ref tool) = event.tool {
             let normalized = normalize_tool_name(&tool.name);
             if KAIJUTSU_MCP_TOOLS
@@ -403,6 +438,7 @@ impl HookListener {
                 if let Some(ref remote) = self.remote
                     && let Some(ctx_id) = self.context_id()
                     && let Some(model) = event.model.as_deref()
+                    && let Some(provider) = provider_for_source(&event.source)
                 {
                     // Recover a poisoned lock (rather than `.ok()`-skip like
                     // `session_id` elsewhere) — this flag exists to stop a
@@ -414,11 +450,9 @@ impl HookListener {
                         std::mem::replace(&mut *guard, true)
                     };
                     if !already_set {
-                        // Only adapter today is claude-code (docs/hooks.md) — its
-                        // models are always served by the "anthropic" provider.
-                        match remote.actor.set_context_model(ctx_id, "anthropic", model).await {
+                        match remote.actor.set_context_model(ctx_id, provider, model).await {
                             Ok(_) => {
-                                tracing::info!(model, "Set context model from session.start")
+                                tracing::info!(source = %event.source, provider, model, "Set context model from session.start")
                             }
                             Err(e) => tracing::warn!("Failed to set context model: {e}"),
                         }
@@ -970,6 +1004,18 @@ impl HookListener {
     }
 }
 
+/// Map a normalized hook source to the kernel provider which serves its model.
+///
+/// A source without an explicit mapping must not pin a context to an arbitrary
+/// provider: its model identifier may be meaningful only to that source.
+fn provider_for_source(source: &str) -> Option<&'static str> {
+    match source {
+        "claude-code" => Some("anthropic"),
+        "codex" => Some("codex-app"),
+        _ => None,
+    }
+}
+
 /// Truncate a string to `max_len` bytes at a char boundary.
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -1325,6 +1371,13 @@ mod tests {
             agent_type: None,
             trigger: None,
         }
+    }
+
+    #[test]
+    fn session_model_provider_is_explicitly_mapped_by_source() {
+        assert_eq!(provider_for_source("claude-code"), Some("anthropic"));
+        assert_eq!(provider_for_source("codex"), Some("codex-app"));
+        assert_eq!(provider_for_source("unrecognized-agent"), None);
     }
 
     fn local_listener_with_context() -> (HookListener, SharedBlockStore, ContextId) {

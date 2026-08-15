@@ -47,9 +47,10 @@ use serde::{Deserialize, Serialize};
 ///    several hops, the hop *closest to the caller* fires first, so the caller
 ///    reports a clean failure instead of racing a peer's timeout.
 ///
-/// An external bound we do not own but must respect: **Claude Code's hook
-/// timeout is 5 s.** Anything on the hook critical path needs a budget under
-/// that, or CC kills the hook while our side is still patiently waiting.
+/// External bounds we do not own but must respect include Claude Code's
+/// five-second hook timeout and Codex's three-second maximum for
+/// `SessionEnd`. Anything on a hook critical path needs a budget below its
+/// host's bound, or the host kills the hook while our side is still waiting.
 pub mod tiers {
     use std::time::Duration;
 
@@ -68,6 +69,10 @@ pub mod tiers {
     /// constraint that binds anything on the hook critical path.
     pub const CC_HOOK_DEADLINE: Duration = Duration::from_secs(5);
 
+    /// Codex's hard ceiling for `SessionEnd`. Unlike its other command hooks,
+    /// this event defaults to one second and may be raised only to three.
+    pub const CODEX_SESSION_END_DEADLINE: Duration = Duration::from_secs(3);
+
     /// Our own budget for everything on the CC hook critical path, held
     /// strictly under [`CC_HOOK_DEADLINE`] so **we** answer first.
     ///
@@ -85,6 +90,11 @@ pub mod tiers {
     /// (docs/issues.md, the MCP latency entry). The budget converts that from
     /// "CC kills us" into "we degrade and say so".
     pub const HOOK_PATH: Duration = Duration::from_secs(4);
+
+    /// Kaijutsu's reply budget for Codex hooks. Kept inside the shortest host
+    /// ceiling (`SessionEnd`) and used for every event for consistent,
+    /// quick-failing behavior.
+    pub const CODEX_HOOK_PATH: Duration = Duration::from_millis(2500);
 }
 
 /// The peer-invocation ladder — one logical deadline enforced at three hops.
@@ -398,6 +408,16 @@ mod tests {
             margin >= tiers::PROBE,
             "only {margin:?} of headroom to serialize and write the response"
         );
+    }
+
+    #[test]
+    fn codex_session_end_budget_expires_before_codex_gives_up() {
+        let margin = tiers::CODEX_SESSION_END_DEADLINE
+            - tiers::CODEX_HOOK_PATH;
+        assert!(
+            tiers::CODEX_HOOK_PATH < tiers::CODEX_SESSION_END_DEADLINE
+        );
+        assert!(margin >= tiers::PROBE);
     }
 
     #[test]

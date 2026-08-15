@@ -648,12 +648,13 @@ pub struct KaijutsuMcp {
     server_state: McpServerState,
     /// Handle to abort the background event listener when all clones are dropped.
     _bg_task: Option<Arc<AbortOnDrop>>,
-    /// Agent session ID (e.g., Claude Code session UUID).
+    /// Agent session ID (e.g., a Codex thread ID or Claude Code session UUID).
     session_id: Arc<Mutex<Option<String>>>,
     /// Context label used at connection time.
     context_name: String,
-    /// Detected agent name (e.g., "claude-code").
-    agent_name: Option<String>,
+    /// Hosting agent name. Shared with the hook listener because a lifecycle
+    /// event may identify the host when startup detection could not.
+    agent_name: Arc<Mutex<Option<String>>>,
     /// Per-session principal for block authorship. Captured at connect; the
     /// authorship path doesn't read it back through this handle yet.
     #[allow(dead_code)]
@@ -684,7 +685,7 @@ impl KaijutsuMcp {
             _bg_task: None,
             session_id: Arc::new(Mutex::new(None)),
             context_name: "local".to_string(),
-            agent_name: None,
+            agent_name: Arc::new(Mutex::new(None)),
             session_principal: PrincipalId::new(),
         }
     }
@@ -705,7 +706,8 @@ impl KaijutsuMcp {
         host: &str,
         port: u16,
         context_name: &str,
-        cc_session_id: Option<&str>,
+        session_id: Option<&str>,
+        agent_name: Option<&str>,
     ) -> Result<Self, anyhow::Error> {
         let config = SshConfig {
             host: host.to_string(),
@@ -713,7 +715,9 @@ impl KaijutsuMcp {
             username: whoami::username(),
             ..SshConfig::default()
         };
-        Self::connect_with_config(config, context_name, cc_session_id).await
+        let mut server = Self::connect_with_config(config, context_name, session_id).await?;
+        server.agent_name = Arc::new(Mutex::new(agent_name.map(String::from)));
+        Ok(server)
     }
 
     /// Connect using an explicit [`SshConfig`].
@@ -776,7 +780,9 @@ impl KaijutsuMcp {
             _bg_task: None,
             session_id: Arc::new(Mutex::new(cc_session_id.map(String::from))),
             context_name: context_name.to_string(),
-            agent_name: cc_session_id.map(|_| "claude-code".to_string()),
+            agent_name: Arc::new(Mutex::new(
+                cc_session_id.map(|_| "claude-code".to_string()),
+            )),
             session_principal,
         })
     }
@@ -789,6 +795,11 @@ impl KaijutsuMcp {
     /// Get the shared session ID arc (for hook listener to share).
     pub fn session_id_arc(&self) -> &Arc<Mutex<Option<String>>> {
         &self.session_id
+    }
+
+    /// Get the shared hosting-agent name for hook-driven identity updates.
+    pub fn agent_name_arc(&self) -> &Arc<Mutex<Option<String>>> {
+        &self.agent_name
     }
 
     /// Get the remote state if connected to a server.
@@ -1751,6 +1762,7 @@ impl KaijutsuMcp {
     #[tracing::instrument(skip(self), name = "mcp.whoami")]
     pub async fn whoami(&self) -> String {
         let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
+        let agent_name = self.agent_name.lock().ok().and_then(|g| g.clone());
 
         let actor = match self.actor() {
             Some(a) => a,
@@ -1760,7 +1772,7 @@ impl KaijutsuMcp {
                     "mode": "local",
                     "context_name": self.context_name,
                     "session_id": session_id,
-                    "agent_name": self.agent_name,
+                    "agent_name": agent_name,
                 })
                 .to_string();
             }
@@ -1783,7 +1795,7 @@ impl KaijutsuMcp {
             "context_label": ctx_label,
             "context_name": self.context_name,
             "session_id": session_id,
-            "agent_name": self.agent_name,
+            "agent_name": agent_name,
         })
         .to_string()
     }

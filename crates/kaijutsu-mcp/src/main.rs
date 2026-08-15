@@ -135,6 +135,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let detected_session_id = agent
         .as_ref()
         .and_then(|a| a.session_id().map(String::from));
+    let detected_agent_name = agent.as_ref().map(|a| a.agent_name());
+    let agent_label = agent_label_prefix(detected_agent_name);
 
     // Cap'n Proto RPC requires LocalSet for !Send types
     let local_set = tokio::task::LocalSet::new();
@@ -146,7 +148,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         // repo-only prefix (`auto_register_base`), NOT the timestamped
         // label used for the initial join — the stable label is
         // `{base}-{sid8}`, deterministic across MCP relaunches within the
-        // same Claude Code session (docs/issues.md "cc-* hook
+        // same hosting-agent session (docs/issues.md "cc-* hook
         // re-registration mints a new context per MCP relaunch").
         let mut pending_label_base: Option<String> = None;
 
@@ -162,6 +164,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 args.port,
                 &args.context_name,
                 detected_session_id.as_deref(),
+                detected_agent_name,
             ).await?;
 
             // Auto-register a session context so hook events land somewhere
@@ -173,15 +176,16 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            // No session-id suffix here even when detection reported one:
-            // detection scrapes the newest transcript file, and at MCP spawn
-            // time the CURRENT session's transcript may not exist yet — the
-            // detected id can belong to a previous session (observed live).
-            // The first hook event that carries a session_id (any event
+            // No session-id suffix here even when detection reported one.
+            // Claude detection scrapes the newest transcript file, and at MCP
+            // spawn time the CURRENT session's transcript may not exist yet —
+            // that id can belong to a previous session (observed live). Codex
+            // supplies its thread id directly, but uses the same stabilization
+            // path. The first hook event that carries a session_id (any event
             // type — not just session.start, which never fires again on a
             // same-session MCP relaunch) carries the true id;
             // `stabilize_context_label` does the fixup.
-            let label = auto_register_label(&cwd, unix_secs);
+            let label = auto_register_label(&cwd, unix_secs, agent_label);
             // The actor connects in the background, so the first attempt can
             // race it ("not ready: connecting"). Retry briefly with backoff;
             // exhaustion stays fail-open (the tool can be called manually).
@@ -206,7 +210,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 }
             }
             if success {
-                pending_label_base = Some(auto_register_base(&cwd));
+                pending_label_base = Some(auto_register_base(&cwd, agent_label));
                 tracing::info!(label = %label, "Auto-registered MCP session");
             } else {
                 tracing::warn!(
@@ -258,10 +262,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             }
             kaijutsu_mcp::Backend::Remote(remote) => {
                 // shared_context_id is updated by register_session when a context is joined
-                Arc::new(HookListener::remote(
+                Arc::new(HookListener::remote_with_agent(
                     remote.clone(),
                     Arc::clone(&remote.shared_context_id),
                     Arc::clone(mcp.session_id_arc()),
+                    Arc::clone(mcp.agent_name_arc()),
                     pending_label_base.clone(),
                 ))
             }
@@ -383,7 +388,7 @@ fn normalize_hook_input(input: &str) -> Option<(String, Option<String>)> {
     Some((compact, session_id))
 }
 
-/// Generate the auto-register label: `cc-{cwd basename}-{MMDD-HHMM}` (UTC).
+/// Generate the auto-register label: `{agent}-{cwd basename}-{MMDD-HHMM}` (UTC).
 ///
 /// Deliberately no session-id suffix — startup agent detection can report a
 /// PREVIOUS session's id (it scrapes the newest transcript file, which may
@@ -393,22 +398,31 @@ fn normalize_hook_input(input: &str) -> Option<(String, Option<String>)> {
 /// reveals the true id, so the stabilized label stays the same across an
 /// MCP relaunch within the same Claude Code session even though this
 /// timestamped one differs every time.
-fn auto_register_label(cwd: &Path, unix_secs: u64) -> String {
-    format!("{}-{}", auto_register_base(cwd), format_stamp(unix_secs))
+fn auto_register_label(cwd: &Path, unix_secs: u64, agent: &str) -> String {
+    format!("{}-{}", auto_register_base(cwd, agent), format_stamp(unix_secs))
 }
 
-/// The label prefix stable for a whole Claude Code session: `cc-{cwd
+/// The label prefix stable for a whole agent session: `{agent}-{cwd
 /// basename}`, with no launch timestamp. `auto_register_label`'s prefix
 /// before the timestamp suffix — `stabilize_context_label` appends
 /// `-{sid8}` to THIS (not to the timestamped label) once the true session
 /// id is known, so relaunches of the same session converge on the same
 /// stable label instead of minting a fresh one per process.
-fn auto_register_base(cwd: &Path) -> String {
+fn auto_register_base(cwd: &Path, agent: &str) -> String {
     let dirname = cwd
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("kaijutsu");
-    format!("cc-{dirname}")
+    format!("{agent}-{dirname}")
+}
+
+/// Short, stable label namespace for the detected MCP host.
+fn agent_label_prefix(agent: Option<&str>) -> &'static str {
+    match agent {
+        Some("claude-code") => "cc",
+        Some("codex") => "codex",
+        _ => "mcp",
+    }
 }
 
 /// Format a Unix timestamp (seconds) as `MMDD-HHMM`, UTC.
@@ -486,14 +500,14 @@ mod tests {
         // Even when startup detection reports a session id it is NOT baked
         // into the label — it can be a previous session's (stale transcript
         // scrape). session.start's rename appends the true id later.
-        let label = auto_register_label(Path::new("/home/amy/src/kaijutsu"), 0);
+        let label = auto_register_label(Path::new("/home/amy/src/kaijutsu"), 0, "cc");
         assert_eq!(label, "cc-kaijutsu-0101-0000");
     }
 
     #[test]
     fn auto_register_label_falls_back_when_cwd_has_no_basename() {
         // "/" has no file_name() component — must not panic.
-        let label = auto_register_label(Path::new("/"), 0);
+        let label = auto_register_label(Path::new("/"), 0, "cc");
         assert_eq!(label, "cc-kaijutsu-0101-0000");
     }
 
@@ -505,7 +519,7 @@ mod tests {
         // it must be identical across two calls at different times, unlike
         // `auto_register_label`'s timestamped output.
         assert_eq!(
-            auto_register_base(Path::new("/home/amy/src/kaijutsu")),
+            auto_register_base(Path::new("/home/amy/src/kaijutsu"), "cc"),
             "cc-kaijutsu"
         );
     }
@@ -517,8 +531,16 @@ mod tests {
         // and a relaunch's stable label would silently stop matching an
         // earlier process's.
         let cwd = Path::new("/home/amy/src/candle");
-        let base = auto_register_base(cwd);
-        let label = auto_register_label(cwd, 1_700_000_000);
+        let base = auto_register_base(cwd, "cc");
+        let label = auto_register_label(cwd, 1_700_000_000, "cc");
         assert_eq!(label, format!("{base}-{}", format_stamp(1_700_000_000)));
+    }
+
+    #[test]
+    fn agent_label_prefix_distinguishes_codex_and_claude() {
+        assert_eq!(agent_label_prefix(Some("claude-code")), "cc");
+        assert_eq!(agent_label_prefix(Some("codex")), "codex");
+        assert_eq!(agent_label_prefix(None), "mcp");
+        assert_eq!(agent_label_prefix(Some("future-agent")), "mcp");
     }
 }
