@@ -6,6 +6,49 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Model names via hooks — the plumbing exists, the data mostly does not arrive (2026-08-15, Amy)
+
+Amy, seeing `cc-.crush-c776babb  now  (no model)` in `kj context list`:
+*"getting model names in via hooks should go on the todo, seems tricky."*
+
+**Do not start by building the plumbing — it is already there.** `HookEvent` has
+`model: Option<String>` (`crates/kaijutsu-mcp/src/hook_types.rs:30`), the adapter
+parses it (`hook_adapter.rs:35`), and `hook_listener.rs:440-457` already sets the
+context's model on `SessionStart` when the field is present. Codex sends it —
+see the `model: "gpt-5-codex"` in
+`crates/kaijutsu-mcp/tests/fixtures/codex/session_start.json`, the only fixture
+that carries one.
+
+**The real gap is the source data**, and it is three different problems wearing
+one hat:
+
+1. **Claude Code does not put the model in its hook payload at all.** Recovering
+   it means reading `transcript_path` (the JSONL carries `model` on assistant
+   messages) — a file read on a hot path, with the session's own format as an
+   undocumented dependency.
+2. **Crush/qwen evidently does not send it either** — that is the observation
+   that started this. Confirm what its hook payload actually contains before
+   assuming it can be asked for.
+3. **`SessionStart`-only is stale by construction.** A user typing `/model`
+   mid-session silently invalidates whatever was recorded. Whatever lands should
+   refresh on later events, or the field should be honest that it is
+   "model at session start" rather than "current model".
+
+**Why it matters beyond cosmetics.** The roster and `kj context list` are how a
+human or a sibling agent answers "who is around and what are they." A context
+that reports `(no model)` is not neutral — it reads as *unconfigured* when the
+truth is *unreported*, which is the wrong kind of wrong for an instrument whose
+whole job is telling you who is in the room. If a source genuinely cannot supply
+it, say "unreported", not "(no model)".
+
+**Suggested shape:** treat it as a per-source capability question first — a short
+table of {agent, does its hook payload carry model, if not what is the cheapest
+honest fallback} — and only then write code. The answer may well be "Codex yes,
+everyone else needs transcript sniffing," which is worth knowing before building
+transcript sniffing.
+
+---
+
 ## Principal plumbing — a holistic sweep, not a per-lane patch (2026-08-15, Amy)
 
 Amy: *"I don't think the principal plumbing should gate the git work. Let's make
