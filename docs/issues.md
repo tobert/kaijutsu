@@ -387,7 +387,53 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ---
 
-## kaish captured stdout truncates SILENTLY at 8 KB (2026-08-13)
+## kaish output limiting — REMEASURED 2026-08-15 against a live kernel, and both halves of the original filing were wrong
+
+> **Read this correction before acting on the entry below.** Probed against
+> the running zorak kernel (restarted 07:03 EDT onto `e2905a86`, still pinned
+> to `kaish-kernel = "0.13.0"` per `Cargo.lock` — *not* the pending 0.14 bump).
+> Every claim here is a measurement, with the control that isolates it.
+>
+> **1. Command substitution does NOT truncate at 8 KB on this build.**
+> `big=$(seq 1 20000)` round-tripped **108896 bytes** intact.
+> `n=$(seq 1 5000 | wc -l)` returned exactly **5000**, and
+> `$(seq 1 5000 | grep -c .)` likewise — the pipeline-into-`grep -c` shape
+> that produced the original 12-vs-105 report. It does not reproduce.
+> **This does NOT mean it was never real.** The 12-vs-105 observation was
+> made by someone watching it happen, and a negative probe is a claim about
+> the probe (signoff process lessons, "a negative grep is a claim about your
+> PATTERN"). What changed between 08-13 and today is unestablished and is the
+> open question — not whether the original reporter was mistaken.
+>
+> **2. Truncation DOES set a failure code — the entry's central claim is
+> backwards, and candidate fix #2 below is already shipped.** kaish remaps the
+> exit code to **3** on `did_spill`, preserving the real code in
+> `original_code`; it is documented at `kaish-kernel-0.13.0/src/output_limit.rs:14`
+> and covered by its own `test_kernel_memory_mode_exits_3_preserves_original`.
+> So "ask kaish to make Memory-mode truncation loud — a nonzero status" was
+> asking for something kaish had already done, in the version we are pinned to.
+>
+> **3. The live hazard is the opposite shape from the one filed: loud but
+> misattributed, not silent.** Controlled matrix, one variable at a time —
+> `seq 1 100` captured → exit **0**; `seq 1 5000` captured → exit **3**;
+> `seq 1 5000 > /dev/null` → exit **0**. Identical command, succeeds every
+> time. So inside a kaish script, **`$?` is 3 for a command that worked**,
+> purely because it printed a lot. Any `set -e`, any `cmd || fallback`, any
+> `if cmd; then` takes the failure branch on success.
+> **`kj`/MCP callers are NOT affected** — `mcp/servers/shell.rs:448` already
+> does `result.original_code.unwrap_or(result.code)` with the right comment
+> ("truncation is not failure"). The exposure is **rc and hook bodies**, which
+> is precisely where the gate's classifier escalator is designed to live
+> (signoff: "the classifier call is an rc/kaish thing"). An rc script doing
+> `resp=$(<a POST that returns a large body>) || escalate` would take the
+> escalate branch on a perfectly good response. Worth settling before that
+> script is written, not after.
+>
+> Still true and untouched by this correction: the `localfs` analysis below
+> (we build without it, so Memory mode is our only mode and no spill path
+> exists), and the doctrine question in candidate fix #3.
+
+### Original entry (2026-08-13), retained for its reasoning
 
 `OutputLimitConfig::agent()` (`kernel/src/runtime/embedded_kaish.rs:264`) caps
 a builtin's captured stdout at 8192 bytes. Crossing it does **not** error and
