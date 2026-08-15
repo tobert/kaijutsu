@@ -25,6 +25,25 @@ pub struct Session {
     /// Shared with the pump task: the pump emits through it, the prompt
     /// handler arms echo suppression on it.
     pub mapper: Arc<Mutex<UpdateMapper>>,
+    /// Closing this binding stops its event pump. The durable context remains
+    /// in the kernel; ACP `session/delete` archives it separately.
+    pump_stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl Session {
+    pub fn new(context_id: ContextId, label: String, mapper: UpdateMapper) -> Self {
+        let (pump_stop, _) = tokio::sync::watch::channel(false);
+        Self {
+            context_id,
+            label,
+            mapper: Arc::new(Mutex::new(mapper)),
+            pump_stop,
+        }
+    }
+
+    fn stop_pump(&self) {
+        let _ = self.pump_stop.send(true);
+    }
 }
 
 /// All bound sessions, keyed by ACP session id.
@@ -47,6 +66,14 @@ impl SessionRegistry {
         }
         let session = Arc::new(session);
         map.insert(id, Arc::clone(&session));
+        Some(session)
+    }
+
+    /// Remove a live ACP binding and tell its pump to stop. This does not
+    /// alter the durable context; callers perform the kernel operation first.
+    pub fn unbind(&self, id: &SessionId) -> Option<Arc<Session>> {
+        let session = self.sessions.lock().remove(id)?;
+        session.stop_pump();
         Some(session)
     }
 
@@ -106,6 +133,14 @@ pub async fn run_pump(
     replay_history: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     let context_id = session.context_id;
+    let mut pump_stop = session.pump_stop.subscribe();
+    // Deletion can race the small bind→spawn window. A receiver subscribed
+    // after `send(true)` considers the current value already seen, so check
+    // it explicitly instead of waiting for another change that will not come.
+    if *pump_stop.borrow() {
+        tracing::info!(session = %session_id, "session already unbound; pump not started");
+        return Ok(());
+    }
 
     // Subscribe before the first read so nothing that lands during setup is
     // lost between the snapshot and the stream.
@@ -161,6 +196,13 @@ pub async fn run_pump(
 
     loop {
         tokio::select! {
+            biased;
+            stopped = pump_stop.changed() => {
+                if stopped.is_err() || *pump_stop.borrow() {
+                    tracing::info!(session = %session_id, "session unbound; pump exiting");
+                    return Ok(());
+                }
+            }
             _ = sweep.tick() => {
                 if dirty {
                     dirty = false;
@@ -530,11 +572,11 @@ mod tests {
     }
 
     fn session(context_id: ContextId) -> Session {
-        Session {
+        Session::new(
             context_id,
-            label: "test".into(),
-            mapper: Arc::new(Mutex::new(UpdateMapper::new(SessionId::new("s")))),
-        }
+            "test".into(),
+            UpdateMapper::new(SessionId::new("s")),
+        )
     }
 
     #[test]
@@ -555,6 +597,19 @@ mod tests {
         let reg = SessionRegistry::default();
         assert!(reg.get(&SessionId::new("nope")).is_none());
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn unbinding_removes_the_session_and_stops_its_pump() {
+        let reg = SessionRegistry::default();
+        let id = SessionId::new("s");
+        let bound = reg.bind(id.clone(), session(ctx())).unwrap();
+        let stop = bound.pump_stop.subscribe();
+
+        assert!(reg.unbind(&id).is_some());
+        assert!(reg.get(&id).is_none());
+        assert!(*stop.borrow());
+        assert!(reg.unbind(&id).is_none(), "retrying an unbind is harmless");
     }
 
     #[test]

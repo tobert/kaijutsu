@@ -31,7 +31,6 @@ use kaijutsu_acp::session::{Session, SessionRegistry};
 use kaijutsu_acp::update::UpdateMapper;
 use kaijutsu_client::{PermissionAskAnswer, PermissionAskEnvelope, PermissionOptionInfo};
 use kaijutsu_crdt::ContextId;
-use parking_lot::Mutex as PLMutex;
 use tokio::sync::{mpsc, oneshot};
 
 /// Short enough that the timeout-denies test doesn't actually wait 30s.
@@ -40,11 +39,11 @@ const TEST_TIMEOUT: Duration = Duration::from_millis(200);
 fn session_registry_with(context_id: ContextId) -> SessionRegistry {
     let reg = SessionRegistry::default();
     let session_id = session_id_of(context_id);
-    let session = Session {
+    let session = Session::new(
         context_id,
-        label: "test".into(),
-        mapper: Arc::new(PLMutex::new(UpdateMapper::new(session_id.clone()))),
-    };
+        "test".into(),
+        UpdateMapper::new(session_id.clone()),
+    );
     assert!(reg.bind(session_id, session).is_some());
     reg
 }

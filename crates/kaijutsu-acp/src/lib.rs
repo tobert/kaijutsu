@@ -33,11 +33,12 @@ pub mod update;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, Error, Implementation, InitializeRequest, InitializeResponse,
+    AgentCapabilities, DeleteSessionRequest, DeleteSessionResponse, Error, Implementation,
+    InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId,
-    SessionListCapabilities, SessionResumeCapabilities,
+    SessionDeleteCapabilities, SessionListCapabilities, SessionResumeCapabilities,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::ContentBlock;
@@ -88,6 +89,7 @@ fn agent_capabilities() -> AgentCapabilities {
         .session_capabilities(
             SessionCapabilities::new()
                 .list(SessionListCapabilities::new())
+                .delete(SessionDeleteCapabilities::new())
                 .resume(SessionResumeCapabilities::new()),
         )
 }
@@ -128,6 +130,7 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
     let load = Arc::clone(&bridge);
     let resume = Arc::clone(&bridge);
     let list = Arc::clone(&bridge);
+    let delete = Arc::clone(&bridge);
     let prompt = Arc::clone(&bridge);
     let cancel = Arc::clone(&bridge);
     let permission = Arc::clone(&bridge);
@@ -166,6 +169,12 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
         .on_receive_request(
             async move |req: ListSessionsRequest, responder, _cx| {
                 handle_list_sessions(Arc::clone(&list), req, responder).await
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: DeleteSessionRequest, responder, _cx| {
+                handle_delete_session(Arc::clone(&delete), req, responder).await
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -377,11 +386,7 @@ async fn start_session(
         .await
         .map_err(internal)?;
 
-    let session = Session {
-        context_id,
-        label,
-        mapper: Arc::new(Mutex::new(UpdateMapper::new(session_id.clone()))),
-    };
+    let session = Session::new(context_id, label, UpdateMapper::new(session_id.clone()));
     let Some(session) = bridge.sessions.bind(session_id.clone(), session) else {
         // Lost a race with a concurrent bind; the winner's pump is running.
         return Ok(());
@@ -419,6 +424,31 @@ async fn handle_list_sessions(
             responder.respond(ListSessionsResponse::new(sessions))
         }
         Err(e) => responder.respond_with_error(internal(e)),
+    }
+}
+
+/// Archive the durable kj context, then tear down only this process's live
+/// ACP binding. Kernel archive is idempotent, so a client may safely retry a
+/// successful delete after losing its response.
+async fn handle_delete_session(
+    bridge: Arc<AcpBridge>,
+    req: DeleteSessionRequest,
+    responder: Responder<DeleteSessionResponse>,
+) -> Result<(), Error> {
+    let Some(context_id) = rank::context_id_of(&req.session_id) else {
+        return responder.respond_with_error(
+            Error::invalid_params().data(serde_json::json!({
+                "reason": "session id is not a kaijutsu context id",
+                "sessionId": req.session_id.0.as_ref(),
+            })),
+        );
+    };
+    match bridge.kernel.archive_context(context_id).await {
+        Ok(()) => {
+            bridge.sessions.unbind(&req.session_id);
+            responder.respond(DeleteSessionResponse::new())
+        }
+        Err(e) => responder.respond_with_error(Error::resource_not_found(Some(e.to_string()))),
     }
 }
 
@@ -545,6 +575,10 @@ mod tests {
         assert!(
             caps.session_capabilities.resume.is_some(),
             "session/resume attaches without replay"
+        );
+        assert!(
+            caps.session_capabilities.delete.is_some(),
+            "session/delete archives contexts"
         );
         // Advertising image/audio we would drop is worse than declining them.
         assert!(!caps.prompt_capabilities.image);

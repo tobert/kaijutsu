@@ -37,7 +37,7 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/load` | attach → reassert requested cwd → replay transcript as updates | built |
 | `session/resume` | attach → reassert requested cwd → live pump without transcript replay | built; advertised as stable ACP v1 |
 | `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1; cwd read per context | built |
-| `session/delete` | archive the kj context | planned |
+| `session/delete` | archive the kj context → unbind/stop the live pump | built; advertised as stable ACP v1 |
 | `session/prompt` | `get_input_state` → `edit_input(0, text, len)` → `submit_input(ctx, false)` | built; text-only |
 | turn end → `stopReason` | `ServerEvent::TurnCompleted{stop_reason}` (1:1 by construction) | built |
 | turn broke | `ServerEvent::TurnFailed` → JSON-RPC error, **not** a stop reason | built |
@@ -182,8 +182,10 @@ a Toad flight before the next one needs to start.
 1. **Addressed cwd + resume — shipped.** Context-addressed cwd RPCs persist new
    session cwd, reset it on load/resume, and report it per context;
    stable-v1 `session/resume` is advertised and attaches without replay.
-2. **Archive through `session/delete`.** Archive idempotently enough for
-   client retries, unbind the live pump, and advertise delete support.
+2. **Archive through `session/delete` — shipped.** Kernel archive is
+   idempotent for client retries; a successful request unbinds the session
+   registry entry and stops its event pump, while context data remains
+   recoverable in kj.
 3. **Client identity and presence.** Retain `clientInfo`, attach `acp/<name>`
    as a peer, and feed the client-config/preset machinery with parity to the
    native Claude Code and Codex integrations where appropriate.
@@ -427,11 +429,9 @@ in practice.
 - **`kaijutsu-mcp`'s `write_input` deletes by byte length** (`lib.rs:1434`,
   `state.content.len()`), so a non-ASCII input doc is corrupted or truncated.
   `kaijutsu-acp` uses `chars().count()`. mcp should too.
-- **Stable session controls remain incomplete.** `session/delete`,
-  `session/set_mode`, and `session/set_config_option` are in
-  the pinned v1 schema and unimplemented. Delete maps to archive (not
-  conclude). Modes/config are not advertised,
-  so a conforming client will not call their setters yet.
+- **Stable session controls remain incomplete.** `session/set_mode` and
+  `session/set_config_option` are in the pinned v1 schema and unimplemented.
+  Neither is advertised, so a conforming client will not call its setter yet.
 - **Prompt content is text-only.** Image/audio/embedded-resource blocks are
   turned into a `[… omitted]` marker rather than dropped in silence, and the
   capabilities say `image: false, audio: false, embedded_context: false`.

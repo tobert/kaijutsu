@@ -272,6 +272,7 @@ impl KernelBridge {
         let Some(info) = contexts.into_iter().find(|c| c.id == context_id) else {
             bail!("no such context: {}", context_id.short());
         };
+        ensure_context_attachable(&info)?;
         self.actor.join_context(context_id).await?;
         Ok(info)
     }
@@ -328,6 +329,19 @@ impl KernelBridge {
     }
 }
 
+/// Loading/resuming is an attachment, never a resurrection act. Keep this
+/// check immediately before `join_context` so every ACP attach-by-id path has
+/// the same lifecycle boundary.
+fn ensure_context_attachable(info: &ContextInfo) -> Result<()> {
+    if info.archived {
+        bail!("context {} is archived", info.id.short());
+    }
+    if info.concluded_at.is_some() {
+        bail!("context {} is concluded", info.id.short());
+    }
+    Ok(())
+}
+
 /// What `open_or_create` did.
 #[derive(Debug, Clone)]
 pub struct OpenedContext {
@@ -359,6 +373,40 @@ pub fn new_session_label(cwd: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    fn context_lifecycle(archived: bool, concluded_at: Option<u64>) -> ContextInfo {
+        ContextInfo {
+            id: ContextId::new(),
+            label: "test".into(),
+            forked_from: None,
+            provider: String::new(),
+            model: String::new(),
+            created_at: 0,
+            trace_id: [0; 16],
+            fork_kind: None,
+            context_type: "coder".into(),
+            archived,
+            concluded_at,
+            keywords: Vec::new(),
+            top_block_preview: None,
+            live_status: kaijutsu_types::Status::Pending,
+            last_activity_at: None,
+            track_id: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            context_window: None,
+            context_used_tokens: None,
+            context_used_pct: None,
+            background_running_count: 0,
+            background_oldest_running_started_at: None,
+            background_last_finished_at: None,
+            background_last_finished_status: None,
+            background_last_exit_code: None,
+            cast_label: None,
+            origin_host: None,
+        }
+    }
+
     #[test]
     fn session_labels_name_the_directory() {
         let label = new_session_label(std::path::Path::new("/home/amy/src/kaijutsu"));
@@ -389,5 +437,15 @@ mod tests {
     #[test]
     fn empty_client_name_has_a_safe_fallback() {
         assert_eq!(peer_nick_for_client(" \t/ "), "acp/client");
+    }
+
+    #[test]
+    fn attach_by_id_never_resurrects_archived_or_concluded_contexts() {
+        ensure_context_attachable(&context_lifecycle(false, None)).unwrap();
+        let archived = ensure_context_attachable(&context_lifecycle(true, None)).unwrap_err();
+        assert!(archived.to_string().contains("archived"));
+        let concluded =
+            ensure_context_attachable(&context_lifecycle(false, Some(1))).unwrap_err();
+        assert!(concluded.to_string().contains("concluded"));
     }
 }

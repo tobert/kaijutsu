@@ -1910,10 +1910,18 @@ adapter, as built".
   Happy gets Z." Today every ACP context gets the row-stamped default
   (ds-v4-flash) regardless of who connected; this is also where the pending
   ACP-cast decision could land generally instead of as a bridge hardcode.
-- **Stable v1 methods left unimplemented**: `session/delete` (→
-  `conclude`/`archive`), `session/set_mode` (→ `context_type` / cast roles),
-  `session/set_config_option`. None are advertised in capabilities, so no
-  client will call them.
+- **Stable v1 methods left unimplemented**: `session/set_mode` (→
+  `context_type` / cast roles) and `session/set_config_option`. Neither is
+  advertised in capabilities, so clients should not call them.
+- **ACP delete follow-ups.** `session/delete` archives first and only then
+  unbinds/stops the pump, but its handler still flattens every archive failure
+  to `resource_not_found`; preserve typed actor/RPC errors so transport and
+  server failures can map honestly. Add a handler-level fake-kernel test that
+  pins archive-before-unbind and failure-keeps-binding ordering once
+  `KernelBridge` has a narrow injectable seam. Deleting during an in-flight
+  `session/prompt` deliberately does not interrupt that turn yet; decide the
+  prompt response/interrupt semantics from ACP client flights before adding
+  another stop path.
 - **Kernel-wide block subscription.** The bridge uses
   `scope_blocks_to_context: false` so several ACP sessions can stream at once,
   and filters per pump. That is the firehose kaijutsu-mcp deliberately scopes

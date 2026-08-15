@@ -1,7 +1,7 @@
 //! Does the ACP handler chain actually dispatch?
 //!
-//! `serve_stdio` chains six `on_receive_*` registrations on one builder —
-//! five request types plus `session/cancel`. Chaining is how the SDK composes
+//! `serve_stdio` chains eight `on_receive_*` registrations on one builder —
+//! seven request types plus `session/cancel`. Chaining is how the SDK composes
 //! handlers (each wraps the previous; the first whose `matches_method` hits
 //! claims the message), and getting it wrong is a runtime `method_not_found`,
 //! not a compile error. These tests pair a real ACP `Client` against an agent
@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
+    AgentCapabilities, CancelNotification, DeleteSessionRequest, DeleteSessionResponse,
+    InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionInfo,
     ResumeSessionRequest, ResumeSessionResponse, StopReason,
@@ -30,10 +31,11 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 /// exactly once, in the right place.
 type Log = Arc<Mutex<Vec<&'static str>>>;
 
-/// Mirror of `serve_stdio`'s builder: same seven registrations, same order,
+/// Mirror of `serve_stdio`'s builder: same eight registrations, same order,
 /// same `cx.spawn` for prompt.
 fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'static {
-    let (l1, l2, l3, l4, l5, l6, l7) = (
+    let (l1, l2, l3, l4, l5, l6, l7, l8) = (
+        log.clone(),
         log.clone(),
         log.clone(),
         log.clone(),
@@ -98,12 +100,21 @@ fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'sta
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |_req: DeleteSessionRequest,
+                        responder: Responder<DeleteSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                l6.lock().unwrap().push("session/delete");
+                responder.respond(DeleteSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async move |_req: PromptRequest,
                         responder: Responder<PromptResponse>,
                         cx: ConnectionTo<Client>| {
                 // The real handler spawns so the dispatch loop stays free for
                 // session/cancel. Same shape here.
-                let l = l6.clone();
+                let l = l7.clone();
                 cx.spawn(async move {
                     l.lock().unwrap().push("session/prompt");
                     responder.respond(PromptResponse::new(StopReason::EndTurn))
@@ -113,7 +124,7 @@ fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'sta
         )
         .on_receive_notification(
             async move |_n: CancelNotification, _cx: ConnectionTo<Client>| {
-                l7.lock().unwrap().push("session/cancel");
+                l8.lock().unwrap().push("session/cancel");
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -162,6 +173,10 @@ async fn every_acp_method_reaches_its_own_handler() {
             assert_eq!(listed.sessions.len(), 1);
             assert_eq!(listed.sessions[0].title.as_deref(), Some("ring zero"));
 
+            cx.send_request(DeleteSessionRequest::new(SessionId::new("ctx-hex")))
+                .block_task()
+                .await?;
+
             let prompt = cx
                 .send_request(PromptRequest::new(SessionId::new("ctx-hex"), vec![]))
                 .block_task()
@@ -185,6 +200,7 @@ async fn every_acp_method_reaches_its_own_handler() {
             "session/load",
             "session/resume",
             "session/list",
+            "session/delete",
             "session/prompt",
             "session/cancel",
         ],
@@ -194,10 +210,10 @@ async fn every_acp_method_reaches_its_own_handler() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_method_we_do_not_implement_is_refused_not_mishandled() {
-    // Nothing in the chain claims `session/delete`; the SDK must answer
+    // Nothing in the chain claims `session/set_mode`; the SDK must answer
     // method_not_found rather than letting it fall into a neighbouring
     // handler.
-    use agent_client_protocol::schema::v1::DeleteSessionRequest;
+    use agent_client_protocol::schema::v1::SetSessionModeRequest;
     let log: Log = Arc::default();
     let agent = agent_shape(log.clone());
 
@@ -205,10 +221,10 @@ async fn a_method_we_do_not_implement_is_refused_not_mishandled() {
         .builder()
         .connect_with(agent, async move |cx| {
             let err = cx
-                .send_request(DeleteSessionRequest::new(SessionId::new("ctx-hex")))
+                .send_request(SetSessionModeRequest::new(SessionId::new("ctx-hex"), "mode"))
                 .block_task()
                 .await
-                .expect_err("session/delete is not implemented");
+                .expect_err("session/set_mode is not implemented");
             assert_eq!(
                 err.code,
                 agent_client_protocol::schema::v1::Error::method_not_found().code
