@@ -26,7 +26,9 @@
 //! rather than opening a second ACP tool call — one kj call/result pair is one
 //! ACP tool call.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionId,
@@ -118,9 +120,21 @@ pub fn tool_call_id(block: BlockId) -> ToolCallId {
 #[derive(Debug)]
 pub struct UpdateMapper {
     session_id: SessionId,
-    /// Chars of `content` already emitted, per block. Char counts, not bytes —
-    /// a chunk boundary that lands mid-codepoint is a corrupted frame.
-    emitted: HashMap<BlockId, usize>,
+    /// High-water mark of `content` already emitted, per block — length AND
+    /// a hash of exactly that emitted prefix (chars, not bytes: a chunk
+    /// boundary that lands mid-codepoint is a corrupted frame).
+    ///
+    /// A length alone cannot tell "the kernel appended" from "the kernel
+    /// spliced/edited/replaced text at or before the mark" — those look
+    /// identical if the new length happens to be `>=` the old one, and
+    /// `skip(seen)` on the latter hands the client a suffix that, appended
+    /// to what it already has, produces a corrupted string (see
+    /// [`Self::take_delta`]'s doc comment for the exact failure shape). The
+    /// hash is what lets [`Self::take_delta`] verify `content[..len]` is
+    /// still the text already emitted before trusting anything past it —
+    /// without keeping a full copy of (potentially large) block text per
+    /// block in this map.
+    emitted: HashMap<BlockId, EmitMark>,
     /// Tool calls whose ACP `tool_call` create has gone out; subsequent
     /// observations patch instead of re-announcing.
     announced: HashSet<BlockId>,
@@ -154,6 +168,41 @@ pub struct UpdateMapper {
     /// "identical re-observation is silent" contract `observe()` gives every
     /// other block kind.
     last_plan: Option<Vec<PlanEntry>>,
+}
+
+/// A block's streaming high-water mark: how many chars of its content have
+/// been emitted, plus a hash of exactly those chars. See the `emitted` field
+/// doc on [`UpdateMapper`] for why both are needed.
+///
+/// `DefaultHasher` (SipHash-1-3) is not adversarial-proof, but nothing here
+/// needs it to be: kaijutsu treats every writer as a cooperating player, not
+/// an attacker (`CLAUDE.md` "Shared trust, crosstalk-as-feature") — this only
+/// has to catch an honest non-append mutation (a splice, an edit, a resync
+/// rebuild), never resist a deliberate forgery.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct EmitMark {
+    len: usize,
+    hash: u64,
+}
+
+/// Hash of the first `n` chars of `content` (fewer if `content` is shorter).
+fn prefix_hash(content: &str, n: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for c in content.chars().take(n) {
+        c.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The mark for treating all of `content` as emitted.
+fn mark_for(content: &str) -> EmitMark {
+    let mut hasher = DefaultHasher::new();
+    let mut len = 0usize;
+    for c in content.chars() {
+        c.hash(&mut hasher);
+        len += 1;
+    }
+    EmitMark { len, hash: hasher.finish() }
 }
 
 impl UpdateMapper {
@@ -195,7 +244,7 @@ impl UpdateMapper {
     /// used for resync — a resync keeps its marks and re-observes, so the
     /// client receives exactly the gap (see `session.rs::resync`).
     pub fn mark_seen(&mut self, block: &BlockSnapshot) {
-        self.emitted.insert(block.id, block.content.chars().count());
+        self.emitted.insert(block.id, mark_for(&block.content));
         if matches!(block.kind, BlockKind::ToolCall) {
             self.announced.insert(block.id);
             self.tool_status.insert(block.id, acp_tool_status(block.status));
@@ -322,7 +371,7 @@ impl UpdateMapper {
         if self.suppressed.contains(&block.id) {
             // Still advance the mark so un-suppressing later does not replay
             // the whole block.
-            self.emitted.insert(block.id, block.content.chars().count());
+            self.emitted.insert(block.id, mark_for(&block.content));
             return Vec::new();
         }
         let Some(delta) = self.take_delta(block) else {
@@ -393,14 +442,14 @@ impl UpdateMapper {
         }
 
         let changed_status = self.tool_status.get(&target) != Some(&status);
-        let changed_body = self.emitted.get(&block.id).copied().unwrap_or(0)
+        let changed_body = self.emitted.get(&block.id).map(|m| m.len).unwrap_or(0)
             != block.content.chars().count()
             || (changed_status && !body.is_empty());
         if !changed_status && !changed_body {
             return Vec::new();
         }
         self.tool_status.insert(target, status);
-        self.emitted.insert(block.id, block.content.chars().count());
+        self.emitted.insert(block.id, mark_for(&block.content));
 
         let mut fields = ToolCallUpdateFields::new().status(status);
         if !body.is_empty() {
@@ -461,7 +510,7 @@ impl UpdateMapper {
         blocks.iter().all(|b| match b.kind {
             BlockKind::Text | BlockKind::Thinking | BlockKind::Notification | BlockKind::Drift => {
                 self.suppressed.contains(&b.id)
-                    || self.emitted.get(&b.id).copied().unwrap_or(0)
+                    || self.emitted.get(&b.id).map(|m| m.len).unwrap_or(0)
                         >= b.content.chars().count()
             }
             _ => true,
@@ -480,21 +529,89 @@ impl UpdateMapper {
     }
 
     /// The not-yet-emitted suffix of a block's content, advancing the mark.
-    /// `None` when nothing is new.
+    /// `None` when there is nothing safe to emit.
+    ///
+    /// ACP's message-chunk lanes (`user_message_chunk` / `agent_message_chunk`
+    /// / `agent_thought_chunk`, and the `content` this method's callers hand
+    /// to `AgentMessageChunk`/`AgentThoughtChunk`/`UserMessageChunk`) are pure
+    /// **append** streams from the client's perspective — `SessionUpdate` (ACP
+    /// v1, `agent-client-protocol-schema` crate) has no variant that replaces
+    /// or resets already-delivered text, only ones that append more of it. A
+    /// client is expected to concatenate every chunk it receives for a
+    /// message onto what it already has.
+    ///
+    /// kaijutsu's block content is not append-only, though: `block_splice`,
+    /// `block_edit`, `kj block edit`, a kaish VFS write, and `merge_ops` can
+    /// all rewrite a block's content anywhere, not just its tail. A
+    /// count-only high-water mark cannot tell "the tail grew" from "the
+    /// content was rewritten to something that happens to be the same length
+    /// or longer" — and blindly `skip`-ping to the old count in the latter
+    /// case hands the client a suffix that, appended to its stale copy,
+    /// produces text that never existed in the block. Example: local "abcdef"
+    /// (seen=6), kernel splices "X" at offset 0 → "Xabcdef" (total=7);
+    /// `skip(6)` yields "f", and the client renders "abcdeff". Silent
+    /// corruption, not cosmetic drift.
+    ///
+    /// So this only ever emits a delta when it can prove the previously
+    /// emitted prefix is *still* a prefix of the current content (verified by
+    /// [`prefix_hash`], not by re-storing the full prefix — these are
+    /// conversation blocks and can be large). Otherwise — a shrink, or a
+    /// same-or-greater-length divergence — there is nothing ACP lets us say
+    /// that would correct what the client already rendered, so we say nothing
+    /// and log loudly instead of fabricating a wrong suffix. The client is
+    /// left holding stale text for that block until a full `session/load`
+    /// replay or a fresh session picks it up; that is a known, visible gap,
+    /// not a silent one (docs/acp.md has the write-up).
     fn take_delta(&mut self, block: &BlockSnapshot) -> Option<String> {
-        let seen = self.emitted.get(&block.id).copied().unwrap_or(0);
+        let Some(mark) = self.emitted.get(&block.id).copied() else {
+            // Never observed before: the whole thing is new.
+            let fresh = mark_for(&block.content);
+            self.emitted.insert(block.id, fresh);
+            return (fresh.len > 0).then(|| block.content.clone());
+        };
+
         let total = block.content.chars().count();
-        if total <= seen {
-            // Content shrank (an edit, or a resync rebuilt the block). Re-peg
-            // the mark rather than emitting a negative delta; the client keeps
-            // the stale tail, which beats a duplicated body.
-            if total < seen {
-                self.emitted.insert(block.id, total);
-            }
+
+        if total < mark.len {
+            // Content shrank (an edit, a delete, a resync rebuild). ACP
+            // cannot un-send text, so the client keeps the stale tail — but
+            // it hears about it, rather than the mark silently re-pegging as
+            // if nothing had happened.
+            tracing::warn!(
+                block = %block.id.to_key(),
+                was_chars = mark.len,
+                now_chars = total,
+                "ACP: block content shrank mid-stream; client keeps the \
+                 stale tail — message-chunk updates cannot be un-sent"
+            );
+            self.emitted.insert(block.id, mark_for(&block.content));
             return None;
         }
-        self.emitted.insert(block.id, total);
-        Some(block.content.chars().skip(seen).collect())
+
+        // total >= mark.len: only safe to treat as an append if the chars
+        // already emitted are still exactly there.
+        if prefix_hash(&block.content, mark.len) != mark.hash {
+            tracing::warn!(
+                block = %block.id.to_key(),
+                was_chars = mark.len,
+                now_chars = total,
+                "ACP: block content diverged mid-stream (text at or before \
+                 the already-emitted mark changed, not just appended after \
+                 it); refusing to emit a suffix delta — it would corrupt the \
+                 client's copy. Client keeps its stale text until a full \
+                 resync/reload"
+            );
+            self.emitted.insert(block.id, mark_for(&block.content));
+            return None;
+        }
+
+        if total == mark.len {
+            return None;
+        }
+
+        let delta: String = block.content.chars().skip(mark.len).collect();
+        self.emitted.insert(block.id, mark_for(&block.content));
+        Some(delta)
     }
 }
 
@@ -821,6 +938,180 @@ mod tests {
         assert_eq!(chunk_text(&m.observe(&b)[0]), "日本");
         b.content = "日本語".to_string();
         assert_eq!(chunk_text(&m.observe(&b)[0]), "語");
+    }
+
+    // ── take_delta divergence (mid-content mutation, not a tail append) ────
+
+    #[test]
+    fn pure_append_still_emits_only_the_suffix() {
+        // Regression guard for the hot path: LLM streaming is many small
+        // appends in a row, and each one must emit only its own new text —
+        // re-sending the whole growing block on every op would be a
+        // performance disaster.
+        let mut m = mapper();
+        let mut b = block(BlockKind::Text, Role::Model, "T", 1);
+        assert_eq!(chunk_text(&m.observe(&b)[0]), "T");
+        for suffix in ["h", "e", " quick", " brown fox"] {
+            b.content.push_str(suffix);
+            let out = m.observe(&b);
+            assert_eq!(out.len(), 1, "each append is exactly one chunk: {out:?}");
+            assert_eq!(chunk_text(&out[0]), suffix);
+        }
+        assert_eq!(b.content, "The quick brown fox");
+    }
+
+    #[test]
+    fn mid_content_insertion_does_not_corrupt_the_tail() {
+        // Local text "abcdef" (seen=6). Kernel splices "X" at offset 0 →
+        // "Xabcdef" (total=7). The old count-only mark did `skip(6)`,
+        // handing back "f" — appended to the client's stale "abcdef" that
+        // renders "abcdeff". Silent corruption, not cosmetic drift.
+        let mut m = mapper();
+        let mut b = block(BlockKind::Text, Role::Model, "abcdef", 1);
+        assert_eq!(chunk_text(&m.observe(&b)[0]), "abcdef");
+
+        b.content = "Xabcdef".to_string();
+        let out = m.observe(&b);
+        assert!(
+            out.is_empty(),
+            "a non-append mutation must not fabricate a bogus suffix: {out:?}"
+        );
+
+        // The mark must have caught up to the CURRENT content — not stayed
+        // pinned at the old length — so a subsequent genuine append streams
+        // correctly again instead of re-triggering divergence forever.
+        b.content = "Xabcdef more".to_string();
+        let out2 = m.observe(&b);
+        assert_eq!(
+            chunk_text(&out2[0]),
+            " more",
+            "once re-pegged to the corrected content, real appends resume streaming"
+        );
+    }
+
+    #[test]
+    fn shrink_signals_instead_of_silently_re_pegging() {
+        let mut m = mapper();
+        let mut b = block(BlockKind::Text, Role::Model, "abcdef", 1);
+        m.observe(&b);
+
+        b.content = "abc".to_string();
+        assert!(
+            m.observe(&b).is_empty(),
+            "ACP message-chunk lanes cannot un-send text, so a shrink cannot emit a delta"
+        );
+
+        // The mark re-pegs to the shrunk content so a later genuine append
+        // is diffed against the truth, not treated as another divergence.
+        b.content = "abcXYZ".to_string();
+        let out = m.observe(&b);
+        assert_eq!(chunk_text(&out[0]), "XYZ");
+    }
+
+    #[test]
+    fn same_length_replacement_is_never_mistaken_for_no_change() {
+        // "abcdef" -> "abcXef": the char count is unchanged, so the old
+        // count-only mark thought nothing happened and emitted nothing —
+        // the client's copy silently stopped matching the kernel's. There is
+        // nothing ACP lets us send that would correct already-delivered
+        // text, so the fix must still emit nothing here — but it must be
+        // because a real replacement was detected and refused, not because
+        // the mark never noticed.
+        let mut m = mapper();
+        let mut b = block(BlockKind::Text, Role::Model, "abcdef", 1);
+        m.observe(&b);
+
+        b.content = "abcXef".to_string();
+        assert!(
+            m.observe(&b).is_empty(),
+            "same-length replace: nothing safe to emit over an append-only lane"
+        );
+
+        // Confirm the mark caught up to "abcXef" (not left pinned on the
+        // stale "abcdef") by checking the next real append diffs correctly.
+        b.content = "abcXef!!".to_string();
+        let out = m.observe(&b);
+        assert_eq!(chunk_text(&out[0]), "!!");
+    }
+
+    #[test]
+    fn non_ascii_mid_content_splice_is_char_correct_not_byte_correct() {
+        let mut m = mapper();
+        let mut b = block(BlockKind::Text, Role::Model, "日本語", 1);
+        assert_eq!(chunk_text(&m.observe(&b)[0]), "日本語");
+
+        // Insert a multi-byte char in the middle — byte-indexed divergence
+        // detection would slice mid-codepoint or misalign the comparison
+        // entirely instead of cleanly detecting the splice.
+        b.content = "日本ご語".to_string();
+        assert!(
+            m.observe(&b).is_empty(),
+            "a mid-content multi-byte splice must not emit a corrupted suffix"
+        );
+
+        b.content = "日本ご語です".to_string();
+        let out = m.observe(&b);
+        assert_eq!(chunk_text(&out[0]), "です", "recovers to incremental streaming after re-pegging");
+    }
+
+    /// A `tracing::Subscriber` that captures formatted output into a shared
+    /// buffer, so a test can assert a warning actually fired instead of
+    /// trusting that "returns `None`" implies "and it was loud about it."
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn shrink_and_divergence_log_a_loud_warning_not_silence() {
+        // The whole point of this fix: silence-and-stale is a lesser sin than
+        // silent corruption, but it is still a sin. Both non-append cases
+        // must tell someone, not just quietly re-peg and move on.
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut m = mapper();
+
+            let mut shrinking = block(BlockKind::Text, Role::Model, "abcdef", 1);
+            m.observe(&shrinking);
+            shrinking.content = "abc".to_string();
+            m.observe(&shrinking);
+
+            let mut diverging = block(BlockKind::Text, Role::Model, "abcdef", 2);
+            m.observe(&diverging);
+            diverging.content = "Xabcdef".to_string();
+            m.observe(&diverging);
+        });
+
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.to_ascii_lowercase().contains("shrank"),
+            "expected a warning naming the shrink, got: {logged}"
+        );
+        assert!(
+            logged.to_ascii_lowercase().contains("diverged"),
+            "expected a warning naming the divergence, got: {logged}"
+        );
     }
 
     #[test]

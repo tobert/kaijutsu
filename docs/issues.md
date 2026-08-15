@@ -2153,6 +2153,17 @@ adapter, as built".
   instead of quietly losing events.
 - **Client-declared `mcpServers` are ignored** (warned once per
   `session/new`). Needs the unplumbed `external.rs` caller — acp.md gap #4.
+- **`observe_tool_result`'s `changed_body` check is length-only, so a
+  same-length content replacement on a `ToolResult` block (e.g. `boom` →
+  `oops`) can be missed and the update dropped silently — the same shape of
+  gap `take_delta` had before the 2026-08-15 fix (`update.rs`), just in a
+  sibling method that was out of that fix's scope. Lower stakes here: this
+  path always sends the *full* current body when it does fire (no
+  suffix-slicing, so no corruption risk), and a status change on the same
+  event usually forces a send anyway — but a same-length body change with an
+  unchanged status is a real, if narrow, silent-staleness gap. Swap the
+  length comparison for the same prefix-hash-style check `take_delta` now
+  uses (or just always compare a content hash) if it's ever seen live.
 
 ## FlowBus backpressure — what the 2026-08-05 rework left open
 
