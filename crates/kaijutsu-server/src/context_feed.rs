@@ -108,8 +108,9 @@ pub(crate) async fn run_context_feed(
                     // Deliver what we already hold first: those events are
                     // accepted facts, and the client's recovery is cheaper if
                     // its snapshot is as recent as possible.
-                    if let Some(v) =
-                        deliver(&observer, context_id, &mut batch, kernel_id).await
+                    if let Ok(Some(v)) =
+                        deliver(&observer, context_id, &mut batch, kernel_id, delivered_version)
+                            .await
                     {
                         delivered_version = v;
                     }
@@ -123,9 +124,14 @@ pub(crate) async fn run_context_feed(
         // 3. Deliver. A batch that holds nothing this feed carries (a beat, a
         //    cue, another context's change) is not an empty delivery — it is no
         //    delivery at all.
-        match deliver(&observer, context_id, &mut batch, kernel_id).await {
-            Some(v) => delivered_version = v,
-            None => continue,
+        match deliver(&observer, context_id, &mut batch, kernel_id, delivered_version).await {
+            Ok(Some(v)) => delivered_version = v,
+            Ok(None) => continue,
+            Err(fault) => {
+                terminate_fault(&observer, delivered_version, kernel_id, fault).await;
+                disconnect.cancel();
+                break;
+            }
         }
     }
 }
@@ -138,12 +144,13 @@ async fn deliver(
     context_id: ContextId,
     batch: &mut Vec<BlockFlow>,
     kernel_id: KernelId,
-) -> Option<u64> {
+    last_delivered: u64,
+) -> Result<Option<u64>, FeedFault> {
     // This feed is one context's. Another context's changes share the bus, not
     // the version counter, so they are not ours to deliver.
     batch.retain(|flow| flow.context_id() == context_id && carries(flow));
     if batch.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Version order within the delivery (rules 11, 13, 14). Stable, so two
@@ -152,6 +159,28 @@ async fn deliver(
     batch.sort_by_key(|flow| flow.version().unwrap_or(0));
     let version = batch.last().and_then(|flow| flow.version()).unwrap_or(0);
 
+    // The window repairs an inversion by sorting; an inversion that spans two
+    // windows it cannot repair, because the earlier event is already gone. Say
+    // so instead of shipping it: an event older than one already delivered
+    // would either be applied out of order (corrupting text) or skipped
+    // (losing a change), and neither is something a client can discover on its
+    // own. `Err` here ends the feed, and the client rehydrates from a
+    // snapshot — the same recovery a slow subscriber gets, for the same
+    // reason.
+    let oldest = batch.first().and_then(|flow| flow.version()).unwrap_or(0);
+    if last_delivered > 0 && oldest <= last_delivered {
+        tracing::error!(
+            kernel = %kernel_id,
+            %context_id,
+            oldest,
+            last_delivered,
+            "context feed saw an event older than one already delivered — the \
+             batching window could not repair it; ending the feed so the client \
+             refetches rather than applying it out of order"
+        );
+        return Err(FeedFault::UnrepairableInversion);
+    }
+
     let mut req = observer.on_context_changed_request();
     {
         let mut params = req.get();
@@ -159,24 +188,69 @@ async fn deliver(
         params.set_version(version);
         let mut list = params.init_events(batch.len() as u32);
         for (i, flow) in batch.iter().enumerate() {
-            write_event(list.reborrow().get(i as u32), flow);
+            let mut event = list.reborrow().get(i as u32);
+            // Per event, not just per delivery: a batch can straddle a
+            // client's snapshot, and only the event's own version can say
+            // which side of it the event falls on.
+            event.set_version(flow.version().unwrap_or(0));
+            write_event(event, flow);
         }
     }
     batch.clear();
 
     match tokio::time::timeout(FEED_CALLBACK_TIMEOUT, req.send().promise).await {
-        Ok(Ok(_)) => Some(version),
+        Ok(Ok(_)) => Ok(Some(version)),
         Ok(Err(e)) => {
             tracing::debug!(kernel = %kernel_id, error = %e, "context feed delivery refused");
-            None
+            Ok(None)
         }
         Err(_) => {
             tracing::warn!(
                 kernel = %kernel_id,
                 "context feed delivery timed out after {FEED_CALLBACK_TIMEOUT:?}"
             );
-            None
+            Ok(None)
         }
+    }
+}
+
+/// A fault the feed cannot deliver through — it ends the feed instead.
+#[derive(Debug, Clone, Copy)]
+enum FeedFault {
+    /// An event arrived older than one already delivered, across two batching
+    /// windows. Sorting cannot repair what has already been sent.
+    UnrepairableInversion,
+}
+
+/// End the feed because the server cannot deliver a correct stream.
+///
+/// Distinct from the slow-subscriber path below: nothing is wrong with the
+/// client here. It is told so, and recovers exactly the same way — refetch a
+/// snapshot and start again.
+async fn terminate_fault(
+    observer: &context_observer::Client,
+    delivered_version: u64,
+    kernel_id: KernelId,
+    fault: FeedFault,
+) {
+    const TERMINATE_TIMEOUT: Duration = Duration::from_secs(1);
+    tracing::error!(
+        kernel = %kernel_id,
+        ?fault,
+        delivered_version,
+        "context feed ending on a server-side fault; the client will refetch"
+    );
+    let mut req = observer.on_terminated_request();
+    {
+        let mut p = req.get();
+        p.set_reason(crate::kaijutsu_capnp::SubscriptionEndReason::InternalFault);
+        p.set_delivered_version(delivered_version);
+    }
+    if tokio::time::timeout(TERMINATE_TIMEOUT, req.send().promise)
+        .await
+        .is_err()
+    {
+        tracing::debug!("context feed subscriber did not accept its fault notice");
     }
 }
 

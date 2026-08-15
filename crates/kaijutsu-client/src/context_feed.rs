@@ -82,14 +82,37 @@ pub enum ContextChange {
     },
 }
 
+/// One change, with the context version it brought the context to.
+///
+/// The version is per event and not merely per delivery, because a batch can
+/// straddle a client's snapshot: a burst of five mutations can be one delivery,
+/// and `getBlocks` can be served in the middle of it. A per-delivery comparison
+/// then has to take all five or none — taking all replays what the snapshot
+/// already holds (a duplicated append), taking none loses the rest. Only the
+/// event's own version answers the question.
+#[derive(Clone, Debug)]
+pub struct VersionedChange {
+    pub version: u64,
+    pub change: ContextChange,
+}
+
 /// One delivery: an ordered batch, and the version it brings the client to.
 #[derive(Clone, Debug)]
 pub struct ContextDelivery {
     pub context_id: ContextId,
-    pub events: Vec<ContextChange>,
-    /// Applying `events` in order makes the client's state exactly the context
-    /// at this version.
+    pub events: Vec<VersionedChange>,
+    /// The version of the LAST event in `events`. Applying the batch in order
+    /// makes the client's state exactly the context at this version — but see
+    /// [`VersionedChange`] for why a client filters per event, not by this.
     pub version: u64,
+}
+
+impl ContextDelivery {
+    /// The changes alone, in order, for a consumer that only reacts to what
+    /// happened and lets [`ContextMirror`] handle versions.
+    pub fn changes(&self) -> impl Iterator<Item = &ContextChange> {
+        self.events.iter().map(|e| &e.change)
+    }
 }
 
 /// What arrives on a feed.
@@ -167,6 +190,9 @@ impl context_observer::Server for ContextObserverForwarder {
             Ok(crate::kaijutsu_capnp::SubscriptionEndReason::Superseded) => {
                 SubscriptionEndReason::Superseded
             }
+            Ok(crate::kaijutsu_capnp::SubscriptionEndReason::InternalFault) => {
+                SubscriptionEndReason::InternalFault
+            }
             // An enumerant this build does not know. Honest beats guessed.
             Err(_) => SubscriptionEndReason::Unknown,
         };
@@ -208,7 +234,10 @@ fn parse_delivery(
     let list = p.get_events()?;
     let mut events = Vec::with_capacity(list.len() as usize);
     for reader in list.iter() {
-        events.push(parse_change(reader)?);
+        events.push(VersionedChange {
+            version: reader.get_version(),
+            change: parse_change(reader)?,
+        });
     }
     Ok(ContextDelivery {
         context_id,
@@ -326,6 +355,10 @@ pub enum MirrorError {
     /// should re-subscribe and refetch: version going backwards means this
     /// mirror is not following one ordered feed.
     VersionWentBackwards { have: u64, got: u64 },
+    /// An earlier delivery failed partway through, so these blocks are a
+    /// half-applied batch. The mirror refuses everything until a fresh
+    /// snapshot replaces them.
+    NeedsRehydration,
 }
 
 impl std::fmt::Display for MirrorError {
@@ -338,6 +371,10 @@ impl std::fmt::Display for MirrorError {
             Self::VersionWentBackwards { have, got } => {
                 write!(f, "delivery at version {got} after {have} was applied")
             }
+            Self::NeedsRehydration => write!(
+                f,
+                "mirror holds a half-applied delivery and needs a fresh snapshot"
+            ),
         }
     }
 }
@@ -375,6 +412,9 @@ pub struct ContextMirror {
     /// Deliveries received before the snapshot arrived.
     buffered: Vec<ContextDelivery>,
     snapshot_applied: bool,
+    /// Set when a delivery failed partway through, leaving the blocks in a
+    /// state no caller can reason about. Cleared only by a fresh snapshot.
+    poisoned: bool,
 }
 
 impl ContextMirror {
@@ -389,6 +429,7 @@ impl ContextMirror {
             snapshot_version: 0,
             buffered: Vec::new(),
             snapshot_applied: false,
+            poisoned: false,
         }
     }
 
@@ -435,12 +476,11 @@ impl ContextMirror {
                 got: delivery.context_id,
             });
         }
+        if self.poisoned {
+            return Err(MirrorError::NeedsRehydration);
+        }
         if !self.snapshot_applied {
             self.buffered.push(delivery);
-            return Ok(());
-        }
-        if delivery.version <= self.snapshot_version {
-            // Already in the snapshot. Applying it would double an append.
             return Ok(());
         }
         self.apply(delivery)
@@ -461,37 +501,69 @@ impl ContextMirror {
         self.version = version;
         self.snapshot_version = version;
         self.snapshot_applied = true;
+        // A fresh snapshot is exactly the repair a poisoned mirror needed.
+        self.poisoned = false;
 
         let mut buffered = std::mem::take(&mut self.buffered);
         buffered.sort_by_key(|d| d.version);
         for delivery in buffered {
-            if delivery.version <= version {
-                continue;
-            }
+            // No per-delivery filter here: `apply` drops the events the
+            // snapshot already holds and keeps the rest, which is the only
+            // correct answer for a batch that straddles `version`.
             self.apply(delivery)?;
         }
         Ok(())
     }
 
-    /// Apply one delivery to a hydrated mirror, in order.
+    /// Apply one delivery to a hydrated mirror, event by event.
     ///
-    /// A delivery that does not advance the version and is NOT covered by the
-    /// snapshot is still an error, and deliberately so: it means a delivery
-    /// this mirror never applied arrived after a later one: an inversion. Both
-    /// applying it (out of order) and dropping it (losing a change) corrupt,
-    /// so the honest move is to refuse and let the caller refetch.
+    /// Per event, not per delivery, because a batch can straddle the snapshot:
+    /// each event is dropped if the snapshot already holds it, applied if it
+    /// advances, and refused otherwise.
+    ///
+    /// A refusal means an event this mirror never applied arrived after a later
+    /// one — an inversion. Applying it puts changes out of order and dropping
+    /// it loses one, so neither is available; the mirror says so and needs
+    /// rehydrating.
+    ///
+    /// **Any error poisons the mirror.** Events are applied in place, so a
+    /// failure partway through a batch leaves some applied and some not. That
+    /// half-state is not something the caller can reason about, and a mirror
+    /// that kept accepting deliveries onto it would compound the damage
+    /// silently — which is the whole failure mode this migration exists to end.
     fn apply(&mut self, delivery: ContextDelivery) -> Result<(), MirrorError> {
-        if delivery.version <= self.version {
-            return Err(MirrorError::VersionWentBackwards {
-                have: self.version,
-                got: delivery.version,
-            });
+        for event in delivery.events {
+            if event.version <= self.snapshot_version {
+                // Already in the snapshot this mirror was hydrated from.
+                continue;
+            }
+            // Strictly greater, not "at least": every event this feed carries
+            // comes from its own kernel mutation, so two carried events never
+            // share a version. Requiring an advance means a duplicate delivery
+            // is refused instead of doubling an append. The cost if that ever
+            // stops being true — a mutation that publishes two carried events
+            // — is a spurious rehydrate, which is loud and recoverable; the
+            // cost of the lax version is silently duplicated text.
+            if event.version <= self.version {
+                return self.poison(MirrorError::VersionWentBackwards {
+                    have: self.version,
+                    got: event.version,
+                });
+            }
+            if let Err(e) = self.apply_change(event.change) {
+                return self.poison(e);
+            }
+            // Advanced per event, so a failure later in the batch leaves the
+            // version pointing at the last change that actually landed.
+            self.version = event.version;
         }
-        for change in delivery.events {
-            self.apply_change(change)?;
-        }
-        self.version = delivery.version;
         Ok(())
+    }
+
+    /// Mark the mirror unusable and return the error that caused it.
+    fn poison(&mut self, error: MirrorError) -> Result<(), MirrorError> {
+        self.poisoned = true;
+        Err(error)
     }
 
     fn apply_change(&mut self, change: ContextChange) -> Result<(), MirrorError> {
@@ -599,6 +671,8 @@ mod tests {
         snap
     }
 
+    /// A delivery whose events all landed at `version` — the common shape,
+    /// where one delivery carries one mutation's worth of changes.
     fn delivery(
         context_id: ContextId,
         version: u64,
@@ -606,7 +680,24 @@ mod tests {
     ) -> ContextDelivery {
         ContextDelivery {
             context_id,
-            events,
+            events: events
+                .into_iter()
+                .map(|change| VersionedChange { version, change })
+                .collect(),
+            version,
+        }
+    }
+
+    /// A delivery that batches SEVERAL mutations — the shape that straddles a
+    /// snapshot, and the one a per-delivery version cannot describe.
+    fn batched(context_id: ContextId, events: Vec<(u64, ContextChange)>) -> ContextDelivery {
+        let version = events.last().map(|(v, _)| *v).unwrap_or(0);
+        ContextDelivery {
+            context_id,
+            events: events
+                .into_iter()
+                .map(|(version, change)| VersionedChange { version, change })
+                .collect(),
             version,
         }
     }
@@ -621,26 +712,33 @@ mod tests {
         let mut mirror = ContextMirror::new(c);
         mirror.apply_snapshot(vec![b], 10).unwrap();
 
+        // Two appends are two mutations, so two versions — the wire never puts
+        // two carried events at one version.
         mirror
-            .receive(delivery(
+            .receive(batched(
                 c,
-                11,
                 vec![
-                    ContextChange::TextAppended {
-                        block_id: id,
-                        suffix: "こんにちは".into(),
-                    },
-                    ContextChange::TextAppended {
-                        block_id: id,
-                        suffix: "、世界".into(),
-                    },
+                    (
+                        11,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "こんにちは".into(),
+                        },
+                    ),
+                    (
+                        12,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "、世界".into(),
+                        },
+                    ),
                 ],
             ))
             .unwrap();
         mirror
             .receive(delivery(
                 c,
-                12,
+                13,
                 vec![ContextChange::TextReplaced {
                     block_id: id,
                     content: "はい、世界".into(),
@@ -649,7 +747,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(mirror.block(&id).unwrap().content, "はい、世界");
-        assert_eq!(mirror.version(), 12);
+        assert_eq!(mirror.version(), 13);
     }
 
     /// Rule 21-26. The client subscribes first, so deliveries can arrive while
@@ -785,6 +883,57 @@ mod tests {
         assert_eq!(mirror.block(&id).unwrap().content, "abcd");
     }
 
+    /// PROBE (gemini-pro review, 2026-08-15): a batched delivery whose events
+    /// SPAN the snapshot version. No concurrency required — a burst is batched,
+    /// and `getBlocks` is served in the middle of it.
+    #[test]
+    fn a_delivery_spanning_the_snapshot_version_must_not_double_apply() {
+        let c = ctx();
+        // The snapshot was read at version 6, with "ab" already in it.
+        let b = block(c, 1, "ab");
+        let id = b.id;
+        let mut mirror = ContextMirror::new(c);
+
+        // One delivery carrying versions 5, 6 and 7. Versions 5 and 6 are the
+        // "a" and "b" the snapshot already contains.
+        mirror
+            .receive(batched(
+                c,
+                vec![
+                    (
+                        5,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "a".into(),
+                        },
+                    ),
+                    (
+                        6,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "b".into(),
+                        },
+                    ),
+                    (
+                        7,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "c".into(),
+                        },
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        mirror.apply_snapshot(vec![b], 6).unwrap();
+
+        assert_eq!(
+            mirror.block(&id).unwrap().content,
+            "abc",
+            "only the event ABOVE the snapshot version may be applied"
+        );
+    }
+
     /// Document order comes from the feed's positions, not from any ordering
     /// key on the snapshot — there isn't one on the wire.
     #[test]
@@ -878,6 +1027,81 @@ mod tests {
         assert_eq!(err, MirrorError::UnknownBlock(stranger_id));
     }
 
+    /// A delivery that fails partway leaves the blocks half-applied, and the
+    /// mirror says so instead of carrying on.
+    ///
+    /// Carrying on is the tempting option — the first events did apply — but a
+    /// half-applied batch is a state no caller can reason about, and accepting
+    /// more deliveries onto it compounds the damage invisibly. Which is the
+    /// exact failure mode this whole migration exists to end.
+    #[test]
+    fn a_half_applied_delivery_poisons_the_mirror() {
+        let c = ctx();
+        let b = block(c, 1, "start");
+        let id = b.id;
+        let stranger = block(c, 99, "never seen").id;
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![b], 1).unwrap();
+
+        // The first change applies; the second names a block this mirror does
+        // not hold.
+        let err = mirror
+            .receive(batched(
+                c,
+                vec![
+                    (
+                        2,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "-ok".into(),
+                        },
+                    ),
+                    (
+                        3,
+                        ContextChange::TextAppended {
+                            block_id: stranger,
+                            suffix: "-boom".into(),
+                        },
+                    ),
+                ],
+            ))
+            .unwrap_err();
+        assert_eq!(err, MirrorError::UnknownBlock(stranger));
+
+        // The version reflects the last change that actually landed, and the
+        // mirror now refuses everything until it is rehydrated.
+        assert_eq!(mirror.version(), 2);
+        let refused = mirror
+            .receive(delivery(
+                c,
+                4,
+                vec![ContextChange::TextAppended {
+                    block_id: id,
+                    suffix: "-more".into(),
+                }],
+            ))
+            .unwrap_err();
+        assert_eq!(refused, MirrorError::NeedsRehydration);
+
+        // A fresh snapshot is the repair. Same block id — `block()` mints a new
+        // principal each call, so rebuilding it from the id is the only way to
+        // model the same block coming back.
+        let mut healed = block(c, 1, "start-ok");
+        healed.id = id;
+        mirror.apply_snapshot(vec![healed], 3).unwrap();
+        mirror
+            .receive(delivery(
+                c,
+                4,
+                vec![ContextChange::TextAppended {
+                    block_id: id,
+                    suffix: "-more".into(),
+                }],
+            ))
+            .expect("a rehydrated mirror works again");
+        assert_eq!(mirror.block(&id).unwrap().content, "start-ok-more");
+    }
+
     /// Two contexts have two version counters. Mixing them would make either
     /// one meaningless, so a stray delivery is refused rather than dropped.
     #[test]
@@ -931,19 +1155,27 @@ mod tests {
         let mut mirror = ContextMirror::new(c);
         mirror.apply_snapshot(vec![b], 1).unwrap();
 
+        // The text write and the completion are two kernel mutations, hence two
+        // versions — but ONE delivery, which is the property under test: a
+        // client never sees a finished tool with missing output.
         mirror
-            .receive(delivery(
+            .receive(batched(
                 c,
-                2,
                 vec![
-                    ContextChange::TextAppended {
-                        block_id: id,
-                        suffix: "done.\n".into(),
-                    },
-                    ContextChange::StatusChanged {
-                        block_id: id,
-                        status: Status::Done,
-                    },
+                    (
+                        2,
+                        ContextChange::TextAppended {
+                            block_id: id,
+                            suffix: "done.\n".into(),
+                        },
+                    ),
+                    (
+                        3,
+                        ContextChange::StatusChanged {
+                            block_id: id,
+                            status: Status::Done,
+                        },
+                    ),
                 ],
             ))
             .unwrap();

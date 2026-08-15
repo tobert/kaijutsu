@@ -36,6 +36,7 @@ async fn drain_until(mirror: &mut ContextMirror, rx: &mut Receiver<FeedEvent>, v
     while mirror.version() < version {
         match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
             Ok(Some(FeedEvent::Changed(delivery))) => {
+                assert_per_event_versions(&delivery);
                 mirror.receive(delivery).expect("delivery applies cleanly")
             }
             Ok(Some(FeedEvent::Terminated { reason, .. })) => {
@@ -54,6 +55,31 @@ async fn drain_until(mirror: &mut ContextMirror, rx: &mut Receiver<FeedEvent>, v
             ),
         }
     }
+}
+
+/// Every event must carry its OWN version, strictly increasing across the
+/// delivery, with the last equal to the delivery's.
+///
+/// Checked on the wire and not only in the mirror's unit tests because the
+/// failure mode is a field the server never sets: it decodes as `0`, the
+/// mirror reads `0 <= snapshot_version` and silently drops every change, and
+/// the client renders a context frozen at its snapshot. Two fields on this
+/// wire have already been shipped unread (`excluded`, `created_at`); this is
+/// the assertion that would catch the third.
+fn assert_per_event_versions(delivery: &kaijutsu_client::ContextDelivery) {
+    let mut last = 0u64;
+    for event in &delivery.events {
+        assert!(
+            event.version > last,
+            "event versions must strictly increase within a delivery: {} after {last}",
+            event.version
+        );
+        last = event.version;
+    }
+    assert_eq!(
+        last, delivery.version,
+        "the delivery's version must be its last event's"
+    );
 }
 
 async fn author_empty_block(
@@ -376,8 +402,8 @@ fn an_append_crosses_the_wire_as_a_suffix() {
                 Ok(Some(FeedEvent::Changed(d))) => d,
                 other => panic!("expected a delivery, got {other:?}"),
             };
-            for event in &delivery.events {
-                if let ContextChange::TextAppended { block_id: id, suffix } = event
+            for change in delivery.changes() {
+                if let ContextChange::TextAppended { block_id: id, suffix } = change
                     && *id == block_id
                 {
                     appended = Some(suffix.clone());

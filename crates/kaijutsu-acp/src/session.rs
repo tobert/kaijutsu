@@ -278,7 +278,7 @@ fn deliver_updates(
 ) -> Vec<SessionUpdate> {
     let mut deleted = Vec::new();
     let mut touched = Vec::new();
-    for change in &delivery.events {
+    for change in delivery.changes() {
         match change {
             ContextChange::BlockDeleted { block_id } => deleted.push(*block_id),
             ContextChange::BlockInserted { block, .. } => touched.push(block.id),
@@ -670,17 +670,26 @@ mod tests {
 
         let s = Arc::new(session(c));
         let sid = SessionId::new("s");
+        // The text write and the completion are two kernel mutations, so two
+        // versions — one delivery, which is the property: a client never sees
+        // a finished turn with its text missing.
         let delivery = ContextDelivery {
             context_id: c,
-            version: 2,
+            version: 3,
             events: vec![
-                ContextChange::TextAppended {
-                    block_id: id,
-                    suffix: "hello from the feed".into(),
+                kaijutsu_client::context_feed::VersionedChange {
+                    version: 2,
+                    change: ContextChange::TextAppended {
+                        block_id: id,
+                        suffix: "hello from the feed".into(),
+                    },
                 },
-                ContextChange::StatusChanged {
-                    block_id: id,
-                    status: kaijutsu_types::Status::Done,
+                kaijutsu_client::context_feed::VersionedChange {
+                    version: 3,
+                    change: ContextChange::StatusChanged {
+                        block_id: id,
+                        status: kaijutsu_types::Status::Done,
+                    },
                 },
             ],
         };
@@ -698,7 +707,11 @@ mod tests {
         // The mirror itself now holds the kernel's text — reached purely by
         // applying typed `ContextChange`s, never by decoding a CRDT op.
         assert_eq!(mirror.block(&id).unwrap().content, "hello from the feed");
-        assert_eq!(mirror.version(), 2);
+        assert_eq!(
+            mirror.version(),
+            3,
+            "the mirror advances to the LAST event's version, not the first"
+        );
     }
 
     /// Lag recovery's ground-truth check: a context with any Running or

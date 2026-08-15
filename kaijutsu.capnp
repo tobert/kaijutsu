@@ -562,6 +562,10 @@ enum SubscriptionEndReason {
   serverShutdown @1;
   # Replaced by a newer subscription from the same client instance.
   superseded @2;
+  # The server cannot produce a correct stream and is ending it rather than
+  # sending one it knows is wrong (docs/change-feed.md). Nothing is wrong with
+  # the client; recovery is the same refetch as any other ending.
+  internalFault @3;
 }
 
 # ============================================================================
@@ -642,6 +646,17 @@ struct BlockOutputChange {
 # blocks authored, edited, completed, excluded — Kaijutsu's vocabulary, not a
 # text engine's.
 struct ContextEvent {
+  # The context version this ONE change brought the context to.
+  #
+  # Not redundant with the delivery's version, which is only the last one in
+  # the batch. A client filters per event, because a batch can straddle
+  # anything: a snapshot served in the middle of a burst means some events in
+  # a delivery are already in the snapshot and some are not, and a per-delivery
+  # comparison has to choose all-or-nothing. Choosing "all" duplicates text
+  # (a batch of v5,v6,v7 against a snapshot at v6 replays v5 and v6); choosing
+  # "none" loses v7. Per-event versions make the question answerable.
+  version @10 :UInt64;
+
   union {
     blockInserted     @0 :BlockInsert;
     blockDeleted      @1 :BlockId;

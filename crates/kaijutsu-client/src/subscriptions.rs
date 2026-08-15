@@ -37,6 +37,9 @@ pub enum SubscriptionEndReason {
     ServerShutdown,
     /// Replaced by a newer subscription from the same client instance.
     Superseded,
+    /// The server ended the stream because it could not produce a correct one
+    /// — not the client's fault, and recovered the same way: refetch.
+    InternalFault,
     /// An enumerant this build does not know. Honest rather than guessed.
     Unknown,
 }
@@ -1639,6 +1642,9 @@ impl block_events::Server for BlockEventsForwarder {
             }
             Ok(crate::kaijutsu_capnp::SubscriptionEndReason::Superseded) => {
                 SubscriptionEndReason::Superseded
+            }
+            Ok(crate::kaijutsu_capnp::SubscriptionEndReason::InternalFault) => {
+                SubscriptionEndReason::InternalFault
             }
             Err(_) => SubscriptionEndReason::Unknown,
         };

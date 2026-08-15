@@ -97,6 +97,9 @@ impl block_events::Server for WedgedClient {
             Ok(kaijutsu_client::kaijutsu_capnp::SubscriptionEndReason::SlowSubscriber) => "slowSubscriber",
             Ok(kaijutsu_client::kaijutsu_capnp::SubscriptionEndReason::ServerShutdown) => "serverShutdown",
             Ok(kaijutsu_client::kaijutsu_capnp::SubscriptionEndReason::Superseded) => "superseded",
+            Ok(kaijutsu_client::kaijutsu_capnp::SubscriptionEndReason::InternalFault) => {
+                "internalFault"
+            }
             Err(_) => "unknown",
         };
         let mut k = self.kick.borrow_mut();
