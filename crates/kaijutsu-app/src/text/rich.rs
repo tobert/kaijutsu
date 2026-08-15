@@ -425,11 +425,7 @@ fn try_parse_svg(
 ) -> Option<(Arc<usvg::Tree>, f32, f32, Arc<String>)> {
     let svg_str = if text.trim_start().starts_with("<svg") {
         text.trim()
-    } else if let Some(inner) = extract_fenced_block(text, "svg") {
-        inner
-    } else {
-        return None;
-    };
+    } else { extract_fenced_block(text, "svg")? };
 
     if svg_str.len() > SVG_MAX_BYTES {
         return None;

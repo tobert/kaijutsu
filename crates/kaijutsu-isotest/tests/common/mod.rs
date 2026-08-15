@@ -295,14 +295,13 @@ pub async fn bg_pid(kernel: &KernelHandle, bg_id: &str) -> u32 {
         .await
         .expect("list_background_processes");
     for line in r.content.lines() {
-        if line.starts_with(bg_id) {
-            if let Some(pid) = line
+        if line.starts_with(bg_id)
+            && let Some(pid) = line
                 .split_whitespace()
                 .find_map(|w| w.strip_prefix("pid="))
                 .and_then(|p| p.parse().ok())
-            {
-                return pid;
-            }
+        {
+            return pid;
         }
     }
     panic!("no pid for {bg_id} in: {}", r.content);

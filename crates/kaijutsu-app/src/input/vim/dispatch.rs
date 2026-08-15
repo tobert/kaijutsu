@@ -142,19 +142,19 @@ fn apply_delete(
     overlay.selection_anchor = None;
 
     // Fire CRDT sync (chat only)
-    if !skip_crdt {
-        if let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id()) {
-            let handle = actor.handle.clone();
-            let pos = start as u64;
-            let delete = del_len as u64;
-            bevy::tasks::IoTaskPool::get()
-                .spawn(async move {
-                    if let Err(e) = handle.edit_input(ctx_id, pos, "", delete).await {
-                        log::warn!("edit_input (vim delete) failed: {e}");
-                    }
-                })
-                .detach();
-        }
+    if !skip_crdt
+        && let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id())
+    {
+        let handle = actor.handle.clone();
+        let pos = start as u64;
+        let delete = del_len as u64;
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.edit_input(ctx_id, pos, "", delete).await {
+                    log::warn!("edit_input (vim delete) failed: {e}");
+                }
+            })
+            .detach();
     }
 }
 
@@ -177,19 +177,19 @@ fn apply_insert(
     overlay.cursor = pos + text_to_insert.len();
     overlay.selection_anchor = None;
 
-    if !skip_crdt {
-        if let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id()) {
-            let handle = actor.handle.clone();
-            let p = pos as u64;
-            let insert = text_to_insert.to_string();
-            bevy::tasks::IoTaskPool::get()
-                .spawn(async move {
-                    if let Err(e) = handle.edit_input(ctx_id, p, &insert, 0).await {
-                        log::warn!("edit_input (vim insert) failed: {e}");
-                    }
-                })
-                .detach();
-        }
+    if !skip_crdt
+        && let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id())
+    {
+        let handle = actor.handle.clone();
+        let p = pos as u64;
+        let insert = text_to_insert.to_string();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.edit_input(ctx_id, p, &insert, 0).await {
+                    log::warn!("edit_input (vim insert) failed: {e}");
+                }
+            })
+            .detach();
     }
 }
 

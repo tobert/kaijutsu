@@ -507,14 +507,14 @@ fn compute_border_style(
     };
 
     // Post-process: dim excluded blocks (gutter indicator is shader-driven)
-    if block.excluded {
-        if let Some(ref mut style) = result {
-            // Dim the border color to indicate exclusion
-            let dimmed = style.color.with_alpha(style.color.alpha() * 0.35);
-            style.color = dimmed;
-            // Override animation — excluded blocks shouldn't animate
-            style.animation = BorderAnimation::None;
-        }
+    if block.excluded
+        && let Some(ref mut style) = result
+    {
+        // Dim the border color to indicate exclusion
+        let dimmed = style.color.with_alpha(style.color.alpha() * 0.35);
+        style.color = dimmed;
+        // Override animation — excluded blocks shouldn't animate
+        style.animation = BorderAnimation::None;
     }
 
     result

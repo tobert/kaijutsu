@@ -330,9 +330,7 @@ impl MountTable {
     /// pattern line is skipped by the builder itself rather than failing the
     /// whole snapshot over one typo'd `.gitignore`.
     async fn build_ignore_level(&self, vfs_dir: &Path) -> Option<Arc<Gitignore>> {
-        if self.real_path(vfs_dir).await.ok().flatten().is_none() {
-            return None;
-        }
+        self.real_path(vfs_dir).await.ok().flatten()?;
         let gi_path = vfs_dir.join(".gitignore");
         let content = self.read_all(&gi_path).await.ok()?;
         let text = String::from_utf8_lossy(&content);

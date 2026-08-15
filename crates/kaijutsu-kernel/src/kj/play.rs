@@ -328,10 +328,10 @@ impl KjDispatcher {
         // gate with a technically-true-but-confusing "InThePast { start: Tick(-1) }"
         // error; the user didn't pick a past tick, they picked a nonsense one —
         // reject it here with the real reason (kaibo review 2026-07-16).
-        if let Some(at) = parsed.at {
-            if at < 0 {
-                return KjResult::Err(format!("kj play --track: --at must be ≥ 0 (got {at})"));
-            }
+        if let Some(at) = parsed.at
+            && at < 0
+        {
+            return KjResult::Err(format!("kj play --track: --at must be ≥ 0 (got {at})"));
         }
         let at = parsed.at.map(kaijutsu_types::Tick::new);
         let tick = match schedule_clip_cell(

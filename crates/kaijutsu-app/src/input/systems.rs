@@ -859,19 +859,19 @@ pub fn handle_compose_input(
         overlay.insert(text);
 
         // Only dual-write to CRDT for chat input. Shell input is local-only.
-        if !is_shell {
-            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                let handle = actor.handle.clone();
-                let insert_text = text.clone();
-                let pos = pos_before as u64;
-                bevy::tasks::IoTaskPool::get()
-                    .spawn(async move {
-                        if let Err(e) = handle.edit_input(ctx, pos, &insert_text, 0).await {
-                            log::warn!("edit_input (insert) failed: {e}");
-                        }
-                    })
-                    .detach();
-            }
+        if !is_shell
+            && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
+        {
+            let handle = actor.handle.clone();
+            let insert_text = text.clone();
+            let pos = pos_before as u64;
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    if let Err(e) = handle.edit_input(ctx, pos, &insert_text, 0).await {
+                        log::warn!("edit_input (insert) failed: {e}");
+                    }
+                })
+                .detach();
         }
     }
 
@@ -1045,24 +1045,24 @@ pub fn handle_compose_input(
 
                             overlay.insert(&text);
 
-                            if !is_shell {
-                                if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                                    let handle = actor.handle.clone();
-                                    let pos = pos_before as u64;
-                                    let delete = del_len as u64;
-                                    let insert_text = text.clone();
-                                    bevy::tasks::IoTaskPool::get()
-                                        .spawn(async move {
-                                            if let Err(e) =
-                                                handle
-                                                    .edit_input(ctx, pos, &insert_text, delete)
-                                                    .await
-                                            {
-                                                log::warn!("edit_input (paste) failed: {e}");
-                                            }
-                                        })
-                                        .detach();
-                                }
+                            if !is_shell
+                                && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
+                            {
+                                let handle = actor.handle.clone();
+                                let pos = pos_before as u64;
+                                let delete = del_len as u64;
+                                let insert_text = text.clone();
+                                bevy::tasks::IoTaskPool::get()
+                                    .spawn(async move {
+                                        if let Err(e) =
+                                            handle
+                                                .edit_input(ctx, pos, &insert_text, delete)
+                                                .await
+                                        {
+                                            log::warn!("edit_input (paste) failed: {e}");
+                                        }
+                                    })
+                                    .detach();
                             }
                         }
                         Err(e) => warn!("Paste failed: {e}"),

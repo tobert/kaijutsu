@@ -145,7 +145,7 @@ impl MsdfGenerator {
         let mut completed = Vec::new();
         self.tasks.retain_mut(|task| {
             if task.is_finished() {
-                completed.push(block_on(async { task.await }));
+                completed.push(block_on(task));
                 false
             } else {
                 true

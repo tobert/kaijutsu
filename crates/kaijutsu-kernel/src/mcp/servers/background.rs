@@ -374,10 +374,9 @@ mod tests {
             let structured = r.structured.expect("structured envelope");
             if let Some(entry) = structured.as_array().and_then(|a| {
                 a.iter().find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
-            }) {
-                if entry.get("status").and_then(|v| v.as_str()) == Some(want) {
-                    return entry.clone();
-                }
+            }) && entry.get("status").and_then(|v| v.as_str()) == Some(want)
+            {
+                return entry.clone();
             }
             if start.elapsed() > timeout {
                 panic!("timed out waiting for background process {id} to reach status {want}");
@@ -1124,13 +1123,13 @@ mod tests {
         let poll_start = std::time::Instant::now();
         let mut last = None;
         loop {
-            if let Ok(content) = std::fs::read_to_string(&heartbeat) {
-                if !content.is_empty() {
-                    match &last {
-                        Some(prev) if prev != &content => break,
-                        Some(_) => {}
-                        None => last = Some(content),
-                    }
+            if let Ok(content) = std::fs::read_to_string(&heartbeat)
+                && !content.is_empty()
+            {
+                match &last {
+                    Some(prev) if prev != &content => break,
+                    Some(_) => {}
+                    None => last = Some(content),
                 }
             }
             assert!(

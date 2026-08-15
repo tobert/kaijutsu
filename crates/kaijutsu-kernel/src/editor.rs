@@ -80,31 +80,30 @@ pub async fn resolve_editor_target(
 ) -> Result<EditorTarget, String> {
     // Ask the VFS which backend owns this path. The config-doc backends answer
     // for themselves — no hardcoded `/etc/rc` prefix to drift from the mounts.
-    if let Some((mount_root, fs)) = mounts.owner_of(std::path::Path::new(path)).await {
-        if fs.owns_config_docs() {
-            // Follow any rc/config symlink to its terminal document FIRST, exactly
-            // as the read/exec path (`ConfigCrdtFs`) does. Without this the editor
-            // binds the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
-            // composition) while reads resolve to the target — so saved edits land
-            // on a block nothing else reads (docs/issues.md). Resolving here makes
-            // the editor and the executor agree on one block. A fresh
-            // `ConfigCrdtFs` at the mount root does the lexical walk (it is
-            // stateless — blocks + root); `resolve_canonical` is not on `VfsOps`.
-            let root = mount_root.to_string_lossy().into_owned();
-            let config_fs =
-                crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), root);
-            let resolved = config_fs
-                .resolve_canonical(path)
-                .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
-            let context_id = config_context_id(&resolved);
-            let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
-                format!("open editor: config document '{path}' does not exist (nothing to edit)")
-            })?;
-            return Ok(EditorTarget {
-                context_id,
-                block_id,
-            });
-        }
+    if let Some((mount_root, fs)) = mounts.owner_of(std::path::Path::new(path)).await
+        && fs.owns_config_docs()
+    {
+        // Follow any rc/config symlink to its terminal document FIRST, exactly
+        // as the read/exec path (`ConfigCrdtFs`) does. Without this the editor
+        // binds the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
+        // composition) while reads resolve to the target — so saved edits land
+        // on a block nothing else reads (docs/issues.md). Resolving here makes
+        // the editor and the executor agree on one block. A fresh
+        // `ConfigCrdtFs` at the mount root does the lexical walk (it is
+        // stateless — blocks + root); `resolve_canonical` is not on `VfsOps`.
+        let root = mount_root.to_string_lossy().into_owned();
+        let config_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), root);
+        let resolved = config_fs
+            .resolve_canonical(path)
+            .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
+        let context_id = config_context_id(&resolved);
+        let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
+            format!("open editor: config document '{path}' does not exist (nothing to edit)")
+        })?;
+        return Ok(EditorTarget {
+            context_id,
+            block_id,
+        });
     }
     let (context_id, block_id) = file_cache
         .get_or_load(path)

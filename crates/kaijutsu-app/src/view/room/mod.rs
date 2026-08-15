@@ -1650,11 +1650,11 @@ fn room_focus_visuals(
         // Guarded write: only dirty the material when focus actually flips, so a
         // settled plate stops re-extracting (the well's asset discipline).
         let border = if focused { PLATE_BORDER_FOCUSED } else { Vec4::ZERO };
-        if materials.get(&mat_handle.0).is_some_and(|m| m.dim.x != dim || m.border != border) {
-            if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
-                mat.dim.x = dim;
-                mat.border = border;
-            }
+        if materials.get(&mat_handle.0).is_some_and(|m| m.dim.x != dim || m.border != border)
+            && let Some(mut mat) = materials.get_mut(&mat_handle.0)
+        {
+            mat.dim.x = dim;
+            mat.border = border;
         }
     }
 }
@@ -1839,13 +1839,12 @@ fn set_glow(mats: &mut Assets<StandardMaterial>, handle: &Handle<StandardMateria
     let Some(cur) = mats.get(handle).map(|m| m.base_color.to_linear()) else {
         return;
     };
-    if (cur.red - target.x).abs() > 1e-4
+    if ((cur.red - target.x).abs() > 1e-4
         || (cur.green - target.y).abs() > 1e-4
-        || (cur.blue - target.z).abs() > 1e-4
+        || (cur.blue - target.z).abs() > 1e-4)
+        && let Some(mut m) = mats.get_mut(handle)
     {
-        if let Some(mut m) = mats.get_mut(handle) {
-            m.base_color = lin_v(target);
-        }
+        m.base_color = lin_v(target);
     }
 }
 

@@ -1651,16 +1651,14 @@ impl KaijutsuMcp {
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_default();
-            if !origin_host.is_empty() {
-                if let Err(e) =
-                    remote.actor.set_context_origin_host(context_id, &origin_host).await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        error = %e,
-                        "register_session: failed to record origin_host (non-fatal)",
-                    );
-                }
+            if !origin_host.is_empty()
+                && let Err(e) = remote.actor.set_context_origin_host(context_id, &origin_host).await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "register_session: failed to record origin_host (non-fatal)",
+                );
             }
         }
 

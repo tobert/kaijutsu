@@ -662,10 +662,10 @@ pub fn sync_backdrop_heat(
         let gain = super::scene::WIREFRAME_GAIN_MID * (1.0 + h * HEAT_GAIN_LIFT);
         let hue = super::scene::lerp_hue(palette.fsn_edge, palette.gold, h);
         let want = lin_scaled(hue, gain);
-        if mats.get(&bf.material).is_some_and(|m| m.base_color != want) {
-            if let Some(mut mat) = mats.get_mut(&bf.material) {
-                mat.base_color = want;
-            }
+        if mats.get(&bf.material).is_some_and(|m| m.base_color != want)
+            && let Some(mut mat) = mats.get_mut(&bf.material)
+        {
+            mat.base_color = want;
         }
     }
 }

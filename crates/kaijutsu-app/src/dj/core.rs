@@ -485,15 +485,15 @@ impl DjCore {
             // free-run cap (alive but never corrected, `MAX_FREE_RUN`'s
             // sustained-Touch failure mode). Both are proactive: neither
             // condition ever *arrives* as an event.
-            if let Some(last) = self.last_ref_at {
-                if now.saturating_duration_since(last) > REF_STALE_MAX {
-                    return self.exit_beat_grid(TransitionReason::Stale).transition;
-                }
+            if let Some(last) = self.last_ref_at
+                && now.saturating_duration_since(last) > REF_STALE_MAX
+            {
+                return self.exit_beat_grid(TransitionReason::Stale).transition;
             }
-            if let Some(folded) = self.last_fold_at {
-                if now.saturating_duration_since(folded) > MAX_FREE_RUN {
-                    return self.exit_beat_grid(TransitionReason::FreeRunCap).transition;
-                }
+            if let Some(folded) = self.last_fold_at
+                && now.saturating_duration_since(folded) > MAX_FREE_RUN
+            {
+                return self.exit_beat_grid(TransitionReason::FreeRunCap).transition;
             }
         }
         None

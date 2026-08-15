@@ -83,10 +83,10 @@ fn session_info(c: &ContextInfo, cwd: &Path) -> SessionInfo {
         c.label.clone()
     };
     let mut info = SessionInfo::new(session_id_of(c.id), PathBuf::from(cwd)).title(title);
-    if let Some(ts) = c.last_activity_at.or(Some(c.created_at)) {
-        if let Some(stamp) = rfc3339_millis(ts) {
-            info = info.updated_at(stamp);
-        }
+    if let Some(ts) = c.last_activity_at.or(Some(c.created_at))
+        && let Some(stamp) = rfc3339_millis(ts)
+    {
+        info = info.updated_at(stamp);
     }
     info
 }

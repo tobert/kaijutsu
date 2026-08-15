@@ -337,13 +337,13 @@ impl DriftRouter {
 
     /// Check that a label is not already in use by a different context.
     fn check_label_available(&self, label: &str, id: ContextId) -> Result<(), DriftError> {
-        if let Some(&existing_id) = self.label_to_id.get(label) {
-            if existing_id != id {
-                return Err(DriftError::LabelInUse {
-                    label: label.to_string(),
-                    existing: existing_id.short(),
-                });
-            }
+        if let Some(&existing_id) = self.label_to_id.get(label)
+            && existing_id != id
+        {
+            return Err(DriftError::LabelInUse {
+                label: label.to_string(),
+                existing: existing_id.short(),
+            });
         }
         Ok(())
     }
