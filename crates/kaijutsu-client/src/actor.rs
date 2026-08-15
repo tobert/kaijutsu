@@ -426,6 +426,10 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<SyncState, CallError>>,
     },
+    GetContextVersion {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<u64, CallError>>,
+    },
     CompactContext {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(u64, u64), CallError>>,
@@ -731,6 +735,7 @@ impl RpcCommand {
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Execute { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ShellExecute { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1201,6 +1206,14 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError> {
         self.send(|reply| RpcCommand::GetContextSync { context_id, reply })
+            .await
+    }
+
+    /// Projected revision of a context's block document, no oplog bytes.
+    /// See `get_context_sync`'s doc comment for the seam this replaces.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_context_version(&self, context_id: ContextId) -> Result<u64, CallError> {
+        self.send(|reply| RpcCommand::GetContextVersion { context_id, reply })
             .await
     }
 
@@ -3176,6 +3189,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetContextSync { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_context_sync(context_id));
+        }
+        RpcCommand::GetContextVersion { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_context_version(context_id));
         }
         RpcCommand::CompactContext { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.compact_context(context_id));

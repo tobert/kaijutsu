@@ -224,6 +224,100 @@ fn shell_survives_dead_event_feed() {
     });
 }
 
+/// Guards `execute_and_poll_shell`'s deleted "Phase 2" read: the terminal
+/// snapshot returned once the poll observes Done/Error must already carry
+/// full content, not a truncated or empty placeholder that a since-removed
+/// second authoritative read used to paper over. 4 KiB is comfortably bigger
+/// than a single text-op chunk or any accidental off-by-a-line truncation,
+/// while staying under kaish's own 8 KB `OutputProfile::Agent` head+tail cap
+/// (`kaish-kernel`'s `DEFAULT_AGENT_LIMIT`) — that cap is real, working
+/// as designed, and applied before content ever reaches the BlockStore, so
+/// this test deliberately stays below it rather than conflating "did the
+/// terminal snapshot lose content" with "did the unrelated, pre-existing
+/// output cap fire".
+#[test]
+fn shell_returns_full_nontrivial_stdout() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+
+        register_with_retry(&mcp, "e2e-long-stdout").await;
+
+        // `head -c N /dev/zero` writes exactly N bytes then exits cleanly
+        // (EOF, not a broken pipe); `tr` reads that to its own EOF and exits
+        // 0 — deliberately the "downstream outlives upstream" pipe shape
+        // rather than `yes | head`'s early-close-upstream shape, which some
+        // shells report as a non-zero pipeline exit (SIGPIPE) and would
+        // conflate this test with pipe-signal semantics instead of the
+        // content-length property under test. Exact byte count so the
+        // assertion below has a precise expected length rather than an
+        // inequality a truncation bug could still satisfy.
+        const WANT_BYTES: usize = 4096;
+        let out = mcp
+            .shell(Parameters(ShellRequest {
+                command: format!("head -c {WANT_BYTES} /dev/zero | tr '\\0' 'a'"),
+                timeout_secs: Some(30),
+            }))
+            .await;
+        let env: serde_json::Value = out
+            .structured_content
+            .clone()
+            .expect("shell must return structuredContent");
+
+        assert_eq!(
+            env["status"].as_str(),
+            Some("done"),
+            "expected Done status, got envelope keys: {:?}",
+            env.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+        let stdout = env["stdout"]
+            .as_str()
+            .unwrap_or_else(|| panic!("stdout missing from envelope: {env}"));
+        assert_eq!(
+            stdout.len(),
+            WANT_BYTES,
+            "stdout must survive the trip through the terminal snapshot at its full \
+             length ({WANT_BYTES} bytes) — got {} bytes, envelope: {env}",
+            stdout.len()
+        );
+    });
+}
+
+/// A non-zero exit code must survive to the returned snapshot — the same
+/// "Phase 2 used to protect this" property as the stdout test above, but for
+/// `exit_code` rather than `content`.
+#[test]
+fn shell_returns_nonzero_exit_code() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+
+        register_with_retry(&mcp, "e2e-exit-code").await;
+
+        let out = mcp
+            .shell(Parameters(ShellRequest {
+                command: "exit 17".to_string(),
+                timeout_secs: Some(30),
+            }))
+            .await;
+        let env: serde_json::Value = out
+            .structured_content
+            .clone()
+            .expect("shell must return structuredContent");
+
+        assert_eq!(
+            env["status"].as_str(),
+            Some("error"),
+            "a non-zero exit must map to Error status, got envelope: {env}"
+        );
+        assert_eq!(
+            env["exit_code"].as_i64(),
+            Some(17),
+            "exit_code must survive to the terminal snapshot: {env}"
+        );
+    });
+}
+
 /// Sequential commands must each return their own stdout — guards against the
 /// store replica diverging after the first command (stale frontier, stranded
 /// text ops).

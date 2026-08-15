@@ -1086,6 +1086,24 @@ impl KernelHandle {
         })
     }
 
+    /// Fetch just the projected revision of a context's block document — the
+    /// semantic counterpart to `get_context_sync`'s `version` field, without
+    /// the oplog bytes. For callers that only need staleness/gap detection
+    /// and would otherwise decode a `SyncState` just to throw the ops away.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_version")]
+    pub async fn get_context_version(&self, context_id: ContextId) -> Result<u64, RpcError> {
+        let mut request = self.kernel.get_context_version_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_version())
+    }
+
     // =========================================================================
     // LLM operations
     // =========================================================================
@@ -3485,6 +3503,23 @@ pub(crate) fn parse_block_snapshot(
     builder = builder.content(reader.get_content()?.to_str()?);
     builder = builder.collapsed(reader.get_collapsed());
 
+    // created_at (kaijutsu.capnp:207, "Unix timestamp in milliseconds").
+    // BlockSnapshotBuilder::new() defaults this to now_millis(), correct for
+    // a block being authored locally right now — but wrong for one being
+    // reconstructed off the wire, where the server always sends the real
+    // creation time (kaijutsu-server/src/rpc.rs set_block_snapshot,
+    // unconditional builder.set_created_at). We propagate the wire value
+    // faithfully, including 0, rather than treating 0 as "unset" and
+    // falling back to now_millis(): the server never omits this field, so a
+    // 0 here means the sender's own created_at was genuinely 0 (a bug
+    // upstream, or a malformed/ancient peer) — and an obviously-bogus
+    // 1970 timestamp is far easier to notice and debug (e.g. a context
+    // parked at the extreme end of the time well) than silently
+    // substituting "now", which would make a real upstream defect
+    // indistinguishable from a correctly-timestamped fresh block. That
+    // masking is exactly the shape of bug this fix exists to close.
+    builder = builder.created_at(reader.get_created_at());
+
     // Tool-specific fields
     if reader.has_tool_name() {
         let name = reader.get_tool_name()?.to_str()?;
@@ -3620,6 +3655,15 @@ pub(crate) fn parse_block_snapshot(
     // Ephemeral flag (human-only, excluded from LLM hydration)
     if reader.get_ephemeral() {
         builder = builder.ephemeral(true);
+    }
+
+    // Excluded flag (user-curated staging curation, toggled by `block exclude`;
+    // decides whether the block is dropped at the next conversation hydrate
+    // boundary). Unlike `ephemeral` above (system-managed, always hidden from
+    // hydration), `excluded` is an explicit user decision — see
+    // kaijutsu.capnp:215-219.
+    if reader.get_excluded() {
+        builder = builder.excluded(true);
     }
 
     // Hyoushigi timeline coordinate (Some only for materialized timeline cells)
@@ -4276,6 +4320,9 @@ mod tests {
 
         builder.set_content(&snap.content);
         builder.set_collapsed(snap.collapsed);
+        builder.set_ephemeral(snap.ephemeral);
+        builder.set_excluded(snap.excluded);
+        builder.set_created_at(snap.created_at);
 
         // Set file_path if present
         if let Some(ref path) = snap.file_path {
@@ -4512,6 +4559,155 @@ mod tests {
         // A block with no signature roundtrips as None (hasSignature=false).
         let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
         assert_eq!(roundtrip_snapshot(&plain).signature, None);
+    }
+
+    /// `excluded` (kaijutsu.capnp:219) is the user-curated staging-exclusion
+    /// flag `block exclude` toggles — distinct from `ephemeral` (system-managed,
+    /// hidden from LLM hydration). The server always writes it
+    /// (`set_block_snapshot`, kaijutsu-server/src/rpc.rs), but until this fix
+    /// `parse_block_snapshot` never called `get_excluded()`, so every
+    /// capnp-decoded block silently reported `excluded = false` regardless of
+    /// its real value — a latent bug that becomes real data loss once clients
+    /// migrate from `getContextSync` (CBOR, unaffected) onto projected
+    /// `getBlocks` queries.
+    #[test]
+    fn test_parse_block_snapshot_excluded_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        // A user-excluded block carries excluded=true across the wire.
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .excluded(true)
+            .build();
+        assert!(
+            roundtrip_snapshot(&snap).excluded,
+            "excluded=true must survive the capnp round trip"
+        );
+
+        // An ordinary (non-excluded) block roundtrips with excluded=false.
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        assert!(
+            !roundtrip_snapshot(&plain).excluded,
+            "excluded=false must survive the capnp round trip"
+        );
+    }
+
+    /// Pins the wire-carried / CRDT-internal split documented at
+    /// `kaijutsu-types/src/block.rs:1578`: `order_key`, `updated_at`, and the
+    /// six per-field LWW Lamport timestamps (`status_at`, `collapsed_at`,
+    /// `ephemeral_at`, `excluded_at`, `tool_meta_at`, `content_type_at`,
+    /// `task_status_at`) are deliberately absent from `kaijutsu.capnp` — they
+    /// are CRDT-internal bookkeeping, not conversation-visible state, and
+    /// `parse_block_snapshot` has no wire field to read them from. That is
+    /// by design, not a gap to "fix" the way `excluded` above was. Wire-carried
+    /// flags (`excluded`, `ephemeral`, `tick`) must still survive the same
+    /// round trip that drops the CRDT-internal ones.
+    #[test]
+    fn test_parse_block_snapshot_drops_crdt_internal_fields_by_design() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        let mut snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .excluded(true)
+            .ephemeral(true)
+            .tick(Tick::new(7))
+            .build();
+        // CRDT-internal bookkeeping — never on the wire.
+        snap.order_key = Some("a0".to_string());
+        snap.updated_at = 999;
+        snap.status_at = 999;
+        snap.collapsed_at = 999;
+        snap.ephemeral_at = 999;
+        snap.excluded_at = 999;
+        snap.tool_meta_at = 999;
+        snap.content_type_at = 999;
+        snap.task_status_at = 999;
+
+        let round_tripped = roundtrip_snapshot(&snap);
+
+        // Wire-carried fields survive.
+        assert!(round_tripped.excluded, "excluded is on the wire");
+        assert!(round_tripped.ephemeral, "ephemeral is on the wire");
+        assert_eq!(round_tripped.tick, Some(Tick::new(7)), "tick is on the wire");
+
+        // CRDT-internal fields are intentionally absent from the wire and
+        // must decode to their defaults, not silently carry the sender's
+        // in-memory values.
+        assert_eq!(round_tripped.order_key, None, "order_key is not on the wire");
+        assert_eq!(round_tripped.updated_at, 0, "updated_at is not on the wire");
+        assert_eq!(round_tripped.status_at, 0, "status_at is not on the wire");
+        assert_eq!(round_tripped.collapsed_at, 0, "collapsed_at is not on the wire");
+        assert_eq!(round_tripped.ephemeral_at, 0, "ephemeral_at is not on the wire");
+        assert_eq!(round_tripped.excluded_at, 0, "excluded_at is not on the wire");
+        assert_eq!(round_tripped.tool_meta_at, 0, "tool_meta_at is not on the wire");
+        assert_eq!(round_tripped.content_type_at, 0, "content_type_at is not on the wire");
+        assert_eq!(round_tripped.task_status_at, 0, "task_status_at is not on the wire");
+    }
+
+    /// `created_at` (kaijutsu.capnp:207) is written unconditionally by the
+    /// server (`set_block_snapshot`, kaijutsu-server/src/rpc.rs) but until
+    /// this fix `parse_block_snapshot` never called `get_created_at()`, so
+    /// `BlockSnapshotBuilder::new`'s `now_millis()` default silently stood in
+    /// for every capnp-decoded block's real creation time. Pins a fixed,
+    /// unmistakably-not-"now" timestamp so a regression back to the
+    /// `now_millis()` default fails loudly rather than plausibly (a
+    /// regression that swapped in the current wallclock would otherwise
+    /// still look like "some recent timestamp" and could slip past a casual
+    /// read of a failing assertion).
+    #[test]
+    fn test_parse_block_snapshot_created_at_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        // 2000-01-01T00:00:00Z in ms — decades before "now" by construction,
+        // so a fallback to now_millis() cannot masquerade as this value.
+        const FIXED_PAST_MS: u64 = 946_684_800_000;
+
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .created_at(FIXED_PAST_MS)
+            .build();
+        assert_eq!(
+            roundtrip_snapshot(&snap).created_at,
+            FIXED_PAST_MS,
+            "created_at must survive the capnp round trip, not fall back to now_millis()"
+        );
+    }
+
+    /// Zero-value decision for `created_at`: the server writes it
+    /// unconditionally (never omits the field), so a wire value of 0 means
+    /// the *sender's* `created_at` was genuinely 0 — a bug upstream, or a
+    /// malformed/ancient peer — not "field not set". We propagate 0
+    /// faithfully rather than treating it as a sentinel and substituting
+    /// `now_millis()`: an obviously-bogus 1970 timestamp is easy to notice
+    /// and debug downstream (e.g. a context parked at the extreme end of
+    /// the time well's idle-age ring), whereas silently substituting "now"
+    /// would make a real upstream defect indistinguishable from a
+    /// correctly-timestamped fresh block — the exact silent-fallback shape
+    /// this fix exists to close.
+    #[test]
+    fn test_parse_block_snapshot_created_at_zero_propagates_faithfully() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .created_at(0)
+            .build();
+        assert_eq!(
+            roundtrip_snapshot(&snap).created_at,
+            0,
+            "created_at=0 must propagate faithfully, not be masked by a now_millis() fallback"
+        );
     }
 
     /// Task block round-trip (household-agent arc, docs/tasks.md): create →

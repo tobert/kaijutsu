@@ -1201,3 +1201,58 @@ fn test_active_ring_cap_enforced_over_rpc() {
         );
     });
 }
+
+/// `getContextVersion` (docs/crdt-position-2026-08.md) is the projected,
+/// oplog-free counterpart to `getContextSync`'s `version` field — added so a
+/// caller that only needs staleness/gap detection never has to decode a
+/// `SyncState` it would otherwise throw away. The two must never diverge:
+/// they both read `DocumentEntry::version()` off the same `BlockStore` entry
+/// (`documents.version()` vs `documents.context_sync_state()`), so this
+/// equality assertion is the one that would actually fail if a future change
+/// split them onto different sources of truth.
+#[test]
+fn test_get_context_version_matches_get_context_sync() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let context_id = kernel.create_context("context-version-probe").await.unwrap();
+        kernel
+            .join_context(context_id, "context-version-test")
+            .await
+            .unwrap();
+
+        let v0 = kernel.get_context_version(context_id).await.unwrap();
+        let sync0 = kernel.get_context_sync(context_id).await.unwrap();
+        assert_eq!(
+            v0, sync0.version,
+            "a fresh context's getContextVersion must match getContextSync's version field"
+        );
+
+        // A block-mutating op must bump the version, and both RPCs must
+        // observe the same post-mutation value.
+        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("context-version-author");
+        kernel
+            .author_block(&kaijutsu_client::AuthorBlock::text(
+                context_id,
+                principal,
+                kaijutsu_crdt::Role::User,
+                "context-version probe block",
+            ))
+            .await
+            .unwrap();
+
+        let v1 = kernel.get_context_version(context_id).await.unwrap();
+        let sync1 = kernel.get_context_sync(context_id).await.unwrap();
+        assert!(
+            v1 >= v0,
+            "version must be monotonically non-decreasing across a block-mutating op: {v0} -> {v1}"
+        );
+        assert_eq!(
+            v1, sync1.version,
+            "getContextVersion must still match getContextSync's version after a mutation \
+             — the point of this test is that it would fail if the two diverged"
+        );
+    });
+}

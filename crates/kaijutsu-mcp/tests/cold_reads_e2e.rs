@@ -181,8 +181,10 @@ fn search_context_reads_the_server_with_the_event_listener_dead() {
 }
 
 /// `analyze_document` (sites 3/7 of the migration —
-/// `context_blocks_and_version`, backed by `get_context_sync`) must report
-/// both the block and the version of a mutation this process's event
+/// `context_blocks_and_version`, now backed by `context_blocks`
+/// (`get_all_blocks`) plus the projected `get_context_version` RPC, with no
+/// oplog decode anywhere in the Remote arm) must report both the blocks, in
+/// document order, and the version of mutations this process's event
 /// listener never observed.
 #[test]
 fn analyze_document_reads_the_server_with_the_event_listener_dead() {
@@ -201,22 +203,44 @@ fn analyze_document_reads_the_server_with_the_event_listener_dead() {
             panic!("expected Remote backend");
         };
 
-        // Baseline version, straight from the server, before the mutation
-        // this process's dead event listener will never see.
-        let before_version = remote
+        // Baseline version, straight from the server, before the mutations
+        // this process's dead event listener will never see. Read via both
+        // RPCs the projected `get_context_version` is meant to agree with.
+        let before_sync = remote
             .actor
             .get_context_sync(context_id)
             .await
-            .expect("get_context_sync (before)")
-            .version;
+            .expect("get_context_sync (before)");
+        let before_version = remote
+            .actor
+            .get_context_version(context_id)
+            .await
+            .expect("get_context_version (before)");
+        assert_eq!(
+            before_version, before_sync.version,
+            "get_context_version must agree with get_context_sync's version field"
+        );
 
         let principal = PrincipalId::for_agent_session("sess-cold-read-analyze");
-        let marker = "COLD_READ_PROOF_ANALYZE_5e21db";
+        // Two markers, authored in this order, so the rendered content can
+        // be checked for document order — not just presence — the same
+        // property `context_blocks` (site 4) already covers for
+        // `search_context`; this proves `context_blocks_and_version`'s
+        // Remote arm still returns blocks in that order after routing
+        // through the projected version RPC instead of a decoded
+        // `SyncedDocument`.
+        let marker_a = "COLD_READ_PROOF_ANALYZE_A_5e21db";
+        let marker_b = "COLD_READ_PROOF_ANALYZE_B_9c40f1";
         remote
             .actor
-            .author_block(AuthorBlock::text(context_id, principal, Role::User, marker))
+            .author_block(AuthorBlock::text(context_id, principal, Role::User, marker_a))
             .await
-            .expect("author_block");
+            .expect("author_block (marker_a)");
+        remote
+            .actor
+            .author_block(AuthorBlock::text(context_id, principal, Role::User, marker_b))
+            .await
+            .expect("author_block (marker_b)");
 
         let result = mcp
             .analyze_document(Parameters(AnalyzeDocumentArgs {
@@ -227,22 +251,38 @@ fn analyze_document_reads_the_server_with_the_event_listener_dead() {
             .expect("analyze_document must succeed");
         let text = prompt_text(&result);
         assert!(
-            text.contains(marker),
-            "analyze_document must find the server-authored block even though this \
-             process's event listener never observed it; got:\n{text}"
+            text.contains(marker_a) && text.contains(marker_b),
+            "analyze_document must find both server-authored blocks even though this \
+             process's event listener never observed them; got:\n{text}"
+        );
+        let pos_a = text.find(marker_a).expect("marker_a present (checked above)");
+        let pos_b = text.find(marker_b).expect("marker_b present (checked above)");
+        assert!(
+            pos_a < pos_b,
+            "analyze_document must report blocks in document order (marker_a authored \
+             before marker_b); got:\n{text}"
         );
 
         // The reported version must reflect the post-mutation server state,
-        // not a frozen pre-kill snapshot.
-        let after_version = remote
+        // not a frozen pre-kill snapshot, and both version RPCs must still
+        // agree after the mutations.
+        let after_sync = remote
             .actor
             .get_context_sync(context_id)
             .await
-            .expect("get_context_sync (after)")
-            .version;
+            .expect("get_context_sync (after)");
+        let after_version = remote
+            .actor
+            .get_context_version(context_id)
+            .await
+            .expect("get_context_version (after)");
+        assert_eq!(
+            after_version, after_sync.version,
+            "get_context_version must still agree with get_context_sync after mutations"
+        );
         assert!(
             after_version > before_version,
-            "sanity: authoring a block must bump the server's version"
+            "sanity: authoring blocks must bump the server's version"
         );
         assert!(
             text.contains(&format!("**Version:** {}", after_version)),

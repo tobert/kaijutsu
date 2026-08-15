@@ -1467,6 +1467,11 @@ interface Kernel {
   # Fetch CRDT sync state only (ops + version, no blocks)
   getContextSync @36 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
 
+  # Projected revision of a context's block document. The semantic
+  # counterpart to getContextSync's version field, with no oplog bytes:
+  # clients use it for staleness/gap detection without decoding DTE.
+  getContextVersion @110 (contextId :Data, trace :TraceContext) -> (version :UInt64);
+
   # Push CRDT operations from client to server for bidirectional sync.
   # Returns ack version so client knows ops were accepted and ordered.
   pushOps @37 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);

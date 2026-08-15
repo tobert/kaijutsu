@@ -3589,10 +3589,13 @@ impl kernel::Server for KernelImpl {
         _params: kernel::GetContextStateParams,
         _results: kernel::GetContextStateResults,
     ) -> Promise<(), capnp::Error> {
-        // Tombstoned: use getBlocks @82 + getContextSync @83 instead.
-        // Schema ordinal @14 is preserved for wire compatibility.
+        // Tombstoned: use getBlocks @35 for blocks and getContextVersion @110
+        // for the revision. `getContextSync @36` also carries a version, but it
+        // ships the whole oplog to do it and is itself on the way out — prefer
+        // the projected read. Schema ordinal @34 is preserved for wire
+        // compatibility.
         Promise::err(capnp::Error::failed(
-            "getContextState removed: use getBlocks @82 + getContextSync @83".into(),
+            "getContextState removed: use getBlocks @35 + getContextVersion @110".into(),
         ))
     }
 
@@ -6349,6 +6352,36 @@ impl kernel::Server for KernelImpl {
         r.set_context_id(context_id.as_bytes());
         r.set_ops(&ops);
         r.set_version(version);
+
+        Promise::ok(())
+    }
+
+    /// Semantic counterpart to `get_context_sync`'s `version` field, minus
+    /// the oplog bytes: reads `DocumentEntry::version()` directly and
+    /// serializes nothing else. Clients that only need staleness/gap
+    /// detection use this instead of decoding a `SyncState` they'd otherwise
+    /// throw away — see `docs/crdt-position-2026-08.md`.
+    fn get_context_version(
+        self: Rc<Self>,
+        params: kernel::GetContextVersionParams,
+        mut results: kernel::GetContextVersionResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_version").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        let documents = &self.kernel.documents;
+        let version = pry!(
+            documents
+                .version(context_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        );
+
+        results.get().set_version(version);
 
         Promise::ok(())
     }

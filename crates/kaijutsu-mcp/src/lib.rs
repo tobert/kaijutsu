@@ -79,9 +79,7 @@ use rmcp::model::{LoggingLevel, SetLevelRequestParams};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use kaijutsu_client::{
-    ActorHandle, PeerConfig, PeerInvocation, SshConfig, SyncedDocument, connect_ssh, spawn_actor,
-};
+use kaijutsu_client::{ActorHandle, PeerConfig, PeerInvocation, SshConfig, connect_ssh, spawn_actor};
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use tokio::sync::{broadcast, watch};
@@ -180,10 +178,11 @@ enum ShellCompletion {
         timeout_secs: u64,
         elapsed_ms: u64,
     },
-    /// Reserved for connection-loss detection. The current SyncedDocument poll
-    /// degrades a mid-command disconnect to `Timeout` (it waits on `change`
-    /// rather than the raw event stream); this variant + its `to_json` arm are
-    /// kept for when the poll learns to surface a closed connection directly.
+    /// Reserved for connection-loss detection. The current authoritative poll
+    /// (`execute_and_poll_shell`) degrades a mid-command disconnect to
+    /// `Timeout` (it waits on `change` rather than the raw event stream);
+    /// this variant + its `to_json` arm are kept for when the poll learns to
+    /// surface a closed connection directly.
     #[allow(dead_code)]
     StreamClosed {
         cmd_block_id: BlockId,
@@ -932,16 +931,19 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Blocks (document order) plus the document's version, paired because
-    /// there is no cheap standalone version RPC. Local reads both off the
-    /// in-process `BlockStore` directly. Remote makes one `get_context_sync`
-    /// call — the same RPC `execute_and_poll_shell`'s Phase 2 already uses
-    /// to decode an authoritative snapshot — and decodes it into a
-    /// throwaway `SyncedDocument` (there is no mirror left to race with —
-    /// `RemoteState.synced` is gone, docs/crdt-position-2026-08.md slice 4).
-    /// `SyncState` already carries `version` on the wire, so that's read
-    /// straight off the RPC reply rather than re-derived from the decoded
-    /// document.
+    /// Blocks (document order) plus the document's version. Local reads both
+    /// off the in-process `BlockStore` directly. Remote pairs the existing
+    /// `context_blocks` (`get_all_blocks`) with the projected `get_context_version`
+    /// RPC — no CRDT bytes cross the wire for this call at all, so there is
+    /// nothing here to decode. This used to fetch `get_context_sync` and
+    /// throw away a `SyncedDocument` built purely to read its block list;
+    /// `getContextVersion` exists so a caller that only wants the semantic
+    /// facts (blocks, version) never needs the oplog in the first place.
+    /// `execute_and_poll_shell` used to decode a second `SyncedDocument` from
+    /// `get_context_sync` to re-fetch its terminal block "authoritatively" —
+    /// retired once the investigation showed `query_blocks` (what its own
+    /// poll already used) reads the identical server-side `entry.doc`, so the
+    /// second decode could never see anything the first read hadn't already.
     async fn context_blocks_and_version(
         &self,
         ctx: ContextId,
@@ -951,14 +953,19 @@ impl KaijutsuMcp {
                 Ok(store.get(ctx).map(|e| (e.doc.blocks_ordered(), e.doc.version())))
             }
             Backend::Remote(remote) => {
-                let state = remote
+                let Some(blocks) = self.context_blocks(ctx).await? else {
+                    // `context_blocks`'s Remote arm never returns `Ok(None)`
+                    // (a missing context surfaces as `Err`) — this arm exists
+                    // only so this function stays honest about that type
+                    // rather than assuming it.
+                    return Ok(None);
+                };
+                let version = remote
                     .actor
-                    .get_context_sync(ctx)
+                    .get_context_version(ctx)
                     .await
-                    .map_err(|e| format!("Error syncing context {ctx}: {e}"))?;
-                let doc = SyncedDocument::from_sync_state(&state, self.session_principal)
-                    .map_err(|e| format!("Error decoding context {ctx} sync state: {e}"))?;
-                Ok(Some((doc.blocks(), state.version)))
+                    .map_err(|e| format!("Error reading version for context {ctx}: {e}"))?;
+                Ok(Some((blocks, version)))
             }
         }
     }
@@ -1091,16 +1098,43 @@ impl KaijutsuMcp {
             }
         };
 
-        // Phase 1 — wait for the ToolResult to reach a terminal status.
+        // Wait for the ToolResult to reach a terminal status, then return
+        // that same snapshot directly. There used to be a second read here
+        // (a "Phase 2") that re-fetched the block via `get_context_sync` and
+        // decoded it into a throwaway `SyncedDocument`, on the theory that a
+        // locally-applied terminal `status` did not guarantee content/exit_code
+        // had replicated, since the three ride independently-reorderable
+        // FlowBus topics (`BlockTextOps` / `BlockMetadataChanged` /
+        // `BlockStatusChanged`). That reasoning was about a *local mirror* fed
+        // by that event stream — this function has not read a mirror since
+        // `query_terminal` below moved to `query_blocks`, an authoritative
+        // server query. `query_blocks`/`get_context_sync` both read the exact
+        // same server-side `entry.doc` (`kaijutsu-kernel/src/block_store.rs`)
+        // — one returns already-decoded `BlockSnapshot`s, the other serializes
+        // the same document's oplog for a client to decode back into an
+        // identical `BlockSnapshot` — so a second read cannot see anything
+        // this one doesn't. And the server's shell-completion writer
+        // (`execute_shell_command`, `kaijutsu-server/src/rpc.rs`) writes
+        // content, then stderr/output_data/content_type, then exit_code,
+        // and only *then* flips status to Done/Error — each write is its own
+        // fully-synchronous BlockStore mutation (acquire the per-context
+        // lock, mutate, release, journal) with no `.await` between them and
+        // no other writer of this block, so the moment any reader observes a
+        // terminal status the preceding writes are already committed and
+        // visible. That is a real ordering guarantee from strict sequential
+        // locking on the same store entry — unrelated to the FlowBus, whose
+        // topic reordering only affects event *notification*, never what a
+        // direct store read sees. So the snapshot below is already complete;
+        // re-reading it a second way would decode the same bytes twice.
         //
         // **Polling is the guarantee; the event feed only makes it fast.**
-        // That inversion is the point of this slice. Before it, the event
-        // feed was the mechanism and an authoritative catch-up was the
-        // emergency: the loop scanned the local mirror on every wake and
-        // only pulled from the server once a stall window convinced it that
-        // delivery had died. So the common path trusted a cache that the
-        // uncommon path existed to correct — and the cache is fed by exactly
-        // the feed whose death we were trying to detect.
+        // Before this shape, the event feed was the mechanism and an
+        // authoritative catch-up was the emergency: the loop scanned a local
+        // mirror on every wake and only pulled from the server once a stall
+        // window convinced it that delivery had died. So the common path
+        // trusted a cache that the uncommon path existed to correct — and the
+        // cache was fed by exactly the feed whose death we were trying to
+        // detect.
         //
         // Now every check is an authoritative query and `change` is a
         // *hint*: it can pull the next poll earlier, never later, and never
@@ -1127,7 +1161,7 @@ impl KaijutsuMcp {
         let mut change_rx = remote.change.subscribe();
         let mut poll_interval = MIN_POLL_INTERVAL;
 
-        let local = loop {
+        let terminal = loop {
             if let Some(snap) = query_terminal().await {
                 break snap;
             }
@@ -1166,48 +1200,18 @@ impl KaijutsuMcp {
             };
         };
 
-        // Phase 2 — read the AUTHORITATIVE final block from the server. A shell
-        // result's content (BlockTextOps), exit_code/stderr (BlockMetadataChanged)
-        // and status (BlockStatusChanged) ride three independently-reorderable
-        // topics, so a locally-applied terminal `status` does NOT guarantee
-        // content/exit_code have replicated — any of the three can arrive last,
-        // which would surface empty stdout / null exit_code. But the server writes
-        // content+exit_code BEFORE flipping status (program order), so a snapshot
-        // taken after we observe Done is guaranteed complete. Decode it into a
-        // throwaway document (no write to the shared doc → no race with the
-        // sole-writer doc task) and read just this block.
-        // TODO(perf): this pulls the full context snapshot per shell command; a
-        // per-block read RPC would avoid that for large contexts (docs/issues.md).
-        match remote.actor.get_context_sync(ctx_id).await {
-            Ok(state) => match SyncedDocument::from_sync_state(&state, self.session_principal) {
-                Ok(doc) => {
-                    if let Some(snap) = doc.get_block(&local.id) {
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        tracing::info!(
-                            command = %command,
-                            status = %snap.status.as_str(),
-                            exit_code = ?snap.exit_code,
-                            output_len = snap.content.len(),
-                            elapsed_ms,
-                            "{label} completed"
-                        );
-                        return ShellCompletion::Done {
-                            snapshot: Box::new(snap),
-                            elapsed_ms,
-                        };
-                    }
-                    tracing::warn!("{label}: authoritative snapshot missing block, using local");
-                }
-                Err(e) => {
-                    tracing::warn!("{label}: authoritative decode failed: {e}, using local")
-                }
-            },
-            Err(e) => tracing::warn!("{label}: authoritative fetch failed: {e}, using local"),
-        }
-        // Fallback to the local terminal snapshot if the authoritative read failed.
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            command = %command,
+            status = %terminal.status.as_str(),
+            exit_code = ?terminal.exit_code,
+            output_len = terminal.content.len(),
+            elapsed_ms,
+            "{label} completed"
+        );
         ShellCompletion::Done {
-            snapshot: Box::new(local),
-            elapsed_ms: start.elapsed().as_millis() as u64,
+            snapshot: Box::new(terminal),
+            elapsed_ms,
         }
     }
 }
@@ -1662,9 +1666,11 @@ impl KaijutsuMcp {
             }
         }
 
-        // 3-8: sync, build SyncedDocument, spawn doc task + event bridge,
-        // publish JoinedContext / shared_context_id — shared with
-        // `stabilize_context_label`'s reattach case (see `finish_join`).
+        // Spawn the pulse task, then publish JoinedContext /
+        // shared_context_id — shared with `stabilize_context_label`'s reattach
+        // case (see `finish_join`). No replica is built and no doc task runs:
+        // reads are authoritative queries, and the pulse only supplies an
+        // early-wake hint.
         let outcome = match finish_join(remote, context_id, label, resumed, previous_context).await
         {
             Ok(outcome) => outcome,
