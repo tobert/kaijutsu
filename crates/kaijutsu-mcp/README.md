@@ -5,7 +5,7 @@ MCP server exposing the Kaijutsu CRDT kernel to MCP clients.
 ## Usage
 
 ```bash
-# Run as stdio MCP server (for Claude Code, etc.)
+# Run as stdio MCP server (for Codex, Claude Code, etc.)
 cargo run -p kaijutsu-mcp
 
 # With debug logging
@@ -25,6 +25,23 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+### Codex Configuration
+
+Codex must forward its thread ID so the MCP process can correlate tools and
+hooks with the same session:
+
+```toml
+[mcp_servers.kaijutsu]
+command = "/path/to/kaijutsu-mcp"
+env_vars = ["CODEX_THREAD_ID"]
+```
+
+For lifecycle mirroring, install `contrib/adapters/codex.sh` together with
+`codex-to-kaijutsu.jq`, then merge the `hooks` object from
+`contrib/codex-hooks.json` into `~/.codex/hooks.json`. Set `KJ_MCP_BIN` in the
+hook command if `kaijutsu-mcp` is not on `PATH`. Codex requires project hook
+configurations to be trusted explicitly through `/hooks`.
 
 ## Tools
 

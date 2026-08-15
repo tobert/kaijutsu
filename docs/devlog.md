@@ -1091,6 +1091,15 @@ invalid filter silently passed on an empty task list. Both are exactly
 the shape of bug a fresh feature is supposed to shake out before anyone
 depends on it.
 
+Codex later joined this same instrument through two deliberately separate
+channels: its MCP subprocess receives `CODEX_THREAD_ID` for stable identity,
+while command hooks translate Codex lifecycle events into the existing generic
+hook protocol. The split matters because MCP identifies the player but cannot
+observe prompts, compaction, or session boundaries. A source-aware model map
+keeps Codex models on `codex-app` and Claude models on `anthropic`; unknown
+sources leave the provider alone instead of guessing. Codex hooks use a tight
+fail-open budget so a slow kernel never makes the coding loop feel sticky.
+
 ## The day toad played kaijutsu (August 5)
 
 The household-agent foundations were one night old when Amy opened the day
