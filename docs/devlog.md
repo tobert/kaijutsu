@@ -1776,6 +1776,40 @@ migration at all; it is a missing three-field event. There is something apt
 about a project spent replacing an encoding with meaning discovering that its
 final holdout wanted neither.
 
+### The flag day, and the assumption underneath it (August 15, late)
+
+Amy disabled the activity glow rather than migrate it — *"we'll be doing
+embeddings for a lot of that content kernel side and maybe we can emit something
+more useful and derived"* — and with its last consumer gone, the deletion could
+happen. Four thousand lines: the raw-operation events, the sync-state query, the
+capability negotiation, the coalescing path that existed only to batch those
+events, and finally the two client types that could decode an operation at all.
+Ordinals compacted, eight tombstones closed.
+
+Renumbering had been argued about earlier in the day, and the argument against
+it was that a stale binary would call the wrong method instead of failing
+cleanly. It was accepted on the grounds that every binary here is rebuilt
+together. Within minutes of the renumber, a test failed with *"Message contains
+non-list pointer where data was expected"* — a client asking for one method and
+being answered by another. The cause was not a stale binary on some other
+machine. The client crate's build script had never declared the schema as a
+dependency: the schema lives outside the package, so cargo's rerun rule never
+fired for it. Every previous schema change had been additive, where a stale
+client merely cannot see a new method, and in practice the client's own sources
+changed alongside anyway, which retriggered the build. The one change that could
+expose it was the one that finally happened.
+
+So the assumption was false in the least visible way available — not "we forgot
+to rebuild something" but "our build had never been rebuilding it, and nothing
+we had done before could tell." One line fixed it. The server's build script had
+carried that line all along.
+
+It surfaced through a second small failure worth its own note: the test that
+caught it retried registration a hundred times and then panicked with "never
+became ready", discarding every error it had seen on the way. Five seconds spent
+proving something was broken, with nothing to say about what. It carries the
+last response into the panic now.
+
 A third thing happened alongside, prompted by Amy reading the test output rather
 than the code: *"did I see tests accessing my ~ XDG path?"* She had. The shipped
 default `mcp.toml` carried a server entry pointing at her own kaibo build, and
