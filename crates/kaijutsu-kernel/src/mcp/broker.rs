@@ -1872,7 +1872,7 @@ impl Broker {
             }
         };
         let kaish = dispatcher
-            .materialize_context_kaish(
+            .materialize_context_kaish_internal(
                 "hook",
                 ctx.principal_id,
                 ctx.context_id,

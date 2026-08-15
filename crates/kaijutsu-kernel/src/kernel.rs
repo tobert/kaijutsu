@@ -1301,7 +1301,7 @@ impl Kernel {
                     "editor: ':r !cmd' unavailable — kj dispatcher not wired".to_string()
                 })?;
                 let kaish = dispatcher
-                    .materialize_context_kaish(
+                    .materialize_context_kaish_internal(
                         "editor-read",
                         opener.principal,
                         opener.context_id,
