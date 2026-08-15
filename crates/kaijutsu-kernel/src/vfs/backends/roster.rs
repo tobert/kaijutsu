@@ -67,6 +67,32 @@ use crate::roster::{RosterRow, RosterStore};
 use crate::vfs::{DirEntry, FileAttr, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
 
 const INDEX_NAME: &str = "index";
+/// The unfiltered sibling of [`INDEX_NAME`]. `index` answers "who is around
+/// right now" — the mount's whole purpose — and so omits rows we positively
+/// know are not live. `index-all` answers "everything the roster knows".
+///
+/// The split exists because the `recent` source is 1:1 with every non-archived
+/// context (`roster_sources::recent_snapshot`), so `index` grew to 199 rows /
+/// 17.8 KB on a real kernel to report **3** live entities — over kaish's 8 KB
+/// model-facing output cap, meaning a model asking who was around got a
+/// truncated splice of mostly-dead rows.
+///
+/// Filtering is **listing-only, never lookup**: `resolve` still finds any row
+/// directory by key, so `/run/roster/<key>/live` answers for a hidden entity
+/// too. Nothing becomes unreachable, it just stops being listed — which is the
+/// design record's "missing entry = unknown, never absent" read the only way
+/// it can be honoured by a surface that must also stay bounded.
+const INDEX_ALL_NAME: &str = "index-all";
+
+/// Whether a row survives the default (unfiltered = `index-all`) listing.
+///
+/// Hides ONLY what we positively know is dead. `live == None` means *unknown*
+/// — the shape a status-only entity has (slice 3 re-rooted `roster_snapshot`
+/// at `roster_entity` precisely so those stay visible), and hiding unknowns
+/// would quietly undo that fix while looking like a tidier filter.
+fn is_around(row: &RosterRow) -> bool {
+    row.live != Some(false)
+}
 
 /// Fact files inside one row directory, in the order `readdir` lists them.
 const FACTS: &[&str] = &[
@@ -94,7 +120,8 @@ fn row_key(row: &RosterRow) -> String {
 
 enum Resolved {
     Root,
-    Index,
+    /// `true` = the unfiltered `index-all`.
+    Index(bool),
     RowDir(String),
     RowFile(String, &'static str),
 }
@@ -126,7 +153,8 @@ impl RosterFs {
         let segs = Self::segments(path);
         match segs.as_slice() {
             [] => Ok(Resolved::Root),
-            [s] if s == INDEX_NAME => Ok(Resolved::Index),
+            [s] if s == INDEX_NAME => Ok(Resolved::Index(false)),
+            [s] if s == INDEX_ALL_NAME => Ok(Resolved::Index(true)),
             [key] => Ok(Resolved::RowDir(key.clone())),
             [key, fact] => match FACTS.iter().find(|f| *f == fact) {
                 Some(f) => Ok(Resolved::RowFile(key.clone(), f)),
@@ -187,12 +215,12 @@ impl RosterFs {
     /// The `/run/roster/index` TSV: `entity_kind entity_id label
     /// liveness_kind live host status_text availability recorded_at`, one
     /// row per entity (same grouping as the directory listing).
-    fn index_bytes(&self) -> VfsResult<Vec<u8>> {
+    fn index_bytes(&self, all: bool) -> VfsResult<Vec<u8>> {
         let rows = self.rows_by_key()?;
         let mut out = String::from(
             "entity_kind\tentity_id\tlabel\tliveness_kind\tlive\thost\tstatus_text\tavailability\trecorded_at\n",
         );
-        for row in rows.values() {
+        for row in rows.values().filter(|r| all || is_around(r)) {
             out.push_str(row.entity.kind_str());
             out.push('\t');
             out.push_str(&row.entity.to_hex());
@@ -226,8 +254,8 @@ impl VfsOps for RosterFs {
         let generation = self.roster.generation();
         match self.resolve(path)? {
             Resolved::Root => Ok(FileAttr::directory(0o555)),
-            Resolved::Index => {
-                let body = self.index_bytes()?;
+            Resolved::Index(all) => {
+                let body = self.index_bytes(all)?;
                 let mut attr = FileAttr::file(body.len() as u64, 0o444);
                 attr.generation = generation;
                 Ok(attr)
@@ -252,11 +280,21 @@ impl VfsOps for RosterFs {
         match self.resolve(path)? {
             Resolved::Root => {
                 let rows = self.rows_by_key()?;
-                let mut entries: Vec<DirEntry> = vec![DirEntry::file(INDEX_NAME)];
-                entries.extend(rows.keys().map(|k| DirEntry::directory(k.clone())));
+                let mut entries: Vec<DirEntry> =
+                    vec![DirEntry::file(INDEX_NAME), DirEntry::file(INDEX_ALL_NAME)];
+                // Listing filtered, lookup not — see `INDEX_ALL_NAME`.
+                entries.extend(
+                    rows.iter()
+                        .filter(|(_, r)| is_around(r))
+                        .map(|(k, _)| DirEntry::directory(k.clone())),
+                );
                 Ok(entries)
             }
-            Resolved::Index => Err(VfsError::not_a_directory(INDEX_NAME)),
+            Resolved::Index(all) => Err(VfsError::not_a_directory(if all {
+                INDEX_ALL_NAME
+            } else {
+                INDEX_NAME
+            })),
             Resolved::RowDir(key) => {
                 self.row(&key)?;
                 Ok(FACTS.iter().copied().map(DirEntry::file).collect())
@@ -268,7 +306,7 @@ impl VfsOps for RosterFs {
     async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
         let body = match self.resolve(path)? {
             Resolved::Root => return Err(VfsError::is_a_directory("/".to_string())),
-            Resolved::Index => self.index_bytes()?,
+            Resolved::Index(all) => self.index_bytes(all)?,
             Resolved::RowDir(key) => return Err(VfsError::is_a_directory(key)),
             Resolved::RowFile(key, fact) => {
                 let row = self.row(&key)?;
@@ -368,11 +406,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_view_lists_only_the_index() {
+    async fn a_fresh_view_lists_only_the_two_indexes() {
         let (_roster, fs) = fs();
         let names: Vec<String> =
             fs.readdir(Path::new("")).await.unwrap().into_iter().map(|e| e.name).collect();
-        assert_eq!(names, vec!["index".to_string()]);
+        assert_eq!(names, vec!["index".to_string(), "index-all".to_string()]);
+    }
+
+    /// `index` answers "who is around", `index-all` answers "what is known",
+    /// and a known-idle row must be absent from the first and present in the
+    /// second. Without this the roster reports 199 rows to name 3 live
+    /// entities and blows the model-facing output cap doing it.
+    #[tokio::test]
+    async fn an_idle_row_is_listed_only_by_index_all() {
+        let (roster, fs) = fs();
+        let live_p = PrincipalId::new();
+        let idle_p = PrincipalId::new();
+        let mut idle = presence_row(RosterEntity::Principal(idle_p), "win-idle");
+        idle.live = false;
+        roster
+            .reconcile(
+                "peer_registry",
+                LivenessKind::Bound,
+                &[presence_row(RosterEntity::Principal(live_p), "win-live"), idle],
+                100,
+            )
+            .unwrap();
+
+        let live_key = format!("principal-{}", live_p.to_hex());
+        let idle_key = format!("principal-{}", idle_p.to_hex());
+
+        let index = String::from_utf8(fs.read(Path::new("index"), 0, u32::MAX).await.unwrap())
+            .unwrap();
+        assert!(index.contains(&live_p.to_hex()), "index must carry the live entity");
+        assert!(
+            !index.contains(&idle_p.to_hex()),
+            "index must omit a known-idle entity — it is the who-is-around view"
+        );
+
+        let all = String::from_utf8(fs.read(Path::new("index-all"), 0, u32::MAX).await.unwrap())
+            .unwrap();
+        assert!(all.contains(&idle_p.to_hex()), "index-all must carry the idle entity");
+
+        let names: Vec<String> =
+            fs.readdir(Path::new("")).await.unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&live_key), "root listing keeps the live row dir");
+        assert!(!names.contains(&idle_key), "root listing omits the idle row dir");
+
+        // Filtering is LISTING-only. The hidden row is still addressable, so
+        // nothing became unreachable — only unlisted.
+        let live_fact = fs.read(&PathBuf::from(&idle_key).join("live"), 0, u32::MAX).await;
+        assert_eq!(
+            String::from_utf8(live_fact.expect("a hidden row must still resolve by key")).unwrap(),
+            "false\n"
+        );
+    }
+
+    /// The trap a tidier filter falls into: `live == None` is *unknown*, not
+    /// dead. A status-only entity has that shape — slice 3 re-rooted
+    /// `roster_snapshot` at `roster_entity` specifically so it stays visible —
+    /// and hiding unknowns would quietly undo that fix.
+    #[tokio::test]
+    async fn an_unknown_liveness_row_is_not_treated_as_idle() {
+        let (roster, fs) = fs();
+        let p = PrincipalId::new();
+        roster
+            .write_status(
+                RosterEntity::Principal(p),
+                Some("amy"),
+                Some("thinking"),
+                crate::roster::Availability::Active,
+                None,
+                100,
+            )
+            .expect("write_status");
+
+        let index = String::from_utf8(fs.read(Path::new("index"), 0, u32::MAX).await.unwrap())
+            .unwrap();
+        assert!(
+            index.contains(&p.to_hex()),
+            "a status-only entity has live=None (unknown) and must stay in `index` —              hiding it re-breaks the slice-3 read-model fix"
+        );
     }
 
     #[tokio::test]

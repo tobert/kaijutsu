@@ -48,6 +48,12 @@ enum RosterCommand {
         /// Emit a JSON array of row objects instead of a labelled table.
         #[arg(long)]
         json: bool,
+        /// Include entities we positively know are NOT live. Off by default:
+        /// the `recent` source carries one row per non-archived context, so
+        /// this is usually a few live entities among hundreds of idle ones.
+        /// Applies to `--json` too.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -73,7 +79,7 @@ impl KjDispatcher {
             RosterCommand::Status { text, availability } => {
                 self.roster_status(&text, availability.as_deref(), caller).await
             }
-            RosterCommand::List { json } => self.roster_list(json).await,
+            RosterCommand::List { json, all } => self.roster_list(json, all).await,
         }
     }
 
@@ -98,21 +104,68 @@ impl KjDispatcher {
         KjResult::ok("")
     }
 
-    async fn roster_list(&self, json: bool) -> KjResult {
+    /// Hides ONLY what we positively know is dead. `live == None` is
+    /// *unknown* — a status-only entity's shape — and unknowns stay visible
+    /// ("missing entry = unknown, never absent"). See `vfs::backends::roster`.
+    fn is_around(row: &crate::roster::RosterRow) -> bool {
+        row.live != Some(false)
+    }
+
+    async fn roster_list(&self, json: bool, all: bool) -> KjResult {
         if let KjResult::Err(e) = self.ensure_refreshed().await {
             return KjResult::Err(e);
         }
-        let rows = match self.roster().snapshot() {
+        let known = match self.roster().snapshot() {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj roster list: {e}")),
         };
+        // Group by ENTITY, newest first, exactly as `/run/roster/index` does
+        // (`vfs::backends::roster::rows_by_key`). `roster_presence` is keyed
+        // `(source, source_local_id)` — one row per *connection* — so one
+        // principal with two windows open is two rows, and rendering them raw
+        // showed the same entity twice. The two surfaces must not disagree
+        // about the same data; the connection count is kept rather than
+        // dropped so grouping loses nothing a reader wanted.
+        let total_entities = {
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            for r in &known {
+                seen.insert(entity_key(r));
+            }
+            seen.len()
+        };
+        let mut grouped: std::collections::BTreeMap<String, (crate::roster::RosterRow, usize)> =
+            Default::default();
+        for row in known.into_iter().filter(|r| all || Self::is_around(r)) {
+            let key = entity_key(&row);
+            match grouped.get_mut(&key) {
+                Some((existing, n)) => {
+                    *n += 1;
+                    if row.recorded_at >= existing.recorded_at {
+                        *existing = row;
+                    }
+                }
+                None => {
+                    grouped.insert(key, (row, 1));
+                }
+            }
+        }
+        let counts: Vec<usize> = grouped.values().map(|(_, n)| *n).collect();
+        let rows: Vec<crate::roster::RosterRow> =
+            grouped.into_values().map(|(r, _)| r).collect();
+        let total = total_entities;
+        let hidden = total.saturating_sub(rows.len());
 
         let data = serde_json::Value::Array(rows.iter().map(row_to_json).collect());
         if json {
             return KjResult::ok_with_data(data.to_string(), data);
         }
         if rows.is_empty() {
-            return KjResult::ok_with_data("(nobody on the roster yet)".to_string(), data);
+            let msg = if total == 0 {
+                "(nobody on the roster yet)".to_string()
+            } else {
+                format!("(nobody around right now — {total} known, `--all` to list them)")
+            };
+            return KjResult::ok_with_data(msg, data);
         }
 
         let kind_w = rows.iter().map(|r| r.entity.kind_str().len()).max().unwrap_or(0);
@@ -142,7 +195,23 @@ impl KjDispatcher {
                 format!("  {kind:<kind_w$} {id}  {label:<label_w$}  {liveness}{status}")
             })
             .collect();
-        KjResult::ok_with_data(lines.join("\n"), data)
+        // `×N` where one entity holds N live connections (two app windows, two
+        // MCP sessions). Absent for the ordinary single-connection case.
+        let lines: Vec<String> = lines
+            .into_iter()
+            .zip(counts.iter())
+            .map(|(line, n)| if *n > 1 { format!("{line}  ×{n}") } else { line })
+            .collect();
+        let mut body = lines.join("\n");
+        // Say what was withheld rather than silently shrinking the answer —
+        // a short roster and a filtered roster must not look identical.
+        if hidden > 0 {
+            body.push_str(&format!(
+                "\n\n  showing {} of {total} known — `--all` for the {hidden} idle",
+                rows.len()
+            ));
+        }
+        KjResult::ok_with_data(body, data)
     }
 
     /// `kj roster status <text> [--availability <state>]`. `caller` is the
@@ -203,6 +272,12 @@ impl KjDispatcher {
 /// programmatically (e.g. `kj roster status` for itself, or a future
 /// approval-omni-view lookup) never has to round-trip a truncated display
 /// id.
+/// The grouping key `/run/roster` uses: entity kind + id. Presence rows are
+/// per-connection, entities are what a reader means by "who".
+fn entity_key(row: &crate::roster::RosterRow) -> String {
+    format!("{}-{}", row.entity.kind_str(), row.entity.to_hex())
+}
+
 fn row_to_json(row: &crate::roster::RosterRow) -> serde_json::Value {
     serde_json::json!({
         "entity_kind": row.entity.kind_str(),
@@ -402,5 +477,105 @@ mod tests {
         // The recent source picks up the registered context once refreshed.
         let snap = d.roster().snapshot().unwrap();
         assert!(snap.iter().any(|r| r.entity == RosterEntity::Context(ctx)));
+    }
+
+    /// Two connections for ONE principal render as one line, not two.
+    ///
+    /// `roster_presence` is keyed `(source, source_local_id)` — one row per
+    /// connection — so a principal with two app windows or two MCP sessions
+    /// has two rows. `/run/roster/index` has always grouped by entity; this
+    /// pins `kj roster list` to the same convention, because the two surfaces
+    /// disagreeing about the same data is how "the roster is flaky" starts.
+    /// Found live: the same MCP principal printed twice, invisible until the
+    /// idle rows stopped burying it.
+    #[tokio::test]
+    async fn two_connections_for_one_principal_render_as_one_row() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let entity = RosterEntity::Principal(principal);
+        let mk = |local: &str, at: i64| crate::roster::PresenceSnapshotRow {
+            source_local_id: local.to_string(),
+            entity,
+            entity_label: Some("amy".to_string()),
+            host: Some("moltar".to_string()),
+            pid: None,
+            proc_start: None,
+            observed_at: Some(at),
+            live: true,
+        };
+        // Pin the boot rule as already satisfied: `ensure_refreshed` would
+        // otherwise reconcile against this test kernel's empty peer list and
+        // correctly prune these hand-written rows.
+        d.roster().mark_refreshed(200);
+        d.roster()
+            .reconcile(
+                "peer_registry",
+                crate::roster::LivenessKind::Bound,
+                &[mk("win-a", 100), mk("win-b", 200)],
+                200,
+            )
+            .unwrap();
+
+        let result =
+            d.dispatch(&[s("roster"), s("list")], &caller_with_context(principal, None)).await;
+        let KjResult::Ok { message, .. } = result else { panic!("expected Ok, got {result:?}") };
+        let hits = message.matches(&principal.to_hex()[..8]).count()
+            + message.matches("amy").count();
+        assert!(
+            message.contains("×2"),
+            "two connections must render as one row carrying ×2; got:\n{message}"
+        );
+        assert_eq!(
+            message.lines().filter(|l| l.contains("amy")).count(),
+            1,
+            "the entity must appear on exactly ONE line (hits={hits}); got:\n{message}"
+        );
+    }
+
+    /// A filtered list must SAY it filtered. A short roster and a roster with
+    /// 195 hidden rows must not render identically — "missing entry =
+    /// unknown, never absent" applies to the count as much as to a row.
+    #[tokio::test]
+    async fn hiding_idle_rows_is_disclosed_and_reversible() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let entity = RosterEntity::Principal(principal);
+        let mut idle = crate::roster::PresenceSnapshotRow {
+            source_local_id: "win-idle".to_string(),
+            entity,
+            entity_label: Some("ghost".to_string()),
+            host: None,
+            pid: None,
+            proc_start: None,
+            observed_at: Some(100),
+            live: false,
+        };
+        idle.live = false;
+        d.roster().mark_refreshed(100);
+        d.roster()
+            .reconcile("peer_registry", crate::roster::LivenessKind::Bound, &[idle], 100)
+            .unwrap();
+
+        let caller = caller_with_context(principal, None);
+        let KjResult::Ok { message, .. } =
+            d.dispatch(&[s("roster"), s("list")], &caller).await
+        else {
+            panic!("expected Ok")
+        };
+        assert!(
+            !message.contains("ghost"),
+            "a known-idle entity is hidden by default; got:\n{message}"
+        );
+        assert!(
+            message.contains("known"),
+            "the default view must disclose what it withheld; got:\n{message}"
+        );
+
+        let KjResult::Ok { message, .. } =
+            d.dispatch(&[s("roster"), s("list"), s("--all")], &caller).await
+        else {
+            panic!("expected Ok")
+        };
+        assert!(message.contains("ghost"), "--all must reveal it; got:\n{message}");
     }
 }

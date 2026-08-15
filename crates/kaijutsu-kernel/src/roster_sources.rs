@@ -29,12 +29,11 @@
 //! clock, `docs/midi.md` "The one timebase") wrapper around `refresh_once`,
 //! at a fixed ~10s cadence with `MissedTickBehavior::Delay` (the same pattern
 //! `kaijutsu-server`'s other interval loops use, e.g. `rpc.rs`'s VFS activity
-//! subscription). **Not wired into `kaijutsu-server`'s boot sequence by this
-//! slice** — this crate cannot start/verify a live kernel (offline
-//! build-and-test constraint), so the production `tokio::spawn` call at
-//! server startup is left as the next integration step rather than added
-//! unverified. Everything up to that one call site is complete and tested
-//! here directly against `refresh_once`.
+//! subscription). **Wired into `kaijutsu-server`'s boot** as of 2026-08-15
+//! (`create_shared_kernel`, cancelled from `SharedKernelState::shutdown` on
+//! drop) and verified live: sampling `/run/roster/index` at 12s intervals
+//! returns `recorded_at` values exactly 10000ms apart, so the loop runs on
+//! its own grid rather than being driven by reads.
 //!
 //! Push-based refresh (design record: "push where events already exist:
 //! peer attach/detach, status post") is only partly built: a status post is
