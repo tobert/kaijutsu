@@ -826,6 +826,17 @@ fn test_context_cwd_is_addressed_and_vfs_validated() {
             "a rejected cwd must not replace durable state"
         );
 
+        let error = kernel.set_context_cwd(context_a, "relative/path").await.unwrap_err();
+        assert!(
+            error.to_string().contains("must be absolute"),
+            "the shared RPC seam must reject relative paths: {error}"
+        );
+        assert_eq!(
+            kernel.get_context_cwd(context_a).await.unwrap(),
+            Some(target.to_owned()),
+            "a relative cwd must not replace durable state"
+        );
+
         let unknown = kaijutsu_types::ContextId::new();
         let error = kernel.get_context_cwd(unknown).await.unwrap_err();
         assert!(

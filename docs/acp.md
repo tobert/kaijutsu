@@ -33,10 +33,10 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | ACP v1 | kaijutsu | status |
 |---|---|---|
 | ACP `SessionId` | `ContextId` hex (`rank::session_id_of`) | durable; survives restarts, no side table |
-| `session/new` | `resolve_context_label` upsert → `create_context_typed(label, "coder")` → `join_context` | built; requested `cwd` is not persisted yet |
-| `session/load` | parse session id → `join_context` + replay transcript as updates | built; requested `cwd` is not applied yet |
-| `session/resume` | attach without transcript replay | planned; stable ACP v1 in the pinned schema |
-| `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1 | built; currently reports the bridge cwd for every session |
+| `session/new` | create/attach context → persist requested cwd → start live pump | built |
+| `session/load` | attach → reassert requested cwd → replay transcript as updates | built |
+| `session/resume` | attach → reassert requested cwd → live pump without transcript replay | built; advertised as stable ACP v1 |
+| `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1; cwd read per context | built |
 | `session/delete` | archive the kj context | planned |
 | `session/prompt` | `get_input_state` → `edit_input(0, text, len)` → `submit_input(ctx, false)` | built; text-only |
 | turn end → `stopReason` | `ServerEvent::TurnCompleted{stop_reason}` (1:1 by construction) | built |
@@ -98,6 +98,10 @@ is live.**
 - A relative path or a path that is not a directory in the context's VFS is a
   request error. There is no silent fallback to `/docs`, `$HOME`, or the
   bridge process cwd.
+- ACP requires every listed `SessionInfo` to carry a cwd. Legacy/non-ACP
+  contexts whose durable cwd is unset are therefore omitted from
+  `session/list`; inventing the bridge process cwd would misrepresent shared
+  execution state. They become listable after any surface sets their cwd.
 
 The reset is shared context state: opening a context from an ACP client can
 move the cwd seen by another connected player. That is intentional under the
@@ -105,14 +109,14 @@ shared-trust model and should be visible in logs. If real use later demands a
 stable project root *and* an independently movable shell cwd, the durable
 project root belongs in kaijutsu's workspace model, not in ACP-only metadata.
 
-The current Cap'n Proto `getCwd`/`setCwd` calls are connection-scoped: they
-operate on whichever context the connection last joined. That is unsafe for
-an ACP bridge multiplexing several sessions over one actor. Do not implement
-this by injecting `cd` or `kj context set`. Add explicitly addressed
-`getContextCwd(contextId)` / `setContextCwd(contextId, path)` RPCs, reuse the
-existing kaish/VFS validation and `context_shell` persistence, and expose
-them through `kaijutsu-client`. This keeps cwd mutation atomic with respect to
-the named context instead of ambient connection state.
+The older Cap'n Proto `getCwd`/`setCwd` calls are connection-scoped: they
+operate on whichever context the connection last joined, which is unsafe for
+an ACP bridge multiplexing several sessions over one actor. The explicitly
+addressed `getContextCwd(contextId)` / `setContextCwd(contextId, path)` RPCs
+reuse the existing kaish/VFS validation and `context_shell` persistence and
+are exposed through `kaijutsu-client`. This keeps cwd mutation atomic with
+respect to the named context instead of ambient connection state; no injected
+`cd` or `kj context set` is involved.
 
 ### Commands, modes, and configuration
 
@@ -175,10 +179,9 @@ The order is deliberate but not a monolithic project plan. Each hunk should
 land with its own protocol dispatch tests, kernel/client seam tests, docs, and
 a Toad flight before the next one needs to start.
 
-1. **Addressed cwd + resume.** Add context-addressed cwd RPCs; persist new
-   session cwd; reset it on load/resume; report per-context cwd; implement and
-   advertise stable-v1 `session/resume`. Test two ACP sessions on one actor so
-   cwd can never land on the ambient/wrong context.
+1. **Addressed cwd + resume — shipped.** Context-addressed cwd RPCs persist new
+   session cwd, reset it on load/resume, and report it per context;
+   stable-v1 `session/resume` is advertised and attaches without replay.
 2. **Archive through `session/delete`.** Archive idempotently enough for
    client retries, unbind the live pump, and advertise delete support.
 3. **Client identity and presence.** Retain `clientInfo`, attach `acp/<name>`
@@ -424,10 +427,10 @@ in practice.
 - **`kaijutsu-mcp`'s `write_input` deletes by byte length** (`lib.rs:1434`,
   `state.content.len()`), so a non-ASCII input doc is corrupted or truncated.
   `kaijutsu-acp` uses `chars().count()`. mcp should too.
-- **Stable session controls remain incomplete.** `session/resume`,
-  `session/delete`, `session/set_mode`, and `session/set_config_option` are in
+- **Stable session controls remain incomplete.** `session/delete`,
+  `session/set_mode`, and `session/set_config_option` are in
   the pinned v1 schema and unimplemented. Delete maps to archive (not
-  conclude); resume attaches without replay. Modes/config are not advertised,
+  conclude). Modes/config are not advertised,
   so a conforming client will not call their setters yet.
 - **Prompt content is text-only.** Image/audio/embedded-resource blocks are
   turned into a `[… omitted]` marker rather than dropped in silence, and the

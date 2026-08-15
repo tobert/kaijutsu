@@ -63,16 +63,18 @@ pub fn ranked_context_ids(contexts: &[ContextInfo]) -> Vec<ContextId> {
 
 /// The ACP session list: the rank, rendered as `SessionInfo`.
 ///
-/// `cwd` is the bridge's working directory — ACP requires one per session and
-/// a kj context does not carry one, so every listed session reports the
-/// bridge's. Noted in docs/acp.md as a known impedance mismatch.
-pub fn ranked_sessions(contexts: &[ContextInfo], cwd: &Path) -> Vec<SessionInfo> {
+/// ACP requires a cwd, so contexts without durable cwd state are deliberately
+/// omitted rather than assigned a process-wide directory they never owned.
+pub fn ranked_sessions(
+    contexts: &[ContextInfo],
+    cwds: &std::collections::HashMap<ContextId, PathBuf>,
+) -> Vec<SessionInfo> {
     let by_id: std::collections::HashMap<ContextId, &ContextInfo> =
         contexts.iter().map(|c| (c.id, c)).collect();
     ranked_context_ids(contexts)
         .into_iter()
         .filter_map(|id| by_id.get(&id).copied())
-        .map(|c| session_info(c, cwd))
+        .filter_map(|c| cwds.get(&c.id).map(|cwd| session_info(c, cwd)))
         .collect()
 }
 
@@ -203,7 +205,8 @@ mod tests {
     fn session_info_carries_the_label_as_title() {
         let mut c = ctx("household-agent");
         c.last_activity_at = Some(1_700_000_000_000);
-        let infos = ranked_sessions(&[c.clone()], Path::new("/tmp/work"));
+        let cwds = std::collections::HashMap::from([(c.id, PathBuf::from("/tmp/work"))]);
+        let infos = ranked_sessions(&[c.clone()], &cwds);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].session_id, session_id_of(c.id));
         assert_eq!(infos[0].title.as_deref(), Some("household-agent"));
@@ -214,8 +217,34 @@ mod tests {
     #[test]
     fn an_unlabelled_context_falls_back_to_its_short_id() {
         let c = ctx("");
-        let infos = ranked_sessions(&[c.clone()], Path::new("/tmp"));
+        let cwds = std::collections::HashMap::from([(c.id, PathBuf::from("/tmp"))]);
+        let infos = ranked_sessions(&[c.clone()], &cwds);
         assert_eq!(infos[0].title.as_deref(), Some(c.id.short().as_str()));
+    }
+
+    #[test]
+    fn context_without_a_durable_cwd_is_not_misrepresented() {
+        let c = ctx("legacy");
+        assert!(ranked_sessions(&[c], &std::collections::HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn each_session_reports_its_own_context_cwd() {
+        let mut a = ctx("alpha");
+        a.last_activity_at = Some(2_000);
+        let mut b = ctx("beta");
+        b.last_activity_at = Some(1_000);
+        let cwds = std::collections::HashMap::from([
+            (a.id, PathBuf::from("/work/alpha")),
+            (b.id, PathBuf::from("/work/beta")),
+        ]);
+        let infos = ranked_sessions(&[a.clone(), b.clone()], &cwds);
+        let by_id = infos
+            .into_iter()
+            .map(|info| (info.session_id, info.cwd))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(by_id[&session_id_of(a.id)], PathBuf::from("/work/alpha"));
+        assert_eq!(by_id[&session_id_of(b.id)], PathBuf::from("/work/beta"));
     }
 
     #[test]

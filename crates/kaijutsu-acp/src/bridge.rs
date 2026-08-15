@@ -55,7 +55,6 @@ pub struct KernelBridge {
     actor: ActorHandle,
     principal: PrincipalId,
     context_type: String,
-    cwd: PathBuf,
 }
 
 impl KernelBridge {
@@ -69,7 +68,6 @@ impl KernelBridge {
     pub async fn connect(
         config: SshConfig,
         context_type: String,
-        cwd: PathBuf,
         connect_timeout: std::time::Duration,
     ) -> Result<Self> {
         let client = connect_ssh(config.clone())
@@ -136,16 +134,11 @@ impl KernelBridge {
             actor,
             principal: PrincipalId::new(),
             context_type,
-            cwd,
         })
     }
 
     pub fn actor(&self) -> &ActorHandle {
         &self.actor
-    }
-
-    pub fn cwd(&self) -> &PathBuf {
-        &self.cwd
     }
 
     /// Advertise the ACP client process as one peer, independent of how many
@@ -182,6 +175,37 @@ impl KernelBridge {
             .await
             .context("list contexts")
             .map_err(Into::into)
+    }
+
+    /// Read the durable kaish cwd for one context without depending on the
+    /// actor's ambient joined context.
+    pub async fn context_cwd(&self, context_id: ContextId) -> Result<Option<PathBuf>> {
+        self.actor
+            .get_context_cwd(context_id)
+            .await
+            .context("get context cwd")
+            .map(|cwd| cwd.map(PathBuf::from))
+    }
+
+    /// Reassert an ACP attachment's cwd as durable kaish state.
+    pub async fn set_context_cwd(&self, context_id: ContextId, cwd: &std::path::Path) -> Result<()> {
+        if !cwd.is_absolute() {
+            bail!("ACP cwd must be absolute: {}", cwd.display());
+        }
+        let cwd = cwd
+            .to_str()
+            .with_context(|| format!("ACP cwd is not valid UTF-8: {}", cwd.display()))?;
+        self.actor
+            .set_context_cwd(context_id, cwd)
+            .await
+            .with_context(|| format!("set context cwd to {cwd}"))
+    }
+
+    pub async fn archive_context(&self, context_id: ContextId) -> Result<()> {
+        self.actor
+            .archive_context(context_id)
+            .await
+            .context("archive context")
     }
 
     /// Resolve-or-create a context for a label, then join it.

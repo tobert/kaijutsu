@@ -8238,6 +8238,9 @@ async fn set_context_cwd(
     path: &str,
 ) -> Result<Result<(), String>, capnp::Error> {
     require_context_exists(kernel, context_id)?;
+    if !std::path::Path::new(path).is_absolute() {
+        return Ok(Err(format!("cwd must be absolute: {}", path)));
+    }
     let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
     if !kaish.try_set_cwd(std::path::PathBuf::from(path)).await {
         return Ok(Err(format!("not a directory: {}", path)));
