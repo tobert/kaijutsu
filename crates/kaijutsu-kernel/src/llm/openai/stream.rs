@@ -37,8 +37,9 @@ use super::sse::OpenAiSseEvent;
 use super::types::{ChunkChoice, ToolCallChunk, Usage};
 
 /// Which content block is currently open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Phase {
+    #[default]
     None,
     Thinking,
     Text,
@@ -76,12 +77,6 @@ pub struct StateMachine {
 /// the value is never read back (only its presence gates rehydration); the build
 /// path re-emits the reasoning *text* as `reasoning_content`.
 const REASONING_NONCE: &str = "openai-compat-reasoning";
-
-impl Default for Phase {
-    fn default() -> Self {
-        Phase::None
-    }
-}
 
 impl StateMachine {
     pub fn new(reasoning_required: bool) -> Self {

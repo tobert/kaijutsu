@@ -8836,7 +8836,6 @@ fn error_severity_to_capnp(
     }
 }
 
-/// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
 // ── Wire → kernel enum conversions (inbound RPC authoring, @106/@107) ──────
 //
 // The `*_to_capnp` twins below have existed since the server only ever
@@ -8888,6 +8887,7 @@ fn block_kind_from_capnp(kind: crate::kaijutsu_capnp::BlockKind) -> BlockKind {
     }
 }
 
+/// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
 fn tool_kind_to_capnp(tk: kaijutsu_crdt::ToolKind) -> crate::kaijutsu_capnp::ToolKind {
     match tk {
         kaijutsu_crdt::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,

@@ -227,8 +227,6 @@ impl FocusTarget {
 #[derive(Component)]
 pub struct FocusedBlockCell;
 
-/// Marker for a block cell that is currently being edited.
-///
 // ============================================================================
 // CONVERSATION UI LAYOUT COMPONENTS
 // ============================================================================

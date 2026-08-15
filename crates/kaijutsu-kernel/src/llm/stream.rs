@@ -349,18 +349,13 @@ impl CacheTarget {
 /// Cache TTL hint. Anthropic offers a default 5-minute ephemeral cache
 /// and a 1-hour `extended` variant; choose based on how often the same
 /// prefix recurs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheTtl {
     /// 5-minute TTL (Anthropic's default `ephemeral`).
+    #[default]
     Ephemeral,
     /// 1-hour TTL (Anthropic's `extended`).
     Extended,
-}
-
-impl Default for CacheTtl {
-    fn default() -> Self {
-        Self::Ephemeral
-    }
 }
 
 /// Token usage from a completed stream.

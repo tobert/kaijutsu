@@ -171,6 +171,9 @@ pub struct MidiPresenceState {
 impl MidiPresenceState {
     /// What we know about a device right now (for UI/debug; the kernel is
     /// the shared truth).
+    // Deliberately unused for now — no UI/debug consumer exists yet
+    // (docs/issues.md candidate: wire this up or drop it).
+    #[allow(dead_code)]
     pub fn reported(&self) -> &BTreeMap<String, bool> {
         &self.reported
     }

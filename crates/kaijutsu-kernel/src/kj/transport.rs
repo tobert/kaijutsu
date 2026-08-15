@@ -629,7 +629,7 @@ impl KjDispatcher {
                 .map(|l| l.period.as_millis() as u64)
                 .or_else(|| pers.map(|p| p.period_ms))
                 .unwrap_or(0);
-            let bpm = if period_ms > 0 { 60_000 / period_ms } else { 0 };
+            let bpm = 60_000u64.checked_div(period_ms).unwrap_or(0);
             let beats_per_phrase = live
                 .map(|l| l.beats_per_phrase)
                 .or_else(|| pers.map(|p| p.beats_per_phrase))

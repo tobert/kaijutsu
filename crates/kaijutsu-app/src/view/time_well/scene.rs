@@ -2164,6 +2164,12 @@ pub fn spin_rings(
     // cards' targets — a settled ring leaves its cards alone (Deepseek: the
     // recompute is only needed while spinning).
     let mut active = [false; super::card::N_BANDS];
+    // `i` indexes four independent collections in lockstep — three `state`
+    // fields (one read-and-written) plus the local `active` array. An
+    // iterator/zip rewrite would need to split `state`'s fields apart to
+    // satisfy the borrow checker for the mutable one; not worth it for a
+    // fixed-size, small (`N_BANDS`) loop.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..super::card::N_BANDS {
         // An empty ring has no cards to move (and sync_time_well's
         // `flen.max(1)` only gives it a synthetic single-slot gate target) —

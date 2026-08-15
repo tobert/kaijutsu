@@ -203,6 +203,11 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
             k.delivered,
             k.capacity
         );
+        // Release the RefCell borrow before the `.await`s below — the
+        // connection is already dead at this point so `WedgedClient` won't
+        // fire another `borrow_mut()`, but there's no reason to hold a
+        // `Ref` live across an await when it's done being read.
+        drop(k);
 
         // The healthy connection is untouched: one slow subscriber must never
         // take down the kernel or its neighbours.

@@ -280,7 +280,7 @@ pub fn apply_thinking(body: &mut MessagesRequest, opts: &BuildOpts) -> Result<()
 ///
 /// Out-of-range indices are logged and skipped.
 fn apply_message_breakpoints(
-    messages: &mut Vec<RequestMessage>,
+    messages: &mut [RequestMessage],
     breakpoints: &[(usize, CacheTtl)],
 ) {
     for &(idx, ttl) in breakpoints {

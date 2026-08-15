@@ -2092,6 +2092,9 @@ mod tests {
         ]
     }
 
+    /// What the fake sink saw: `(port_or_device, payload, reply_match, timeout_ms)`.
+    type FakeSinkCapture = (String, Vec<u8>, Vec<u8>, u32);
+
     /// Register a stand-in sink on `connection` and answer the first exchange
     /// with `answer`. Returns the join handle so a test can inspect exactly
     /// what the kernel asked for.
@@ -2099,7 +2102,7 @@ mod tests {
         d: &KjDispatcher,
         connection: kaijutsu_types::SessionId,
         answer: Result<Vec<u8>, String>,
-    ) -> tokio::task::JoinHandle<Option<(String, Vec<u8>, Vec<u8>, u32)>> {
+    ) -> tokio::task::JoinHandle<Option<FakeSinkCapture>> {
         let mut rx = d.kernel().midi_exchange().register(connection).receiver;
         tokio::spawn(async move {
             let ExchangeRequest {

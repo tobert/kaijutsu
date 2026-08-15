@@ -53,6 +53,10 @@ fn main() -> Result<(), String> {
     let bpm = arg("--bpm").unwrap_or(120.0);
     let drift_bpm_per_min = arg("--drift").unwrap_or(0.0);
     let jitter_ms = arg("--jitter-ms").unwrap_or(0.0);
+    // Deliberately negated rather than `bpm <= 0.0`: NaN compares false either
+    // way, so `!(bpm > 0.0)` rejects NaN (via the negation) while `bpm <= 0.0`
+    // would let it through unrejected — the two forms are NOT equivalent here.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(bpm > 0.0) {
         return Err("--bpm must be positive".into());
     }

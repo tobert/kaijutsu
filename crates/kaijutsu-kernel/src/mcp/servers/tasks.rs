@@ -146,7 +146,7 @@ impl TaskFilter {
     fn parse(filter: Option<&str>) -> McpResult<Self> {
         match filter {
             None => Ok(TaskFilter::All),
-            Some(f) if f.is_empty() => Ok(TaskFilter::All),
+            Some("") => Ok(TaskFilter::All),
             Some("open") => Ok(TaskFilter::Open),
             Some("done") => Ok(TaskFilter::Done),
             Some(other) => TaskStatus::from_str(other)

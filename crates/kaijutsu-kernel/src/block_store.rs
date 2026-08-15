@@ -4544,7 +4544,7 @@ mod tests {
             let payload: SyncPayload = codec::decode(&ops).unwrap();
             client
                 .merge_ops(payload)
-                .expect(&format!("should merge block {i}"));
+                .unwrap_or_else(|e| panic!("should merge block {i}: {e}"));
         }
 
         assert_eq!(client.block_count(), 5);
@@ -4603,7 +4603,7 @@ mod tests {
             let payload = store.ops_since(ctx, &client_frontier).unwrap();
             client
                 .merge_ops(payload)
-                .expect(&format!("should merge chunk '{chunk}'"));
+                .unwrap_or_else(|e| panic!("should merge chunk '{chunk}': {e}"));
         }
 
         let snapshot = client.get_block_snapshot(&block_id).unwrap();

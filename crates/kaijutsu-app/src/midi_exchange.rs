@@ -159,6 +159,9 @@ pub struct MidiExchange {
 
 impl MidiExchange {
     /// The routes this sink can currently reach (for debug/UI).
+    // Deliberately unused for now — no UI/debug consumer exists yet
+    // (docs/issues.md candidate: wire this up or drop it).
+    #[allow(dead_code)]
     pub fn routes(&self) -> ExchangeRoutes {
         self.routes
             .read()
