@@ -50,6 +50,17 @@ pub fn format_context_table(
 
     let mut lines = Vec::new();
 
+    // Width from the actual data, not a fixed 16 — a label longer than the
+    // pad shoves every column after it rightward, and the age column added
+    // 2026-08-15 made that ragged edge obvious. Floored at 16 so a listing of
+    // only short labels doesn't render cramped.
+    let label_w = contexts
+        .iter()
+        .map(|c| c.label.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(0)
+        .max(16);
+
     for ctx in contexts {
         let marker = if Some(ctx.context_id) == current {
             "*"
@@ -68,7 +79,7 @@ pub fn format_context_table(
         let host = origin_host_tag(&ctx.origin_host);
         let age = format_age_compact(ctx.last_activity_at.unwrap_or(ctx.created_at));
         lines.push(format!(
-            "{marker} {id_short}  {label:<16} {age:>5}  {model}{ring0}{cast}{host}"
+            "{marker} {id_short}  {label:<label_w$} {age:>5}  {model}{ring0}{cast}{host}"
         ));
     }
 

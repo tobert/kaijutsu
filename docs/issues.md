@@ -131,12 +131,21 @@ Three things the manual sweep taught, worth not re-learning:
   of accumulators, so ROOT and live contexts were still protected), but verify
   bulk work by re-querying state, never by a counter the loop printed.
 
-**Still unaddressed: the pile regrows on its own.** Every MCP reconnect mints a
-fresh context — 9 `mcp-kaijutsu-*` contexts existed on 08-15, all minted that
-day, two of them (`0815-1201`, `0815-1203`) during three kernel restarts an
-hour apart. Same phenomenon as the filed `cc-kaijutsu` prefix pileup. A janitor
-that only sweeps is a treadmill while the mint runs; the reconnect path wanting
-to *reuse* a session's context is the other half.
+**Still unaddressed: the pile regrows on its own.** 9 `mcp-kaijutsu-*` contexts
+existed on 08-15, **all minted that day**, and two (`0815-1201`, `0815-1203`)
+appeared during kernel restarts within the hour. Same phenomenon as the filed
+`cc-kaijutsu` prefix pileup.
+
+*Corrected on the spot, because the obvious generalisation is wrong:* a later
+restart in the same session minted **nothing** and the MCP client re-attached to
+its existing context. So it is **not** one-context-per-reconnect — something
+about the reconnect path sometimes reuses and sometimes mints, and **which is
+which is the actual question**, not "reconnect leaks". The two naming schemes
+in the wild are the visible half of that fork: `mcp-kaijutsu-<HHMM>` vs
+`mcp-kaijutsu-<hex session id>` come from different registration paths, and the
+timestamp-named ones are the suspicious set. A janitor that only sweeps is a
+treadmill while the mint runs, so this wants diagnosing before a janitor is
+built to paper over it.
 
 ---
 
