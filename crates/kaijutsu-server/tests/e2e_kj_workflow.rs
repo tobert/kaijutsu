@@ -479,6 +479,63 @@ fn test_shell_propagates_exit_code() {
     });
 }
 
+/// Regression pin for the truncation exit-code bug: `shell_execute` runs its
+/// shell at `OutputProfile::Agent` (an 8 KB captured-output cap). When a
+/// command's output crosses that cap, kaish-kernel truncates it AND remaps
+/// the exit code to 3 (`did_spill`), stashing the command's real code in
+/// `original_code` — a deliberate, loud signal aimed at a script's own `$?`.
+/// `execute_shell_command` was persisting the remapped `3` onto the durable
+/// ToolResult block regardless of what the command actually did, so a command
+/// that ran to completion and exited 0 — merely printing more than 8 KB —
+/// recorded `exit_code = 3` forever. `seq 1 5000` is a kaish builtin (no host
+/// exec needed) that prints ~19 KB and always exits 0, so it deterministically
+/// crosses the cap on every host, unlike the earlier `mount`-based flake this
+/// bug hid behind (see `kj::context_shell::tests::
+/// unknown_command_fails_fast_exec_granted_shell`, whose host-dependent
+/// `mount` output was this same remap wearing a different command).
+///
+/// This test failed before the `original_code` resolution landed in
+/// `execute_shell_command` (recorded `exit_code = Some(3)`) and passes after.
+#[test]
+fn test_shell_truncation_does_not_corrupt_exit_code() {
+    run_local(async {
+        let addr = start_server_with_mock_llm().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let ctx = kernel.create_context("truncation-exit-code-test").await.unwrap();
+        kernel.join_context(ctx, "test").await.unwrap();
+
+        // seq 1 5000 prints far more than the 8 KB agent cap and always
+        // succeeds — the exact "succeeded but got capped" shape the bug hid.
+        let (cmd_id, output, status) = shell_exec_wait(&kernel, "seq 1 5000", ctx).await;
+        assert_eq!(
+            status,
+            Status::Done,
+            "a spilled-but-successful command must still read Done, got: {output}"
+        );
+        assert!(
+            output.contains("[output truncated"),
+            "kaish's own truncation marker should be visible in the persisted \
+             body so the cap stays discoverable even without a structured \
+             field on this path, got: {output}"
+        );
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        let result = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_id))
+            .expect("ToolResult for `seq 1 5000` not found");
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "a command that exited 0 but spilled output must record \
+             exit_code=Some(0) on its durable ToolResult, not kaish's \
+             truncation-remapped 3, got {:?}",
+            result.exit_code
+        );
+    });
+}
+
 /// A `cd` and an `export` in one shell command must persist to the context's
 /// durable L1 state, so the *next* command — which runs in a freshly
 /// materialized, single-use shell re-seeded from L1 — lands in the same cwd and

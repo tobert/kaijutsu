@@ -8572,9 +8572,23 @@ async fn execute_shell_command(
                 // before flipping status. Consumers (MCP context_shell return,
                 // BRP introspection, history views) read this to distinguish
                 // exit codes that all map to the same Status::Error.
+                //
+                // `result.code` is the code kaish hands back for `$?` inside a
+                // script — and on this `OutputProfile::Agent` shell, a capped
+                // command (`did_spill`) has that field FORCIBLY remapped to 3,
+                // with the command's actual exit stashed in `original_code`
+                // (kaish-kernel's `output_limit` module doc). That remap is a
+                // deliberate, loud signal for a script's own control flow — but
+                // this durable field is not control flow, it's the permanent
+                // record. Resolving through `original_code` here is the same
+                // move `mcp/servers/shell.rs`'s `shell_result_to_kernel` makes
+                // ("truncation is not failure") — a command that exited 0 and
+                // merely printed a lot must not read back as exit_code=3
+                // forever because it once got captured over 8 KB.
                 // Clamp to i32 — POSIX exit codes are 0-255; saturating cast
                 // covers the i64-to-i32 narrowing without surprise.
-                let exit_code_i32: i32 = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                let real_code = result.original_code.unwrap_or(result.code);
+                let exit_code_i32: i32 = real_code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 if let Err(e) = documents_clone.set_exit_code(
                     context_id,
                     &output_block_id_clone,
@@ -8617,8 +8631,20 @@ async fn execute_shell_command(
                 }
 
                 // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
-                // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
-                let final_status = match result.code {
+                // Exit 3: truncation (did_spill) OR a command's own genuine exit 3 — neither is a failure
+                //
+                // Matched on `real_code`, not `result.code`: kaish's did_spill
+                // remap is unconditional — a command that FAILED and also
+                // spilled >8KB of output gets `code = 3` with the real failing
+                // code stashed in `original_code` (kaish-kernel's `output_limit`
+                // remap in `Kernel::run`/`spill_if_needed`, unconditional on the
+                // pre-spill exit). Matching on the raw code would fold that
+                // failure into the `3 => Done` arm and misreport it as success.
+                // `real_code` collapses back to `result.code` whenever
+                // `original_code` is `None` (no spill), so a command that
+                // genuinely exits 2 or 3 on its own is unaffected — this only
+                // changes classification for the spilled-and-failed case.
+                let final_status = match real_code {
                     0 | 2 | 3 => Status::Done,
                     _ => Status::Error,
                 };

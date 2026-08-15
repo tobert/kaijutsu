@@ -804,6 +804,55 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ### 2026-08-15, later: the exposure analysis above was too narrow — a second write path corrupts the DURABLE exit code
 
+**RESOLVED 2026-08-15.** `execute_shell_command` (`rpc.rs`) now resolves
+`result.original_code.unwrap_or(result.code)` before persisting `exit_code`
+and before the `final_status` match (both now read the resolved code, not the
+raw one — see "final_status" note below). `did_spill` remains discoverable via
+kaish's own inline `[output truncated: N bytes total — ...]` marker baked into
+the persisted block body (no structured field on this path, unlike MCP's
+`shell.rs` envelope — see the new backlog item below). The host-dependent
+`mount` test (`context_shell.rs::unknown_command_fails_fast_exec_granted_shell`)
+now runs `id` instead, which is not a kaish builtin and always prints a short,
+bounded line. A new regression test,
+`test_shell_truncation_does_not_corrupt_exit_code`
+(`crates/kaijutsu-server/tests/e2e_kj_workflow.rs`), pins the exact shape: `seq
+1 5000` (a builtin, ~19 KB, always exits 0) must record `exit_code = Some(0)`,
+not `Some(3)`. It failed before the fix and passes after.
+
+One correction to "keep the `0 | 2 | 3` status match as-is (it is
+independently correct)" above: it was **not** independently correct.
+kaish's remap is unconditional — a command that *fails* and also spills
+>8 KB gets `code = 3` with the real failing code in `original_code`, so
+matching on the raw code folded a genuine failure into the `3 => Done` arm.
+`final_status` now matches on the same resolved code as the persisted
+`exit_code`; this is a no-op for every case except spilled-and-failed, which
+it now classifies correctly.
+
+**New backlog: the same bug shape, found by an exhaustive sweep for other
+`ExecResult.code` consumers, in four places still unfixed** (kaijutsu-kernel
+has two unrelated types both named `ExecResult` — kaish's, with
+`did_spill`/`original_code`, and kaijutsu's own internal engine-call type in
+`execution.rs` with neither; only the former is in scope here):
+- `crates/kaijutsu-kernel/src/kernel.rs:1318` — `EditorIo::ReadShell` (vi's
+  `:r !cmd`) checks `result.code != 0` raw; a `:r !cmd` whose output spills
+  reports a spurious failure to the editor even though the command succeeded.
+- `crates/kaijutsu-kernel/src/kj/lifecycle.rs:507,532` — rc-lifecycle `.kai`
+  script execution matches `exec.code == 0` raw and **persists** the
+  unresolved code into a durable rc-failure block on the fallthrough arm; a
+  successful rc script that spills >8 KB gets permanently filed as failed.
+- `crates/kaijutsu-kernel/src/mcp/broker.rs:1939-1953` — hook body execution
+  (tool-call pre/post hooks) matches `exec.code == 0` raw and surfaces `"kaish
+  hook exit {}"` with the unresolved code on failure; a spilled-but-successful
+  hook can incorrectly abort/flag the tool-call pipeline.
+- `crates/kaijutsu-server/src/rpc.rs:~1270` (`dispatch_output_events`, backing
+  the streaming `execute` RPC — a different path from `shell_execute`/
+  `execute_shell_command` above) — `set_exit_code(result.code as i32)` ships
+  the unresolved code over the wire to every `on_output` subscriber.
+
+None of these four are touched by this fix — flagged here per CLAUDE.md
+("note problems we can fix later") rather than fixed opportunistically, since
+each sits in a file this session was not scoped to touch.
+
 The correction above concluded "**`kj`/MCP callers are NOT affected**" on the
 strength of `mcp/servers/shell.rs:448` doing
 `result.original_code.unwrap_or(result.code)`. That is true of *that* path. It is

@@ -426,9 +426,24 @@ mod tests {
 
     /// The exec-granted flavor: with `Exec` in the loadout and a real host `/`
     /// mount (so the cwd resolves and external exec is actually attempted),
-    /// `mount` — a real host binary — resolves on PATH and spawns, so it must
-    /// return promptly; and a name on neither PATH nor the registry must fall
-    /// through and fail fast (127). Neither may hang the request timeout.
+    /// `id` — a real host binary, not a kaish builtin (see the builtin list in
+    /// `kaish-kernel::tools::builtin`) — resolves on PATH and spawns, so it
+    /// must return promptly; and a name on neither PATH nor the registry must
+    /// fall through and fail fast (127). Neither may hang the request timeout.
+    ///
+    /// This used to run `mount` instead. That command's own intent — "a real
+    /// host binary resolves on PATH and spawns" — has nothing to do with how
+    /// much text it prints, but on a host with a large mount table (observed:
+    /// 15,381 bytes) `mount`'s output crosses kaish's 8 KB `OutputProfile::
+    /// Agent` cap, which remaps the exit code to 3 (`did_spill`) and fails
+    /// `res.ok()` (`code == 0`) — not because anything is wrong, but because
+    /// the test's assertion couldn't see past the raw code to `original_code`.
+    /// That made the test flake by host, which is exactly what let the
+    /// rpc.rs bug this file's sibling test suite pins go unnoticed: a
+    /// truncation-driven exit-code remap looking like a real failure. `id`
+    /// prints one short, bounded line everywhere, so the test now exercises
+    /// its actual intent deterministically instead of depending on how big
+    /// the host's mount table happens to be.
     #[tokio::test]
     async fn unknown_command_fails_fast_exec_granted_shell() {
         let d = dispatcher_with_full_broker().await;
@@ -456,14 +471,14 @@ mod tests {
         // A real host binary resolves on PATH and spawns — must return promptly.
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            kaish.execute_with_options("mount", ExecuteOptions::default()),
+            kaish.execute_with_options("id", ExecuteOptions::default()),
         )
         .await
-        .expect("`mount` must return promptly, not hang the shell timeout")
+        .expect("`id` must return promptly, not hang the shell timeout")
         .expect("exec returns");
         assert!(
             res.ok(),
-            "`mount` should run and exit 0 in an exec-granted shell: {}",
+            "`id` should run and exit 0 in an exec-granted shell: {}",
             res.err
         );
 
