@@ -6,6 +6,49 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The last consumer of raw CRDT ops is a heat map (2026-08-15)
+
+The change feed's flag day is blocked on one thing, and it is not a migration.
+
+After ACP, MCP and the app moved onto the feed, **no production code anywhere
+decodes a CRDT operation off the wire**. `SyncedDocument` — the only type that
+can — has zero production callers left: a re-export, its own tests, and one
+`kaijutsu-server` reconnect test.
+
+But `onBlockTextOps` cannot be deleted yet, because of this
+(`kaijutsu-app/src/view/time_well/activity.rs:138`):
+
+```rust
+ServerEvent::BlockTextOps { context_id, .. } => Some((*context_id, 1.0)),
+```
+
+The time well's activity heat uses block events as a **pulse**. It never looks
+at the operations; it counts that one arrived and weights it. Streaming is the
+loudest signal (1.0) precisely because it means a model is writing right now.
+`view/room/activity.rs` and `connection/drift.rs` consume the same events the
+same way.
+
+So the app currently receives **every token of every context, kernel-wide, to
+draw a glow**. That is worse than it sounds: it is the single largest remaining
+consumer of the wire, and it is spending a firehose on a scalar.
+
+**The fix is a small event, not a migration.** The feed is deliberately
+per-context (one version counter per context), and the time well is deliberately
+kernel-wide — those do not meet, and should not. What the time well wants is a
+kernel-wide, low-rate *activity* signal: `(contextId, weight)` and nothing else,
+riding the directive path beside `onRenderCue`/`onBeatSync` rather than the
+change feed, since it is a hint and not a fact — a dropped pulse costs a dimmer
+glow, never a wrong document.
+
+Sequence once that exists: emit the activity signal → move
+`time_well/activity.rs`, `room/activity.rs`, `connection/drift.rs` onto it →
+delete `onBlockTextOps`/`onBlockTextOpsBatch`/`onSyncReset`/the per-block
+`BlockEvents` methods/`getContextSync`/`declareEventCapabilities` → compact the
+ordinals with `contrib/compact-capnp-ordinals.py` → delete `SyncedDocument` and
+`SyncManager` (but NOT `SyncedInput`; the compose input is still CRDT-backed by
+design). `BlockEvents` survives, reduced, for the timing directives and MIDI
+exchange — see `docs/change-feed.md`.
+
 ## Two findings from the change-feed step-1 review (2026-08-15, kaibo/DeepSeek)
 
 Both pre-existing; the change feed is what makes them matter. A third — the

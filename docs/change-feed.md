@@ -274,6 +274,16 @@ endpoints).
   wraps a `SyncedDocument`; appending a raw `String` to a CRDT is not a supported
   operation. That cache is rewritten, not toggled.
 
+  **Done 2026-08-15** (`1a9985fd`), and the rewrite deleted more than it added:
+  the `generation`/`stale_active` counter and the poll systems built on it went
+  with it, because a feed that announces `Resubscribed`/`Terminated`/`Desynced`
+  leaves a periodic "is anything stale?" scan nothing to find.
+
+  One integration cost every Bevy consumer will hit: a live
+  `mpsc::Receiver<FeedEvent>` cannot ride Bevy's `MessageReader`, which hands
+  out shared references only. The receiver travels through a drain-once channel
+  resource instead. ACP, being plain tokio, never had this problem.
+
 ## Open questions
 
 1. **`ContextSwitched`** is published on the block flow but is a shell concern,
