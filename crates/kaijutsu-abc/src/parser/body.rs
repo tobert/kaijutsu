@@ -59,6 +59,10 @@ pub fn parse_body_with_voices(
     (elements, voice_defs)
 }
 
+// Recursive-descent state threaded across recursive calls: input cursor,
+// diagnostics collector, parse config, mutable symbol/voice tables shared
+// across the whole parse, and the recursion-depth guard — every one is
+// read or mutated independently, not bundled incidentally.
 #[allow(clippy::too_many_arguments)]
 fn parse_body_inner(
     input: &str,

@@ -400,6 +400,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
+    // One argument per `kj backend set` CLI flag / `backends` table column.
     #[allow(clippy::too_many_arguments)]
     fn backend_set(
         &self,
@@ -556,6 +557,8 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
+    // Same shape as `backend_set` above: one argument per `kj backend
+    // default set` flag / `llm_defaults` table column.
     #[allow(clippy::too_many_arguments)]
     fn backend_default_set(
         &self,

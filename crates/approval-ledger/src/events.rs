@@ -8,6 +8,8 @@ use rusqlite::{Connection, params};
 use crate::error::Result;
 use crate::types::EventKind;
 
+// One argument per `approval_events` column (all but `kind` are nullable) —
+// a params struct would just re-describe the row this INSERTs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append(
     conn: &Connection,

@@ -2466,6 +2466,8 @@ async fn ensure_context_joinable(
 /// musician contexts. Hard failures (document / DB / drift) return `Err`;
 /// everything downstream is best-effort. Wire-result writing is the caller's
 /// job — this never touches capnp results.
+// The state handle, the new context's own identity (id/type/label/creator/
+// parent), and the session it's joining — none share a natural owner.
 #[allow(clippy::too_many_arguments)]
 async fn create_context_inner(
     state: &SharedKernelState,
@@ -9716,6 +9718,9 @@ fn text_ops_parts(msg: &FlowMessage<BlockFlow>) -> Option<(ContextId, kaijutsu_c
 ///
 /// `filter` is `None` for `subscribe_blocks` (everything) and `Some` for
 /// `subscribe_blocks_filtered`; the two RPCs differ in nothing else.
+// Wire callback, two independent subscriptions, filter config, caller
+// identity/capabilities, and two independent cancellation tokens (per-conn
+// vs. per-subscription) — a shared loop genuinely needs all of it.
 #[allow(clippy::too_many_arguments)]
 async fn run_block_bridge(
     callback: block_events::Client,

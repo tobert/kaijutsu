@@ -174,6 +174,11 @@ impl EmbeddedKaish {
     ///
     /// The `configure_tools` callback receives the map and session ID so callers
     /// can register tools (like KjBuiltin) that need context awareness.
+    ///
+    /// One argument per independent piece of construction state (identity,
+    /// storage handles, execution/output policy, tool wiring) — this and
+    /// `with_identity_read_only`/`with_identity_mode` below all share the
+    /// shape for the same reason; this is the one comment for the family.
     #[allow(clippy::too_many_arguments)]
     pub fn with_identity(
         name: &str,
@@ -209,6 +214,8 @@ impl EmbeddedKaish {
     /// construction, while reads — real files *and* the CRDT document views at
     /// `/v/docs` / `/v/input` — still work. Backs the toolie's
     /// `read_only_shell` (see `mcp/servers/shell.rs`).
+    // See with_identity's doc above for why this family's argument count is
+    // what it is.
     #[allow(clippy::too_many_arguments)]
     pub fn with_identity_read_only(
         name: &str,
@@ -249,6 +256,9 @@ impl EmbeddedKaish {
     /// read-only, and external command execution is disabled — three structural
     /// levers, mirroring kaibo's read-only sandbox recipe (`sandbox.rs`) adapted
     /// to kaijutsu's *shared*, CRDT-backed mount table.
+    // See with_identity's doc for why this family's argument count is what
+    // it is — this is the shared implementation both public constructors
+    // above funnel into.
     #[allow(clippy::too_many_arguments)]
     fn with_identity_mode(
         name: &str,

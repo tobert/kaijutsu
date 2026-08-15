@@ -423,6 +423,9 @@ impl MsdfAtlas {
 
 /// Copy a WxH RGBA8 rect from one packed buffer to another. The two buffers
 /// may have different row strides (an atlas grow changes width mid-copy).
+// Genuinely symmetric: a (buffer, stride, x, y) tuple for src, the same
+// shape for dst, plus the shared width/height — two structs would just
+// split this list in half without simplifying it.
 #[allow(clippy::too_many_arguments)]
 fn copy_rect_between_buffers(
     src: &[u8],

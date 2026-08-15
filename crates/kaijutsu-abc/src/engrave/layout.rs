@@ -1541,6 +1541,9 @@ fn close_volta_bracket(
 /// `suppress_flag`) a flag. When `forced_stem_up` is `Some`, the stem
 /// direction overrides the default pitch-based heuristic so all
 /// stems in a beam group point the same way.
+// Per-call state falls into three independent groups (staff geometry, the
+// note's own source span/flags, beam-group layout hints) that don't share
+// a natural owning struct — not incidental clutter a builder would trim.
 #[allow(clippy::too_many_arguments)]
 fn emit_note_with(
     elements: &mut Vec<EngravingElement>,

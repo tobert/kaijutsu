@@ -596,6 +596,9 @@ pub fn sync_backdrop_fields(
 /// something to report), and its own handle is retained in
 /// [`FsnBackdrop::entities`] so that system can find it without a
 /// `MeshMaterial3d` query.
+// Same shape as (and shares most parameters with) `scene::spawn_field_entities`
+// — a manual spawn helper carrying what SystemParam injection would
+// otherwise supply, plus the `FsnBackdrop` bookkeeping it updates in place.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_one(
     commands: &mut Commands,

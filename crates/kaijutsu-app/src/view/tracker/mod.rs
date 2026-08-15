@@ -621,6 +621,9 @@ pub(crate) fn sync_tracker_columns(
 /// [`DOT_CAP`] attached-context dots, `R` row-line quads (phrase rows on
 /// `phrase_material`, the rest on `row_material`), the playhead quad, and
 /// the (hidden, dive-LOD) header plate.
+// Same shape as the fsn spawn helpers: a manual (non-system) spawn carries
+// asset tables and scene context by hand instead of via SystemParam
+// injection, plus the track/scroll state specific to one column.
 #[allow(clippy::too_many_arguments)]
 fn spawn_column(
     commands: &mut Commands,

@@ -175,6 +175,9 @@ pub struct MatchReport {
 ///
 /// Returns `Ok(None)` for "no profile claims this port", `Err(devices)` for a
 /// refused tie, `Ok(Some(..))` for a confident match.
+// The nested Option/tuple IS the three-way result the doc above describes
+// (no match / tie / confident match-with-optional-detail) — a type alias
+// would just rename this signature, not simplify it.
 #[allow(clippy::type_complexity)]
 pub fn match_port<'a>(
     profiles: &'a [DeviceMatch],

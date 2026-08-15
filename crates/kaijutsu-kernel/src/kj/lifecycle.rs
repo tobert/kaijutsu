@@ -378,6 +378,9 @@ fn run_md_script(
     }
 }
 
+// Three disjoint groups: the new context's identity (new_id/parent_id/
+// fork_kind/drift_info), the script's own identity (verb/script/child_depth),
+// and who's running it (extra_vars/principal) — none share a natural owner.
 #[allow(clippy::too_many_arguments)]
 async fn run_kai_script(
     dispatcher: &KjDispatcher,

@@ -133,6 +133,9 @@ impl MusicGeometryRenderer {
     /// `encoder` (no submit — batched with the caller's other MSDF work).
     /// `clear` mirrors `MsdfBlockRenderer::encode_render`'s convention:
     /// `true` when nothing has drawn to this texture yet this frame.
+    // Bevy render-graph plumbing (device/encoder/pipeline_cache/gpu_images)
+    // plus the actual draw inputs — the render API dictates this shape, not
+    // an accretion a builder would clean up.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_render(
         &self,

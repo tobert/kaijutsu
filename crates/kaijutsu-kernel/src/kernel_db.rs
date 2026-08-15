@@ -1197,6 +1197,7 @@ fn parse_optional_context_id(
 /// than wrapped into a nonsense cadence (`0 - 1` would surface as `u64::MAX`).
 /// The single construction path both `get_track` and `list_tracks` funnel
 /// through, so neither read API can skip the check.
+// One argument per raw `tracks` row column, pre-validation.
 #[allow(clippy::too_many_arguments)]
 fn validated_track(
     track_id: String,

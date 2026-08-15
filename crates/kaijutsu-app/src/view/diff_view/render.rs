@@ -255,6 +255,9 @@ fn window_for(
 }
 
 /// Lay the active session out into glyphs, bands, and cursor geometry.
+// Bevy system signature: every parameter is a `Res`/`Query` the scheduler
+// injects, not a call-site argument list — see main.rs's "Bevy ECS idioms"
+// note.
 #[allow(clippy::too_many_arguments)]
 pub fn build_diff_surface(
     active: Res<ActiveDiffView>,
