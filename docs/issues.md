@@ -72,6 +72,36 @@ each correct for an ordinary context, and the root is not one. More careful
 procedure will not fix this — the specialness has to become structural or it
 will keep being rediscovered by whatever generic pass runs next.
 
+**The shape is settled (Amy, 2026-08-15):** *"I had thought to make it a dag
+but the data is naturally a forest and drifts create cycles if you count them.
+So, yeah, pinned or anchored contexts."* So: **a forest of one-parent trees,
+with drift as a separate overlay that is deliberately NOT part of the
+structural graph.** The code already agrees — `KernelDb::insert_edge` runs
+`would_create_cycle` **only** for `EdgeKind::Structural`, leaving drift edges
+exempt by construction. That is the invariant to keep: structure stays
+acyclic because it is a forest, and drift is allowed to be cyclic because
+nothing walks it as structure.
+
+**Anchors are seats, not workspaces** — Amy's practice, and an open question
+about enforcing it: *"my practice, maybe we should enforce, will probably be
+to leave the anchors mostly unused, and create children of them for doing
+stuff."*
+
+The argument FOR enforcing is stronger than tidiness, and it is **fork cost**:
+an anchor is the thing you fork from, and `kj fork` copies history by default
+(see the fork-filters entry), so every block that lands in an anchor is paid
+for again by every descendant, forever. The old ROOT had **90 blocks** — each
+fork carried them. An unused anchor is not just clean, it is cheap, and the
+cost of violating the convention is invisible at the moment you violate it
+(you pay later, in every child). That is exactly the shape of rule worth
+enforcing rather than remembering.
+
+Partial enforcement already exists and is worth not re-deriving: the
+`director` loadout has no drive/fork authority, so ROOT structurally *cannot*
+drive turns already (`rpc.rs` genesis comment). The open question is narrower
+than it looks — whether `anchored` should *imply* that loadout restriction, or
+stay orthogonal to it.
+
 **Two things worth deciding before designing anything:**
 
 1. **One tree or a forest? This has never actually been decided — it was
@@ -144,6 +174,23 @@ with #1 that is a live landmine: **the current ROOT (`f0a66870`) is a
 structural child of a `cc-kaijutsu-*` session context**, so archiving that
 session — which the 3-hour rule will eventually do — cascades into ROOT.
 Wants either a `--detached` flag or a `--parent` sentinel.
+
+**2b. `kj context move` is NOT atomic — a REFUSED move orphans the context it
+refused to move.** `context_move` deletes every existing structural parent edge
+first, then calls `insert_edge`, which is where cycle detection lives — with no
+transaction around the pair. So a rejected move has already destroyed the old
+edge. **Proved live 2026-08-15**, not inferred: created `cyc-parent` with a
+child, ran `kj context move cyc-parent cyc-child`, got the correct
+`cycle detected: adding this edge would create a cycle` — and the tree then
+rendered `cyc-parent` at top level with its real parent edge gone. A failed
+operation left the tree changed.
+
+Two consequences. It is a plain data bug (wrap the delete+insert in one
+transaction, or check the cycle *before* deleting). And it is currently the
+**only** way to produce a detached context from `kj` — via a failure path —
+which is a wry confirmation of #2: the forest is representable and renderable
+(the orphan displayed correctly as a root), and the CLI simply cannot ask for
+it deliberately.
 
 **3. An archived context still holds its label, so the label is
 simultaneously "in use" and "not found".** `kj context create ROOT` →
