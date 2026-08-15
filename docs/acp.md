@@ -33,9 +33,11 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | ACP v1 | kaijutsu | status |
 |---|---|---|
 | ACP `SessionId` | `ContextId` hex (`rank::session_id_of`) | durable; survives restarts, no side table |
-| `session/new` | `resolve_context_label` upsert → `create_context_typed(label, "coder")` → `join_context` | built |
-| `session/load` | parse session id → `join_context` + replay transcript as updates | built |
-| `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1 | built (ring stamps are on the wire — see below) |
+| `session/new` | `resolve_context_label` upsert → `create_context_typed(label, "coder")` → `join_context` | built; requested `cwd` is not persisted yet |
+| `session/load` | parse session id → `join_context` + replay transcript as updates | built; requested `cwd` is not applied yet |
+| `session/resume` | attach without transcript replay | planned; stable ACP v1 in the pinned schema |
+| `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1 | built; currently reports the bridge cwd for every session |
+| `session/delete` | archive the kj context | planned |
 | `session/prompt` | `get_input_state` → `edit_input(0, text, len)` → `submit_input(ctx, false)` | built; text-only |
 | turn end → `stopReason` | `ServerEvent::TurnCompleted{stop_reason}` (1:1 by construction) | built |
 | turn broke | `ServerEvent::TurnFailed` → JSON-RPC error, **not** a stop reason | built |
@@ -45,7 +47,158 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/request_permission` | `ActorHandle::take_permission_asks` → `permission::run_permission_pump` → `contextId` → ACP session (`rank::session_id_of`) → real round trip; fail-closed on no session/client error/timeout | built |
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the CRDT mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
+| `session/update` commands / usage / mode / config | kj actions, context usage, casts/presets/config | planned |
 | `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
+
+## Direction: ordinary ACP clients should just work
+
+The bridge is no longer waiting on the basic turn loop. The next arc is
+interoperability: fill out the commonly used stable v1 surface, preserve
+kaijutsu's context semantics underneath it, and try more ACP clients as each
+hunk lands. Toad is the current flight client; Happy is the next ecosystem to
+study. A broader functional-client matrix comes later, after the surface is
+less visibly incomplete.
+
+### Session identity and forks
+
+**One ACP session binds one kj context id.** The session id remains the
+context id's hex form. A fork creates a new context and therefore a new ACP
+session; the parent session does not silently follow or retarget to the child.
+The user can select the child in the session browser, while both parent and
+child remain independently addressable. If ACP's unstable `session/fork`
+stabilizes, its natural response is simply the child context's session id.
+No chain identity or adapter side table is needed.
+
+`session/load` replays the existing transcript. Stable-v1 `session/resume`
+attaches the same context but streams only new activity. `session/delete`
+archives the context in kj, stops/unbinds its ACP pump, and removes it from
+`session/list`; it does not hard-delete context data.
+
+### Cwd: ACP attachment meets durable kaish state
+
+ACP supplies an absolute `cwd` on `session/new`, `session/load`, and
+`session/resume`. Kaijutsu already has the right execution model underneath:
+`context_shell.cwd` is durable context state, and every model, tool, hook, or
+interactive shell invocation materializes a fresh kaish seeded from it. An
+agent therefore does not need to prefix every shell command with
+`cd /path/to/project` merely to recover its project directory.
+
+The translation rule is: **the ACP client's cwd is authoritative at an ACP
+attachment boundary; kaish cwd is durable and mutable while that attachment
+is live.**
+
+- `session/new(cwd)` validates the path through kaish's actual VFS namespace
+  and persists it before the first prompt.
+- `session/load(sessionId, cwd)` attaches, then deliberately resets the
+  context's durable cwd to the requested path before replaying history.
+- `session/resume(sessionId, cwd)` performs the same reset, then starts a live
+  pump without replay.
+- `session/list` reports each context's persisted cwd, never one process-wide
+  bridge cwd.
+- A relative path or a path that is not a directory in the context's VFS is a
+  request error. There is no silent fallback to `/docs`, `$HOME`, or the
+  bridge process cwd.
+
+The reset is shared context state: opening a context from an ACP client can
+move the cwd seen by another connected player. That is intentional under the
+shared-trust model and should be visible in logs. If real use later demands a
+stable project root *and* an independently movable shell cwd, the durable
+project root belongs in kaijutsu's workspace model, not in ACP-only metadata.
+
+The current Cap'n Proto `getCwd`/`setCwd` calls are connection-scoped: they
+operate on whichever context the connection last joined. That is unsafe for
+an ACP bridge multiplexing several sessions over one actor. Do not implement
+this by injecting `cd` or `kj context set`. Add explicitly addressed
+`getContextCwd(contextId)` / `setContextCwd(contextId, path)` RPCs, reuse the
+existing kaish/VFS validation and `context_shell` persistence, and expose
+them through `kaijutsu-client`. This keeps cwd mutation atomic with respect to
+the named context instead of ambient connection state.
+
+### Commands, modes, and configuration
+
+ACP `available_commands_update` is a natural projection of kj's human-facing
+command surface. Publish a **curated, loadout-aware catalog**, not a blind
+dump of every administrative verb. Likely first commands are context/fork,
+cast, model, tasks, archive, and help. Invocation should reach the same kj
+operation and shared approval gate as every other surface; ACP does not grow
+a second command or permission system. Command descriptions and arguments
+should ultimately derive from kj's command metadata so the two help surfaces
+cannot drift.
+
+Keep the three ACP affordances distinct:
+
+- **modes** are persistent operating stances, naturally backed by casts,
+  presets, or context type;
+- **configuration options** are selectable session settings such as model or
+  consent mode;
+- **available commands** are one-shot kj actions.
+
+Do not advertise modes or configuration until their set methods and update
+notifications are truthful. `usage_update` should project context-window and
+cost information already known by the kernel; Toad and Happy both have useful
+UI for these updates.
+
+### Client identity and parity
+
+`initialize.clientInfo` currently disappears. Retain it and derive the same
+kind of stable client identity used by the native Claude Code and Codex
+integrations where their semantics overlap. An ACP connection should attach
+to the peer registry with a nick such as `acp/toad`, and client identity
+should feed the existing `/etc/client` cascade and eventual preset/cast
+selection. Identity is ergonomic routing and presence, not a security
+boundary.
+
+### Rich prompt content
+
+Text and resource-link markers work today; image, audio, and embedded-resource
+capabilities are honestly advertised as false. The kernel now handles several
+media forms, but reaching it from ACP needs an end-to-end content path rather
+than base64 flattened into prompt text. Treat this as its own larger arc:
+content ingestion and storage, block representation, provider projection,
+transcript replay, size limits, and capability advertisement must agree.
+
+### Delivery and correlation correctness
+
+Two prototype compromises remain behind the otherwise working turn loop:
+
+- `TurnCompleted` has no turn id, so two simultaneous interactive turns in
+  one context can cross-wire their prompt responses.
+- prompt echo suppression is armed by timing before `submit_input` returns its
+  block id; a sibling user block landing in that window can be swallowed.
+
+Both want addressed identity on the originating write/turn, not another
+timing heuristic.
+
+## Remaining work, in shippable hunks
+
+The order is deliberate but not a monolithic project plan. Each hunk should
+land with its own protocol dispatch tests, kernel/client seam tests, docs, and
+a Toad flight before the next one needs to start.
+
+1. **Addressed cwd + resume.** Add context-addressed cwd RPCs; persist new
+   session cwd; reset it on load/resume; report per-context cwd; implement and
+   advertise stable-v1 `session/resume`. Test two ACP sessions on one actor so
+   cwd can never land on the ambient/wrong context.
+2. **Archive through `session/delete`.** Archive idempotently enough for
+   client retries, unbind the live pump, and advertise delete support.
+3. **Client identity and presence.** Retain `clientInfo`, attach `acp/<name>`
+   as a peer, and feed the client-config/preset machinery with parity to the
+   native Claude Code and Codex integrations where appropriate.
+4. **Commands and usage.** Emit a curated kj-backed command catalog and usage
+   updates. Route invoked actions through the existing kj implementation and
+   shared approval gate.
+5. **Client-declared MCP servers.** Call the already-built external MCP
+   substrate for `mcpServers` on new/load/resume; define lifecycle, reconnect,
+   duplicate-name, and teardown semantics before advertising transports.
+6. **Modes and config options.** Project casts/presets/context type and useful
+   settings; implement both client-set methods and asynchronous updates.
+7. **Rich prompt content.** Carry resources and media end to end, then turn on
+   only the capabilities proven by that path.
+8. **Turn/write correlation.** Add turn identity and addressed prompt-block
+   identity, deleting the ordering match and echo-suppression race.
+9. **Compatibility flights.** Keep Toad as the fast manual loop, add Happy,
+   then consider a small independent client (Python is a good candidate) for
+   black-box functional tests once the common surface is present.
 
 ## Session picker = the rank
 
@@ -258,11 +411,11 @@ in practice.
 
 **Gaps found while building** (also in issues.md):
 
-- **No catch-up after a resync.** On `SyncReset`/lag/reconnect the pump
-  rebuilds the mirror and re-pegs the mapper *silently* — anything that
-  changed during the gap never reaches that client. Replaying instead would
-  duplicate the whole transcript. Logged at `warn`; the real fix is the same
-  catch-up story the turn-events work deferred.
+- ~~**No catch-up after a resync.**~~ **SHIPPED 2026-08-05.** The mapper keeps
+  its high-water marks while the mirror rebuilds, then emits exactly the gap.
+  Quiet-poll turn recovery and the trailing-edge sweep remain dormant
+  defence-in-depth after the kernel FlowBus backpressure fix; remove them
+  together only after real ACP flights show that neither fires.
 - **`TurnCompleted` has no turn id.** The prompt wait matches on
   `context_id` + `TurnOrigin::Interactive`, which is correlation by ordering.
   Two interactive turns racing in one context would confuse it. Already noted
@@ -271,10 +424,11 @@ in practice.
 - **`kaijutsu-mcp`'s `write_input` deletes by byte length** (`lib.rs:1434`,
   `state.content.len()`), so a non-ASCII input doc is corrupted or truncated.
   `kaijutsu-acp` uses `chars().count()`. mcp should too.
-- **`session/delete`, `session/set_mode`, `session/set_config_option`** are
-  stable v1 and unimplemented. `set_mode` maps naturally onto `context_type`
-  / cast roles; `delete` onto `conclude`/`archive`. Not advertised, so a
-  client will not call them.
+- **Stable session controls remain incomplete.** `session/resume`,
+  `session/delete`, `session/set_mode`, and `session/set_config_option` are in
+  the pinned v1 schema and unimplemented. Delete maps to archive (not
+  conclude); resume attaches without replay. Modes/config are not advertised,
+  so a conforming client will not call their setters yet.
 - **Prompt content is text-only.** Image/audio/embedded-resource blocks are
   turned into a `[… omitted]` marker rather than dropped in silence, and the
   capabilities say `image: false, audio: false, embedded_context: false`.
@@ -361,15 +515,11 @@ principal-major and would scramble both plan order and subtask nesting
 (`gotcha_blockid_vs_document_order` — the same trap this crate's other
 block-ordered reads already avoid).
 
-**Known gap, not fixed here**: `session::run_pump`'s `BlockDeleted` arm
-calls `mapper.forget(block_id)` and `continue`s *without* calling
-`doc.apply_event(&event)` — so the live `SyncedDocument` mirror never
-actually drops a deleted block; it lingers until the next resync rebuilds
-the mirror from scratch. This predates the Task work and affects every
-block kind identically, not just tasks — a deleted Task block (`kj block
-delete` on the underlying generic block, since `builtin.tasks` itself
-has no delete verb) will not disappear from a live plan until the next
-resync/reconnect. Logged in `docs/issues.md`.
+**Deletion bug found here, fixed in `833f951c`.** `session::run_pump`'s
+`BlockDeleted` arm once forgot the mapper mark but skipped
+`doc.apply_event(&event)`, leaving deleted blocks in the live mirror until a
+resync. The arm now applies the deletion before rebuilding a Task plan; Task
+and non-Task cases are both pinned by tests.
 
 ## Manual smoke test (live kernel)
 
@@ -450,18 +600,23 @@ Remote transport (HTTP/WS) is an Active RFD — irrelevant to us; SSH
 
 ## Open questions
 
-- One ACP session per kj context is the obvious mapping — but does a session
-  want to *follow* a context through fork rolls (EvictionIndex generations),
-  or bind to a single context id? Leaning: follow the chain, it's what a
-  phone user means by "the conversation." **The prototype binds a single
-  context id** and makes the session id *be* that context id, which is what
-  made `session/list` → `session/load` work with no side table. Following the
-  chain means the session id can no longer be the context id — it would have
-  to name a chain, and the picker would have to show chains. Worth doing, but
-  it is a data-model change, not an adapter change.
-- Permission UX on mobile: ACP `session/request_permission` vs. kj's
-  shared-trust stance — the adapter may be where graduated trust first gets
-  real teeth.
+The context/fork identity question is settled above: one ACP session stays
+with one context, and a fork appears as another selectable session. Questions
+that remain genuinely open:
+
+- Which subset and argument shape makes the first useful loadout-aware kj
+  command catalog? Do not freeze an ACP-only command vocabulary before reading
+  the existing kj metadata closely.
+- Which kaijutsu concept should be the primary ACP mode: cast, preset, or a
+  smaller curated projection across both? Context type is lifecycle identity
+  and may be too structural to expose as an ordinary mode switch.
+- Should an ACP attachment always reassert cwd even when sibling activity is
+  live, or should the bridge warn/refuse when a turn is currently executing?
+  Start with the deterministic reset rule above; revisit only after a real
+  collision, not in anticipation.
+- Permission UX on mobile: ACP `session/request_permission` now works, but the
+  shared approval ledger will eventually need an inline ACP projection that
+  stays one system with kj/CLI/app approval management.
 - Happy's relay architecture (E2E-encrypted sync server) vs. plain
   ACP-over-local-bridge: if we want push notifications to the phone, we may
   end up wanting a relay too. Study the clone before deciding.
