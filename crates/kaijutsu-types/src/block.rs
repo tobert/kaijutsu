@@ -2501,6 +2501,17 @@ impl BlockSnapshotBuilder {
         self
     }
 
+    /// Override the default `created_at` (`new()` seeds it with
+    /// `crate::now_millis()`, correct for a block being authored right now).
+    /// Use this when reconstructing a snapshot whose real creation time is
+    /// already known — e.g. decoding one off the wire (kaijutsu.capnp
+    /// `createdAt` @6) — so the wallclock-at-parse-time default doesn't
+    /// silently stand in for it.
+    pub fn created_at(mut self, created_at: u64) -> Self {
+        self.snap.created_at = created_at;
+        self
+    }
+
     pub fn tool_kind(mut self, tool_kind: ToolKind) -> Self {
         self.snap.tool_kind = Some(tool_kind);
         self
