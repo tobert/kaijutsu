@@ -1743,6 +1743,39 @@ and a version that fails to advance are all errors. Its own tests immediately
 caught a stale-index bug in the move path, which is the argument for building it
 that way, made without anyone having to make it.
 
+### What the clients gave up (August 15, night)
+
+All three clients moved onto the feed the same evening, and the striking thing
+is how much each deleted. ACP lost a five-second sweep that existed to paper
+over silently dropped events, a connection-status resync, and its whole
+event-routing layer. The app lost a generation counter and the periodic scan
+that asked "has anything gone stale?". None of that was accidental complexity —
+each piece was load-bearing for a replica that could quietly diverge with
+nothing to announce it. A feed that says *resubscribed*, *terminated*, or
+*desynced* out loud leaves a staleness poll with nothing to look for.
+
+Two things were learned by building rather than by planning.
+
+The first was a bug, and it needed no concurrency at all. The version was
+attached to a *delivery* while the recovery rule was written per *event* — and a
+delivery is a batch. A burst of five mutations is one message, a client's
+snapshot can be served in the middle of it, and then the client must take all
+five or none: taking all replays what the snapshot already holds, taking none
+loses the rest. A review by a second model found it, and it reproduced on the
+first try as a duplicated string. The fix is small — every event carries its own
+version — but the shape of the mistake is worth keeping: the unit the protocol
+counted in was not the unit the rule reasoned about.
+
+The second is where the migration stopped. After every client moved, nothing in
+the system decodes a text-engine operation off the wire anymore. Yet the old
+event cannot be deleted, because one consumer still wants it — the time well's
+activity glow, which counts events as a pulse and never looks inside them. The
+app has been receiving every token of every context, kernel-wide, to decide how
+brightly to shine. It is the last dependency on the old surface and it is not a
+migration at all; it is a missing three-field event. There is something apt
+about a project spent replacing an encoding with meaning discovering that its
+final holdout wanted neither.
+
 A third thing happened alongside, prompted by Amy reading the test output rather
 than the code: *"did I see tests accessing my ~ XDG path?"* She had. The shipped
 default `mcp.toml` carried a server entry pointing at her own kaibo build, and
