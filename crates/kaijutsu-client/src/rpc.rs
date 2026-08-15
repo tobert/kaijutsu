@@ -1086,6 +1086,24 @@ impl KernelHandle {
         })
     }
 
+    /// Fetch just the projected revision of a context's block document — the
+    /// semantic counterpart to `get_context_sync`'s `version` field, without
+    /// the oplog bytes. For callers that only need staleness/gap detection
+    /// and would otherwise decode a `SyncState` just to throw the ops away.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_version")]
+    pub async fn get_context_version(&self, context_id: ContextId) -> Result<u64, RpcError> {
+        let mut request = self.kernel.get_context_version_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_version())
+    }
+
     // =========================================================================
     // LLM operations
     // =========================================================================

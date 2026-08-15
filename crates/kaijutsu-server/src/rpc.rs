@@ -6353,6 +6353,36 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    /// Semantic counterpart to `get_context_sync`'s `version` field, minus
+    /// the oplog bytes: reads `DocumentEntry::version()` directly and
+    /// serializes nothing else. Clients that only need staleness/gap
+    /// detection use this instead of decoding a `SyncState` they'd otherwise
+    /// throw away — see `docs/crdt-position-2026-08.md`.
+    fn get_context_version(
+        self: Rc<Self>,
+        params: kernel::GetContextVersionParams,
+        mut results: kernel::GetContextVersionResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_version").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        let documents = &self.kernel.documents;
+        let version = pry!(
+            documents
+                .version(context_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        );
+
+        results.get().set_version(version);
+
+        Promise::ok(())
+    }
+
     fn subscribe_blocks_filtered(
         self: Rc<Self>,
         params: kernel::SubscribeBlocksFilteredParams,

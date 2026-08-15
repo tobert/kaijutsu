@@ -932,16 +932,18 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Blocks (document order) plus the document's version, paired because
-    /// there is no cheap standalone version RPC. Local reads both off the
-    /// in-process `BlockStore` directly. Remote makes one `get_context_sync`
-    /// call — the same RPC `execute_and_poll_shell`'s Phase 2 already uses
-    /// to decode an authoritative snapshot — and decodes it into a
-    /// throwaway `SyncedDocument` (there is no mirror left to race with —
-    /// `RemoteState.synced` is gone, docs/crdt-position-2026-08.md slice 4).
-    /// `SyncState` already carries `version` on the wire, so that's read
-    /// straight off the RPC reply rather than re-derived from the decoded
-    /// document.
+    /// Blocks (document order) plus the document's version. Local reads both
+    /// off the in-process `BlockStore` directly. Remote pairs the existing
+    /// `context_blocks` (`get_all_blocks`) with the projected `get_context_version`
+    /// RPC — no CRDT bytes cross the wire for this call at all, so there is
+    /// nothing here to decode. This used to fetch `get_context_sync` and
+    /// throw away a `SyncedDocument` built purely to read its block list;
+    /// `getContextVersion` exists so a caller that only wants the semantic
+    /// facts (blocks, version) never needs the oplog in the first place.
+    /// `execute_and_poll_shell`'s Phase 2 still decodes a `SyncedDocument`
+    /// from `get_context_sync` — it needs the CRDT snapshot itself (a
+    /// throwaway, sole-writer-safe read of one block), which is a different
+    /// shape of problem than this function's.
     async fn context_blocks_and_version(
         &self,
         ctx: ContextId,
@@ -951,14 +953,19 @@ impl KaijutsuMcp {
                 Ok(store.get(ctx).map(|e| (e.doc.blocks_ordered(), e.doc.version())))
             }
             Backend::Remote(remote) => {
-                let state = remote
+                let Some(blocks) = self.context_blocks(ctx).await? else {
+                    // `context_blocks`'s Remote arm never returns `Ok(None)`
+                    // (a missing context surfaces as `Err`) — this arm exists
+                    // only so this function stays honest about that type
+                    // rather than assuming it.
+                    return Ok(None);
+                };
+                let version = remote
                     .actor
-                    .get_context_sync(ctx)
+                    .get_context_version(ctx)
                     .await
-                    .map_err(|e| format!("Error syncing context {ctx}: {e}"))?;
-                let doc = SyncedDocument::from_sync_state(&state, self.session_principal)
-                    .map_err(|e| format!("Error decoding context {ctx} sync state: {e}"))?;
-                Ok(Some((doc.blocks(), state.version)))
+                    .map_err(|e| format!("Error reading version for context {ctx}: {e}"))?;
+                Ok(Some((blocks, version)))
             }
         }
     }
