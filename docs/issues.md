@@ -59,6 +59,63 @@ a fresh `instance` or the same one?) outside this task's scope.
 
 ---
 
+## Managing roots — the concept kaijutsu is missing (Amy, 2026-08-15: "eventually we need to come up with a way to manage these roots")
+
+Seeded from replacing ROOT, where the three edges below each nearly killed the
+new root inside twenty minutes. The pattern under them is one thing:
+
+**"ROOT" is pure convention — a label plus a promotion — while every generic
+mechanism treats it as an ordinary context.** Archive cascade took it. The
+3-hour sweep would have taken it (29 days idle). Label uniqueness locked its
+own name against reuse. None of those are bugs in *those* mechanisms; they are
+each correct for an ordinary context, and the root is not one. More careful
+procedure will not fix this — the specialness has to become structural or it
+will keep being rediscovered by whatever generic pass runs next.
+
+**Two things worth deciding before designing anything:**
+
+1. **One tree or a forest? This has never actually been decided — it was
+   defaulted into.** `kj context create` resolves an absent `--parent` to the
+   caller's context, so everything ends up in one tree descending from
+   whatever ran the command. Genesis creates ROOT with `parent = None`, so a
+   forest is *representable* and simply unreachable from `kj`. Are several
+   live roots wanted (work / music / household, each its own tree), or one at
+   a time with generations succeeding each other? Amy's phrasing — *"fork it
+   to a new clean generation and archive it"* — points at succession, but the
+   two are not exclusive.
+2. **Is a root a seat of authority or a container of work?** Today it is the
+   former: binding-admin, `director` loadout, deliberately *cannot* drive
+   turns, forked-from rather than worked-in. That is why it sits idle for a
+   month and why every activity-based heuristic reads it as dead. If that
+   holds, then **idleness is a root's normal state**, and any liveness or
+   recency signal is structurally the wrong instrument to point at one.
+
+**The connection worth not missing: the janitor needs this exact concept.**
+Whatever marks "never reap this" for a root is the same marker a janitor must
+consult (see the janitor/librarian entry). Solve them separately and we build
+two overlapping mechanisms that disagree at the edges. Solve the root marker
+first and the janitor inherits its safety rule for free.
+
+**Two shapes, cheapest first:**
+
+- **A — an `anchor` bit, no new noun.** A context can be anchored: parentless
+  by construction, cascade stops there (never archived as a descendant),
+  never swept by age. `kj context create --detached` sets it. Roots become
+  "anchored director contexts", multiple are allowed, and the forest falls out
+  without being designed. Fixes all three edges below and gives the janitor its
+  rule. Note **promotion is NOT already this** — the new ROOT was promoted
+  before the archive and the cascade took it anyway.
+- **B — a `kj root` verb family** over A: `root new` doing the whole
+  succession dance atomically (create detached → promote → retag → retire the
+  previous), `root list` showing generations, `root retire`. Worth it because
+  that dance is five latched steps and getting the order wrong is what
+  destroyed a context today — but only once A exists.
+
+Recommendation: **A now, B when there is a second reason to want it** ("start
+with less, it's easier to add more than take away"). Not scheduled.
+
+---
+
 ## Context lifecycle — three sharp edges found while replacing ROOT (2026-08-15)
 
 Found the expensive way, replacing ROOT with a fresh deepseek-v4-flash
