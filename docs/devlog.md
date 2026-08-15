@@ -1494,3 +1494,98 @@ signal aimed at the wrong audience, a specialness that lives only in a label.
 And the loop is not decoration: the fact that prevented the day's one
 irreversible mistake was held by the human, because the instrument had no way
 to represent it.
+
+## The melt begins, and finds two armed fields (August 15)
+
+The CRDT position paper had already ruled: one authoritative kernel sequencer,
+rich RPC authoring, projected event streams, no client dependency on the text
+engine. What began this day was the migration itself, and it went one step past
+the paper — replacing CRDT-shaped durable storage wherever semantic kernel
+operations are sufficient, rather than only closing the client boundary.
+
+Amy's rulings came first, because the config half could not start without them.
+The four config roots melt into one git worktree, one commit per accepted
+mutation — the git log *is* the config oplog, which is the whole reason to
+prefer files over documents. Seeding stays bootstrap-only through the migration:
+a deleted file stays deleted, new shipped defaults do not appear, and the
+migration does not also introduce tombstones. And no client outside the repo
+uses the raw push/sync RPCs, so they could be frozen outright instead of
+carrying an open-ended compatibility promise.
+
+One ruling was a correction. The plan had made honest per-mutation provenance a
+precondition for the git work, since a commit is supposed to record who asked.
+Amy declined the gating: *"I don't think the principal plumbing should gate the
+git work. Let's make a local note to do a sweep across the code and look at
+principal plumbing holistically."* The gap is real but it is a pattern across
+seams, not a config bug, and fixing it under whichever lane happens to be
+standing there fixes it in exactly one place.
+
+### Phase 2, and the comment that kept it alive
+
+The MCP shell-completion path had two phases. Phase 1 waited for a tool result
+to reach terminal status; Phase 2 then pulled the entire context snapshot,
+decoded the oplog into a throwaway document, and re-read the same block. Its
+comment justified the second read carefully: content, exit code and status ride
+three independently-reorderable topics, so an observed terminal status does not
+prove the rest has replicated.
+
+The argument was sound. It was also about a local mirror that the August 13
+demolition had already replaced with an authoritative server query — a fact
+visible in the variable still named `local`. Phase 1's result had been complete
+for two days. The comment kept arguing for machinery that no longer fed it, and
+because the argument read as current, nobody re-derived it.
+
+Two independent traces — an outside model reading the real code, and the
+implementing agent — checked field parity, write ordering, lock coverage and
+output caps before anything was removed, and agreed. Phase 2 was deleted rather
+than reimplemented, and with it the last production oplog decode in the MCP
+crate. The lesson generalizes past this one function: a stale comment is not
+cosmetic debt, it is a false premise parked where the next reader will pick it
+up. Two more were found and corrected the same day, one of them citing three
+schema ordinals that were all wrong.
+
+### The fields nobody read
+
+The audit that mattered came out of a throwaway question — whether a projected
+block query returns the same snapshot as a decoded sync payload. Field for
+field, almost. Two exceptions: `excluded` and `created_at` were both serialized
+by the server and never read back by the client. Every block that arrived over
+the projected path reported itself as not excluded, and reported the moment it
+was parsed as the moment it was created.
+
+Neither was doing damage, and that is precisely why they had survived. The app
+and ACP still read blocks off the sync payload, which carries both fields
+correctly. But the remaining work in this lane is moving those two clients onto
+projected queries — which would have converted both gaps, on the same day, into
+silent loss of user-curated exclusions and the corruption of every block's
+creation time. The time well seats contexts on rings by idle age; exclusions are
+an explicit invariant of the migration.
+
+So: a wire field that no client currently reads is not dormant. It is armed, and
+the migration is what pulls the pin. Both were fixed before the clients moved,
+and a full field-by-field sweep confirmed they were the only two — with the
+nested payload structs recorded honestly as spot-checked rather than audited.
+
+The zero case for `created_at` got its own decision, and it is the house style
+in miniature: propagate a zero faithfully rather than substituting "now". A
+visibly absurd 1970 timestamp is debuggable. A silent substitution makes an
+upstream defect indistinguishable from a correct fresh block.
+
+### A flake that was not one
+
+A kernel test was failing on main, and the first agent to meet it reported a
+pre-existing flake. The claim was true and the explanation was not. The test
+asserts that `mount` runs and exits zero in an exec-granted shell; `mount` on
+that host prints fifteen kilobytes against an eight-kilobyte output cap, and
+kaish remaps a capped command's exit code to signal the truncation. The test was
+reproducing a real bug, and it passes anywhere `mount` happens to print less —
+which is exactly why it reads as noise.
+
+Following it found the durable half. An earlier investigation had concluded that
+the tool-facing callers were safe, on the strength of one call site that consults
+the preserved original code. The path that writes the durable record does not:
+a command that exits zero but prints past the cap records a failure code on its
+result block, permanently, while its status still reads as done. Wrong data, at
+rest, wearing a healthy status — filed rather than patched, because the fix
+belongs with whoever also makes that test's dependence on the host's mount table
+explicit instead of incidental.
