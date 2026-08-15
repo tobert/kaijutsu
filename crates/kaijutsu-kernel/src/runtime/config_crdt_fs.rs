@@ -382,7 +382,11 @@ impl ConfigCrdtFs {
 /// Normalize an absolute path string: collapse `//`, drop `.`, resolve `..`
 /// (popping the prior segment). Returns a clean absolute path (`/a/b/c`). Used
 /// to canonicalize a symlink target before keying its document.
-fn normalize_abs(path: &str) -> String {
+///
+/// `pub(crate)` so [`crate::config_export`] can apply the identical
+/// escape-check math when re-validating a materialized symlink on import —
+/// one normalization rule, not two that could drift apart.
+pub(crate) fn normalize_abs(path: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for seg in path.split('/') {
         match seg {
