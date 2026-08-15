@@ -550,6 +550,8 @@ toad acp '/home/atobey/src/kaijutsu/target/debug/kaijutsu-acp --connect --host z
 What to check, in order:
 
 1. **initialize** — toad connects and shows the agent as `kaijutsu-acp`.
+   `kj peer list` should show `acp/toad`; after toad disconnects, that peer
+   should disappear when the SSH connection is torn down.
 2. **session picker** — the sessions listed are ring 0 in seat order, then
    ring 1. Compare against `kj context list` (ring-0 rows carry `[ring0]`).
 3. **session/new** — a fresh `acp-<dir>-<secs>` context appears in the app's
