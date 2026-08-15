@@ -173,6 +173,11 @@ pub(crate) fn plan_splice(blocks: &[BlockSnapshot], keep_set: &[Range<usize>]) -
 }
 
 #[cfg(test)]
+// `plan_splice`'s `keep_set: &[Range<usize>]` genuinely takes multiple ranges
+// (see `zero_width_and_inverted_runs_drop` below, `&[0..2, 2..2, 3..1]`) — most
+// of these tests exercise it with exactly one, which is a real call shape for
+// this API, not a mistake to collapse to a bare `Range`.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use kaijutsu_types::{

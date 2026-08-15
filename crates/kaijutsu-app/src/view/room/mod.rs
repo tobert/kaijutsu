@@ -2017,6 +2017,13 @@ fn plate_shape() -> Vec4 {
 }
 
 #[cfg(test)]
+// Several tests below assert a relationship between two `const` geometry
+// values (e.g. `MARKER_HEIGHT_RESERVED < MARKER_HEIGHT`) — clippy sees a
+// compile-time-constant condition and calls it dead, but that's the point:
+// these are regression pins on hand-tuned magic numbers, verified at test
+// time so a future edit to one constant that breaks the relationship with
+// another fails loudly instead of silently drifting the scene geometry.
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 
