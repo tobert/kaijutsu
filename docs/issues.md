@@ -759,6 +759,52 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 > (we build without it, so Memory mode is our only mode and no spill path
 > exists), and the doctrine question in candidate fix #3.
 
+### 2026-08-15, later: the exposure analysis above was too narrow — a second write path corrupts the DURABLE exit code
+
+The correction above concluded "**`kj`/MCP callers are NOT affected**" on the
+strength of `mcp/servers/shell.rs:448` doing
+`result.original_code.unwrap_or(result.code)`. That is true of *that* path. It is
+**not** true of the path that writes the durable record.
+
+`execute_shell_command` in `crates/kaijutsu-server/src/rpc.rs` persists
+`result.code` directly (`rpc.rs:8544`, `set_exit_code(... exit_code_i32 ...)`
+where `exit_code_i32` comes from `result.code`). It logs `original_code` five
+lines earlier (`rpc.rs:8469-8471`) and then does not consult it. The comment
+immediately above the write says *"Persist the **real** kaish exit code on the
+ToolResult block"* — which is precisely what it does not do once output spilled.
+
+**Consequence.** Any shell command routed through the server whose output
+exceeds the 8 KB `OutputProfile::Agent` cap records `exit_code = 3` on its
+ToolResult block, permanently, for a command that exited 0. `rpc.rs:4390`
+describes that field as "the durable, authoritative" value read by MCP
+`context_shell` return, BRP introspection, and history views. So this is wrong
+data at rest, not a transient misreport.
+
+It is *not* visible as a failure, which is what let it survive: `final_status`
+matches `0 | 2 | 3 => Status::Done` (`rpc.rs:8588`), so the block looks fine and
+only the number is wrong. Silent, and in the durable record — the shape CLAUDE.md
+rejects twice over.
+
+**Fix:** the same unwrap `mcp/servers/shell.rs:448` already does, applied before
+the clamp at `rpc.rs:8543`. Keep the `0 | 2 | 3` status match as-is (it is
+independently correct), and keep `did_spill` observable — truncation should be
+*discoverable*, just not by corrupting the exit code.
+
+**There is a failing test on `main` that reproduces this**, found 2026-08-15
+while auditing an unrelated config slice:
+`kj::context_shell::tests::unknown_command_fails_fast_exec_granted_shell`
+(`crates/kaijutsu-kernel/src/kj/context_shell.rs:464`) asserts `mount` runs and
+exits 0 in an exec-granted shell. It fails on `main` on this host — `mount`
+prints 15,381 bytes here, well past the 8 KB cap, so kaish remaps the exit to 3
+and `res.ok()` is false with an empty `res.err`.
+
+**The test is host-dependent**, which is the trap: it passes wherever `mount`
+happens to print under 8 KB and fails wherever it does not, so it reads as a
+flake and will be dismissed as one. It is not a flake — it is the bug, reproduced.
+Whoever fixes the exit-code write should also make this test's dependence on
+host mount-table size explicit rather than incidental (bound the output, or
+assert on `original_code`).
+
 ### Original entry (2026-08-13), retained for its reasoning
 
 `OutputLimitConfig::agent()` (`kernel/src/runtime/embedded_kaish.rs:264`) caps
