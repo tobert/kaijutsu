@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Semantic vector indexing for kaijutsu contexts"
 
+[lints]
+workspace = true
+
 [dependencies]
 kaijutsu-types.workspace = true
 

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
+[lints]
+workspace = true
+
 [dependencies]
 kaijutsu-kernel.workspace = true
 kaijutsu-crdt.workspace = true

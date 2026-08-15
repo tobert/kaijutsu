@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "拍子木 — kaijutsu's timing substrate: timelines, cells, resolvers, speculation"
 
+[lints]
+workspace = true
+
 [features]
 # Test-only helpers exported across crates (e.g. injecting a committed cell whose
 # bytes are absent from CAS, to exercise the materializer's bail-on-missing-bytes

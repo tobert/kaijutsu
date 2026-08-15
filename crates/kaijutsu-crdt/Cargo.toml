@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Block-based CRDT document model for Kaijutsu"
 
+[lints]
+workspace = true
+
 [dependencies]
 kaijutsu-types.workspace = true
 diamond-types-extended.workspace = true

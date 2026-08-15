@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Cap'n Proto RPC client library for kaijutsu"
 
+[lints]
+workspace = true
+
 [dependencies]
 capnp.workspace = true
 capnp-rpc.workspace = true

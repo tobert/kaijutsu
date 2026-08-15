@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "D3-inspired scales and layout primitives for kaijutsu's bespoke data-driven views"
 
+[lints]
+workspace = true
+
 [dependencies]
 voronator = { version = "0.2.1", default-features = false }
 

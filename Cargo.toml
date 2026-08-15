@@ -29,6 +29,17 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/tobert/kaijutsu"
 
+# Clippy floor: `all` (style/complexity/perf/etc., warn-by-default group) is a
+# superset that includes `correctness`. Cargo resolves lint conflicts by
+# priority (higher wins, default 0), not by table order, so `correctness`
+# needs an explicit higher priority to actually win over `all` — without it
+# both sit at priority 0 and the result is unspecified/last-one-wins by lint
+# id rather than "correctness always deny". Member crates opt in via
+# `[lints] workspace = true`.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = 0 }
+
 [workspace.dependencies]
 # Internal crates
 kaijutsu-abc = { path = "crates/kaijutsu-abc" }

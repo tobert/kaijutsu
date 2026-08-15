@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Pure diff model, unified-diff dialect, and word-level refinement for kaijutsu"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # The vi-motion viewer core (`DiffCore`). Off by default and gated because

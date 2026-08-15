@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "OpenTelemetry integration for kaijutsu — tracing layer, W3C context propagation, and sampling"
 
+[lints]
+workspace = true
+
 [dependencies]
 tracing = { workspace = true }
 tracing-core = "0.1"

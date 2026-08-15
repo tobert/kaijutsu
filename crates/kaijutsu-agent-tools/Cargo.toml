@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Agent detection and session correlation for MCP servers"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
