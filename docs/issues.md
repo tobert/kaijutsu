@@ -4406,6 +4406,21 @@ the *remaining* findings, triaged.
 
 ## Testing & Tooling
 
+- **Clippy has no floor, and a warning backlog behind it (2026-08-14).** The
+  repo has no `[lints]` table, no `clippy.toml`, and no CI, so clippy is red
+  only when someone runs it by hand with `-D warnings` — which is how the
+  reconnect lane tripped over a `reversed_empty_ranges` error in a test whose
+  reversed range was the assertion (fixed with a commented `#[allow]`,
+  `b103f8b1`). Underneath it, `cargo clippy -p kaijutsu-app --all-targets`
+  reports **51 warnings (31 duplicates)**, ~20 real: `field_reassign_with_default`
+  in `view/time_well/scene.rs` tests, items-after-test-module, and 4 with
+  machine-applicable fixes. Not urgent and *not* a `--fix` sweep candidate
+  while three lanes are in flight. The real question is whether we want a
+  workspace `[lints.clippy]` floor at all — that's a standard we'd be adopting,
+  so it wants a decision, not a drive-by. Note `rustfmt` is disabled repo-wide
+  on purpose (README "Code Style"); clippy is a separate question and the
+  rustfmt rationale does not automatically carry over.
+
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
 - **`vfs::backends::local::tests::test_normal_paths_succeed` is flaky under
   full-workspace parallelism** (found 2026-08-02 verifying the compaction
