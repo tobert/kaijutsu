@@ -49,6 +49,42 @@ transcript sniffing.
 
 ---
 
+## `/v/docs` block filenames do not sort into document order (2026-08-15, Amy)
+
+Blocks are already exposed in the VFS as `/v/docs/<context_id>/<block_id>`, each
+a readable file (verified live: `cat` returns block content). But `ls` order is
+useless for reading a conversation — block ids are `<ctx>_<principal>_<seq>`, so
+lexical sort is **principal-major**, and the sequence sorts as a *string*. Real
+output: `_0, _1, _10, _11, _12, _13, _14, _15, _2`.
+
+Amy: *"we should modify the generated block filenames so they sort lexically more
+naturally. or maybe kaish could offer a way to plug default sorts into ls?"*
+
+**Recommendation: change the filenames, not kaish.** A pluggable `ls` sort
+changes a general shell contract to solve one VFS's problem, and every other
+consumer of that VFS still gets the wrong order. Encode the order in the name.
+
+`order_key` is already a **base-62 lexicographic fractional index** built for
+exactly this (`crdt/content.rs`, "Fractional index for sibling ordering"), so a
+name like `<order_key>__<short_block_id>` sorts into document order by
+construction, stays unique, and needs no shell change. Open questions before
+building it: `order_key` changes when a block moves, so the filename is not a
+stable identifier — decide whether that matters for the consumers we want (a
+subscription view probably doesn't care; a bookmark would). Also check whether
+`readdir` could simply return `block_ids_ordered()` order and whether kaish's
+`ls` preserves readdir order or re-sorts.
+
+**Why it's worth doing:** it unblocks a genuinely nice interface Amy sketched —
+netrw-style directory open, but as a *subscription*: new blocks appear at the
+top as they arrive, highlight an id to see a tail, select to open it read-only in
+vi. That needs three things and ordering is the first. The other two: a
+synthesized index so `ls` shows role/kind/status/preview instead of opaque hex
+(`RosterFs`'s `/r/index` TSV is the precedent to copy), and wiring the existing
+`onBlockInserted` feed to a VFS view. Amy sees this as "a substantial part of our
+eventual tui experience, app too".
+
+---
+
 ## Principal plumbing — a holistic sweep, not a per-lane patch (2026-08-15, Amy)
 
 Amy: *"I don't think the principal plumbing should gate the git work. Let's make
