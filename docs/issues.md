@@ -59,38 +59,309 @@ a fresh `instance` or the same one?) outside this task's scope.
 
 ---
 
-## Live roster — two things landed without, on purpose (2026-08-14)
+## Managing roots — the concept kaijutsu is missing (Amy, 2026-08-15: "eventually we need to come up with a way to manage these roots")
+
+Seeded from replacing ROOT, where the three edges below each nearly killed the
+new root inside twenty minutes. The pattern under them is one thing:
+
+**"ROOT" is pure convention — a label plus a promotion — while every generic
+mechanism treats it as an ordinary context.** Archive cascade took it. The
+3-hour sweep would have taken it (29 days idle). Label uniqueness locked its
+own name against reuse. None of those are bugs in *those* mechanisms; they are
+each correct for an ordinary context, and the root is not one. More careful
+procedure will not fix this — the specialness has to become structural or it
+will keep being rediscovered by whatever generic pass runs next.
+
+**The shape is settled (Amy, 2026-08-15):** *"I had thought to make it a dag
+but the data is naturally a forest and drifts create cycles if you count them.
+So, yeah, pinned or anchored contexts."* So: **a forest of one-parent trees,
+with drift as a separate overlay that is deliberately NOT part of the
+structural graph.** The code already agrees — `KernelDb::insert_edge` runs
+`would_create_cycle` **only** for `EdgeKind::Structural`, leaving drift edges
+exempt by construction. That is the invariant to keep: structure stays
+acyclic because it is a forest, and drift is allowed to be cyclic because
+nothing walks it as structure.
+
+**Anchors are seats, not workspaces** — Amy's practice, and an open question
+about enforcing it: *"my practice, maybe we should enforce, will probably be
+to leave the anchors mostly unused, and create children of them for doing
+stuff."*
+
+The argument FOR enforcing is stronger than tidiness, and it is **fork cost**:
+an anchor is the thing you fork from, and `kj fork` copies history by default
+(see the fork-filters entry), so every block that lands in an anchor is paid
+for again by every descendant, forever. The old ROOT had **90 blocks** — each
+fork carried them. An unused anchor is not just clean, it is cheap, and the
+cost of violating the convention is invisible at the moment you violate it
+(you pay later, in every child). That is exactly the shape of rule worth
+enforcing rather than remembering.
+
+Partial enforcement already exists and is worth not re-deriving: the
+`director` loadout has no drive/fork authority, so ROOT structurally *cannot*
+drive turns already (`rpc.rs` genesis comment). The open question is narrower
+than it looks — whether `anchored` should *imply* that loadout restriction, or
+stay orthogonal to it.
+
+**Two things worth deciding before designing anything:**
+
+1. **One tree or a forest? This has never actually been decided — it was
+   defaulted into.** `kj context create` resolves an absent `--parent` to the
+   caller's context, so everything ends up in one tree descending from
+   whatever ran the command. Genesis creates ROOT with `parent = None`, so a
+   forest is *representable* and simply unreachable from `kj`. Are several
+   live roots wanted (work / music / household, each its own tree), or one at
+   a time with generations succeeding each other? Amy's phrasing — *"fork it
+   to a new clean generation and archive it"* — points at succession, but the
+   two are not exclusive.
+2. **Is a root a seat of authority or a container of work?** Today it is the
+   former: binding-admin, `director` loadout, deliberately *cannot* drive
+   turns, forked-from rather than worked-in. That is why it sits idle for a
+   month and why every activity-based heuristic reads it as dead. If that
+   holds, then **idleness is a root's normal state**, and any liveness or
+   recency signal is structurally the wrong instrument to point at one.
+
+**The connection worth not missing: the janitor needs this exact concept.**
+Whatever marks "never reap this" for a root is the same marker a janitor must
+consult (see the janitor/librarian entry). Solve them separately and we build
+two overlapping mechanisms that disagree at the edges. Solve the root marker
+first and the janitor inherits its safety rule for free.
+
+**Two shapes, cheapest first:**
+
+- **A — an `anchor` bit, no new noun.** A context can be anchored: parentless
+  by construction, cascade stops there (never archived as a descendant),
+  never swept by age. `kj context create --detached` sets it. Roots become
+  "anchored director contexts", multiple are allowed, and the forest falls out
+  without being designed. Fixes all three edges below and gives the janitor its
+  rule. Note **promotion is NOT already this** — the new ROOT was promoted
+  before the archive and the cascade took it anyway.
+- **B — a `kj root` verb family** over A: `root new` doing the whole
+  succession dance atomically (create detached → promote → retag → retire the
+  previous), `root list` showing generations, `root retire`. Worth it because
+  that dance is five latched steps and getting the order wrong is what
+  destroyed a context today — but only once A exists.
+
+Recommendation: **A now, B when there is a second reason to want it** ("start
+with less, it's easier to add more than take away").
+
+### QUEUED by Amy 2026-08-15: *"when we're done with other things let's do the anchors and related fixups and guardrails"*
+
+Slices, in dependency order. Slice 1 is worth doing even if the anchor design
+changes — those are plain bugs, and two of them are what make the current
+tree fragile.
+
+**Slice 1 — guardrails (no new concept, all independently correct).**
+- `kj context move` in ONE transaction, or cycle-check before deleting the old
+  edge. Today a refused move orphans the context (edge 2b above, proved live).
+- The archive latch prints a **consequence**, not an inventory: "this will also
+  archive N descendant context(s)" instead of `1 children`. This is the line
+  that cost a context today.
+- Free the label on archive, or make the conflict error say the holder is
+  archived and name `retag`. Right now "already in use" and "not found"
+  contradict each other and neither points anywhere.
+
+**Slice 2 — the anchor bit.** A column (`anchored_at`, same shape as
+`promoted_at`/`archived_at`) plus three behaviours: **parentless by
+construction**, **cascade stops** (never archived as a descendant), **never
+swept by age**. `kj context create --detached` sets it. Genesis marks ROOT.
+Multiple anchors allowed — the forest falls out rather than being designed.
+Both layers, per the approval-ledger/roster precedent: a schema CHECK or
+trigger that refuses a structural parent edge into an anchored context, *and*
+the Rust check for the typed-error contract.
+
+**Slice 3 — enforcement, pending Amy's ruling.** Does `anchored` imply the
+no-drive restriction (making "leave anchors unused" structural rather than
+habitual)? Argument for is fork cost, above. Note the `director` loadout
+already provides most of it, so this may be "anchored implies director-ish"
+rather than new machinery.
+
+**Slice 4 — `kj root`/`kj anchor` verbs.** Only once 1–3 exist.
+
+**Migration, do it in slice 2:** the current ROOT (`f0a66870`) is a structural
+child of a `cc-kaijutsu-*` session context. Nothing sweeps automatically today
+so it is not urgent, but it is the live instance of the landmine — anchoring it
+must also detach it.
+
+---
+
+## Context lifecycle — three sharp edges found while replacing ROOT (2026-08-15)
+
+Found the expensive way, replacing ROOT with a fresh deepseek-v4-flash
+generation. All three are real; the first destroyed a context.
+
+**1. `kj context archive` CASCADES to structural children, and the confirm
+prompt does not say so.** The latch prints `(90 blocks | 1 children | 0 drift
+edges)` — a count, not a consequence — and then reports `archived 2
+context(s)`. I had reparented the new ROOT under the old one (to give the new
+generation honest lineage), archived the old one, and **took the new ROOT with
+it**. The blast-radius line reads like inventory; it should say what will
+happen to those children, because "1 children" and "this will archive 1 other
+context" are read completely differently at 2 lines of terminal output.
+*This matters far beyond one mistake:* a janitor sweeping on age will archive
+parents, and every descendant goes with them regardless of its own age. The
+age filter people will reason about is per-context; the effect is per-subtree.
+
+**2. There is no way to create a detached (parentless) context from `kj`.**
+`kj context create`'s `--parent` resolves to the *caller's* context when
+absent (`context_create`, "Default to root if no current context" — only
+reached when the caller has none). Genesis makes ROOT with `parent = None`
+(`rpc.rs`, `create_context_inner(..., None, ...)`), which `kj` cannot express.
+So the root of the tree can only be born at genesis; recreate it any other way
+and it descends from whatever session happened to run the command. Combined
+with #1 that is a live landmine: **the current ROOT (`f0a66870`) is a
+structural child of a `cc-kaijutsu-*` session context**, so archiving that
+session — which the 3-hour rule will eventually do — cascades into ROOT.
+Wants either a `--detached` flag or a `--parent` sentinel.
+
+**2b. `kj context move` is NOT atomic — a REFUSED move orphans the context it
+refused to move.** `context_move` deletes every existing structural parent edge
+first, then calls `insert_edge`, which is where cycle detection lives — with no
+transaction around the pair. So a rejected move has already destroyed the old
+edge. **Proved live 2026-08-15**, not inferred: created `cyc-parent` with a
+child, ran `kj context move cyc-parent cyc-child`, got the correct
+`cycle detected: adding this edge would create a cycle` — and the tree then
+rendered `cyc-parent` at top level with its real parent edge gone. A failed
+operation left the tree changed.
+
+Two consequences. It is a plain data bug (wrap the delete+insert in one
+transaction, or check the cycle *before* deleting). And it is currently the
+**only** way to produce a detached context from `kj` — via a failure path —
+which is a wry confirmation of #2: the forest is representable and renderable
+(the orphan displayed correctly as a root), and the CLI simply cannot ask for
+it deliberately.
+
+**3. An archived context still holds its label, so the label is
+simultaneously "in use" and "not found".** `kj context create ROOT` →
+`label conflict: label 'ROOT' already in use`; `kj context info ROOT` →
+`not found: no context matches 'ROOT'`. The uniqueness check sees archived
+rows, resolution does not. `retag` *can* still see the holder (it reported
+`currently held by ROOT (b94d3f85)` for an archived context), which is the
+only reason recovery was possible. Either the conflict check should ignore
+archived rows, or the error should say the holder is archived and name
+`retag` as the way through — right now the two messages contradict each other
+and neither points anywhere.
+
+**Also worth a ruling: should a promoted (ring0) context be sweep-exempt and
+cascade-exempt?** Promotion did NOT protect the new ROOT from the cascade in
+#1 (it was promoted before the archive). ROOT itself had 29 days of no
+activity, so the 3-hour rule would archive the root of the tree on its own
+merits — the manual sweep only spared it because it was excluded by label.
+
+---
+
+## Janitors and librarians — long-running contexts that tend the kernel (Amy, 2026-08-15)
+
+Amy's direction, prompted by finding 195 idle contexts behind the roster:
+**cleanup will eventually happen from within kaijutsu**, by contexts rather
+than by a sweeper we bolt on. Her words:
+
+> "We'll have a bunch of musician-like contexts that are janitors (cleaning up
+> old contexts) and librarians (indexing, summarizing, and filing away).
+> Similar shaped problem — stuff that runs forever and has a log-like
+> structure to its observability."
+
+Three things that ruling settles, worth not re-deriving:
+
+1. **Musician-shaped, not cron-shaped.** These are contexts attached to
+   something that runs, in the `docs/chameleon.md` sense — players, not
+   scripts we schedule. That distinguishes them from "Grooming tracks —
+   kaijutsu-style cron" below, which is the *scheduling* substrate; a janitor
+   might ride it, but the janitor is a context.
+2. **The observability shape is the shared problem, and it is log-like.**
+   Anything that runs forever produces a stream, not a state — so the
+   interesting question is what its *observability* looks like, not what its
+   return value is. Same shape as the roster's own "history is otel, not a
+   table" ruling: current state in one place, the narrative in the stream.
+   Solve it once for the class.
+3. **Two roles, deliberately distinct.** A janitor *removes* (archiving stale
+   contexts); a librarian *preserves in cheaper form* (indexing, summarizing,
+   filing). They fail in opposite directions, so they should not be one agent
+   with a policy flag. Cross-refs already in this file: "Archive-time
+   summaries, written by a local model" is librarian work; "Context lifecycle:
+   'done for now' marker" is the signal a janitor would read.
+
+Not scheduled, no slices cut. This is the durable answer, not the urgent one.
+
+**The interim rule, from the first manual sweep (2026-08-15): no activity for
+3 hours ⇒ expired.** Amy: *"anything older than 2-3 hours ago is expired and
+can be archived."* 194 of 200 contexts went in one pass; ROOT and the five
+live session contexts survived.
+
+**That rule is provisional and its expiry condition is known.** Amy, same
+session: *"eventually we'll have longer-living sessions that do local
+inference and don't care about KV caches but for the moment it's a cheap
+cleanup rule."* So the 3-hour number is not a judgment about when work goes
+stale — it is downstream of **hosted-model KV-cache economics**, which is why
+a session that has gone cold is worth little. A local-inference session has no
+such cliff and may legitimately sit idle for days. **A janitor must therefore
+take its cutoff from the context's own economics (is this a cached hosted
+session or a local one?), not from a global constant** — bake 3h in as a
+literal and the first long-lived local musician gets reaped mid-thought.
+
+Three things the manual sweep taught, worth not re-learning:
+
+- **Roster liveness is the WRONG safety filter for archiving, and it looks
+  right.** `recent` liveness means "appended a block in the last 15 minutes",
+  not "someone is attached". The roster reported **4** live contexts while
+  **24** had been active within the day and an ACP lane was mid-review; a
+  session that is connected but thinking has a live connection and an idle
+  context. Filtering on roster-idle would have soft-deleted attached sessions'
+  contexts. Use last-activity age, and treat "attached" as a separate question
+  the roster cannot currently answer per-context (its `bound` rows are keyed by
+  principal).
+- **The archive latch scopes its nonce to the RESOLVED LABEL**, so confirming
+  with the id you just listed fails with `nonce scope mismatch: unauthorized
+  path '<id>' (authorized: ["<label>"])`. Unlabeled contexts scope to the short
+  id. This is the gate research pass's finding #3 observed live — see "Gate
+  slice 1a" below, which already says `authorized_label` must become the raw
+  typed reference.
+- **kaish loop counters do not persist across iterations here**, so a batch
+  guard written as `if test "$i" -ge 10` never trips and a "batch of 10" runs
+  the whole list. Nothing was lost (the per-item skip checks are independent
+  of accumulators, so ROOT and live contexts were still protected), but verify
+  bulk work by re-querying state, never by a counter the loop printed.
+
+**Still unaddressed: the pile regrows on its own.** 9 `mcp-kaijutsu-*` contexts
+existed on 08-15, **all minted that day**, and two (`0815-1201`, `0815-1203`)
+appeared during kernel restarts within the hour. Same phenomenon as the filed
+`cc-kaijutsu` prefix pileup.
+
+*Corrected on the spot, because the obvious generalisation is wrong:* a later
+restart in the same session minted **nothing** and the MCP client re-attached to
+its existing context. So it is **not** one-context-per-reconnect — something
+about the reconnect path sometimes reuses and sometimes mints, and **which is
+which is the actual question**, not "reconnect leaks". The two naming schemes
+in the wild are the visible half of that fork: `mcp-kaijutsu-<HHMM>` vs
+`mcp-kaijutsu-<hex session id>` come from different registration paths, and the
+timestamp-named ones are the suspicious set. A janitor that only sweeps is a
+treadmill while the mint runs, so this wants diagnosing before a janitor is
+built to paper over it.
+
+---
+
+## Live roster — push-on-attach is the remaining unwired half (2026-08-14)
 
 Slices 1–4 (`crates/kaijutsu-kernel/src/roster.rs`, `roster_sources.rs`,
 `kj/roster.rs`, `vfs/backends/roster.rs`) shipped in full: schema+store,
 sources+refresh, `kj roster status`, `kj roster list` + `/run/roster`. Two
 things were deliberately built but not wired into the running server,
-because this branch could not start or verify a live kernel:
+because that branch could not start or verify a live kernel. **The first
+shipped 2026-08-15** — `spawn_periodic_refresh` is now called from
+`create_shared_kernel`, cancelled by `SharedKernelState::shutdown` on drop,
+and covered by `tests/roster_refresh_boot.rs` (which reads no roster surface
+on purpose, so the read path's inline `ensure_refreshed` cannot mask a
+missing spawn). This one is still open:
 
-**1. `roster_sources::spawn_periodic_refresh` is not called from
-`kaijutsu-server`'s boot (`rpc.rs::create_shared_kernel`).** The function is
-built and unit-tested against `refresh_once` directly. The read surfaces
-(`kj roster list`, `/run/roster`) self-heal the boot-rule case by running one
-refresh inline on first read (`kj/roster.rs::ensure_refreshed`), so
-correctness doesn't depend on this being spawned — but without it, staleness
-between reads can grow past the ~10s design target after the first read. Add
-one `tokio::spawn(roster_sources::spawn_periodic_refresh(kernel_arc.clone(),
-kernel_db_arc.clone(), roster_store.clone(), roster_sources::
-DEFAULT_REFRESH_INTERVAL, <a cancellation token scoped to server
-shutdown>))` near the `roster_store` construction in `rpc.rs`, once someone
-can watch it run against a live kernel. (The `/run/roster` VFS mount itself
-IS wired in — read-only and inert until read, a different risk profile.)
-
-**2. Push-based refresh on peer attach/detach isn't wired.** The design
+**Push-based refresh on peer attach/detach isn't wired.** The design
 record calls for pushing "where events already exist: peer attach/detach,
 status post." Status-post is push-based today (`RosterStore::write_status`
 writes immediately). Peer attach/detach still only reconciles on the next
-pull tick (once #1 above is spawned) or on-demand via `ensure_refreshed`.
-Correct either way (a `bound` peer is never wrong for longer than one
-refresh interval), just not the lowest-latency version the design allows.
-Would need a call from wherever `kaijutsu-server`'s RPC layer currently
-calls `PeerRegistry::attach`/`detach` into a narrow single-peer reconcile (or
-just `refresh_once`).
+pull tick or on-demand via `ensure_refreshed`. Correct either way (a `bound`
+peer is never wrong for longer than one ~10s refresh interval), just not the
+lowest-latency version the design allows. Would need a call from wherever
+`kaijutsu-server`'s RPC layer currently calls `PeerRegistry::attach`/`detach`
+into a narrow single-peer reconcile (or just `refresh_once`) — the server now
+holds its own handle for exactly this, `SharedKernelState::roster`.
 
 Also worth a look, not urgent: `roster_sources::RECENT_LIVE_WINDOW_MS` (15
 minutes) is a v1 starting guess, not tuned against real usage — a config
@@ -396,7 +667,53 @@ currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ---
 
-## kaish captured stdout truncates SILENTLY at 8 KB (2026-08-13)
+## kaish output limiting — REMEASURED 2026-08-15 against a live kernel, and both halves of the original filing were wrong
+
+> **Read this correction before acting on the entry below.** Probed against
+> the running zorak kernel (restarted 07:03 EDT onto `e2905a86`, still pinned
+> to `kaish-kernel = "0.13.0"` per `Cargo.lock` — *not* the pending 0.14 bump).
+> Every claim here is a measurement, with the control that isolates it.
+>
+> **1. Command substitution does NOT truncate at 8 KB on this build.**
+> `big=$(seq 1 20000)` round-tripped **108896 bytes** intact.
+> `n=$(seq 1 5000 | wc -l)` returned exactly **5000**, and
+> `$(seq 1 5000 | grep -c .)` likewise — the pipeline-into-`grep -c` shape
+> that produced the original 12-vs-105 report. It does not reproduce.
+> **This does NOT mean it was never real.** The 12-vs-105 observation was
+> made by someone watching it happen, and a negative probe is a claim about
+> the probe (signoff process lessons, "a negative grep is a claim about your
+> PATTERN"). What changed between 08-13 and today is unestablished and is the
+> open question — not whether the original reporter was mistaken.
+>
+> **2. Truncation DOES set a failure code — the entry's central claim is
+> backwards, and candidate fix #2 below is already shipped.** kaish remaps the
+> exit code to **3** on `did_spill`, preserving the real code in
+> `original_code`; it is documented at `kaish-kernel-0.13.0/src/output_limit.rs:14`
+> and covered by its own `test_kernel_memory_mode_exits_3_preserves_original`.
+> So "ask kaish to make Memory-mode truncation loud — a nonzero status" was
+> asking for something kaish had already done, in the version we are pinned to.
+>
+> **3. The live hazard is the opposite shape from the one filed: loud but
+> misattributed, not silent.** Controlled matrix, one variable at a time —
+> `seq 1 100` captured → exit **0**; `seq 1 5000` captured → exit **3**;
+> `seq 1 5000 > /dev/null` → exit **0**. Identical command, succeeds every
+> time. So inside a kaish script, **`$?` is 3 for a command that worked**,
+> purely because it printed a lot. Any `set -e`, any `cmd || fallback`, any
+> `if cmd; then` takes the failure branch on success.
+> **`kj`/MCP callers are NOT affected** — `mcp/servers/shell.rs:448` already
+> does `result.original_code.unwrap_or(result.code)` with the right comment
+> ("truncation is not failure"). The exposure is **rc and hook bodies**, which
+> is precisely where the gate's classifier escalator is designed to live
+> (signoff: "the classifier call is an rc/kaish thing"). An rc script doing
+> `resp=$(<a POST that returns a large body>) || escalate` would take the
+> escalate branch on a perfectly good response. Worth settling before that
+> script is written, not after.
+>
+> Still true and untouched by this correction: the `localfs` analysis below
+> (we build without it, so Memory mode is our only mode and no spill path
+> exists), and the doctrine question in candidate fix #3.
+
+### Original entry (2026-08-13), retained for its reasoning
 
 `OutputLimitConfig::agent()` (`kernel/src/runtime/embedded_kaish.rs:264`) caps
 a builtin's captured stdout at 8192 bytes. Crossing it does **not** error and
@@ -1059,7 +1376,7 @@ ambient signal surfaces (switchboard shipped, seats in flight). Backlog:
 
 ---
 
-## Peer-registry doctrine — ACP/headless clients still need to attach; `PeerInfo` lacks `instance` on the wire (2026-08-10, peers-plumbing)
+## Peer-registry doctrine — headless clients still need to attach; `PeerInfo` lacks `instance` on the wire (2026-08-10, peers-plumbing)
 
 Every connected client is supposed to register in the kernel's peer registry
 so the app can render "who's at the table" (`docs/instrument-design.md`,
@@ -1070,8 +1387,12 @@ instance a per-process UUID mirroring the app's `app_peer_instance()`,
 invocations drained with a graceful "unsupported action" reply since no peer
 actions are implemented on the MCP side yet. Use that as the pattern.
 
+`kaijutsu-acp` now retains `initialize.clientInfo` and registers one peer per
+ACP process as `acp/<client-name>`. It deliberately does not register once per
+session: one ACP connection can host several contexts. The actor replays the
+registration after reconnect and SSH connection teardown removes it.
+
 Still needed:
-- **ACP sessions** (`kaijutsu-acp`) don't attach as peers at all.
 - **The upcoming headless client** should attach on connect, same pattern.
 - **The MCP peer nick goes stale on label stabilization.** An auto-registered
   session attaches under its placeholder label, then
@@ -4535,9 +4856,6 @@ leaked runtime outliving the guard.
 - `is_disconnect_error` matches on the capnp error `Display` text
   (`actor.rs:1214`) — fragile; a capnp formatting change would stop triggering
   reconnect. Prefer a typed `ErrorKind::Disconnected` match.
-- Peer-reattach residual: initial `attach_peer` isn't remembered until the first
-  *successful* user call, so a kernel restart before that leaves the peer
-  un-reattached (`actor.rs:1933`). *(extends `tech_debt_peer_reattach_on_reconnect`)*
 
 **App (`kaijutsu-app`):**
 - Triple Chat/Shell discriminator — `FocusArea` + `ActiveSurface` +

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use kaijutsu_client::{
-    ActorHandle, ContextInfo, SshConfig, SyncedDocument, connect_ssh, spawn_actor,
+    ActorHandle, ContextInfo, PeerConfig, PeerInvocation, SshConfig, SyncedDocument, connect_ssh,
+    spawn_actor,
 };
 use kaijutsu_crdt::{BlockId, ContextId, PrincipalId};
 
@@ -24,13 +25,36 @@ fn acp_peer_instance() -> &'static str {
     INSTANCE.get_or_init(|| format!("kaijutsu-acp-{}", uuid::Uuid::new_v4()))
 }
 
+/// Turn an ACP implementation name into the stable address shown in the
+/// kernel's peer registry. ACP names are programmatic identifiers, but they
+/// are supplied by another process, so keep the useful identifier characters
+/// and collapse everything else rather than putting arbitrary display text in
+/// a peer address.
+pub fn peer_nick_for_client(name: &str) -> String {
+    let slug = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() { "acp/client".to_string() } else { format!("acp/{slug}") }
+}
+
 /// A live connection to a kaijutsu kernel.
 #[derive(Clone)]
 pub struct KernelBridge {
     actor: ActorHandle,
     principal: PrincipalId,
     context_type: String,
-    cwd: PathBuf,
 }
 
 impl KernelBridge {
@@ -44,7 +68,6 @@ impl KernelBridge {
     pub async fn connect(
         config: SshConfig,
         context_type: String,
-        cwd: PathBuf,
         connect_timeout: std::time::Duration,
     ) -> Result<Self> {
         let client = connect_ssh(config.clone())
@@ -111,7 +134,6 @@ impl KernelBridge {
             actor,
             principal: PrincipalId::new(),
             context_type,
-            cwd,
         })
     }
 
@@ -119,8 +141,32 @@ impl KernelBridge {
         &self.actor
     }
 
-    pub fn cwd(&self) -> &PathBuf {
-        &self.cwd
+    /// Advertise the ACP client process as one peer, independent of how many
+    /// contexts it opens. `ActorHandle` remembers this registration and
+    /// replays it after reconnect; cancelling the underlying SSH connection
+    /// removes the server-side registration at process teardown.
+    pub async fn attach_client_peer(&self, client_name: &str) -> Result<String> {
+        let nick = peer_nick_for_client(client_name);
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel::<PeerInvocation>();
+        std::thread::spawn(move || {
+            while let Ok(invocation) = peer_rx.recv() {
+                let _ = invocation.reply.send(Err(format!(
+                    "ACP client peer does not implement action '{}'",
+                    invocation.action
+                )));
+            }
+        });
+        self.actor
+            .attach_peer(
+                PeerConfig {
+                    nick: nick.clone(),
+                    instance: acp_peer_instance().to_string(),
+                },
+                peer_tx,
+            )
+            .await
+            .context("attach ACP client peer")?;
+        Ok(nick)
     }
 
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
@@ -128,6 +174,37 @@ impl KernelBridge {
             .list_contexts()
             .await
             .context("list contexts")
+    }
+
+    /// Read the durable kaish cwd for one context without depending on the
+    /// actor's ambient joined context.
+    pub async fn context_cwd(&self, context_id: ContextId) -> Result<Option<PathBuf>> {
+        self.actor
+            .get_context_cwd(context_id)
+            .await
+            .context("get context cwd")
+            .map(|cwd| cwd.map(PathBuf::from))
+    }
+
+    /// Reassert an ACP attachment's cwd as durable kaish state.
+    pub async fn set_context_cwd(&self, context_id: ContextId, cwd: &std::path::Path) -> Result<()> {
+        if !cwd.is_absolute() {
+            bail!("ACP cwd must be absolute: {}", cwd.display());
+        }
+        let cwd = cwd
+            .to_str()
+            .with_context(|| format!("ACP cwd is not valid UTF-8: {}", cwd.display()))?;
+        self.actor
+            .set_context_cwd(context_id, cwd)
+            .await
+            .with_context(|| format!("set context cwd to {cwd}"))
+    }
+
+    pub async fn archive_context(&self, context_id: ContextId) -> Result<()> {
+        self.actor
+            .archive_context(context_id)
+            .await
+            .context("archive context")
     }
 
     /// Resolve-or-create a context for a label, then join it.
@@ -300,5 +377,17 @@ mod tests {
         // replace our subscription on reconnect, not stack a second one.
         assert_eq!(acp_peer_instance(), acp_peer_instance());
         assert!(acp_peer_instance().starts_with("kaijutsu-acp-"));
+    }
+
+    #[test]
+    fn client_name_becomes_namespaced_peer_nick() {
+        assert_eq!(peer_nick_for_client("toad"), "acp/toad");
+        assert_eq!(peer_nick_for_client("Zed Industries"), "acp/zed-industries");
+        assert_eq!(peer_nick_for_client("Happy/手机"), "acp/happy");
+    }
+
+    #[test]
+    fn empty_client_name_has_a_safe_fallback() {
+        assert_eq!(peer_nick_for_client(" \t/ "), "acp/client");
     }
 }

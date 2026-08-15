@@ -459,12 +459,45 @@ pub struct SharedKernelState {
     /// connection's bridge task ended) is pruned reactively by the bridge.
     pub permission_subscribers:
         Arc<TokioRwLock<Vec<tokio::sync::mpsc::Sender<PermissionAskChannelMsg>>>>,
+    /// The live roster's materialized view (`kaijutsu_kernel::roster`). The
+    /// SAME instance the `/run/roster` mount and `KjDispatcher`'s `kj roster`
+    /// verbs hold — three handles, one store, because a second store would
+    /// carry its own generation counter and silently desync the two readers
+    /// (see `KjDispatcher::new_with_roster`).
+    ///
+    /// Held here so the server owns a handle independent of the dispatcher:
+    /// the scheduled-periodic refresh below needs one, and push-on-peer-
+    /// attach/detach (docs/issues.md, the roster's remaining unwired half)
+    /// will need one from the RPC layer.
+    pub roster: Arc<kaijutsu_kernel::roster::RosterStore>,
+    /// Cancellation for kernel-lifetime background tasks — those whose owner
+    /// is the server process itself rather than a connection (which has
+    /// `conn_cancel`) or a prompt (which gets a fresh interrupt token). The
+    /// roster's scheduled-periodic refresh loop is the first and, today, only
+    /// subscriber.
+    ///
+    /// Fired from `Drop`, with exactly the same reach as the WAL checkpoint
+    /// there: it runs when the LAST `Arc<SharedKernelState>` drops — a clean
+    /// process exit or a test teardown — and **not** on SIGKILL/SIGTERM,
+    /// where the process dies without unwinding. That is acceptable for a
+    /// task whose only cost on abrupt death is its own tokio task going away
+    /// with the runtime; it would NOT be acceptable for anything that must
+    /// flush. The SIGTERM gap is the same one filed under
+    /// "graceful-shutdown WAL checkpoint" in docs/issues.md.
+    pub shutdown: CancellationToken,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
 
 impl Drop for SharedKernelState {
     fn drop(&mut self) {
+        // Stop kernel-lifetime background tasks before the checkpoint below,
+        // so nothing is still touching `kernel_db` while we checkpoint it.
+        // The roster refresh loop holds its own clones of the `Kernel` and
+        // `KernelDb` Arcs — deliberately NOT an `Arc<SharedKernelState>`,
+        // which would be a cycle that kept this `Drop` from ever running.
+        self.shutdown.cancel();
+
         // Best-effort WAL checkpoint on clean teardown so the main `.db` file
         // doesn't linger behind committed history after exit. This fires only
         // when the LAST `Arc<SharedKernelState>` drops — a clean process exit
@@ -2078,13 +2111,15 @@ pub async fn create_shared_kernel(
 
     // Create kj dispatcher — shared across all connections. Takes the SAME
     // `roster_store` the /run/roster mount above uses (`new_with_roster`),
-    // not a freshly constructed one.
+    // not a freshly constructed one. (Cloned, not moved, because the periodic
+    // refresh loop spawned below needs that same third handle — all three are
+    // one store, which is the whole point of `new_with_roster`.)
     let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new_with_roster(
         kernel_arc.drift().clone(),
         documents.clone(),
         kernel_db_arc.clone(),
         kernel_arc.clone(),
-        roster_store,
+        roster_store.clone(),
     ));
     // Stash a Weak<Self> on the dispatcher so internal paths (rc
     // lifecycle, kaish hook bodies) can construct KjBuiltin without
@@ -2102,6 +2137,36 @@ pub async fn create_shared_kernel(
         .set_kj_dispatcher(&kj_dispatcher)
         .await;
 
+    // Kernel-lifetime task cancellation; see `SharedKernelState::shutdown`.
+    let shutdown = CancellationToken::new();
+
+    // Drive the roster's scheduled-periodic reconcile (`roster_sources`
+    // module doc; design record in signoff/`docs/issues.md`). Spawned here
+    // rather than left to the read surfaces because `kj/roster.rs`'s
+    // `ensure_refreshed` only self-heals the boot rule *on a read* — without
+    // this loop, staleness between reads grows unbounded past the ~10s design
+    // target, and `/run/roster` would report presence that stopped being true
+    // whenever nobody happened to be looking.
+    //
+    // `tokio::time::interval` fires its first tick immediately, so this also
+    // satisfies the boot rule proactively: the first `refresh_once` lands at
+    // spawn time, not one interval later. `ensure_refreshed` stays as the
+    // belt-and-braces path for a read that beats this task to the DB.
+    //
+    // Scheduled-periodic, never chase-the-clock — `MissedTickBehavior::Delay`
+    // is set inside `spawn_periodic_refresh`, so a slow refresh delays the
+    // next tick rather than queuing a burst to "catch up" (CLAUDE.md "Time").
+    let roster_refresh = kaijutsu_kernel::roster_sources::spawn_periodic_refresh(
+        kernel_arc.clone(),
+        kernel_db_arc.clone(),
+        roster_store.clone(),
+        kaijutsu_kernel::roster_sources::DEFAULT_REFRESH_INTERVAL,
+        shutdown.clone(),
+    );
+    // The loop only ends via `shutdown` (fired in `Drop`), so nothing joins
+    // this handle; dropping it detaches the task, which is what we want.
+    drop(roster_refresh);
+
     let shared = SharedKernelState {
         id,
         name: id_str,
@@ -2116,6 +2181,8 @@ pub async fn create_shared_kernel(
         session_contexts,
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         permission_subscribers: Arc::new(TokioRwLock::new(Vec::new())),
+        roster: roster_store,
+        shutdown,
     };
 
     // Wire the permission-ask bridge (D-57) onto the broker so
@@ -4253,40 +4320,57 @@ impl kernel::Server for KernelImpl {
                 // context — model, interactive, headless — seeds from here.
                 let context_id = connection.borrow().require_context()?;
 
-                // Validate the path against the context's shell backend (the
-                // namespace `cd` uses) before persisting — fail fast rather than
-                // store a cwd that every later materialized shell would reject
-                // on restore. A throwaway shell is enough to reach the backend.
-                let kaish = materialize_context_shell(&kernel, &connection).await?;
-                if !kaish.try_set_cwd(std::path::PathBuf::from(&path)).await {
-                    results.get().set_success(false);
-                    results
-                        .get()
-                        .set_error(format!("not a directory: {}", path));
-                    return Ok(());
-                }
-
-                let updated_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before UNIX epoch")
-                    .as_millis() as i64;
-                kernel
-                    .kernel_db
-                    .lock()
-                    .upsert_context_shell(&ContextShellRow {
-                        context_id,
-                        cwd: Some(path.clone()),
-                        updated_at,
-                    })
-                    .map_err(|e| {
-                        capnp::Error::failed(format!("failed to persist cwd: {}", e))
-                    })?;
-                results.get().set_success(true);
-                results.get().set_error("");
+                let outcome = set_context_cwd(&kernel, &connection, context_id, &path).await?;
+                results.get().set_success(outcome.is_ok());
+                results.get().set_error(outcome.err().unwrap_or_default());
                 Ok(())
             }
             .instrument(span),
         )
+    }
+
+    fn get_context_cwd(
+        self: Rc<Self>,
+        params: kernel::GetContextCwdParams,
+        mut results: kernel::GetContextCwdResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_cwd").entered();
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        pry!(require_context_exists(&self.kernel, context_id));
+        if let Some(cwd) = context_cwd(&self.kernel, context_id) {
+            results.get().set_path(cwd.to_string_lossy());
+            results.get().set_found(true);
+        } else {
+            results.get().set_path("");
+            results.get().set_found(false);
+        }
+        Promise::ok(())
+    }
+
+    fn set_context_cwd(
+        self: Rc<Self>,
+        params: kernel::SetContextCwdParams,
+        mut results: kernel::SetContextCwdResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "set_context_cwd");
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let path = pry!(pry!(p.get_path()).to_str()).to_owned();
+        let kernel = self.kernel.clone();
+        let connection = self.connection.clone();
+        Promise::from_future(async move {
+            let outcome = set_context_cwd(&kernel, &connection, context_id, &path).await?;
+            results.get().set_success(outcome.is_ok());
+            results.get().set_error(outcome.err().unwrap_or_default());
+            Ok(())
+        }.instrument(trace_span))
     }
 
     fn get_last_result(
@@ -8101,7 +8185,18 @@ async fn materialize_context_shell(
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
 ) -> Result<EmbeddedKaish, capnp::Error> {
-    let (name, principal, context_id, session_id) = {
+    let context_id = connection.borrow().require_context()?;
+    materialize_context_shell_for(kernel, connection, context_id).await
+}
+
+/// Materialize a shell for an explicitly addressed context without consulting
+/// or changing the connection's ambient joined-context binding.
+async fn materialize_context_shell_for(
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+    context_id: ContextId,
+) -> Result<EmbeddedKaish, capnp::Error> {
+    let (name, principal, session_id) = {
         let conn = connection.borrow();
         (
             format!(
@@ -8111,7 +8206,6 @@ async fn materialize_context_shell(
                 conn.session_id.short()
             ),
             conn.principal.id,
-            conn.require_context()?,
             conn.session_id,
         )
     };
@@ -8132,6 +8226,47 @@ async fn materialize_context_shell(
         )
         .await
         .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
+}
+
+/// Validate and persist a durable cwd through the same backend used by `cd`.
+/// `Ok(Err(message))` is a normal validation refusal for the wire result;
+/// outer errors mean the operation itself could not be performed.
+async fn set_context_cwd(
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+    context_id: ContextId,
+    path: &str,
+) -> Result<Result<(), String>, capnp::Error> {
+    require_context_exists(kernel, context_id)?;
+    if !std::path::Path::new(path).is_absolute() {
+        return Ok(Err(format!("cwd must be absolute: {}", path)));
+    }
+    let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
+    if !kaish.try_set_cwd(std::path::PathBuf::from(path)).await {
+        return Ok(Err(format!("not a directory: {}", path)));
+    }
+
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_millis() as i64;
+    kernel.kernel_db.lock().upsert_context_shell(&ContextShellRow {
+        context_id,
+        cwd: Some(path.to_owned()),
+        updated_at,
+    }).map_err(|e| capnp::Error::failed(format!("failed to persist cwd: {}", e)))?;
+    Ok(Ok(()))
+}
+
+fn require_context_exists(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+) -> Result<(), capnp::Error> {
+    match kernel.kernel_db.lock().get_context(context_id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(capnp::Error::failed("context not found".into())),
+        Err(e) => Err(capnp::Error::failed(format!("failed to read context: {}", e))),
+    }
 }
 
 /// After a materialized shell runs, propagate any in-shell context switch

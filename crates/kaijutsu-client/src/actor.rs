@@ -458,6 +458,17 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Vec<HistoryEntry>, CallError>>,
     },
 
+    // ── Addressed Shell State ───────────────────────────────────────────
+    GetContextCwd {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<Option<String>, CallError>>,
+    },
+    SetContextCwd {
+        context_id: ContextId,
+        path: String,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+
     // ── Shell Variables ──────────────────────────────────────────────────
     GetShellVar {
         name: String,
@@ -723,6 +734,8 @@ impl RpcCommand {
             Self::Interrupt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Complete { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetCommandHistory { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1264,6 +1277,27 @@ impl ActorHandle {
     }
 
     // ── Shell Variables ─────────────────────────────────────────────────
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get_context_cwd(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Option<String>, CallError> {
+        self.send(|reply| RpcCommand::GetContextCwd { context_id, reply }).await
+    }
+
+    #[tracing::instrument(skip(self, path))]
+    pub async fn set_context_cwd(
+        &self,
+        context_id: ContextId,
+        path: &str,
+    ) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::SetContextCwd {
+            context_id,
+            path: path.into(),
+            reply,
+        }).await
+    }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_shell_var(
@@ -1838,6 +1872,9 @@ struct RpcActor {
     /// (tech_debt_peer_reattach_on_reconnect). The `Sender` is cheap to clone
     /// and the capnp callback is rebuilt from it on each attach.
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
+    /// The remembered peer intent changed after the current handshake took
+    /// its reconnect snapshot. Replayed once on the next Connected edge.
+    peer_attach_pending: bool,
     /// Requested tick interval for the VFS activity digest subscription
     /// (Lane K, FSN slice-1) — `None` until the first
     /// `SubscribeVfsActivity` command. Persisted like `peer_registration` so
@@ -1886,6 +1923,27 @@ struct RpcActor {
 }
 
 impl RpcActor {
+    /// Snapshot peer intent for a new handshake. Any later declaration sets
+    /// `peer_attach_pending` again and is replayed on the Connected edge.
+    fn peer_registration_for_handshake(
+        &mut self,
+    ) -> Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)> {
+        self.peer_attach_pending = false;
+        self.peer_registration.clone()
+    }
+
+    /// Take a declaration that arrived after the handshake snapshot. Taking
+    /// makes replay edge-triggered: one declaration produces one attach.
+    fn take_pending_peer_registration(
+        &mut self,
+    ) -> Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)> {
+        if !self.peer_attach_pending {
+            return None;
+        }
+        self.peer_attach_pending = false;
+        self.peer_registration.clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: SshConfig,
@@ -1910,6 +1968,7 @@ impl RpcActor {
             scope_blocks_to_context,
             joined_context_id: None,
             peer_registration: None,
+            peer_attach_pending: false,
             vfs_activity_interval_ms: None,
             midi_exchange,
             permission_tx,
@@ -1976,13 +2035,17 @@ impl RpcActor {
             attempt,
             started_at: Instant::now(),
         };
+        let peer_registration = self.peer_registration_for_handshake();
+        // This handshake now owns the replay for the snapshot above. An
+        // AttachPeer arriving while it runs sets this back to true, and the
+        // Connected transition replays that newer intent.
         let task = spawn_handshake(
             self.config.clone(),
             self.context_id,
             self.instance.clone(),
             self.scope_blocks_to_context,
             self.event_tx.clone(),
-            self.peer_registration.clone(),
+            peer_registration,
             self.vfs_activity_interval_ms,
             self.midi_exchange.clone(),
             self.permission_tx.clone(),
@@ -2015,6 +2078,30 @@ impl RpcActor {
         self.state = ActorState::Connected {
             since: Instant::now(),
         };
+
+        // A one-shot caller may have declared peer intent while this
+        // connection was still being built. Its request correctly received
+        // NotReady, but the durable intent must not disappear with that
+        // response. The in-flight handshake could not see it, so replay it
+        // exactly once now.
+        if let Some((config, invocation_tx)) = self.take_pending_peer_registration() {
+            let kernel = built.kernel.clone();
+            tokio::task::spawn_local(async move {
+                match tokio::time::timeout(
+                    RPC_CALL_TIMEOUT,
+                    kernel.attach_peer(&config, invocation_tx),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => log::info!(
+                        "Attached peer '{}' after connect-time declaration",
+                        config.nick
+                    ),
+                    Ok(Err(e)) => log::warn!("peer attach replay failed (non-fatal): {e}"),
+                    Err(_) => log::warn!("peer attach replay timed out (non-fatal)"),
+                }
+            });
+        }
 
         // Spawn the liveness pinger. It runs until aborted on Closing.
         let close_tx = self.close_tx.clone();
@@ -2174,7 +2261,16 @@ impl RpcActor {
     }
 
     /// Reject a command with the current state's `NotReady` reason.
-    fn reject_not_ready(&self, cmd: RpcCommand) {
+    fn reject_not_ready(&mut self, cmd: RpcCommand) {
+        if let RpcCommand::AttachPeer {
+            config,
+            invocation_tx,
+            ..
+        } = &cmd
+        {
+            self.peer_registration = Some((config.clone(), invocation_tx.clone()));
+            self.peer_attach_pending = true;
+        }
         let reason = match &self.state {
             ActorState::Idle => NotReadyReason::Idle,
             ActorState::Connecting { attempt, .. } => NotReadyReason::Connecting {
@@ -2299,6 +2395,7 @@ impl RpcActor {
                 let client = conn.client.clone();
                 let kernel = conn.kernel.clone();
                 self.peer_registration = Some((config.clone(), invocation_tx.clone()));
+                self.peer_attach_pending = false;
                 tokio::task::spawn_local(
                     dispatch_kernel_command(
                         RpcCommand::AttachPeer {
@@ -3116,6 +3213,14 @@ async fn dispatch_kernel_command(
             dispatch!(kernel, reply, close_tx, k, k.get_command_history(limit));
         }
 
+        // ── Addressed Shell State ──
+        RpcCommand::GetContextCwd { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_context_cwd(context_id));
+        }
+        RpcCommand::SetContextCwd { context_id, path, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.set_context_cwd(context_id, &path));
+        }
+
         // ── Shell Variables ──
         RpcCommand::GetShellVar { name, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_shell_var(&name));
@@ -3776,5 +3881,110 @@ mod tests {
             actor.context_id.is_some(),
             "context_id must survive close→cooldown so connect_handshake re-joins it"
         );
+    }
+
+    #[test]
+    fn attach_peer_during_connecting_keeps_intent_and_replays_once() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Connecting {
+            attempt: 2,
+            started_at: Instant::now(),
+        };
+        // The current handshake already took its snapshot, so this declaration
+        // must be replayed on the Connected edge instead of waiting for yet
+        // another reconnect.
+        assert!(actor.peer_registration_for_handshake().is_none());
+
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor.reject_not_ready(RpcCommand::AttachPeer {
+            config: PeerConfig {
+                nick: "acp/toad".into(),
+                instance: "toad-1".into(),
+            },
+            invocation_tx: peer_tx,
+            reply: reply_tx,
+        });
+
+        assert!(matches!(
+            reply_rx.blocking_recv(),
+            Ok(Err(CallError::NotReady(NotReadyReason::Connecting { attempt: 2 })))
+        ));
+        let (config, replay_tx) = actor
+            .take_pending_peer_registration()
+            .expect("connect-time declaration should replay on Connected");
+        assert_eq!(config.nick, "acp/toad");
+        assert!(
+            actor.take_pending_peer_registration().is_none(),
+            "one declaration must not produce duplicate registrations"
+        );
+
+        let (invocation_reply, _invocation_result) = oneshot::channel();
+        replay_tx
+            .send(PeerInvocation {
+                action: "ping".into(),
+                params: vec![],
+                reply: invocation_reply,
+            })
+            .expect("replay must retain the original invocation receiver");
+        assert_eq!(peer_rx.recv().unwrap().action, "ping");
+    }
+
+    #[test]
+    fn attach_peer_during_cooldown_is_owned_by_next_handshake() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Cooldown {
+            next_attempt: 4,
+            until: Instant::now(),
+            last_error: "kernel restarting".into(),
+        };
+        let (peer_tx, _peer_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor.reject_not_ready(RpcCommand::AttachPeer {
+            config: PeerConfig {
+                nick: "mcp".into(),
+                instance: "mcp-1".into(),
+            },
+            invocation_tx: peer_tx,
+            reply: reply_tx,
+        });
+
+        assert!(matches!(
+            reply_rx.blocking_recv(),
+            Ok(Err(CallError::NotReady(NotReadyReason::Cooldown {
+                ref last_error,
+                ..
+            }))) if last_error == "kernel restarting"
+        ));
+        let (config, _) = actor
+            .peer_registration_for_handshake()
+            .expect("next handshake should own cooldown declaration");
+        assert_eq!(config.nick, "mcp");
+        assert!(actor.take_pending_peer_registration().is_none());
+    }
+
+    #[test]
+    fn terminal_rejection_does_not_remember_peer_intent() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Terminal {
+            reason: "authentication rejected".into(),
+        };
+        let (peer_tx, _peer_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor.reject_terminal(RpcCommand::AttachPeer {
+            config: PeerConfig {
+                nick: "acp/toad".into(),
+                instance: "toad-1".into(),
+            },
+            invocation_tx: peer_tx,
+            reply: reply_tx,
+        });
+
+        assert!(matches!(
+            reply_rx.blocking_recv(),
+            Ok(Err(CallError::PermanentlyFailed(_)))
+        ));
+        assert!(actor.peer_registration.is_none());
+        assert!(!actor.peer_attach_pending);
     }
 }

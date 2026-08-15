@@ -28,7 +28,7 @@ use anyhow::Result;
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use crate::runtime::context_engine::SessionContextMap;
-use crate::runtime::embedded_kaish::EmbeddedKaish;
+use crate::runtime::embedded_kaish::{EmbeddedKaish, OutputProfile};
 
 use super::KjDispatcher;
 
@@ -60,6 +60,41 @@ impl KjDispatcher {
             block_source,
             false,
             false,
+            OutputProfile::Agent,
+        )
+        .await
+    }
+
+    /// Like [`Self::materialize_context_kaish`] but for shells whose output
+    /// **kaijutsu itself consumes** rather than shipping to a model: hook
+    /// bodies and the editor's `:r !cmd` splice. Unprivileged — this is about
+    /// who reads the output, not what the caller may do.
+    ///
+    /// The difference that matters is [`OutputProfile::Internal`]: kaish's
+    /// output cap remaps a capped command's exit code to 3, which reaches the
+    /// script's own `$?`, so on the model-facing profile a hook body doing
+    /// `cmd || fail` fails on a command that worked and merely printed a lot.
+    /// For `:r !cmd` the cap is worse still — it would splice a head+tail
+    /// preview into a document as if it were the real text.
+    pub async fn materialize_context_kaish_internal(
+        &self,
+        name: &str,
+        principal: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_inner(
+            name,
+            principal,
+            context_id,
+            session_id,
+            semantic_index,
+            block_source,
+            false,
+            false,
+            OutputProfile::Internal,
         )
         .await
     }
@@ -86,6 +121,10 @@ impl KjDispatcher {
             block_source,
             true,
             false,
+            // rc bodies are kernel-internal: their stdout becomes Trace blocks
+            // and their captures feed `kj` verbs, so a forged `$?` would break
+            // ordinary `cmd || handle` control flow in a lifecycle script.
+            OutputProfile::Internal,
         )
         .await
     }
@@ -113,6 +152,7 @@ impl KjDispatcher {
             block_source,
             false,
             true,
+            OutputProfile::Agent,
         )
         .await
     }
@@ -128,6 +168,7 @@ impl KjDispatcher {
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
         privileged: bool,
         read_only: bool,
+        output: OutputProfile,
     ) -> Result<EmbeddedKaish> {
         // Fresh, isolated session map: this kaish lives for one invocation and
         // tracks exactly one session→context mapping. No cross-invocation
@@ -226,6 +267,7 @@ impl KjDispatcher {
                 session_id,
                 session_contexts,
                 external_exec,
+                output,
                 configure_tools,
             )?
         };

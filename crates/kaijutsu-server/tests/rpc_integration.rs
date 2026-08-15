@@ -782,6 +782,70 @@ async fn collect_output_events(
 // context's durable env (L1 `context_env`) rather than a connection-local
 // shell. These tests lock that contract.
 
+/// Addressed cwd calls must target their explicit context even while the actor
+/// is joined elsewhere. The setter also validates through kaish's VFS backend:
+/// a rejected path must not overwrite the last durable value.
+#[test]
+fn test_context_cwd_is_addressed_and_vfs_validated() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context_a = kernel.create_context("addressed-cwd-a").await.unwrap();
+        let context_b = kernel.create_context("addressed-cwd-b").await.unwrap();
+
+        // Keep B as the ambient binding throughout every addressed operation.
+        kernel.join_context(context_b, "addressed-cwd-test").await.unwrap();
+        assert_eq!(
+            kernel.get_context_cwd(context_a).await.unwrap(),
+            None,
+            "addressed reads preserve unset rather than fabricating /docs"
+        );
+        let target = env!("CARGO_MANIFEST_DIR");
+        kernel.set_context_cwd(context_a, target).await.unwrap();
+
+        assert_eq!(
+            kernel.get_context_cwd(context_a).await.unwrap(),
+            Some(target.to_owned())
+        );
+        assert_eq!(
+            kernel.get_context_cwd(context_b).await.unwrap(),
+            None,
+            "setting A must not follow the connection's ambient binding to B"
+        );
+
+        let missing = format!("{target}/definitely-not-a-directory");
+        let error = kernel.set_context_cwd(context_a, &missing).await.unwrap_err();
+        assert!(
+            error.to_string().contains("not a directory"),
+            "VFS refusal should cross the wire clearly: {error}"
+        );
+        assert_eq!(
+            kernel.get_context_cwd(context_a).await.unwrap(),
+            Some(target.to_owned()),
+            "a rejected cwd must not replace durable state"
+        );
+
+        let error = kernel.set_context_cwd(context_a, "relative/path").await.unwrap_err();
+        assert!(
+            error.to_string().contains("must be absolute"),
+            "the shared RPC seam must reject relative paths: {error}"
+        );
+        assert_eq!(
+            kernel.get_context_cwd(context_a).await.unwrap(),
+            Some(target.to_owned()),
+            "a relative cwd must not replace durable state"
+        );
+
+        let unknown = kaijutsu_types::ContextId::new();
+        let error = kernel.get_context_cwd(unknown).await.unwrap_err();
+        assert!(
+            error.to_string().contains("context not found"),
+            "unknown contexts should fail loudly: {error}"
+        );
+    });
+}
+
 #[test]
 fn test_shell_var_round_trips_through_context() {
     run_local(async {

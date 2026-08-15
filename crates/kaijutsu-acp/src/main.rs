@@ -19,7 +19,7 @@ use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kaijutsu_acp::bridge::KernelBridge;
-use kaijutsu_acp::{AcpBridge, default_cwd, serve_stdio};
+use kaijutsu_acp::{AcpBridge, serve_stdio};
 use kaijutsu_client::{KeySource, SshConfig};
 
 #[derive(Parser, Debug)]
@@ -57,7 +57,8 @@ struct Cli {
     #[arg(long, default_value = "coder")]
     context_type: String,
 
-    /// Working directory reported for sessions. Defaults to the process cwd.
+    /// Deprecated compatibility flag. ACP lifecycle requests supply the
+    /// authoritative cwd; this value is accepted but never used as fallback.
     #[arg(long)]
     cwd: Option<PathBuf>,
 
@@ -105,8 +106,13 @@ async fn run(cli: Cli) -> Result<()> {
              Start kaijutsu-server and pass --connect [--host H] [--port P]."
         );
     }
+    if let Some(cwd) = &cli.cwd {
+        tracing::warn!(
+            cwd = %cwd.display(),
+            "--cwd is deprecated and ignored; ACP session cwd is authoritative"
+        );
+    }
 
-    let cwd = cli.cwd.unwrap_or_else(default_cwd);
     let config = SshConfig {
         host: cli.host.clone(),
         port: cli.port,
@@ -120,14 +126,12 @@ async fn run(cli: Cli) -> Result<()> {
         port = config.port,
         user = %config.username,
         context_type = %cli.context_type,
-        cwd = %cwd.display(),
         "kaijutsu-acp starting"
     );
 
     let kernel = KernelBridge::connect(
         config,
         cli.context_type,
-        cwd,
         std::time::Duration::from_secs(cli.connect_timeout),
     )
     .await?;

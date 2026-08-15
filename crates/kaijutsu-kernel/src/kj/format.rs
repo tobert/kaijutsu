@@ -50,6 +50,17 @@ pub fn format_context_table(
 
     let mut lines = Vec::new();
 
+    // Width from the actual data, not a fixed 16 — a label longer than the
+    // pad shoves every column after it rightward, and the age column added
+    // 2026-08-15 made that ragged edge obvious. Floored at 16 so a listing of
+    // only short labels doesn't render cramped.
+    let label_w = contexts
+        .iter()
+        .map(|c| c.label.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(0)
+        .max(16);
+
     for ctx in contexts {
         let marker = if Some(ctx.context_id) == current {
             "*"
@@ -66,12 +77,43 @@ pub fn format_context_table(
         };
         let cast = cast_tag(ctx.cast_id, casts);
         let host = origin_host_tag(&ctx.origin_host);
+        let age = format_age_compact(ctx.last_activity_at.unwrap_or(ctx.created_at));
         lines.push(format!(
-            "{marker} {id_short}  {label:<16} {model}{ring0}{cast}{host}"
+            "{marker} {id_short}  {label:<label_w$} {age:>5}  {model}{ring0}{cast}{host}"
         ));
     }
 
     lines.join("\n")
+}
+
+/// Compact relative age for table columns: `now`, `5m`, `3h`, `12d`.
+///
+/// Deliberately unit-suffixed rather than "3d ago" — this is a column, and
+/// the `ago` is implied once every row carries one. Same thresholds as
+/// [`format_timestamp`], which stays the sentence-shaped form used by
+/// `kj context info`.
+///
+/// Fed from `last_activity_at`, falling back to `created_at`: a context that
+/// has never had a block is "as old as itself", which is the same floor
+/// `list_active_contexts`' own ORDER BY and `roster_sources::recent_snapshot`
+/// use. Age answers "is anyone still using this", so last activity is the
+/// question, not birth.
+fn format_age_compact(millis: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dt = UNIX_EPOCH + Duration::from_secs((millis / 1000).max(0) as u64);
+    let secs = std::time::SystemTime::now()
+        .duration_since(dt)
+        .unwrap_or_default()
+        .as_secs();
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 /// Format context DAG results as an indented tree.
@@ -433,6 +475,42 @@ pub fn format_drift_queue(items: &[crate::drift::StagedDrift]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+
+    /// The age column exists because finding "what is stale enough to
+    /// archive" otherwise meant reading `observed_at` out of the roster's
+    /// per-row VFS directories one file at a time. Thresholds pinned so the
+    /// column stays narrow — a table column, not a sentence.
+    #[test]
+    fn compact_age_is_column_width_at_every_threshold() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let cases = [
+            (now - 5_000, "now"),
+            (now - 300_000, "5m"),
+            (now - 3 * 3_600_000, "3h"),
+            (now - 12 * 86_400_000, "12d"),
+        ];
+        for (ts, want) in cases {
+            let got = format_age_compact(ts);
+            assert_eq!(got, want, "age for {ts}");
+            assert!(got.len() <= 5, "age column must stay narrow, got {got:?}");
+        }
+    }
+
+    /// A future timestamp (clock skew between hosts — contexts carry an
+    /// `origin_host`) must render as `now`, never underflow into a huge age.
+    #[test]
+    fn a_future_timestamp_renders_as_now_not_a_giant_age() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 60_000_000;
+        assert_eq!(format_age_compact(future), "now");
+    }
     use super::*;
     use kaijutsu_types::{ConsentMode, ContextState, PrincipalId};
 

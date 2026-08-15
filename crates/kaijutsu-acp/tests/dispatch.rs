@@ -21,7 +21,7 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionInfo,
-    StopReason,
+    ResumeSessionRequest, ResumeSessionResponse, StopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
@@ -30,10 +30,11 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 /// exactly once, in the right place.
 type Log = Arc<Mutex<Vec<&'static str>>>;
 
-/// Mirror of `serve_stdio`'s builder: same six registrations, same order,
+/// Mirror of `serve_stdio`'s builder: same seven registrations, same order,
 /// same `cx.spawn` for prompt.
 fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'static {
-    let (l1, l2, l3, l4, l5, l6) = (
+    let (l1, l2, l3, l4, l5, l6, l7) = (
+        log.clone(),
         log.clone(),
         log.clone(),
         log.clone(),
@@ -75,10 +76,19 @@ fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'sta
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |_req: ResumeSessionRequest,
+                        responder: Responder<ResumeSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                l4.lock().unwrap().push("session/resume");
+                responder.respond(ResumeSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async move |_req: ListSessionsRequest,
                         responder: Responder<ListSessionsResponse>,
                         _cx: ConnectionTo<Client>| {
-                l4.lock().unwrap().push("session/list");
+                l5.lock().unwrap().push("session/list");
                 responder.respond(ListSessionsResponse::new(vec![SessionInfo::new(
                     SessionId::new("seat-0"),
                     "/tmp",
@@ -93,7 +103,7 @@ fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'sta
                         cx: ConnectionTo<Client>| {
                 // The real handler spawns so the dispatch loop stays free for
                 // session/cancel. Same shape here.
-                let l = l5.clone();
+                let l = l6.clone();
                 cx.spawn(async move {
                     l.lock().unwrap().push("session/prompt");
                     responder.respond(PromptResponse::new(StopReason::EndTurn))
@@ -103,7 +113,7 @@ fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'sta
         )
         .on_receive_notification(
             async move |_n: CancelNotification, _cx: ConnectionTo<Client>| {
-                l6.lock().unwrap().push("session/cancel");
+                l7.lock().unwrap().push("session/cancel");
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -138,6 +148,13 @@ async fn every_acp_method_reaches_its_own_handler() {
             .block_task()
             .await?;
 
+            cx.send_request(ResumeSessionRequest::new(
+                SessionId::new("ctx-hex"),
+                "/tmp/resumed",
+            ))
+            .block_task()
+            .await?;
+
             let listed = cx
                 .send_request(ListSessionsRequest::new())
                 .block_task()
@@ -166,6 +183,7 @@ async fn every_acp_method_reaches_its_own_handler() {
             "initialize",
             "session/new",
             "session/load",
+            "session/resume",
             "session/list",
             "session/prompt",
             "session/cancel",

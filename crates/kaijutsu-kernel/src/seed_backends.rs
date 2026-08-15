@@ -119,6 +119,20 @@ const FACTORY_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 /// V4 models think by default and reasoning tokens count toward the output
 /// budget (max 64K), so leave headroom above a plain-answer ceiling.
 const FACTORY_MAX_TOKENS: i64 = 16384;
+/// Factory effort-ladder token. DeepSeek's ladder is
+/// `none|minimal|low|medium|high|xhigh|max` (probed against the live API
+/// 2026-08-15 — an unknown token 400s with the full variant list, so this is
+/// measured, not assumed), and we start at the top on purpose.
+///
+/// Amy's reasoning, 2026-08-15: *"generally ds4 flash max should be the
+/// default for kaijutsu. we pay for api pricing there so we'll bring in
+/// claudes via claude code / mcp and the new connector for messaging."* The
+/// frugality argument runs the opposite way from the usual one — DeepSeek is
+/// where the metered spend lives and it is cheap, so buying maximum reasoning
+/// there is the *thrifty* choice; the expensive models arrive through
+/// subscription surfaces (Claude Code, MCP, the messaging connector) rather
+/// than through this default.
+const FACTORY_EFFORT: &str = "max";
 
 /// The local ONNX embedding model for semantic indexing (constellation
 /// clustering, drift discovery, semantic search). Inference is pure-Rust
@@ -240,7 +254,8 @@ fn factory_defaults() -> LlmDefaultsRow {
         // Undecided knobs stay NULL — "provider default" is a real answer.
         temperature: None,
         top_p: None,
-        effort: None,
+        // Decided, not undecided: see FACTORY_EFFORT.
+        effort: Some(FACTORY_EFFORT.to_string()),
         thinking_budget: None,
         thinking_style: None,
     }
@@ -277,6 +292,28 @@ fn insert_factory_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The factory floor ships `effort=max`, and that is a decision rather
+    /// than an oversight — DeepSeek is where the metered spend lives and it is
+    /// cheap, so maximum reasoning there is the thrifty choice while the
+    /// expensive models arrive through subscription surfaces. Pinned so a
+    /// future "tidy up the NULL knobs" pass cannot quietly drop it back to
+    /// provider-default, which would look like no change at all.
+    #[test]
+    fn the_factory_floor_asks_for_maximum_reasoning() {
+        let d = factory_defaults();
+        assert_eq!(d.default_backend, "deepseek");
+        assert_eq!(d.default_model, "deepseek-v4-flash");
+        assert_eq!(
+            d.effort.as_deref(),
+            Some("max"),
+            "the floor must ask for max reasoning — see FACTORY_EFFORT"
+        );
+        // Deliberately still unset: these have no decided answer, and
+        // "provider default" is a real one.
+        assert_eq!(d.temperature, None);
+        assert_eq!(d.top_p, None);
+    }
 
     #[test]
     fn ensure_is_idempotent_and_seeds_four_backends() {

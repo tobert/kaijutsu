@@ -85,6 +85,62 @@ pub enum ExternalExec {
     Allow { path: Option<String> },
 }
 
+/// Who consumes this shell's output — which decides how hard we cap it.
+///
+/// kaish caps output by *replacing* the captured text with a head+tail preview
+/// and **remapping the exit code to 3** (`did_spill`), keeping the real code in
+/// `original_code` (`kaish-kernel`'s `output_limit` module doc). The remap is a
+/// deliberate signal to the embedder, but it reaches the running script's `$?`
+/// too — so inside a kaish program a command that *succeeded* and merely
+/// printed a lot looks like it failed, and `set -e` / `cmd || fallback` /
+/// `if cmd; then` all take the error branch. Measured live 2026-08-15; see
+/// docs/issues.md, "kaish output limiting — REMEASURED".
+///
+/// `kj`/MCP callers never see this, because `mcp/servers/shell.rs` unwraps
+/// `original_code` at the tool boundary. Scripts do. So the profile is chosen
+/// by who reads the output, not by how much we trust the caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputProfile {
+    /// **Model-facing.** kaish's sandboxed-agent preset: an 8 KB cap with a
+    /// head+tail preview. Bounded output is the point here — it protects the
+    /// context window, and a model that hits the cap can re-run something
+    /// narrower. The `$?` remap is a live wart on this path (a model writing
+    /// `cmd || echo failed` gets bitten), and the real fix for it is upstream:
+    /// a kaish knob that signals spill without forging the exit code. Filed.
+    #[default]
+    Agent,
+    /// **Kernel-internal.** rc scripts, hook bodies, and editor `:r !cmd`
+    /// splices: output is consumed by kaijutsu itself, not shipped to a model,
+    /// so capping it buys nothing and costs correctness twice over — a forged
+    /// `$?`, and (where the text is spliced into a document) a silent
+    /// head+tail replacement of content that was supposed to be verbatim.
+    ///
+    /// Still an explicit cap rather than `none()`: a runaway rc script should
+    /// hit a wall rather than eat the kernel's memory. It is set far above any
+    /// legitimate rc output, so `did_spill` should never fire in practice —
+    /// and if it does, that is a real problem worth the loud wrong answer.
+    Internal,
+}
+
+/// The in-memory ceiling for [`OutputProfile::Internal`]. Two orders of
+/// magnitude above kaish's 8 KB agent preset and far above any rc/hook body we
+/// write, so it is a runaway backstop and not a working limit.
+const INTERNAL_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+impl OutputProfile {
+    /// Build the kaish config for this profile.
+    fn to_config(self) -> OutputLimitConfig {
+        match self {
+            Self::Agent => OutputLimitConfig::agent(),
+            Self::Internal => {
+                let mut cfg = OutputLimitConfig::agent();
+                cfg.set_limit(Some(INTERNAL_OUTPUT_LIMIT_BYTES));
+                cfg
+            }
+        }
+    }
+}
+
 impl EmbeddedKaish {
     /// Create a new embedded kaish executor with default identity.
     ///
@@ -106,6 +162,7 @@ impl EmbeddedKaish {
             SessionId::new(),
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
+            OutputProfile::Agent,
             |_, _, _| {},
         )
     }
@@ -128,6 +185,7 @@ impl EmbeddedKaish {
         session_id: SessionId,
         session_contexts: SessionContextMap,
         external_exec: ExternalExec,
+        output: OutputProfile,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         Self::with_identity_mode(
@@ -141,6 +199,7 @@ impl EmbeddedKaish {
             session_contexts,
             false,
             external_exec,
+            output,
             configure_tools,
         )
     }
@@ -175,6 +234,11 @@ impl EmbeddedKaish {
             // Read-only never spawns: external exec is the sandbox's fourth
             // lever, held Deny by construction (no caller choice to get wrong).
             ExternalExec::Deny,
+            // Read-only backs the toolie's `read_only_shell` — a model-facing
+            // surface, so it takes the model-facing cap. Same reasoning as
+            // exec: not a caller choice, because there is only one caller and
+            // one right answer.
+            OutputProfile::Agent,
             configure_tools,
         )
     }
@@ -197,6 +261,7 @@ impl EmbeddedKaish {
         session_contexts: SessionContextMap,
         read_only: bool,
         external_exec: ExternalExec,
+        output: OutputProfile,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         // Initialize session map entry if missing
@@ -261,7 +326,11 @@ impl EmbeddedKaish {
         // these `mcp()` presets to `agent()` — same sandboxed-agent behavior.)
         let mut config = KaishConfig::named(name)
             .with_ignore_config(IgnoreConfig::agent())
-            .with_output_limit(OutputLimitConfig::agent())
+            // Output cap by consumer, not by trust — see `OutputProfile`.
+            // Model-facing shells keep kaish's 8 KB agent preset; rc/hook/
+            // editor-splice shells get a runaway backstop instead, so kaish's
+            // `did_spill` exit-code remap never forges a failure in a script.
+            .with_output_limit(output.to_config())
             // Latch nonces must outlive this per-execute shell: a nonce issued
             // by one command (e.g. `kj context retag`) is confirmed by the
             // *next* command in a fresh `EmbeddedKaish`. The store is keyed by
@@ -881,6 +950,7 @@ mod tests {
                 SessionId::new(),
                 crate::runtime::context_engine::session_context_map(),
                 exec,
+                OutputProfile::Agent,
                 |_, _, _| {},
             )
             .unwrap()
@@ -912,6 +982,93 @@ mod tests {
             .unwrap();
         assert!(!r.ok(), "Deny must refuse external exec");
         assert_eq!(r.code, 127, "fail-fast command-not-found: {}", r.err);
+    }
+
+    /// Output capping must not forge a failure inside the script.
+    ///
+    /// kaish remaps a capped command's exit code to 3 so the *embedder* can
+    /// tell (`output_limit` module doc). That signal reaches the running
+    /// program's `$?` as well, so on the Agent profile a successful command
+    /// that merely printed a lot reads as failed — which is why rc scripts,
+    /// hook bodies, and editor splices run Internal instead.
+    ///
+    /// Both halves are asserted deliberately. The Agent half pins kaish's
+    /// current behaviour: if a future bump stops forging the code, this test
+    /// fails and tells us the local workaround can go away, rather than the
+    /// workaround quietly outliving its reason.
+    #[tokio::test]
+    async fn internal_profile_does_not_forge_a_failure_on_large_output() {
+        let principal = kaijutsu_types::PrincipalId::system();
+        let blocks = shared_block_store(principal);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-outlimit").await);
+
+        let mk = |name: &str, profile: OutputProfile| {
+            EmbeddedKaish::with_identity(
+                name,
+                blocks.clone(),
+                kernel.clone(),
+                Some(std::env::temp_dir()),
+                principal,
+                ContextId::new(),
+                SessionId::new(),
+                crate::runtime::context_engine::session_context_map(),
+                ExternalExec::Deny,
+                profile,
+                |_, _, _| {},
+            )
+            .unwrap()
+        };
+
+        // ~23 KB from a kaish builtin — no host exec, so this is the shell's
+        // own captured-output path and nothing else.
+        const BIG: &str = "seq 1 5000; echo \"status=$?\"";
+        // Same command shape, small enough never to trip the cap: the control
+        // that proves the profile is what differs and not the command.
+        const SMALL: &str = "seq 1 100; echo \"status=$?\"";
+
+        let agent = mk("test-outlimit-agent", OutputProfile::Agent);
+        let r = agent
+            .execute_with_options(SMALL, ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            r.text_out().contains("status=0"),
+            "control: under the cap, $? must be the real exit — got: {}",
+            r.text_out().lines().last().unwrap_or("")
+        );
+
+        let r = agent
+            .execute_with_options(BIG, ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            r.text_out().contains("status=3"),
+            "Agent profile is expected to forge $?=3 on a capped command \
+             (kaish's did_spill remap). If this now reports status=0, kaish \
+             changed and OutputProfile::Internal may no longer be needed — \
+             check before deleting it. Got: {}",
+            r.text_out().lines().last().unwrap_or("")
+        );
+
+        let internal = mk("test-outlimit-internal", OutputProfile::Internal);
+        let r = internal
+            .execute_with_options(BIG, ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            r.text_out().contains("status=0"),
+            "Internal profile must report the command's REAL exit — an rc \
+             script doing `cmd || escalate` must not escalate on a command \
+             that worked and merely printed a lot. Got: {}",
+            r.text_out().lines().last().unwrap_or("")
+        );
+        // And the output itself must be verbatim, not a head+tail splice —
+        // the editor's `:r !cmd` splices this text into a document.
+        assert!(
+            r.text_out().contains("\n5000\n"),
+            "Internal profile must not truncate: the last line of a 5000-line \
+             run is missing, so the capture was spliced"
+        );
     }
 
     /// `$HOME` and `~` must give the SAME answer, and it must be non-empty.
@@ -1086,6 +1243,7 @@ mod tests {
             sid,
             session_contexts,
             ExternalExec::Deny,
+            OutputProfile::Agent,
             |_, _, _| {},
         )
         .unwrap();
@@ -1197,6 +1355,7 @@ mod tests {
             sid,
             session_contexts,
             ExternalExec::Deny,
+            OutputProfile::Agent,
             |_, _, _| {},
         )
         .unwrap();

@@ -205,6 +205,7 @@ mod tests {
             session_id,
             session_contexts,
             crate::runtime::embedded_kaish::ExternalExec::Deny,
+            crate::runtime::embedded_kaish::OutputProfile::Agent,
             configure_tools,
         )
         .expect("EmbeddedKaish init")

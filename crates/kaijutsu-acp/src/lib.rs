@@ -30,14 +30,14 @@ pub mod rank;
 pub mod session;
 pub mod update;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, Error, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionCapabilities, SessionId, SessionListCapabilities,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId,
+    SessionListCapabilities, SessionResumeCapabilities,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::ContentBlock;
@@ -52,6 +52,7 @@ use update::UpdateMapper;
 pub struct AcpBridge {
     pub kernel: KernelBridge,
     pub sessions: SessionRegistry,
+    client_info: Mutex<Option<Implementation>>,
 }
 
 impl AcpBridge {
@@ -59,7 +60,12 @@ impl AcpBridge {
         Self {
             kernel,
             sessions: SessionRegistry::default(),
+            client_info: Mutex::new(None),
         }
+    }
+
+    pub fn client_info(&self) -> Option<Implementation> {
+        self.client_info.lock().clone()
     }
 }
 
@@ -79,7 +85,11 @@ fn agent_capabilities() -> AgentCapabilities {
                 .audio(false)
                 .embedded_context(false),
         )
-        .session_capabilities(SessionCapabilities::new().list(SessionListCapabilities::new()))
+        .session_capabilities(
+            SessionCapabilities::new()
+                .list(SessionListCapabilities::new())
+                .resume(SessionResumeCapabilities::new()),
+        )
 }
 
 /// Flatten an ACP prompt into the text kaijutsu's input doc accepts.
@@ -116,6 +126,7 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
     let init = Arc::clone(&bridge);
     let new = Arc::clone(&bridge);
     let load = Arc::clone(&bridge);
+    let resume = Arc::clone(&bridge);
     let list = Arc::clone(&bridge);
     let prompt = Arc::clone(&bridge);
     let cancel = Arc::clone(&bridge);
@@ -129,8 +140,8 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
             Ok(())
         })
         .on_receive_request(
-            async move |req: InitializeRequest, responder, _cx| {
-                handle_initialize(&init, req, responder)
+            async move |req: InitializeRequest, responder, cx| {
+                handle_initialize(&init, req, responder, cx)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -143,6 +154,12 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
         .on_receive_request(
             async move |req: LoadSessionRequest, responder, cx| {
                 handle_load_session(Arc::clone(&load), req, responder, cx).await
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: ResumeSessionRequest, responder, cx| {
+                handle_resume_session(Arc::clone(&resume), req, responder, cx).await
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -183,14 +200,29 @@ pub fn negotiate_version(client_asked: ProtocolVersion) -> ProtocolVersion {
 }
 
 fn handle_initialize(
-    _bridge: &Arc<AcpBridge>,
+    bridge: &Arc<AcpBridge>,
     req: InitializeRequest,
     responder: Responder<InitializeResponse>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
     let negotiated = negotiate_version(req.protocol_version);
+    let client_info = req.client_info.clone();
+    *bridge.client_info.lock() = client_info.clone();
+    if let Some(info) = &client_info {
+        let kernel = bridge.kernel.clone();
+        let info = info.clone();
+        cx.spawn(async move {
+            match kernel.attach_client_peer(&info.name).await {
+                Ok(nick) => tracing::info!(%nick, version = %info.version, "ACP client attached as peer"),
+                Err(e) => tracing::warn!(client = %info.name, "ACP client peer attach failed (non-fatal): {e}"),
+            }
+            Ok(())
+        })?;
+    }
     tracing::info!(
         client_asked = req.protocol_version.as_u16(),
         negotiated = negotiated.as_u16(),
+        client = client_info.as_ref().map(|info| info.name.as_str()),
         "initialize"
     );
     responder.respond(
@@ -209,20 +241,27 @@ async fn handle_new_session(
     responder: Responder<NewSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
-    if !req.mcp_servers.is_empty() {
-        // Client-declared MCP servers are unplumbed on the kernel side
-        // (`external.rs` exists, nothing calls it). Say so once rather than
-        // pretending they were wired.
-        tracing::warn!(
-            count = req.mcp_servers.len(),
-            "ignoring client-declared mcpServers — external MCP wiring is unplumbed (docs/acp.md gap #4)"
-        );
+    warn_ignored_mcp_servers(req.mcp_servers.len(), "session/new");
+    if let Err(e) = validate_acp_cwd(&req.cwd) {
+        return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
     let label = new_session_label(&req.cwd);
     let opened = match bridge.kernel.open_or_create(&label).await {
         Ok(o) => o,
         Err(e) => return responder.respond_with_error(internal(e)),
     };
+    if let Err(e) = bridge.kernel.set_context_cwd(opened.context_id, &req.cwd).await {
+        if !opened.resumed {
+            if let Err(cleanup) = bridge.kernel.archive_context(opened.context_id).await {
+                tracing::warn!(
+                    context = %opened.context_id.short(),
+                    error = %cleanup,
+                    "failed to archive fresh context after invalid ACP cwd"
+                );
+            }
+        }
+        return responder.respond_with_error(invalid_cwd(&req.cwd, e));
+    }
     let session_id = rank::session_id_of(opened.context_id);
     match start_session(&bridge, &session_id, opened.context_id, opened.label, &cx, false).await {
         Ok(()) => responder.respond(NewSessionResponse::new(session_id)),
@@ -236,6 +275,7 @@ async fn handle_load_session(
     responder: Responder<LoadSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
+    warn_ignored_mcp_servers(req.mcp_servers.len(), "session/load");
     let Some(context_id) = rank::context_id_of(&req.session_id) else {
         return responder.respond_with_error(
             Error::invalid_params().data(serde_json::json!({
@@ -251,12 +291,70 @@ async fn handle_load_session(
                 .respond_with_error(Error::resource_not_found(Some(e.to_string())));
         }
     };
+    if let Err(e) = bridge.kernel.set_context_cwd(context_id, &req.cwd).await {
+        return responder.respond_with_error(invalid_cwd(&req.cwd, e));
+    }
     // Replay the transcript: `session/load` exists so a client can render the
     // conversation it is rejoining.
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, true).await {
         Ok(()) => responder.respond(LoadSessionResponse::new()),
         Err(e) => responder.respond_with_error(e),
     }
+}
+
+async fn handle_resume_session(
+    bridge: Arc<AcpBridge>,
+    req: ResumeSessionRequest,
+    responder: Responder<ResumeSessionResponse>,
+    cx: ConnectionTo<Client>,
+) -> Result<(), Error> {
+    warn_ignored_mcp_servers(req.mcp_servers.len(), "session/resume");
+    let Some(context_id) = rank::context_id_of(&req.session_id) else {
+        return responder.respond_with_error(
+            Error::invalid_params().data(serde_json::json!({
+                "reason": "session id is not a kaijutsu context id",
+                "sessionId": req.session_id.0.as_ref(),
+            })),
+        );
+    };
+    let info = match bridge.kernel.attach(context_id).await {
+        Ok(i) => i,
+        Err(e) => {
+            return responder
+                .respond_with_error(Error::resource_not_found(Some(e.to_string())));
+        }
+    };
+    if let Err(e) = bridge.kernel.set_context_cwd(context_id, &req.cwd).await {
+        return responder.respond_with_error(invalid_cwd(&req.cwd, e));
+    }
+    match start_session(&bridge, &req.session_id, context_id, info.label, &cx, false).await {
+        Ok(()) => responder.respond(ResumeSessionResponse::new()),
+        Err(e) => responder.respond_with_error(e),
+    }
+}
+
+fn warn_ignored_mcp_servers(count: usize, method: &'static str) {
+    if count != 0 {
+        tracing::warn!(
+            count,
+            method,
+            "ignoring client-declared mcpServers — external MCP wiring is unplumbed (docs/acp.md gap #5)"
+        );
+    }
+}
+
+fn invalid_cwd(cwd: &std::path::Path, error: anyhow::Error) -> Error {
+    Error::invalid_params().data(serde_json::json!({
+        "reason": error.to_string(),
+        "cwd": cwd,
+    }))
+}
+
+fn validate_acp_cwd(cwd: &std::path::Path) -> anyhow::Result<()> {
+    if !cwd.is_absolute() {
+        anyhow::bail!("ACP cwd must be absolute: {}", cwd.display());
+    }
+    Ok(())
 }
 
 /// Bind a session and start its pump. Idempotent: loading an already-bound
@@ -305,7 +403,19 @@ async fn handle_list_sessions(
 ) -> Result<(), Error> {
     match bridge.kernel.list_contexts().await {
         Ok(contexts) => {
-            let sessions = rank::ranked_sessions(&contexts, bridge.kernel.cwd());
+            let mut cwds = std::collections::HashMap::new();
+            for context_id in rank::ranked_context_ids(&contexts) {
+                match bridge.kernel.context_cwd(context_id).await {
+                    Ok(Some(cwd)) => {
+                        cwds.insert(context_id, cwd);
+                    }
+                    Ok(None) => {
+                        tracing::debug!(context = %context_id.short(), "omitting context without durable cwd from ACP session/list");
+                    }
+                    Err(e) => return responder.respond_with_error(internal(e)),
+                }
+            }
+            let sessions = rank::ranked_sessions(&contexts, &cwds);
             responder.respond(ListSessionsResponse::new(sessions))
         }
         Err(e) => responder.respond_with_error(internal(e)),
@@ -373,11 +483,6 @@ fn internal(e: impl std::fmt::Display) -> Error {
     Error::internal_error().data(serde_json::json!({ "reason": e.to_string() }))
 }
 
-/// Default working directory when the client does not name one.
-pub fn default_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,9 +542,21 @@ mod tests {
             caps.session_capabilities.list.is_some(),
             "session/list serves the rank"
         );
+        assert!(
+            caps.session_capabilities.resume.is_some(),
+            "session/resume attaches without replay"
+        );
         // Advertising image/audio we would drop is worse than declining them.
         assert!(!caps.prompt_capabilities.image);
         assert!(!caps.prompt_capabilities.audio);
         assert!(!caps.prompt_capabilities.embedded_context);
+    }
+
+    #[test]
+    fn relative_new_session_cwd_is_rejected_before_kernel_work() {
+        let err = validate_acp_cwd(std::path::Path::new("relative/project"))
+            .expect_err("ACP requires absolute cwd");
+        assert!(err.to_string().contains("must be absolute"));
+        validate_acp_cwd(std::path::Path::new("/absolute/project")).unwrap();
     }
 }
