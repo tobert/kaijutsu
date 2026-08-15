@@ -6,6 +6,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kaijutsu-mcp --connect serve` silently runs local (2026-08-15)
+
+`kaijutsu-mcp --connect` attaches to the server. `kaijutsu-mcp --connect serve`
+— the same flag with the subcommand spelled out — **silently ignores it and runs
+in local mode**. `whoami` then answers `{"mode":"local"}` and `register_session`
+replies "requires --connect to kaijutsu-server", while the caller believes it
+passed exactly that.
+
+Found while probing the live kernel after the wire flag day. Costs a few minutes
+of confusion each time, and it is a silent fallback of the kind we treat as a
+defect: it should either honour the flag under `serve` or refuse the
+combination, not quietly do the other thing.
+
 ## The well's activity glow wants a derived signal (2026-08-15)
 
 The glow is **disabled**, not broken: `RingActivity`'s decay/ripple math is live
