@@ -1952,7 +1952,7 @@ interface Kernel {
   # command text from becoming an unintended general shell surface. The latch
   # fields reserve the confirmation round trip even though the first ACP
   # catalog is deliberately read-mostly.
-  executeKj @110 (contextId :Data, argv :List(Text), trace :TraceContext) -> (
+  executeKj @111 (contextId :Data, argv :List(Text), trace :TraceContext) -> (
     exitCode :Int32,
     stdout :Text,
     stderr :Text,
@@ -1966,7 +1966,7 @@ interface Kernel {
   # ACP-facing command metadata. argvPrefix is the exact kj argv represented
   # by name; clients append parsed user arguments. The server owns curation so
   # every frontend observes the same loadout-aware surface.
-  getKjCommandCatalog @111 (contextId :Data, trace :TraceContext) -> (commands :List(KjCommand));
+  getKjCommandCatalog @112 (contextId :Data, trace :TraceContext) -> (commands :List(KjCommand));
 }
 
 struct KjCommand {
