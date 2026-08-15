@@ -32,10 +32,19 @@ or open an issue on Github.
 ## Introduction
 
 Kaijutsu is an AI agent system built around context forking and drifting, with some
-experimental features for agentic music production. The core is the kaijutsu kernel,
-which offers CRDT-based editing primitives to help users and multiple agents work
-in parallel over unreliable networks. To make authentication simple and secure, kaijutsu
-uses an embedded SSH server and ssh keys exclusively to identify users. 
+experimental features for agentic music production. The core is the kaijutsu kernel:
+one authoritative sequencer that many players — humans, models, connected apps —
+write to at once. Clients send rich commands expressing intent; the kernel validates,
+orders, and commits them, then projects the accepted facts back out as an event
+stream. To make authentication simple and secure, kaijutsu uses an embedded SSH
+server and ssh keys exclusively to identify users.
+
+Kaijutsu is deliberately **not** a partition-tolerant peer-to-peer system. Contexts
+are multi-writer because many players share one kernel, not because replicas
+reconcile: there is one place that decides what happened, and recovery is asking it
+again rather than merging with a peer. Block text is still stored in a CRDT
+underneath, but that is an implementation detail being retired from the contract —
+see [Status](#status).
 
 The stance behind all of it: kaijutsu is an instrument, not a harness. You play
 it, a model plays it, and if you hand someone a connected app they play it too —
@@ -50,8 +59,22 @@ kaijutsu. This can be inspected and visualized in the app or over MCP.
 
 ## Status
 
-**Kaijutsu is not released yet**. The kernel feels solid and reliable, and
-diamond-types-extended seems to be stable. The UI is coming along.
+**Kaijutsu is not released yet**. The kernel feels solid and reliable, and the UI
+is coming along.
+
+**Durable storage is mid-migration.** Kaijutsu was built on a CRDT
+(diamond-types-extended) as the shared state everyone edits concurrently. That bet
+bought less than it cost: the real concurrency need is "many players, one kernel,"
+which a kernel-side sequencer serves directly, while a CRDT's operation encoding
+leaked outward and became the de facto client contract and the de facto meaning of
+history. So the vocabulary is moving to Kaijutsu's own domain operations, and DTE
+is being demoted to a private text buffer kept only where it earns its keep.
+Reasoning and the ruling: [docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md).
+
+Practically, if you are reading the code: the `kaijutsu-crdt` crate is still here
+and still load-bearing, some clients still consume raw sync payloads, and rc/config
+still live as CRDT documents. Treat all of that as scaffolding on its way out
+rather than as the design.
 
 You may need my branch of kaish for this to build. Kaish will go back to
 cargo versions soon.
@@ -112,16 +135,21 @@ and tools.
 
 ### kaijutsu-crdt
 
-Block-based CRDT document model built on [diamond-types-extended][dte]. Documents
-are DAGs of blocks — each block is an independently-editable CRDT text buffer with
-metadata (role, kind, status, parent). This is the shared state that all
-participants (models, humans, scripts) edit concurrently.
+The block document model and `BlockStore`. Documents are DAGs of blocks — each
+block carries metadata (role, kind, status, parent) and a text buffer built on
+[diamond-types-extended][dte].
+
+Being demoted, deliberately. This crate's operation encoding is not the client
+contract and not the meaning of kaijutsu history; the kernel sequences domain
+operations and projects them outward. The text engine survives only where merge
+actually does work. Don't build new code against its raw ops.
 
 ### kaijutsu-server
 
-SSH + Cap'n Proto RPC server. Handles authentication via SQLite-backed public
-keys, runs EmbeddedKaish for shell command execution, and routes file I/O
-through CRDT blocks via KaijutsuBackend.
+SSH + Cap'n Proto RPC server, and the sequencing boundary: it accepts commands,
+orders and commits them, and publishes the resulting events. Handles authentication
+via SQLite-backed public keys, runs EmbeddedKaish for shell command execution, and
+routes file I/O through kernel-owned blocks via KaijutsuBackend.
 
 ### kaijutsu-client
 
@@ -196,7 +224,7 @@ in `docs/issues.md`.
 
 ### kaijutsu-mcp
 
-[MCP server][mcp] exposing the CRDT kernel to Claude Code, Gemini CLI, opencode,
+[MCP server][mcp] exposing the kernel to Claude Code, Gemini CLI, opencode,
 and other MCP clients. Can run standalone (in-memory) or connected to
 kaijutsu-server.
 
@@ -230,6 +258,8 @@ text rendering, theming, and the UI architecture.
 | Doc | Purpose |
 |-----|---------|
 | [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
+| [docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md) | Why the CRDT is being demoted, and what replaces it |
+| [docs/architecture/](docs/architecture/) | Code-verified architecture map, per crate |
 | [docs/devlog.md](docs/devlog.md) | The story of how kaijutsu took shape — arcs, decisions, lessons |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
 | [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
@@ -239,6 +269,6 @@ text rendering, theming, and the UI architecture.
 
 | Fork | Why |
 |------|-----|
-| [diamond-types-extended][dte] | Completes Map/Set/Register types alongside Text CRDT |
+| [diamond-types-extended][dte] | Completes Map/Set/Register types alongside Text CRDT. Being narrowed to block text only; the Map/Set/Register work is what the domain-operation vocabulary replaces. |
 
 [dte]: https://github.com/tobert/diamond-types-extended

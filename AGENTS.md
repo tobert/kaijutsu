@@ -12,12 +12,17 @@ embodied — never preached — in the model-facing rc stances.)
 
 The kernel restates the cybernetic / 改善 / TDD posture in its own rc lifecycle:
 `/etc/rc/coder/create/S00-stance.kai` reaches the model via the system-prompt slot for
-every context with `context_type=coder`. rc scripts at `/etc/rc` are **CRDT-owned** — the
-kernel is the sole owner (no host file, no write-through); embedded defaults under
-`assets/defaults/rc/` seed the CRDT once on a fresh kernel. There is no host file to
+every context with `context_type=coder`. rc scripts at `/etc/rc` are **kernel-owned** —
+one owner, no host file, no write-through; embedded defaults under
+`assets/defaults/rc/` seed a fresh kernel once. There is no host file to
 `vim`: edit a live script with `kj rc edit <path> --content <body>`, and `kj rc reset
 <path>` restores one to its embedded default. Change the shipped default by editing
 `assets/defaults/rc/` (the in-repo seed). See `docs/config-crdt-ownership.md`.
+
+*Migration in flight:* rc/config are stored as CRDT documents today and are being
+melted into a kernel-owned git worktree of plain files. **Single kernel ownership is
+the invariant that survives the change** — whatever the storage, config must never
+have two competing sources of truth.
 
 **Shared trust, crosstalk-as-feature.** Every player — human, model, connected
 app, sibling context — is *inside* the trust boundary; the kernel runs as one
@@ -41,10 +46,44 @@ agent-supplied. A new ad-hoc exec site (another `/bin/sh -c`, another bare
 kaish already owns, and the copy drifts — see `docs/issues.md` for one that
 did and is being retired.
 
+## Durable state and the wire
+
+**The kernel is the sole sequencer.** Kaijutsu is not a partition-tolerant
+peer-to-peer system and does not try to be: there is one authoritative kernel,
+every accepted mutation gets a kernel-assigned sequence, and gap recovery is
+"ask the kernel again" — never a peer merge. Contexts are multi-writer because
+many players share one kernel, not because replicas reconcile.
+
+The shape every path should follow:
+
+```text
+rich RPC command  →  kernel validates and sequences  →  semantic operation +
+materialized state commit atomically  →  projected event stream  →  thin clients
+```
+
+Three rules that follow, and they are the ones to check a patch against:
+
+1. **Commands express intent; events express accepted facts.** Commit first,
+   publish second — never publish an event you have not durably accepted.
+2. **Clients never author or decode storage-engine operations.** A client that
+   decodes an oplog to learn what happened is reaching around the contract. Ask
+   for blocks and revisions as projected facts.
+3. **The durable and wire vocabulary is Kaijutsu's domain vocabulary** — blocks
+   authored, edited, completed, excluded; input edited, submitted, cleared — not
+   a text engine's encoding of them.
+
+*Migration in flight.* Block text is stored in a CRDT (diamond-types-extended,
+the `kaijutsu-crdt` crate) and some clients still consume raw sync payloads. That
+is being retired: DTE stays only where it earns its keep, as a **private text
+buffer**, never as the client contract or the meaning of history. **Do not add a
+new consumer of raw CRDT ops or sync state** — if you need one, that is a design
+conversation. Amy's ruling and the reasoning: `docs/crdt-position-2026-08.md`.
+
 ## Crates
 
 `kaijutsu-types` first — the shared types every other crate depends on. Then
-`kaijutsu-crdt` (BlockStore), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
+`kaijutsu-crdt` (BlockStore; the block text engine, being demoted to a private
+implementation detail), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
 LLM, drift, `kj` builtin), `kaijutsu-server` (SSH server, EmbeddedKaish),
 `kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.18 GUI;
 inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, editor,
@@ -62,7 +101,7 @@ beat/clock/cue code with that section open.
 
 ## Conversation vs Context
 
-**Context** is the durable side: CRDT block log, exclusions, edits, conversation metadata. Multi-writer. Holds more than the live conversation knows about.
+**Context** is the durable side: the kernel-sequenced block log, exclusions, edits, conversation metadata. Multi-writer — many players, one kernel. Holds more than the live conversation knows about.
 
 **Conversation** is the live session: an append-only message sequence shipped to the LLM. Hydrated from context once at boundary events (fork, new, cold start, attach) and append-only thereafter.
 
