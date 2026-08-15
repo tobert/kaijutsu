@@ -4378,6 +4378,94 @@ impl kernel::Server for KernelImpl {
         }.instrument(trace_span))
     }
 
+    fn execute_kj(
+        self: Rc<Self>,
+        params: kernel::ExecuteKjParams,
+        mut results: kernel::ExecuteKjResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "execute_kj");
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let argv_reader = pry!(p.get_argv());
+        let mut argv = Vec::with_capacity(argv_reader.len() as usize);
+        for item in argv_reader.iter() {
+            argv.push(pry!(pry!(item).to_str()).to_owned());
+        }
+        if argv.len() > 64 || argv.iter().any(|arg| arg.len() > 16 * 1024) {
+            return Promise::err(capnp::Error::failed("kj argv exceeds wire limits".into()));
+        }
+        let kernel = self.kernel.clone();
+        let connection = self.connection.clone();
+        let principal = self.connection.borrow().principal.id;
+        Promise::from_future(async move {
+            let executed = execute_kj_command(context_id, principal, &argv, &kernel, &connection).await?;
+            let mut out = results.get();
+            out.set_exit_code(executed.exit_code);
+            out.set_stdout(&executed.stdout);
+            out.set_stderr(&executed.stderr);
+            set_block_id_builder(&mut out.reborrow().init_command_block_id(), &executed.command_block_id);
+            if let Some(latch) = executed.latch {
+                out.set_latch_command(&latch.command);
+                out.set_latch_target(&latch.target);
+                out.set_latch_message(&latch.message);
+                out.set_has_latch(true);
+            } else {
+                out.set_latch_command("");
+                out.set_latch_target("");
+                out.set_latch_message("");
+                out.set_has_latch(false);
+            }
+            Ok(())
+        }.instrument(trace_span))
+    }
+
+    fn get_kj_command_catalog(
+        self: Rc<Self>,
+        params: kernel::GetKjCommandCatalogParams,
+        mut results: kernel::GetKjCommandCatalogResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "get_kj_command_catalog");
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let kernel = self.kernel.clone();
+        Promise::from_future(async move {
+            require_context_exists(&kernel, context_id)?;
+            if kernel.documents.get(context_id).is_none() {
+                return Err(capnp::Error::failed(format!("context {} is not materialized", context_id)));
+            }
+            // Match KjDispatcher::require_cap: KernelDb is authoritative for
+            // kj authority bits, rather than the broker's cache-first view.
+            let binding = kernel.kernel_db.lock().get_context_binding(context_id)
+                .map_err(|e| capnp::Error::failed(format!("failed to read context binding: {e}")))?
+                .unwrap_or_default();
+            let mut catalog = kj_command_catalog();
+            if binding.allows(&kaijutsu_kernel::mcp::Capability::Fork) {
+                catalog.push(KjCatalogEntry {
+                    name: "fork", description: "Fork this context into a new session",
+                    input_hint: "[--name <label>]", argv_prefix: &["fork"],
+                });
+            }
+            let mut list = results.get().init_commands(catalog.len() as u32);
+            for (i, entry) in catalog.into_iter().enumerate() {
+                let mut item = list.reborrow().get(i as u32);
+                item.set_name(entry.name);
+                item.set_description(entry.description);
+                item.set_input_hint(entry.input_hint);
+                let mut prefix = item.init_argv_prefix(entry.argv_prefix.len() as u32);
+                for (j, part) in entry.argv_prefix.iter().enumerate() {
+                    prefix.set(j as u32, part);
+                }
+            }
+            Ok(())
+        }.instrument(trace_span))
+    }
+
     fn get_last_result(
         self: Rc<Self>,
         _params: kernel::GetLastResultParams,
@@ -8687,6 +8775,152 @@ async fn execute_shell_command(
     });
 
     Ok(command_block_id)
+}
+
+struct KjCatalogEntry {
+    name: &'static str,
+    description: &'static str,
+    input_hint: &'static str,
+    argv_prefix: &'static [&'static str],
+}
+
+fn kj_command_catalog() -> Vec<KjCatalogEntry> {
+    vec![
+        KjCatalogEntry { name: "help", description: "Show kj help", input_hint: "", argv_prefix: &["help"] },
+        KjCatalogEntry { name: "context-list", description: "List contexts", input_hint: "", argv_prefix: &["context", "list"] },
+        KjCatalogEntry { name: "context-info", description: "Show context details", input_hint: "[context]", argv_prefix: &["context", "info"] },
+        KjCatalogEntry { name: "context-current", description: "Show the current context", input_hint: "", argv_prefix: &["context", "current"] },
+        KjCatalogEntry { name: "context-log", description: "Show context history", input_hint: "[context]", argv_prefix: &["context", "log"] },
+        KjCatalogEntry { name: "context-prompt", description: "Show the hydrated context prompt", input_hint: "[context]", argv_prefix: &["context", "prompt"] },
+        KjCatalogEntry { name: "model", description: "Show effective model information", input_hint: "[--context <context>]", argv_prefix: &["model"] },
+        KjCatalogEntry { name: "models", description: "List available models", input_hint: "", argv_prefix: &["models"] },
+    ]
+}
+
+struct ExecutedKj {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    command_block_id: kaijutsu_crdt::BlockId,
+    latch: Option<ExecutedKjLatch>,
+}
+
+struct ExecutedKjLatch { command: String, target: String, message: String }
+
+fn kaish_quote(word: &str) -> String {
+    let escaped = word.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("\"{}\"", escaped)
+}
+
+/// Execute exactly one `kj` builtin against an addressed context. This is a
+/// sibling of shell execution, not a call through its facade: the context's
+/// materialized kaish supplies kj's rc, persistence and latch semantics while
+/// structured argv prevents this RPC from becoming a general shell escape.
+async fn execute_kj_command(
+    context_id: ContextId,
+    principal: PrincipalId,
+    argv: &[String],
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+) -> Result<ExecutedKj, capnp::Error> {
+    require_context_exists(kernel, context_id)?;
+    let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
+    let documents = kernel.documents.clone();
+    if documents.get(context_id).is_none() {
+        return Err(capnp::Error::failed(format!("context {} is not materialized", context_id)));
+    }
+    let last = documents.last_block_id(context_id);
+    let command_block_id = documents.insert_tool_call_as(
+        context_id, None, last.as_ref(), "kj", serde_json::json!({"argv": argv}),
+        Some(TypesToolKind::Builtin), Some(principal), None, Some(Role::User),
+    ).map_err(|e| capnp::Error::failed(format!("failed to insert kj command: {e}")))?;
+    let output_block_id = documents.insert_tool_result_as(
+        context_id, &command_block_id, Some(&command_block_id), "", false, None,
+        Some(TypesToolKind::Builtin), Some(PrincipalId::system()), None,
+    ).map_err(|e| capnp::Error::failed(format!("failed to insert kj output: {e}")))?;
+    let _ = documents.set_status(context_id, &output_block_id, Status::Running);
+
+    let state_before = snapshot_shell_state(&kaish).await;
+    let mut code = String::from("kj");
+    for arg in argv {
+        code.push(' ');
+        code.push_str(&kaish_quote(arg));
+    }
+    let result = match kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()).await {
+        Ok(result) => result,
+        Err(e) => {
+            let stderr = format!("kj execution failed: {e}");
+            documents.set_stderr(context_id, &output_block_id, Some(stderr.clone()))
+                .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
+            documents.set_exit_code(context_id, &output_block_id, Some(1))
+                .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
+            documents.set_status(context_id, &output_block_id, Status::Error)
+                .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
+            documents.set_status(context_id, &command_block_id, Status::Error)
+                .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+            return Ok(ExecutedKj { exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None });
+        }
+    };
+    let latch = result.latch_request().map(|latch| ExecutedKjLatch {
+        command: latch.command.clone(),
+        target: latch.paths.join(" "),
+        message: latch.hint.clone(),
+    });
+    let stdout = result.text_out().into_owned();
+    let stderr = result.err.clone();
+    documents.edit_text_as(context_id, &output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))
+        .map_err(|e| capnp::Error::failed(format!("failed to persist kj output: {e}")))?;
+    if !stderr.is_empty() {
+        documents.set_stderr(context_id, &output_block_id, Some(stderr.clone()))
+            .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
+    }
+    if let Some(output) = block_output_data(&result) {
+        documents.set_output(context_id, &output_block_id, Some(&output))
+            .map_err(|e| capnp::Error::failed(format!("failed to persist kj data: {e}")))?;
+    }
+    let exit_code = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    documents.set_exit_code(context_id, &output_block_id, Some(exit_code))
+        .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
+    // Deliberately ignore kaish.context_id(): ACP sessions stay pinned even
+    // when a (future or direct-RPC) kj command returns KjResult::Switch.
+    let state_after = snapshot_shell_state(&kaish).await;
+    if kaish.context_id() == Some(context_id) {
+        persist_shell_state(&kernel.kernel_db, context_id, &state_before, &state_after);
+    }
+    let status = if matches!(result.code, 0 | 2 | 3) { Status::Done } else { Status::Error };
+    documents.set_status(context_id, &output_block_id, status)
+        .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
+    documents.set_status(context_id, &command_block_id, status)
+        .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+    Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch })
+}
+
+#[cfg(test)]
+mod kj_rpc_tests {
+    use super::{kaish_quote, kj_command_catalog};
+
+    #[test]
+    fn static_catalog_excludes_attach_and_context_switch() {
+        let catalog = kj_command_catalog();
+        let names: Vec<_> = catalog.iter().map(|c| c.name).collect();
+        assert_eq!(names, vec![
+            "help", "context-list", "context-info", "context-current",
+            "context-log", "context-prompt", "model", "models",
+        ]);
+        assert!(catalog.iter().all(|c| !matches!(c.argv_prefix, ["attach"] | ["context", "switch"])));
+        assert_eq!(catalog[0].argv_prefix, &["help"]);
+    }
+
+    #[test]
+    fn structured_argv_cannot_escape_the_single_kj_invocation() {
+        let hostile = "x'; context switch victim; echo '";
+        let quoted = kaish_quote(hostile);
+        assert_eq!(quoted, "\"x'; context switch victim; echo '\"");
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+    }
 }
 
 // ============================================================================

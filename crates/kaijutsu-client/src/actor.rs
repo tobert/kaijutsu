@@ -476,6 +476,15 @@ enum RpcCommand {
         path: String,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    ExecuteKj {
+        context_id: ContextId,
+        argv: Vec<String>,
+        reply: oneshot::Sender<Result<crate::rpc::KjExecutionResult, CallError>>,
+    },
+    GetKjCommandCatalog {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<Vec<crate::rpc::KjCommandInfo>, CallError>>,
+    },
 
     // ── Shell Variables ──────────────────────────────────────────────────
     GetShellVar {
@@ -745,6 +754,8 @@ impl RpcCommand {
             Self::GetCommandHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ExecuteKj { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetKjCommandCatalog { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1314,6 +1325,23 @@ impl ActorHandle {
             path: path.into(),
             reply,
         }).await
+    }
+
+    #[tracing::instrument(skip(self, argv))]
+    pub async fn execute_kj(
+        &self,
+        context_id: ContextId,
+        argv: Vec<String>,
+    ) -> Result<crate::rpc::KjExecutionResult, CallError> {
+        self.send(|reply| RpcCommand::ExecuteKj { context_id, argv, reply }).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get_kj_command_catalog(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Vec<crate::rpc::KjCommandInfo>, CallError> {
+        self.send(|reply| RpcCommand::GetKjCommandCatalog { context_id, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -3243,6 +3271,12 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::SetContextCwd { context_id, path, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_cwd(context_id, &path));
+        }
+        RpcCommand::ExecuteKj { context_id, argv, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.execute_kj(context_id, &argv));
+        }
+        RpcCommand::GetKjCommandCatalog { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_kj_command_catalog(context_id));
         }
 
         // ── Shell Variables ──

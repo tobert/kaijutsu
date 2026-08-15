@@ -461,6 +461,30 @@ pub struct ContextInfo {
     pub origin_host: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KjCommandInfo {
+    pub name: String,
+    pub description: String,
+    pub input_hint: String,
+    pub argv_prefix: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KjExecutionResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub command_block_id: BlockId,
+    pub latch: Option<KjLatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KjLatch {
+    pub command: String,
+    pub target: String,
+    pub message: String,
+}
+
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
 /// beat scheduler's in-memory truth via `listTracks`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2238,6 +2262,69 @@ impl KernelHandle {
             return Err(RpcError::ServerError(result.get_error()?.to_string()?));
         }
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, argv), name = "rpc_client.execute_kj")]
+    pub async fn execute_kj(
+        &self,
+        context_id: ContextId,
+        argv: &[String],
+    ) -> Result<KjExecutionResult, RpcError> {
+        let mut request = self.kernel.execute_kj_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let mut wire_argv = request.get().init_argv(argv.len() as u32);
+            for (i, arg) in argv.iter().enumerate() {
+                wire_argv.set(i as u32, arg);
+            }
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        let latch = if result.get_has_latch() {
+            Some(KjLatch {
+                command: result.get_latch_command()?.to_string()?,
+                target: result.get_latch_target()?.to_string()?,
+                message: result.get_latch_message()?.to_string()?,
+            })
+        } else { None };
+        Ok(KjExecutionResult {
+            exit_code: result.get_exit_code(),
+            stdout: result.get_stdout()?.to_string()?,
+            stderr: result.get_stderr()?.to_string()?,
+            command_block_id: parse_block_id(&result.get_command_block_id()?)?,
+            latch,
+        })
+    }
+
+    #[tracing::instrument(skip(self), name = "rpc_client.get_kj_command_catalog")]
+    pub async fn get_kj_command_catalog(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Vec<KjCommandInfo>, RpcError> {
+        let mut request = self.kernel.get_kj_command_catalog_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        response.get()?.get_commands()?.iter().map(|item| {
+            Ok(KjCommandInfo {
+                name: item.get_name()?.to_string()?,
+                description: item.get_description()?.to_string()?,
+                input_hint: item.get_input_hint()?.to_string()?,
+                argv_prefix: item.get_argv_prefix()?.iter()
+                    .map(|s| Ok(s?.to_string()?)).collect::<Result<Vec<_>, RpcError>>()?,
+            })
+        }).collect()
     }
 
     /// Get a shell variable by name.

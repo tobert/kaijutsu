@@ -847,6 +847,44 @@ fn test_context_cwd_is_addressed_and_vfs_validated() {
 }
 
 #[test]
+fn test_kj_rpc_is_addressed_curated_and_keeps_ambient_context() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context_a = kernel.create_context("addressed-kj-'a").await.unwrap();
+        let context_b = kernel.create_context("addressed-kj-b").await.unwrap();
+        kernel.join_context(context_b, "addressed-kj-test").await.unwrap();
+
+        let catalog = kernel.get_kj_command_catalog(context_a).await.unwrap();
+        let names: Vec<_> = catalog.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"context-current"));
+        assert!(!names.contains(&"attach") && !names.contains(&"context-switch"));
+
+        let argv = vec!["context".into(), "info".into(), "addressed-kj-'a".into()];
+        let execution = kernel.execute_kj(context_a, &argv).await.unwrap();
+        assert_eq!(execution.exit_code, 0);
+        assert!(execution.stdout.contains("addressed-kj-'a"), "{:?}", execution.stdout);
+        let (ambient, _) = kernel.get_context_id().await.unwrap();
+        assert_eq!(ambient, context_b, "addressed kj must not mutate the actor's ambient context");
+
+        let blocks = kernel.get_blocks(context_a, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        assert!(blocks.iter().any(|b| b.tool_name.as_deref() == Some("kj")),
+            "kj execution must persist through the Builtin tool block path");
+
+        if names.contains(&"fork") {
+            let fork_argv = vec![
+                "fork".into(), "--name".into(), "addressed-kj-child".into(), "--switch".into(),
+            ];
+            let forked = kernel.execute_kj(context_a, &fork_argv).await.unwrap();
+            assert_eq!(forked.exit_code, 0, "{}", forked.stderr);
+            let (ambient, _) = kernel.get_context_id().await.unwrap();
+            assert_eq!(ambient, context_b, "KjResult::Switch from fork must stay inside the addressed shell");
+        }
+    });
+}
+
+#[test]
 fn test_shell_var_round_trips_through_context() {
     run_local(async {
         let addr = start_server().await;

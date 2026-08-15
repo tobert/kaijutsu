@@ -1946,6 +1946,34 @@ interface Kernel {
   # context, so one client can safely manage several sessions.
   getContextCwd @108 (contextId :Data, trace :TraceContext) -> (path :Text, found :Bool);
   setContextCwd @109 (contextId :Data, path :Text, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Run one context-addressed kj invocation through the materialized kaish
+  # builtin. argv excludes the leading "kj". Keeping argv structured prevents
+  # command text from becoming an unintended general shell surface. The latch
+  # fields reserve the confirmation round trip even though the first ACP
+  # catalog is deliberately read-mostly.
+  executeKj @110 (contextId :Data, argv :List(Text), trace :TraceContext) -> (
+    exitCode :Int32,
+    stdout :Text,
+    stderr :Text,
+    commandBlockId :BlockId,
+    latchCommand :Text,
+    latchTarget :Text,
+    latchMessage :Text,
+    hasLatch :Bool
+  );
+
+  # ACP-facing command metadata. argvPrefix is the exact kj argv represented
+  # by name; clients append parsed user arguments. The server owns curation so
+  # every frontend observes the same loadout-aware surface.
+  getKjCommandCatalog @111 (contextId :Data, trace :TraceContext) -> (commands :List(KjCommand));
+}
+
+struct KjCommand {
+  name @0 :Text;
+  description @1 :Text;
+  inputHint @2 :Text;
+  argvPrefix @3 :List(Text);
 }
 
 # ============================================================================
