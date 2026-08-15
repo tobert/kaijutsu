@@ -10845,7 +10845,7 @@ mod tests {
     // message text. These prove the typed, read-back-based classification.
 
     /// 1. Re-inserting a `DocumentRow` with an already-used `document_id`
-    /// must classify as `DuplicateDocument`, carrying the right id.
+    ///    must classify as `DuplicateDocument`, carrying the right id.
     #[test]
     fn insert_document_duplicate_id_is_typed_duplicate_document() {
         let db = KernelDb::in_memory().unwrap();
@@ -10872,8 +10872,8 @@ mod tests {
     }
 
     /// 2. Inserting a *different* document whose `(workspace_id, path)` is
-    /// already claimed must classify as `DocumentPathConflict`, carrying the
-    /// path and the id of the document that actually holds it.
+    ///    already claimed must classify as `DocumentPathConflict`, carrying the
+    ///    path and the id of the document that actually holds it.
     #[test]
     fn insert_document_path_conflict_is_typed_document_path_conflict() {
         let db = KernelDb::in_memory().unwrap();
@@ -10912,9 +10912,9 @@ mod tests {
     }
 
     /// 3. Guard: `idx_documents_path` is a *partial* unique index
-    /// (`WHERE path IS NOT NULL`) — two documents with `path: None` in the
-    /// same workspace must both insert cleanly. If someone "fixes" the index
-    /// into a full unique index, this must fail loudly.
+    ///    (`WHERE path IS NOT NULL`) — two documents with `path: None` in the
+    ///    same workspace must both insert cleanly. If someone "fixes" the index
+    ///    into a full unique index, this must fail loudly.
     #[test]
     fn insert_document_two_null_paths_in_same_workspace_both_succeed() {
         let db = KernelDb::in_memory().unwrap();

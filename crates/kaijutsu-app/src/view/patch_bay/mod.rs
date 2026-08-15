@@ -1315,6 +1315,7 @@ const INFO_PLATE_SIZES: [f32; 5] = [PLATE_FONT_SIZE, 26.0, 22.0, 18.0, 15.0];
 ///   2. only if no size clears pass 1, the old wrap-allowed fit
 ///      (`wrapped_metrics`: `(content_widths.min, height)`) — a genuinely
 ///      long multi-hop wire name still wraps rather than truncating.
+///
 /// Falls back to the smallest size (the floor) if nothing fits either pass.
 fn choose_info_plate_size(
     sizes: &[f32],

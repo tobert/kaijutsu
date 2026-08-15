@@ -541,8 +541,8 @@ impl DjCore {
     /// Return the offsets-from-`now` at which to schedule a click for every
     /// integer beat whose predicted time falls within `horizon` — each beat
     /// returned exactly once across calls. PORTED VERBATIM from
-    /// `Metronome::schedule_due`; see that method's doc for the never-replay
-    /// + un-strand policy derivation (this is the same policy, not a
+    /// `Metronome::schedule_due`; see that method's doc for the never-replay +
+    /// un-strand policy derivation (this is the same policy, not a
     /// reimplementation — only `self`'s type differs).
     fn schedule_due(&mut self, now: Instant, horizon: Duration) -> Vec<Duration> {
         let Some(beat) = &self.beat else {

@@ -6131,9 +6131,9 @@ mod tests {
     // ========================================================================
 
     /// 5. A matching row already in the DB (same id, kind, path=None) is the
-    /// genuine benign-recovery case: `create_document` must still return
-    /// `Ok` and the in-memory entry must exist. `test_merge_ops_persists_to_db`
-    /// already depends on this staying `Ok` — this test pins it directly.
+    ///    genuine benign-recovery case: `create_document` must still return
+    ///    `Ok` and the in-memory entry must exist. `test_merge_ops_persists_to_db`
+    ///    already depends on this staying `Ok` — this test pins it directly.
     #[test]
     fn create_document_recovers_when_db_row_matches() {
         use crate::kernel_db::{DocumentRow, KernelDb};
@@ -6170,8 +6170,8 @@ mod tests {
     }
 
     /// 6. A DB row with the SAME id but a DIFFERENT `doc_kind` is divergence,
-    /// not benign duplication — `create_document` must return
-    /// `DocumentDiverged` and must NOT insert the in-memory entry.
+    ///    not benign duplication — `create_document` must return
+    ///    `DocumentDiverged` and must NOT insert the in-memory entry.
     #[test]
     fn create_document_errors_on_diverged_kind() {
         use crate::kernel_db::{DocumentRow, KernelDb};
@@ -6215,9 +6215,9 @@ mod tests {
     }
 
     /// 7. `create_document_with_path` where a DIFFERENT document already
-    /// owns that `(workspace, path)` must return `DocumentPathConflict` —
-    /// always a hard error, never recovered — and must NOT insert the
-    /// in-memory entry.
+    ///    owns that `(workspace, path)` must return `DocumentPathConflict` —
+    ///    always a hard error, never recovered — and must NOT insert the
+    ///    in-memory entry.
     #[test]
     fn create_document_with_path_errors_on_path_conflict() {
         use crate::kernel_db::{DocumentRow, KernelDb};

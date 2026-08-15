@@ -55,9 +55,9 @@ pub struct EditorTarget {
 /// Cheap prefix test for whether `path` is in the rc/config trees.
 ///
 /// **This is NOT the editor's ownership decision** — that is
-/// [`resolve_editor_target`], which asks the mount table ([`MountTable::owner_of`]
-/// + [`VfsOps::owns_config_docs`](crate::vfs::VfsOps::owns_config_docs)) so the
-/// editor and the VFS can't drift on what owns a path. This prefix check survives
+/// [`resolve_editor_target`], which asks the mount table
+/// ([`MountTable::owner_of`] + [`VfsOps::owns_config_docs`](crate::vfs::VfsOps::owns_config_docs))
+/// so the editor and the VFS can't drift on what owns a path. This prefix check survives
 /// only as the **synchronous** guard for `Kernel::invalidate_config_file_cache`,
 /// a cache-coherence optimization on the sync editor-quit path where an `async`
 /// mount-table query would cascade. Tracked in `docs/issues.md`.

@@ -120,6 +120,7 @@ pub enum KjResult {
         /// - List commands: JSON array of identifier strings (block ids,
         ///   context labels) so naive iteration prints handles.
         /// - Inspect/info commands: JSON object with the full record.
+        ///
         /// Independent of the rendered text — the same call may emit a
         /// human table and an iteration-friendly array.
         data: Option<serde_json::Value>,

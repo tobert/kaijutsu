@@ -1738,8 +1738,8 @@ fn ingest_room_activity(
 
 /// Push ambient telemetry into the wall-bearing markers as light: the tracks
 /// (E) marker breathes with the well's beat phasor (HDR pulse decaying to
-/// LDR), and the focused station's marker takes a steady lift. Change-guarded
-/// + quantized so a settled marker never touches `Assets<StandardMaterial>`
+/// LDR), and the focused station's marker takes a steady lift. Change-guarded +
+/// quantized so a settled marker never touches `Assets<StandardMaterial>`
 /// (the well's `sync_card_live_uniforms` discipline).
 ///
 /// The `Bearing::East` branch below is now inert code, not deleted: Tracker

@@ -599,8 +599,8 @@ fn layout_reading_block(
 /// reference material the edge HUD's East/West/South panels carried before
 /// the melt, retired in slice 4.
 ///
-/// No gist/keywords/cluster repeat: the specs block already carries keywords
-/// + cluster, and this card is reference material at reading distance, not a
+/// No gist/keywords/cluster repeat: the specs block already carries keywords +
+/// cluster, and this card is reference material at reading distance, not a
 /// bigger rim-card face.
 ///
 /// `tail` is a **snapshot**, not a live window: [`update_reading_card`]'s own
