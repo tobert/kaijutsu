@@ -34,8 +34,12 @@ hooks with the same session:
 ```toml
 [mcp_servers.kaijutsu]
 command = "/path/to/kaijutsu-mcp"
-env_vars = ["CODEX_THREAD_ID"]
+env_vars = ["CODEX_THREAD_ID", "XDG_RUNTIME_DIR"]
 ```
+
+`XDG_RUNTIME_DIR` is where the MCP listener creates its per-session hook
+socket; without it the MCP tool surface still works, but lifecycle events have
+no local transport.
 
 For lifecycle mirroring, install `contrib/adapters/codex.sh` together with
 `codex-to-kaijutsu.jq`, then merge the `hooks` object from

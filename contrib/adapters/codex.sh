@@ -11,6 +11,17 @@
 # socket all leave Codex's action untouched and return success.
 set -euo pipefail
 
+# Codex may launch command hooks with a minimal environment. Recover the
+# conventional Linux runtime directory when it exists so socket discovery does
+# not silently disappear. Non-Linux hosts simply retain the existing fail-open
+# behavior unless XDG_RUNTIME_DIR was supplied explicitly.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    RUNTIME_CANDIDATE="/run/user/$(id -u)"
+    if [ -d "$RUNTIME_CANDIDATE" ]; then
+        export XDG_RUNTIME_DIR="$RUNTIME_CANDIDATE"
+    fi
+fi
+
 # Resolve this script's directory so the jq field-map filter is found
 # regardless of the cwd Codex invokes us from.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
