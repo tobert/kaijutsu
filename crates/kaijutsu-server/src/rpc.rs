@@ -4320,40 +4320,57 @@ impl kernel::Server for KernelImpl {
                 // context — model, interactive, headless — seeds from here.
                 let context_id = connection.borrow().require_context()?;
 
-                // Validate the path against the context's shell backend (the
-                // namespace `cd` uses) before persisting — fail fast rather than
-                // store a cwd that every later materialized shell would reject
-                // on restore. A throwaway shell is enough to reach the backend.
-                let kaish = materialize_context_shell(&kernel, &connection).await?;
-                if !kaish.try_set_cwd(std::path::PathBuf::from(&path)).await {
-                    results.get().set_success(false);
-                    results
-                        .get()
-                        .set_error(format!("not a directory: {}", path));
-                    return Ok(());
-                }
-
-                let updated_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before UNIX epoch")
-                    .as_millis() as i64;
-                kernel
-                    .kernel_db
-                    .lock()
-                    .upsert_context_shell(&ContextShellRow {
-                        context_id,
-                        cwd: Some(path.clone()),
-                        updated_at,
-                    })
-                    .map_err(|e| {
-                        capnp::Error::failed(format!("failed to persist cwd: {}", e))
-                    })?;
-                results.get().set_success(true);
-                results.get().set_error("");
+                let outcome = set_context_cwd(&kernel, &connection, context_id, &path).await?;
+                results.get().set_success(outcome.is_ok());
+                results.get().set_error(outcome.err().unwrap_or_default());
                 Ok(())
             }
             .instrument(span),
         )
+    }
+
+    fn get_context_cwd(
+        self: Rc<Self>,
+        params: kernel::GetContextCwdParams,
+        mut results: kernel::GetContextCwdResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_cwd").entered();
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        pry!(require_context_exists(&self.kernel, context_id));
+        if let Some(cwd) = context_cwd(&self.kernel, context_id) {
+            results.get().set_path(cwd.to_string_lossy());
+            results.get().set_found(true);
+        } else {
+            results.get().set_path("");
+            results.get().set_found(false);
+        }
+        Promise::ok(())
+    }
+
+    fn set_context_cwd(
+        self: Rc<Self>,
+        params: kernel::SetContextCwdParams,
+        mut results: kernel::SetContextCwdResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "set_context_cwd");
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let path = pry!(pry!(p.get_path()).to_str()).to_owned();
+        let kernel = self.kernel.clone();
+        let connection = self.connection.clone();
+        Promise::from_future(async move {
+            let outcome = set_context_cwd(&kernel, &connection, context_id, &path).await?;
+            results.get().set_success(outcome.is_ok());
+            results.get().set_error(outcome.err().unwrap_or_default());
+            Ok(())
+        }.instrument(trace_span))
     }
 
     fn get_last_result(
@@ -8168,7 +8185,18 @@ async fn materialize_context_shell(
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
 ) -> Result<EmbeddedKaish, capnp::Error> {
-    let (name, principal, context_id, session_id) = {
+    let context_id = connection.borrow().require_context()?;
+    materialize_context_shell_for(kernel, connection, context_id).await
+}
+
+/// Materialize a shell for an explicitly addressed context without consulting
+/// or changing the connection's ambient joined-context binding.
+async fn materialize_context_shell_for(
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+    context_id: ContextId,
+) -> Result<EmbeddedKaish, capnp::Error> {
+    let (name, principal, session_id) = {
         let conn = connection.borrow();
         (
             format!(
@@ -8178,7 +8206,6 @@ async fn materialize_context_shell(
                 conn.session_id.short()
             ),
             conn.principal.id,
-            conn.require_context()?,
             conn.session_id,
         )
     };
@@ -8199,6 +8226,44 @@ async fn materialize_context_shell(
         )
         .await
         .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
+}
+
+/// Validate and persist a durable cwd through the same backend used by `cd`.
+/// `Ok(Err(message))` is a normal validation refusal for the wire result;
+/// outer errors mean the operation itself could not be performed.
+async fn set_context_cwd(
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+    context_id: ContextId,
+    path: &str,
+) -> Result<Result<(), String>, capnp::Error> {
+    require_context_exists(kernel, context_id)?;
+    let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
+    if !kaish.try_set_cwd(std::path::PathBuf::from(path)).await {
+        return Ok(Err(format!("not a directory: {}", path)));
+    }
+
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_millis() as i64;
+    kernel.kernel_db.lock().upsert_context_shell(&ContextShellRow {
+        context_id,
+        cwd: Some(path.to_owned()),
+        updated_at,
+    }).map_err(|e| capnp::Error::failed(format!("failed to persist cwd: {}", e)))?;
+    Ok(Ok(()))
+}
+
+fn require_context_exists(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+) -> Result<(), capnp::Error> {
+    match kernel.kernel_db.lock().get_context(context_id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(capnp::Error::failed("context not found".into())),
+        Err(e) => Err(capnp::Error::failed(format!("failed to read context: {}", e))),
+    }
 }
 
 /// After a materialized shell runs, propagate any in-shell context switch

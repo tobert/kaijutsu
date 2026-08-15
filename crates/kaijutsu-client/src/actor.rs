@@ -458,6 +458,17 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Vec<HistoryEntry>, CallError>>,
     },
 
+    // ── Addressed Shell State ───────────────────────────────────────────
+    GetContextCwd {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<Option<String>, CallError>>,
+    },
+    SetContextCwd {
+        context_id: ContextId,
+        path: String,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+
     // ── Shell Variables ──────────────────────────────────────────────────
     GetShellVar {
         name: String,
@@ -723,6 +734,8 @@ impl RpcCommand {
             Self::Interrupt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Complete { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetCommandHistory { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1264,6 +1277,27 @@ impl ActorHandle {
     }
 
     // ── Shell Variables ─────────────────────────────────────────────────
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get_context_cwd(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Option<String>, CallError> {
+        self.send(|reply| RpcCommand::GetContextCwd { context_id, reply }).await
+    }
+
+    #[tracing::instrument(skip(self, path))]
+    pub async fn set_context_cwd(
+        &self,
+        context_id: ContextId,
+        path: &str,
+    ) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::SetContextCwd {
+            context_id,
+            path: path.into(),
+            reply,
+        }).await
+    }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_shell_var(
@@ -3114,6 +3148,14 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetCommandHistory { limit, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_command_history(limit));
+        }
+
+        // ── Addressed Shell State ──
+        RpcCommand::GetContextCwd { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_context_cwd(context_id));
+        }
+        RpcCommand::SetContextCwd { context_id, path, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.set_context_cwd(context_id, &path));
         }
 
         // ── Shell Variables ──

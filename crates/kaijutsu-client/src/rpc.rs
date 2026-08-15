@@ -2173,8 +2173,54 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // Shell Variable Introspection
+    // Addressed Shell State / Shell Variable Introspection
     // =========================================================================
+
+    /// Read the durable cwd of `context_id`, independent of this connection's
+    /// currently joined context.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_cwd")]
+    pub async fn get_context_cwd(&self, context_id: ContextId) -> Result<Option<String>, RpcError> {
+        let mut request = self.kernel.get_context_cwd_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if result.get_found() {
+            Ok(Some(result.get_path()?.to_string()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Validate and persist `path` as `context_id`'s durable cwd, independent
+    /// of this connection's currently joined context.
+    #[tracing::instrument(skip(self, path), name = "rpc_client.set_context_cwd")]
+    pub async fn set_context_cwd(
+        &self,
+        context_id: ContextId,
+        path: &str,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.set_context_cwd_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_path(path);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if !result.get_success() {
+            return Err(RpcError::ServerError(result.get_error()?.to_string()?));
+        }
+        Ok(())
+    }
 
     /// Get a shell variable by name.
     #[tracing::instrument(skip(self), name = "rpc_client.get_shell_var")]

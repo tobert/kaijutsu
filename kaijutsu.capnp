@@ -1935,6 +1935,12 @@ interface Kernel {
     hasExitCode :Bool,
     trace :TraceContext
   ) -> (success :Bool, error :Text);
+
+  # Addressed forms of the durable context cwd operations. Unlike getCwd /
+  # setCwd these never consult or mutate the connection's ambient joined
+  # context, so one client can safely manage several sessions.
+  getContextCwd @108 (contextId :Data, trace :TraceContext) -> (path :Text, found :Bool);
+  setContextCwd @109 (contextId :Data, path :Text, trace :TraceContext) -> (success :Bool, error :Text);
 }
 
 # ============================================================================
