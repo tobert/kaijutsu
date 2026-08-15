@@ -249,6 +249,10 @@ pub struct KjDispatcher {
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     kernel: Arc<Kernel>,
+    /// The live roster's storage half (`crate::roster`) — one per kernel,
+    /// backed by the same `kernel_db`. Held here (not on `Kernel`) because
+    /// `KernelDb` itself lives with the dispatcher, not the kernel.
+    roster: Arc<crate::roster::RosterStore>,
     /// Self-Weak so internal paths (rc lifecycle, hook kaish) can hand
     /// an `Arc<KjDispatcher>` to `KjBuiltin::new` without forcing every
     /// call site to thread an Arc through. Set via `set_self_arc` after
@@ -274,15 +278,22 @@ impl KjDispatcher {
             .lock()
             .kernel_id()
             .expect("KernelDb singleton row must exist");
+        let roster = Arc::new(crate::roster::RosterStore::new(kernel_db.clone()));
         Self {
             drift,
             blocks,
             kernel_db,
             kernel_id,
             kernel,
+            roster,
             weak_self: parking_lot::RwLock::new(None),
             semantic_index: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// The live roster's storage half.
+    pub(crate) fn roster(&self) -> &Arc<crate::roster::RosterStore> {
+        &self.roster
     }
 
     /// Wire a `Weak<Self>` so internal paths can construct `KjBuiltin`
