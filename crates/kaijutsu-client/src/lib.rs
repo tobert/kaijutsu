@@ -35,9 +35,10 @@ pub use rpc::{
     VfsFileType,
 };
 pub use context_feed::{
-    ContextChange, ContextDelivery, ContextMirror, FeedEvent, MirrorError, context_feed_channel,
+    ContextChange, ContextDelivery, ContextMirror, FeedEvent, MirrorError, VersionedChange,
+    context_feed_channel,
 };
-pub use document_store::{DocumentEntry, DocumentStore};
+pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
 pub use sftp::{CasFetch, CasResolver, ResolveSource, SftpClient, SftpError, default_cache_dir};
 pub use share_server::{
     ShareArg, ShareHandler, ShareServerConfig, parse_share_arg, validate_unique_names,

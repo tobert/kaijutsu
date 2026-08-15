@@ -11,9 +11,10 @@ pub use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Session-scoped agent identity for CRDT operations.
 ///
-/// Created once at startup, reused for all SyncedDocument
-/// construction. Without this, each frame or context switch would generate
-/// a fresh PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
+/// Created once at startup, reused for the `CellEditor` render buffer's
+/// local `BlockStore` and for `SyncedInput` (the compose-input CRDT).
+/// Without this, each frame or context switch would generate a fresh
+/// PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
 #[derive(Resource)]
 pub struct SessionPrincipal(pub PrincipalId);
 
@@ -70,8 +71,10 @@ impl BlockCursor {
 ///
 /// The `store` field (BlockStore) is the local editor buffer — one DTE instance
 /// per block, matching the server's native format.
-/// Synced content arrives via `DocumentCache` (SyncedDocument per context) and is
-/// copied into this editor's BlockStore via `from_snapshot`.
+/// Synced content arrives via `DocumentCache` (a `ContextMirror` per context,
+/// docs/change-feed.md — plain `BlockSnapshot`s, no CRDT) and is materialized
+/// into this editor's BlockStore via `insert_from_snapshot`
+/// (`view::sync::sync_main_cell_to_conversation`).
 ///
 /// Note: Not reflectable due to BlockStore lacking Default.
 /// Use query filters to find CellEditor entities instead of BRP inspection.

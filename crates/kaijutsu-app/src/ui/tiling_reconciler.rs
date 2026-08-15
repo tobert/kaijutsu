@@ -514,7 +514,7 @@ pub fn sync_unfocused_pane_summaries(
                         } else {
                             cached.context_name.clone()
                         };
-                        let count = cached.synced.block_count();
+                        let count = cached.mirror.blocks().len();
                         (name, count)
                     } else {
                         (short_id(doc_id), 0)

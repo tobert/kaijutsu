@@ -1448,8 +1448,8 @@ mod tests {
     // count_block_activity — pure counting logic over document state
     // ------------------------------------------------------------------
 
-    use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
-    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContentType, PrincipalId, Role, Status};
+    use kaijutsu_client::{ContextChange, ContextDelivery, ContextMirror};
+    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, PrincipalId, Status};
 
     fn test_block_id() -> kaijutsu_types::BlockId {
         kaijutsu_types::BlockId::new(
@@ -1503,119 +1503,118 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // State-derivation proofs — these exercise the REAL join/resync code
-    // path (CrdtBlockStore -> StoreSnapshot -> SyncState ->
-    // SyncedDocument::from_sync_state / apply_sync_state), the same one
-    // `ContextJoined`/`ContextResynced` drive in `view/sync.rs`. No
-    // `ServerEvent::BlockStatusChanged` is ever constructed — proving the
-    // count no longer depends on having observed a transition event.
+    // State-derivation proofs — these exercise the REAL join/recovery code
+    // path (docs/change-feed.md): `ContextMirror::apply_snapshot` for a
+    // hydrate, `ContextMirror::receive` for a steady-state delivery. No
+    // `ServerEvent::BlockStatusChanged`, and — post-migration — no CRDT of
+    // any kind, is ever constructed; the count is derived fresh from
+    // `mirror.blocks()` every time, proving it cannot drift from an
+    // accumulator that was never built.
     // ------------------------------------------------------------------
 
-    fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
-        kaijutsu_types::codec::encode(&store.snapshot()).expect("serialize snapshot")
+    fn mirror_delivery(
+        context_id: kaijutsu_types::ContextId,
+        version: u64,
+        events: Vec<ContextChange>,
+    ) -> ContextDelivery {
+        ContextDelivery {
+            context_id,
+            events: events
+                .into_iter()
+                .map(|change| kaijutsu_client::VersionedChange { version, change })
+                .collect(),
+            version,
+        }
     }
 
     #[test]
     fn joining_a_context_with_preexisting_error_blocks_shows_nonzero_failed_count() {
         // Defect 1: a document that already had Running/Error blocks BEFORE
-        // this client ever attached — the exact `ContextJoined.initial_sync`
-        // shape — must show a correct count from the first frame, with zero
-        // events in its history.
+        // this client ever attached — the exact shape `ContextHydration::
+        // Joined`'s `apply_snapshot` installs on a fresh join — must show a
+        // correct count from the first frame, with zero feed deliveries in
+        // its history.
         let ctx = kaijutsu_types::ContextId::new();
-        let principal = PrincipalId::new();
-        let mut store = CrdtBlockStore::new(ctx, principal);
-        store
-            .insert_block(None, None, Role::User, BlockKind::Text, "ok", Status::Done, ContentType::Plain)
-            .unwrap();
-        store
-            .insert_block(None, None, Role::Model, BlockKind::Text, "boom", Status::Error, ContentType::Plain)
-            .unwrap();
-        store
-            .insert_block(None, None, Role::Model, BlockKind::Text, "still going", Status::Running, ContentType::Plain)
-            .unwrap();
+        let blocks = vec![
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Done)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Error)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Running)
+                .build(),
+        ];
 
-        let state = kaijutsu_client::SyncState {
-            context_id: ctx,
-            version: 1,
-            ops: snapshot_bytes(&store),
-        };
-        let synced = kaijutsu_client::SyncedDocument::from_sync_state(&state, principal)
-            .expect("from_sync_state");
+        let mut mirror = ContextMirror::new(ctx);
+        mirror.apply_snapshot(blocks, 1).expect("apply_snapshot");
 
-        assert_eq!(count_block_activity(&synced.blocks()), (1, 1));
+        assert_eq!(count_block_activity(mirror.blocks()), (1, 1));
     }
 
     #[test]
-    fn a_resync_that_deletes_an_error_block_clears_it_from_the_count() {
-        // Defect 2 (deletion half), reached via the SAME resync path as
-        // defect 1 (no BlockDeleted event ever constructed): the server-side
-        // store deletes the failed block, and the next full resync — as
-        // `ContextResynced` would deliver after a reconnect — must drop it
-        // from the count, not just leave it stuck at 1 forever.
+    fn a_delivery_that_deletes_an_error_block_clears_it_from_the_count() {
+        // Defect 2 (deletion half): the failed block is deleted server-side
+        // and the change feed delivers that fact directly — no
+        // `BlockStatusChanged` fabricated, and (unlike the pre-migration
+        // CRDT resync this test used to drive) no full resnapshot needed
+        // either: an ordinary `BlockDeleted` delivery must drop it from the
+        // count on its own.
         let ctx = kaijutsu_types::ContextId::new();
-        let principal = PrincipalId::new();
-        let mut server_store = CrdtBlockStore::new(ctx, principal);
-        let failed_id = server_store
-            .insert_block(None, None, Role::Model, BlockKind::Text, "boom", Status::Error, ContentType::Plain)
+        let failed_id = test_block_id();
+        let mut mirror = ContextMirror::new(ctx);
+        mirror
+            .apply_snapshot(
+                vec![BlockSnapshotBuilder::new(failed_id, BlockKind::Text)
+                    .status(Status::Error)
+                    .build()],
+                1,
+            )
             .unwrap();
+        assert_eq!(count_block_activity(mirror.blocks()), (0, 1), "sanity: starts failed");
 
-        let mut synced = kaijutsu_client::SyncedDocument::from_sync_state(
-            &kaijutsu_client::SyncState {
-                context_id: ctx,
-                version: 1,
-                ops: snapshot_bytes(&server_store),
-            },
-            principal,
-        )
-        .expect("initial from_sync_state");
-        assert_eq!(count_block_activity(&synced.blocks()), (0, 1), "sanity: starts failed");
+        mirror
+            .receive(mirror_delivery(
+                ctx,
+                2,
+                vec![ContextChange::BlockDeleted { block_id: failed_id }],
+            ))
+            .expect("apply delivery");
 
-        // Server deletes the block; client receives a full resync (no event).
-        server_store.delete_block(&failed_id).unwrap();
-        synced
-            .apply_sync_state(&kaijutsu_client::SyncState {
-                context_id: ctx,
-                version: 2,
-                ops: snapshot_bytes(&server_store),
-            })
-            .expect("apply_sync_state (resync)");
-
-        assert_eq!(count_block_activity(&synced.blocks()), (0, 0));
+        assert_eq!(count_block_activity(mirror.blocks()), (0, 0));
     }
 
     #[test]
-    fn a_resync_that_excludes_an_error_block_clears_it_from_the_count() {
-        // Defect 2 (exclusion half) via the resync path: the block is not
-        // deleted, just excluded — same "must clear from the count without
-        // ever seeing BlockExcludedChanged" shape as the deletion case.
+    fn a_delivery_that_excludes_an_error_block_clears_it_from_the_count() {
+        // Defect 2 (exclusion half): the block is not deleted, just
+        // excluded — same "must clear from the count without ever seeing a
+        // fabricated status change" shape as the deletion case above.
         let ctx = kaijutsu_types::ContextId::new();
-        let principal = PrincipalId::new();
-        let mut server_store = CrdtBlockStore::new(ctx, principal);
-        let failed_id = server_store
-            .insert_block(None, None, Role::Model, BlockKind::Text, "boom", Status::Error, ContentType::Plain)
+        let failed_id = test_block_id();
+        let mut mirror = ContextMirror::new(ctx);
+        mirror
+            .apply_snapshot(
+                vec![BlockSnapshotBuilder::new(failed_id, BlockKind::Text)
+                    .status(Status::Error)
+                    .build()],
+                1,
+            )
             .unwrap();
+        assert_eq!(count_block_activity(mirror.blocks()), (0, 1), "sanity: starts failed");
 
-        let mut synced = kaijutsu_client::SyncedDocument::from_sync_state(
-            &kaijutsu_client::SyncState {
-                context_id: ctx,
-                version: 1,
-                ops: snapshot_bytes(&server_store),
-            },
-            principal,
-        )
-        .expect("initial from_sync_state");
-        assert_eq!(count_block_activity(&synced.blocks()), (0, 1), "sanity: starts failed");
+        mirror
+            .receive(mirror_delivery(
+                ctx,
+                2,
+                vec![ContextChange::ExcludedChanged {
+                    block_id: failed_id,
+                    excluded: true,
+                }],
+            ))
+            .expect("apply delivery");
 
-        server_store.set_excluded(&failed_id, true).unwrap();
-        synced
-            .apply_sync_state(&kaijutsu_client::SyncState {
-                context_id: ctx,
-                version: 2,
-                ops: snapshot_bytes(&server_store),
-            })
-            .expect("apply_sync_state (resync)");
-
-        assert_eq!(count_block_activity(&synced.blocks()), (0, 0));
+        assert_eq!(count_block_activity(mirror.blocks()), (0, 0));
     }
 
     #[test]
@@ -2148,10 +2147,10 @@ pub fn update_background_jobs(
 ///    transitions were in flight, and per (1) the resync that follows
 ///    doesn't regenerate them — the counters never recover.
 ///
-/// Deriving the counts fresh from `SyncedDocument::blocks()` whenever the
-/// document's sync version changes makes all three impossible by
-/// construction: there is no accumulator to drift out of sync with the
-/// document, because there is no accumulator.
+/// Deriving the counts fresh from `ContextMirror::blocks()` whenever the
+/// mirror's version changes makes all three impossible by construction:
+/// there is no accumulator to drift out of sync with the document, because
+/// there is no accumulator.
 #[derive(Default)]
 pub(crate) struct BlockActivityState {
     /// `(active context, that document's sync version)` at the last
@@ -2172,10 +2171,10 @@ pub(crate) struct BlockActivityState {
 /// remediate-a-poisoned-conversation flow — exclude, then fork) is the
 /// user's "I've dealt with this" gesture, so an excluded Error block should
 /// stop nagging the HUD even though it's still visible (dimmed) in the
-/// transcript. Deleted blocks never appear here at all —
-/// `BlockStore::blocks_ordered` (which `SyncedDocument::blocks` calls)
-/// already filters tombstones at the CRDT layer, so no explicit check is
-/// needed for those.
+/// transcript. Deleted blocks never appear here at all — `ContextMirror`
+/// removes a deleted block from its list outright (`ContextChange::
+/// BlockDeleted`, docs/change-feed.md), so no explicit check is needed for
+/// those.
 fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) {
     let mut running = 0u32;
     let mut failed = 0u32;
@@ -2224,12 +2223,12 @@ pub fn update_block_activity(
     let active = doc_cache
         .active_id()
         .and_then(|id| doc_cache.get(id).map(|entry| (id, entry)));
-    let seen = active.as_ref().map(|(id, entry)| (*id, entry.synced.version()));
+    let seen = active.as_ref().map(|(id, entry)| (*id, entry.mirror.version()));
 
     if seen != state.last_seen {
         state.last_seen = seen;
         let (running, failed) = active
-            .map(|(_, entry)| count_block_activity(&entry.synced.blocks()))
+            .map(|(_, entry)| count_block_activity(entry.mirror.blocks()))
             .unwrap_or_default();
         state.running = running;
         state.failed = failed;

@@ -120,16 +120,24 @@ impl Plugin for CellPlugin {
             Update,
             (
                 view_sync::handle_block_events,
+                view_sync::drain_context_hydrations.after(view_sync::handle_block_events),
                 view_sync::handle_input_doc_events.after(view_sync::handle_block_events),
                 view_sync::handle_context_switch.after(view_sync::handle_block_events),
                 view_sync::handle_server_context_switch.before(view_sync::handle_context_switch),
                 view_submit::handle_submit_failed.after(view_sync::handle_context_switch),
+                // Drains each followed context's change feed — the
+                // docs/change-feed.md steady-state + recovery driver that
+                // replaced `check_cache_staleness`. Must run before
+                // `sync_main_cell_to_conversation` reads `mirror.version()`,
+                // and after `drain_context_hydrations` so a just-installed
+                // mirror's own feed is drained the same frame it lands.
+                view_sync::drain_context_feeds
+                    .after(view_sync::drain_context_hydrations)
+                    .after(view_sync::handle_context_switch),
                 view_sync::sync_main_cell_to_conversation
                     .after(view_sync::handle_block_events)
-                    .after(view_sync::handle_context_switch),
-                view_sync::check_cache_staleness
-                    .after(view_sync::handle_block_events)
-                    .after(view_sync::handle_context_switch),
+                    .after(view_sync::handle_context_switch)
+                    .after(view_sync::drain_context_feeds),
             )
                 .in_set(CellPhase::Sync),
         );

@@ -1,17 +1,22 @@
-//! Document sync — server events → DocumentCache → MainCell.
+//! Document sync — the context change feed → DocumentCache → MainCell.
 //!
-//! These systems handle the data flow from server block events through
-//! the DocumentCache to the MainCell's CellEditor for rendering.
+//! docs/change-feed.md is normative here. The block document is a
+//! `ContextMirror` (crates/kaijutsu-client/src/context_feed.rs) fed by a
+//! per-context change feed, not a CRDT fed by `ServerEvent::BlockTextOps`.
+//! `handle_block_events` still owns `ContextJoined`/input-state bootstrap;
+//! `drain_context_feeds` is the new steady-state and recovery driver,
+//! replacing the old `check_cache_staleness` poll.
 
 use bevy::prelude::*;
 
 use crate::cell::{
-    CachedDocument, CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration,
-    MainCell, ViewingConversation,
+    CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration, MainCell,
+    ViewingConversation,
 };
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
 use kaijutsu_client::ServerEvent;
+use kaijutsu_types::ContextId;
 
 /// The `Screen` a *landed* context switch should reveal, or `None` if the
 /// current screen already shows the active context.
@@ -34,15 +39,21 @@ fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
     }
 }
 
-/// Handle block events from the server, routing through DocumentCache.
+/// Handle context-join bookkeeping: membership (`RpcResultMessage::
+/// ContextJoined`) and compose-input hydration (`InputStateReceived`).
 ///
-/// Processes `ServerEventMessage` (streamed block events) and
-/// `RpcResultMessage::ContextJoined` (initial document state).
-///
-/// Multi-context routing: all events go by context_id to the appropriate
-/// CachedDocument. sync_main_cell_to_conversation reads the active entry.
+/// The block document itself is no longer hydrated here. A `ContextJoined`
+/// carries no CRDT state to apply any more — `drain_context_hydrations`
+/// (below) installs the mirror once the background subscribe+`getBlocks`
+/// finishes, on its own channel (a live `mpsc::Receiver<FeedEvent>` can't
+/// ride `RpcResultMessage`: `MessageReader` hands out shared references, and
+/// a receiver can't be moved out of one — see `ContextHydrationChannel`).
+/// This function only reacts to the join *event* — set active, satisfy a
+/// pending switch, kick off the input-doc fetch — plus the scroll-follow
+/// bookkeeping that used to piggyback on the streamed-block loop this
+/// function no longer has (streamed block/text changes ride the per-context
+/// change feed now; see `drain_context_feeds`).
 pub fn handle_block_events(
-    mut server_events: MessageReader<ServerEventMessage>,
     mut result_events: MessageReader<RpcResultMessage>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
@@ -53,49 +64,15 @@ pub fn handle_block_events(
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
 ) {
-    use kaijutsu_client::ServerEvent;
-
     let was_at_bottom = scroll_state.is_at_bottom();
     let principal_id = session_principal.0;
 
-    // Handle initial document state from ContextJoined
     for result in result_events.read() {
         match result {
-            RpcResultMessage::ContextJoined {
-                membership,
-                initial_sync,
-            } => {
+            RpcResultMessage::ContextJoined { membership } => {
                 let ctx_id = membership.context_id;
 
-                match initial_sync {
-                    // The store creates-or-refreshes the doc and marks it synced.
-                    Some(state) => {
-                        match doc_cache.apply_sync(ctx_id, state, principal_id, || {
-                            membership.context_id.short()
-                        }) {
-                            Ok(created) => info!(
-                                "Cache: {} for {}",
-                                if created { "initial sync" } else { "reconnect refresh" },
-                                ctx_id
-                            ),
-                            Err(e) => error!("Cache: sync error for {}: {}", ctx_id, e),
-                        }
-                    }
-                    // The initial fetch failed — start an empty doc so the view
-                    // has something to render; the staleness path fills it later.
-                    None => {
-                        if !doc_cache.contains(ctx_id) {
-                            let synced = kaijutsu_client::SyncedDocument::new(ctx_id, principal_id);
-                            let generation = doc_cache.generation();
-                            doc_cache.insert(
-                                ctx_id,
-                                CachedDocument::new(synced, membership.context_id.short(), generation),
-                            );
-                        }
-                    }
-                }
-
-                // Fetch input document state for the joined context
+                // Fetch input document state for the joined context.
                 if let Some(ref actor) = actor {
                     let handle = actor.handle.clone();
                     let tx = channel.sender();
@@ -167,45 +144,8 @@ pub fn handle_block_events(
                     }
                 }
             }
-            RpcResultMessage::ContextResynced { context_id, sync } => {
-                // A staleness re-fetch (post-reconnect / post-lag) delivered the
-                // full CRDT state. Merge it via the store — the idempotent catch-up
-                // that heals blocks lost while the transport was down. Only an
-                // already-cached doc is refreshed; an unknown/evicted context is
-                // not resurrected here (the join bootstrap hydrates fresh ones).
-                let ctx_id = *context_id;
-                if doc_cache.contains(ctx_id) {
-                    match doc_cache.apply_sync(ctx_id, sync, principal_id, String::new) {
-                        Ok(_) => info!("Cache: staleness re-sync for {}", ctx_id),
-                        Err(e) => error!("Cache: staleness re-sync error for {}: {}", ctx_id, e),
-                    }
-                }
-            }
             _ => {}
         }
-    }
-
-    // Handle streamed block events
-    for ServerEventMessage(event) in server_events.read() {
-        // An actor-delivered post-reconnect resync carries the full CRDT state,
-        // not a streamed delta — merge it via the store (idempotent), which marks
-        // the doc fresh so check_cache_staleness won't re-fetch it. The eager
-        // catch-up for the joined context; non-joined docs re-sync lazily off the
-        // generation bump (ServerEvent::Reconnected).
-        if let ServerEvent::ContextResynced { sync } = event {
-            let ctx_id = sync.context_id;
-            if doc_cache.contains(ctx_id) {
-                match doc_cache.apply_sync(ctx_id, sync, principal_id, String::new) {
-                    Ok(_) => info!("Cache: actor re-sync for {}", ctx_id),
-                    Err(e) => error!("Cache: actor re-sync error for {}: {}", ctx_id, e),
-                }
-            }
-            continue;
-        }
-
-        // The store routes the event to its context's doc and keeps the
-        // generation/staleness in step (a NeedsResync bumps internally).
-        doc_cache.apply_server_event(event);
     }
 
     if was_at_bottom
@@ -215,6 +155,151 @@ pub fn handle_block_events(
         scroll_state.start_following();
         scroll_state.last_content_gen = layout_gen.0;
     }
+}
+
+/// Drain the change-feed hydration channel (`ContextHydrationChannel`) and
+/// install the results into `DocumentCache`. Separate from `handle_block_events`
+/// because a hydration result carries a live `mpsc::Receiver<FeedEvent>`,
+/// which cannot travel through the `RpcResultMessage`/Bevy-Message path (see
+/// that type's doc comment).
+pub fn drain_context_hydrations(
+    channel: Res<crate::connection::ContextHydrationChannel>,
+    mut doc_cache: ResMut<crate::cell::DocumentCache>,
+) {
+    use crate::connection::ContextHydration;
+    for item in channel.drain() {
+        match item {
+            ContextHydration::Joined {
+                context_id,
+                mirror,
+                feed,
+            } => {
+                info!("Cache: hydrated {} (version {})", context_id, mirror.version());
+                doc_cache.install(context_id, mirror, Some(feed), || context_id.short());
+            }
+            ContextHydration::Snapshot {
+                context_id,
+                blocks,
+                version,
+            } => match doc_cache.apply_snapshot(context_id, blocks, version) {
+                Ok(()) => info!("Cache: re-hydrated snapshot for {} (version {})", context_id, version),
+                Err(e) => error!("Cache: snapshot apply error for {}: {}", context_id, e),
+            },
+            ContextHydration::JoinFailed { context_id } => {
+                // The initial subscribe+hydrate failed — start an empty,
+                // unfed mirror so the view has something to render. Nothing
+                // will fill it further until the user switches away and back
+                // (respawning the actor); there is no poll-driven staleness
+                // fallback any more, the feed itself is the recovery path.
+                if !doc_cache.contains(context_id) {
+                    doc_cache.install(
+                        context_id,
+                        kaijutsu_client::ContextMirror::new(context_id),
+                        None,
+                        || context_id.short(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Drain every followed context's change feed once per frame, applying
+/// deliveries to their mirrors (`DocumentStore::drain_feeds`) and reacting to
+/// `Resubscribed`/`Terminated`/`Desynced` by re-hydrating in the background
+/// (docs/change-feed.md rules 21-28). This is the change feed's replacement
+/// for the old poll-driven staleness sweep (`check_cache_staleness`, deleted)
+/// — recovery is now driven by the feed itself, per context, instead of a
+/// coarse generation bump on `ServerEvent::Reconnected`.
+pub fn drain_context_feeds(
+    mut doc_cache: ResMut<crate::cell::DocumentCache>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    hydration_channel: Res<crate::connection::ContextHydrationChannel>,
+) {
+    let signals = doc_cache.drain_feeds();
+    if signals.is_empty() {
+        return;
+    }
+    let Some(ref actor) = actor else {
+        // No actor to re-hydrate with — the signals still applied locally
+        // (mirrors already reset by `drain_feeds`); recovery resumes once an
+        // actor exists again.
+        return;
+    };
+
+    for (context_id, signal) in signals {
+        match signal {
+            kaijutsu_client::FeedSignal::Updated => {}
+            kaijutsu_client::FeedSignal::Desynced(e) => {
+                error!(
+                    "context mirror desynced for {}: {} — re-hydrating from a fresh snapshot",
+                    context_id, e
+                );
+                spawn_snapshot_refetch(&actor.handle, context_id, &hydration_channel);
+            }
+            kaijutsu_client::FeedSignal::Resubscribed => {
+                trace!("context {} resubscribed — re-hydrating from a fresh snapshot", context_id);
+                spawn_snapshot_refetch(&actor.handle, context_id, &hydration_channel);
+            }
+            kaijutsu_client::FeedSignal::Terminated => {
+                warn!("context {} feed terminated — re-subscribing and re-hydrating", context_id);
+                spawn_full_rehydrate(&actor.handle, context_id, &hydration_channel);
+            }
+        }
+    }
+}
+
+/// The `Resubscribed`/`Desynced` recovery: the existing feed receiver is
+/// still good, so only a fresh snapshot is needed.
+fn spawn_snapshot_refetch(
+    handle: &kaijutsu_client::ActorHandle,
+    context_id: ContextId,
+    hydration_channel: &crate::connection::ContextHydrationChannel,
+) {
+    let handle = handle.clone();
+    let tx = hydration_channel.sender();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            match handle
+                .get_blocks_versioned(context_id, kaijutsu_types::BlockQuery::All)
+                .await
+            {
+                Ok((blocks, version)) => {
+                    let _ = tx.send(crate::connection::ContextHydration::Snapshot {
+                        context_id,
+                        blocks,
+                        version,
+                    });
+                }
+                Err(e) => log::warn!("re-hydrate snapshot fetch failed for {}: {}", context_id, e),
+            }
+        })
+        .detach();
+}
+
+/// The `Terminated` recovery: the receiver is spent, so subscribe from
+/// scratch and hydrate a brand-new mirror over the new receiver.
+fn spawn_full_rehydrate(
+    handle: &kaijutsu_client::ActorHandle,
+    context_id: ContextId,
+    hydration_channel: &crate::connection::ContextHydrationChannel,
+) {
+    let handle = handle.clone();
+    let tx = hydration_channel.sender();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            match crate::connection::actor_plugin::hydrate_context(&handle, context_id).await {
+                Ok((mirror, feed)) => {
+                    let _ = tx.send(crate::connection::ContextHydration::Joined {
+                        context_id,
+                        mirror,
+                        feed,
+                    });
+                }
+                Err(e) => log::warn!("re-subscribe+hydrate failed for {}: {}", context_id, e),
+            }
+        })
+        .detach();
 }
 
 /// Handle input document events (InputTextOps, InputCleared).
@@ -342,8 +427,8 @@ pub fn sync_main_cell_to_conversation(
         return;
     };
 
-    let ctx_id = cached.synced.context_id();
-    let sync_version = cached.synced.version();
+    let ctx_id = cached.mirror.context_id();
+    let sync_version = cached.mirror.version();
 
     let Ok((mut editor, viewing_opt)) = main_cell.get_mut(entity) else {
         return;
@@ -360,16 +445,37 @@ pub fn sync_main_cell_to_conversation(
         return;
     }
 
+    // `CellEditor.store` is a `kaijutsu_crdt::BlockStore` — the local render
+    // buffer every other view system already reads (block_border.rs,
+    // render.rs, diff_view, timeline, …), unchanged by this migration. The
+    // change-feed mirror holds plain `BlockSnapshot`s, not a CRDT, so this
+    // materializes them via `insert_from_snapshot` (the same "remote sync /
+    // restore" primitive the kernel and MCP use to load snapshots into a
+    // fresh store) instead of `BlockStore::from_snapshot`'s CRDT-snapshot
+    // round trip. `ContextMirror::blocks()` is already document order, so a
+    // plain left-to-right insert reproduces it.
     let principal_id = editor.store.principal_id();
-    let store_snap = cached.synced.snapshot();
-    editor.store = match kaijutsu_crdt::BlockStore::from_snapshot(store_snap, principal_id) {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::error!("Failed to restore snapshot for sync: {e}");
-            return;
+    let mut store = kaijutsu_crdt::BlockStore::new(ctx_id, principal_id);
+    let mut after = None;
+    let mut ok = true;
+    for block in cached.mirror.blocks() {
+        match store.insert_from_snapshot(block.clone(), after.as_ref()) {
+            Ok(id) => after = Some(id),
+            Err(e) => {
+                tracing::error!(
+                    "Failed to materialize block {} into the render buffer: {e}",
+                    block.id
+                );
+                ok = false;
+                break;
+            }
         }
-    };
-    editor.store.set_version(sync_version);
+    }
+    if !ok {
+        return;
+    }
+    store.set_version(sync_version);
+    editor.store = store;
 
     if let Some(last_block) = editor.blocks().last() {
         let len = last_block.content.len();
@@ -504,57 +610,10 @@ pub fn handle_server_context_switch(
     }
 }
 
-/// Re-fetch the active document when the store marks it stale (after a
-/// generation bump from reconnect or broadcast lag). The store owns the
-/// staleness decision; this system only performs the IO and routes the result
-/// back through `ContextResynced` for the store to merge.
-pub fn check_cache_staleness(
-    doc_cache: Res<crate::cell::DocumentCache>,
-    actor: Option<Res<crate::connection::RpcActor>>,
-    channel: Res<crate::connection::RpcResultChannel>,
-    mut checked_gen: Local<u64>,
-) {
-    let generation = doc_cache.generation();
-    if generation == *checked_gen {
-        return;
-    }
-    *checked_gen = generation;
-
-    let Some(ctx_id) = doc_cache.stale_active() else {
-        return;
-    };
-    let Some(ref actor) = actor else {
-        return;
-    };
-
-    info!("Staleness detected: active doc {} behind generation {}", ctx_id, generation);
-
-    let handle = actor.handle.clone();
-    let tx = channel.sender();
-
-    bevy::tasks::IoTaskPool::get()
-        .spawn(async move {
-            match handle.get_context_sync(ctx_id).await {
-                Ok(sync) => {
-                    info!(
-                        "Staleness re-fetch complete for {}: {} bytes oplog — applying",
-                        ctx_id,
-                        sync.ops.len()
-                    );
-                    // Route the fetched state back to the main thread; the store
-                    // merges it (and marks the doc fresh).
-                    let _ = tx.send(RpcResultMessage::ContextResynced {
-                        context_id: ctx_id,
-                        sync,
-                    });
-                }
-                Err(e) => {
-                    warn!("Staleness re-fetch failed for {}: {}", ctx_id, e);
-                }
-            }
-        })
-        .detach();
-}
+// `check_cache_staleness` (the old poll-driven CRDT re-fetch) is gone —
+// `drain_context_feeds`, above, replaces it. Each followed context now gets
+// its own precise recovery signal straight from its change feed instead of a
+// coarse generation bump checked once a frame.
 
 #[cfg(test)]
 mod tests {

@@ -30,6 +30,44 @@ fn app_peer_instance() -> &'static str {
     INSTANCE.get_or_init(|| format!("kaijutsu-app-{}", uuid::Uuid::new_v4()))
 }
 
+/// Subscribe to a context's change feed and hydrate a fresh `ContextMirror`
+/// over it — docs/change-feed.md rules 21-26. Subscribe FIRST (so nothing
+/// published between the subscribe and the fetch is lost), then fetch the
+/// snapshot with `getBlocks`, then apply it.
+///
+/// No `select!` race against the receiver is needed here: `ContextMirror`
+/// itself discards a delivery the fetch's own snapshot already covers
+/// (`ContextMirror::receive`'s doc comment), so a caller may fetch first and
+/// drain the receiver afterward without a spurious error.
+///
+/// Used both for a context's first join (`poll_bootstrap_results`) and for
+/// the `FeedEvent::Terminated` recovery, which needs a brand-new receiver
+/// exactly the way a first join does (`view::sync::drain_context_feeds`).
+pub(crate) async fn hydrate_context(
+    handle: &ActorHandle,
+    context_id: ContextId,
+) -> Result<
+    (
+        kaijutsu_client::ContextMirror,
+        mpsc::Receiver<kaijutsu_client::FeedEvent>,
+    ),
+    String,
+> {
+    let rx = handle
+        .subscribe_context(context_id)
+        .await
+        .map_err(|e| format!("subscribe_context: {e}"))?;
+    let mut mirror = kaijutsu_client::ContextMirror::new(context_id);
+    let (blocks, version) = handle
+        .get_blocks_versioned(context_id, kaijutsu_types::BlockQuery::All)
+        .await
+        .map_err(|e| format!("get_blocks_versioned: {e}"))?;
+    mirror
+        .apply_snapshot(blocks, version)
+        .map_err(|e| format!("apply_snapshot: {e}"))?;
+    Ok((mirror, rx))
+}
+
 // ============================================================================
 // Resources
 // ============================================================================
@@ -90,6 +128,72 @@ impl RpcResultChannel {
     }
 }
 
+/// The result of a background change-feed subscribe/hydrate/re-hydrate,
+/// docs/change-feed.md rules 21-28.
+///
+/// This does NOT ride [`RpcResultMessage`]: `Joined` carries a live
+/// `mpsc::Receiver<FeedEvent>`, and `MessageReader` hands every consumer a
+/// shared reference into Bevy's double-buffered message storage — a
+/// receiver can't be moved out of a `&T`. [`ContextHydrationChannel`] is a
+/// dedicated, drain-once channel instead (the same shape as
+/// `peers::PeerInvocationChannel`), so ownership genuinely transfers to
+/// whichever system drains it.
+pub enum ContextHydration {
+    /// A context's first join, or the `FeedEvent::Terminated` recovery: a
+    /// brand-new mirror AND receiver, installed wholesale
+    /// (`DocumentStore::install`).
+    Joined {
+        context_id: ContextId,
+        mirror: kaijutsu_client::ContextMirror,
+        feed: mpsc::Receiver<kaijutsu_client::FeedEvent>,
+    },
+    /// The `FeedEvent::Resubscribed`/`Desynced` recovery: a fresh snapshot
+    /// for a mirror whose existing receiver is still good
+    /// (`DocumentStore::apply_snapshot`).
+    Snapshot {
+        context_id: ContextId,
+        blocks: Vec<kaijutsu_types::BlockSnapshot>,
+        version: u64,
+    },
+    /// The initial join's subscribe+hydrate failed. The join still lands —
+    /// against an empty, unfed mirror — rather than blocking on it forever.
+    JoinFailed { context_id: ContextId },
+}
+
+/// Drain-once channel for [`ContextHydration`] results — see its doc comment
+/// for why this can't be `RpcResultMessage`. `rx` uses `std::sync::mpsc`
+/// (not tokio) because nothing here needs an async receiver: it is drained
+/// synchronously, once a frame, exactly like `peers::PeerInvocationChannel`.
+#[derive(Resource)]
+pub struct ContextHydrationChannel {
+    tx: std::sync::mpsc::Sender<ContextHydration>,
+    rx: Mutex<std::sync::mpsc::Receiver<ContextHydration>>,
+}
+
+impl ContextHydrationChannel {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            tx,
+            rx: Mutex::new(rx),
+        }
+    }
+
+    /// Convenience: clone the sender for passing to async tasks.
+    pub fn sender(&self) -> std::sync::mpsc::Sender<ContextHydration> {
+        self.tx.clone()
+    }
+
+    /// Drain whatever is queued right now. Locked internally so callers
+    /// don't need `ResMut` just to read a channel.
+    pub fn drain(&self) -> Vec<ContextHydration> {
+        let Ok(rx) = self.rx.lock() else {
+            return Vec::new();
+        };
+        rx.try_iter().collect()
+    }
+}
+
 // ============================================================================
 // Bevy Messages (written by poll systems, read by consumer systems)
 // ============================================================================
@@ -106,17 +210,25 @@ pub struct ConnectionStatusMessage(pub kaijutsu_client::ConnectionStatus);
 ///
 /// Sent via `RpcResultChannel` from async tasks, polled and written as
 /// Bevy messages by `poll_rpc_results`.
-#[derive(Message, Clone, Debug)]
+///
+/// Not `Clone`: `ContextJoined`/`ContextRehydrated` carry a live
+/// `mpsc::Receiver<FeedEvent>` (the change feed, docs/change-feed.md), and a
+/// receiver cannot be duplicated.
+#[derive(Message, Debug)]
 #[allow(dead_code)]
 pub enum RpcResultMessage {
     /// Kernel info received after attach/reconnect.
     KernelAttached(Result<KernelInfo, String>),
     /// Identity received.
     IdentityReceived(Identity),
-    /// Context joined — includes membership info and initial sync state.
+    /// Context joined — membership info only. The change-feed hydration
+    /// (docs/change-feed.md rules 21-26: subscribe, then `getBlocks`, then
+    /// apply) travels separately on `ContextHydrationChannel` — a live
+    /// `mpsc::Receiver<FeedEvent>` can't ride this message (see that
+    /// channel's doc comment) — and is drained by
+    /// `view::sync::drain_context_hydrations`.
     ContextJoined {
         membership: ContextMembership,
-        initial_sync: Option<kaijutsu_client::SyncState>,
     },
     /// Context left.
     ContextLeft,
@@ -185,15 +297,25 @@ pub enum RpcResultMessage {
     ThemeReceived(String),
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
-    /// A staleness re-fetch (`view::sync::check_cache_staleness`, fired by a
-    /// `SyncGeneration` bump on reconnect or broadcast lag) pulled the full CRDT
-    /// sync state for a context. Routed to `handle_block_events`, which merges it
-    /// into the cached document — the idempotent re-sync that heals blocks lost
-    /// during a transport outage. Distinct from `ContextJoined`'s `initial_sync`:
-    /// this refreshes an already-cached doc without re-running the join bootstrap.
-    ContextResynced {
+    /// A followed context's change feed ended and does not resume
+    /// (`FeedEvent::Terminated`) — re-subscribed from scratch and
+    /// re-hydrated (`view::sync::drain_context_feeds`). Installed wholesale
+    /// via `DocumentStore::install`, replacing both the dead receiver and
+    /// the mirror it fed.
+    ContextRehydrated {
         context_id: ContextId,
-        sync: kaijutsu_client::SyncState,
+        mirror: kaijutsu_client::ContextMirror,
+        feed: mpsc::Receiver<kaijutsu_client::FeedEvent>,
+    },
+    /// A followed context's mirror was re-fetched from a fresh snapshot
+    /// while KEEPING its existing feed receiver — the
+    /// `FeedEvent::Resubscribed`/`Desynced` recovery
+    /// (`view::sync::drain_context_feeds`). Installed via
+    /// `DocumentStore::apply_snapshot`.
+    ContextSnapshotReady {
+        context_id: ContextId,
+        blocks: Vec<kaijutsu_types::BlockSnapshot>,
+        version: u64,
     },
     /// An open editor's kernel session is gone: a keystroke to `editor_keys`
     /// came back `no such session`. The session is in-memory kernel state and
@@ -250,6 +372,7 @@ impl Plugin for ActorPlugin {
         // Register resources
         app.insert_resource(bootstrap_channel)
             .insert_resource(RpcResultChannel::new())
+            .insert_resource(ContextHydrationChannel::new())
             .insert_resource(RpcConnectionState {
                 ssh_config,
                 ..Default::default()
@@ -269,7 +392,6 @@ impl Plugin for ActorPlugin {
                 poll_connection_status,
                 poll_rpc_results,
                 update_connection_state,
-                bump_sync_generation_on_reconnect,
                 refetch_config_on_reconnect,
                 restore_context_on_message,
                 apply_theme_from_rpc,
@@ -282,39 +404,20 @@ impl Plugin for ActorPlugin {
     }
 }
 
-/// Bump the document store's generation when the actor reports a reconnect, so
-/// the active document re-syncs after a transport flake (laptop sleep, Wi-Fi
-/// blip). The reconnect handshake re-subscribes the block *stream*, but blocks
-/// the kernel published *during* the outage went to the dropped subscription and
-/// are gone; without a re-fetch the view stays gap-stale until a manual context
-/// switch respawns the actor. The bump drives
-/// [`crate::view::sync::check_cache_staleness`] to re-fetch and merge the full
-/// CRDT state (idempotent).
-///
-/// Detection lives in the actor ([`kaijutsu_client`]): it owns the reconnect FSM,
-/// so it emits [`ServerEvent::Reconnected`] only on a real reconnect (never the
-/// first connect, which hydrates via the `ActorReady` bootstrap). The app just
-/// reacts — no re-derivation from the `ConnectionStatus` stream.
-fn bump_sync_generation_on_reconnect(
-    mut server_events: MessageReader<ServerEventMessage>,
-    mut doc_cache: ResMut<crate::cell::DocumentCache>,
-) {
-    for ServerEventMessage(event) in server_events.read() {
-        if matches!(event, ServerEvent::Reconnected) {
-            let generation = doc_cache.bump_generation();
-            log::info!(
-                "reconnect signalled — bumped sync generation to {} for active-doc re-sync",
-                generation
-            );
-        }
-    }
-}
+// `bump_sync_generation_on_reconnect` (the old CRDT-era generation-bump
+// staleness sweep) is gone: the block document no longer has a coarse
+// broadcast-level staleness signal to react to. Each followed context now
+// gets its OWN precise recovery signal straight from its change feed
+// (`FeedEvent::Resubscribed`/`Terminated`, docs/change-feed.md rules 21-28),
+// drained by `view::sync::drain_context_feeds` — replacing both this system
+// and `view::sync::check_cache_staleness`.
 
 /// Re-fetch the theme/metronome/scroll config trio whenever the actor
-/// reports a reconnect. Uses the SAME [`ServerEvent::Reconnected`] trigger as
-/// [`bump_sync_generation_on_reconnect`] just above — the actor's one
-/// canonical "we came back from an outage" signal — rather than adding a
-/// second reconnect-detection mechanism alongside it.
+/// reports a reconnect. Uses the SAME `ServerEvent::Reconnected` trigger the
+/// now-deleted `bump_sync_generation_on_reconnect` used to (see the comment
+/// just above) — the actor's one canonical "we came back from an outage"
+/// signal — rather than adding a second reconnect-detection mechanism
+/// alongside it.
 ///
 /// Before this system existed, [`fetch_startup_configs`] only ran once, from
 /// `poll_bootstrap_results`'s `ActorReady` arm. That is correct for cold
@@ -792,6 +895,7 @@ fn poll_bootstrap_results(
     mut commands: Commands,
     channel: Res<BootstrapChannel>,
     result_channel: Res<RpcResultChannel>,
+    hydration_channel: Res<ContextHydrationChannel>,
     invocation_channel: Res<crate::peers::PeerInvocationChannel>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
     client_id: Res<crate::connection::client_id::ClientId>,
@@ -829,6 +933,7 @@ fn poll_bootstrap_results(
                 // and the UI sat on "Disconnected" while drift-poll data flowed).
                 let h = handle.clone();
                 let tx = result_channel.sender();
+                let hydration_tx = hydration_channel.sender();
                 let inv_tx = invocation_channel.tx.clone();
                 let ctx_id = context_id;
                 let client_id = client_id.0.to_string();
@@ -952,13 +1057,25 @@ fn poll_bootstrap_results(
                                 return;
                             };
 
-                            let initial_sync = match h.get_context_sync(ctx_id).await {
-                                Ok(state) => Some(state),
-                                Err(e) => {
-                                    log::warn!("Initial get_context_sync failed: {e}");
-                                    None
+                            // docs/change-feed.md rule 27: never `getContextSync`
+                            // for a snapshot. Subscribe first, then `getBlocks`.
+                            // Travels on `ContextHydrationChannel`, not
+                            // `RpcResultMessage` — see that channel's doc
+                            // comment for why.
+                            match hydrate_context(&h, ctx_id).await {
+                                Ok((mirror, feed)) => {
+                                    let _ = hydration_tx.send(ContextHydration::Joined {
+                                        context_id: ctx_id,
+                                        mirror,
+                                        feed,
+                                    });
                                 }
-                            };
+                                Err(e) => {
+                                    log::warn!("Initial context hydrate failed: {e}");
+                                    let _ = hydration_tx
+                                        .send(ContextHydration::JoinFailed { context_id: ctx_id });
+                                }
+                            }
 
                             let nick = identity.map(|id| id.username).unwrap_or_default();
                             let membership = ContextMembership {
@@ -968,10 +1085,7 @@ fn poll_bootstrap_results(
                                 instance: app_peer_instance().to_string(),
                             };
 
-                            let _ = tx.send(RpcResultMessage::ContextJoined {
-                                membership,
-                                initial_sync,
-                            });
+                            let _ = tx.send(RpcResultMessage::ContextJoined { membership });
                             return;
                         }
 
@@ -1027,7 +1141,6 @@ fn poll_bootstrap_results(
 fn poll_server_events(
     actor: Option<Res<RpcActor>>,
     mut events: MessageWriter<ServerEventMessage>,
-    mut doc_cache: ResMut<crate::cell::DocumentCache>,
     mut receiver: Local<Option<broadcast::Receiver<kaijutsu_client::ServerEvent>>>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
@@ -1053,8 +1166,12 @@ fn poll_server_events(
                 events.write(ServerEventMessage(event));
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                // The block document no longer listens on this broadcast at
+                // all (docs/change-feed.md) — its own per-context feed has
+                // its own gap detection (`FeedEvent::Terminated`). A lag
+                // here only drops whatever OTHER stream events (turn
+                // completion, VFS activity, …) were in flight.
                 log::warn!("Server event broadcast lagged by {n} messages");
-                doc_cache.bump_generation();
             }
             Err(broadcast::error::TryRecvError::Empty) => {
                 break;

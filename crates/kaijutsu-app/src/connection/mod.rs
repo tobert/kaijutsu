@@ -12,8 +12,8 @@ pub mod peers;
 pub mod share_dial;
 
 pub use actor_plugin::{
-    ActorPlugin, RpcActor, RpcConnectionState, RpcResultChannel, RpcResultMessage,
-    ServerEventMessage,
+    ActorPlugin, ContextHydration, ContextHydrationChannel, RpcActor, RpcConnectionState,
+    RpcResultChannel, RpcResultMessage, ServerEventMessage,
 };
 pub use bootstrap::{BootstrapChannel, BootstrapCommand};
 pub use share_dial::ShareDialPlugin;
