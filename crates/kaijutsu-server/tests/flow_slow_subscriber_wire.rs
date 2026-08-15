@@ -182,32 +182,34 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
         }
 
         // …and it was told why, before the socket went away.
-        let k = kick.borrow();
-        assert_eq!(
-            k.reason.as_deref(),
-            Some("slowSubscriber"),
-            "the kick must name the reason, not just vanish"
-        );
-        assert_eq!(
-            k.topic, "block.text_ops",
-            "the kick names the topic whose event could not be enqueued"
-        );
-        assert_eq!(
-            k.capacity,
-            TEST_QUEUE_DEPTH.parse::<u64>().unwrap(),
-            "the kick reports the depth that was exceeded"
-        );
-        assert!(
-            k.delivered <= k.capacity,
-            "delivered ({}) cannot exceed the queue it overflowed ({})",
-            k.delivered,
-            k.capacity
-        );
-        // Release the RefCell borrow before the `.await`s below — the
+        //
+        // Scoped so the `Ref` borrow drops before the `.await`s below — the
         // connection is already dead at this point so `WedgedClient` won't
         // fire another `borrow_mut()`, but there's no reason to hold a
         // `Ref` live across an await when it's done being read.
-        drop(k);
+        {
+            let k = kick.borrow();
+            assert_eq!(
+                k.reason.as_deref(),
+                Some("slowSubscriber"),
+                "the kick must name the reason, not just vanish"
+            );
+            assert_eq!(
+                k.topic, "block.text_ops",
+                "the kick names the topic whose event could not be enqueued"
+            );
+            assert_eq!(
+                k.capacity,
+                TEST_QUEUE_DEPTH.parse::<u64>().unwrap(),
+                "the kick reports the depth that was exceeded"
+            );
+            assert!(
+                k.delivered <= k.capacity,
+                "delivered ({}) cannot exceed the queue it overflowed ({})",
+                k.delivered,
+                k.capacity
+            );
+        }
 
         // The healthy connection is untouched: one slow subscriber must never
         // take down the kernel or its neighbours.
