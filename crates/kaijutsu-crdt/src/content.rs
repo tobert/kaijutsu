@@ -10,6 +10,28 @@ use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uu
 use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus};
 use kaijutsu_types::Tick;
 
+// Test-only instrumentation for `BlockContent::text()` — see
+// `block_store::tests::statuses_ordered_does_not_materialize_block_text` for
+// the regression this guards (a status-only accessor that quietly starts
+// routing through `text()`/`snapshot()` again). Thread-local, not a global
+// atomic: `cargo test` runs each `#[test]` fn on its own thread, so counts
+// stay isolated per test without cross-test contamination or a `serial_test`
+// dependency. Not compiled into non-test builds.
+#[cfg(test)]
+thread_local! {
+    static TEXT_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_text_call_count() {
+    TEXT_CALL_COUNT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn text_call_count() -> usize {
+    TEXT_CALL_COUNT.with(|c| c.get())
+}
+
 /// Value-based tiebreaker for per-field LWW merge.
 ///
 /// Remote wins if its timestamp is higher, or if timestamps are equal and
@@ -393,6 +415,8 @@ impl BlockContent {
 
     /// Get the current text content.
     pub fn text(&self) -> String {
+        #[cfg(test)]
+        TEXT_CALL_COUNT.with(|c| c.set(c.get() + 1));
         self.doc
             .get_text(&["content"])
             .map(|t| t.content())

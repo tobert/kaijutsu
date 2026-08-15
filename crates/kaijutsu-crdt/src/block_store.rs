@@ -223,6 +223,27 @@ impl BlockStore {
         ordered.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// Get block statuses in document order (same ordering as
+    /// `blocks_ordered`/`block_ids_ordered`) without building `BlockSnapshot`s.
+    /// `BlockSnapshot::content` is populated by `BlockContent::text()`, which
+    /// materializes a block's full text out of its DTE document into a fresh
+    /// `String` — the one expensive field on an otherwise-cheap struct of
+    /// header clones. Status-only callers (e.g. `journal_op`'s per-op live-
+    /// status recompute) don't need that text and were paying for it on every
+    /// journaled op, context-wide. This does the same order_key sort
+    /// `block_ids_ordered` does, but reads `header().status` directly instead
+    /// of routing through `get_block_snapshot`/`snapshot()`.
+    pub fn statuses_ordered(&self) -> Vec<Status> {
+        let mut ordered: Vec<_> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| !b.is_deleted())
+            .map(|(id, b)| (b.order_key().to_string(), *id, b.header().status))
+            .collect();
+        ordered.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        ordered.into_iter().map(|(_, _, status)| status).collect()
+    }
+
     /// The maximum `Tick` over live blocks, or `None` if none carry one. A direct
     /// O(N) scan — no ordering sort, no snapshot allocation — for the re-arm
     /// playhead seed (the ordered/allocating `blocks_ordered` path is gratuitous
@@ -2074,6 +2095,79 @@ mod tests {
 
         let order: Vec<_> = store.blocks_ordered().iter().map(|b| b.id).collect();
         assert_eq!(order, vec![id1, id2, id3]);
+    }
+
+    /// `statuses_ordered()` exists specifically so `journal_op`'s per-op
+    /// live-status recompute (`kaijutsu-kernel/src/block_store.rs`) stops
+    /// materializing every block's full text on every journaled op — see
+    /// that call site's comment. This is the regression it guards: a status-
+    /// only accessor that quietly starts routing through
+    /// `get_block_snapshot`/`snapshot()`/`text()` again would silently bring
+    /// the cost straight back with no functional test failure elsewhere,
+    /// since the returned `Vec<Status>` would still be correct.
+    ///
+    /// `BlockContent::text()` increments a `#[cfg(test)]` thread-local
+    /// counter (`content::TEXT_CALL_COUNT`) — this asserts `statuses_ordered`
+    /// drives it to zero, then uses `blocks_ordered` as a positive control
+    /// (one `text()` call per live block) to prove the counter itself is
+    /// live and would have caught the regression.
+    #[test]
+    fn statuses_ordered_does_not_materialize_block_text() {
+        let mut store = test_store();
+
+        let id1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let id2 = store
+            .insert_block(
+                None,
+                Some(&id1),
+                Role::Model,
+                BlockKind::Text,
+                "Second",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let _id3 = store
+            .insert_block(
+                None,
+                Some(&id2),
+                Role::Model,
+                BlockKind::Text,
+                "Third",
+                Status::Error,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        crate::content::reset_text_call_count();
+        let statuses = store.statuses_ordered();
+        assert_eq!(
+            crate::content::text_call_count(),
+            0,
+            "statuses_ordered() must never call BlockContent::text()"
+        );
+        assert_eq!(statuses, vec![Status::Done, Status::Running, Status::Error]);
+
+        // Positive control: prove the counter actually observes text()
+        // materialization, so the zero above is meaningful and not just an
+        // inert counter.
+        crate::content::reset_text_call_count();
+        let snaps = store.blocks_ordered();
+        assert_eq!(
+            crate::content::text_call_count(),
+            snaps.len(),
+            "blocks_ordered() calls text() exactly once per live block"
+        );
     }
 
     #[test]

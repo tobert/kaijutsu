@@ -908,7 +908,10 @@ impl BlockStore {
     /// Get the last block ID in a document (for ordering new blocks at the end).
     pub fn last_block_id(&self, context_id: ContextId) -> Option<BlockId> {
         let entry = self.get(context_id)?;
-        entry.doc.blocks_ordered().last().map(|b| b.id)
+        // `block_ids_ordered()`, not `blocks_ordered()`: only the id is
+        // needed, so skip building `BlockSnapshot`s (and the `text()`
+        // materialization each one carries) entirely.
+        entry.doc.block_ids_ordered().last().copied()
     }
 
     /// Reserve a fresh `BlockId` under `principal` without inserting — the
@@ -986,9 +989,18 @@ impl BlockStore {
         // distinguishes a status change from a status-neutral edit. The scan is
         // the cheapest thing that knows the new status, and it's dwarfed by the
         // `append_op` SQLite write it sits beside, so leave it unconditional.
+        //
+        // `statuses_ordered()`, not `blocks_ordered()`: the latter builds a
+        // full `BlockSnapshot` per block, and `BlockSnapshot::content` calls
+        // `BlockContent::text()` — materializing every block's full text out
+        // of its DTE document on every journaled op, context-wide, just to
+        // read `.status` off the snapshot and throw the rest away. This is
+        // the streaming hot path (one call per token), so that cost was paid
+        // once per token per block. `statuses_ordered()` reads `.status`
+        // directly off each block's header, same document-order sort,
+        // without ever touching the text.
         if let Some(entry) = self.get(context_id) {
-            let statuses: Vec<Status> =
-                entry.doc.blocks_ordered().iter().map(|b| b.status).collect();
+            let statuses = entry.doc.statuses_ordered();
             drop(entry);
             self.recompute_live_status(context_id, &statuses);
         }
@@ -2260,9 +2272,10 @@ impl BlockStore {
         }
         let computed = match self.get(context_id) {
             Some(entry) => {
-                let statuses: Vec<Status> =
-                    entry.doc.blocks_ordered().iter().map(|b| b.status).collect();
-                derive_context_live_status(&statuses)
+                // Status-only, same reasoning as `journal_op`'s recompute:
+                // no need to materialize every block's text for a one-time
+                // cold-cache fill.
+                derive_context_live_status(&entry.doc.statuses_ordered())
             }
             None => Status::Pending,
         };
