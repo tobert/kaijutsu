@@ -6057,20 +6057,28 @@ fn read_roster_entity(
     })
 }
 
-fn read_liveness_kind(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<LivenessKind> {
-    let s: String = row.get(idx)?;
-    LivenessKind::parse(&s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            idx,
-            rusqlite::types::Type::Text,
-            format!("invalid liveness_kind: {s:?}").into(),
-        )
+/// Nullable liveness_kind — `None` when the LEFT JOIN found no
+/// `roster_presence` row at all (a status-only entity). A NON-NULL value
+/// that fails to parse is still a loud error: the CHECK constraint means
+/// that should be unreachable, and a read path never silently swallows a
+/// value that shouldn't exist (no-silent-fallbacks).
+fn read_opt_liveness_kind(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<LivenessKind>> {
+    let s: Option<String> = row.get(idx)?;
+    s.map(|s| {
+        LivenessKind::parse(&s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                format!("invalid liveness_kind: {s:?}").into(),
+            )
+        })
     })
+    .transpose()
 }
 
 fn row_to_roster_row(row: &rusqlite::Row<'_>) -> SqliteResult<RosterRow> {
     let entity = read_roster_entity(row, 0, 1)?;
-    let liveness_kind = read_liveness_kind(row, 5)?;
+    let liveness_kind = read_opt_liveness_kind(row, 5)?;
     let availability: Option<String> = row.get(14)?;
     let availability = availability
         .map(|s| {
@@ -6083,17 +6091,19 @@ fn row_to_roster_row(row: &rusqlite::Row<'_>) -> SqliteResult<RosterRow> {
             })
         })
         .transpose()?;
+    let live: Option<i64> = row.get(10)?;
     Ok(RosterRow {
         entity,
         label: row.get(2)?,
+        entity_first_seen_at: row.get(17)?,
         source: row.get(3)?,
         source_local_id: row.get(4)?,
         liveness_kind,
         host: row.get(6)?,
         pid: row.get(7)?,
         proc_start: row.get(8)?,
-        first_seen_at: row.get(9)?,
-        live: row.get::<_, i64>(10)? != 0,
+        presence_first_seen_at: row.get(9)?,
+        live: live.map(|v| v != 0),
         observed_at: row.get(11)?,
         recorded_at: row.get(12)?,
         status_text: row.get(13)?,
@@ -6239,21 +6249,69 @@ impl KernelDb {
     /// against its entity and (if any) self-reported status. The one SELECT
     /// a read surface (later slices) runs — no fan-out to `PeerRegistry` or
     /// anywhere else.
+    ///
+    /// Rooted at `roster_entity` with LEFT JOINs to presence/activity/status
+    /// — NOT rooted at `roster_presence` — so an entity that has posted a
+    /// status but has no known liveness source at all still surfaces (with
+    /// `source`/`liveness_kind`/`live`/… all `None`). Same "unknown, never
+    /// absent" stance as everywhere else in this module: no presence row
+    /// means liveness is unknown, not that the entity should be invisible.
+    /// An entity WITH multiple presence rows (not expected in v1 — `bound`
+    /// is principal-only, `recent` is context-only, so today's two sources
+    /// never overlap on one entity — but the schema doesn't forbid it once
+    /// `attested` lands) yields one result row per presence, each carrying
+    /// the same entity/status columns.
+    ///
+    /// `WHERE p.source IS NOT NULL OR s.entity_id IS NOT NULL` excludes the
+    /// other direction of orphan: `roster_entity` rows are never deleted (no
+    /// history-table/GC machinery — module doc), so a `bound` entity whose
+    /// sole presence row was just pruned by reconcile, and who has never
+    /// posted a status, would otherwise linger here as a ghost with every
+    /// column `NULL`. It has nothing current to say about itself any more,
+    /// so it drops out of the view entirely rather than surfacing as a
+    /// phantom "known but empty" row — this is what keeps the restart-shaped
+    /// guarantee (a pruned `bound` row must not read back live, or at all)
+    /// true even after the LEFT JOIN widening above.
     pub fn roster_snapshot(&self) -> KernelDbResult<Vec<RosterRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT e.entity_kind, e.entity_id, e.label,
                     p.source, p.source_local_id, p.liveness_kind,
                     p.host, p.pid, p.proc_start, p.first_seen_at,
                     a.live, a.observed_at, a.recorded_at,
-                    s.status_text, s.availability, s.observed_at, s.recorded_at
-             FROM roster_presence p
-             JOIN roster_entity e ON e.entity_kind = p.entity_kind AND e.entity_id = p.entity_id
-             JOIN roster_activity a ON a.source = p.source AND a.source_local_id = p.source_local_id
+                    s.status_text, s.availability, s.observed_at, s.recorded_at,
+                    e.first_seen_at
+             FROM roster_entity e
+             LEFT JOIN roster_presence p ON p.entity_kind = e.entity_kind AND p.entity_id = e.entity_id
+             LEFT JOIN roster_activity a ON a.source = p.source AND a.source_local_id = p.source_local_id
              LEFT JOIN roster_status s ON s.entity_kind = e.entity_kind AND s.entity_id = e.entity_id
-             ORDER BY p.source, p.source_local_id",
+             WHERE p.source IS NOT NULL OR s.entity_id IS NOT NULL
+             ORDER BY e.entity_kind, e.entity_id, p.source, p.source_local_id",
         )?;
         let rows = stmt.query_map([], row_to_roster_row)?.collect::<SqliteResult<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The current availability on file for one entity's self-reported
+    /// status, or `None` if it has never posted one. `kj roster status`
+    /// reads this when the caller omits `--availability`, so a text-only
+    /// update never silently resets a standing `dnd`/`away` back to a
+    /// default.
+    pub fn roster_get_availability(&self, entity: RosterEntity) -> KernelDbResult<Option<Availability>> {
+        let id_bytes = entity.id_bytes();
+        let s: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT availability FROM roster_status WHERE entity_kind = ?1 AND entity_id = ?2",
+                params![entity.kind_str(), blob_param(&id_bytes)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match s {
+            None => None,
+            Some(s) => Some(Availability::parse(&s).ok_or_else(|| {
+                KernelDbError::Validation(format!("roster_status holds an invalid availability: {s:?}"))
+            })?),
+        })
     }
 
     /// Every `source_local_id` currently on file for `source`, before a

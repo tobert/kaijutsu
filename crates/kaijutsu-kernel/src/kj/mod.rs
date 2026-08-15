@@ -38,6 +38,7 @@ pub mod preset;
 pub mod editor;
 pub mod rc;
 pub mod lifecycle;
+pub mod roster;
 pub mod model;
 pub mod refs;
 pub mod search;
@@ -402,6 +403,12 @@ impl KjDispatcher {
         // context — same exemption rationale as `kj audio`/`kj config`.
         if cmd == "midi" {
             return self.dispatch_midi(&argv[1..], caller).await;
+        }
+        // `kj roster` posts/reads the live roster; identity is stamped from
+        // `caller`, not from an active context — works with or without one
+        // (a human at the shell has no context to require).
+        if cmd == "roster" {
+            return self.dispatch_roster(&argv[1..], caller).await;
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
@@ -829,6 +836,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())
         .subcommand(midi::MidiArgs::command())
+        .subcommand(roster::RosterArgs::command())
         .subcommand(cp::CpArgs::command())
         .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())

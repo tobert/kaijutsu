@@ -297,8 +297,8 @@ mod tests {
         assert!(roster.refreshed_at().is_some(), "boot rule: refresh_once must stamp refreshed_at");
         let snap = roster.snapshot().unwrap();
         assert_eq!(snap.len(), 2, "one bound peer + one recent context");
-        assert!(snap.iter().any(|r| r.entity == RosterEntity::Principal(principal) && r.live));
-        assert!(snap.iter().any(|r| r.entity == RosterEntity::Context(ctx) && r.live));
+        assert!(snap.iter().any(|r| r.entity == RosterEntity::Principal(principal) && r.live == Some(true)));
+        assert!(snap.iter().any(|r| r.entity == RosterEntity::Context(ctx) && r.live == Some(true)));
     }
 
     /// The restart-shaped guarantee, exercised through the real source

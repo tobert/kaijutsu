@@ -230,16 +230,24 @@ pub struct PresenceSnapshotRow {
 pub struct RosterRow {
     pub entity: RosterEntity,
     pub label: Option<String>,
-    pub source: String,
-    pub source_local_id: String,
-    pub liveness_kind: LivenessKind,
+    pub entity_first_seen_at: i64,
+    // The presence half is entirely `None` for an entity that has posted a
+    // status but has no known liveness source at all (no `bound` peer, no
+    // `recent` context) — this is the SAME "unknown, never absent" stance
+    // the rest of this module lives by: absence of a presence row means
+    // liveness is unknown, not that the entity is somehow "not here". A
+    // status-only entity therefore still surfaces in `RosterStore::snapshot`
+    // rather than being invisible just because it has no presence row.
+    pub source: Option<String>,
+    pub source_local_id: Option<String>,
+    pub liveness_kind: Option<LivenessKind>,
     pub host: Option<String>,
     pub pid: Option<u32>,
     pub proc_start: Option<i64>,
-    pub first_seen_at: i64,
-    pub live: bool,
+    pub presence_first_seen_at: Option<i64>,
+    pub live: Option<bool>,
     pub observed_at: Option<i64>,
-    pub recorded_at: i64,
+    pub recorded_at: Option<i64>,
     pub status_text: Option<String>,
     pub availability: Option<Availability>,
     pub status_observed_at: Option<i64>,
@@ -363,6 +371,14 @@ impl RosterStore {
     pub fn snapshot(&self) -> KernelDbResult<Vec<RosterRow>> {
         self.db.lock().roster_snapshot()
     }
+
+    /// The availability currently on file for `entity`, or `None` if it has
+    /// never posted a status. See `KernelDb::roster_get_availability` — a
+    /// text-only status update reads this first so it never silently resets
+    /// a standing `dnd`/`away` back to a default.
+    pub fn current_availability(&self, entity: RosterEntity) -> KernelDbResult<Option<Availability>> {
+        self.db.lock().roster_get_availability(entity)
+    }
 }
 
 #[cfg(test)]
@@ -428,8 +444,8 @@ mod tests {
         let snap = store.snapshot().unwrap();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].entity, entity);
-        assert!(snap[0].live);
-        assert_eq!(snap[0].liveness_kind, LivenessKind::Bound);
+        assert_eq!(snap[0].live, Some(true));
+        assert_eq!(snap[0].liveness_kind, Some(LivenessKind::Bound));
         assert_eq!(snap[0].host.as_deref(), Some("moltar"));
     }
 
@@ -495,7 +511,7 @@ mod tests {
 
         let snap = store.snapshot().unwrap();
         assert_eq!(snap.len(), 1);
-        assert!(!snap[0].live, "liveness must reflect the latest refresh, not the first one");
+        assert_eq!(snap[0].live, Some(false), "liveness must reflect the latest refresh, not the first one");
     }
 
     /// `recorded_at` — never a foreign clock — governs what the view shows
@@ -512,7 +528,7 @@ mod tests {
         store.reconcile("peer_registry", LivenessKind::Bound, &[row], 500).unwrap();
 
         let snap = store.snapshot().unwrap();
-        assert_eq!(snap[0].recorded_at, 500, "recorded_at must be the kernel's own clock");
+        assert_eq!(snap[0].recorded_at, Some(500), "recorded_at must be the kernel's own clock");
         assert_eq!(snap[0].observed_at, Some(9_999_999_999_999), "observed_at is carried, never trusted for ordering");
     }
 

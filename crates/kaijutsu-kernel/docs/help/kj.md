@@ -93,6 +93,8 @@ play            Play a sample now, or commit it as a clip cell onto a track with
 policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove, reseed
 rc              add, list, rm, show, edit, reset — lifecycle scripts (/etc/rc/<type>/<verb>/)
+roster          status <text> [--availability active|idle|away|dnd] — post your
+                own self-reported status; identity is always the caller's own
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 stage           commit, status, include, exclude — curate a staged (liminal) fork
 transport       attach, detach, play, pause, stop, tempo <bpm>, ooda <on|off>,
