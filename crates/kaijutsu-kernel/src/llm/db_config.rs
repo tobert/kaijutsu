@@ -360,12 +360,18 @@ mod tests {
         assert_eq!(registry.default_provider_name(), Some("deepseek"));
         assert_eq!(registry.default_model(), Some("deepseek-v4-flash"));
         assert_eq!(registry.max_output_tokens(), 16384);
+        let t = registry.default_tunables();
+        // Effort IS decided: the factory floor asks for maximum reasoning on
+        // deepseek (see `seed_backends::FACTORY_EFFORT` for why that is the
+        // frugal choice rather than the extravagant one). Asserted here as
+        // well as at the seed, because this is the path that carries it into
+        // a live registry — the seed being right buys nothing if the registry
+        // drops it.
+        assert_eq!(t.effort.as_deref(), Some("max"));
         // Knobs we haven't decided on stay NULL — "provider default" is a
         // real answer, not a gap to fill with an invented number.
-        let t = registry.default_tunables();
         assert_eq!(t.temperature, None);
         assert_eq!(t.top_p, None);
-        assert_eq!(t.effort, None);
         assert_eq!(t.thinking_budget, None);
         assert_eq!(t.thinking_style, None);
     }
