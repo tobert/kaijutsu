@@ -4771,9 +4771,6 @@ leaked runtime outliving the guard.
 - `is_disconnect_error` matches on the capnp error `Display` text
   (`actor.rs:1214`) — fragile; a capnp formatting change would stop triggering
   reconnect. Prefer a typed `ErrorKind::Disconnected` match.
-- Peer-reattach residual: initial `attach_peer` isn't remembered until the first
-  *successful* user call, so a kernel restart before that leaves the peer
-  un-reattached (`actor.rs:1933`). *(extends `tech_debt_peer_reattach_on_reconnect`)*
 
 **App (`kaijutsu-app`):**
 - Triple Chat/Shell discriminator — `FocusArea` + `ActiveSurface` +
