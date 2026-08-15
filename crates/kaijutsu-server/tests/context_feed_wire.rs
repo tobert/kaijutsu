@@ -41,6 +41,12 @@ async fn drain_until(mirror: &mut ContextMirror, rx: &mut Receiver<FeedEvent>, v
             Ok(Some(FeedEvent::Terminated { reason, .. })) => {
                 panic!("feed terminated early: {reason:?}")
             }
+            // These tests drive one connection and never drop it, so a
+            // reconnect notice here would mean the transport went away
+            // underneath the assertion — a failure, not something to absorb.
+            Ok(Some(FeedEvent::Resubscribed)) => {
+                panic!("feed re-subscribed: the connection dropped mid-test")
+            }
             Ok(None) => panic!("feed channel closed before reaching version {version}"),
             Err(_) => panic!(
                 "timed out at version {} waiting for {version}",

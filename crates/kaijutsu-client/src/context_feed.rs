@@ -96,6 +96,12 @@ pub struct ContextDelivery {
 #[derive(Clone, Debug)]
 pub enum FeedEvent {
     Changed(ContextDelivery),
+    /// The connection dropped and the actor has already re-subscribed. Nothing
+    /// the kernel published during the outage is on this feed, so the mirror
+    /// held before it is stale: fetch a fresh snapshot and hydrate a new
+    /// mirror. Continuing to apply deltas to the old one would silently skip
+    /// the gap.
+    Resubscribed,
     /// The feed ended and is **not** resumable: re-subscribe and refetch.
     /// `delivered_version` is the last version actually applied, useful for
     /// logging how far behind the client had fallen — never for patching

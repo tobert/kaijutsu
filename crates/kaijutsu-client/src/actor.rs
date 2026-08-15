@@ -58,6 +58,7 @@
 //!    every `join_context` and every `subscribe_*` call. The server uses
 //!    `(principal, instance)` to dedupe subscriptions across reconnects.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,15 @@ use crate::constants::{
     RPC_BIND_KERNEL_TIMEOUT, RPC_CALL_TIMEOUT, RPC_JOIN_CONTEXT_TIMEOUT, SSH_DIAL_TIMEOUT,
     SUBSCRIBE_TIMEOUT,
 };
+/// Depth of the actor-internal queue between a context feed's observer and the
+/// consumer's receiver.
+///
+/// Deep enough that an ordinary streaming burst never backs up into the RPC
+/// callback, shallow enough that a consumer which has stopped draining applies
+/// backpressure the kernel can see and act on — it terminates a subscriber that
+/// cannot keep up rather than dropping events behind its back.
+const CONTEXT_FEED_QUEUE: usize = 256;
+
 use crate::rpc::{
     Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
     KernelInfo, LlmConfigInfo, McpResource, McpToolResult, PeerInfo, ShellValue, SimilarContext,
@@ -417,6 +427,14 @@ enum RpcCommand {
         query: BlockQuery,
         reply: oneshot::Sender<Result<Vec<BlockSnapshot>, CallError>>,
     },
+    /// Follow one context's change feed. The actor keeps the sender and
+    /// re-subscribes on every reconnect, so the consumer's receiver outlives
+    /// the connection (docs/change-feed.md).
+    SubscribeContext {
+        context_id: ContextId,
+        sender: mpsc::Sender<crate::context_feed::FeedEvent>,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     /// Same query, but keeping the context version the blocks were read at —
     /// the snapshot half of the change feed's recovery protocol
     /// (docs/change-feed.md rules 21-26).
@@ -741,6 +759,7 @@ impl RpcCommand {
             Self::ResolveContextLabel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocksVersioned { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SubscribeContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1159,6 +1178,31 @@ impl ActorHandle {
             reply,
         })
         .await
+    }
+
+    /// Follow one context's change feed (docs/change-feed.md).
+    ///
+    /// The returned receiver outlives reconnects: the actor re-subscribes on
+    /// every new connection and sends [`FeedEvent::Resubscribed`] first, which
+    /// is the consumer's cue to refetch a snapshot with
+    /// [`Self::get_blocks_versioned`] and hydrate a fresh
+    /// [`ContextMirror`](crate::ContextMirror). Subscribing while disconnected
+    /// is fine — the feed starts at the next connection.
+    ///
+    /// Subscribing twice to one context replaces the first receiver.
+    #[tracing::instrument(skip(self))]
+    pub async fn subscribe_context(
+        &self,
+        context_id: ContextId,
+    ) -> Result<mpsc::Receiver<crate::context_feed::FeedEvent>, CallError> {
+        let (sender, receiver) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        self.send(|reply| RpcCommand::SubscribeContext {
+            context_id,
+            sender,
+            reply,
+        })
+        .await?;
+        Ok(receiver)
     }
 
     /// Query blocks and keep the version they were read at, atomically.
@@ -1930,6 +1974,16 @@ struct RpcActor {
     /// unconditionally every time.
     permission_tx: mpsc::Sender<PermissionAskEnvelope>,
 
+    /// Context change feeds this client wants, by context
+    /// (docs/change-feed.md). The actor keeps the consumer's end of each feed
+    /// so it can build a fresh observer and re-subscribe after a reconnect —
+    /// the consumer's receiver survives, the wire capability does not.
+    ///
+    /// Intent, not connection state: a subscribe that arrives while
+    /// disconnected is remembered and issued on the next Connected edge, the
+    /// same way peer attachment is.
+    context_feeds: HashMap<ContextId, mpsc::Sender<crate::context_feed::FeedEvent>>,
+
     /// Owned during `Connected`. Replaced atomically on successful handshake.
     connection: Option<ConnectionState>,
     /// Spawned during `Connected` to issue periodic pings; aborted on Closing.
@@ -2011,6 +2065,7 @@ impl RpcActor {
             vfs_activity_interval_ms: None,
             midi_exchange,
             permission_tx,
+            context_feeds: HashMap::new(),
             connection: None,
             ping_task: None,
             connecting_task: None,
@@ -2117,6 +2172,14 @@ impl RpcActor {
         self.state = ActorState::Connected {
             since: Instant::now(),
         };
+
+        // Context feeds are intent, like peer attachment: the observer
+        // capability died with the old connection, but the consumer's receiver
+        // did not. Re-issue every feed on the new connection and tell each
+        // consumer to refetch — nothing published during the outage is on the
+        // feed, and a client that kept applying deltas across the gap would be
+        // quietly missing whatever happened while it was away.
+        self.resubscribe_context_feeds();
 
         // A one-shot caller may have declared peer intent while this
         // connection was still being built. Its request correctly received
@@ -2385,6 +2448,20 @@ impl RpcActor {
                     .instrument(span),
                 );
             }
+            RpcCommand::SubscribeContext {
+                context_id,
+                sender,
+                reply,
+            } => {
+                // Recorded as intent first, issued second: a subscribe that
+                // arrives while disconnected is not an error, it is a feed that
+                // starts at the next Connected edge. Re-subscribing an already
+                // followed context replaces its sender rather than stacking a
+                // second pump onto the same feed.
+                self.context_feeds.insert(context_id, sender.clone());
+                self.issue_context_feed(context_id, sender, false);
+                let _ = reply.send(Ok(()));
+            }
             RpcCommand::ResubscribeBlocks { reply } => {
                 // Inline: uses the live connection's kernel via the actor's
                 // own scoped re-subscribe helper. Fire-and-forget on the wire;
@@ -2488,6 +2565,68 @@ impl RpcActor {
     /// Connected. Used both to re-scope after a `JoinContext` and to recover a
     /// subscription the server may have reaped after a sustained callback stall
     /// (the client-side half of the 2026-06-17 shell-timeout fix).
+    /// Issue one context feed's `subscribeContext` on the live connection.
+    ///
+    /// Fire-and-forget on the wire, like the block re-subscribe beside it: a
+    /// failure logs and leaves the consumer waiting, which its next reconnect
+    /// repairs. No-op when not Connected — the intent stays in
+    /// `context_feeds` and is replayed on the Connected edge.
+    fn issue_context_feed(
+        &self,
+        context_id: ContextId,
+        sender: mpsc::Sender<crate::context_feed::FeedEvent>,
+        announce_resubscribe: bool,
+    ) {
+        let Some(conn) = self.connection.as_ref() else {
+            return;
+        };
+        let kernel = conn.kernel.clone();
+        tokio::task::spawn_local(async move {
+            // Announced inside this task, before the subscribe, so the
+            // consumer cannot receive a post-reconnect delta ahead of the
+            // notice that it must rehydrate. Two spawned tasks would race.
+            if announce_resubscribe
+                && sender
+                    .send(crate::context_feed::FeedEvent::Resubscribed)
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            let (observer, mut rx) = crate::context_feed::context_feed_channel(CONTEXT_FEED_QUEUE);
+            match tokio::time::timeout(SUBSCRIBE_TIMEOUT, kernel.subscribe_context(context_id, observer))
+                .await
+            {
+                Ok(Ok(())) => log::debug!("Subscribed to the change feed for {context_id}"),
+                Ok(Err(e)) => {
+                    log::warn!("Context feed subscribe failed for {context_id} (non-fatal): {e}");
+                    return;
+                }
+                Err(_) => {
+                    log::warn!("Context feed subscribe timed out for {context_id} (non-fatal)");
+                    return;
+                }
+            }
+            // Pump the observer's channel into the consumer's. Two channels
+            // rather than one because the observer is rebuilt on every
+            // reconnect while the consumer's receiver has to survive; the pump
+            // ends when either side goes away.
+            while let Some(event) = rx.recv().await {
+                if sender.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Re-issue every context feed on a new connection, telling each consumer
+    /// to rehydrate first.
+    fn resubscribe_context_feeds(&self) {
+        for (context_id, sender) in &self.context_feeds {
+            self.issue_context_feed(*context_id, sender.clone(), true);
+        }
+    }
+
     fn resubscribe_blocks(&self) {
         let Some(conn) = self.connection.as_ref() else {
             return;
@@ -3457,6 +3596,15 @@ async fn dispatch_kernel_command(
         RpcCommand::JoinContext { reply, .. } => {
             let _ = reply.send(Err(CallError::Rpc(
                 "join_context leaked into kernel dispatch (bug)".into(),
+            )));
+        }
+
+        // ── SubscribeContext handled inline by RpcActor::dispatch ──
+        // It has to be: the actor owns the feed registry that survives
+        // reconnects, and this dispatcher only sees one live connection.
+        RpcCommand::SubscribeContext { reply, .. } => {
+            let _ = reply.send(Err(CallError::Rpc(
+                "subscribe_context leaked into kernel dispatch (bug)".into(),
             )));
         }
 
