@@ -53,6 +53,12 @@ pub enum BlockStoreError {
     #[error("block not found after insert")]
     BlockNotFoundAfterInsert,
 
+    #[error("no draft in context {0} for principal {1}")]
+    NoDraft(ContextId, PrincipalId),
+
+    #[error("draft in context {0} is empty")]
+    EmptyDraft(ContextId),
+
     #[error(transparent)]
     Crdt(#[from] kaijutsu_crdt::CrdtError),
 
@@ -2040,6 +2046,128 @@ impl BlockStore {
         Ok(())
     }
 
+    // =========================================================================
+    // Compose drafts (docs/change-feed.md)
+    // =========================================================================
+    //
+    // A draft is a block, not a parallel document. It is an ordinary
+    // `Role::User` / `BlockKind::Text` block carrying `Status::Draft` and
+    // `ephemeral`, living at the end of its context.
+    //
+    // The property that matters: **submitting is a status transition, not a
+    // copy.** The block a player types into IS the message they send, so there
+    // is no window in which the text exists only in a variable — which is
+    // exactly where the old `submit_input` could lose it (read draft, clear
+    // draft, THEN try to author a block that might fail).
+    //
+    // One draft per (context, principal): `BlockId` already carries the
+    // principal, so two players sharing a context each get their own without
+    // any extra key. Their drafts ride the change feed like any other block,
+    // which is how a co-player sees you typing.
+
+    /// This principal's draft block in `context_id`, if they have one.
+    pub fn draft_block(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<Option<BlockSnapshot>> {
+        let entry = self
+            .get(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        Ok(entry
+            .doc
+            .blocks_ordered()
+            .into_iter()
+            .find(|b| b.status == Status::Draft && b.id.principal_id == principal_id))
+    }
+
+    /// This principal's draft block, created empty at the end of the document
+    /// if they do not have one yet.
+    pub fn get_or_create_draft(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<BlockId> {
+        if let Some(existing) = self.draft_block(context_id, principal_id)? {
+            return Ok(existing.id);
+        }
+        let last = self.last_block_id(context_id);
+        let id = self.insert_block_as(
+            context_id,
+            None,
+            last.as_ref(),
+            Role::User,
+            BlockKind::Text,
+            "",
+            Status::Draft,
+            ContentType::Plain,
+            Some(principal_id),
+        )?;
+        // Belt and braces with the `Draft` status: hydration checks both, so a
+        // draft cannot reach a model on the strength of one flag.
+        self.set_ephemeral(context_id, &id, true)?;
+        Ok(id)
+    }
+
+    /// Edit this principal's draft, creating it if absent. Character-indexed,
+    /// preserving the contract the compose box was already written against.
+    pub fn edit_draft(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        pos: usize,
+        insert: &str,
+        delete: usize,
+    ) -> BlockStoreResult<BlockId> {
+        let id = self.get_or_create_draft(context_id, principal_id)?;
+        self.edit_text_as(context_id, &id, pos, insert, delete, Some(principal_id))?;
+        Ok(id)
+    }
+
+    /// Promote this principal's draft into a submitted user message.
+    ///
+    /// Returns the block id and its text. The id is the SAME block they typed
+    /// into — nothing is copied, so nothing can be dropped between reading the
+    /// text and authoring the message.
+    ///
+    /// Refuses an empty or whitespace-only draft, leaving it untouched, so a
+    /// stray Enter neither sends nothing nor clears what is there.
+    pub fn submit_draft(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<(BlockId, String)> {
+        let draft = self
+            .draft_block(context_id, principal_id)?
+            .ok_or(BlockStoreError::NoDraft(context_id, principal_id))?;
+        let text = draft.content.trim().to_string();
+        if text.is_empty() {
+            return Err(BlockStoreError::EmptyDraft(context_id));
+        }
+        // Order matters on a crash: `Draft` is the status hydration refuses, so
+        // clearing `ephemeral` first and the status second means an interrupted
+        // submit leaves a block that is still hidden from the model rather than
+        // one that is visible to it but unfinished.
+        self.set_ephemeral(context_id, &draft.id, false)?;
+        self.set_status(context_id, &draft.id, Status::Done)?;
+        Ok((draft.id, text))
+    }
+
+    /// Discard this principal's draft. Returns the text that was thrown away,
+    /// so a caller can offer it back.
+    pub fn clear_draft(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<String> {
+        let Some(draft) = self.draft_block(context_id, principal_id)? else {
+            return Ok(String::new());
+        };
+        let text = draft.content.clone();
+        self.delete_block(context_id, &draft.id)?;
+        Ok(text)
+    }
+
     /// Append text to a block.
     pub fn append_text(
         &self,
@@ -3280,7 +3408,16 @@ impl BlockStore {
 pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
     if statuses_in_order.contains(&Status::Running) {
         Status::Running
-    } else if statuses_in_order.last() == Some(&Status::Error) {
+    // The tail check skips drafts deliberately. A compose draft is a block and
+    // it lives at the END of the document, so a naive `.last()` would find the
+    // draft instead of the failed turn behind it and report a broken context as
+    // idle. A draft is not the context's work; it is someone mid-sentence.
+    } else if statuses_in_order
+        .iter()
+        .rev()
+        .find(|s| **s != Status::Draft)
+        == Some(&Status::Error)
+    {
         Status::Error
     } else {
         Status::Pending
@@ -6235,6 +6372,151 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].content, "x");
         assert_eq!(blocks[0].status, Status::Done);
+    }
+
+    // ── Compose drafts as blocks (Lane C) ────────────────────────────────
+
+    /// The property the whole design exists for: **submit does not copy.**
+    ///
+    /// The old path read the draft, cleared it, and only then tried to author a
+    /// block — so a failure or a crash after the clear destroyed what someone
+    /// had typed. Here the block they typed into becomes the message, so there
+    /// is no interval in which the text lives nowhere.
+    #[test]
+    fn submitting_a_draft_keeps_the_same_block() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let drafted = store.edit_draft(ctx, me, 0, "hello world", 0).unwrap();
+        let (submitted, text) = store.submit_draft(ctx, me).unwrap();
+
+        assert_eq!(
+            submitted, drafted,
+            "the submitted message must BE the drafted block, not a copy of it"
+        );
+        assert_eq!(text, "hello world");
+
+        let snap = store.get_block_snapshot(ctx, &submitted).unwrap().unwrap();
+        assert_eq!(snap.status, Status::Done);
+        assert!(!snap.ephemeral, "a submitted message is no longer hidden");
+        assert_eq!(snap.content, "hello world");
+        assert_eq!(snap.role, Role::User);
+    }
+
+    /// A draft is invisible to the model until it is sent — checked on both
+    /// flags independently, because submit clears them one at a time and a
+    /// crash between the two must fail toward silence.
+    #[test]
+    fn a_draft_is_hidden_from_hydration_by_status_and_by_ephemeral() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let id = store.edit_draft(ctx, me, 0, "unsent thought", 0).unwrap();
+        let snap = store.get_block_snapshot(ctx, &id).unwrap().unwrap();
+        assert_eq!(snap.status, Status::Draft);
+        assert!(snap.ephemeral);
+    }
+
+    /// An empty or whitespace-only draft is refused and left alone: a stray
+    /// Enter must neither send nothing nor destroy what is sitting there.
+    #[test]
+    fn an_empty_draft_is_refused_without_being_cleared() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let id = store.edit_draft(ctx, me, 0, "   \n  ", 0).unwrap();
+        assert!(matches!(
+            store.submit_draft(ctx, me),
+            Err(BlockStoreError::EmptyDraft(_))
+        ));
+
+        let snap = store.get_block_snapshot(ctx, &id).unwrap().unwrap();
+        assert_eq!(snap.status, Status::Draft, "the draft survives a refused submit");
+        assert_eq!(snap.content, "   \n  ");
+    }
+
+    /// Two players in one context each get their own draft. `BlockId` already
+    /// carries the principal, so this needs no extra key — and it is the thing
+    /// a single shared input document could never do.
+    #[test]
+    fn two_principals_hold_independent_drafts() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let amy = PrincipalId::new();
+        let model = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        store.edit_draft(ctx, amy, 0, "mine", 0).unwrap();
+        store.edit_draft(ctx, model, 0, "theirs", 0).unwrap();
+
+        assert_eq!(
+            store.draft_block(ctx, amy).unwrap().unwrap().content,
+            "mine"
+        );
+        assert_eq!(
+            store.draft_block(ctx, model).unwrap().unwrap().content,
+            "theirs"
+        );
+
+        // Submitting one leaves the other alone and still a draft.
+        store.submit_draft(ctx, amy).unwrap();
+        assert!(store.draft_block(ctx, amy).unwrap().is_none());
+        assert_eq!(
+            store.draft_block(ctx, model).unwrap().unwrap().status,
+            Status::Draft
+        );
+    }
+
+    /// Clearing returns the discarded text, so a caller can offer it back
+    /// rather than swallowing it.
+    #[test]
+    fn clearing_a_draft_returns_what_it_threw_away() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        store.edit_draft(ctx, me, 0, "second thoughts", 0).unwrap();
+        assert_eq!(store.clear_draft(ctx, me).unwrap(), "second thoughts");
+        assert!(store.draft_block(ctx, me).unwrap().is_none());
+        // Clearing nothing is not an error.
+        assert_eq!(store.clear_draft(ctx, me).unwrap(), "");
+    }
+
+    /// A draft sits at the END of the document, which is exactly where a naive
+    /// tail check looks for the last real status. A half-typed message must not
+    /// make a context that just failed a turn read as idle.
+    #[test]
+    fn a_draft_does_not_mask_a_failed_turn_in_live_status() {
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Error, Status::Draft]),
+            Status::Error,
+            "the draft is not the context's work — the failed turn behind it is"
+        );
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Draft]),
+            Status::Pending
+        );
+        assert_eq!(
+            derive_context_live_status(&[Status::Running, Status::Draft]),
+            Status::Running
+        );
     }
 
     // ── Version durability (docs/change-feed.md rules 21-26) ─────────────

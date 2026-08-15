@@ -124,6 +124,15 @@ impl HydrationState {
         if block.ephemeral {
             return;
         }
+        // A compose draft is someone mid-sentence — it is not part of the
+        // conversation until they submit it, at which point the SAME block
+        // leaves this status. Checked independently of `ephemeral` (which a
+        // draft also carries) so that a draft can never hydrate on the
+        // strength of one flag being wrong: submit clears them one at a time,
+        // and a crash between the two must fail toward silence.
+        if block.status == kaijutsu_types::Status::Draft {
+            return;
+        }
         if block.excluded {
             return;
         }

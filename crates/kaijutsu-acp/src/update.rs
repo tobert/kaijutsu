@@ -60,14 +60,19 @@ pub fn acp_stop_reason(reason: TurnCompletedStopReason) -> StopReason {
     }
 }
 
-/// Map kaijutsu block status onto ACP tool-call status. A clean 1:1 — the two
-/// enums were arrived at independently and happen to agree.
+/// Map kaijutsu block status onto ACP tool-call status. A clean 1:1 over the
+/// statuses a tool block can hold — the two enums were arrived at independently
+/// and happen to agree.
 pub fn acp_tool_status(status: Status) -> ToolCallStatus {
     match status {
         Status::Pending => ToolCallStatus::Pending,
         Status::Running => ToolCallStatus::InProgress,
         Status::Done => ToolCallStatus::Completed,
         Status::Error => ToolCallStatus::Failed,
+        // A compose draft is never a tool call — the status exists for the
+        // block someone is typing into. Mapped for totality only; if this arm
+        // is ever reached, a draft has been handed to the tool renderer.
+        Status::Draft => ToolCallStatus::Pending,
     }
 }
 

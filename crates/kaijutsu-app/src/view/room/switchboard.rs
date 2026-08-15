@@ -208,7 +208,11 @@ impl LampSignal {
     pub fn reconcile_status(&mut self, live_status: Status) {
         self.sticky_error = match live_status {
             Status::Error => true,
-            Status::Running | Status::Pending | Status::Done => false,
+            // `Draft` is here for totality, as this match's doc demands, but a
+            // context's *live status* can never be it: the reducer
+            // (`derive_context_live_status`) filters drafts out precisely so a
+            // half-typed message cannot mask the failed turn behind it.
+            Status::Running | Status::Pending | Status::Done | Status::Draft => false,
         };
     }
 

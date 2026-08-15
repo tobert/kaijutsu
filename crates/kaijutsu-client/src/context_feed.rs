@@ -299,6 +299,7 @@ fn parse_change(reader: context_event::Reader<'_>) -> Result<ContextChange, capn
                     crate::kaijutsu_capnp::Status::Running => Status::Running,
                     crate::kaijutsu_capnp::Status::Done => Status::Done,
                     crate::kaijutsu_capnp::Status::Error => Status::Error,
+                    crate::kaijutsu_capnp::Status::Draft => Status::Draft,
                 },
             }
         }

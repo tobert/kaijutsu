@@ -1021,6 +1021,18 @@ pub enum Status {
     Done,
     /// Failed with error.
     Error,
+    /// An unsubmitted compose draft — the block a player is typing into.
+    ///
+    /// A draft is a real block in the context (docs/change-feed.md): it rides
+    /// the change feed, it belongs to one principal, and **submitting it is a
+    /// status transition, not a copy**. The block you type into IS the message
+    /// you send, which is why submit cannot lose your text — there is no
+    /// intermediate step to lose it in.
+    ///
+    /// Never hydrated into a conversation (`ephemeral` is set alongside, and
+    /// hydration skips this status outright), and never counted as a context's
+    /// live work.
+    Draft,
 }
 
 impl Status {
@@ -1040,6 +1052,7 @@ impl Status {
             Status::Running => "running",
             Status::Done => "done",
             Status::Error => "error",
+            Status::Draft => "draft",
         }
     }
 

@@ -161,6 +161,7 @@ fn status_to_capnp(status: Status) -> crate::kaijutsu_capnp::Status {
         Status::Running => crate::kaijutsu_capnp::Status::Running,
         Status::Done => crate::kaijutsu_capnp::Status::Done,
         Status::Error => crate::kaijutsu_capnp::Status::Error,
+        Status::Draft => crate::kaijutsu_capnp::Status::Draft,
     }
 }
 
@@ -2950,6 +2951,7 @@ fn set_block_filter_builder(
                     Status::Running => crate::kaijutsu_capnp::Status::Running,
                     Status::Done => crate::kaijutsu_capnp::Status::Done,
                     Status::Error => crate::kaijutsu_capnp::Status::Error,
+                    Status::Draft => crate::kaijutsu_capnp::Status::Draft,
                 },
             );
         }
@@ -3308,6 +3310,7 @@ fn parse_context_info(
         crate::kaijutsu_capnp::Status::Running => Status::Running,
         crate::kaijutsu_capnp::Status::Done => Status::Done,
         crate::kaijutsu_capnp::Status::Error => Status::Error,
+        crate::kaijutsu_capnp::Status::Draft => Status::Draft,
     };
 
     let last_activity_at = match reader.get_last_activity_at() {
@@ -3545,6 +3548,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::Status::Running => Status::Running,
         crate::kaijutsu_capnp::Status::Done => Status::Done,
         crate::kaijutsu_capnp::Status::Error => Status::Error,
+        crate::kaijutsu_capnp::Status::Draft => Status::Draft,
     };
     builder = builder.status(status);
 
@@ -4355,6 +4359,7 @@ mod tests {
             Status::Running => crate::kaijutsu_capnp::Status::Running,
             Status::Done => crate::kaijutsu_capnp::Status::Done,
             Status::Error => crate::kaijutsu_capnp::Status::Error,
+            Status::Draft => crate::kaijutsu_capnp::Status::Draft,
         });
 
         builder.set_content(&snap.content);

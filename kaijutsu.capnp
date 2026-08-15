@@ -53,6 +53,11 @@ enum Status {
   running @1;
   done @2;
   error @3;
+  # An unsubmitted compose draft. A draft is a real block owned by one
+  # principal; submitting it flips this status rather than copying the text
+  # into a new block, which is what makes submit incapable of losing what you
+  # typed. Never hydrated, never counted as live work.
+  draft @4;
 }
 
 # Block content type — 10 variants covering what a block *is*.

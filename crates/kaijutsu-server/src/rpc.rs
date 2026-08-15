@@ -9112,6 +9112,7 @@ fn status_from_capnp(status: crate::kaijutsu_capnp::Status) -> Status {
         crate::kaijutsu_capnp::Status::Running => Status::Running,
         crate::kaijutsu_capnp::Status::Done => Status::Done,
         crate::kaijutsu_capnp::Status::Error => Status::Error,
+        crate::kaijutsu_capnp::Status::Draft => Status::Draft,
     }
 }
 
@@ -9244,6 +9245,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::Status::Running => Status::Running,
                 crate::kaijutsu_capnp::Status::Done => Status::Done,
                 crate::kaijutsu_capnp::Status::Error => Status::Error,
+                crate::kaijutsu_capnp::Status::Draft => Status::Draft,
             });
         }
         if statuses.is_empty() {
@@ -10070,6 +10072,7 @@ pub(crate) fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_
         kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,
         kaijutsu_crdt::Status::Done => crate::kaijutsu_capnp::Status::Done,
         kaijutsu_crdt::Status::Error => crate::kaijutsu_capnp::Status::Error,
+        kaijutsu_crdt::Status::Draft => crate::kaijutsu_capnp::Status::Draft,
     }
 }
 
