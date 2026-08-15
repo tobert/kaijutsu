@@ -136,7 +136,9 @@ impl Drop for CallReservation {
 /// Hook listener — receives events over a Unix socket and writes CRDT blocks.
 pub struct HookListener {
     /// Local-mode block store (in-process). `None` in remote mode, where blocks
-    /// are authored into the `RemoteState`'s `SyncedDocument` and pushed up.
+    /// are authored by RPC through `RemoteState`'s actor — this process holds
+    /// no replica of anything. (It once pushed into a local `SyncedDocument`;
+    /// that path is gone, and so is the RPC it pushed through.)
     local_store: Option<SharedBlockStore>,
     /// Shared context ID — updated by register_session (None until then).
     shared_context_id: Arc<Mutex<Option<ContextId>>>,
