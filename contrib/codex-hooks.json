@@ -1,0 +1,14 @@
+{
+  "_comment": "Sample Codex CLI hook configuration for kaijutsu integration. Copy the hooks section into ~/.codex/hooks.json (or $CODEX_HOME/hooks.json).",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }],
+    "PostCompact": [{ "hooks": [{ "type": "command", "command": "~/.codex/hooks/kaijutsu-adapter/codex.sh", "timeout": 3 }] }]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "session_id": "codex-thread-0001",
+  "transcript_path": "/home/user/.codex/sessions/2026/08/14/codex-thread-0001.jsonl",
+  "cwd": "/home/user/src/demo",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "refactor the hook adapter"
+}

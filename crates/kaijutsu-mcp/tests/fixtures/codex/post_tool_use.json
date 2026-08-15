@@ -1,0 +1,10 @@
+{
+  "session_id": "codex-thread-0001",
+  "transcript_path": "/home/user/.codex/sessions/2026/08/14/codex-thread-0001.jsonl",
+  "cwd": "/home/user/src/demo",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "shell",
+  "tool_input": { "command": "ls -la" },
+  "tool_response": { "stdout": "total 0", "stderr": "", "exit_code": 0 },
+  "duration_ms": 27
+}
