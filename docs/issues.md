@@ -1186,7 +1186,7 @@ ambient signal surfaces (switchboard shipped, seats in flight). Backlog:
 
 ---
 
-## Peer-registry doctrine — ACP/headless clients still need to attach; `PeerInfo` lacks `instance` on the wire (2026-08-10, peers-plumbing)
+## Peer-registry doctrine — headless clients still need to attach; `PeerInfo` lacks `instance` on the wire (2026-08-10, peers-plumbing)
 
 Every connected client is supposed to register in the kernel's peer registry
 so the app can render "who's at the table" (`docs/instrument-design.md`,
@@ -1197,8 +1197,12 @@ instance a per-process UUID mirroring the app's `app_peer_instance()`,
 invocations drained with a graceful "unsupported action" reply since no peer
 actions are implemented on the MCP side yet. Use that as the pattern.
 
+`kaijutsu-acp` now retains `initialize.clientInfo` and registers one peer per
+ACP process as `acp/<client-name>`. It deliberately does not register once per
+session: one ACP connection can host several contexts. The actor replays the
+registration after reconnect and SSH connection teardown removes it.
+
 Still needed:
-- **ACP sessions** (`kaijutsu-acp`) don't attach as peers at all.
 - **The upcoming headless client** should attach on connect, same pattern.
 - **The MCP peer nick goes stale on label stabilization.** An auto-registered
   session attaches under its placeholder label, then

@@ -52,6 +52,7 @@ use update::UpdateMapper;
 pub struct AcpBridge {
     pub kernel: KernelBridge,
     pub sessions: SessionRegistry,
+    client_info: Mutex<Option<Implementation>>,
 }
 
 impl AcpBridge {
@@ -59,7 +60,12 @@ impl AcpBridge {
         Self {
             kernel,
             sessions: SessionRegistry::default(),
+            client_info: Mutex::new(None),
         }
+    }
+
+    pub fn client_info(&self) -> Option<Implementation> {
+        self.client_info.lock().clone()
     }
 }
 
@@ -129,8 +135,8 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
             Ok(())
         })
         .on_receive_request(
-            async move |req: InitializeRequest, responder, _cx| {
-                handle_initialize(&init, req, responder)
+            async move |req: InitializeRequest, responder, cx| {
+                handle_initialize(&init, req, responder, cx)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -183,14 +189,29 @@ pub fn negotiate_version(client_asked: ProtocolVersion) -> ProtocolVersion {
 }
 
 fn handle_initialize(
-    _bridge: &Arc<AcpBridge>,
+    bridge: &Arc<AcpBridge>,
     req: InitializeRequest,
     responder: Responder<InitializeResponse>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
     let negotiated = negotiate_version(req.protocol_version);
+    let client_info = req.client_info.clone();
+    *bridge.client_info.lock() = client_info.clone();
+    if let Some(info) = &client_info {
+        let kernel = bridge.kernel.clone();
+        let info = info.clone();
+        cx.spawn(async move {
+            match kernel.attach_client_peer(&info.name).await {
+                Ok(nick) => tracing::info!(%nick, version = %info.version, "ACP client attached as peer"),
+                Err(e) => tracing::warn!(client = %info.name, "ACP client peer attach failed (non-fatal): {e}"),
+            }
+            Ok(())
+        })?;
+    }
     tracing::info!(
         client_asked = req.protocol_version.as_u16(),
         negotiated = negotiated.as_u16(),
+        client = client_info.as_ref().map(|info| info.name.as_str()),
         "initialize"
     );
     responder.respond(
