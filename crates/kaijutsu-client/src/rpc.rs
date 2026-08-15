@@ -3640,6 +3640,15 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.ephemeral(true);
     }
 
+    // Excluded flag (user-curated staging curation, toggled by `block exclude`;
+    // decides whether the block is dropped at the next conversation hydrate
+    // boundary). Unlike `ephemeral` above (system-managed, always hidden from
+    // hydration), `excluded` is an explicit user decision — see
+    // kaijutsu.capnp:215-219.
+    if reader.get_excluded() {
+        builder = builder.excluded(true);
+    }
+
     // Hyoushigi timeline coordinate (Some only for materialized timeline cells)
     if reader.get_has_tick() {
         builder = builder.tick(Tick::new(reader.get_tick()));
@@ -4294,6 +4303,8 @@ mod tests {
 
         builder.set_content(&snap.content);
         builder.set_collapsed(snap.collapsed);
+        builder.set_ephemeral(snap.ephemeral);
+        builder.set_excluded(snap.excluded);
 
         // Set file_path if present
         if let Some(ref path) = snap.file_path {
@@ -4530,6 +4541,94 @@ mod tests {
         // A block with no signature roundtrips as None (hasSignature=false).
         let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
         assert_eq!(roundtrip_snapshot(&plain).signature, None);
+    }
+
+    /// `excluded` (kaijutsu.capnp:219) is the user-curated staging-exclusion
+    /// flag `block exclude` toggles — distinct from `ephemeral` (system-managed,
+    /// hidden from LLM hydration). The server always writes it
+    /// (`set_block_snapshot`, kaijutsu-server/src/rpc.rs), but until this fix
+    /// `parse_block_snapshot` never called `get_excluded()`, so every
+    /// capnp-decoded block silently reported `excluded = false` regardless of
+    /// its real value — a latent bug that becomes real data loss once clients
+    /// migrate from `getContextSync` (CBOR, unaffected) onto projected
+    /// `getBlocks` queries.
+    #[test]
+    fn test_parse_block_snapshot_excluded_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        // A user-excluded block carries excluded=true across the wire.
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .excluded(true)
+            .build();
+        assert!(
+            roundtrip_snapshot(&snap).excluded,
+            "excluded=true must survive the capnp round trip"
+        );
+
+        // An ordinary (non-excluded) block roundtrips with excluded=false.
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        assert!(
+            !roundtrip_snapshot(&plain).excluded,
+            "excluded=false must survive the capnp round trip"
+        );
+    }
+
+    /// Pins the wire-carried / CRDT-internal split documented at
+    /// `kaijutsu-types/src/block.rs:1578`: `order_key`, `updated_at`, and the
+    /// six per-field LWW Lamport timestamps (`status_at`, `collapsed_at`,
+    /// `ephemeral_at`, `excluded_at`, `tool_meta_at`, `content_type_at`,
+    /// `task_status_at`) are deliberately absent from `kaijutsu.capnp` — they
+    /// are CRDT-internal bookkeeping, not conversation-visible state, and
+    /// `parse_block_snapshot` has no wire field to read them from. That is
+    /// by design, not a gap to "fix" the way `excluded` above was. Wire-carried
+    /// flags (`excluded`, `ephemeral`, `tick`) must still survive the same
+    /// round trip that drops the CRDT-internal ones.
+    #[test]
+    fn test_parse_block_snapshot_drops_crdt_internal_fields_by_design() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        let mut snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .excluded(true)
+            .ephemeral(true)
+            .tick(Tick::new(7))
+            .build();
+        // CRDT-internal bookkeeping — never on the wire.
+        snap.order_key = Some("a0".to_string());
+        snap.updated_at = 999;
+        snap.status_at = 999;
+        snap.collapsed_at = 999;
+        snap.ephemeral_at = 999;
+        snap.excluded_at = 999;
+        snap.tool_meta_at = 999;
+        snap.content_type_at = 999;
+        snap.task_status_at = 999;
+
+        let round_tripped = roundtrip_snapshot(&snap);
+
+        // Wire-carried fields survive.
+        assert!(round_tripped.excluded, "excluded is on the wire");
+        assert!(round_tripped.ephemeral, "ephemeral is on the wire");
+        assert_eq!(round_tripped.tick, Some(Tick::new(7)), "tick is on the wire");
+
+        // CRDT-internal fields are intentionally absent from the wire and
+        // must decode to their defaults, not silently carry the sender's
+        // in-memory values.
+        assert_eq!(round_tripped.order_key, None, "order_key is not on the wire");
+        assert_eq!(round_tripped.updated_at, 0, "updated_at is not on the wire");
+        assert_eq!(round_tripped.status_at, 0, "status_at is not on the wire");
+        assert_eq!(round_tripped.collapsed_at, 0, "collapsed_at is not on the wire");
+        assert_eq!(round_tripped.ephemeral_at, 0, "ephemeral_at is not on the wire");
+        assert_eq!(round_tripped.excluded_at, 0, "excluded_at is not on the wire");
+        assert_eq!(round_tripped.tool_meta_at, 0, "tool_meta_at is not on the wire");
+        assert_eq!(round_tripped.content_type_at, 0, "content_type_at is not on the wire");
+        assert_eq!(round_tripped.task_status_at, 0, "task_status_at is not on the wire");
     }
 
     /// Task block round-trip (household-agent arc, docs/tasks.md): create →
