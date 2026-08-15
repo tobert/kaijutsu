@@ -1684,3 +1684,44 @@ happened; a projection that quietly disagrees with the kernel is that promise
 failing quietly. The wire changes are the interesting engineering, but the reason
 to make them is that the fewer things a client has to reconstruct, the fewer
 places it can be confidently wrong.
+
+### The kernel learns to say what a change was (August 15, evening)
+
+Building the first slice of the feed was mostly unremarkable — the kernel now
+decides append-or-replace where the mutation happens, and the snapshot query
+reports the version it read at. Two things about it are worth keeping.
+
+The first is a rule the specification had already written and the code had to
+honor in an inconvenient place. Classification must not consult *who* made the
+edit, only the coordinates: an insert at the end with nothing deleted is an
+append, everything else is a replace. That is easy on the edit path, where the
+length is already measured for a bounds check. It is not free on the streaming
+path, where measuring the text before each token would restore an O(n²) that had
+been removed a day earlier for exactly that reason. The append primitive is an
+append by construction, so it asserts rather than measures — and a test appends
+multibyte chunks and compares the published suffix against what the engine
+actually stored, so the assertion is pinned to behavior instead of to a comment.
+
+The second was found by a test that had no obvious relationship to the change.
+While the old wire still carries raw operations, the kernel publishes both kinds
+of event, and the old bridge simply does not send the new ones. Not sending them
+was not enough. A batching test dropped from twelve batches to zero: the bridge
+collapses a *run* of consecutive text operations for one block into one call, and
+the new events, sitting between them in the queue, broke every run into
+singletons. Worse and quieter, the bridge allocates a per-subscription sequence
+number before it sends; allocating one for an event that never goes out punches a
+hole in a lane whose whole contract is that a hole means the subscription died.
+The fix was to drop them at ingress rather than at send time — an event nobody
+sends still does damage while it waits in line.
+
+A third thing happened alongside, prompted by Amy reading the test output rather
+than the code: *"did I see tests accessing my ~ XDG path?"* She had. The shipped
+default `mcp.toml` carried a server entry pointing at her own kaibo build, and
+every kernel a test booted spawned it, whereupon kaibo opened her live state
+database — the one a running kaibo was already using. An earlier fix had moved
+external server startup off kernel construction onto the serving path for exactly
+this reason, which had helped and had not been enough, because the tests that
+boot a server take the serving path. The default now ships empty, with the real
+entries kept in the file as commented reference, and the test asserting the
+default configures *nothing* says why in its name. A shipped default is not
+inert: it is a decision made on every machine that has not overridden it.

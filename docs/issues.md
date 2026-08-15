@@ -6,47 +6,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## The test suite spawns real external MCP servers against Amy's real XDG state (2026-08-15, Amy)
-
-Amy, reading a `cargo test -p kaijutsu-server` run: *"did I see tests accessing
-my ~ XDG path?"* Yes.
-
-`assets/defaults/mcp.toml` — "Defines MCP servers to launch automatically when
-a kernel starts" — is seeded into **every kernel a test boots**, including
-`[servers.kaibo]` with the absolute path `/home/atobey/src/kaibo/target/debug/kaibo`
-(and `[servers.bevy_brp]`). The kernel's own DB is a temp file; the spawned
-subprocess is not sandboxed at all. It inherits the environment, resolves its
-own XDG dirs, and opens the developer's live state:
-
-```
-state_db=/home/atobey/.local/state/kaibo/state.db
-cas_dir=/home/atobey/.local/share/kaibo/cas
-```
-
-Confirmed, not inferred: `~/.local/state/kaibo/state.db-tshm` carries the mtime
-of the test run's first second.
-
-What is wrong with it, in order of seriousness:
-
-1. A test run attaches to a **live** SQLite DB that a running kaibo may be
-   writing (sessions and batch handles are durable there). Whatever migrations
-   a newer/older kaibo build runs on open, it runs on the real file.
-2. Every kernel-booting test pays a process spawn + MCP handshake for servers
-   the test never calls — and the machine-specific path means the suite behaves
-   differently on moltar, zorak, and the MacBook.
-3. It is a second, quieter instance of the host-exec ownership rule: the
-   sanctioned MCP stdio exception (`mcp/servers/external.rs`) is config-driven,
-   and here the config is a *shipped default*, so "config-driven" stopped
-   meaning "someone asked for it".
-
-Shape of the fix (undecided, needs Amy): a test kernel should launch **no**
-external stdio servers unless a test asks for one — either by keeping external
-entries out of the embedded seed (making `mcp.toml` opt-in, which also removes
-a developer-machine path from a shipped asset), or by an explicit
-"external servers off" construction the test harnesses use. The narrow variant
-— point spawned children at a temp `XDG_STATE_HOME`/`XDG_DATA_HOME` — treats
-the symptom and still spawns processes nobody wanted.
-
 ## Model names via hooks — the plumbing exists, the data mostly does not arrive (2026-08-15, Amy)
 
 Amy, seeing `cc-.crush-c776babb  now  (no model)` in `kj context list`:

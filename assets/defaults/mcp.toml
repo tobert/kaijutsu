@@ -21,23 +21,37 @@
 # actually running; `kj mcp list` shows configured-vs-running with health.
 # Editing this file (`kj config set/edit mcp.toml`) has no live effect on its
 # own — run `kj mcp reload` afterward.
-
-[servers.bevy_brp]
-command = "bevy_brp_mcp"
-
-# kaibo is a sister project of kaijutsu (same author, same repo host) — we
-# dogfood our own `~/src/kaibo` build rather than a packaged release while
-# both are under active development. Only the debug binary exists today
-# (`cargo build` in ~/src/kaibo, not `--release`); the absolute path below
-# is a development-machine path, not a shipped-install path, and will need
-# revisiting (e.g. a `kaibo` on PATH) once kaibo has an install story.
 #
-# call_timeout_ms is 900000 (15 min) because a kaibo consultation is a real
-# model call — Gemini Pro / DeepSeek / Claude reading and reasoning over a
-# codebase — and routinely runs 5-15 minutes. The kernel-wide
-# mcp_call_timeout_default (120000ms / 2 min) would cut off every single
-# consultation before it finished.
-[servers.kaibo]
-command = "/home/atobey/src/kaibo/target/debug/kaibo"
-args = ["--root", "/home/atobey/src/kaijutsu"]
-call_timeout_ms = 900000
+# ── This file ships EMPTY, on purpose (2026-08-15) ──────────────────────────
+#
+# A seeded server entry launches a real subprocess in every kernel that boots
+# from this default — including every kernel a test boots. Those children are
+# not sandboxed: they inherit the environment, resolve their own XDG paths,
+# and open the developer's live state. `[servers.kaibo]` used to live here and
+# was opening ~/.local/state/kaibo/state.db during `cargo test`, alongside
+# whatever kaibo the developer had running.
+#
+# It also meant a shipped asset carried a developer-machine absolute path,
+# which was never going to be right on any other machine.
+#
+# So: a fresh kernel launches nothing external, and you add what you want to
+# YOUR kernel. Existing kernels are unaffected — this file is seeded once, so
+# their configured servers stay exactly as they are.
+#
+# Add one with:
+#
+#   kj config edit mcp.toml     # then `kj mcp reload`
+#
+# The two we actually run on moltar, for reference:
+#
+#   [servers.bevy_brp]
+#   command = "bevy_brp_mcp"
+#
+#   # call_timeout_ms is 900000 (15 min) because a kaibo consultation is a
+#   # real model call — Gemini Pro / DeepSeek / Claude reading and reasoning
+#   # over a codebase — and routinely runs 5-15 minutes. The kernel-wide
+#   # default (120000ms / 2 min) would cut off every consultation.
+#   [servers.kaibo]
+#   command = "/home/atobey/src/kaibo/target/debug/kaibo"
+#   args = ["--root", "/home/atobey/src/kaijutsu"]
+#   call_timeout_ms = 900000

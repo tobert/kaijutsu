@@ -198,22 +198,21 @@ mod tests {
 
     const DEFAULT_MCP_TOML: &str = include_str!("../../../../assets/defaults/mcp.toml");
 
+    /// The shipped default must parse clean **and** launch nothing.
+    ///
+    /// A seeded server entry spawns a real, unsandboxed subprocess in every
+    /// kernel booted from this default — including every kernel a test boots,
+    /// where it opened the developer's live `~/.local/state` (2026-08-15). The
+    /// emptiness is the point, so it is what this asserts.
     #[test]
-    fn default_mcp_toml_parses() {
+    fn default_mcp_toml_parses_and_launches_nothing() {
         let load = load_mcp_config_toml(DEFAULT_MCP_TOML).unwrap();
         assert!(load.warnings.is_empty(), "warnings: {:?}", load.warnings);
-        assert_eq!(load.servers.len(), 2);
-        assert_eq!(load.servers[0].name, "bevy_brp");
-        assert_eq!(load.servers[0].command, "bevy_brp_mcp");
-        assert_eq!(load.servers[0].transport, McpTransport::Stdio);
-        assert_eq!(load.servers[0].call_timeout, None);
-        assert_eq!(load.servers[1].name, "kaibo");
-        assert_eq!(load.servers[1].command, "/home/atobey/src/kaibo/target/debug/kaibo");
-        assert_eq!(load.servers[1].args, vec!["--root", "/home/atobey/src/kaijutsu"]);
-        assert_eq!(load.servers[1].transport, McpTransport::Stdio);
-        assert_eq!(
-            load.servers[1].call_timeout,
-            Some(std::time::Duration::from_millis(900_000))
+        assert!(
+            load.servers.is_empty(),
+            "the shipped mcp.toml must configure no servers — a seeded entry \
+             spawns a host process in every fresh kernel, tests included; got {:?}",
+            load.servers.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 
