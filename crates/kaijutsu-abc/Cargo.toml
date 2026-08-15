@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "ABC music notation parser, engraver, and MIDI generator"
 
+[lints]
+workspace = true
+
 [dependencies]
 winnow = "0.6"
 serde = { workspace = true }

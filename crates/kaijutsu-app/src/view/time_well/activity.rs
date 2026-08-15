@@ -84,15 +84,14 @@ impl RingActivity {
         let e = self.per_context.entry(ctx).or_insert(0.0);
         *e = (*e + weight).min(CONTEXT_MAX);
 
-        if self.ripples.len() >= MAX_RIPPLES {
-            if let Some((i, _)) = self
+        if self.ripples.len() >= MAX_RIPPLES
+            && let Some((i, _)) = self
                 .ripples
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.age.total_cmp(&b.1.age))
-            {
-                self.ripples.swap_remove(i);
-            }
+        {
+            self.ripples.swap_remove(i);
         }
         self.ripples.push(Ripple {
             angle,

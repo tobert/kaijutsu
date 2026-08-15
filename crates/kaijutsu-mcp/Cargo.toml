@@ -10,6 +10,9 @@ description = "MCP server exposing kaijutsu CRDT kernel to Claude Code, Gemini C
 name = "kaijutsu-mcp"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 kaijutsu-kernel.workspace = true
 kaijutsu-crdt.workspace = true

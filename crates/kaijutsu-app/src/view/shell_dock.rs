@@ -80,8 +80,10 @@ pub fn spawn_shell_dock(
         ..default()
     };
 
-    let mut shell_overlay = InputOverlay::default();
-    shell_overlay.mode = crate::view::components::InputMode::Shell;
+    let shell_overlay = InputOverlay {
+        mode: crate::view::components::InputMode::Shell,
+        ..Default::default()
+    };
 
     let shell_entity = commands
         .spawn((

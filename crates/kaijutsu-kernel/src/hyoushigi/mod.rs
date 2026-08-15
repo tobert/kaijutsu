@@ -80,7 +80,7 @@ impl BeatPolicy {
     /// Whether `beat_count` lands on a phrase boundary. A zero `beats_per_phrase`
     /// has no boundaries (defensive: never `% 0`).
     pub fn is_phrase_boundary(&self, beat_count: u64) -> bool {
-        self.beats_per_phrase > 0 && beat_count % self.beats_per_phrase == 0
+        self.beats_per_phrase > 0 && beat_count.is_multiple_of(self.beats_per_phrase)
     }
 
     /// The wall-clock binding derived from the beat period: one logical tick per
@@ -112,7 +112,7 @@ impl Cadence {
     /// Whether `count` lands on a boundary of this cadence. The caller supplies
     /// the right counter — `beat_count` for a wakeup, `phrase` for a rotate.
     pub fn is_due(&self, count: u64) -> bool {
-        self.every > 0 && count % self.every == 0
+        self.every > 0 && count.is_multiple_of(self.every)
     }
 }
 

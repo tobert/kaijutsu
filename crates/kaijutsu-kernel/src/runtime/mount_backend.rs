@@ -977,7 +977,7 @@ mod tests {
         // still returns the on-disk content, not the phantom edit.
         assert_eq!(backend.read(&file, None).await.unwrap(), b"on-disk");
 
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// `new_read_only` is the structural read-only *mode* (for the toolie's

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Content Addressable Storage for Kaijutsu"
 
+[lints]
+workspace = true
+
 [dependencies]
 blake3 = "1"
 hex = "0.4"

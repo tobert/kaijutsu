@@ -157,6 +157,9 @@ impl KjDispatcher {
         .await
     }
 
+    // Mirrors EmbeddedKaish::with_identity's own shape (runtime/embedded_kaish.rs)
+    // — this is the kernel-side call site constructing one, so it carries
+    // the same identity + session-map + policy fields by necessity.
     #[allow(clippy::too_many_arguments)]
     async fn materialize_context_kaish_inner(
         &self,

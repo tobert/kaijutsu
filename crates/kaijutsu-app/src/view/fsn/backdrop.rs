@@ -596,6 +596,9 @@ pub fn sync_backdrop_fields(
 /// something to report), and its own handle is retained in
 /// [`FsnBackdrop::entities`] so that system can find it without a
 /// `MeshMaterial3d` query.
+// Same shape as (and shares most parameters with) `scene::spawn_field_entities`
+// — a manual spawn helper carrying what SystemParam injection would
+// otherwise supply, plus the `FsnBackdrop` bookkeeping it updates in place.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_one(
     commands: &mut Commands,
@@ -662,10 +665,10 @@ pub fn sync_backdrop_heat(
         let gain = super::scene::WIREFRAME_GAIN_MID * (1.0 + h * HEAT_GAIN_LIFT);
         let hue = super::scene::lerp_hue(palette.fsn_edge, palette.gold, h);
         let want = lin_scaled(hue, gain);
-        if mats.get(&bf.material).is_some_and(|m| m.base_color != want) {
-            if let Some(mut mat) = mats.get_mut(&bf.material) {
-                mat.base_color = want;
-            }
+        if mats.get(&bf.material).is_some_and(|m| m.base_color != want)
+            && let Some(mut mat) = mats.get_mut(&bf.material)
+        {
+            mat.base_color = want;
         }
     }
 }

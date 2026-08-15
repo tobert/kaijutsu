@@ -1445,7 +1445,7 @@ impl Kernel {
     ) -> kaish_kernel::nonce::NonceStore {
         self.nonce_stores
             .entry(context_id)
-            .or_insert_with(kaish_kernel::nonce::NonceStore::new)
+            .or_default()
             .clone()
     }
 

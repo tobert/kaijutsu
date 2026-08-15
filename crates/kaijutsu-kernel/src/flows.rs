@@ -775,7 +775,7 @@ struct SubscriberSlot<T> {
 
 impl<T: Clone> SubscriberSlot<T> {
     fn matches(&self, topic: &str) -> bool {
-        self.topics.iter().any(|t| *t == topic)
+        self.topics.contains(&topic)
     }
 
     /// Enqueue one message. Returns true if it was accepted (a drop-oldest
@@ -1167,10 +1167,8 @@ impl<T: Clone + Send + 'static> Subscription<T> {
             if slot.finished() {
                 return None;
             }
-            if self.bus.upgrade().is_none() {
-                // Bus gone and nothing buffered — the stream really is over.
-                return None;
-            }
+            // Bus gone and nothing buffered — the stream really is over.
+            self.bus.upgrade()?;
             // `notify_one` stores a permit when nobody is waiting, so a publish
             // that lands between the `pop` above and this await is not lost.
             slot.notify.notified().await;

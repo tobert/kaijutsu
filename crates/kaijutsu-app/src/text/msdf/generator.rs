@@ -145,7 +145,7 @@ impl MsdfGenerator {
         let mut completed = Vec::new();
         self.tasks.retain_mut(|task| {
             if task.is_finished() {
-                completed.push(block_on(async { task.await }));
+                completed.push(block_on(task));
                 false
             } else {
                 true
@@ -294,9 +294,9 @@ fn generate_glyph(
     // Generate the MSDF
     let config = MsdfGeneratorConfig::default();
     let mut bitmap = Bitmap::<Rgba<f32>>::new(width, height);
-    shape.generate_mtsdf(&mut bitmap, &framing, config);
-    shape.correct_sign(&mut bitmap, &framing, FillRule::default());
-    shape.correct_msdf_error(&mut bitmap, &framing, config);
+    shape.generate_mtsdf(&mut bitmap, framing, config);
+    shape.correct_sign(&mut bitmap, framing, FillRule::default());
+    shape.correct_msdf_error(&mut bitmap, framing, config);
 
     // Convert to RGBA8
     let data: Vec<u8> = bitmap

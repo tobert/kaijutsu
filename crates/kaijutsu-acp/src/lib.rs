@@ -251,14 +251,14 @@ async fn handle_new_session(
         Err(e) => return responder.respond_with_error(internal(e)),
     };
     if let Err(e) = bridge.kernel.set_context_cwd(opened.context_id, &req.cwd).await {
-        if !opened.resumed {
-            if let Err(cleanup) = bridge.kernel.archive_context(opened.context_id).await {
-                tracing::warn!(
-                    context = %opened.context_id.short(),
-                    error = %cleanup,
-                    "failed to archive fresh context after invalid ACP cwd"
-                );
-            }
+        if !opened.resumed
+            && let Err(cleanup) = bridge.kernel.archive_context(opened.context_id).await
+        {
+            tracing::warn!(
+                context = %opened.context_id.short(),
+                error = %cleanup,
+                "failed to archive fresh context after invalid ACP cwd"
+            );
         }
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }

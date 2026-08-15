@@ -109,17 +109,16 @@ fn handle_editor_events(
                     view.state = state.clone();
                 }
             }
-            ServerEvent::EditorClosed { session_id } => {
+            ServerEvent::EditorClosed { session_id }
                 if active
                     .session
                     .as_ref()
-                    .is_some_and(|v| v.session == *session_id)
-                {
-                    info!("editor session {session_id} closed by server");
-                    active.session = None;
-                    key_pipe.0.clear();
-                    next_screen.set(Screen::Conversation);
-                }
+                    .is_some_and(|v| v.session == *session_id) =>
+            {
+                info!("editor session {session_id} closed by server");
+                active.session = None;
+                key_pipe.0.clear();
+                next_screen.set(Screen::Conversation);
             }
             _ => {}
         }
@@ -277,7 +276,7 @@ fn handle_editor_keys_outcome(
         };
         // A stale outcome from a replaced session must not advance the new
         // session's pipe (the open handler already cleared it).
-        if !active.session.as_ref().is_some_and(|v| v.session == *session) {
+        if active.session.as_ref().is_none_or(|v| v.session != *session) {
             continue;
         }
         if *ok {

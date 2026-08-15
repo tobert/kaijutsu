@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Pure vi editing engine (EditorCore) — modalkit-driven, no Bevy/kernel/RPC"
 
+[lints]
+workspace = true
+
 [dependencies]
 modalkit = { workspace = true }
 editor-types = { workspace = true }

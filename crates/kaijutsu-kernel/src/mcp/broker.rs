@@ -738,15 +738,15 @@ impl Broker {
         // see its call fail (the transport was just torn down) — that's the
         // acceptable "fail loudly" outcome CLAUDE.md prefers over a silent
         // hang, not something this call waits on or is blocked by.
-        if let Some(server) = &server_arc {
-            if let Err(e) = server.shutdown().await {
-                tracing::warn!(
-                    instance = %id,
-                    error = %e,
-                    "unregister: server shutdown failed — its process may outlive \
-                     unregister until every Arc clone is dropped",
-                );
-            }
+        if let Some(server) = &server_arc
+            && let Err(e) = server.shutdown().await
+        {
+            tracing::warn!(
+                instance = %id,
+                error = %e,
+                "unregister: server shutdown failed — its process may outlive \
+                 unregister until every Arc clone is dropped",
+            );
         }
 
         if !removed_tools.is_empty() {

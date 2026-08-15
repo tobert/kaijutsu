@@ -485,15 +485,15 @@ impl DjCore {
             // free-run cap (alive but never corrected, `MAX_FREE_RUN`'s
             // sustained-Touch failure mode). Both are proactive: neither
             // condition ever *arrives* as an event.
-            if let Some(last) = self.last_ref_at {
-                if now.saturating_duration_since(last) > REF_STALE_MAX {
-                    return self.exit_beat_grid(TransitionReason::Stale).transition;
-                }
+            if let Some(last) = self.last_ref_at
+                && now.saturating_duration_since(last) > REF_STALE_MAX
+            {
+                return self.exit_beat_grid(TransitionReason::Stale).transition;
             }
-            if let Some(folded) = self.last_fold_at {
-                if now.saturating_duration_since(folded) > MAX_FREE_RUN {
-                    return self.exit_beat_grid(TransitionReason::FreeRunCap).transition;
-                }
+            if let Some(folded) = self.last_fold_at
+                && now.saturating_duration_since(folded) > MAX_FREE_RUN
+            {
+                return self.exit_beat_grid(TransitionReason::FreeRunCap).transition;
             }
         }
         None
@@ -541,8 +541,8 @@ impl DjCore {
     /// Return the offsets-from-`now` at which to schedule a click for every
     /// integer beat whose predicted time falls within `horizon` — each beat
     /// returned exactly once across calls. PORTED VERBATIM from
-    /// `Metronome::schedule_due`; see that method's doc for the never-replay
-    /// + un-strand policy derivation (this is the same policy, not a
+    /// `Metronome::schedule_due`; see that method's doc for the never-replay +
+    /// un-strand policy derivation (this is the same policy, not a
     /// reimplementation — only `self`'s type differs).
     fn schedule_due(&mut self, now: Instant, horizon: Duration) -> Vec<Duration> {
         let Some(beat) = &self.beat else {
@@ -550,6 +550,17 @@ impl DjCore {
         };
         let cur = beat.position(now);
         let tempo = beat.tempo_bps();
+        // Not `!(tempo > 0.0)` (contrast midi_clock.rs's `--bpm`, which is
+        // user input and where `f64::from_str` accepts the literal "NaN"):
+        // `tempo_bps()` traces back to `ClockEstimator::tempo_bps()` =
+        // `1e9 / (period_ema_ns * PULSES_PER_BEAT)`, an EMA seeded and
+        // updated only from `u64` pulse-interval deltas (always finite,
+        // never negative) and only ever set once known `> 0.0` — so `tempo`
+        // here can be zero or negative (an unlearned/degenerate estimator)
+        // but never NaN, and the plain `<=` reads correctly. If this ever
+        // gets hardened further: neither form alone catches `+inf` (which
+        // `period_ema_ns == 0` would produce) — that needs an explicit
+        // `is_finite()` check, not just flipping the comparison.
         if tempo <= 0.0 {
             return Vec::new();
         }
@@ -597,6 +608,8 @@ impl DjCore {
     pub fn next_wake(&self, now: Instant, horizon: Duration) -> Option<Instant> {
         let beat = self.beat.as_ref()?;
         let tempo = beat.tempo_bps();
+        // Plain `<=`, not negated — see `schedule_due`'s comment above for
+        // why `tempo_bps()` can never be NaN here.
         if tempo <= 0.0 {
             return None;
         }
@@ -676,6 +689,8 @@ impl DjCore {
             return DueCues { due: Vec::new(), dropped_cues: 0, transition: None };
         };
         let tempo = beat.tempo_bps();
+        // Plain `<=`, not negated — see `schedule_due`'s comment above for
+        // why `tempo_bps()` can never be NaN here.
         if tempo <= 0.0 {
             return DueCues { due: Vec::new(), dropped_cues: 0, transition: None };
         }
@@ -710,6 +725,8 @@ impl DjCore {
         }
         let beat = self.beat.as_ref()?;
         let tempo = beat.tempo_bps();
+        // Plain `<=`, not negated — see `schedule_due`'s comment above for
+        // why `tempo_bps()` can never be NaN here.
         if tempo <= 0.0 {
             return None;
         }

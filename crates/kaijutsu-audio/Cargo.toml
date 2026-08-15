@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "FFI-free render + capture seam: RenderCue out, CaptureBatch in, LocalBeat timebase, Shape A clip record"
 
+[lints]
+workspace = true
+
 [dependencies]
 kaijutsu-cas = { workspace = true }
 anyhow = { workspace = true }

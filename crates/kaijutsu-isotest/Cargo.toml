@@ -10,6 +10,9 @@ publish = false
 # Everything lives in tests/; the lib target is empty. Tests self-skip unless
 # KAIJUTSU_ISOTEST=1 so a bare host `cargo test` stays fast and green.
 
+[lints]
+workspace = true
+
 [dependencies]
 
 [dev-dependencies]

@@ -113,15 +113,14 @@ impl ContextTails {
         tail.lines.push_back(line);
         tail.touched = now;
 
-        if self.tails.len() > TAIL_CONTEXT_CAP {
-            if let Some(oldest) = self
+        if self.tails.len() > TAIL_CONTEXT_CAP
+            && let Some(oldest) = self
                 .tails
                 .iter()
                 .min_by(|a, b| a.1.touched.total_cmp(&b.1.touched))
                 .map(|(id, _)| *id)
-            {
-                self.tails.remove(&oldest);
-            }
+        {
+            self.tails.remove(&oldest);
         }
     }
 
@@ -728,7 +727,7 @@ mod tests {
         tails.push(ctx(9), TailLine::new("✦", "new"), 1e9);
         assert_eq!(tails.tails.len(), TAIL_CONTEXT_CAP, "capped");
         assert!(!tails.tails.contains_key(&oldest), "oldest-touched dropped");
-        assert!(!tails.iter_lines(&ctx(9)).next().is_none(), "newcomer kept");
+        assert!(tails.iter_lines(&ctx(9)).next().is_some(), "newcomer kept");
     }
 
     // ── tail_lines ──

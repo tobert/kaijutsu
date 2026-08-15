@@ -44,6 +44,9 @@ fn key_pitch_offset(key: &Key) -> i16 {
 /// ~1/8 of a unit note, but the run is capped at half the principal's duration.
 /// Returns the ticks stolen (to subtract from the principal). `channel` lets the
 /// single-track and per-voice paths share this.
+// MIDI-emission state falls into three groups (the writer + notes to emit,
+// bar timing/key context, and per-call MIDI knobs) with no natural shared
+// owner — a params struct would just rename this list.
 #[allow(clippy::too_many_arguments)]
 fn play_grace_run(
     writer: &mut MidiWriter,

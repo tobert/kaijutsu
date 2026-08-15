@@ -1669,8 +1669,10 @@ mod tests {
 
     #[test]
     fn arm_dive_resets_focus_and_placement_pending_but_not_ring_rotation() {
-        let mut state = TimeWellState::default();
-        state.focused = true;
+        let mut state = TimeWellState {
+            focused: true,
+            ..Default::default()
+        };
         state.placement_pending.insert(ContextId::new());
         state.ring_rotation[0] = 1.23;
         state.ring_rotation_target[0] = 4.56;
@@ -1697,8 +1699,10 @@ mod tests {
         // crash, but a real one. Unlike ring position/rotation, hero has no
         // visual anchor a user would recognize as "where I left off," so
         // every fresh dive should start OUT of it.
-        let mut state = TimeWellState::default();
-        state.hero = true;
+        let mut state = TimeWellState {
+            hero: true,
+            ..Default::default()
+        };
 
         arm_dive(&mut state);
 
@@ -2160,6 +2164,12 @@ pub fn spin_rings(
     // cards' targets — a settled ring leaves its cards alone (Deepseek: the
     // recompute is only needed while spinning).
     let mut active = [false; super::card::N_BANDS];
+    // `i` indexes four independent collections in lockstep — three `state`
+    // fields (one read-and-written) plus the local `active` array. An
+    // iterator/zip rewrite would need to split `state`'s fields apart to
+    // satisfy the borrow checker for the mutable one; not worth it for a
+    // fixed-size, small (`N_BANDS`) loop.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..super::card::N_BANDS {
         // An empty ring has no cards to move (and sync_time_well's
         // `flen.max(1)` only gives it a synthetic single-slot gate target) —

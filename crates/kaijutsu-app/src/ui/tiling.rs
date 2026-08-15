@@ -611,11 +611,7 @@ impl TilingTree {
 
         // Walk ancestors from the focused pane upward
         let mut current = self.focused;
-        loop {
-            let Some((parent_id, child_idx)) = self.root.find_parent(current) else {
-                break;
-            };
-
+        while let Some((parent_id, child_idx)) = self.root.find_parent(current) {
             // Check if parent is a Split with the right direction
             if let Some(TileNode::Split {
                 direction: split_dir,

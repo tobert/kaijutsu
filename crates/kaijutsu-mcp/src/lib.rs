@@ -197,7 +197,7 @@ impl ShellCompletion {
     /// agents parse this to extract `stdout`, `exit_code`, structured `data`,
     /// and the result block id for follow-up reads.
     ///
-    /// Callers get it via `into_tool_result`, which ships it as both text and
+    /// Callers get it via `to_tool_result`, which ships it as both text and
     /// `structuredContent`.
     /// Wrap the envelope as a 2026-07-28 tool result.
     ///
@@ -213,7 +213,7 @@ impl ShellCompletion {
     /// failure via `exit_code` / `status`, exactly as the tool description
     /// says — flipping `isError` would make well-formed results look like tool
     /// faults.
-    fn into_tool_result(&self) -> CallToolResult {
+    fn to_tool_result(&self) -> CallToolResult {
         CallToolResult::structured(self.to_value())
     }
 
@@ -1310,7 +1310,7 @@ impl KaijutsuMcp {
         // successful result, which is what "Error: ..." text used to do — a
         // client had to string-match to notice. A command that runs and exits
         // non-zero is NOT this case and stays a success envelope (see
-        // `into_tool_result`).
+        // `to_tool_result`).
         let (ctx_id, actor) = match self.require_joined().await {
             Ok(v) => v,
             Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
@@ -1352,7 +1352,7 @@ impl KaijutsuMcp {
             "Shell command",
         )
         .await
-        .into_tool_result()
+        .to_tool_result()
     }
 
     // ========================================================================
@@ -1651,16 +1651,14 @@ impl KaijutsuMcp {
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_default();
-            if !origin_host.is_empty() {
-                if let Err(e) =
-                    remote.actor.set_context_origin_host(context_id, &origin_host).await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        error = %e,
-                        "register_session: failed to record origin_host (non-fatal)",
-                    );
-                }
+            if !origin_host.is_empty()
+                && let Err(e) = remote.actor.set_context_origin_host(context_id, &origin_host).await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "register_session: failed to record origin_host (non-fatal)",
+                );
             }
         }
 
@@ -3115,7 +3113,7 @@ mod tests {
             elapsed_ms: 7,
         };
         let value = completion.to_value();
-        let result = completion.into_tool_result();
+        let result = completion.to_tool_result();
 
         let structured = result
             .structured_content
@@ -3149,7 +3147,7 @@ mod tests {
             snapshot: Box::new(snap),
             elapsed_ms: 2,
         }
-        .into_tool_result();
+        .to_tool_result();
 
         assert_eq!(result.is_error, Some(false));
         assert_eq!(

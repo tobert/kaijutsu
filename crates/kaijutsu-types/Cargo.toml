@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Shared identity and block types for Kaijutsu — the relational foundation"
 
+[lints]
+workspace = true
+
 [dependencies]
 uuid = { workspace = true }
 serde = { workspace = true }

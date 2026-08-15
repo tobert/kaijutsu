@@ -296,6 +296,10 @@ enum InternalMsg {
 /// Each variant carries its arguments and a oneshot reply channel. World-level
 /// and FSM-mutating commands are handled inline in the run loop; kernel-level
 /// commands are dispatched concurrently via `spawn_local`.
+// One mpsc payload per RPC call shape, so variant sizes vary with each
+// call's own arguments — boxing the larger ones trades enum size for a
+// heap alloc on every dispatch of this actor's hottest path; not a clear
+// win either way, left as a design call.
 #[allow(clippy::large_enum_variant)]
 enum RpcCommand {
     // ── Drift ────────────────────────────────────────────────────────────
@@ -1944,6 +1948,10 @@ impl RpcActor {
         self.peer_registration.clone()
     }
 
+    // One argument per independent piece of actor construction state
+    // (connection config, session identity, and every channel endpoint the
+    // run loop owns) — the actor's whole raison d'être is holding these
+    // together, so a params struct would just be this list with a name.
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: SshConfig,

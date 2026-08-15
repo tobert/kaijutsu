@@ -378,6 +378,9 @@ fn run_md_script(
     }
 }
 
+// Three disjoint groups: the new context's identity (new_id/parent_id/
+// fork_kind/drift_info), the script's own identity (verb/script/child_depth),
+// and who's running it (extra_vars/principal) — none share a natural owner.
 #[allow(clippy::too_many_arguments)]
 async fn run_kai_script(
     dispatcher: &KjDispatcher,
@@ -2155,8 +2158,10 @@ esac
     /// script is killed with an Error block and never completes.
     #[tokio::test]
     async fn rc_kernel_default_timeout_kills_runaway_script() {
-        let mut policy = kaijutsu_types::TimeoutPolicy::default();
-        policy.rc_script_timeout = std::time::Duration::from_millis(200);
+        let policy = kaijutsu_types::TimeoutPolicy {
+            rc_script_timeout: std::time::Duration::from_millis(200),
+            ..Default::default()
+        };
         let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
 
         install_script(

@@ -280,7 +280,7 @@ pub fn apply_thinking(body: &mut MessagesRequest, opts: &BuildOpts) -> Result<()
 ///
 /// Out-of-range indices are logged and skipped.
 fn apply_message_breakpoints(
-    messages: &mut Vec<RequestMessage>,
+    messages: &mut [RequestMessage],
     breakpoints: &[(usize, CacheTtl)],
 ) {
     for &(idx, ttl) in breakpoints {
@@ -678,7 +678,7 @@ mod tests {
             Some(CacheControl::extended()),
             "Extended TTL must produce the 1h-flavored cache_control"
         );
-        let cc = serde_json::to_value(&req.tools[0].cache_control).unwrap();
+        let cc = serde_json::to_value(req.tools[0].cache_control).unwrap();
         assert_eq!(cc["ttl"], "1h");
     }
 

@@ -4,10 +4,10 @@
 //! the accent rounded-rect background, the selection/lineage rings (SDF, from
 //! `params`), and the MSDF text composited on top (the `texture`, which the MSDF
 //! pass renders text-on-transparent into). This is the vello-free well — vello no
-//! longer touches card textures (it stays for SVG elsewhere). The bling (rings
-//! + status pulse) is SDF in the fragment shader emitting **HDR** (>1.0) color, so
-//! the app's single HDR `Camera3d` blooms it into a glow halo (see
-//! `main::setup_camera`); animation reads `globals.time` directly.
+//! longer touches card textures (it stays for SVG elsewhere). The bling (rings +
+//! status pulse) is SDF in the fragment shader emitting **HDR** (>1.0) color, so the
+//! app's single HDR `Camera3d` blooms it into a glow halo (see `main::setup_camera`);
+//! animation reads `globals.time` directly.
 
 use bevy::prelude::*;
 use bevy::material::AlphaMode;

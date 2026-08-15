@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Core kernel with VFS abstraction for kaijutsu"
 
+[lints]
+workspace = true
+
 [dependencies]
 # "process" — tokio::process::Command/Child for background host-process
 # execution (background_exec.rs); the shell tool's synchronous path spawns

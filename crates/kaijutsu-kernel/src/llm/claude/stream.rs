@@ -126,7 +126,7 @@ impl StateMachine {
             ClaudeSseEvent::MessageStop => {
                 let extra = (self.cache_read_input_tokens > 0
                     || self.cache_creation_input_tokens > 0)
-                    .then(|| {
+                    .then_some({
                         crate::llm::stream::UsageExtra::Claude(
                             crate::llm::stream::ClaudeUsageExtra {
                                 cache_read_input_tokens: self.cache_read_input_tokens,

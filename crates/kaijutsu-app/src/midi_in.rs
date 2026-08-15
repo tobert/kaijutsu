@@ -606,7 +606,7 @@ fn capture_loop(
             _ => None,
         };
         if let Some(ce) = clock_event {
-            let est = clocks.entry(source.clone()).or_insert_with(ClockEstimator::new);
+            let est = clocks.entry(source.clone()).or_default();
             if let Some(estimate) = est.observe(ce) {
                 let msg = EarEvent::Clock {
                     source: source.clone(),
@@ -656,8 +656,10 @@ mod tests {
     #[test]
     fn no_target_means_no_cut() {
         let mut app = App::new();
-        let mut state = CaptureState::default();
-        state.last_cut = Instant::now() - CUT_INTERVAL * 2; // cadence due
+        let mut state = CaptureState {
+            last_cut: Instant::now() - CUT_INTERVAL * 2, // cadence due
+            ..Default::default()
+        };
         for i in 0..3 {
             state.ring.push(kaijutsu_audio::CaptureEvent {
                 epoch_ns: 1_000 + i,

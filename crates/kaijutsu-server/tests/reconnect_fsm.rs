@@ -5,8 +5,6 @@
 //! the failure mode that motivated the rewrite: a connection that dies
 //! mid-session and must be re-established without losing the actor.
 
-#![allow(clippy::needless_collect)]
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

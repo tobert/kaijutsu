@@ -1197,6 +1197,7 @@ fn parse_optional_context_id(
 /// than wrapped into a nonsense cadence (`0 - 1` would surface as `u64::MAX`).
 /// The single construction path both `get_track` and `list_tracks` funnel
 /// through, so neither read API can skip the check.
+// One argument per raw `tracks` row column, pre-validation.
 #[allow(clippy::too_many_arguments)]
 fn validated_track(
     track_id: String,
@@ -1615,8 +1616,7 @@ impl KernelDb {
         }
 
         conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        let result = (|| -> SqliteResult<()> {
-            conn.execute_batch(
+        let result = conn.execute_batch(
                 "BEGIN IMMEDIATE;
                  CREATE TABLE backends_codex_migration (
                      backend_id           BLOB NOT NULL PRIMARY KEY,
@@ -1642,8 +1642,7 @@ impl KernelDb {
                  DROP TABLE backends;
                  ALTER TABLE backends_codex_migration RENAME TO backends;
                  COMMIT;",
-            )
-        })();
+            );
         if result.is_err() {
             let _ = conn.execute_batch("ROLLBACK;");
         }
@@ -2087,7 +2086,7 @@ impl KernelDb {
              FROM documents
              ORDER BY created_at",
         )?;
-        let rows = stmt.query_map([], |row| row_to_document_row(row))?;
+        let rows = stmt.query_map([], row_to_document_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -2906,7 +2905,7 @@ impl KernelDb {
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
 
-        let rows = stmt.query_map([], |row| row_to_context_row(row))?;
+        let rows = stmt.query_map([], row_to_context_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -2922,7 +2921,7 @@ impl KernelDb {
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
 
-        let rows = stmt.query_map([], |row| row_to_context_row(row))?;
+        let rows = stmt.query_map([], row_to_context_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -3323,7 +3322,7 @@ impl KernelDb {
              ORDER BY label",
         )?;
 
-        let rows = stmt.query_map([], |row| row_to_preset_row(row))?;
+        let rows = stmt.query_map([], row_to_preset_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -3488,7 +3487,7 @@ impl KernelDb {
              ORDER BY label",
         )?;
 
-        let rows = stmt.query_map([], |row| row_to_workspace_row(row))?;
+        let rows = stmt.query_map([], row_to_workspace_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -3501,7 +3500,7 @@ impl KernelDb {
              ORDER BY label",
         )?;
 
-        let rows = stmt.query_map([], |row| row_to_workspace_row(row))?;
+        let rows = stmt.query_map([], row_to_workspace_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -6346,7 +6345,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         consent_mode: ConsentMode::default(),
         context_state: ContextState::Live,
         context_type: "default".to_string(),
-        created_at: now_millis() as i64,
+        created_at: now_millis(),
         created_by: PrincipalId::new(),
         forked_from: None,
         fork_kind: None,
@@ -6395,7 +6394,7 @@ fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdg
         target_id: target,
         kind,
         metadata: None,
-        created_at: now_millis() as i64,
+        created_at: now_millis(),
     }
 }
 
@@ -6430,7 +6429,7 @@ mod tests {
             cast_id: None,
             system_prompt: None,
             consent_mode: ConsentMode::Collaborative,
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::new(),
         })
         .unwrap();
@@ -6995,7 +6994,7 @@ mod tests {
             doc_kind: DocKind::Conversation,
             language: None,
             path: None,
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::system(),
         })
         .unwrap();
@@ -7080,7 +7079,7 @@ mod tests {
             doc_kind: DocKind::Conversation,
             language: None,
             path: None,
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::system(),
         })
         .unwrap();
@@ -7416,7 +7415,7 @@ mod tests {
     fn preset_lifecycle() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         // Two casts so the "update" step below can move the reference, not
         // just leave it at None.
@@ -7482,7 +7481,7 @@ mod tests {
     fn workspace_lifecycle() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -7535,7 +7534,7 @@ mod tests {
     fn workspace_soft_delete() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -7786,7 +7785,7 @@ mod tests {
     fn context_row_to_context() {
         let creator = PrincipalId::new();
         let parent = ContextId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let row = ContextRow {
             context_id: ContextId::new(),
@@ -7954,7 +7953,7 @@ mod tests {
             doc_kind: DocKind::Conversation,
             language: None,
             path: None,
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::new(),
         })
         .unwrap();
@@ -7968,7 +7967,7 @@ mod tests {
             consent_mode: ConsentMode::default(),
             context_state: ContextState::Live,
             context_type: "default".to_string(),
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::new(),
             forked_from: None,
             fork_kind: None,
@@ -8006,7 +8005,7 @@ mod tests {
         let row = ContextShellRow {
             context_id: ctx.context_id,
             cwd: Some("/home/user/src/kaijutsu".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         };
         db.upsert_context_shell(&row).unwrap();
 
@@ -8017,7 +8016,7 @@ mod tests {
         let row2 = ContextShellRow {
             context_id: ctx.context_id,
             cwd: Some("/tmp/work".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         };
         db.upsert_context_shell(&row2).unwrap();
 
@@ -8059,7 +8058,7 @@ mod tests {
             cache_read_tokens: 800,
             cache_write_tokens: 100,
             reasoning_tokens: 0,
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         };
         db.set_context_usage(&row).unwrap();
 
@@ -8240,7 +8239,7 @@ mod tests {
         let row = ContextShellRow {
             context_id: src.context_id,
             cwd: Some("/home/user/project".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         };
         db.upsert_context_shell(&row).unwrap();
 
@@ -8280,7 +8279,7 @@ mod tests {
         db.upsert_context_shell(&ContextShellRow {
             context_id: ctx.context_id,
             cwd: Some("/tmp".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         })
         .unwrap();
         assert!(db.get_context_shell(ctx.context_id).unwrap().is_some());
@@ -9903,7 +9902,7 @@ mod tests {
     fn workspace_path_read_only_roundtrip() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -9954,7 +9953,7 @@ mod tests {
         db.upsert_context_shell(&ContextShellRow {
             context_id: src.context_id,
             cwd: Some("/home/user/src/kaijutsu".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         })
         .unwrap();
         db.set_context_env(src.context_id, "RUST_LOG", "debug")
@@ -10012,7 +10011,7 @@ mod tests {
         db.upsert_context_shell(&ContextShellRow {
             context_id: src.context_id,
             cwd: Some("/work".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         })
         .unwrap();
         db.set_context_env(src.context_id, "RUST_LOG", "debug")
@@ -10059,7 +10058,7 @@ mod tests {
         db.upsert_context_shell(&ContextShellRow {
             context_id: src.context_id,
             cwd: Some("/work/kaijutsu".into()),
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         })
         .unwrap();
         db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
@@ -10154,7 +10153,7 @@ mod tests {
     fn context_workspace_paths_bound() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -10238,7 +10237,7 @@ mod tests {
     fn check_workspace_path_allowed_rw() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -10272,7 +10271,7 @@ mod tests {
     fn check_workspace_path_allowed_ro() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -10306,7 +10305,7 @@ mod tests {
     fn check_workspace_path_outside_scope() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -10340,7 +10339,7 @@ mod tests {
     fn check_workspace_path_longest_prefix() {
         let db = KernelDb::in_memory().unwrap();
         let creator = PrincipalId::new();
-        let now = now_millis() as i64;
+        let now = now_millis();
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
@@ -10847,7 +10846,7 @@ mod tests {
     // message text. These prove the typed, read-back-based classification.
 
     /// 1. Re-inserting a `DocumentRow` with an already-used `document_id`
-    /// must classify as `DuplicateDocument`, carrying the right id.
+    ///    must classify as `DuplicateDocument`, carrying the right id.
     #[test]
     fn insert_document_duplicate_id_is_typed_duplicate_document() {
         let db = KernelDb::in_memory().unwrap();
@@ -10859,7 +10858,7 @@ mod tests {
             doc_kind: DocKind::Conversation,
             language: None,
             path: None,
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::system(),
         };
         db.insert_document(&row).unwrap();
@@ -10874,8 +10873,8 @@ mod tests {
     }
 
     /// 2. Inserting a *different* document whose `(workspace_id, path)` is
-    /// already claimed must classify as `DocumentPathConflict`, carrying the
-    /// path and the id of the document that actually holds it.
+    ///    already claimed must classify as `DocumentPathConflict`, carrying the
+    ///    path and the id of the document that actually holds it.
     #[test]
     fn insert_document_path_conflict_is_typed_document_path_conflict() {
         let db = KernelDb::in_memory().unwrap();
@@ -10887,7 +10886,7 @@ mod tests {
             doc_kind: DocKind::Conversation,
             language: None,
             path: Some("/etc/rc/shared.kai".into()),
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by: PrincipalId::system(),
         })
         .unwrap();
@@ -10900,7 +10899,7 @@ mod tests {
                 doc_kind: DocKind::Conversation,
                 language: None,
                 path: Some("/etc/rc/shared.kai".into()),
-                created_at: now_millis() as i64,
+                created_at: now_millis(),
                 created_by: PrincipalId::system(),
             })
             .unwrap_err();
@@ -10914,9 +10913,9 @@ mod tests {
     }
 
     /// 3. Guard: `idx_documents_path` is a *partial* unique index
-    /// (`WHERE path IS NOT NULL`) — two documents with `path: None` in the
-    /// same workspace must both insert cleanly. If someone "fixes" the index
-    /// into a full unique index, this must fail loudly.
+    ///    (`WHERE path IS NOT NULL`) — two documents with `path: None` in the
+    ///    same workspace must both insert cleanly. If someone "fixes" the index
+    ///    into a full unique index, this must fail loudly.
     #[test]
     fn insert_document_two_null_paths_in_same_workspace_both_succeed() {
         let db = KernelDb::in_memory().unwrap();
@@ -10928,7 +10927,7 @@ mod tests {
                 doc_kind: DocKind::Conversation,
                 language: None,
                 path: None,
-                created_at: now_millis() as i64,
+                created_at: now_millis(),
                 created_by: PrincipalId::system(),
             })
             .unwrap();

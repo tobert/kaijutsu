@@ -1650,11 +1650,11 @@ fn room_focus_visuals(
         // Guarded write: only dirty the material when focus actually flips, so a
         // settled plate stops re-extracting (the well's asset discipline).
         let border = if focused { PLATE_BORDER_FOCUSED } else { Vec4::ZERO };
-        if materials.get(&mat_handle.0).is_some_and(|m| m.dim.x != dim || m.border != border) {
-            if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
-                mat.dim.x = dim;
-                mat.border = border;
-            }
+        if materials.get(&mat_handle.0).is_some_and(|m| m.dim.x != dim || m.border != border)
+            && let Some(mut mat) = materials.get_mut(&mat_handle.0)
+        {
+            mat.dim.x = dim;
+            mat.border = border;
         }
     }
 }
@@ -1738,8 +1738,8 @@ fn ingest_room_activity(
 
 /// Push ambient telemetry into the wall-bearing markers as light: the tracks
 /// (E) marker breathes with the well's beat phasor (HDR pulse decaying to
-/// LDR), and the focused station's marker takes a steady lift. Change-guarded
-/// + quantized so a settled marker never touches `Assets<StandardMaterial>`
+/// LDR), and the focused station's marker takes a steady lift. Change-guarded +
+/// quantized so a settled marker never touches `Assets<StandardMaterial>`
 /// (the well's `sync_card_live_uniforms` discipline).
 ///
 /// The `Bearing::East` branch below is now inert code, not deleted: Tracker
@@ -1839,13 +1839,12 @@ fn set_glow(mats: &mut Assets<StandardMaterial>, handle: &Handle<StandardMateria
     let Some(cur) = mats.get(handle).map(|m| m.base_color.to_linear()) else {
         return;
     };
-    if (cur.red - target.x).abs() > 1e-4
+    if ((cur.red - target.x).abs() > 1e-4
         || (cur.green - target.y).abs() > 1e-4
-        || (cur.blue - target.z).abs() > 1e-4
+        || (cur.blue - target.z).abs() > 1e-4)
+        && let Some(mut m) = mats.get_mut(handle)
     {
-        if let Some(mut m) = mats.get_mut(handle) {
-            m.base_color = lin_v(target);
-        }
+        m.base_color = lin_v(target);
     }
 }
 
@@ -2018,6 +2017,13 @@ fn plate_shape() -> Vec4 {
 }
 
 #[cfg(test)]
+// Several tests below assert a relationship between two `const` geometry
+// values (e.g. `MARKER_HEIGHT_RESERVED < MARKER_HEIGHT`) — clippy sees a
+// compile-time-constant condition and calls it dead, but that's the point:
+// these are regression pins on hand-tuned magic numbers, verified at test
+// time so a future edit to one constant that breaks the relationship with
+// another fails loudly instead of silently drifting the scene geometry.
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 

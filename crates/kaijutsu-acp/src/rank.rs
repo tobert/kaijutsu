@@ -85,10 +85,10 @@ fn session_info(c: &ContextInfo, cwd: &Path) -> SessionInfo {
         c.label.clone()
     };
     let mut info = SessionInfo::new(session_id_of(c.id), PathBuf::from(cwd)).title(title);
-    if let Some(ts) = c.last_activity_at.or(Some(c.created_at)) {
-        if let Some(stamp) = rfc3339_millis(ts) {
-            info = info.updated_at(stamp);
-        }
+    if let Some(ts) = c.last_activity_at.or(Some(c.created_at))
+        && let Some(stamp) = rfc3339_millis(ts)
+    {
+        info = info.updated_at(stamp);
     }
     info
 }
@@ -218,7 +218,7 @@ mod tests {
     fn an_unlabelled_context_falls_back_to_its_short_id() {
         let c = ctx("");
         let cwds = std::collections::HashMap::from([(c.id, PathBuf::from("/tmp"))]);
-        let infos = ranked_sessions(&[c.clone()], &cwds);
+        let infos = ranked_sessions(std::slice::from_ref(&c), &cwds);
         assert_eq!(infos[0].title.as_deref(), Some(c.id.short().as_str()));
     }
 

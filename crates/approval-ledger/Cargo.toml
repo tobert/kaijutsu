@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Durable SQLite-backed approval ledger for human-in-the-loop authorization of agent actions. DB-injected, no kaijutsu-* dependency — publishable standalone."
 
+[lints]
+workspace = true
+
 [dependencies]
 rusqlite = { workspace = true }
 serde = { workspace = true }

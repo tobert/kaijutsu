@@ -755,6 +755,14 @@ fn hex_to_color(s: &str) -> Color {
 }
 
 impl From<kaijutsu_types::theme::ThemeData> for Theme {
+    // Deliberate: ~30 fields (including nested `theme.ansi.*`) assigned one at a
+    // time in comment-grouped batches (Base UI / Row colors / Semantic / Mode
+    // colors / …) for readability against `ThemeData`'s own field grouping.
+    // Folding this into a single `Theme { .. }` struct literal (clippy's fix)
+    // would flatten those groups into one wall of fields and can't express the
+    // nested `ansi: AnsiPalette { .. }` assignments without duplicating the
+    // grouping structure anyway — not worth it for a one-time conversion path.
+    #[allow(clippy::field_reassign_with_default)]
     fn from(td: kaijutsu_types::theme::ThemeData) -> Self {
         let mut theme = Theme::default();
 

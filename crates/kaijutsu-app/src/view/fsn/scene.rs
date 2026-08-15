@@ -431,6 +431,9 @@ pub(super) fn cell_edge_tints(
 /// (shouldn't happen — `field.cells` is built FROM this same listing) reads
 /// as infinitely aged (no tint) rather than defaulting to full gold, the
 /// safer failure direction.
+// A manual (non-system) spawn helper: since it can't lean on Bevy's
+// SystemParam injection, every asset table and piece of scene context a
+// system's params would normally carry has to come in explicitly.
 #[allow(clippy::too_many_arguments)]
 fn spawn_field_entities(
     commands: &mut Commands,

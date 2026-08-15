@@ -127,10 +127,10 @@ impl KjDispatcher {
             }
         };
         // Document lifecycle (create/delete) is operator authority; list/tree read.
-        if matches!(parsed.command, DocCommand::Create { .. } | DocCommand::Delete { .. }) {
-            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "doc") {
-                return denied;
-            }
+        if matches!(parsed.command, DocCommand::Create { .. } | DocCommand::Delete { .. })
+            && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "doc")
+        {
+            return denied;
         }
         match parsed.command {
             DocCommand::List { kind, json } => self.doc_list(kind.as_deref(), json),

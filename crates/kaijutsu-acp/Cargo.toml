@@ -10,6 +10,9 @@ description = "Agent Client Protocol (ACP v1) bridge exposing a kaijutsu kernel 
 name = "kaijutsu-acp"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 kaijutsu-client.workspace = true
 kaijutsu-crdt.workspace = true

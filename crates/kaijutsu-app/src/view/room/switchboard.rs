@@ -845,13 +845,15 @@ mod tests {
     /// pass, while an off-roster sticky ember survives.
     #[test]
     fn retain_relevant_keeps_offroster_embers_and_drops_idle_signals() {
-        let mut state = SwitchboardState::default();
         // Only ctx 1 is seated.
-        state.order = vec![LampEntry {
-            context_id: id_of(1),
-            effective_activity_ms: 0,
-            running: false,
-        }];
+        let mut state = SwitchboardState {
+            order: vec![LampEntry {
+                context_id: id_of(1),
+                effective_activity_ms: 0,
+                running: false,
+            }],
+            ..Default::default()
+        };
         state.signals.entry(id_of(1)).or_default();
         // Off-roster with a sticky ember — must survive.
         state.signals.entry(id_of(2)).or_default().on_turn_failed();

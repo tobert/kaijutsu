@@ -3094,7 +3094,7 @@ impl BlockStore {
             entry
                 .doc
                 .get_block_snapshot(block_id)
-                .ok_or_else(|| BlockStoreError::BlockNotFoundAfterInsert)?
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?
         };
 
         let new_errors = match snap.content_type {
@@ -3335,7 +3335,7 @@ impl BlockStore {
 /// (`kaijutsu-server`, which re-exports this fn) both call the same logic —
 /// there is exactly one place this derivation is written.
 pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
-    if statuses_in_order.iter().any(|s| *s == Status::Running) {
+    if statuses_in_order.contains(&Status::Running) {
         Status::Running
     } else if statuses_in_order.last() == Some(&Status::Error) {
         Status::Error
@@ -4544,7 +4544,7 @@ mod tests {
             let payload: SyncPayload = codec::decode(&ops).unwrap();
             client
                 .merge_ops(payload)
-                .expect(&format!("should merge block {i}"));
+                .unwrap_or_else(|e| panic!("should merge block {i}: {e}"));
         }
 
         assert_eq!(client.block_count(), 5);
@@ -4603,7 +4603,7 @@ mod tests {
             let payload = store.ops_since(ctx, &client_frontier).unwrap();
             client
                 .merge_ops(payload)
-                .expect(&format!("should merge chunk '{chunk}'"));
+                .unwrap_or_else(|e| panic!("should merge chunk '{chunk}': {e}"));
         }
 
         let snapshot = client.get_block_snapshot(&block_id).unwrap();
@@ -6131,9 +6131,9 @@ mod tests {
     // ========================================================================
 
     /// 5. A matching row already in the DB (same id, kind, path=None) is the
-    /// genuine benign-recovery case: `create_document` must still return
-    /// `Ok` and the in-memory entry must exist. `test_merge_ops_persists_to_db`
-    /// already depends on this staying `Ok` — this test pins it directly.
+    ///    genuine benign-recovery case: `create_document` must still return
+    ///    `Ok` and the in-memory entry must exist. `test_merge_ops_persists_to_db`
+    ///    already depends on this staying `Ok` — this test pins it directly.
     #[test]
     fn create_document_recovers_when_db_row_matches() {
         use crate::kernel_db::{DocumentRow, KernelDb};
@@ -6170,8 +6170,8 @@ mod tests {
     }
 
     /// 6. A DB row with the SAME id but a DIFFERENT `doc_kind` is divergence,
-    /// not benign duplication — `create_document` must return
-    /// `DocumentDiverged` and must NOT insert the in-memory entry.
+    ///    not benign duplication — `create_document` must return
+    ///    `DocumentDiverged` and must NOT insert the in-memory entry.
     #[test]
     fn create_document_errors_on_diverged_kind() {
         use crate::kernel_db::{DocumentRow, KernelDb};
@@ -6215,9 +6215,9 @@ mod tests {
     }
 
     /// 7. `create_document_with_path` where a DIFFERENT document already
-    /// owns that `(workspace, path)` must return `DocumentPathConflict` —
-    /// always a hard error, never recovered — and must NOT insert the
-    /// in-memory entry.
+    ///    owns that `(workspace, path)` must return `DocumentPathConflict` —
+    ///    always a hard error, never recovered — and must NOT insert the
+    ///    in-memory entry.
     #[test]
     fn create_document_with_path_errors_on_path_conflict() {
         use crate::kernel_db::{DocumentRow, KernelDb};

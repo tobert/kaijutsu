@@ -287,6 +287,14 @@ impl Role {
     /// Parse from string (case-insensitive).
     ///
     /// Supports aliases: "human" -> User, "assistant"/"agent" -> Model.
+    ///
+    /// Deliberate inherent `from_str` alongside the real `FromStr` impl this
+    /// delegates to: an `Option`-returning sibling for call sites (kj arg
+    /// parsing, iteration-friendly `for x in $(kj …)` handles) that want
+    /// Some/None, not an error type to match on. Same convention repeats on
+    /// every enum in this file with a `FromStr` impl (`Status`, `BlockKind`,
+    /// `ToolKind`, `DriftKind`, `TaskStatus`) — this is the one comment for
+    /// all of them.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         <Self as FromStr>::from_str(s).ok()
@@ -1017,6 +1025,9 @@ pub enum Status {
 
 impl Status {
     /// Parse from string (case-insensitive).
+    ///
+    /// Deliberate `Option`-returning sibling of the real `FromStr` impl —
+    /// see `Role::from_str`'s doc for the one shared writeup.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         <Self as FromStr>::from_str(s).ok()
@@ -1132,6 +1143,9 @@ pub enum BlockKind {
 
 impl BlockKind {
     /// Parse from string (case-insensitive).
+    ///
+    /// Deliberate `Option`-returning sibling of the real `FromStr` impl —
+    /// see `Role::from_str`'s doc for the one shared writeup.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         <Self as FromStr>::from_str(s).ok()
@@ -1218,6 +1232,9 @@ pub enum ToolKind {
 
 impl ToolKind {
     /// Parse from string (case-insensitive).
+    ///
+    /// Deliberate `Option`-returning sibling of the real `FromStr` impl —
+    /// see `Role::from_str`'s doc for the one shared writeup.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         <Self as FromStr>::from_str(s).ok()
@@ -1263,6 +1280,9 @@ pub enum DriftKind {
 
 impl DriftKind {
     /// Parse from string (case-insensitive).
+    ///
+    /// Deliberate `Option`-returning sibling of the real `FromStr` impl —
+    /// see `Role::from_str`'s doc for the one shared writeup.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         <Self as FromStr>::from_str(s).ok()
@@ -1332,6 +1352,9 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     /// Parse from string (case-insensitive).
+    ///
+    /// Deliberate `Option`-returning sibling of the real `FromStr` impl —
+    /// see `Role::from_str`'s doc for the one shared writeup.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         <Self as FromStr>::from_str(s).ok()

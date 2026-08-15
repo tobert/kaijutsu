@@ -9,7 +9,16 @@
 //! Chrome is handled by the tiling WM system (North/South docks).
 //! Connection + context join happens in the background (ActorPlugin bootstrap).
 
-// Bevy ECS idioms that trigger these lints
+// Bevy ECS idioms that trigger these lints: system functions take one
+// argument per injected `Res`/`Query`/etc. (too_many_arguments), and query
+// tuples/filters read as deeply nested generic types (type_complexity).
+// Deliberately CRATE-WIDE (an inner `#![allow]` in the binary's root, not a
+// per-function one): it silences every instance of both lints anywhere in
+// this binary, not just the idiomatic ECS cases — a genuinely oversized
+// argument list or an actually-too-complex type elsewhere in the app won't
+// surface as a warning either. That breadth is the accepted tradeoff for
+// not annotating every system function individually; a case that turns out
+// to matter still needs eyes-on review, not a lint, to catch.
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 

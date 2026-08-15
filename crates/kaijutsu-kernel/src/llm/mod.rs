@@ -61,8 +61,6 @@ use std::sync::Arc;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// Default model to use when none specified.
-
 /// Mock LLM client for testing — returns a canned response.
 #[cfg(any(test, feature = "test-mock"))]
 #[derive(Clone, Debug)]
