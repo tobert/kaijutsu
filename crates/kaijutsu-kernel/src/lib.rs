@@ -37,6 +37,7 @@ pub mod midi_seed;
 pub mod model_resolution;
 pub mod peers;
 pub mod roster;
+pub mod roster_sources;
 pub mod runtime;
 pub mod seed_backends;
 pub mod seed_presets;

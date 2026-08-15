@@ -436,6 +436,57 @@ pub fn record_llm_usage(provider: &str, model: &str, tokens: TokenCounts) {
     LLM_METRICS.record(provider, model, tokens);
 }
 
+/// The live roster's transition counter (`kaijutsu-kernel/src/roster.rs`).
+/// History is otel, not a table — the design record's ruling ("current only,
+/// we have otel traces & logs for history") means every presence
+/// appeared/gone and every status/availability change is recorded HERE
+/// instead of accumulating rows in `kernel.db`.
+pub struct RosterMetrics {
+    /// `kaijutsu.roster.transition` — one add per observed transition, by
+    /// `kind` (`appeared` | `gone` | `status_changed` | `availability_changed`)
+    /// and `liveness_kind` (`bound` | `recent` | `attested`; empty string for
+    /// the two status-only kinds, which aren't tied to one presence source).
+    transitions: Counter<u64>,
+}
+
+impl RosterMetrics {
+    /// Build the instrument from a meter. Public so tests can bind a meter
+    /// backed by an in-memory reader.
+    pub fn new(meter: &Meter) -> Self {
+        let transitions = meter
+            .u64_counter("kaijutsu.roster.transition")
+            .with_unit("{transition}")
+            .with_description(
+                "Roster presence transitions (appeared/gone/status_changed/availability_changed), \
+                 by kind and liveness_kind",
+            )
+            .build();
+        Self { transitions }
+    }
+
+    /// Record one transition. `liveness_kind` is `""` for `status_changed`/
+    /// `availability_changed` (a status write is not tied to one presence
+    /// source).
+    pub fn record_transition(&self, kind: &str, liveness_kind: &str) {
+        self.transitions.add(
+            1,
+            &[
+                KeyValue::new("kind", kind.to_owned()),
+                KeyValue::new("liveness_kind", liveness_kind.to_owned()),
+            ],
+        );
+    }
+}
+
+static ROSTER_METRICS: LazyLock<RosterMetrics> =
+    LazyLock::new(|| RosterMetrics::new(&global::meter("kaijutsu")));
+
+/// Record one roster presence/status transition to the global meter provider
+/// — see [`RosterMetrics::record_transition`].
+pub fn record_roster_transition(kind: &str, liveness_kind: &str) {
+    ROSTER_METRICS.record_transition(kind, liveness_kind);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

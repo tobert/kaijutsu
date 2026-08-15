@@ -6255,6 +6255,22 @@ impl KernelDb {
         let rows = stmt.query_map([], row_to_roster_row)?.collect::<SqliteResult<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Every `source_local_id` currently on file for `source`, before a
+    /// refresh pass. A source's refresh loop (`roster_sources.rs`) reads
+    /// this first to tell "appeared" (in the new snapshot, not in this set)
+    /// from "already known" — `roster_reconcile_presence` itself only
+    /// reports what it PRUNED, not what's new, since new-vs-updated isn't a
+    /// distinction the upsert needs to make.
+    pub fn roster_presence_source_local_ids(&self, source: &str) -> KernelDbResult<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_local_id FROM roster_presence WHERE source = ?1")?;
+        let ids = stmt
+            .query_map(params![source], |r| r.get(0))?
+            .collect::<SqliteResult<HashSet<String>>>()?;
+        Ok(ids)
+    }
 }
 
 // ============================================================================
