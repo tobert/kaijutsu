@@ -667,7 +667,7 @@ mod tests {
 
         // t2 deleted — the plan is now shorter and MUST be re-emitted.
         let after = m
-            .build_plan(&[t1.clone()])
+            .build_plan(std::slice::from_ref(&t1))
             .expect("a deleted task must produce a new plan");
         let entries = plan_entries(&after);
         assert_eq!(entries.len(), 1, "deleted task must leave the plan");
@@ -689,7 +689,7 @@ mod tests {
 
         assert!(m.build_plan(&[t1.clone(), chatter.clone()]).is_some());
         assert!(
-            m.build_plan(&[t1.clone()]).is_none(),
+            m.build_plan(std::slice::from_ref(&t1)).is_none(),
             "removing a non-Task block leaves the plan identical, so the pump \
              must send nothing"
         );
@@ -1119,7 +1119,7 @@ mod tests {
         let t = task(ctx, 1, "buy milk", TaskStatus::Open, None);
 
         assert!(m.note_task(&t), "a brand-new task is a change");
-        let update = m.build_plan(&[t.clone()]).expect("plan emitted");
+        let update = m.build_plan(std::slice::from_ref(&t)).expect("plan emitted");
         let entries = plan_entries(&update);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "buy milk");
@@ -1167,7 +1167,7 @@ mod tests {
         let mut m = mapper();
         let t = task(ctx, 1, "buy milk", TaskStatus::Open, None);
         m.note_task(&t);
-        assert!(m.build_plan(&[t.clone()]).is_some(), "first build emits");
+        assert!(m.build_plan(std::slice::from_ref(&t)).is_some(), "first build emits");
         assert!(
             m.build_plan(&[t]).is_none(),
             "second build over unchanged state must be silent"
@@ -1287,7 +1287,7 @@ mod tests {
         let mut m = mapper();
         let t = task(ctx, 1, "pre-seeded", TaskStatus::Open, None);
         m.mark_seen(&t);
-        m.baseline_plan(&[t.clone()]);
+        m.baseline_plan(std::slice::from_ref(&t));
 
         assert!(
             m.build_plan(&[t]).is_none(),

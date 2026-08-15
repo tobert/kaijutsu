@@ -1669,8 +1669,10 @@ mod tests {
 
     #[test]
     fn arm_dive_resets_focus_and_placement_pending_but_not_ring_rotation() {
-        let mut state = TimeWellState::default();
-        state.focused = true;
+        let mut state = TimeWellState {
+            focused: true,
+            ..Default::default()
+        };
         state.placement_pending.insert(ContextId::new());
         state.ring_rotation[0] = 1.23;
         state.ring_rotation_target[0] = 4.56;
@@ -1697,8 +1699,10 @@ mod tests {
         // crash, but a real one. Unlike ring position/rotation, hero has no
         // visual anchor a user would recognize as "where I left off," so
         // every fresh dive should start OUT of it.
-        let mut state = TimeWellState::default();
-        state.hero = true;
+        let mut state = TimeWellState {
+            hero: true,
+            ..Default::default()
+        };
 
         arm_dive(&mut state);
 

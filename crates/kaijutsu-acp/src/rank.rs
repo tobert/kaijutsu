@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn an_unlabelled_context_falls_back_to_its_short_id() {
         let c = ctx("");
-        let infos = ranked_sessions(&[c.clone()], Path::new("/tmp"));
+        let infos = ranked_sessions(std::slice::from_ref(&c), Path::new("/tmp"));
         assert_eq!(infos[0].title.as_deref(), Some(c.id.short().as_str()));
     }
 

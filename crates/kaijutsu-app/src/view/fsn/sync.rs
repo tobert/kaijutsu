@@ -342,8 +342,10 @@ mod tests {
 
     #[test]
     fn settle_in_flight_ignores_a_mismatched_path() {
-        let mut state = FsnState::default();
-        state.in_flight = Some("/current".into());
+        let mut state = FsnState {
+            in_flight: Some("/current".into()),
+            ..Default::default()
+        };
         state.settle_in_flight("/other");
         assert_eq!(
             state.in_flight.as_deref(),

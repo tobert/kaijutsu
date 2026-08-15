@@ -2155,8 +2155,10 @@ esac
     /// script is killed with an Error block and never completes.
     #[tokio::test]
     async fn rc_kernel_default_timeout_kills_runaway_script() {
-        let mut policy = kaijutsu_types::TimeoutPolicy::default();
-        policy.rc_script_timeout = std::time::Duration::from_millis(200);
+        let policy = kaijutsu_types::TimeoutPolicy {
+            rc_script_timeout: std::time::Duration::from_millis(200),
+            ..Default::default()
+        };
         let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
 
         install_script(

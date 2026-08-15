@@ -809,10 +809,9 @@ mod tests {
         app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
 
         // Focus the LAST block (far outside the keep band at scroll top).
-        app.insert_resource({
-            let mut focus = FocusTarget::default();
-            focus.block_id = Some(ids[99]);
-            focus
+        app.insert_resource(FocusTarget {
+            block_id: Some(ids[99]),
+            ..Default::default()
         });
 
         app.update();

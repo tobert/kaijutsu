@@ -643,7 +643,7 @@ mod tests {
         let prompt_id = prompt.id;
 
         // Submitted but the model hasn't spoken: idle, yet NOT settled.
-        assert!(!turn_ran_and_settled(&[prompt.clone()], &prompt_id));
+        assert!(!turn_ran_and_settled(std::slice::from_ref(&prompt), &prompt_id));
         // Prompt not even visible yet: not settled.
         assert!(!turn_ran_and_settled(&[], &prompt_id));
         // Model replied and everything is done: settled.
