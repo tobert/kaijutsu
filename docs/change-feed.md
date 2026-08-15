@@ -200,17 +200,40 @@ artifact is exactly the mistake the timebase doctrine forbids.**
 
 Flag day. Every client is in-repo and rebuilt together.
 
+**`BlockEvents` survives the flag day, reduced.** The table below deletes its
+block half, not the interface. Three members have no replacement and must stay:
+`onRenderCue` and `onBeatSync` (musical-timebase directives, excluded from the
+feed by the section above), `exchange` (the MIDI request/reply the kernel calls
+back on), and `onSubscriptionTerminated`, which is still their termination
+signal. `subscribeBlocks`/`subscribeBlocksFiltered` therefore stay too.
+
+A client that draws blocks *and* plays sound ends up holding both: a
+`ContextObserver` feed per followed context, and a `BlockEvents` subscription
+for directives. That is the intended end state, not a transitional wart — one is
+a change log where batching is a feature, the other is a directive channel where
+batching is forbidden.
+
 | Deleted | Reason |
 |---|---|
 | `onBlockTextOps @5`, `onBlockTextOpsBatch @17` | replaced by `textAppended` / `textReplaced` |
-| `onInputTextOps` | same, for the input document |
-| the other per-event `BlockEvents` methods | folded into `ContextEvent` |
+| ~~`onInputTextOps`~~ | **NOT this flag day** — see below |
+| the other per-event `BlockEvents` methods | folded into `ContextEvent` (except the four named above) |
 | `getContextSync @36` | returns raw oplog bytes; `getBlocks` + version replaces it |
 | `getContextState @34` | already a tombstone, redundant with `getBlocks` |
 | `pushOps @37`, `pushInputOps` | clients do not author operations |
 | `ops` on `onBlockInserted` | dead weight; the snapshot is what renders |
 | `declareEventCapabilities @104` | a flag day needs no negotiation |
 | `onSyncReset` | oplog compaction is server maintenance; a client holding materialized state is not affected by it |
+
+**`onInputTextOps` stays, and this is a correction to an earlier draft of this
+table.** The compose input is a separate document on a separate API surface
+(`editInput`, `getInputState`, `onInputTextOps`, `onInputCleared`) and it is
+still CRDT-backed — open question 2 below, deliberately out of scope here.
+Deleting its event because it looks like a sibling of `onBlockTextOps` would
+break the app's compose box for no gain: nothing in this change replaces it.
+It goes when the input document is migrated, which is its own decision and
+probably its own shape (a block with a draft status would delete six
+endpoints).
 
 ## Migration order (Amy, 2026-08-15)
 
