@@ -287,6 +287,11 @@ pub enum BlockFlow {
         /// Clients should merge these ops instead of creating their own.
         /// Arc-wrapped to avoid per-subscriber deep cloning.
         ops: Arc<[u8]>,
+        /// The context's mutation version **after** this insert, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -302,6 +307,11 @@ pub enum BlockFlow {
         /// Serialized CRDT operations (diamond-types format).
         /// Arc-wrapped to avoid per-subscriber deep cloning.
         ops: Arc<[u8]>,
+        /// The context's mutation version **after** this edit, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -362,6 +372,11 @@ pub enum BlockFlow {
         context_id: ContextId,
         /// The block that was deleted.
         block_id: BlockId,
+        /// The context's mutation version **after** this delete, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -375,6 +390,11 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// The new status.
         status: Status,
+        /// The context's mutation version **after** this change, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -388,6 +408,11 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// New collapsed state.
         collapsed: bool,
+        /// The context's mutation version **after** this change, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -401,6 +426,11 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// New excluded state.
         excluded: bool,
+        /// The context's mutation version **after** this change, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -414,6 +444,11 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// New position (after this block, None = beginning).
         after_id: Option<BlockId>,
+        /// The context's mutation version **after** this move, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -438,6 +473,11 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// The new output data.
         output: Option<kaijutsu_types::OutputData>,
+        /// The context's mutation version **after** this change, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -455,6 +495,11 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// Current scalar metadata for the block.
         metadata: kaijutsu_types::BlockMetadata,
+        /// The context's mutation version **after** this change, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -551,6 +596,33 @@ impl BlockFlow {
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
             | Self::MetadataChanged { block_id, .. } => Some(block_id),
+            Self::SyncReset { .. }
+            | Self::ContextSwitched { .. }
+            | Self::RenderCue { .. }
+            | Self::BeatSync { .. } => None,
+        }
+    }
+
+    /// Get the context's post-mutation version for this event, if it carries
+    /// one. `None` for the compaction-generation bump ([`Self::SyncReset`])
+    /// and the three non-block-mutation directives ([`Self::ContextSwitched`],
+    /// [`Self::RenderCue`], [`Self::BeatSync`]) — the server bridge uses this
+    /// to sort a delivery's block-mutation events into publish order before
+    /// sending, since the kernel captures the version under the document
+    /// guard but publishes after releasing it.
+    pub fn version(&self) -> Option<u64> {
+        match self {
+            Self::Inserted { version, .. }
+            | Self::TextOps { version, .. }
+            | Self::TextAppended { version, .. }
+            | Self::TextReplaced { version, .. }
+            | Self::Deleted { version, .. }
+            | Self::StatusChanged { version, .. }
+            | Self::CollapsedChanged { version, .. }
+            | Self::ExcludedChanged { version, .. }
+            | Self::Moved { version, .. }
+            | Self::OutputChanged { version, .. }
+            | Self::MetadataChanged { version, .. } => Some(*version),
             Self::SyncReset { .. }
             | Self::ContextSwitched { .. }
             | Self::RenderCue { .. }
@@ -1770,6 +1842,7 @@ mod tests {
                 block: Arc::new(block),
                 after_id: None,
                 ops: Arc::from(Vec::<u8>::new()),
+                version: 1,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1780,6 +1853,7 @@ mod tests {
             BlockFlow::Deleted {
                 context_id: ctx,
                 block_id: id,
+                version: 1,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1791,6 +1865,7 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 status: Status::Done,
+                version: 1,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1802,6 +1877,7 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 collapsed: true,
+                version: 1,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1813,6 +1889,7 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 after_id: None,
+                version: 1,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1829,6 +1906,7 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
+            version: 1,
             source: OpSource::Local,
         };
         assert_eq!(flow.subject(), "block.status");
@@ -1854,6 +1932,7 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 ops: Arc::from(vec![1u8, 2, 3]),
+                version: 1,
                 source: OpSource::Local,
                 seq_num: 0,
             });
@@ -1864,6 +1943,7 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
+            version: 2,
             source: OpSource::Local,
         });
 
@@ -1891,36 +1971,42 @@ mod tests {
             block: block.clone(),
             after_id: None,
             ops: Arc::from(vec![]),
+            version: 1,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::TextOps {
             context_id: ctx,
             block_id: id,
             ops: Arc::from(vec![1u8]),
+            version: 2,
             source: OpSource::Local,
             seq_num: 0,
         });
         bus.publish(BlockFlow::Deleted {
             context_id: ctx,
             block_id: id,
+            version: 3,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::StatusChanged {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
+            version: 4,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::CollapsedChanged {
             context_id: ctx,
             block_id: id,
             collapsed: true,
+            version: 5,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::Moved {
             context_id: ctx,
             block_id: id,
             after_id: None,
+            version: 6,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::SyncReset {
@@ -1951,6 +2037,7 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 ops: Arc::from(vec![0u8]),
+                version: 1,
                 source: OpSource::Local,
                 seq_num: 0,
             });
@@ -1962,6 +2049,7 @@ mod tests {
             block,
             after_id: None,
             ops: Arc::from(vec![]),
+            version: 1001,
             source: OpSource::Local,
         });
 
@@ -1987,12 +2075,14 @@ mod tests {
             block,
             after_id: None,
             ops: Arc::from(vec![]),
+            version: 1,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::StatusChanged {
             context_id: ctx,
             block_id: id,
             status: Status::Running,
+            version: 2,
             source: OpSource::Local,
         });
 
@@ -2074,6 +2164,7 @@ mod tests {
             block,
             after_id: None,
             ops: Arc::from(vec![42u8]),
+            version: 1,
             source: OpSource::Local,
         });
 
@@ -2116,6 +2207,7 @@ mod tests {
                 block: block_clone,
                 after_id: None,
                 ops: Arc::from(Vec::<u8>::new()),
+                version: 1,
                 source: OpSource::Local,
             });
         });
@@ -2462,42 +2554,49 @@ mod tests {
                 block: block.clone(),
                 after_id: None,
                 ops: Arc::from(Vec::<u8>::new()),
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::TextOps {
                 context_id: ctx,
                 block_id: id,
                 ops: Arc::from(Vec::<u8>::new()),
+                version: 1,
                 source: OpSource::Local,
                 seq_num: 0,
             },
             BlockFlow::Deleted {
                 context_id: ctx,
                 block_id: id,
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::StatusChanged {
                 context_id: ctx,
                 block_id: id,
                 status: Status::Done,
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::CollapsedChanged {
                 context_id: ctx,
                 block_id: id,
                 collapsed: true,
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::ExcludedChanged {
                 context_id: ctx,
                 block_id: id,
                 excluded: true,
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::Moved {
                 context_id: ctx,
                 block_id: id,
                 after_id: None,
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::SyncReset {
@@ -2508,12 +2607,14 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 output: None,
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::MetadataChanged {
                 context_id: ctx,
                 block_id: id,
                 metadata: kaijutsu_types::BlockMetadata::default(),
+                version: 1,
                 source: OpSource::Local,
             },
             BlockFlow::TextAppended {
@@ -2665,6 +2766,7 @@ mod tests {
             context_id: ctx,
             block_id: id,
             ops: Arc::from(vec![byte]),
+            version: byte as u64,
             source: OpSource::Local,
             seq_num: 0,
         }
@@ -2850,6 +2952,7 @@ mod tests {
             block,
             after_id: None,
             ops: Arc::from(Vec::<u8>::new()),
+            version: 0,
             source: OpSource::Local,
         });
         bus.publish(text_op(ctx, id, 1));
@@ -2858,6 +2961,7 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
+            version: 3,
             source: OpSource::Local,
         });
 

@@ -1267,7 +1267,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1294,7 +1294,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1304,6 +1305,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -1345,7 +1347,7 @@ impl BlockStore {
         role: Option<Role>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1374,7 +1376,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1384,6 +1387,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -1431,7 +1435,7 @@ impl BlockStore {
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1465,7 +1469,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1475,6 +1480,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -1517,7 +1523,7 @@ impl BlockStore {
             }
         }
         let after_id = after.cloned();
-        let (block_id, final_snapshot, ops, ops_bytes) = {
+        let (block_id, final_snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1536,7 +1542,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, final_snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, final_snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1545,6 +1552,7 @@ impl BlockStore {
             block: Arc::new(final_snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -1558,7 +1566,7 @@ impl BlockStore {
         block_id: &BlockId,
         status: Status,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1566,7 +1574,8 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
             entry.doc.set_status(block_id, status)?;
             entry.touch(principal_id);
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1577,6 +1586,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             status,
+            version,
             source: OpSource::Local,
         });
 
@@ -1662,6 +1672,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
             seq_num,
         });
@@ -1695,10 +1706,11 @@ impl BlockStore {
             TextChange::Replaced => BlockFlow::TextReplaced {
                 context_id,
                 block_id: *block_id,
+                // Moves the owned `String` into the `Arc` rather than copying
+                // it: the after-text was just materialized, and a whole extra
+                // copy of a block is not free on a large one.
                 content: Arc::from(
-                    after_text
-                        .expect("a replace classification always carries the after-text")
-                        .as_str(),
+                    after_text.expect("a replace classification always carries the after-text"),
                 ),
                 version,
                 source: OpSource::Local,
@@ -1714,14 +1726,15 @@ impl BlockStore {
         block_id: &BlockId,
         ephemeral: bool,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_ephemeral(block_id, ephemeral)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1734,6 +1747,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             metadata,
+            version,
             source: OpSource::Local,
         });
 
@@ -1747,20 +1761,22 @@ impl BlockStore {
         block_id: &BlockId,
         excluded: bool,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_excluded(block_id, excluded)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::ExcludedChanged {
             context_id,
             block_id: *block_id,
             excluded,
+            version,
             source: OpSource::Local,
         });
 
@@ -1779,20 +1795,22 @@ impl BlockStore {
         after: Option<&BlockId>,
     ) -> BlockStoreResult<()> {
         let after_id = after.cloned();
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.move_block(block_id, after)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::Moved {
             context_id,
             block_id: *block_id,
             after_id,
+            version,
             source: OpSource::Local,
         });
         Ok(())
@@ -1805,14 +1823,15 @@ impl BlockStore {
         block_id: &BlockId,
         content_type: ContentType,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_content_type(block_id, content_type)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1825,6 +1844,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             metadata,
+            version,
             source: OpSource::Local,
         });
 
@@ -1845,14 +1865,15 @@ impl BlockStore {
         block_id: &BlockId,
         status: TaskStatus,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_task_status(block_id, status)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1865,6 +1886,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             metadata,
+            version,
             source: OpSource::Local,
         });
 
@@ -1881,14 +1903,15 @@ impl BlockStore {
         block_id: &BlockId,
         exit_code: Option<i32>,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_exit_code(block_id, exit_code)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1901,6 +1924,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             metadata,
+            version,
             source: OpSource::Local,
         });
 
@@ -1918,14 +1942,15 @@ impl BlockStore {
         block_id: &BlockId,
         stderr: Option<String>,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_stderr(block_id, stderr)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1938,6 +1963,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             metadata,
+            version,
             source: OpSource::Local,
         });
 
@@ -1982,7 +2008,7 @@ impl BlockStore {
         block_id: &BlockId,
         output: Option<&kaijutsu_types::OutputData>,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1990,13 +2016,15 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
             entry.doc.set_output(block_id, output.cloned())?;
             entry.touch(principal_id);
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::OutputChanged {
             context_id,
             block_id: *block_id,
             output: output.cloned(),
+            version,
             source: OpSource::Local,
         });
 
@@ -2010,7 +2038,7 @@ impl BlockStore {
         block_id: &BlockId,
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2018,7 +2046,8 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
             entry.doc.set_tool_use_id(block_id, tool_use_id)?;
             entry.touch(principal_id);
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -2031,6 +2060,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             metadata,
+            version,
             source: OpSource::Local,
         });
 
@@ -2080,17 +2110,23 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
             seq_num,
         });
         // Classified as an append *by construction*, not by this function's
         // name (docs/change-feed.md rules 4-5): the primitive underneath
         // computes the end position and deletes nothing, so it satisfies
-        // `classify_text_edit`'s predicate for every input. Measuring the
-        // before-length here to re-derive that would materialize the whole
-        // block on every streamed token — the O(n²) the streaming path exists
-        // to avoid. `append_emits_exact_suffix` pins the claim against the
-        // engine's real behavior instead.
+        // `classify_text_edit`'s predicate for every input.
+        //
+        // Measuring the before-length here would materialize the whole block a
+        // SECOND time per streamed token. Not a second time in place of none:
+        // `BlockContent::append_text` already materializes it once to find the
+        // end (kaijutsu-crdt/src/content.rs), which is a real per-token O(n)
+        // this classification neither causes nor cures — it is filed in
+        // docs/issues.md and belongs in the text engine. What this avoids is
+        // doubling it. `append_emits_exact_suffix` pins the by-construction
+        // claim against the engine's real behavior.
         self.emit_text_change(
             context_id,
             block_id,
@@ -2110,7 +2146,7 @@ impl BlockStore {
         block_id: &BlockId,
         collapsed: bool,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2118,7 +2154,8 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
             entry.doc.set_collapsed(block_id, collapsed)?;
             entry.touch(principal_id);
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2127,6 +2164,7 @@ impl BlockStore {
             context_id,
             block_id: *block_id,
             collapsed,
+            version,
             source: OpSource::Local,
         });
 
@@ -2135,7 +2173,7 @@ impl BlockStore {
 
     /// Delete a block from a document.
     pub fn delete_block(&self, context_id: ContextId, block_id: &BlockId) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2143,7 +2181,8 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
             entry.doc.delete_block(block_id)?;
             entry.touch(principal_id);
-            entry.doc.ops_since(&frontier_before)
+            let version = entry.version();
+            (entry.doc.ops_since(&frontier_before), version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2151,6 +2190,7 @@ impl BlockStore {
         self.emit(BlockFlow::Deleted {
             context_id,
             block_id: *block_id,
+            version,
             source: OpSource::Local,
         });
 
@@ -2957,7 +2997,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2983,7 +3023,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2992,6 +3033,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -3102,7 +3144,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = parent_id.copied();
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -3124,7 +3166,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -3133,6 +3176,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -3154,7 +3198,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = parent_id.copied();
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -3176,7 +3220,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -3185,6 +3230,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id,
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -3203,7 +3249,7 @@ impl BlockStore {
         summary: impl Into<String>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let (block_id, snapshot, ops, ops_bytes) = {
+        let (block_id, snapshot, ops, ops_bytes, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -3225,7 +3271,8 @@ impl BlockStore {
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops, ops_bytes)
+            let version = entry.version();
+            (block_id, snapshot, ops, ops_bytes, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -3234,6 +3281,7 @@ impl BlockStore {
             block: Arc::new(snapshot),
             after_id: Some(*parent_id),
             ops: Arc::from(ops_bytes),
+            version,
             source: OpSource::Local,
         });
 
@@ -6252,6 +6300,131 @@ mod tests {
                     version: after_empty,
                 },
             ]
+        );
+    }
+
+    /// Drain every event the bus has queued right now, assert they all carry
+    /// the SAME version and that it exceeds `last_version`, and return it.
+    ///
+    /// A mutation that emits more than one event today (a text edit's
+    /// `TextOps` and its classified `TextAppended`/`TextReplaced` sibling,
+    /// docs/change-feed.md) legitimately shares one version between them —
+    /// they are captured under a single `entry.touch()` inside a single
+    /// mutation-lock guard, i.e. one accepted mutation, not two. That pairing
+    /// is deliberate and expected to diverge in a later slice; this helper
+    /// pins today's actual behavior rather than a version-per-event
+    /// assumption that would be wrong right now.
+    fn drain_one_mutation(
+        sub: &mut crate::flows::Subscription<BlockFlow>,
+        last_version: u64,
+        label: &str,
+    ) -> u64 {
+        let mut versions = Vec::new();
+        while let Some(msg) = sub.try_recv() {
+            let v = msg
+                .payload
+                .version()
+                .unwrap_or_else(|| panic!("{label}: event with no version: {:?}", msg.payload));
+            versions.push(v);
+        }
+        assert!(!versions.is_empty(), "{label}: emitted no events");
+        let v = versions[0];
+        assert!(
+            versions.iter().all(|&x| x == v),
+            "{label}: every event from one mutation must carry the same version, got {versions:?}"
+        );
+        assert!(
+            v > last_version,
+            "{label}: version must strictly increase across mutations: {v} did not exceed {last_version}"
+        );
+        v
+    }
+
+    /// The property the change-feed ordering fix depends on: every
+    /// `BlockFlow` mutation variant carries the context's post-mutation
+    /// version, captured inside the mutation lock, and that version moves
+    /// strictly forward from one mutation to the next — never backward,
+    /// never stalled — because the server bridge sorts a delivery by this
+    /// field to recover publish order across concurrent writers (the kernel
+    /// captures the version under the document guard but publishes after
+    /// releasing it, so publish order and lock order can disagree).
+    ///
+    /// Drives one of every mutating op this store exposes (insert twice,
+    /// since a move needs a second block) on a single context, and checks
+    /// the resulting stream against `store.version()`.
+    #[tokio::test]
+    async fn block_flow_version_tracks_mutation_order() {
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let mut last_version = 0u64;
+
+        let a = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "hello",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "insert_block a");
+
+        let b = store
+            .insert_block(
+                ctx,
+                None,
+                Some(&a),
+                Role::Model,
+                BlockKind::Text,
+                "world",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "insert_block b");
+
+        store.set_status(ctx, &a, Status::Done).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "set_status");
+
+        store.set_collapsed(ctx, &a, true).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "set_collapsed");
+
+        store.set_excluded(ctx, &a, true).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "set_excluded");
+
+        let output =
+            kaijutsu_types::OutputData::nodes(vec![kaijutsu_types::OutputNode::text("row")]);
+        store.set_output(ctx, &a, Some(&output)).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "set_output");
+
+        // Ends at the current character count — classified as an append, one
+        // event pair (`TextOps` + `TextAppended`), one version.
+        store.append_text(ctx, &a, "!").unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "append_text");
+
+        // Inserts at position 0, not the end — classified as a replace, one
+        // event pair (`TextOps` + `TextReplaced`), one version.
+        store.edit_text(ctx, &a, 0, "X", 0).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "edit_text");
+
+        store.move_block(ctx, &b, None).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "move_block");
+
+        store.delete_block(ctx, &b).unwrap();
+        last_version = drain_one_mutation(&mut sub, last_version, "delete_block");
+
+        assert_eq!(
+            last_version,
+            store.version(ctx).unwrap(),
+            "the last mutation's version must equal what `store.version()` reports"
         );
     }
 }
