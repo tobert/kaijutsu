@@ -42,6 +42,38 @@ of confusion each time, and it is a silent fallback of the kind we treat as a
 defect: it should either honour the flag under `serve` or refuse the
 combination, not quietly do the other thing.
 
+## The config git worktree has no index — `git status` will lie to an operator
+
+Lane B's seam (`crates/kaijutsu-configgit`) writes commits straight from the
+worktree: it walks the live files, builds the tree, commits. It never touches a
+`.git/index`, because the aligned gitoxide plumbing pin set has no stage-all
+helper and staging through an index would be a second copy of the truth.
+
+Consequence, and it matters because Lane B's stated point is that the directory
+is **an operator-visible recovery surface**: someone who cds into
+`<data_dir>/config` and runs real `git status` sees **everything as untracked**,
+while the history is complete and correct. `git log`, `git show` and
+`git checkout` all work; only the index-derived views are wrong.
+
+Decide before the kernel wiring slice, not after someone is confused at 2am:
+
+- write an index alongside each commit (more gitoxide plumbing we then own), or
+- leave it and **say so in the directory** — a README committed at init
+  explaining that this worktree is kernel-written, that `git status` is
+  meaningless here, and which commands do work.
+
+The second is cheaper and honest, and it fits the "no watcher, no implicit
+import" ruling: an operator is a reader here, not a committer. Related: ruling 3
+wants unexpected dirtiness detected and failed loud, which is still doable
+without an index (compare the worktree walk against the HEAD tree), just
+hand-rolled.
+
+Also from the same slice: `init_or_open` hand-writes `HEAD` and a minimal
+`config`, because the pin set has no plumbing `init` (that lives in
+`gix-repository`, deliberately outside the aligned set). Two `fs::write` calls,
+but it is one more piece of git's on-disk format this crate now owns and must
+keep correct by hand.
+
 ## The well's activity glow wants a derived signal (2026-08-15)
 
 The glow is **disabled**, not broken: `RingActivity`'s decay/ripple math is live

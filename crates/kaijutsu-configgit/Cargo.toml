@@ -1,0 +1,73 @@
+[package]
+name = "kaijutsu-configgit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git write seam for the CRDT melt's Lane B (rc/config → plain files + git), built on gitoxide plumbing, never the git executable"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Aligned to ~/src/kaish-extras/crates/kaish-tools-git (inspected 2026-08-15 at
+# commit 96e9825; docs/crdt-melt.md "Git write mechanism — align to
+# kaish-extras" is the ruling this pin set answers to). That crate calls its
+# own set the "Path 2 plumbing pin set": built directly on gitoxide's
+# low-level crates, skipping the `gix` facade entirely, because the facade
+# links gix-command unconditionally (even with --no-default-features) via
+# gix-command -> gix-transport -> gix-protocol -> gix, reintroducing
+# subprocess-spawn machinery. That is also this repo's host-exec-has-one-owner
+# rule (CLAUDE.md): a git subprocess here would be a second exec site kaish
+# already owns.
+#
+# kaish-tools-git is READ-ONLY today (verbs info/status/log, one ReadRepo
+# handle) and has no commit path — this crate is the write half, aligned to
+# its exact pins so it can move into kaish-tools-git as a `Profile::Write`
+# later without a rewrite (deferred, not blocking; see the doc section
+# above). Only the subset of their pin set this crate's write path actually
+# needs is pulled in: object/tree/commit encoding, the loose object store
+# writer, and ref transactions. Their read-side crates (gix-index,
+# gix-worktree, gix-ignore, gix-glob, gix-diff, gix-imara-diff, gix-pack,
+# gix-traverse, gix-revision, gix-revwalk, gix-commitgraph, gix-discover,
+# gix-config, jiff, filetime) aren't needed here: commit_all always rewalks
+# the live worktree rather than staging through an on-disk index, and
+# init_or_open works a known, fixed path rather than discovering one.
+#
+# Every one of these gates its hash implementation behind its own feature
+# (gix-hash itself has `default = []` and will not compile without one
+# selected); none turn `sha1` on by default and Cargo does not infer it from
+# a sibling crate's choice, so it's requested explicitly below, same as
+# kaish-tools-git does.
+gix-object = { version = "=0.63.0", features = ["sha1"] }
+# CommitRef::author()/committer() (and our own Commit construction) hand back
+# a gix_actor::Signature/SignatureRef, and gix-object does not re-export the
+# crate that owns it. Already in the graph under gix-object; pinned because
+# we use it directly, same reasoning as kaish-tools-git's Cargo.toml comment
+# on this line.
+gix-actor = "=0.41.2"
+gix-odb = { version = "=0.83.0", features = ["sha1"] }
+gix-ref = { version = "=0.66.0", features = ["sha1"] }
+# `git log`-style timestamps and Signature::time both need gix_date::Time
+# named directly. gix-object re-exports the crate as `gix_object::date`, but
+# kaish-tools-git pins it directly anyway ("Already in the graph via
+# gix-object; pinned here for direct use") and this crate matches that.
+gix-date = "=0.15.6"
+# Not named directly in kaish-tools-git's own Cargo.toml — its read path
+# reaches gix_hash::ObjectId via `use gix_index::hash as gix_hash;`
+# (crates/kaish-tools-git/src/repo.rs:19) to avoid a direct dependency entry
+# while staying on the copy gix-index already pulls in for its own reasons.
+# This crate has no index-staging step (see above), so there's no gix-index
+# edge to ride along on; gix-hash is named directly instead, pinned to the
+# version gix-object 0.63.0 resolves to in kaish-extras' own Cargo.lock, to
+# stay aligned rather than let the resolver pick independently of that graph.
+gix-hash = { version = "=0.26.0", features = ["sha1"] }
+# Same situation as gix-hash: transitively in the graph via gix-ref (ref-file
+# locking during a transaction), but kaish-tools-git's read path never opens
+# a write transaction so it never names the crate. Pinned to kaish-extras'
+# resolved version for the same reason.
+gix-lock = "=24.0.0"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

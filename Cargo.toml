@@ -21,6 +21,7 @@ members = [
     "crates/kaijutsu-viz",
     "crates/kaijutsu-isotest",
     "crates/approval-ledger",
+    "crates/kaijutsu-configgit",
 ]
 
 [workspace.package]
