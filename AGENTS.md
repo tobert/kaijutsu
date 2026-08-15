@@ -72,6 +72,16 @@ Three rules that follow, and they are the ones to check a patch against:
    authored, edited, completed, excluded; input edited, submitted, cleared — not
    a text engine's encoding of them.
 
+**Clients read over the wire and write through kaish.** There is deliberately no
+client-facing RPC for editing block text — `pushOps` was the only one and it is
+deleted. A client *follows* a context through the change feed
+(`docs/change-feed.md`) and *mutates* by asking the kernel to run something:
+`kj block append`/`edit`, an MCP block tool, a kaish script. One mutation path,
+one set of capability checks, instead of a parallel RPC surface that would drift
+from it (Amy, 2026-08-15: *"clients should rely on stuff in kaish anyways most of
+the time"*). `authorBlock` stays — authoring a whole block is a submission, not
+an edit.
+
 *Migration in flight.* Block text is stored in a CRDT (diamond-types-extended,
 the `kaijutsu-crdt` crate) and some clients still consume raw sync payloads. That
 is being retired: DTE stays only where it earns its keep, as a **private text

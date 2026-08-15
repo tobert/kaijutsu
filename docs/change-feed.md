@@ -166,6 +166,23 @@ resolves the overlap. **Rationale for 24.** Without a snapshot version the clien
 cannot tell whether a buffered append is already included, and applying it twice
 corrupts the text.
 
+## The feed is read-only, and that is the whole client contract
+
+A client **follows** a context here and **mutates** it by asking the kernel to
+run something. There is no client-facing RPC for editing block text: `pushOps`
+was the only one, and deleting it left none. Text reaches a block through the
+LLM stream, an MCP block tool, `kj block append`/`edit`, or a kaish write — all
+kernel-side, all behind the same capability checks.
+
+That is a decision, not an omission (Amy, 2026-08-15: *"clients should rely on
+stuff in kaish anyways most of the time"*). A parallel authoring RPC would be a
+second mutation path to keep in step with the first, and the first is the one
+every tool and script already uses. `authorBlock` stays, because authoring a
+whole block is a submission rather than an edit.
+
+Practical consequence for anyone writing a client: if you need to change text,
+call `executeKj` or a tool. If you need to *see* text change, subscribe here.
+
 ## Timing artifacts do NOT ride this feed
 
 `RenderCue` and `BeatSync` stay on their own delivery path.

@@ -2393,8 +2393,11 @@ impl BlockStore {
         for doc in docs {
             let context_id = doc.document_id;
 
-            // Load base snapshot if available
-            let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
+            // Load base snapshot if available. `snap_row.version` is the
+            // context version the snapshot was taken AT — the durable half of
+            // the version this document resumes from (see `base_version`
+            // below).
+            let (mut crdt_store, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
                 Ok(Some(snap_row)) => {
                     match codec::decode::<StoreSnapshot>(&snap_row.state) {
                         Ok(store_snapshot) => {
@@ -2402,10 +2405,11 @@ impl BlockStore {
                                 document_id = %context_id.to_hex(),
                                 blocks = store_snapshot.blocks.len(),
                                 snap_seq = snap_row.seq,
+                                snap_version = snap_row.version,
                                 "Restored document from snapshot"
                             );
                             match CrdtBlockStore::from_snapshot(store_snapshot, principal_id) {
-                                Ok(store) => (store, snap_row.seq),
+                                Ok(store) => (store, snap_row.seq, snap_row.version.max(0) as u64),
                                 Err(e) => {
                                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot, skipping");
                                     continue;
@@ -2418,7 +2422,7 @@ impl BlockStore {
                         }
                     }
                 }
-                Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0),
+                Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0, 0),
                 Err(e) => {
                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot, skipping");
                     continue;
@@ -2485,7 +2489,20 @@ impl BlockStore {
                 );
             }
 
-            let version = crdt_store.version();
+            // The context version RESUMES; it does not restart. Every
+            // mutator bumps the version once under the document guard and
+            // journals exactly one op, so the version at the snapshot plus the
+            // ops replayed since it is the version this document was at when
+            // the kernel stopped. `crdt_store.version()` counts merged
+            // payloads instead, which after a restart is "how many ops
+            // survived past the last compaction" — a number that starts near
+            // zero on a context that had run for weeks.
+            //
+            // It matters because the version is a client's recovery anchor
+            // (docs/change-feed.md rules 21-26) and, in time, the coordinate a
+            // repair replay is addressed by. A version that silently rewinds
+            // makes both meaningless.
+            let version = base_version + replayed;
             let entry = DocumentEntry {
                 doc: crdt_store,
                 kind: doc.doc_kind,
@@ -2535,8 +2552,9 @@ impl BlockStore {
 
         let principal_id = self.principal_id();
 
-        // Load base snapshot if available
-        let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
+        // Load base snapshot if available. `snap_row.version` is the context
+        // version it was taken at — see the version note in `load_from_db`.
+        let (mut crdt_store, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
             Ok(Some(snap_row)) => {
                 match codec::decode::<StoreSnapshot>(&snap_row.state) {
                     Ok(store_snapshot) => {
@@ -2544,10 +2562,11 @@ impl BlockStore {
                             document_id = %context_id.to_hex(),
                             blocks = store_snapshot.blocks.len(),
                             snap_seq = snap_row.seq,
+                            snap_version = snap_row.version,
                             "Hydrated document from snapshot"
                         );
                         match CrdtBlockStore::from_snapshot(store_snapshot, principal_id) {
-                            Ok(store) => (store, snap_row.seq),
+                            Ok(store) => (store, snap_row.seq, snap_row.version.max(0) as u64),
                             Err(e) => {
                                 tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot");
                                 return Ok(false);
@@ -2560,7 +2579,7 @@ impl BlockStore {
                     }
                 }
             }
-            Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0),
+            Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0, 0),
             Err(e) => {
                 tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot");
                 return Ok(false);
@@ -2610,7 +2629,10 @@ impl BlockStore {
             );
         }
 
-        let version = crdt_store.version();
+        // Resume the version rather than restarting it — see `load_from_db`.
+        // Every replayed entry applied (any failure returned above), so the
+        // entry count is the number of mutations since the snapshot.
+        let version = base_version + oplog_entries.len() as u64;
         let entry = DocumentEntry {
             doc: crdt_store,
             kind: doc.doc_kind,
@@ -6270,6 +6292,151 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].content, "x");
         assert_eq!(blocks[0].status, Status::Done);
+    }
+
+    // ── Version durability (docs/change-feed.md rules 21-26) ─────────────
+
+    /// The context version RESUMES across a restart.
+    ///
+    /// It used to restart: the loader seeded it from the number of replayed
+    /// oplog rows, so a long-lived context came back at a small number and
+    /// every client's recovery anchor silently rewound. A version that goes
+    /// backwards makes "discard deliveries at or below the snapshot version"
+    /// mean the opposite of what it says.
+    ///
+    /// **This test agrees with the old, wrong formula by construction** — with
+    /// no snapshot, replaying from zero counts exactly the mutations that
+    /// happened. It pins the property; the test with teeth is
+    /// `version_resumes_across_a_restart_after_compaction`, which is the only
+    /// one of these four that fails against the old code (verified by
+    /// reverting it).
+    #[test]
+    fn version_resumes_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        for chunk in ["a", "b", "c", "d"] {
+            store.append_text(ctx, &block_id, chunk).unwrap();
+        }
+        let before = store.version(ctx).unwrap();
+        assert!(before >= 5, "fixture should have made several mutations");
+
+        drop(store);
+        let store2 = drop_and_reload(db, ws);
+
+        assert_eq!(
+            store2.version(ctx).unwrap(),
+            before,
+            "the version a context resumes at must be the version it stopped at"
+        );
+    }
+
+    /// The same, across a compaction — the case the old code got closest to
+    /// getting right, since compaction is what persists the version at all.
+    /// After compaction the oplog is truncated, so a loader that counts rows
+    /// sees almost none and reports a version near zero for a context that had
+    /// taken hundreds of mutations.
+    #[test]
+    fn version_resumes_across_a_restart_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        // Past COMPACTION_OP_THRESHOLD, so a snapshot is written and the
+        // oplog behind it is truncated.
+        for i in 0..(COMPACTION_OP_THRESHOLD + 20) {
+            store
+                .append_text(ctx, &block_id, &(i % 10).to_string())
+                .unwrap();
+        }
+        let before = store.version(ctx).unwrap();
+        assert!(
+            before > COMPACTION_OP_THRESHOLD,
+            "fixture must cross the compaction threshold, got {before}"
+        );
+
+        drop(store);
+        let store2 = drop_and_reload(db, ws);
+
+        assert_eq!(
+            store2.version(ctx).unwrap(),
+            before,
+            "a compacted context must resume at its real version, not at the \
+             number of oplog rows that survived truncation"
+        );
+    }
+
+    /// Resuming is not enough on its own: the next mutation has to continue
+    /// from the resumed value, so versions stay strictly increasing across the
+    /// restart boundary as well as within a session.
+    #[test]
+    fn a_mutation_after_a_restart_continues_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "before", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        let before = store.version(ctx).unwrap();
+
+        drop(store);
+        let store2 = drop_and_reload(db, ws);
+        store2.append_text(ctx, &block_id, "-after").unwrap();
+
+        assert!(
+            store2.version(ctx).unwrap() > before,
+            "a post-restart mutation must advance past every pre-restart version"
+        );
+        assert_eq!(
+            store2
+                .get_block_snapshot(ctx, &block_id)
+                .unwrap()
+                .unwrap()
+                .content,
+            "before-after"
+        );
+    }
+
+    /// Hydrating one document on demand must agree with hydrating the whole
+    /// store — two loaders, one version rule.
+    #[test]
+    fn load_one_agrees_with_load_all_on_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        for chunk in ["x", "y", "z"] {
+            store.append_text(ctx, &block_id, chunk).unwrap();
+        }
+        let before = store.version(ctx).unwrap();
+        drop(store);
+
+        let creator = PrincipalId::system();
+        let lazy = BlockStore::with_db(db.clone(), ws, creator);
+        assert!(lazy.load_one_from_db(ctx).unwrap(), "document hydrates");
+        assert_eq!(lazy.version(ctx).unwrap(), before);
+
+        let eager = drop_and_reload(db, ws);
+        assert_eq!(eager.version(ctx).unwrap(), before);
     }
 
     /// The version rides on the event, not on the delivery, so a subscriber can

@@ -6,33 +6,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Three findings from the change-feed step-1 review (2026-08-15, kaibo/DeepSeek)
+## Two findings from the change-feed step-1 review (2026-08-15, kaibo/DeepSeek)
 
-All three are pre-existing; the change feed is what makes them matter.
+Both pre-existing; the change feed is what makes them matter. A third — the
+context version resetting on restart — was **fixed** the same day: Amy ruled
+*"persist & restore the version, it'll come in handy when we need repair
+replays"*.
 
-### 1. The context version resets on kernel restart — DECISION NEEDED
-
-`getBlocks`'s version is now a client's recovery anchor (docs/change-feed.md
-rules 21-26), and it is **not durable**. `StoreSnapshot` carries no version;
-`CrdtBlockStore::from_snapshot` starts at 0; `load_from_db` seeds
-`DocumentEntry::version` from `crdt_store.version()`, which after replay is
-*the number of replayed ops*, not the persisted value. Compaction **does**
-persist the real version (`kernel_db.rs`, read back as `DocSnapshotRow.version`)
-and `load_from_db` simply never reads it. So a context at version 5000 restarts
-at 3.
-
-Two defensible answers, and the current state is neither because it is unstated:
-
-- restore `snap_row.version + replayed_count` on load; or
-- declare the version **session-scoped** and lean on the fact that a restart
-  forces a reconnect, which the recovery protocol already answers with
-  re-subscribe + refetch.
-
-The second is nearly free and arguably correct — but only if it is written down,
-because a client that keeps a version across a reconnect would otherwise be
-silently wrong.
-
-### 2. `BlockContent::append_text` materializes the whole block per token
+### 1. `BlockContent::append_text` materializes the whole block per token
 
 The streaming path's O(n²) is **not** gone. `append_text` computes
 `self.text().chars().count()` on every call (`kaijutsu-crdt/src/content.rs`), so
@@ -44,7 +25,7 @@ without building a `String`. This is one more reason the block-text
 representation is headed for a plain `String` (docs/crdt-melt.md, "What replaces
 DTE").
 
-### 3. kaish VFS write passes a byte length as a character count
+### 2. kaish VFS write passes a byte length as a character count
 
 `kaish_backend.rs`'s write path computes `current_len` as `b.content.len()`
 (bytes) and passes it to `edit_text` as the `delete` **character** count. On a
