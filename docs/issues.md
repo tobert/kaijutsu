@@ -59,6 +59,54 @@ a fresh `instance` or the same one?) outside this task's scope.
 
 ---
 
+## Context lifecycle — three sharp edges found while replacing ROOT (2026-08-15)
+
+Found the expensive way, replacing ROOT with a fresh deepseek-v4-flash
+generation. All three are real; the first destroyed a context.
+
+**1. `kj context archive` CASCADES to structural children, and the confirm
+prompt does not say so.** The latch prints `(90 blocks | 1 children | 0 drift
+edges)` — a count, not a consequence — and then reports `archived 2
+context(s)`. I had reparented the new ROOT under the old one (to give the new
+generation honest lineage), archived the old one, and **took the new ROOT with
+it**. The blast-radius line reads like inventory; it should say what will
+happen to those children, because "1 children" and "this will archive 1 other
+context" are read completely differently at 2 lines of terminal output.
+*This matters far beyond one mistake:* a janitor sweeping on age will archive
+parents, and every descendant goes with them regardless of its own age. The
+age filter people will reason about is per-context; the effect is per-subtree.
+
+**2. There is no way to create a detached (parentless) context from `kj`.**
+`kj context create`'s `--parent` resolves to the *caller's* context when
+absent (`context_create`, "Default to root if no current context" — only
+reached when the caller has none). Genesis makes ROOT with `parent = None`
+(`rpc.rs`, `create_context_inner(..., None, ...)`), which `kj` cannot express.
+So the root of the tree can only be born at genesis; recreate it any other way
+and it descends from whatever session happened to run the command. Combined
+with #1 that is a live landmine: **the current ROOT (`f0a66870`) is a
+structural child of a `cc-kaijutsu-*` session context**, so archiving that
+session — which the 3-hour rule will eventually do — cascades into ROOT.
+Wants either a `--detached` flag or a `--parent` sentinel.
+
+**3. An archived context still holds its label, so the label is
+simultaneously "in use" and "not found".** `kj context create ROOT` →
+`label conflict: label 'ROOT' already in use`; `kj context info ROOT` →
+`not found: no context matches 'ROOT'`. The uniqueness check sees archived
+rows, resolution does not. `retag` *can* still see the holder (it reported
+`currently held by ROOT (b94d3f85)` for an archived context), which is the
+only reason recovery was possible. Either the conflict check should ignore
+archived rows, or the error should say the holder is archived and name
+`retag` as the way through — right now the two messages contradict each other
+and neither points anywhere.
+
+**Also worth a ruling: should a promoted (ring0) context be sweep-exempt and
+cascade-exempt?** Promotion did NOT protect the new ROOT from the cascade in
+#1 (it was promoted before the archive). ROOT itself had 29 days of no
+activity, so the 3-hour rule would archive the root of the tree on its own
+merits — the manual sweep only spared it because it was excluded by label.
+
+---
+
 ## Janitors and librarians — long-running contexts that tend the kernel (Amy, 2026-08-15)
 
 Amy's direction, prompted by finding 195 idle contexts behind the roster:
