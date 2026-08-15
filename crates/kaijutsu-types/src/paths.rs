@@ -63,6 +63,16 @@ pub const RUN_ROOT: &str = "/run";
 /// Ephemeral by construction — see [`RUN_ROOT`].
 pub const MIDI_RUN_ROOT: &str = "/run/midi";
 
+/// Root of the live roster view (`crates/kaijutsu-kernel/src/roster.rs`) —
+/// who's around right now, agents and humans alike. `/run/roster/index` is a
+/// generation-stamped TSV of every current row; `/run/roster/<entity_kind>-
+/// <entity_id>/` holds one fact-per-file for that entity. A materialized
+/// view over `kernel.db`, but still ephemeral in the `/run` sense: liveness
+/// itself is never trusted as a stored fact across a restart (see the module
+/// doc), so this is exactly as much "current runtime state, not truth that
+/// survives unquestioned" as `/run/midi`.
+pub const ROSTER_RUN_ROOT: &str = "/run/roster";
+
 /// Root of the read-only content-addressed object pool
 /// (`/v/cas/<shard>/<hash>`).
 pub const CAS_ROOT: &str = "/v/cas";

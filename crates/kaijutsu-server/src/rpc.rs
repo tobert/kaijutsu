@@ -1818,6 +1818,23 @@ pub async fn create_shared_kernel(
         kaijutsu_kernel::midi_presence::MidiPresenceFs::new(kernel.midi_presence().clone());
     kernel.mount(paths::MIDI_RUN_ROOT, presence_fs).await;
 
+    // The live roster (`kaijutsu_kernel::roster` module doc): who's around
+    // right now, agents and humans alike, persisted in kernel.db and read
+    // back through a single generation-stamped view at /run/roster. `/run`
+    // is the right tree even though this one is SQL-backed, not in-memory —
+    // liveness itself is never trusted as a stored fact across a restart
+    // (same module doc), so it is exactly as ephemeral in spirit as
+    // /run/midi. Constructed here (not inside `KjDispatcher::new`, which
+    // doesn't exist yet at this point in boot — mounts freeze before it's
+    // constructed) so the SAME `RosterStore` instance backs both this mount
+    // and the dispatcher's `kj roster` verbs; see `KjDispatcher::
+    // new_with_roster`'s doc for why a second, independently-constructed
+    // store here would silently desync the generation counter.
+    let roster_store =
+        Arc::new(kaijutsu_kernel::roster::RosterStore::new(kernel_db_arc.clone()));
+    let roster_fs = kaijutsu_kernel::vfs::RosterFs::new(roster_store.clone());
+    kernel.mount(paths::ROSTER_RUN_ROOT, roster_fs).await;
+
     // Mount the CAS object pool read-only at /v/cas (docs/slash-v.md track B).
     // A CasFs over the kernel's FileStore renders every stored object as an
     // immutable file, sharded on the hash's leading two hex chars to match the
@@ -2059,12 +2076,15 @@ pub async fn create_shared_kernel(
         None
     };
 
-    // Create kj dispatcher — shared across all connections
-    let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new(
+    // Create kj dispatcher — shared across all connections. Takes the SAME
+    // `roster_store` the /run/roster mount above uses (`new_with_roster`),
+    // not a freshly constructed one.
+    let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new_with_roster(
         kernel_arc.drift().clone(),
         documents.clone(),
         kernel_db_arc.clone(),
         kernel_arc.clone(),
+        roster_store,
     ));
     // Stash a Weak<Self> on the dispatcher so internal paths (rc
     // lifecycle, kaish hook bodies) can construct KjBuiltin without

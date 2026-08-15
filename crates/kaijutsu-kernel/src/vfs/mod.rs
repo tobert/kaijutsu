@@ -27,7 +27,7 @@ mod types;
 
 pub use activity::{ActivityCursor, ActivityDigest};
 pub use backends::{
-    CasFs, LocalBackend, MemoryBackend, SHARE_OP_TIMEOUT, ShareFs, ShareRegisterError,
+    CasFs, LocalBackend, MemoryBackend, RosterFs, SHARE_OP_TIMEOUT, ShareFs, ShareRegisterError,
     ShareRegistry, ShareRow,
 };
 pub use error::{VfsError, VfsResult};

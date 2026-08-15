@@ -38,6 +38,7 @@ pub mod preset;
 pub mod editor;
 pub mod rc;
 pub mod lifecycle;
+pub mod roster;
 pub mod model;
 pub mod refs;
 pub mod search;
@@ -249,6 +250,10 @@ pub struct KjDispatcher {
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     kernel: Arc<Kernel>,
+    /// The live roster's storage half (`crate::roster`) — one per kernel,
+    /// backed by the same `kernel_db`. Held here (not on `Kernel`) because
+    /// `KernelDb` itself lives with the dispatcher, not the kernel.
+    roster: Arc<crate::roster::RosterStore>,
     /// Self-Weak so internal paths (rc lifecycle, hook kaish) can hand
     /// an `Arc<KjDispatcher>` to `KjBuiltin::new` without forcing every
     /// call site to thread an Arc through. Set via `set_self_arc` after
@@ -270,6 +275,29 @@ impl KjDispatcher {
         kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
         kernel: Arc<Kernel>,
     ) -> Self {
+        let roster = Arc::new(crate::roster::RosterStore::new(kernel_db.clone()));
+        Self::new_with_roster(drift, blocks, kernel_db, kernel, roster)
+    }
+
+    /// Same as [`Self::new`] but takes an existing [`crate::roster::RosterStore`]
+    /// instead of constructing one internally. Use this whenever something
+    /// ELSE also needs to observe the same store's generation counter and
+    /// `refreshed_at` boot stamp — most notably a `/run/roster` VFS mount at
+    /// server boot, which is set up before `KjDispatcher` exists (mounts
+    /// freeze before the dispatcher is constructed). Two independently
+    /// constructed `RosterStore`s over the same `kernel_db` would read/write
+    /// the same rows correctly but track SEPARATE generation/boot-freshness
+    /// state, so a caching reader on one side would never see the other
+    /// side's bumps — the exact kind of drift a shared generation stamp
+    /// exists to prevent. `Self::new` remains the right choice for any
+    /// caller that never mounts a roster VFS view (most tests).
+    pub fn new_with_roster(
+        drift: SharedDriftRouter,
+        blocks: SharedBlockStore,
+        kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
+        kernel: Arc<Kernel>,
+        roster: Arc<crate::roster::RosterStore>,
+    ) -> Self {
         let kernel_id = kernel_db
             .lock()
             .kernel_id()
@@ -280,9 +308,15 @@ impl KjDispatcher {
             kernel_db,
             kernel_id,
             kernel,
+            roster,
             weak_self: parking_lot::RwLock::new(None),
             semantic_index: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// The live roster's storage half.
+    pub(crate) fn roster(&self) -> &Arc<crate::roster::RosterStore> {
+        &self.roster
     }
 
     /// Wire a `Weak<Self>` so internal paths can construct `KjBuiltin`
@@ -391,6 +425,12 @@ impl KjDispatcher {
         // context — same exemption rationale as `kj audio`/`kj config`.
         if cmd == "midi" {
             return self.dispatch_midi(&argv[1..], caller).await;
+        }
+        // `kj roster` posts/reads the live roster; identity is stamped from
+        // `caller`, not from an active context — works with or without one
+        // (a human at the shell has no context to require).
+        if cmd == "roster" {
+            return self.dispatch_roster(&argv[1..], caller).await;
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
@@ -818,6 +858,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())
         .subcommand(midi::MidiArgs::command())
+        .subcommand(roster::RosterArgs::command())
         .subcommand(cp::CpArgs::command())
         .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())
@@ -972,7 +1013,16 @@ pub(crate) mod test_helpers {
         let presence_fs =
             crate::midi_presence::MidiPresenceFs::new(kernel.midi_presence().clone());
         kernel.mount(MIDI_RUN_ROOT, presence_fs).await;
-        KjDispatcher::new(drift, blocks, kernel_db, kernel)
+        // The live roster's read-only view, over the SAME `RosterStore`
+        // instance `KjDispatcher` uses (`new_with_roster` — see its doc for
+        // why a second, independently-constructed store would be a bug) so
+        // `kj roster status`/`list` and `/run/roster` tests observe one
+        // shared generation counter, matching production wiring.
+        let roster = std::sync::Arc::new(crate::roster::RosterStore::new(kernel_db.clone()));
+        kernel
+            .mount(kaijutsu_types::paths::ROSTER_RUN_ROOT, crate::vfs::RosterFs::new(roster.clone()))
+            .await;
+        KjDispatcher::new_with_roster(drift, blocks, kernel_db, kernel, roster)
     }
 
     /// Install an rc script in the mounted `/etc/rc` tree, through the same

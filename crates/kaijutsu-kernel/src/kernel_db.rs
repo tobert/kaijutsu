@@ -31,6 +31,7 @@ use kaijutsu_types::{
 use crate::llm::stream::{CacheTarget, CacheTtl};
 use crate::mcp::binding::ContextToolBinding;
 use crate::mcp::types::InstanceId;
+use crate::roster::{Availability, LivenessKind, PresenceSnapshotRow, RosterEntity, RosterRow};
 
 // ============================================================================
 // Error type
@@ -1012,6 +1013,157 @@ CREATE TABLE IF NOT EXISTS embedding_config (
     model_dir  TEXT    NOT NULL,
     dimensions INTEGER NOT NULL CHECK (dimensions > 0),
     max_tokens INTEGER NOT NULL CHECK (max_tokens > 0)
+);
+
+-- ── Roster (`crates/kaijutsu-kernel/src/roster.rs`) ─────────────────────
+-- The live roster: who's around right now, agents and humans alike. A
+-- MATERIALIZED VIEW, not a log — `docs/issues.md`/the design record: "current
+-- only, we have otel traces & logs for history." Every presence transition
+-- emits an otel event (`kaijutsu-telemetry`) instead of accumulating rows
+-- here; these four tables hold only what is true *now*.
+--
+-- Liveness is deliberately NOT a durable fact carried across a restart —
+-- `roster_activity.live` is a computed column, entirely overwritten on every
+-- refresh pass (`RosterStore::reconcile`) from the live source of truth
+-- (PeerRegistry for `bound`, a recency window over `contexts.last_activity_at`
+-- for `recent`). This is what lets the view survive a restart without lying:
+-- a `bound` row a prior kernel process wrote is worthless truth the moment
+-- the process restarts (no live connections exist yet), and the very next
+-- reconciliation prunes it — same "remove, don't downgrade to false" stance
+-- as `midi_presence.rs::reap_connection`, chosen for the same reason: nobody
+-- observed an absence, so lingering as `live=0` would still be a stale claim
+-- about a specific connection that no longer exists. `recent` rows are
+-- different in kind: a context's last-activity fact stays meaningful even
+-- when stale (it is the honest answer to "when did we last hear from this
+-- agent"), so `recent` presence rows are pruned only when the entity itself
+-- is gone (archived), never merely for falling outside the liveness window.
+--
+-- Two clocks on the churny tables, never conflated (`docs/midi.md` "the one
+-- timebase"): `observed_at` is the reporting source's own clock — display and
+-- provenance only — and `recorded_at` is this kernel's wall clock at write
+-- time. ALL recency/staleness comparisons use `recorded_at`, because clients
+-- run on three machines against one kernel and a skewed foreign clock must
+-- never decide what counts as current.
+--
+-- Split three ways on churn, not one wide row, so a hot per-refresh write
+-- never rewrites the columns that barely change:
+-- - `roster_entity` — WHO. Slow-changing (a label rename, basically never).
+-- - `roster_presence` — WHERE/HOW it's known live. Slow-ish (host/pid change
+--   only on reconnect).
+-- - `roster_activity` — the churny liveness/heartbeat columns, rewritten on
+--   every refresh tick (~10s) or push event.
+-- `roster_status` is self-reported (never kernel-derived) and just as churny
+-- as activity, but it answers a different question (what the human SAID,
+-- not what the kernel OBSERVED), so it is never folded into `roster_activity`.
+--
+-- No `source_kernel` column anywhere: kernel federation is explicitly not a
+-- goal (Amy: "we aren't doing kernel federation").
+CREATE TABLE IF NOT EXISTS roster_entity (
+    -- Principal for humans, context for agents — never a third kind in v1.
+    entity_kind   TEXT NOT NULL CHECK (entity_kind IN ('principal', 'context')),
+    entity_id     BLOB NOT NULL,
+    -- Display label only (a principal's nick, a context's label at the time
+    -- it was last seen) — never the join key. The join key is always
+    -- (entity_kind, entity_id), which downstream tables reference by FK.
+    label         TEXT,
+    first_seen_at INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (entity_kind, entity_id)
+);
+
+-- The joinability guarantee, enforced structurally rather than trusted to
+-- every future call site: an `entity_kind = 'context'` row must name a
+-- context this kernel actually minted (a row in `contexts`), never a
+-- source-asserted id a peer merely claimed. `PeerConfig::principal` is
+-- already stamped server-side from the connection (`peers.rs`) — this is
+-- the schema-level half of the same rule (`docs/cc-peer.md`: peer
+-- attribution is sender-asserted and forgeable). There is no equivalent
+-- check for `entity_kind = 'principal'`: this kernel has no `principals`
+-- table to check against (a `PrincipalId` is a bare, un-rowed identity
+-- here) — that half of the guarantee is enforced entirely by the Rust API
+-- (`RosterEntity` is only ever constructed from a `KjCaller`/`PeerConfig`
+-- the connection layer already stamped, never parsed from a client-supplied
+-- string), documented rather than schema-checked.
+CREATE TRIGGER IF NOT EXISTS roster_entity_context_must_exist
+BEFORE INSERT ON roster_entity
+FOR EACH ROW WHEN NEW.entity_kind = 'context' AND NOT EXISTS (
+    SELECT 1 FROM contexts WHERE context_id = NEW.entity_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'roster_entity: entity_kind=context but entity_id has no contexts row — refusing a source-asserted identity the kernel never minted');
+END;
+
+-- One row per live presence, keyed by the producer's own natural key
+-- (`source`, `source_local_id`) — e.g. `('peer_registry', '<peer key>')` for
+-- a bound app window, `('context_activity', '<context hex>')` for a
+-- context's recency presence. `ON DELETE CASCADE` off `roster_entity` means
+-- deleting an entity (never expected in v1 — entities are never explicitly
+-- deleted, only pruned via presence reconciliation) takes its presence rows
+-- with it; deleting a PRESENCE row (reconciliation pruning an absent
+-- `bound` peer) cascades to `roster_activity` below, so a pruned presence
+-- never leaves a dangling activity row lying about a connection that no
+-- longer exists.
+CREATE TABLE IF NOT EXISTS roster_presence (
+    source          TEXT NOT NULL,
+    source_local_id TEXT NOT NULL,
+    entity_kind     TEXT NOT NULL,
+    entity_id       BLOB NOT NULL,
+    -- How liveness is known for this row (design table, three kinds; a
+    -- fourth — `heard` — has no v1 producer and is deliberately not built).
+    liveness_kind   TEXT NOT NULL CHECK (liveness_kind IN ('bound', 'recent', 'attested')),
+    host            TEXT,
+    pid             INTEGER,
+    proc_start      INTEGER,
+    first_seen_at   INTEGER NOT NULL,
+    PRIMARY KEY (source, source_local_id),
+    FOREIGN KEY (entity_kind, entity_id)
+        REFERENCES roster_entity(entity_kind, entity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_roster_presence_entity
+    ON roster_presence(entity_kind, entity_id);
+
+-- The churny half of a presence row: rewritten wholesale on every refresh
+-- pass or push event, never the wide identity row above. `live` is the
+-- computed-column liveness verdict (see file header) — the ONLY place
+-- liveness is stored, and it is meaningless before the boot-refresh has run
+-- at least once (`RosterStore::refreshed_at`/boot rule).
+CREATE TABLE IF NOT EXISTS roster_activity (
+    source          TEXT    NOT NULL,
+    source_local_id TEXT    NOT NULL,
+    live            INTEGER NOT NULL CHECK (live IN (0, 1)),
+    -- The reporting source's own clock — provenance/display ONLY. Never
+    -- compared against `unixepoch()` or another row's `recorded_at` for
+    -- staleness (see file header: clock skew across three machines).
+    observed_at     INTEGER,
+    -- This kernel's wall clock at write time — the ONLY clock recency and
+    -- staleness evaluation may use.
+    recorded_at     INTEGER NOT NULL,
+    PRIMARY KEY (source, source_local_id),
+    FOREIGN KEY (source, source_local_id)
+        REFERENCES roster_presence(source, source_local_id) ON DELETE CASCADE
+);
+
+-- Self-reported status (never kernel-derived): what the human/agent SAID,
+-- distinct from what the kernel OBSERVED (`roster_activity`). One row per
+-- entity — a status is a property of the entity, not of any one presence/
+-- connection, so unlike `roster_presence`/`roster_activity` this is keyed
+-- directly on (entity_kind, entity_id). Availability is routing data, never
+-- authorization (design record) — nothing in this schema, and nothing that
+-- reads this table, may gate an approval on it.
+CREATE TABLE IF NOT EXISTS roster_status (
+    entity_kind  TEXT NOT NULL,
+    entity_id    BLOB NOT NULL,
+    status_text  TEXT,
+    -- Exactly four states. `locked`/`screensaver` both map to `away` before
+    -- they ever reach this column — the client reports the STATE, never the
+    -- mechanism, so no platform vocabulary (logind, DBus, CoreGraphics)
+    -- reaches the schema.
+    availability TEXT NOT NULL CHECK (availability IN ('active', 'idle', 'away', 'dnd')),
+    observed_at  INTEGER,
+    recorded_at  INTEGER NOT NULL,
+    PRIMARY KEY (entity_kind, entity_id),
+    FOREIGN KEY (entity_kind, entity_id)
+        REFERENCES roster_entity(entity_kind, entity_id) ON DELETE CASCADE
 );
 "#;
 
@@ -5880,6 +6032,306 @@ fn row_to_workspace_row(row: &rusqlite::Row<'_>) -> SqliteResult<WorkspaceRow> {
 }
 
 // ============================================================================
+// Roster (crate::roster) — storage half; types/invariants live in roster.rs
+// ============================================================================
+
+/// Reconstruct a [`RosterEntity`] from its stored `(entity_kind, entity_id)`
+/// columns at `kind_idx`/`id_idx`. Fails loud (a typed SQLite conversion
+/// error, not a silently-dropped row) on an unrecognized kind or malformed
+/// id bytes — the CHECK constraint on `entity_kind` means the first should
+/// be unreachable in practice, but a read path never trusts that from the
+/// Rust side alone (no-silent-fallbacks).
+fn read_roster_entity(
+    row: &rusqlite::Row<'_>,
+    kind_idx: usize,
+    id_idx: usize,
+) -> SqliteResult<RosterEntity> {
+    let kind: String = row.get(kind_idx)?;
+    let id: Vec<u8> = row.get(id_idx)?;
+    RosterEntity::from_parts(&kind, &id).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            id_idx,
+            rusqlite::types::Type::Blob,
+            format!("invalid roster entity: kind={kind:?}").into(),
+        )
+    })
+}
+
+/// Nullable liveness_kind — `None` when the LEFT JOIN found no
+/// `roster_presence` row at all (a status-only entity). A NON-NULL value
+/// that fails to parse is still a loud error: the CHECK constraint means
+/// that should be unreachable, and a read path never silently swallows a
+/// value that shouldn't exist (no-silent-fallbacks).
+fn read_opt_liveness_kind(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<LivenessKind>> {
+    let s: Option<String> = row.get(idx)?;
+    s.map(|s| {
+        LivenessKind::parse(&s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                format!("invalid liveness_kind: {s:?}").into(),
+            )
+        })
+    })
+    .transpose()
+}
+
+fn row_to_roster_row(row: &rusqlite::Row<'_>) -> SqliteResult<RosterRow> {
+    let entity = read_roster_entity(row, 0, 1)?;
+    let liveness_kind = read_opt_liveness_kind(row, 5)?;
+    let availability: Option<String> = row.get(14)?;
+    let availability = availability
+        .map(|s| {
+            Availability::parse(&s).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Text,
+                    format!("invalid availability: {s:?}").into(),
+                )
+            })
+        })
+        .transpose()?;
+    let live: Option<i64> = row.get(10)?;
+    Ok(RosterRow {
+        entity,
+        label: row.get(2)?,
+        entity_first_seen_at: row.get(17)?,
+        source: row.get(3)?,
+        source_local_id: row.get(4)?,
+        liveness_kind,
+        host: row.get(6)?,
+        pid: row.get(7)?,
+        proc_start: row.get(8)?,
+        presence_first_seen_at: row.get(9)?,
+        live: live.map(|v| v != 0),
+        observed_at: row.get(11)?,
+        recorded_at: row.get(12)?,
+        status_text: row.get(13)?,
+        availability,
+        status_observed_at: row.get(15)?,
+        status_recorded_at: row.get(16)?,
+    })
+}
+
+impl KernelDb {
+    /// Reconcile one source's full current presence picture — see
+    /// `RosterStore::reconcile`'s doc comment for the shared-primitive
+    /// rationale. Upserts every row given (entity, presence, activity) and
+    /// prunes every existing `roster_presence` row under `source` this call
+    /// did not reconfirm, cascading to `roster_activity`. Transactional: a
+    /// failure partway (e.g. the joinability trigger firing on a phantom
+    /// context) leaves the prior picture intact rather than half-applied.
+    pub fn roster_reconcile_presence(
+        &mut self,
+        source: &str,
+        liveness_kind: LivenessKind,
+        rows: &[PresenceSnapshotRow],
+        recorded_at: i64,
+    ) -> KernelDbResult<Vec<String>> {
+        let tx = self.conn.transaction()?;
+        for row in rows {
+            let id_bytes = row.entity.id_bytes();
+            tx.execute(
+                "INSERT INTO roster_entity (entity_kind, entity_id, label, first_seen_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (entity_kind, entity_id) DO UPDATE SET
+                    label = COALESCE(excluded.label, roster_entity.label)",
+                params![
+                    row.entity.kind_str(),
+                    blob_param(&id_bytes),
+                    row.entity_label,
+                    recorded_at
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO roster_presence
+                    (source, source_local_id, entity_kind, entity_id, liveness_kind,
+                     host, pid, proc_start, first_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (source, source_local_id) DO UPDATE SET
+                    entity_kind   = excluded.entity_kind,
+                    entity_id     = excluded.entity_id,
+                    liveness_kind = excluded.liveness_kind,
+                    host          = excluded.host,
+                    pid           = excluded.pid,
+                    proc_start    = excluded.proc_start",
+                params![
+                    source,
+                    row.source_local_id,
+                    row.entity.kind_str(),
+                    blob_param(&id_bytes),
+                    liveness_kind.as_str(),
+                    row.host,
+                    row.pid,
+                    row.proc_start,
+                    recorded_at
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO roster_activity (source, source_local_id, live, observed_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (source, source_local_id) DO UPDATE SET
+                    live        = excluded.live,
+                    observed_at = excluded.observed_at,
+                    recorded_at = excluded.recorded_at",
+                params![source, row.source_local_id, row.live as i64, row.observed_at, recorded_at],
+            )?;
+        }
+
+        // Prune: anything this source previously stood behind that this
+        // call did not reconfirm is gone. `midi_presence.rs`'s
+        // `reap_connection` doc explains why removal (not a lingering
+        // `live=0`) is the honest shape for a source whose absence means
+        // "no longer true" — cascades into roster_activity via FK.
+        let keep: HashSet<&str> = rows.iter().map(|r| r.source_local_id.as_str()).collect();
+        let existing: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT source_local_id FROM roster_presence WHERE source = ?1")?;
+            stmt.query_map(params![source], |r| r.get(0))?
+                .collect::<SqliteResult<_>>()?
+        };
+        let removed: Vec<String> =
+            existing.into_iter().filter(|id| !keep.contains(id.as_str())).collect();
+        for id in &removed {
+            tx.execute(
+                "DELETE FROM roster_presence WHERE source = ?1 AND source_local_id = ?2",
+                params![source, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Write (or update in place) one entity's self-reported status. Callers
+    /// MUST construct `entity` from a connection-stamped identity — this
+    /// method trusts it completely (module doc on `RosterEntity`:
+    /// joinability is the caller's responsibility, backed for `context`
+    /// entities by the `roster_entity_context_must_exist` trigger).
+    pub fn roster_write_status(
+        &self,
+        entity: RosterEntity,
+        entity_label: Option<&str>,
+        status_text: Option<&str>,
+        availability: Availability,
+        observed_at: Option<i64>,
+        recorded_at: i64,
+    ) -> KernelDbResult<()> {
+        let id_bytes = entity.id_bytes();
+        self.conn.execute(
+            "INSERT INTO roster_entity (entity_kind, entity_id, label, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (entity_kind, entity_id) DO UPDATE SET
+                label = COALESCE(excluded.label, roster_entity.label)",
+            params![entity.kind_str(), blob_param(&id_bytes), entity_label, recorded_at],
+        )?;
+        self.conn.execute(
+            "INSERT INTO roster_status
+                (entity_kind, entity_id, status_text, availability, observed_at, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (entity_kind, entity_id) DO UPDATE SET
+                status_text  = excluded.status_text,
+                availability = excluded.availability,
+                observed_at  = excluded.observed_at,
+                recorded_at  = excluded.recorded_at",
+            params![
+                entity.kind_str(),
+                blob_param(&id_bytes),
+                status_text,
+                availability.as_str(),
+                observed_at.unwrap_or(recorded_at),
+                recorded_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The full current roster view: one row per live presence, joined
+    /// against its entity and (if any) self-reported status. The one SELECT
+    /// a read surface (later slices) runs — no fan-out to `PeerRegistry` or
+    /// anywhere else.
+    ///
+    /// Rooted at `roster_entity` with LEFT JOINs to presence/activity/status
+    /// — NOT rooted at `roster_presence` — so an entity that has posted a
+    /// status but has no known liveness source at all still surfaces (with
+    /// `source`/`liveness_kind`/`live`/… all `None`). Same "unknown, never
+    /// absent" stance as everywhere else in this module: no presence row
+    /// means liveness is unknown, not that the entity should be invisible.
+    /// An entity WITH multiple presence rows (not expected in v1 — `bound`
+    /// is principal-only, `recent` is context-only, so today's two sources
+    /// never overlap on one entity — but the schema doesn't forbid it once
+    /// `attested` lands) yields one result row per presence, each carrying
+    /// the same entity/status columns.
+    ///
+    /// `WHERE p.source IS NOT NULL OR s.entity_id IS NOT NULL` excludes the
+    /// other direction of orphan: `roster_entity` rows are never deleted (no
+    /// history-table/GC machinery — module doc), so a `bound` entity whose
+    /// sole presence row was just pruned by reconcile, and who has never
+    /// posted a status, would otherwise linger here as a ghost with every
+    /// column `NULL`. It has nothing current to say about itself any more,
+    /// so it drops out of the view entirely rather than surfacing as a
+    /// phantom "known but empty" row — this is what keeps the restart-shaped
+    /// guarantee (a pruned `bound` row must not read back live, or at all)
+    /// true even after the LEFT JOIN widening above.
+    pub fn roster_snapshot(&self) -> KernelDbResult<Vec<RosterRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.entity_kind, e.entity_id, e.label,
+                    p.source, p.source_local_id, p.liveness_kind,
+                    p.host, p.pid, p.proc_start, p.first_seen_at,
+                    a.live, a.observed_at, a.recorded_at,
+                    s.status_text, s.availability, s.observed_at, s.recorded_at,
+                    e.first_seen_at
+             FROM roster_entity e
+             LEFT JOIN roster_presence p ON p.entity_kind = e.entity_kind AND p.entity_id = e.entity_id
+             LEFT JOIN roster_activity a ON a.source = p.source AND a.source_local_id = p.source_local_id
+             LEFT JOIN roster_status s ON s.entity_kind = e.entity_kind AND s.entity_id = e.entity_id
+             WHERE p.source IS NOT NULL OR s.entity_id IS NOT NULL
+             ORDER BY e.entity_kind, e.entity_id, p.source, p.source_local_id",
+        )?;
+        let rows = stmt.query_map([], row_to_roster_row)?.collect::<SqliteResult<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The current availability on file for one entity's self-reported
+    /// status, or `None` if it has never posted one. `kj roster status`
+    /// reads this when the caller omits `--availability`, so a text-only
+    /// update never silently resets a standing `dnd`/`away` back to a
+    /// default.
+    pub fn roster_get_availability(&self, entity: RosterEntity) -> KernelDbResult<Option<Availability>> {
+        let id_bytes = entity.id_bytes();
+        let s: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT availability FROM roster_status WHERE entity_kind = ?1 AND entity_id = ?2",
+                params![entity.kind_str(), blob_param(&id_bytes)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match s {
+            None => None,
+            Some(s) => Some(Availability::parse(&s).ok_or_else(|| {
+                KernelDbError::Validation(format!("roster_status holds an invalid availability: {s:?}"))
+            })?),
+        })
+    }
+
+    /// Every `source_local_id` currently on file for `source`, before a
+    /// refresh pass. A source's refresh loop (`roster_sources.rs`) reads
+    /// this first to tell "appeared" (in the new snapshot, not in this set)
+    /// from "already known" — `roster_reconcile_presence` itself only
+    /// reports what it PRUNED, not what's new, since new-vs-updated isn't a
+    /// distinction the upsert needs to make.
+    pub fn roster_presence_source_local_ids(&self, source: &str) -> KernelDbResult<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_local_id FROM roster_presence WHERE source = ?1")?;
+        let ids = stmt
+            .query_map(params![source], |r| r.get(0))?
+            .collect::<SqliteResult<HashSet<String>>>()?;
+        Ok(ids)
+    }
+}
+
+// ============================================================================
 // Test helpers
 // ============================================================================
 
@@ -10485,4 +10937,136 @@ mod tests {
 
     // 4. The existing FK-violation test (test 22, `fk_violation_is_validation_error`)
     // stays green — see that test above; not duplicated here.
+
+    // ── Roster: schema-level invariants ─────────────────────────────────
+    // Rust-API coverage (upsert/reconcile/restart-shaped/generation/clock
+    // skew) lives in `roster.rs`'s own test module; these exercise the raw
+    // CHECK constraints and the joinability trigger directly against SQL,
+    // independent of anything the Rust API validates — the same split
+    // approval-ledger's `schema.rs` uses.
+
+    #[test]
+    fn roster_status_availability_check_rejects_an_unrecognized_value() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("roster-avail"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let cid_bytes = row.context_id.as_bytes();
+
+        db.conn
+            .execute(
+                "INSERT INTO roster_entity (entity_kind, entity_id, first_seen_at)
+                 VALUES ('context', ?1, 1)",
+                params![blob_param(cid_bytes)],
+            )
+            .unwrap();
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO roster_status (entity_kind, entity_id, availability, recorded_at)
+                 VALUES ('context', ?1, 'sideways', 1)",
+                params![blob_param(cid_bytes)],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "expected a CHECK violation, got: {err}");
+    }
+
+    #[test]
+    fn roster_presence_liveness_kind_check_rejects_an_unrecognized_value() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("roster-liveness"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let cid_bytes = row.context_id.as_bytes();
+
+        db.conn
+            .execute(
+                "INSERT INTO roster_entity (entity_kind, entity_id, first_seen_at)
+                 VALUES ('context', ?1, 1)",
+                params![blob_param(cid_bytes)],
+            )
+            .unwrap();
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO roster_presence
+                    (source, source_local_id, entity_kind, entity_id, liveness_kind, first_seen_at)
+                 VALUES ('x', 'y', 'context', ?1, 'heard', 1)",
+                params![blob_param(cid_bytes)],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "expected a CHECK violation, got: {err}");
+    }
+
+    #[test]
+    fn roster_activity_live_check_rejects_a_non_boolean_value() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("roster-live-check"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let cid_bytes = row.context_id.as_bytes();
+
+        db.conn
+            .execute(
+                "INSERT INTO roster_entity (entity_kind, entity_id, first_seen_at)
+                 VALUES ('context', ?1, 1)",
+                params![blob_param(cid_bytes)],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO roster_presence
+                    (source, source_local_id, entity_kind, entity_id, liveness_kind, first_seen_at)
+                 VALUES ('x', 'y', 'context', ?1, 'bound', 1)",
+                params![blob_param(cid_bytes)],
+            )
+            .unwrap();
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO roster_activity (source, source_local_id, live, recorded_at)
+                 VALUES ('x', 'y', 2, 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "expected a CHECK violation, got: {err}");
+    }
+
+    /// The joinability guarantee at the schema level: an `entity_kind =
+    /// 'context'` row must name a context this kernel actually minted. A
+    /// phantom id (never inserted into `contexts`) is refused outright.
+    #[test]
+    fn roster_entity_context_must_exist_trigger_refuses_a_phantom_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let _ws_id = setup_test_db(&db);
+        let phantom = ContextId::new();
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO roster_entity (entity_kind, entity_id, first_seen_at)
+                 VALUES ('context', ?1, 1)",
+                params![blob_param(phantom.as_bytes())],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("never minted"),
+            "expected the joinability trigger's message, got: {err}"
+        );
+    }
+
+    /// A `principal` entity has no backing table to check against — the
+    /// trigger's `WHEN` is scoped to `entity_kind = 'context'` only, so an
+    /// arbitrary principal id must insert cleanly (documented in
+    /// `roster.rs`'s module doc as Rust-API-only discipline for that half).
+    #[test]
+    fn roster_entity_principal_kind_is_not_checked_against_any_table() {
+        let db = KernelDb::in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO roster_entity (entity_kind, entity_id, first_seen_at)
+                 VALUES ('principal', ?1, 1)",
+                params![blob_param(PrincipalId::new().as_bytes())],
+            )
+            .unwrap();
+    }
 }
