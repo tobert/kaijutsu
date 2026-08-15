@@ -6,6 +6,52 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Principal plumbing — a holistic sweep, not a per-lane patch (2026-08-15, Amy)
+
+Amy: *"I don't think the principal plumbing should gate the git work. Let's make
+a local note to do a sweep across the code and look at principal plumbing
+holistically and wire it down to more places."*
+
+**Trigger.** The CRDT melt's Lane B rules that config mutations auto-commit to
+git, one commit per accepted mutation, each recording principal and operation id.
+But config mutation APIs don't carry honest principal metadata today — a VFS write
+arrives without knowing who asked for it, so those commits would be
+service-authored with the real actor lost. That is one instance of a pattern, not
+a Lane B bug: the same "who did this" gap shows up wherever a mutation crosses an
+internal seam and the actor is dropped on the far side.
+
+**Ruling: this does NOT gate the git work.** Lane B ships with service-authored
+commits. Principal fidelity is a separate, wider improvement that lands on its own
+schedule and retro-fits the commit author when it does.
+
+**The sweep, when it happens.** Not a list of call sites to patch — a survey
+first:
+
+- Inventory every mutation path that reaches durable state and ask what it knows
+  about its actor. VFS/config writes, rc edits, block mutations, editor sessions,
+  MCP tool calls, kaish builtins, drift, and the `kj` verbs.
+- Classify each: carries a real `Principal`; carries a synthetic/service one;
+  carries nothing and infers; or genuinely has no actor (kernel-internal timers,
+  boot seeding). The fourth category is legitimate — the goal is that it be
+  *chosen* rather than the accidental default.
+- Note where principal is available at the caller but dropped at the seam. Those
+  are the cheap wins and should be the first patch series.
+- Related, already-known: `architecture_agent_emerges_not_noun` — the actor is
+  always a `Principal`, there is no first-class "agent" type, so this sweep is
+  also the thing that makes provenance queries answerable at all.
+
+**Why it's worth doing beyond git.** Provenance is what makes the shared-trust
+model legible. Crosstalk is a feature here, and the kernel deliberately does not
+enforce boundaries between cooperating players — which means the *record* of who
+did what is the thing that keeps a many-hands instrument debuggable. Today a
+mutation's author is recoverable in some paths and guessed in others.
+
+**Do not** turn this into an authorization mechanism. Principals are for honest
+attribution and recovery, not for denying operations between players
+(`docs/instrument-design.md`, "Many hands, one trust boundary").
+
+---
+
 ## Reconnect follow-ups from the auto-reconnect + backoff task (2026-08-14)
 
 Landed: indefinite reconnect with jittered exponential backoff
