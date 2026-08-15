@@ -90,12 +90,53 @@ Three things that ruling settles, worth not re-deriving:
    summaries, written by a local model" is librarian work; "Context lifecycle:
    'done for now' marker" is the signal a janitor would read.
 
-Not scheduled, no slices cut. The immediate pressure is relieved — the roster
-no longer renders the pile (see below) — so this is the durable answer, not
-the urgent one. **What is still true and unaddressed: nothing archives
-contexts, and `kj context list` is 195 lines on this kernel.** Filtering the
-roster fixed the symptom on one surface; the pile itself is untouched, and a
-janitor is what actually retires it.
+Not scheduled, no slices cut. This is the durable answer, not the urgent one.
+
+**The interim rule, from the first manual sweep (2026-08-15): no activity for
+3 hours ⇒ expired.** Amy: *"anything older than 2-3 hours ago is expired and
+can be archived."* 194 of 200 contexts went in one pass; ROOT and the five
+live session contexts survived.
+
+**That rule is provisional and its expiry condition is known.** Amy, same
+session: *"eventually we'll have longer-living sessions that do local
+inference and don't care about KV caches but for the moment it's a cheap
+cleanup rule."* So the 3-hour number is not a judgment about when work goes
+stale — it is downstream of **hosted-model KV-cache economics**, which is why
+a session that has gone cold is worth little. A local-inference session has no
+such cliff and may legitimately sit idle for days. **A janitor must therefore
+take its cutoff from the context's own economics (is this a cached hosted
+session or a local one?), not from a global constant** — bake 3h in as a
+literal and the first long-lived local musician gets reaped mid-thought.
+
+Three things the manual sweep taught, worth not re-learning:
+
+- **Roster liveness is the WRONG safety filter for archiving, and it looks
+  right.** `recent` liveness means "appended a block in the last 15 minutes",
+  not "someone is attached". The roster reported **4** live contexts while
+  **24** had been active within the day and an ACP lane was mid-review; a
+  session that is connected but thinking has a live connection and an idle
+  context. Filtering on roster-idle would have soft-deleted attached sessions'
+  contexts. Use last-activity age, and treat "attached" as a separate question
+  the roster cannot currently answer per-context (its `bound` rows are keyed by
+  principal).
+- **The archive latch scopes its nonce to the RESOLVED LABEL**, so confirming
+  with the id you just listed fails with `nonce scope mismatch: unauthorized
+  path '<id>' (authorized: ["<label>"])`. Unlabeled contexts scope to the short
+  id. This is the gate research pass's finding #3 observed live — see "Gate
+  slice 1a" below, which already says `authorized_label` must become the raw
+  typed reference.
+- **kaish loop counters do not persist across iterations here**, so a batch
+  guard written as `if test "$i" -ge 10` never trips and a "batch of 10" runs
+  the whole list. Nothing was lost (the per-item skip checks are independent
+  of accumulators, so ROOT and live contexts were still protected), but verify
+  bulk work by re-querying state, never by a counter the loop printed.
+
+**Still unaddressed: the pile regrows on its own.** Every MCP reconnect mints a
+fresh context — 9 `mcp-kaijutsu-*` contexts existed on 08-15, all minted that
+day, two of them (`0815-1201`, `0815-1203`) during three kernel restarts an
+hour apart. Same phenomenon as the filed `cc-kaijutsu` prefix pileup. A janitor
+that only sweeps is a treadmill while the mint runs; the reconnect path wanting
+to *reuse* a session's context is the other half.
 
 ---
 
