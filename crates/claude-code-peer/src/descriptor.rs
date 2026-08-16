@@ -437,10 +437,9 @@ mod tests {
 
     #[test]
     fn validate_sendable_refuses_an_unknown_peer_protocol() {
-        let mut session: Session = serde_json::from_str::<SessionDescriptor>(&format!(
-            "{}",
-            well_formed_descriptor(1234)
-        ))
+        let mut session: Session = serde_json::from_str::<SessionDescriptor>(
+            &well_formed_descriptor(1234),
+        )
         .map(|d| Session {
             descriptor: d,
             reachable: Reachable::Alive,

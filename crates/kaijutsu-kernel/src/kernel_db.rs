@@ -6992,6 +6992,46 @@ mod tests {
         assert_eq!(loaded.last_activity_at, Some(t1));
     }
 
+    // ── approval-ledger migration ──────────────────────────────────────
+
+    /// `KernelDb::open` must migrate the approval-ledger schema into the
+    /// kernel DB, and a re-open of an already-migrated file must be a no-op
+    /// (the ledger's `CREATE TABLE IF NOT EXISTS` is idempotent). Guards the
+    /// boot path the `kj cc send` gate depends on: a live kernel that
+    /// restarts onto its existing `kernel.db` must find the ledger tables
+    /// every time.
+    #[test]
+    fn open_migrates_the_ledger_schema_and_reopen_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ledger.db");
+
+        {
+            let db = KernelDb::open(&db_path).unwrap();
+            let n: i64 = db
+                .conn_for_ledger()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "open() must create the ledger's approvals table");
+        }
+        // Drop closed the connection; re-open the same file.
+        {
+            let db = KernelDb::open(&db_path).unwrap();
+            let n: i64 = db
+                .conn_for_ledger()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "re-open must be an idempotent no-op");
+        }
+    }
+
     // ── WAL checkpoint ──────────────────────────────────────────────────
 
     /// `checkpoint()` (TRUNCATE) must flush committed frames into the main

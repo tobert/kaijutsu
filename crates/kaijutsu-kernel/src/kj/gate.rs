@@ -336,8 +336,10 @@ mod tests {
     }
 
     async fn short_gate_dispatcher() -> crate::kj::KjDispatcher {
-        let mut policy = TimeoutPolicy::default();
-        policy.gate_wait_timeout = Duration::from_millis(400);
+        let policy = TimeoutPolicy {
+            gate_wait_timeout: Duration::from_millis(400),
+            ..TimeoutPolicy::default()
+        };
         test_dispatcher_with_timeouts(policy).await
     }
 

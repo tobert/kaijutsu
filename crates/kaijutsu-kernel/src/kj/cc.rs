@@ -109,8 +109,8 @@ impl KjDispatcher {
                 let outcome = crate::kj::gate::run_gate(&self.kernel_db, caller, spec, wait).await;
                 if !outcome.allowed {
                     return KjResult::Err(format!(
-                        "kj cc send: approval gate refused ({}): {}",
-                        outcome.status, outcome.reason
+                        "kj cc send: approval gate refused [ask {}] ({}): {}",
+                        outcome.request_id, outcome.status, outcome.reason
                     ));
                 }
                 cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, false)
