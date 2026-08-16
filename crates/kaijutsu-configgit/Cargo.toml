@@ -11,8 +11,9 @@ workspace = true
 
 [dependencies]
 # Aligned to ~/src/kaish-extras/crates/kaish-tools-git (inspected 2026-08-15 at
-# commit 96e9825; docs/crdt-melt.md "Git write mechanism — align to
-# kaish-extras" is the ruling this pin set answers to). That crate calls its
+# commit 96e9825; docs/config-crdt-ownership.md, "Lane B — the git-worktree
+# seam, shipped and deliberately unwired", "Git write mechanism, if this shape
+# ships" is the ruling this pin set answers to). That crate calls its
 # own set the "Path 2 plumbing pin set": built directly on gitoxide's
 # low-level crates, skipping the `gix` facade entirely, because the facade
 # links gix-command unconditionally (even with --no-default-features) via

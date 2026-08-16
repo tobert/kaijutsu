@@ -1,6 +1,6 @@
 //! Git write seam for Lane B of the CRDT melt — rc/config documents becoming
-//! plain files in a kernel-owned git worktree (`docs/crdt-melt.md`, "Lane B
-//! — melt rc/config documents into files + git").
+//! plain files in a kernel-owned git worktree (`docs/config-crdt-ownership.md`,
+//! "Lane B — the git-worktree seam, shipped and deliberately unwired").
 //!
 //! This crate is **not wired into the kernel**. It is the write half of the
 //! future `<data_dir>/config` worktree, built and proven in isolation so the
@@ -33,8 +33,9 @@
 //! wiring, no migration of existing documents. It does not stage changes
 //! through an on-disk git index — `commit_all` rewalks the live worktree
 //! directory on every call and always commits its full current state, which
-//! is what "auto-commit per accepted mutation" (`docs/crdt-melt.md`, ruling
-//! 2) actually needs: the kernel's VFS is the index, not git's.
+//! is what "auto-commit per accepted mutation" (`docs/config-crdt-ownership.md`,
+//! "Rulings (Amy, 2026-08-15)", ruling 2) actually needs: the kernel's VFS is
+//! the index, not git's.
 //!
 //! Unix-only: entry names are read as raw bytes via
 //! [`std::os::unix::ffi::OsStrExt`], matching every other place this
@@ -67,7 +68,7 @@ use gix_ref::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 /// footer convention on every message.
 const OPERATION_ID_HEADER: &str = "kaijutsu-operation-id";
 
-/// Ruling 5 (`docs/crdt-melt.md`, "Decisions — Amy's rulings, 2026-08-15"):
+/// Ruling 5 (`docs/config-crdt-ownership.md`, "Rulings (Amy, 2026-08-15)"):
 /// commits are service-authored for now, and principal plumbing does not
 /// gate this work. This name is the placeholder until that retrofit lands —
 /// tracked as its own holistic sweep in `docs/issues.md` ("Principal
@@ -156,8 +157,10 @@ impl std::fmt::Display for CommitId {
 /// Carries only paths and gitoxide's own low-level store handles — no
 /// kaijutsu kernel type appears in this struct or in any method signature on
 /// it. That's what makes this "liftable into `kaish-tools-git` as a write
-/// profile later without a rewrite" (`docs/crdt-melt.md`): the kernel-wiring
-/// slice adapts kernel calls to this API, not the other way around.
+/// profile later without a rewrite" (`docs/config-crdt-ownership.md`, "Lane B
+/// — the git-worktree seam, shipped and deliberately unwired"): the
+/// kernel-wiring slice adapts kernel calls to this API, not the other way
+/// around.
 pub struct Repo {
     /// `<data_dir>/config` — the worktree root. `rc/`, `config/`, `client/`,
     /// `midi/` and everything else live here as ordinary files;
@@ -175,10 +178,11 @@ pub struct Repo {
 /// the same path is the same as calling it once.
 ///
 /// "Open" is deliberately narrow — it checks for `.git/HEAD` and nothing
-/// more. Lane B's ruling (`docs/crdt-melt.md`, decision 3) is "no watcher, no
-/// implicit import; detect unexpected dirtiness and fail loud", and an
-/// existing directory that lacks `.git/HEAD` is exactly that: something this
-/// seam did not create and should not silently adopt or overwrite.
+/// more. Lane B's ruling (`docs/config-crdt-ownership.md`, "Rulings (Amy,
+/// 2026-08-15)", ruling 3) is "no watcher, no implicit import; detect
+/// unexpected dirtiness and fail loud", and an existing directory that lacks
+/// `.git/HEAD` is exactly that: something this seam did not create and
+/// should not silently adopt or overwrite.
 pub fn init_or_open(worktree_dir: impl AsRef<Path>) -> Result<Repo, Error> {
     let worktree_dir = worktree_dir.as_ref().to_path_buf();
     let git_dir = worktree_dir.join(".git");
@@ -206,9 +210,10 @@ pub fn init_or_open(worktree_dir: impl AsRef<Path>) -> Result<Repo, Error> {
             // Force a reflog on every ref update rather than git's normal
             // rules (which only start logging once `logs/HEAD` already
             // exists). This worktree is an operator-visible recovery
-            // surface (`docs/crdt-melt.md`, Lane B point 2); `git reflog` is
-            // exactly the kind of thing an operator reaches for, and there
-            // is never a reason for it to be empty here.
+            // surface (`docs/config-crdt-ownership.md`, "Rulings (Amy,
+            // 2026-08-15)", ruling 2); `git reflog` is exactly the kind of
+            // thing an operator reaches for, and there is never a reason for
+            // it to be empty here.
             write_reflog: gix_ref::store::WriteReflog::Always,
             object_hash: gix_hash::Kind::Sha1,
             precompose_unicode: false,
@@ -492,9 +497,9 @@ impl Repo {
     /// documents, but nothing about the format lets a parent tree reference
     /// an empty child by name and have `git ls-tree` show a directory there —
     /// real git worktrees can't preserve empty directories either). This
-    /// mirrors `docs/crdt-melt.md`'s already-accepted limitation ("empty
-    /// directories … git cannot track them either"), not a new gap this
-    /// crate introduces.
+    /// mirrors `docs/config-crdt-ownership.md`'s already-accepted limitation
+    /// ("Rulings (Amy, 2026-08-15)", ruling 6: empty directories … git
+    /// cannot track them either), not a new gap this crate introduces.
     fn collect_tree_entries(&self, dir: &Path) -> Result<Vec<TreeEntry>, Error> {
         let mut entries = Vec::new();
         let read_dir = fs::read_dir(dir).map_err(|e| Error::io("read_dir", dir, e))?;

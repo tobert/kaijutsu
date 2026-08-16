@@ -137,8 +137,9 @@ fn empty_directories_are_not_silently_invented_or_required() {
 
     // An empty directory in the worktree (no files under it at all) commits
     // fine — it's just absent from the resulting tree, matching real git's
-    // own inability to track empty directories (docs/crdt-melt.md's already
-    // accepted limitation, not a new gap).
+    // own inability to track empty directories (docs/config-crdt-ownership.md,
+    // "Rulings (Amy, 2026-08-15)", ruling 6: an already-accepted limitation,
+    // not a new gap).
     fs::create_dir_all(dir.path().join("midi/empty")).expect("mkdir empty");
     fs::write(dir.path().join("midi/patch.toml"), b"[patch]\n").expect("write sibling file");
 

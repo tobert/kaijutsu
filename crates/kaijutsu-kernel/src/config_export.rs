@@ -1,6 +1,7 @@
 //! Lossless export/import of the CRDT-owned config trees to/from a real
 //! directory — the precondition for ever trusting the eventual git-worktree
-//! flip (`docs/crdt-melt.md`).
+//! flip (`docs/config-crdt-ownership.md`, "Lane B — the git-worktree seam,
+//! shipped and deliberately unwired").
 //!
 //! [`ConfigCrdtFs`] mounts four roots — `/etc/rc`, `/etc/config`,
 //! `/etc/client`, `/etc/midi` — all sharing one doc model
@@ -80,8 +81,9 @@ use crate::runtime::config_crdt_fs::normalize_abs;
 const MOUNT_ROOTS: [&str; 4] = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT];
 
 /// Directory name a mount root materializes under, inside the export
-/// directory (`docs/crdt-melt.md`'s eventual `<data_dir>/config/{rc,config,
-/// client,midi}` layout). A `match` rather than a derived strip so an
+/// directory (`docs/config-crdt-ownership.md`, "Rulings (Amy, 2026-08-15)",
+/// ruling 1: one worktree at `<data_dir>/config` holding `rc/`, `config/`,
+/// `client/`, `midi/`). A `match` rather than a derived strip so an
 /// unrecognized root fails loud at compile-adjacent time instead of silently
 /// deriving some other subdir name.
 fn root_subdir(root: &str) -> &'static str {

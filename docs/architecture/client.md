@@ -69,7 +69,7 @@ calls `get_context_sync` and feeds `apply_sync_state`).
 
 ### Compose input
 
-`src/synced_input.rs` is deleted (2026-08-16, `docs/crdt-melt.md`). The
+`src/synced_input.rs` is deleted (2026-08-16). The
 compose draft used to be a separate `SyncedInput` CRDT document, hydrated via
 `getInputState` and kept live by `InputTextOps`/`InputCleared` server events.
 It is now an ordinary block (`Role::User`, `Status::Draft`, `ephemeral`, one

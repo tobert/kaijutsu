@@ -1,5 +1,4 @@
-//! e2e: the compose draft is a block, over a real SSH + Cap'n Proto round trip
-//! (docs/crdt-melt.md, Lane C).
+//! e2e: the compose draft is a block, over a real SSH + Cap'n Proto round trip.
 //!
 //! The claim this file exists to pin is **zero-copy submit**. The old
 //! `submit_input` read the draft, cleared it, and only *then* tried to author a
@@ -202,9 +201,9 @@ fn clearing_removes_the_draft_block() {
 /// Edits are **character**-indexed, not byte-indexed.
 ///
 /// This is the coordinate doctrine the old input document never proved: callers
-/// counted characters while its `InputDocEntry` type (deleted 2026-08-16,
-/// docs/crdt-melt.md) bounds-checked Rust byte lengths. Editing after an emoji
-/// is where those two disagree.
+/// counted characters while its `InputDocEntry` type (deleted 2026-08-16)
+/// bounds-checked Rust byte lengths. Editing after an emoji is where those two
+/// disagree.
 #[test]
 fn draft_edits_are_character_indexed_through_multibyte_text() {
     run_local(async {

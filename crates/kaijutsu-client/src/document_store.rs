@@ -26,8 +26,7 @@
 //! `ephemeral`, one per `(context, principal)`) that rides the same change
 //! feed as every other block, so it already lands in `mirror.blocks()` — see
 //! [`DocumentEntry::draft_text`]. `SyncedInput` and the input-doc wire events
-//! it depended on are deleted (2026-08-16, docs/crdt-melt.md); this store
-//! never held one.
+//! it depended on are deleted (2026-08-16); this store never held one.
 
 use std::collections::HashMap;
 use std::time::Instant;

@@ -5827,7 +5827,7 @@ impl kernel::Server for KernelImpl {
                 // `ops` is always empty: the draft is a block, not a CRDT
                 // document, so there is no input oplog to project into it.
                 // The field stays on the wire until a later commit removes it
-                // from the schema (docs/crdt-melt.md).
+                // from the schema.
                 r.set_ops(&[]);
                 r.set_version(documents.version(context_id).unwrap_or(0));
                 Promise::ok(())

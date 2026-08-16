@@ -578,7 +578,7 @@ CREATE TABLE IF NOT EXISTS doc_snapshots (
 -- user_version` gate, so this is not a migration — an existing kernel.db
 -- keeps both tables and their rows exactly as they were; a fresh DB never
 -- creates them. Do not add DROP TABLE for either; do not touch existing
--- data (docs/crdt-melt.md).
+-- data.
 
 -- ── Context Shell / Env ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS context_shell (
