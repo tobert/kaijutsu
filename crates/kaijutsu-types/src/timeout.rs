@@ -170,6 +170,16 @@ pub struct TimeoutPolicy {
     /// registration. Per-instance overrides via the `policy_admin` MCP
     /// server continue to work.
     pub mcp_call_timeout_default: Duration,
+
+    /// How long a gated `kj` verb holds for a human answer from the
+    /// approval ledger before expiring the ask and refusing (fail-closed).
+    /// One shared number by design: the gate's poll deadline and the
+    /// `ctx.patient(...)` hold that freezes the script clock around it
+    /// (see `kj_builtin`) must read the SAME value — two numbers here would
+    /// drift, and the drift is exactly the failure in docs/issues.md "Gate
+    /// slice 1a — three findings", finding #1 (kaish's own watchdog killing
+    /// a blocking gate long before the gate's timeout fires).
+    pub gate_wait_timeout: Duration,
 }
 
 impl Default for TimeoutPolicy {
@@ -187,6 +197,10 @@ impl Default for TimeoutPolicy {
             llm_idle_timeout: Duration::from_secs(30),
             mcp_connect_timeout: Duration::from_secs(10),
             mcp_call_timeout_default: Duration::from_secs(120),
+            // A human answering from another surface (a different shell,
+            // another client) needs real minutes; a turn must not hang
+            // indefinitely on an unanswered prompt either.
+            gate_wait_timeout: Duration::from_secs(300),
         }
     }
 }

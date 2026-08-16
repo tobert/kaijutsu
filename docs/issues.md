@@ -1669,25 +1669,41 @@ credit: pure local IPC, her sessions burn her seat because she started them
 herself in a mux.
 
 **Shipped on branch `cc-peer-roster` (worktree `~/src/wt/kj-cc-roster`), not
-merged:** `kj cc list`, `kj cc send [--dry-run]`, 43 tests, attribution
-validated against a real receiver.
+merged:** `kj cc list`, `kj cc send [--dry-run]`, plus the two pieces that
+followed on 2026-08-16 —
+
+- **`crates/claude-code-peer`** — protocol-only crate, no `kaijutsu-*` deps
+  (`approval-ledger` precedent): registry scan that never touches `.key`
+  files, the `procStart` PID-reuse guard (alive/stale/gone/**unknown**), the
+  attribution envelope with the receiver's exact grammar + canonicalization
+  check, a byte-stable frame codec matched to a live capture, a no-ack
+  sending client, and a tokio inbox listener (0700 dir / 0600 socket,
+  unauthenticated-input posture). 58 crate tests + 2 ignored live probes;
+  golden fixtures from a real CC 2.1.233 session.
+- **The approval-ledger gate** — `kj cc send` is ledger-gated (Amy,
+  2026-08-16: *"yeah kj cc send should go through the ledger"*). Durable ask
+  row before any wait, fail-closed on `gate_wait_timeout`, answered via the
+  new `kj approve list|show|allow|deny` verbs. The message body is a FREE
+  variable in the gated statement, so the ledger's guarantee 3 makes
+  allow-always rules structurally impossible — every send stays
+  human-approved. `--dry-run` is exempt.
 
 **Not built yet:**
 
 - **Inbox** — kaijutsu binds its own socket and becomes a reply target. Proven
   viable: `SendMessage` delivers to an arbitrary `uds:` path with no registry
-  entry, so no squatting in `~/.claude/sessions/` is needed.
-- **Full outbound frame** — `msgV`, `msg_id`, `priority`, and a truthful `from`
-  (emit it *only* once we are listening).
-- **`crates/claude-code-peer`** — protocol-only crate, no `kaijutsu-*` deps,
-  `approval-ledger` precedent. Actor stays in the kernel.
+  entry, so no squatting in `~/.claude/sessions/` is needed. The listener half
+  now exists in `claude-code-peer::server::Inbox`; what's missing is wiring it
+  into the kernel as a drift/mailbox source.
+- **Full outbound frame** — a truthful `from` (emit it *only* once we are
+  listening).
 - **Presence at `/run/cc`** — build as a *source* for Amy's general live roster,
   not a CC-specific store (see `signoff.md`).
 - **Per-peer inbox paths + kernel-stamped principals** — turns an
   unauthenticated channel into a capability-authenticated one.
 - **Hook registration** — consent + session↔context mapping; also closes the
   transcript-scraping identity bug (`CLAUDE_CODE_SESSION_ID`).
-- **Fan-out** — last, behind the gate decision.
+- **Fan-out** — last. The ledger gate is the precondition it needed (below).
 
 **`kj cc` is scaffolding (Amy):** *"kj cc is a temporary thing"* — hooks give us
 contexts, then drift works on a CC session like any other and the verb retires.
@@ -1697,13 +1713,15 @@ session, which is what you need when one *isn't* wired up), and a CC context
 **cannot be clocked** — `--drive` is deliver-and-clock natively but
 deliver-and-hope here. Surface that in the UI rather than let it read as a bug.
 
-**DEFERRED, Amy's call, her words:** *"I should think about and decide on ledger
-gating `--drive` later."* Whether `--drive` routes through the approval gate,
-since it sends instructions to an agent that will act on them. Fine while sends
-are deliberate and manual; **pressing before fan-out exists**. Relevant safety
-fact: inbound peer messages cannot approve a pending prompt, change config, or
-run slash commands, so this cannot launder a permission decision past a
-session's own gate.
+**Ledger gating — RESOLVED (Amy, 2026-08-16: *"yeah kj cc send should go
+through the ledger"*).** `kj cc send` now routes through the approval ledger
+(see the shipped list above); the open question this entry used to park is
+answered. The specific hazard it named — an actor that can inject turns into
+every agent on the box — is what made the gate a precondition for fan-out,
+and the free-variable statement keeps even a "remember always" answer from
+learning an allow rule. Standing safety fact retained: inbound peer messages
+cannot approve a pending prompt, change config, or run slash commands, so a
+peer message cannot launder a permission decision past a session's own gate.
 
 ## Pythonic player: kaijutsu-py wheel (2026-08-09, Amy: "shape B — the pythonic player")
 

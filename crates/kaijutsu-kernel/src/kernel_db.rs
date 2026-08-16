@@ -1530,6 +1530,15 @@ pub struct KernelDb {
 }
 
 impl KernelDb {
+    /// Narrow accessor for the DB-injected `approval-ledger` crate, whose
+    /// whole API borrows whatever connection the caller owns. Deliberately
+    /// the ONLY way kernel code reaches the raw connection — the ledger's
+    /// tables live in this DB (see [`Self::migrate_ledger`]), and its
+    /// functions are the sanctioned callers.
+    pub(crate) fn conn_for_ledger(&self) -> &Connection {
+        &self.conn
+    }
+
     fn init_connection(conn: &Connection) -> SqliteResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1792,6 +1801,7 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
+        Self::migrate_ledger(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
@@ -1802,8 +1812,20 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
+        Self::migrate_ledger(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Migrate the approval-ledger schema into the kernel DB. The ledger is
+    /// DB-injected (`approval_ledger::migrate` borrows whatever connection
+    /// the caller owns), so the kernel owns the single connection and the
+    /// ledger's tables live beside the kernel's own — one DB, one backup,
+    /// one WAL. `execute_batch`'s `CREATE TABLE IF NOT EXISTS` makes this
+    /// idempotent across every open.
+    fn migrate_ledger(conn: &Connection) -> KernelDbResult<()> {
+        approval_ledger::migrate(conn)?;
+        Ok(())
     }
 
     /// Read any legacy `rc_scripts` rows from a pre-files DB, as
@@ -6851,6 +6873,46 @@ mod tests {
         db.touch_context_activity(cid, t1).unwrap();
         let loaded = db.get_context(cid).unwrap().unwrap();
         assert_eq!(loaded.last_activity_at, Some(t1));
+    }
+
+    // ── approval-ledger migration ──────────────────────────────────────
+
+    /// `KernelDb::open` must migrate the approval-ledger schema into the
+    /// kernel DB, and a re-open of an already-migrated file must be a no-op
+    /// (the ledger's `CREATE TABLE IF NOT EXISTS` is idempotent). Guards the
+    /// boot path the `kj cc send` gate depends on: a live kernel that
+    /// restarts onto its existing `kernel.db` must find the ledger tables
+    /// every time.
+    #[test]
+    fn open_migrates_the_ledger_schema_and_reopen_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ledger.db");
+
+        {
+            let db = KernelDb::open(&db_path).unwrap();
+            let n: i64 = db
+                .conn_for_ledger()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "open() must create the ledger's approvals table");
+        }
+        // Drop closed the connection; re-open the same file.
+        {
+            let db = KernelDb::open(&db_path).unwrap();
+            let n: i64 = db
+                .conn_for_ledger()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "re-open must be an idempotent no-op");
+        }
     }
 
     // ── WAL checkpoint ──────────────────────────────────────────────────

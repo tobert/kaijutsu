@@ -290,21 +290,35 @@ Layers 1 and 4 keep 2 and 3 honest. Do not ship the actor without both.
 ## Status and build order
 
 Built, on branch `cc-peer-roster` (worktree `~/src/wt/kj-cc-roster`), not
-merged: `kj cc list` and `kj cc send --dry-run`, 43 tests, attribution
-validated against a real receiver.
+merged:
 
-Order from here: **inbox** (small, unlocks replies) → **full frame** on the
-sender with a truthful `from` → **presence** at `/run/cc`, built as a *source*
-for the general live roster rather than a CC-specific store → **per-peer paths
-+ principal stamping** → **hooks** for consent and session↔context mapping →
-**fan-out last**, behind the gate decision.
+- `kj cc list` and `kj cc send [--dry-run]`, attribution validated against a
+  real receiver.
+- **`crates/claude-code-peer`** — the protocol-only crate this document's
+  "Architecture" section calls for: descriptor scan, liveness guard, envelope
+  codec, frame codec, send client, inbox listener. 58 tests + 2 ignored live
+  probes, golden fixtures from a real session (see the crate's `tests/`).
+- **`kj cc send` is ledger-gated** — the "Open decisions" question below is
+  answered (Amy, 2026-08-16). `kj approve` answers the gate from any shell.
+
+Order from here: **kernel wiring of the inbox** (the listener exists; connect
+it as a drift/mailbox source, unlocks replies) → **truthful `from`** on the
+sender once the kernel is listening → **presence** at `/run/cc`, built as a
+*source* for the general live roster rather than a CC-specific store →
+**per-peer paths + principal stamping** → **hooks** for consent and
+session↔context mapping → **fan-out last**, now that the gate it was waiting
+on exists.
 
 ## Open decisions
 
-- **Does `--drive` route through the approval ledger?** Amy's, parked. Fine
-  while sends are deliberate and manual; pressing **before fan-out exists**.
-  An actor that can inject turns into every agent on the box is a different
-  proposition from one manual send.
+- ~~**Does `--drive` route through the approval ledger?**~~ **Resolved —
+  yes** (Amy, 2026-08-16: *"yeah kj cc send should go through the ledger"*).
+  Implemented as the first consumer of the approval-ledger gate
+  (`crates/kaijutsu-kernel/src/kj/gate.rs`): durable ask row before any wait,
+  fail-closed on `gate_wait_timeout`, answered via `kj approve`. The message
+  body is a free variable in the gated statement, so allow-always rules can
+  never be learned for it (ledger guarantee 3) — every send stays
+  human-approved until that policy changes deliberately.
 - `from-mode` enum beyond `prompting`; `priority` enum beyond `next`. Both
   unknown; hardcode the observed value and comment why.
 - Whether a reply carries any reference to the original `msg_id`. Unprobed, and

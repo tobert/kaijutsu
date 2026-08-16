@@ -1,0 +1,24 @@
+[package]
+name = "claude-code-peer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client and listener for Claude Code's per-session peer messaging socket: on-disk session registry, procStart liveness guard, canonical attribution envelope, frame codec. No kaijutsu-* dependency — publishable standalone."
+
+[lints]
+workspace = true
+
+[dependencies]
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `time` beyond the workspace set: the inbox's tests bound their waits. In
+# full-workspace builds tokio/time is already unified in transitively.
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

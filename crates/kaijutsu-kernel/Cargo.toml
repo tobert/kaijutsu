@@ -53,6 +53,11 @@ rusqlite.workspace = true
 # the ledger crate its own `&Connection`, same pattern as `hook_scripts`.
 approval-ledger.workspace = true
 
+# Claude Code's per-session peer messaging socket: registry scan, liveness
+# guard, attribution envelope, frames, delivery (docs/cc-peer.md). Protocol
+# only — session↔context mapping and gating stay here in the kernel.
+claude-code-peer.workspace = true
+
 # Enum string conversion
 strum = { workspace = true }
 

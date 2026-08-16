@@ -21,6 +21,7 @@ members = [
     "crates/kaijutsu-viz",
     "crates/kaijutsu-isotest",
     "crates/approval-ledger",
+    "crates/claude-code-peer",
     "crates/kaijutsu-configgit",
 ]
 
@@ -57,6 +58,7 @@ kaijutsu-client = { path = "crates/kaijutsu-client" }
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 approval-ledger = { path = "crates/approval-ledger" }
+claude-code-peer = { path = "crates/claude-code-peer" }
 
 # Kaish (execution engine + client) — pinned to published 0.12.
 # `subprocess` compiles in host external-command execution; whether a given
