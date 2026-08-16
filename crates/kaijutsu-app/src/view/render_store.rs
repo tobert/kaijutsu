@@ -8,11 +8,15 @@
 //! ordering, and DAG-reference validation for
 //! multi-writer merge. None of that applies here: this store has exactly one
 //! writer (the sync system), and it is thrown away and rebuilt on every
-//! version bump. `RenderBlockStore` keeps the twelve methods the app calls —
-//! `blocks_ordered`, `block_ids_ordered`, `get_block_snapshot`, `full_text`,
-//! `is_empty`, `version`, `set_version`, `principal_id`, `set_collapsed`,
-//! `move_block`, `insert_block`, `insert_from_snapshot` — over a `Vec` plus
-//! an id-to-index map.
+//! version bump — during live streaming, nearly every frame (`ContextMirror::
+//! apply` advances the version per event). [`RenderBlockStore::rebuild`] is
+//! that whole rebuild, including carrying `collapsed` forward across it so a
+//! local toggle survives streaming elsewhere in the document.
+//! `RenderBlockStore` keeps the methods the app calls — `blocks_ordered`,
+//! `block_ids_ordered`, `get_block_snapshot`, `full_text`, `is_empty`,
+//! `version`, `set_version`, `principal_id`, `set_collapsed`, `move_block`,
+//! `insert_block`, `insert_from_snapshot`, `rebuild` — over a `Vec` plus an
+//! id-to-index map.
 
 use std::collections::HashMap;
 
@@ -194,10 +198,18 @@ impl RenderBlockStore {
     /// this is the one place to bake it in. It only applies the default when
     /// the incoming snapshot is still at the wire default (`collapsed ==
     /// false`); a caller that already resolved a snapshot to `true` is left
-    /// alone. Because this store is rebuilt wholesale on every doc version
-    /// bump (see module doc), a locally-toggled *expand* is not durable
-    /// across an unrelated edit — the same fragility `Thinking`'s local
-    /// toggle already has, not a new one introduced here.
+    /// alone.
+    ///
+    /// This store is rebuilt wholesale on every mirror version bump — during
+    /// live streaming that is nearly every frame (`ContextMirror::apply`
+    /// advances the version per event, so a `TextAppended` anywhere in the
+    /// document retriggers the rebuild), not just at hydration boundaries.
+    /// Called directly, this default would fire on every rebuild, not just
+    /// true first arrival, wiping a user's expand within a frame or two of
+    /// it happening — callers that rebuild the whole store on a cadence like
+    /// that should go through [`Self::rebuild`] instead, which carries
+    /// `collapsed` forward for ids that already existed and only lets this
+    /// default land on ids that didn't.
     pub fn insert_from_snapshot(
         &mut self,
         mut snapshot: BlockSnapshot,
@@ -213,6 +225,50 @@ impl RenderBlockStore {
         let position = self.position_after(after)?;
         self.insert_at(position, snapshot);
         Ok(id)
+    }
+
+    /// Rebuild a fresh store from wire snapshots in document order —
+    /// `sync_main_cell_to_conversation`'s (`view/sync.rs`) whole job, pulled
+    /// out here so it is unit-testable without a Bevy `App`.
+    ///
+    /// `self` is the OUTGOING store: its `collapsed` per id is captured
+    /// before any inserts, then reapplied to the new store for every id
+    /// that already existed. That is what makes `insert_from_snapshot`'s
+    /// Error-defaults-collapsed rule mean "first time this block has ever
+    /// been seen" rather than "first time in *this* store" — see that
+    /// method's doc for why this store's rebuild cadence (nearly every
+    /// frame during live streaming) makes the distinction matter. A block
+    /// id absent from `self` (true first arrival, or `self` was empty) gets
+    /// no override, so `insert_from_snapshot`'s own default applies.
+    ///
+    /// `skip` filters snapshots that should never be materialized here (the
+    /// local principal's own compose draft — already rendered in the
+    /// compose box). Stops and returns the first error rather than
+    /// continuing into an uncertain partial state; the caller should not
+    /// swap it in on failure.
+    pub fn rebuild<'a>(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        snapshots: impl IntoIterator<Item = &'a BlockSnapshot>,
+        mut skip: impl FnMut(&BlockSnapshot) -> bool,
+    ) -> Result<RenderBlockStore, RenderStoreError> {
+        let prev_collapsed: HashMap<BlockId, bool> =
+            self.blocks.iter().map(|b| (b.id, b.collapsed)).collect();
+
+        let mut store = RenderBlockStore::new(context_id, principal_id);
+        let mut after = None;
+        for block in snapshots {
+            if skip(block) {
+                continue;
+            }
+            let id = store.insert_from_snapshot(block.clone(), after.as_ref())?;
+            if let Some(&was_collapsed) = prev_collapsed.get(&id) {
+                store.set_collapsed(&id, was_collapsed)?;
+            }
+            after = Some(id);
+        }
+        Ok(store)
     }
 
     /// Toggle the collapsed flag on a `Thinking` or `Error` block.
@@ -325,5 +381,115 @@ mod tests {
             .build();
         store.insert_from_snapshot(block, None).unwrap();
         assert!(store.get_block_snapshot(&id).unwrap().collapsed);
+    }
+
+    // ------------------------------------------------------------------
+    // rebuild — the sync.rs whole-document rebuild, carrying `collapsed`
+    // forward across it. This runs nearly every frame during live
+    // streaming (a `TextAppended` anywhere bumps the mirror version), so
+    // "survives one rebuild" is really "survives streaming elsewhere in
+    // the document," the bug a kaibo/gemini review caught.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rebuild_carries_forward_a_user_expanded_error_block() {
+        let (ctx, agent) = ctx_and_principal();
+        let id = BlockId::new(ctx, agent, 0);
+
+        let mut old = RenderBlockStore::new(ctx, agent);
+        // The wire snapshot never carries collapsed:true for this block —
+        // `collapsed` is never round-tripped through the kernel — so the
+        // SAME snapshot arrives on every rebuild regardless of what the
+        // user did locally.
+        let wire = BlockSnapshotBuilder::new(id, BlockKind::Error)
+            .content("boom")
+            .build();
+        old.insert_from_snapshot(wire.clone(), None).unwrap();
+        assert!(
+            old.get_block_snapshot(&id).unwrap().collapsed,
+            "sanity: defaults collapsed on first arrival"
+        );
+        old.set_collapsed(&id, false).unwrap(); // user expanded it
+
+        let rebuilt = old
+            .rebuild(ctx, agent, std::iter::once(&wire), |_| false)
+            .unwrap();
+
+        assert!(
+            !rebuilt.get_block_snapshot(&id).unwrap().collapsed,
+            "user's expand must survive a rebuild, not be re-defaulted to collapsed"
+        );
+    }
+
+    #[test]
+    fn rebuild_carries_forward_a_user_collapsed_thinking_block() {
+        let (ctx, agent) = ctx_and_principal();
+        let id = BlockId::new(ctx, agent, 0);
+
+        let mut old = RenderBlockStore::new(ctx, agent);
+        let wire = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
+            .content("pondering")
+            .build();
+        old.insert_from_snapshot(wire.clone(), None).unwrap();
+        old.set_collapsed(&id, true).unwrap(); // user collapsed it
+
+        let rebuilt = old
+            .rebuild(ctx, agent, std::iter::once(&wire), |_| false)
+            .unwrap();
+
+        assert!(
+            rebuilt.get_block_snapshot(&id).unwrap().collapsed,
+            "user's collapse must survive a rebuild, not be silently re-expanded"
+        );
+    }
+
+    #[test]
+    fn rebuild_still_defaults_a_genuinely_new_error_block_to_collapsed() {
+        let (ctx, agent) = ctx_and_principal();
+        let old_id = BlockId::new(ctx, agent, 0);
+        let new_id = BlockId::new(ctx, agent, 1);
+
+        let mut old = RenderBlockStore::new(ctx, agent);
+        let old_wire = BlockSnapshotBuilder::new(old_id, BlockKind::Text)
+            .content("hi")
+            .build();
+        old.insert_from_snapshot(old_wire.clone(), None).unwrap();
+
+        // A brand-new Error block arrives alongside the pre-existing one,
+        // in the same rebuild — its id was never in `old`, so it gets the
+        // real first-arrival default, not a carried-forward value.
+        let new_wire = BlockSnapshotBuilder::new(new_id, BlockKind::Error)
+            .content("boom")
+            .build();
+        let rebuilt = old
+            .rebuild(ctx, agent, vec![&old_wire, &new_wire], |_| false)
+            .unwrap();
+
+        assert!(
+            rebuilt.get_block_snapshot(&new_id).unwrap().collapsed,
+            "a block never seen before should still default collapsed"
+        );
+    }
+
+    #[test]
+    fn rebuild_skips_blocks_the_predicate_rejects() {
+        let (ctx, agent) = ctx_and_principal();
+        let draft_id = BlockId::new(ctx, agent, 0);
+        let keep_id = BlockId::new(ctx, agent, 1);
+
+        let draft = BlockSnapshotBuilder::new(draft_id, BlockKind::Text)
+            .status(Status::Draft)
+            .build();
+        let keep = BlockSnapshotBuilder::new(keep_id, BlockKind::Text)
+            .status(Status::Done)
+            .build();
+
+        let old = RenderBlockStore::new(ctx, agent);
+        let rebuilt = old
+            .rebuild(ctx, agent, vec![&draft, &keep], |b| b.status == Status::Draft)
+            .unwrap();
+
+        assert!(rebuilt.get_block_snapshot(&draft_id).is_none());
+        assert!(rebuilt.get_block_snapshot(&keep_id).is_some());
     }
 }
