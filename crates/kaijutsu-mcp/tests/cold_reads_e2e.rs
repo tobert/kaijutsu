@@ -34,7 +34,7 @@ use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
 use kaijutsu_client::{AuthorBlock, KeySource, SshConfig};
-use kaijutsu_crdt::{PrincipalId, Role};
+use kaijutsu_types::{PrincipalId, Role};
 use kaijutsu_mcp::{AnalyzeDocumentArgs, Backend, KaijutsuMcp, SearchContextArgs};
 use kaijutsu_server::{SshServer, SshServerConfig};
 use kaijutsu_types::BlockQuery;
@@ -108,7 +108,7 @@ async fn auto_register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json:
 /// freeze; what it proves is that the cold readers below still see the
 /// block, because they read the server directly rather than depending on
 /// event delivery at all.
-async fn kill_event_listener_and_get_context(mcp: &KaijutsuMcp) -> kaijutsu_crdt::ContextId {
+async fn kill_event_listener_and_get_context(mcp: &KaijutsuMcp) -> kaijutsu_types::ContextId {
     let Backend::Remote(remote) = mcp.backend() else {
         panic!("expected Remote backend");
     };

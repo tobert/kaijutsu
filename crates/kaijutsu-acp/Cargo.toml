@@ -15,7 +15,6 @@ workspace = true
 
 [dependencies]
 kaijutsu-client.workspace = true
-kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true

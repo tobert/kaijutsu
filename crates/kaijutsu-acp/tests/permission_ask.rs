@@ -30,7 +30,7 @@ use kaijutsu_acp::rank::session_id_of;
 use kaijutsu_acp::session::{Session, SessionRegistry};
 use kaijutsu_acp::update::UpdateMapper;
 use kaijutsu_client::{PermissionAskAnswer, PermissionAskEnvelope, PermissionOptionInfo};
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use tokio::sync::{mpsc, oneshot};
 
 /// Short enough that the timeout-denies test doesn't actually wait 30s.

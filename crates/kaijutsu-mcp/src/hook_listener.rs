@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use kaijutsu_crdt::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, ToolKind};
+use kaijutsu_types::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, ToolKind};
 use kaijutsu_types::timeout::tiers;
 use kaijutsu_kernel::SharedBlockStore;
 
@@ -99,7 +99,7 @@ where
 struct CallReservation {
     actor: ActorHandle,
     context_id: ContextId,
-    call_id: kaijutsu_crdt::BlockId,
+    call_id: kaijutsu_types::BlockId,
     armed: bool,
 }
 
@@ -781,7 +781,7 @@ impl HookListener {
                 tracing::warn!("Hook insert_tool_result error: {e}");
             }
             // The call block is inserted Status::Running (see
-            // kaijutsu_crdt::block_store::BlockStore::insert_tool_call) and
+            // kaijutsu_types::block_store::BlockStore::insert_tool_call) and
             // only the LLM streaming path transitioned it to Done/Error —
             // hook-authored calls never did, so they stayed "running"
             // forever in the UI. Mirror the LLM path: complete the call once

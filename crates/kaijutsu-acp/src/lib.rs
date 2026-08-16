@@ -373,7 +373,7 @@ fn validate_acp_cwd(cwd: &std::path::Path) -> anyhow::Result<()> {
 async fn start_session(
     bridge: &Arc<AcpBridge>,
     session_id: &SessionId,
-    context_id: kaijutsu_crdt::ContextId,
+    context_id: kaijutsu_types::ContextId,
     label: String,
     cx: &ConnectionTo<Client>,
     replay_history: bool,

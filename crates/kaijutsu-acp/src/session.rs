@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionU
 use agent_client_protocol::{Client, ConnectionTo};
 use kaijutsu_client::{ContextChange, ContextDelivery, ContextMirror, FeedEvent, ServerEvent, TurnOrigin};
 use kaijutsu_client::rpc::KjCommandInfo;
-use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_types::{BlockId, ContextId};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
@@ -601,7 +601,7 @@ pub(crate) async fn settle_command_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_types::PrincipalId;
     use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, Role};
 
     fn ctx() -> ContextId {

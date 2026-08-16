@@ -80,7 +80,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{ActorHandle, PeerConfig, PeerInvocation, SshConfig, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
+use kaijutsu_crdt::ConversationDAG;
+use kaijutsu_types::{BlockId, ContextId, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use tokio::sync::{broadcast, watch};
 
@@ -170,7 +171,7 @@ enum ShellCompletion {
         // Boxed: BlockSnapshot dwarfs the other variants' payloads (984 vs
         // 56 bytes), so every ShellCompletion value would otherwise pay for
         // the largest variant (large_enum_variant).
-        snapshot: Box<kaijutsu_crdt::BlockSnapshot>,
+        snapshot: Box<kaijutsu_types::BlockSnapshot>,
         elapsed_ms: u64,
     },
     Timeout {
@@ -340,7 +341,7 @@ fn shell_output_schema() -> std::sync::Arc<rmcp::model::JsonObject> {
 #[derive(Clone)]
 pub struct RemoteState {
     /// Kernel ID we connected to
-    pub kernel_id: kaijutsu_crdt::KernelId,
+    pub kernel_id: kaijutsu_types::KernelId,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
     /// Wake signal: a monotonic generation counter the pulse task bumps
@@ -354,14 +355,14 @@ pub struct RemoteState {
     /// Joined context state (None until register_session is called)
     pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
     /// Shared context_id for hook listener (updated by register_session)
-    pub shared_context_id: Arc<Mutex<Option<kaijutsu_crdt::ContextId>>>,
+    pub shared_context_id: Arc<Mutex<Option<kaijutsu_types::ContextId>>>,
 }
 
 /// State for a joined context — created by `register_session`.
 #[derive(Clone)]
 pub struct JoinedContext {
     /// Context ID we joined
-    pub context_id: kaijutsu_crdt::ContextId,
+    pub context_id: kaijutsu_types::ContextId,
     /// Abort handle for the pulse task (see `spawn_pulse_task`) — the sole
     /// remaining consumer of the actor's event broadcast in this process.
     _pulse_task: Arc<AbortOnDrop>,
@@ -880,7 +881,7 @@ impl KaijutsuMcp {
         &self,
         ctx: ContextId,
         id: &BlockId,
-    ) -> Result<Option<kaijutsu_crdt::BlockSnapshot>, String> {
+    ) -> Result<Option<kaijutsu_types::BlockSnapshot>, String> {
         match &self.backend {
             Backend::Local(store) => Ok(store.get(ctx).and_then(|e| e.doc.get_block_snapshot(id))),
             Backend::Remote(remote) => remote
@@ -901,7 +902,7 @@ impl KaijutsuMcp {
     async fn locate_block(
         &self,
         block_id_str: &str,
-    ) -> Result<Option<(ContextId, BlockId, kaijutsu_crdt::BlockSnapshot)>, String> {
+    ) -> Result<Option<(ContextId, BlockId, kaijutsu_types::BlockSnapshot)>, String> {
         let Some(block_id) = parse_block_id(block_id_str) else {
             return Ok(None);
         };
@@ -919,7 +920,7 @@ impl KaijutsuMcp {
     async fn context_blocks(
         &self,
         ctx: ContextId,
-    ) -> Result<Option<Vec<kaijutsu_crdt::BlockSnapshot>>, String> {
+    ) -> Result<Option<Vec<kaijutsu_types::BlockSnapshot>>, String> {
         match &self.backend {
             Backend::Local(store) => Ok(store.get(ctx).map(|e| e.doc.blocks_ordered())),
             Backend::Remote(remote) => remote
@@ -947,7 +948,7 @@ impl KaijutsuMcp {
     async fn context_blocks_and_version(
         &self,
         ctx: ContextId,
-    ) -> Result<Option<(Vec<kaijutsu_crdt::BlockSnapshot>, u64)>, String> {
+    ) -> Result<Option<(Vec<kaijutsu_types::BlockSnapshot>, u64)>, String> {
         match &self.backend {
             Backend::Local(store) => {
                 Ok(store.get(ctx).map(|e| (e.doc.blocks_ordered(), e.doc.version())))
@@ -1000,7 +1001,7 @@ impl KaijutsuMcp {
         &self,
         actor: &ActorHandle,
         query: &str,
-    ) -> Result<kaijutsu_crdt::ContextId, String> {
+    ) -> Result<kaijutsu_types::ContextId, String> {
         let contexts = actor
             .list_contexts()
             .await
@@ -1013,7 +1014,7 @@ impl KaijutsuMcp {
             };
             (c.id, label)
         });
-        kaijutsu_crdt::resolve_context_prefix(entries, query)
+        kaijutsu_types::resolve_context_prefix(entries, query)
             .map_err(|e| format!("Error resolving context '{query}': {e}"))
     }
 
@@ -1025,7 +1026,7 @@ impl KaijutsuMcp {
     async fn resolve_input_context(
         &self,
         query: Option<&str>,
-    ) -> Result<kaijutsu_crdt::ContextId, String> {
+    ) -> Result<kaijutsu_types::ContextId, String> {
         match (&self.backend, query) {
             // Explicit context provided — resolve it
             (Backend::Remote(remote), Some(q)) => self.resolve_context(&remote.actor, q).await,
@@ -1081,8 +1082,8 @@ impl KaijutsuMcp {
         // children; take them all and pick here.
         let query_terminal = || async {
             let filter = kaijutsu_types::BlockFilter {
-                kinds: vec![kaijutsu_crdt::BlockKind::ToolResult],
-                statuses: vec![kaijutsu_crdt::Status::Done, kaijutsu_crdt::Status::Error],
+                kinds: vec![kaijutsu_types::BlockKind::ToolResult],
+                statuses: vec![kaijutsu_types::Status::Done, kaijutsu_types::Status::Error],
                 parent_id: Some(cmd_block_id),
                 max_depth: 1,
                 ..Default::default()
@@ -2768,7 +2769,7 @@ mod tests {
         assert_eq!(normalize_peer_params(&n), n);
     }
 
-    use kaijutsu_crdt::ContextId;
+    use kaijutsu_types::ContextId;
 
     // =========================================================================
     // register_session TOCTOU retry classification
@@ -2925,22 +2926,22 @@ mod tests {
     // an agent-visible break — start here when you do.
     // ========================================================================
 
-    fn make_result_snapshot(content: &str, exit_code: Option<i32>) -> kaijutsu_crdt::BlockSnapshot {
+    fn make_result_snapshot(content: &str, exit_code: Option<i32>) -> kaijutsu_types::BlockSnapshot {
         let ctx_id = ContextId::new();
-        let call_id = kaijutsu_crdt::BlockId {
+        let call_id = kaijutsu_types::BlockId {
             context_id: ctx_id,
             principal_id: PrincipalId::new(),
             seq: 1,
         };
-        let result_id = kaijutsu_crdt::BlockId {
+        let result_id = kaijutsu_types::BlockId {
             context_id: ctx_id,
             principal_id: PrincipalId::new(),
             seq: 2,
         };
-        kaijutsu_crdt::BlockSnapshot::tool_result(
+        kaijutsu_types::BlockSnapshot::tool_result(
             result_id,
             call_id,
-            kaijutsu_crdt::ToolKind::Shell,
+            kaijutsu_types::ToolKind::Shell,
             content,
             exit_code.is_some_and(|c| c != 0),
             exit_code,
@@ -2953,7 +2954,7 @@ mod tests {
         content: &str,
         stderr: &str,
         exit_code: Option<i32>,
-    ) -> kaijutsu_crdt::BlockSnapshot {
+    ) -> kaijutsu_types::BlockSnapshot {
         let mut snap = make_result_snapshot(content, exit_code);
         snap.stderr = Some(stderr.to_string());
         snap
@@ -3151,7 +3152,7 @@ mod tests {
     #[test]
     fn test_shell_completion_timeout_envelope() {
         let ctx_id = ContextId::new();
-        let cmd_block_id = kaijutsu_crdt::BlockId {
+        let cmd_block_id = kaijutsu_types::BlockId {
             context_id: ctx_id,
             principal_id: PrincipalId::new(),
             seq: 99,
@@ -3177,7 +3178,7 @@ mod tests {
     #[test]
     fn test_shell_completion_stream_closed_envelope() {
         let ctx_id = ContextId::new();
-        let cmd_block_id = kaijutsu_crdt::BlockId {
+        let cmd_block_id = kaijutsu_types::BlockId {
             context_id: ctx_id,
             principal_id: PrincipalId::new(),
             seq: 99,

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use capnp::capability::Promise;
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use kaijutsu_types::{BlockId, BlockMetadata, BlockSnapshot, OutputData, Status};
 use tokio::sync::mpsc;
 
@@ -659,7 +659,7 @@ impl ContextMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::{BlockKind, PrincipalId, Role};
+    use kaijutsu_types::{BlockKind, PrincipalId, Role};
 
     fn ctx() -> ContextId {
         ContextId::new()

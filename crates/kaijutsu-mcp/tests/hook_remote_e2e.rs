@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
 use kaijutsu_client::{KeySource, SshConfig};
-use kaijutsu_crdt::{BlockKind, Status};
+use kaijutsu_types::{BlockKind, Status};
 use kaijutsu_mcp::hook_listener::{HookListener, send_hook_event};
 use kaijutsu_mcp::{Backend, KaijutsuMcp};
 use kaijutsu_server::{SshServer, SshServerConfig};
@@ -128,7 +128,7 @@ fn rename_context_rpc_renames_and_refuses_taken_labels() {
             "register_session_auto failed: {reg}"
         );
         let context_id = reg["context_id"].as_str().unwrap();
-        let context_id = kaijutsu_crdt::ContextId::parse(context_id).unwrap();
+        let context_id = kaijutsu_types::ContextId::parse(context_id).unwrap();
 
         let Backend::Remote(remote) = mcp.backend().clone() else {
             panic!("expected remote backend");
@@ -433,7 +433,7 @@ fn hook_authored_blocks_belong_to_the_agent_session() {
         .to_string();
         send_hook_event(&socket_path, &event).await.unwrap();
 
-        let expected = kaijutsu_crdt::PrincipalId::for_agent_session(session_id);
+        let expected = kaijutsu_types::PrincipalId::for_agent_session(session_id);
 
         let mut server_blocks = Vec::new();
         for _ in 0..50 {
@@ -460,7 +460,7 @@ fn hook_authored_blocks_belong_to_the_agent_session() {
         );
         assert_ne!(
             call.id.principal_id,
-            kaijutsu_crdt::PrincipalId::system(),
+            kaijutsu_types::PrincipalId::system(),
             "must not claim the kernel authored an agent's tool call"
         );
     });
@@ -503,7 +503,7 @@ fn rpc_authoring_carries_tool_fields_and_completes_independently() {
             .expect("context id mutex")
             .expect("registered context");
 
-        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("sess-rpc-authoring");
+        let principal = kaijutsu_types::PrincipalId::for_agent_session("sess-rpc-authoring");
 
         // Reserve: short call, returns an id, holds nothing.
         let call_id = remote
@@ -513,7 +513,7 @@ fn rpc_authoring_carries_tool_fields_and_completes_independently() {
                 principal,
                 "Bash",
                 serde_json::json!({"command": "ls -la /tmp"}),
-                Some(kaijutsu_crdt::ToolKind::Mcp),
+                Some(kaijutsu_types::ToolKind::Mcp),
             ))
             .await
             .expect("authorBlock(tool_call)");
@@ -556,7 +556,7 @@ fn rpc_authoring_carries_tool_fields_and_completes_independently() {
                 call_id,
                 "total 0",
                 false,
-                Some(kaijutsu_crdt::ToolKind::Mcp),
+                Some(kaijutsu_types::ToolKind::Mcp),
             ))
             .await
             .expect("authorBlock(tool_result)");
@@ -645,7 +645,7 @@ fn relaunch_reattaches_to_the_same_stable_context() {
         let reg_a = auto_register_with_retry(&mcp_a, &placeholder_a).await;
         assert!(reg_a["success"].as_bool().unwrap_or(false), "A register failed: {reg_a}");
         let placeholder_a_id =
-            kaijutsu_crdt::ContextId::parse(reg_a["context_id"].as_str().unwrap()).unwrap();
+            kaijutsu_types::ContextId::parse(reg_a["context_id"].as_str().unwrap()).unwrap();
 
         let Backend::Remote(remote_a) = mcp_a.backend().clone() else {
             panic!("expected remote backend");
@@ -699,7 +699,7 @@ fn relaunch_reattaches_to_the_same_stable_context() {
         let reg_b = auto_register_with_retry(&mcp_b, &placeholder_b).await;
         assert!(reg_b["success"].as_bool().unwrap_or(false), "B register failed: {reg_b}");
         let placeholder_b_id =
-            kaijutsu_crdt::ContextId::parse(reg_b["context_id"].as_str().unwrap()).unwrap();
+            kaijutsu_types::ContextId::parse(reg_b["context_id"].as_str().unwrap()).unwrap();
         assert_ne!(
             placeholder_b_id, placeholder_a_id,
             "sanity: B's placeholder must be a distinct fresh context"

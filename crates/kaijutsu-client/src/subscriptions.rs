@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use capnp::capability::Promise;
-use kaijutsu_crdt::{ContextId, KernelId};
+use kaijutsu_types::{ContextId, KernelId};
 use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::{broadcast, mpsc, oneshot};
 

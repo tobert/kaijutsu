@@ -5,7 +5,7 @@
 //! Block resolution now lives on `KaijutsuMcp` (`locate_block`/`read_block`),
 //! which is backend-agnostic; what stays here is the key parser they use.
 
-use kaijutsu_crdt::BlockId;
+use kaijutsu_types::BlockId;
 
 /// Parse block ID from key string.
 pub fn parse_block_id(s: &str) -> Option<BlockId> {

@@ -4,7 +4,7 @@
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
-use kaijutsu_crdt::{ContextId, KernelId};
+use kaijutsu_types::{ContextId, KernelId};
 use kaijutsu_types::{
     BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType,
     DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan, PrincipalId, Role, Status,

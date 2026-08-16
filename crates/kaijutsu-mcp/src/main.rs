@@ -268,7 +268,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 let doc_ids = store.list_ids();
                 let ctx_id = doc_ids.first()
                     .copied()
-                    .unwrap_or_else(kaijutsu_crdt::ContextId::new);
+                    .unwrap_or_else(kaijutsu_types::ContextId::new);
                 Arc::new(HookListener::local(store.clone(), ctx_id))
             }
             kaijutsu_mcp::Backend::Remote(remote) => {

@@ -28,10 +28,8 @@ tracing = { workspace = true }
 kaijutsu-telemetry.workspace = true
 
 # CRDT engine
-diamond-types-extended.workspace = true
 
 # Shared CRDT types
-kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 
 # Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint carried by ServerEvent::PlayAudio.

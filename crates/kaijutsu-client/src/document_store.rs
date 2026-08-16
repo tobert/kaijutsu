@@ -16,8 +16,8 @@
 //! decides *when* a document is stale (the feed says so, per context, via
 //! `FeedEvent::Resubscribed`/`Terminated`) — it only holds the mirror, holds
 //! the live feed receiver alongside it, and drains that receiver on request.
-//! The old `generation`/`stale_active`/`mark_synced` staleness dance is gone
-//! with it; there is nothing left for it to gate.
+//! The old `generation`/`stale_active`/`mark_synced` staleness tracking is
+//! gone with it; there is nothing left for it to gate.
 //!
 //! **Compose input (Lane C slice 3, retired Lane C slice 4).** The compose
 //! draft used to be a separate `SyncedInput` CRDT document, hydrated via
@@ -343,7 +343,7 @@ impl DocumentStore {
 mod tests {
     use super::*;
     use crate::{ContextChange, ContextDelivery};
-    use kaijutsu_crdt::{BlockKind, PrincipalId, Role};
+    use kaijutsu_types::{BlockKind, PrincipalId, Role};
 
     fn ctx() -> ContextId {
         ContextId::new()

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{SessionId, SessionInfo};
 use kaijutsu_client::ContextInfo;
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_ring_seats};
 
 /// The ACP session id for a context: its hex form. Round-trips through

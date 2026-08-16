@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kaijutsu_crdt::{ContextId, KernelId};
+use kaijutsu_types::{ContextId, KernelId};
 use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot, Status};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;

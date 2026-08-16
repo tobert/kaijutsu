@@ -729,7 +729,7 @@ fn tool_title(block: &BlockSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::{ContextId, PrincipalId};
+    use kaijutsu_types::{ContextId, PrincipalId};
 
     fn block(kind: BlockKind, role: Role, content: &str, seq: u64) -> BlockSnapshot {
         kaijutsu_types::BlockSnapshotBuilder::new(

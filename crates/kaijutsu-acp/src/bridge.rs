@@ -13,7 +13,7 @@ use kaijutsu_client::{
     connect_ssh, spawn_actor,
 };
 use kaijutsu_client::rpc::{KjCommandInfo, KjExecutionResult};
-use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::BlockQuery;
 use tokio::sync::mpsc;
 
