@@ -1,16 +1,19 @@
-//! Computed DAG index from CRDT data.
+//! Ephemeral index over a list of block snapshots.
 //!
-//! The ConversationDAG provides efficient tree traversal operations
-//! computed from the flat block list in a BlockStore.
+//! `ConversationDAG` holds no CRDT state and no link to a store — a caller builds it
+//! fresh from a `Vec<BlockSnapshot>` each time it needs tree traversal, then discards it.
+//!
+//! Traversal methods cap depth at `MAX_DAG_DEPTH` (512) — a cyclic parent chain would
+//! otherwise loop forever, so `depth`, `ancestors`, `subtree`, `iter_dfs`, and `iter_bfs`
+//! all stop there and return a truncated result instead.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{BlockId, BlockSnapshot, BlockStore, MAX_DAG_DEPTH};
+use crate::{BlockId, BlockSnapshot, MAX_DAG_DEPTH};
 
-/// Computed DAG index from CRDT data.
+/// Index over a list of block snapshots, built fresh rather than stored.
 ///
-/// This is an ephemeral structure computed from BlockStore data.
-/// It provides efficient traversal without modifying the underlying CRDT.
+/// Provides efficient tree traversal without modifying the snapshots it indexes.
 #[derive(Debug, Clone)]
 pub struct ConversationDAG {
     /// Root blocks (no parent).
@@ -22,11 +25,6 @@ pub struct ConversationDAG {
 }
 
 impl ConversationDAG {
-    /// Build a DAG from a BlockStore.
-    pub fn from_store(store: &BlockStore) -> Self {
-        Self::from_snapshots(store.blocks_ordered())
-    }
-
     /// Build a DAG from an ordered list of block snapshots.
     pub fn from_snapshots(snapshots: Vec<BlockSnapshot>) -> Self {
         let mut roots = Vec::new();
@@ -265,40 +263,44 @@ impl<'a> Iterator for BfsIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, TaskStatus};
+    use crate::{
+        BlockKind, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId, Role, Status,
+        TaskStatus,
+    };
 
-    fn test_store() -> BlockStore {
-        BlockStore::new(ContextId::new(), PrincipalId::new())
+    /// Mint sequential `BlockId`s in one context/principal, mirroring what
+    /// `BlockStore::new_block_id()` did for these fixtures before the move.
+    fn ids(ctx: ContextId, principal: PrincipalId) -> impl FnMut() -> BlockId {
+        let mut seq = 0u64;
+        move || {
+            let id = BlockId::new(ctx, principal, seq);
+            seq += 1;
+            id
+        }
+    }
+
+    fn snap(id: BlockId, kind: BlockKind, role: Role, parent: Option<BlockId>) -> BlockSnapshot {
+        let mut builder = BlockSnapshotBuilder::new(id, kind).role(role).status(Status::Done);
+        if let Some(parent_id) = parent {
+            builder = builder.parent_id(parent_id);
+        }
+        builder.build()
     }
 
     #[test]
-    fn test_dag_from_flat_store() {
-        let mut store = test_store();
+    fn test_dag_from_flat_snapshots() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut next_id = ids(ctx, principal);
 
-        let id1 = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "First",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let id2 = store
-            .insert_block(
-                None,
-                Some(&id1),
-                Role::Model,
-                BlockKind::Text,
-                "Second",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
+        let id1 = next_id();
+        let id2 = next_id();
+        let snapshots = vec![
+            snap(id1, BlockKind::Text, Role::User, None),
+            snap(id2, BlockKind::Text, Role::Model, None),
+        ];
 
-        let dag = ConversationDAG::from_store(&store);
+        let dag = ConversationDAG::from_snapshots(snapshots);
 
         assert_eq!(dag.roots.len(), 2);
         assert!(dag.get(&id1).is_some());
@@ -307,43 +309,20 @@ mod tests {
 
     #[test]
     fn test_dag_with_parent_child() {
-        let mut store = test_store();
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut next_id = ids(ctx, principal);
 
-        let parent = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Question",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let child1 = store
-            .insert_block(
-                Some(&parent),
-                Some(&parent),
-                Role::Model,
-                BlockKind::Thinking,
-                "Thinking...",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let child2 = store
-            .insert_block(
-                Some(&parent),
-                Some(&child1),
-                Role::Model,
-                BlockKind::Text,
-                "Answer",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
+        let parent = next_id();
+        let child1 = next_id();
+        let child2 = next_id();
+        let snapshots = vec![
+            snap(parent, BlockKind::Text, Role::User, None),
+            snap(child1, BlockKind::Thinking, Role::Model, Some(parent)),
+            snap(child2, BlockKind::Text, Role::Model, Some(parent)),
+        ];
 
-        let dag = ConversationDAG::from_store(&store);
+        let dag = ConversationDAG::from_snapshots(snapshots);
 
         assert_eq!(dag.roots.len(), 1);
         assert_eq!(dag.roots[0], parent);
@@ -360,43 +339,20 @@ mod tests {
 
     #[test]
     fn test_dfs_iteration() {
-        let mut store = test_store();
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut next_id = ids(ctx, principal);
 
-        let root = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Root",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let child1 = store
-            .insert_block(
-                Some(&root),
-                Some(&root),
-                Role::Model,
-                BlockKind::Text,
-                "Child1",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let grandchild = store
-            .insert_block(
-                Some(&child1),
-                Some(&child1),
-                Role::Model,
-                BlockKind::Text,
-                "Grandchild",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
+        let root = next_id();
+        let child1 = next_id();
+        let grandchild = next_id();
+        let snapshots = vec![
+            snap(root, BlockKind::Text, Role::User, None),
+            snap(child1, BlockKind::Text, Role::Model, Some(root)),
+            snap(grandchild, BlockKind::Text, Role::Model, Some(child1)),
+        ];
 
-        let dag = ConversationDAG::from_store(&store);
+        let dag = ConversationDAG::from_snapshots(snapshots);
 
         let dfs: Vec<_> = dag.iter_dfs().collect();
         assert_eq!(dfs.len(), 3);
@@ -503,7 +459,7 @@ mod tests {
             tool_meta_at: 0,
         };
 
-        // Build DAG manually (from_store would not create cycles)
+        // Build DAG manually (from_snapshots would not create cycles)
         let mut blocks = HashMap::new();
         let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         blocks.insert(id_a, snap_a);
@@ -542,43 +498,20 @@ mod tests {
 
     #[test]
     fn test_subtree() {
-        let mut store = test_store();
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut next_id = ids(ctx, principal);
 
-        let root = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Root",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let child = store
-            .insert_block(
-                Some(&root),
-                Some(&root),
-                Role::Model,
-                BlockKind::Text,
-                "Child",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let _other_root = store
-            .insert_block(
-                None,
-                Some(&child),
-                Role::User,
-                BlockKind::Text,
-                "Other",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
+        let root = next_id();
+        let child = next_id();
+        let other_root = next_id();
+        let snapshots = vec![
+            snap(root, BlockKind::Text, Role::User, None),
+            snap(child, BlockKind::Text, Role::Model, Some(root)),
+            snap(other_root, BlockKind::Text, Role::User, None),
+        ];
 
-        let dag = ConversationDAG::from_store(&store);
+        let dag = ConversationDAG::from_snapshots(snapshots);
 
         let subtree = dag.subtree(&root);
         assert_eq!(subtree.len(), 2);

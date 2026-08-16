@@ -24,7 +24,6 @@
 
 pub mod block_store;
 pub(crate) mod content;
-mod dag;
 mod error;
 mod ops;
 pub mod selection;
@@ -32,8 +31,8 @@ pub mod selection;
 // Re-export types from kaijutsu-types
 pub use kaijutsu_types::{
     BlockFilter, BlockHeader, BlockId, BlockKind, BlockMetadata, BlockQuery, BlockSnapshot,
-    BlockSnapshotBuilder, ContentType, ContextId, DriftKind, ErrorCategory, ErrorPayload,
-    ErrorSeverity, ErrorSpan, KernelId, LogLevel, MAX_DAG_DEPTH, NotificationKind,
+    BlockSnapshotBuilder, ContentType, ContextId, ConversationDAG, DriftKind, ErrorCategory,
+    ErrorPayload, ErrorSeverity, ErrorSpan, KernelId, LogLevel, MAX_DAG_DEPTH, NotificationKind,
     NotificationPayload, OutputData, OutputEntryType, OutputNode, PrefixError, PrefixResolvable,
     PrincipalId, ResourcePayload, Role, SessionId, Span, Status, TaskStatus, Tick, TickDelta,
     ToolKind, resolve_context_prefix,
@@ -45,7 +44,6 @@ pub use selection::{
     IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
 };
 pub use content::BlockContent;
-pub use dag::ConversationDAG;
 
 pub use error::CrdtError;
 pub use ops::{Frontier, LV, SerializedOps, SerializedOpsOwned};

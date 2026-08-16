@@ -80,8 +80,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{ActorHandle, PeerConfig, PeerInvocation, SshConfig, connect_ssh, spawn_actor};
-use kaijutsu_crdt::ConversationDAG;
-use kaijutsu_types::{BlockId, ContextId, PrincipalId};
+use kaijutsu_types::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use tokio::sync::{broadcast, watch};
 

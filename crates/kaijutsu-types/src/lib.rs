@@ -46,6 +46,7 @@
 pub mod block;
 pub mod codec;
 pub mod context;
+pub mod dag;
 pub mod enums;
 pub mod error_block;
 pub mod ids;
@@ -99,6 +100,7 @@ pub use block::{
 };
 pub use error_block::IntoErrorPayload;
 pub use context::{Context, RING_SLOTS, fork_lineage};
+pub use dag::ConversationDAG;
 pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind};
 pub use ids::{
     BackendId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId,

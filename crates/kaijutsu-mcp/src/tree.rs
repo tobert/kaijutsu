@@ -2,8 +2,7 @@
 //!
 //! Provides functions to format a ConversationDAG as a human-readable tree.
 
-use kaijutsu_crdt::ConversationDAG;
-use kaijutsu_types::{BlockId, BlockKind};
+use kaijutsu_types::{BlockId, BlockKind, ConversationDAG};
 
 /// Format a DAG as ASCII tree lines.
 pub fn format_dag_tree(
