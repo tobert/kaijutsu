@@ -20,12 +20,27 @@ backward-compat path only releases whole detents. winit 0.30.13 (Bevy
 0.19's pin) then prefers `discrete` → integer `LineDelta`. Nothing app-side
 can recover events never delivered.
 
-What to do: track winit/sctk hi-res scroll support and re-check on each
-Bevy winit bump — **our pipeline is already fraction-ready** (no quantum,
-sub-pixel offsets, gain math handles fractional lines), so it lights up
-with zero app work when the events arrive. Do NOT re-add smoothing hacks to
-fake sub-detent motion. Wheel event trace lives at `debug!` in
-`input/dispatch.rs` for feel-tuning.
+Upstream status (checked 2026-08-16): sctk **master** handles AxisValue120
+(exposes `value120: i32` on AxisScroll), but winit has **zero** value120
+references even on master (GitHub code search), and winit 0.30.13 pins
+`smithay-client-toolkit = "0.19.2"` exactly. So the block is winit, not
+sctk. Compositor-agnostic: any compositor must quantize for a ≤v7 client —
+**switching KWin→Mutter would not fix this**. (Browsers had the same bug
+and fixed it client-side: Firefox bugzilla 1831893/1836886.) Two paths:
+(a) wait for Bevy's winit to bump onto a value120-consuming stack; (b) a
+small carried patch — fork sctk 0.19.2 (add the AxisValue120 arm + v8+
+bind) and winit 0.30.13 (prefer `value120/120.0` as fractional LineDelta
+when nonzero) via `[patch.crates-io]`; one file each, removable when
+upstream lands. Given the catch-up loop is "the most important interaction
+in the whole app", (b) is a plausible day-lane.
+
+What to do meanwhile: **our pipeline is already fraction-ready** (no
+quantum, sub-pixel offsets, gain math handles fractional lines), so it
+lights up with zero app work when the events arrive. Do NOT re-add
+smoothing hacks to fake sub-detent motion. Wheel event trace lives at
+`debug!` in `input/dispatch.rs` for feel-tuning — it also answers, in 30
+seconds, whether any given compositor streams sub-detent continuous axis
+to old clients (KWin observed: it does not).
 
 ## Catch-up seam: mark and jump to the read/unread boundary (2026-08-16)
 
