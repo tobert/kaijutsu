@@ -1,11 +1,13 @@
 //! TOML config loader for app-side configuration.
 //!
 //! Loads **bindings** from the host `bindings.toml` (app-only config). The
-//! **theme** is no longer a host file: it is CRDT-owned by the kernel (slice 2,
-//! `docs/config-crdt-ownership.md`) and fetched over RPC on connect
-//! (`apply_theme_from_rpc`), so the app starts on `Theme::default()` and the
-//! real theme arrives once connected. Bindings stay host-side because they are
-//! purely client-local and the kernel has no notion of them.
+//! **theme** is no longer a host file: it lives in the kernel-owned
+//! `/etc/config` (a plain file written through the file tools, see
+//! `docs/config-crdt-ownership.md`'s superseded note) and is fetched over RPC
+//! on connect (`apply_theme_from_rpc`), so the app starts on
+//! `Theme::default()` and the real theme arrives once connected. Bindings
+//! stay host-side because they are purely client-local and the kernel has no
+//! notion of them.
 
 use bevy::prelude::*;
 use std::path::Path;

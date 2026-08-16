@@ -54,7 +54,6 @@ pub enum ServerEvent {
     BlockInserted {
         context_id: ContextId,
         block: Box<BlockSnapshot>,
-        ops: Vec<u8>,
     },
     /// A block's execution status changed (Pending → Running → Done/Error).
     BlockStatusChanged {
@@ -930,13 +929,7 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let ops = params.get_ops().map(|d| d.to_vec()).unwrap_or_default();
-
-        let event = ServerEvent::BlockInserted {
-            context_id,
-            block,
-            ops,
-        };
+        let event = ServerEvent::BlockInserted { context_id, block };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockInserted event");
         }

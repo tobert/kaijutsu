@@ -904,7 +904,6 @@ mod tests {
         app.world_mut().write_message(ServerEventMessage(ServerEvent::BlockInserted {
             context_id: ctx(7),
             block: Box::new(block),
-            ops: vec![],
         }));
         app.update();
 

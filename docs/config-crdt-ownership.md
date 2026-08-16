@@ -19,6 +19,13 @@ build order. It supersedes the earlier `FileDocumentCache`-era design
 > built. The doctrine itself is unchanged and `theme.toml`, `mcp.toml`,
 > `system.md`, and all of `/etc/rc` remain CRDT-owned exactly as described.
 
+> **Superseded in part (2026-08-15/16):** `/etc/config`, `/etc/client`, and
+> `/etc/midi` are no longer CRDT documents — they are plain write surfaces
+> for the file tools, git-backed via `kaijutsu-configgit`. `/etc/rc` keeps
+> the model this doc describes. The invariant that survives unchanged is
+> single kernel ownership: one source of truth, no host write-through. See
+> CLAUDE.md ("Config is different from rc").
+
 ---
 
 ## Why — dual ownership is the disease

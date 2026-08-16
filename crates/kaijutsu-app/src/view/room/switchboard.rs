@@ -370,7 +370,9 @@ pub(crate) fn spawn_switchboard(
         let mat = mats.add(super::unlit(super::lin_v(Vec3::ZERO)));
         commands.spawn((
             SwitchboardLamp(i),
-            super::RoomDistraction,
+            // No RoomDistraction: the lamp grid is the station's own chamber
+            // content (like patch bay's wheel and tracker's grid), not room
+            // chrome — it stays lit through station dives.
             Mesh3d(mesh.clone()),
             MeshMaterial3d(mat),
             Transform::from_translation(panel_tf.transform_point(local))

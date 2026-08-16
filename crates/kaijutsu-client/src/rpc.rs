@@ -2394,7 +2394,7 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // Input Document (CRDT compose scratchpad)
+    // Input Document (draft block, one per context/principal)
     // =========================================================================
 
     /// High-level edit on the input document: insert text at position, delete characters.
@@ -2425,7 +2425,11 @@ impl KernelHandle {
 
     /// Get the full input document state for a context.
     ///
-    /// Returns the current content, CRDT oplog, and version.
+    /// The input document is an ordinary draft block (`Status::Draft`,
+    /// ephemeral, one per (context, principal)) read off the per-context
+    /// change feed — not a CRDT scratchpad. Returns the current content and
+    /// version; `ops` is a legacy wire field kept for schema compatibility
+    /// and carries no meaning today.
     #[tracing::instrument(skip(self), name = "rpc_client.get_input_state")]
     pub async fn get_input_state(&self, context_id: ContextId) -> Result<InputState, RpcError> {
         let mut request = self.kernel.get_input_state_request();
@@ -4039,6 +4043,8 @@ pub struct SubmitResult {
 #[derive(Debug, Clone)]
 pub struct InputState {
     pub content: String,
+    /// Legacy wire field kept for schema compatibility with the retired
+    /// CRDT oplog; no longer populated with meaningful data.
     pub ops: Vec<u8>,
     pub version: u64,
 }

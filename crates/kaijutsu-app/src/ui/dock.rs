@@ -1833,7 +1833,7 @@ pub fn update_event_pulse(
 
     let total = state.timestamps.len();
     let (text, color) = if total > 0 {
-        (format!("~{} ops", total), theme.accent)
+        (format!("~{} ev", total), theme.accent)
     } else {
         ("quiet".to_string(), theme.fg_dim)
     };

@@ -1,6 +1,8 @@
 //! Mouse-wheel scroll sensitivity — a reflected, per-client-configurable
 //! resource mirroring the metronome click config (`crate::metronome`,
-//! `docs/config-crdt-ownership.md` "Per-client config").
+//! `docs/config-crdt-ownership.md` "Per-client config"). The backing file is
+//! kernel-owned but a plain write surface for the file tools, not a CRDT
+//! document (see that doc's superseded note).
 //!
 //! Unlike the metronome click (nested inside the `Metronome` resource),
 //! `ScrollConfig` is itself the `Resource` and is `Reflect`-registered so it
@@ -17,11 +19,12 @@
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::prelude::*;
 
-/// Per-client scroll gains, resolved from `/etc/client/scroll.toml`
-/// (`docs/config-crdt-ownership.md` "Per-client config"). Serde `default`
-/// makes every field optional in the TOML — falls back to the shipped
-/// gains — so a partial file is valid and a missing/failed fetch keeps the
-/// default.
+/// Per-client scroll gains, resolved from `/etc/client/scroll.toml` — a
+/// plain, kernel-owned file written through the file tools, not a CRDT
+/// document (`docs/config-crdt-ownership.md` "Per-client config" and its
+/// superseded note). Serde `default` makes every field optional in the
+/// TOML — falls back to the shipped gains — so a partial file is valid and
+/// a missing/failed fetch keeps the default.
 #[derive(Resource, Reflect, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 #[reflect(Resource)]
 #[serde(default, deny_unknown_fields)]

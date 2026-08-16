@@ -232,7 +232,6 @@ mod tests {
         let ev = ServerEvent::BlockInserted {
             context_id: ctx(1),
             block: Box::new(block),
-            ops: vec![],
         };
         assert!(event_bearing(&ev).is_none(), "block inserts no longer feed room-ambient activity");
     }

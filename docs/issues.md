@@ -64,6 +64,20 @@ exactly how a real failure gets waved through. Worth fixing by making the
 capture deterministic (a subscriber the test fully owns, or asserting on a
 returned value instead of on log output) rather than by adding a retry.
 
+## `docs/crdt-melt.md` is cited ~15 times and does not exist (found 2026-08-16)
+
+Source files across the DTE-removal effort cite `docs/crdt-melt.md` as the
+authoritative design record — `document_store.rs:29`, `kernel_db.rs:581`,
+`config_export.rs`, `kaijutsu-configgit/src/lib.rs` (×7),
+`compose_draft_wire.rs`, `rpc.rs:5801`, and two entries in this file — but no
+such file exists anywhere in the tree or its git history. Either the doc was
+never committed from whichever session authored it (check zorak checkouts),
+or the citations drifted from a different name. Every citation of the
+load-bearing design record for Lanes B/C is currently a dead link: find the
+doc or write it, then leave the citations pointing at something real.
+
+---
+
 ## A context's version is unobservable from `kj` (2026-08-15)
 
 The context version is now load-bearing: it is the client's hydration anchor
@@ -175,6 +189,16 @@ notify. Today a drift into any context pops a notification. Decide whether that
 scope change is wanted before doing the move — it may be an improvement (drift
 into something you are not watching is arguably not urgent), but it is a
 behavior change, not a port.
+
+Same shape, second site (found 2026-08-16, app remnant sweep):
+`view/time_well/live.rs` `ingest_live_events` (~434-478) builds `ContextTails`
+— per-context activity tails for the whole ring, including contexts nobody
+follows — off the kernel-wide `BlockInserted`/`BlockStatusChanged` stream. The
+same per-context-feed-can't-serve-unfollowed-contexts question applies, and
+the two sites should get one answer, not two ports. (Deliberately NOT in this
+bucket: `update_event_pulse`, switchboard, editor, fsn/heat, room/activity —
+those consume `TurnEvents`/`EditorEvents`/`VfsActivityEvents`/directive-only
+members the change feed deliberately excludes; see docs/change-feed.md.)
 
 ## Two findings from the change-feed step-1 review (2026-08-15, kaibo/DeepSeek)
 

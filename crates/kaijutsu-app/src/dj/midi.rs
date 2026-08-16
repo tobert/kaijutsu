@@ -932,9 +932,11 @@ impl MidiOut {
     /// (by default) on a *normal* (non-drum) channel so it sounds under any patch
     /// — GM channel-9 percussion is silent under game soundfonts (the FF4 one on
     /// zorak has no drum kit), and a bare NoteOn on a sustaining patch would
-    /// drone. Sound + gate come from the per-client metronome config
-    /// (`docs/config-crdt-ownership.md`). Reuses the proven render-queue path, so
-    /// it's audible exactly where the music is.
+    /// drone. Sound + gate come from the per-client metronome config — a
+    /// plain, kernel-owned file written through the file tools, not a CRDT
+    /// document (`docs/config-crdt-ownership.md`'s superseded note). Reuses
+    /// the proven render-queue path, so it's audible exactly where the
+    /// music is.
     fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
         // Byte-masking lives in `click_bytes` (config-typo hazard, unit-tested
         // without ALSA); default channel 15 keeps the click off the music's
