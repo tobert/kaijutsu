@@ -67,12 +67,17 @@ block (≤64 blocks, ≤128 events each); on insert the block syncs first, then
 API; `SyncReset` resets the frontier and signals `NeedsResync` (the consumer then
 calls `get_context_sync` and feeds `apply_sync_state`).
 
-### `SyncedInput` (`src/synced_input.rs:14`)
+### Compose input
 
-Much simpler — one DTE doc with an `"input"` text key, no blocks/buffer.
-Pre-registers `PrincipalId::system()` as a known DTE agent so server ops merge
-without `DataMissing`. `edit` returns ops to push upstream; `apply_remote_ops`
-merges; `clear` deletes the full range.
+`src/synced_input.rs` is deleted (2026-08-16, `docs/crdt-melt.md`). The
+compose draft used to be a separate `SyncedInput` CRDT document, hydrated via
+`getInputState` and kept live by `InputTextOps`/`InputCleared` server events.
+It is now an ordinary block (`Role::User`, `Status::Draft`, `ephemeral`, one
+per `(context, principal)`) sent via `editInput`/`submitInput` and read back
+like any other block off the per-context change feed — it lands in
+`mirror.blocks()` and is exposed as [`DocumentEntry::draft_text`]
+(`src/document_store.rs:22`). `document_store.rs` never held a `SyncedInput`
+of its own, so no separate document type survives to replace it.
 
 ### `subscriptions.rs`
 

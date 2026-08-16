@@ -264,7 +264,8 @@ larger decision.
 
 **What actually dies when step 3 lands:** nothing in `kaijutsu-client`. The
 app and ACP keep `SyncedDocument`, `SyncManager` and `subscriptions.rs`; the
-app also keeps `document_store.rs` and `synced_input.rs`. The one thing that
+app also keeps `document_store.rs` (the change-feed mirror cache —
+`synced_input.rs` was deleted 2026-08-16, `a51d2b5b`). The one thing that
 reaches zero production callers is **`push_ops`** — which is exactly what the
 paper predicted.
 
