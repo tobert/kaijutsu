@@ -21,6 +21,7 @@ members = [
     "crates/kaijutsu-viz",
     "crates/kaijutsu-isotest",
     "crates/approval-ledger",
+    "crates/claude-code-peer",
     "crates/kaijutsu-configgit",
 ]
 
