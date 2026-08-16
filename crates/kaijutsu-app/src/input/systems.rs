@@ -502,6 +502,92 @@ pub fn handle_navigate_blocks(
     debug!("Block focus: {:?} (index {})", new_id, new_idx);
 }
 
+/// Handle JumpToLatestError — find the most recent non-excluded
+/// `Status::Error` block and focus + scroll it into view.
+///
+/// A failed tool call's `BlockKind::Error` child is inserted immediately
+/// after its `ToolResult` (`insert_error_block_as`'s `after: Some(parent_id)`
+/// on the kernel side), so "last `Status::Error` block in document order"
+/// naturally lands on the diagnostic-carrying Error block rather than the
+/// bare ToolResult — the useful one to land on. A stream error's parent
+/// (an assistant turn) is never itself `Status::Error`, so the same rule
+/// picks its Error child too.
+///
+/// Follow-up not done here: this focuses the Error block itself, not its
+/// parent (the failed ToolResult/turn the provenance line names). Making
+/// both visible at once would need either scrolling to a rect spanning
+/// both rows or a second "jump to this error's parent" action — noted as
+/// follow-up work rather than built speculatively.
+pub fn handle_jump_to_latest_error(
+    mut commands: Commands,
+    mut actions: MessageReader<ActionFired>,
+    entities: Res<EditorEntities>,
+    editors: Query<&CellEditor, With<MainCell>>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
+    containers: Query<&BlockCellContainer>,
+    mut focus: ResMut<FocusTarget>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+    focused_markers: Query<Entity, With<FocusedBlockCell>>,
+) {
+    let mut fired = false;
+    for ActionFired { action, .. } in actions.read() {
+        if matches!(action, Action::JumpToLatestError) {
+            fired = true;
+        }
+    }
+    if !fired {
+        return;
+    }
+
+    let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Ok(editor) = editors.get(main_ent) else {
+        return;
+    };
+    let Ok(geom) = geometries.get(main_ent) else {
+        return;
+    };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let Some(target_id) = find_latest_error_block(&editor.blocks()) else {
+        debug!("JumpToLatestError: no non-excluded error blocks in document");
+        return;
+    };
+
+    let Some(row) = geom.block_row(&target_id) else {
+        return;
+    };
+    let (row_y, row_h) = (row.y_offset, row.height);
+
+    focus.focus_block(target_id);
+
+    for entity in focused_markers.iter() {
+        commands.entity(entity).remove::<FocusedBlockCell>();
+    }
+    if let Some(entity) = container.get_entity(&target_id) {
+        commands.entity(entity).insert(FocusedBlockCell);
+    }
+
+    scroll_to_rect_visible(&mut scroll_state, row_y, row_h);
+
+    debug!("Jumped to latest error block: {:?}", target_id);
+}
+
+/// Pure lookup: the last non-excluded `Status::Error` block in document
+/// order, or `None` if there isn't one. Extracted from
+/// `handle_jump_to_latest_error` so the "which block wins" logic is
+/// unit-testable without a Bevy `App`.
+fn find_latest_error_block(blocks: &[kaijutsu_types::BlockSnapshot]) -> Option<kaijutsu_types::BlockId> {
+    blocks
+        .iter()
+        .rev()
+        .find(|b| !b.excluded && b.status == kaijutsu_types::Status::Error)
+        .map(|b| b.id)
+}
+
 /// Pure index math for block-focus navigation. `len` must be > 0 (the
 /// caller returns early on an empty row list). Next/Previous clamp at the
 /// document ends — no wraparound — and from an unfocused start, Next
@@ -628,9 +714,12 @@ pub fn handle_scroll(
 // COLLAPSE
 // ============================================================================
 
-/// Handle CollapseToggle action (toggle thinking block collapse).
+/// Handle CollapseToggle action (toggle Thinking/Error block collapse).
 ///
-/// Guarded to Conversation focus — CollapseToggle is Navigation-only.
+/// Guarded to Conversation focus — CollapseToggle is Navigation-only. Toggles
+/// every collapsible block in the editor, each against its own current
+/// state (not a single shared target) — pre-existing behavior for
+/// `Thinking`, now shared by `Error` (task: error-render stub collapse).
 pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
     focus: Res<FocusTarget>,
@@ -649,28 +738,38 @@ pub fn handle_collapse_toggle(
             continue;
         };
 
-        // Find thinking blocks to toggle
-        let thinking_blocks: Vec<_> = editor
+        // Find collapsible blocks (Thinking, Error) to toggle.
+        let collapsible_blocks: Vec<_> = editor
             .blocks()
             .iter()
-            .filter(|b| matches!(b.kind, kaijutsu_types::BlockKind::Thinking))
+            .filter(|b| {
+                matches!(
+                    b.kind,
+                    kaijutsu_types::BlockKind::Thinking | kaijutsu_types::BlockKind::Error
+                )
+            })
             .map(|b| b.id)
             .collect();
 
-        if thinking_blocks.is_empty() {
+        if collapsible_blocks.is_empty() {
             continue;
         }
-        for block_id in &thinking_blocks {
+        for block_id in &collapsible_blocks {
             editor.toggle_block_collapse(block_id);
         }
         let collapsed = editor
             .blocks()
             .iter()
-            .find(|b| matches!(b.kind, kaijutsu_types::BlockKind::Thinking))
+            .find(|b| {
+                matches!(
+                    b.kind,
+                    kaijutsu_types::BlockKind::Thinking | kaijutsu_types::BlockKind::Error
+                )
+            })
             .map(|b| b.collapsed)
             .unwrap_or(false);
         info!(
-            "Thinking blocks: {}",
+            "Collapsible blocks: {}",
             if collapsed { "collapsed" } else { "expanded" }
         );
     }
@@ -1113,7 +1212,16 @@ pub fn cleanup_stale_focused_markers(
 
 #[cfg(test)]
 mod tests {
-    use super::{NavigationDirection, next_focus_index};
+    use super::{NavigationDirection, find_latest_error_block, next_focus_index};
+    use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
+
+    fn block(seq: u64, kind: BlockKind, status: Status, excluded: bool) -> kaijutsu_types::BlockSnapshot {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), seq);
+        BlockSnapshotBuilder::new(id, kind)
+            .status(status)
+            .excluded(excluded)
+            .build()
+    }
 
     /// The end-clamp rules j/k depend on: no wraparound at either edge,
     /// and an unfocused start enters the document at the near end for the
@@ -1145,5 +1253,46 @@ mod tests {
         assert_eq!(next_focus_index(&Previous, Some(0), 1), 0);
         assert_eq!(next_focus_index(&Next, None, 1), 0);
         assert_eq!(next_focus_index(&Previous, None, 1), 0);
+    }
+
+    #[test]
+    fn find_latest_error_block_picks_the_last_one_in_document_order() {
+        let earlier = block(0, BlockKind::Error, Status::Error, false);
+        let later = block(1, BlockKind::Error, Status::Error, false);
+        let blocks = vec![earlier, later.clone()];
+        assert_eq!(find_latest_error_block(&blocks), Some(later.id));
+    }
+
+    #[test]
+    fn find_latest_error_block_skips_excluded_errors() {
+        let excluded_error = block(0, BlockKind::Error, Status::Error, true);
+        let live_error = block(1, BlockKind::Error, Status::Error, false);
+        let blocks = vec![live_error.clone(), excluded_error];
+        assert_eq!(find_latest_error_block(&blocks), Some(live_error.id));
+    }
+
+    #[test]
+    fn find_latest_error_block_none_when_no_errors() {
+        let blocks = vec![
+            block(0, BlockKind::Text, Status::Done, false),
+            block(1, BlockKind::ToolCall, Status::Running, false),
+        ];
+        assert_eq!(find_latest_error_block(&blocks), None);
+    }
+
+    #[test]
+    fn find_latest_error_block_none_when_only_error_is_excluded() {
+        let blocks = vec![block(0, BlockKind::Error, Status::Error, true)];
+        assert_eq!(find_latest_error_block(&blocks), None);
+    }
+
+    #[test]
+    fn find_latest_error_block_matches_status_regardless_of_kind() {
+        // The instruction is "last Status::Error block", not "last
+        // BlockKind::Error" — a ToolResult with no error child yet (still
+        // mid-insert) should still be findable.
+        let tool_result = block(0, BlockKind::ToolResult, Status::Error, false);
+        let blocks = vec![tool_result.clone()];
+        assert_eq!(find_latest_error_block(&blocks), Some(tool_result.id));
     }
 }

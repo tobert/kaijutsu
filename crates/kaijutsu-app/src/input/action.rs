@@ -50,6 +50,10 @@ pub enum Action {
     FocusLastBlock,
     /// Tab on thinking block — toggle collapse
     CollapseToggle,
+    /// Jump to the most recent non-excluded `Status::Error` block and scroll
+    /// it into view (error-render: the dock's "N failed" badge otherwise has
+    /// no way to take you to the failure).
+    JumpToLatestError,
     /// v (in Navigation) — expand the focused diff block into `Screen::Diff`.
     ///
     /// `docs/diff.md` Decision 5: expansion is a *screen change*, never an

@@ -4,8 +4,14 @@
 //! display strings. No ECS, no systems, just data transforms.
 
 use crate::ui::theme::Theme;
-use kaijutsu_types::{BlockKind, BlockSnapshot, DriftKind, Role, Status};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, DriftKind, ErrorCategory, Role, Status};
 use kaijutsu_types::{ContextId, OutputData, OutputEntryType, OutputNode};
+
+/// Looks up a sibling block by id within the same document, for resolving an
+/// `Error` block's provenance (parent ToolResult/ToolCall, interrupted turn).
+/// The render buffer (`RenderBlockStore`) already indexes blocks by id, so
+/// this is an O(1) lookup, not a document scan — see `render.rs`'s call site.
+pub type BlockLookup<'a> = &'a dyn Fn(&BlockId) -> Option<BlockSnapshot>;
 
 /// Map a block to its semantic text color based on BlockKind and Role.
 ///
@@ -123,6 +129,136 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
                 block.content.lines().next().unwrap_or("")
             )
         }
+    }
+}
+
+/// Number of detail lines shown in a collapsed Error block's stub preview.
+const ERROR_STUB_DETAIL_LINES: usize = 3;
+
+/// Total line budget a collapsed Error stub can occupy: provenance + summary
+/// + up to `ERROR_STUB_DETAIL_LINES` detail lines + a trailing "N more
+/// lines" hint. Used by `geometry::estimate_block_height` so a freshly
+/// seeded row isn't sized for the single line a `Thinking` stub gets.
+pub const ERROR_STUB_MAX_LINES: usize = 2 + ERROR_STUB_DETAIL_LINES + 1;
+
+/// The key that toggles block collapse, for the stub's "N more lines" hint.
+/// Mirrors `input::defaults`'s `Action::CollapseToggle` binding (plain `c`
+/// in the Navigation context) — this module can't read the binding table
+/// (pure formatting, no ECS resources), so keep this in sync by hand if
+/// that binding ever moves.
+const COLLAPSE_TOGGLE_KEY_HINT: &str = "c";
+
+/// Format a `BlockKind::Error` block: a provenance line (what failed) always
+/// first, then either the full summary+detail (expanded) or a capped stub
+/// (collapsed) — errors are never dropped from the document, only their
+/// on-screen footprint is capped (see CLAUDE.md "durable state" doctrine).
+fn format_error_block(block: &BlockSnapshot, resolve_parent: BlockLookup) -> String {
+    let provenance = error_provenance_line(block, resolve_parent);
+    let detail = block.error.as_ref().and_then(|p| p.detail.as_deref());
+
+    if block.collapsed {
+        format_error_stub(&provenance, &block.content, detail)
+    } else {
+        match detail {
+            Some(detail) => format!("{provenance}\n{}\n{detail}", block.content),
+            None => format!("{provenance}\n{}", block.content),
+        }
+    }
+}
+
+/// Build the capped stub: provenance, summary, first `ERROR_STUB_DETAIL_LINES`
+/// lines of detail, then a "N more lines" hint if detail was truncated.
+fn format_error_stub(provenance: &str, summary: &str, detail: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push_str(provenance);
+    out.push('\n');
+    out.push_str(summary);
+
+    let Some(detail) = detail else {
+        return out;
+    };
+    let lines: Vec<&str> = detail.lines().collect();
+    if lines.is_empty() {
+        return out;
+    }
+    let shown = lines.len().min(ERROR_STUB_DETAIL_LINES);
+    out.push('\n');
+    out.push_str(&lines[..shown].join("\n"));
+
+    let remaining = lines.len() - shown;
+    if remaining > 0 {
+        out.push('\n');
+        out.push_str(&format!(
+            "\u{2026} {remaining} more line{} ({COLLAPSE_TOGGLE_KEY_HINT} to expand)",
+            if remaining == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
+/// Resolve "what did this error belong to" for the stub/expanded header —
+/// Amy, looking at the live screen: *"I have no idea what these tool errors
+/// and stream errors should be connected to."* Every `Error` block's
+/// `parent_id` points at the block that failed; this walks that edge (and,
+/// for tool errors, one more hop from the ToolResult to its ToolCall) to
+/// name it. An unresolvable parent is reported as `orphan` rather than
+/// omitted — that absence is itself information worth surfacing.
+fn error_provenance_line(block: &BlockSnapshot, resolve_parent: BlockLookup) -> String {
+    let category = block.error.as_ref().map(|p| p.category);
+    let prefix = match category {
+        Some(c) => format!("{} error", c.as_str()),
+        None => "error".to_string(),
+    };
+
+    let Some(parent_id) = block.parent_id else {
+        return format!("{prefix} \u{2190} orphan (no parent recorded)");
+    };
+    let Some(parent) = resolve_parent(&parent_id) else {
+        return format!("{prefix} \u{2190} orphan (parent block not found)");
+    };
+
+    if category == Some(ErrorCategory::Tool) {
+        describe_tool_provenance(&prefix, &parent, resolve_parent)
+    } else {
+        format!("{prefix} \u{2190} {}", describe_block(&parent))
+    }
+}
+
+/// Tool errors attach to the failed `ToolResult`; walk one more hop to its
+/// `ToolCall` for the tool name and a per-call ordinal (the call's
+/// agent-local `seq`, cheap and already on hand — no document scan needed).
+fn describe_tool_provenance(prefix: &str, parent: &BlockSnapshot, resolve_parent: BlockLookup) -> String {
+    let call = match parent.kind {
+        BlockKind::ToolCall => Some(parent.clone()),
+        BlockKind::ToolResult => parent.parent_id.and_then(|id| resolve_parent(&id)),
+        _ => None,
+    };
+    match call {
+        Some(c) if c.kind == BlockKind::ToolCall => {
+            let name = c.tool_name.as_deref().unwrap_or("unknown tool");
+            format!("{prefix} \u{2190} {name} (#{})", c.id.seq)
+        }
+        _ => format!("{prefix} \u{2190} orphan (tool call not found)"),
+    }
+}
+
+/// Human label for a resolved parent block — used for every non-Tool error
+/// category (Stream, Rpc, Render, Parse, Validation, Kernel).
+fn describe_block(block: &BlockSnapshot) -> String {
+    match block.kind {
+        BlockKind::Text => match block.role {
+            Role::Model => "assistant turn".to_string(),
+            Role::User => "user message".to_string(),
+            Role::System => "system message".to_string(),
+            Role::Tool | Role::Asset => "tool text".to_string(),
+        },
+        BlockKind::ToolCall => format!(
+            "tool call {}",
+            block.tool_name.as_deref().unwrap_or("(unnamed)")
+        ),
+        BlockKind::ToolResult => "tool result".to_string(),
+        BlockKind::Thinking => "assistant thinking".to_string(),
+        other => format!("{other:?} block"),
     }
 }
 
@@ -549,8 +685,15 @@ fn format_tree_node(node: &OutputNode, depth: usize, lines: &mut Vec<String>) {
 /// Trailing whitespace is always stripped — LLM streaming and tool output
 /// commonly leave trailing newlines that inflate block height.
 /// `local_ctx`: optional local context ID for drift push direction.
-pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
-    let raw = format_block_inner(block, local_ctx);
+/// `resolve_parent`: sibling-block lookup, consulted only for `BlockKind::Error`
+/// blocks to resolve provenance (what failed). Pass `&|_| None` where no
+/// document is available (e.g. a block rendered outside its context).
+pub fn format_single_block(
+    block: &BlockSnapshot,
+    local_ctx: Option<ContextId>,
+    resolve_parent: BlockLookup,
+) -> String {
+    let raw = format_block_inner(block, local_ctx, resolve_parent);
     // Universal trim — catches trailing whitespace from any block kind
     // (Thinking, ToolResult with output data, File, Drift, etc.)
     let trimmed = raw.trim_end();
@@ -562,7 +705,11 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
 }
 
 /// Inner formatting dispatch — may produce trailing whitespace.
-fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
+fn format_block_inner(
+    block: &BlockSnapshot,
+    local_ctx: Option<ContextId>,
+    resolve_parent: BlockLookup,
+) -> String {
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
@@ -667,18 +814,7 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             format!("{}\n{}", path, block.content)
         }
         BlockKind::Drift => format_drift_block(block, local_ctx),
-        BlockKind::Error => {
-            // Show summary (content), optionally with detail
-            if let Some(ref payload) = block.error {
-                if let Some(ref detail) = payload.detail {
-                    format!("{}\n{}", block.content, detail)
-                } else {
-                    block.content.clone()
-                }
-            } else {
-                block.content.clone()
-            }
-        }
+        BlockKind::Error => format_error_block(block, resolve_parent),
         BlockKind::Notification => {
             if let Some(ref payload) = block.notification {
                 if let Some(ref detail) = payload.detail {
@@ -793,7 +929,7 @@ mod tests {
             Role::Model,
             None,
         );
-        let result = format_single_block(&block, None);
+        let result = format_single_block(&block, None, &|_| None);
         // New format: "ToolName: primary_arg" — no status tag, no box chars
         assert!(!result.contains('┌'));
         assert!(!result.contains('└'));
@@ -815,7 +951,7 @@ mod tests {
             None,
         );
         block.status = Status::Done;
-        let result = format_single_block(&block, None);
+        let result = format_single_block(&block, None, &|_| None);
         assert_eq!(result, "list_all");
     }
 
@@ -833,7 +969,7 @@ mod tests {
             Some(0),
             None,
         );
-        let result = format_single_block(&result_block, None);
+        let result = format_single_block(&result_block, None, &|_| None);
         assert_eq!(result, "");
     }
 
@@ -922,7 +1058,7 @@ mod tests {
             None,
         );
         block.output = Some(output);
-        let result = format_single_block(&block, None);
+        let result = format_single_block(&block, None, &|_| None);
         assert!(!result.contains('\t'), "should use OutputData, not raw TSV");
         assert!(result.contains("PID"));
         assert!(result.contains("init"));
@@ -998,7 +1134,7 @@ mod tests {
             Role::User,
             None,
         );
-        let result = format_single_block(&block, None);
+        let result = format_single_block(&block, None, &|_| None);
         assert_eq!(result, "$ cargo check");
     }
 
@@ -1013,7 +1149,7 @@ mod tests {
             Role::Model,
             None,
         );
-        let result = format_single_block(&block, None);
+        let result = format_single_block(&block, None, &|_| None);
         assert_eq!(result, "cargo check");
     }
 
@@ -1050,7 +1186,7 @@ mod tests {
             Some(0),
             None,
         );
-        let result = format_single_block(&result_block, None);
+        let result = format_single_block(&result_block, None, &|_| None);
         assert_eq!(result, "file contents here");
     }
 
@@ -1058,12 +1194,12 @@ mod tests {
     fn test_trim_end_all_block_kinds() {
         // Text block — trailing whitespace stripped
         let mut block = BlockSnapshot::text(test_block_id(), None, Role::Model, "hello\n\n\n");
-        assert_eq!(format_single_block(&block, None), "hello");
+        assert_eq!(format_single_block(&block, None, &|_| None), "hello");
 
         // Thinking block — trailing whitespace stripped
         block.kind = BlockKind::Thinking;
         block.content = "deep thought\n\n\n".to_string();
-        let result = format_single_block(&block, None);
+        let result = format_single_block(&block, None, &|_| None);
         assert_eq!(result, "Thinking\ndeep thought");
 
         // ToolResult with trailing whitespace
@@ -1079,10 +1215,173 @@ mod tests {
             Some(0),
             None,
         );
-        assert_eq!(format_single_block(&result_block, None), "output");
+        assert_eq!(format_single_block(&result_block, None, &|_| None), "output");
 
         // ToolResult with OutputData text having trailing whitespace
         result_block.output = Some(OutputData::text("table output\n\n\n"));
-        assert_eq!(format_single_block(&result_block, None), "table output");
+        assert_eq!(format_single_block(&result_block, None, &|_| None), "table output");
+    }
+
+    // ------------------------------------------------------------------
+    // BlockKind::Error — provenance line, stub cap, and full expanded view
+    // ------------------------------------------------------------------
+
+    fn tool_error_chain() -> (BlockSnapshot, BlockSnapshot, BlockSnapshot) {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
+        let call = BlockSnapshot::tool_call(
+            call_id,
+            None,
+            ToolKind::Shell,
+            "kaish_exec",
+            serde_json::json!({"code": "false"}),
+            Role::Model,
+            None,
+        );
+        let result_id = BlockId::new(ctx, agent, 1);
+        let result = BlockSnapshot::tool_result(
+            result_id,
+            call_id,
+            ToolKind::Shell,
+            "",
+            true,
+            Some(1),
+            None,
+        );
+        let error_id = BlockId::new(ctx, agent, 2);
+        let payload = kaijutsu_types::ErrorPayload {
+            category: kaijutsu_types::ErrorCategory::Tool,
+            severity: kaijutsu_types::ErrorSeverity::Error,
+            code: None,
+            detail: Some("line1\nline2".to_string()),
+            span: None,
+            source_kind: Some(BlockKind::ToolResult),
+        };
+        let error_block = BlockSnapshot::error_for(error_id, result_id, payload, "tool error: boom");
+        (call, result, error_block)
+    }
+
+    #[test]
+    fn error_block_expanded_shows_tool_provenance_and_full_detail() {
+        let (call, result, error_block) = tool_error_chain();
+        let siblings = vec![call, result];
+        let lookup = |id: &BlockId| siblings.iter().find(|b| &b.id == id).cloned();
+
+        let text = format_single_block(&error_block, None, &lookup);
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), "tool error \u{2190} kaish_exec (#0)");
+        assert_eq!(lines.next().unwrap(), "tool error: boom");
+        assert_eq!(lines.next().unwrap(), "line1");
+        assert_eq!(lines.next().unwrap(), "line2");
+        assert!(lines.next().is_none(), "expanded view has no truncation hint");
+    }
+
+    #[test]
+    fn error_block_collapsed_caps_detail_at_three_lines_with_a_hint() {
+        let (call, result, mut error_block) = tool_error_chain();
+        error_block.collapsed = true;
+        error_block.error.as_mut().unwrap().detail =
+            Some("l1\nl2\nl3\nl4\nl5".to_string());
+        let siblings = vec![call, result];
+        let lookup = |id: &BlockId| siblings.iter().find(|b| &b.id == id).cloned();
+
+        let text = format_single_block(&error_block, None, &lookup);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "tool error \u{2190} kaish_exec (#0)",
+                "tool error: boom",
+                "l1",
+                "l2",
+                "l3",
+                "\u{2026} 2 more lines (c to expand)",
+            ]
+        );
+    }
+
+    #[test]
+    fn error_block_collapsed_singular_hint_for_one_remaining_line() {
+        let (call, result, mut error_block) = tool_error_chain();
+        error_block.collapsed = true;
+        error_block.error.as_mut().unwrap().detail = Some("l1\nl2\nl3\nl4".to_string());
+        let siblings = vec![call, result];
+        let lookup = |id: &BlockId| siblings.iter().find(|b| &b.id == id).cloned();
+
+        let text = format_single_block(&error_block, None, &lookup);
+        assert!(text.ends_with("\u{2026} 1 more line (c to expand)"));
+    }
+
+    #[test]
+    fn error_block_collapsed_short_detail_has_no_hint() {
+        let (call, result, mut error_block) = tool_error_chain();
+        error_block.collapsed = true; // detail is already only 2 lines
+        let siblings = vec![call, result];
+        let lookup = |id: &BlockId| siblings.iter().find(|b| &b.id == id).cloned();
+
+        let text = format_single_block(&error_block, None, &lookup);
+        assert!(!text.contains("more line"));
+        assert!(text.ends_with("line2"));
+    }
+
+    #[test]
+    fn error_block_stream_provenance_names_the_interrupted_turn() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let turn_id = BlockId::new(ctx, agent, 0);
+        let turn = BlockSnapshot::text(turn_id, None, Role::Model, "part of a reply...");
+        let error_id = BlockId::new(ctx, agent, 1);
+        let payload = kaijutsu_types::ErrorPayload {
+            category: kaijutsu_types::ErrorCategory::Stream,
+            severity: kaijutsu_types::ErrorSeverity::Error,
+            code: None,
+            detail: Some("connection reset".to_string()),
+            span: None,
+            source_kind: None,
+        };
+        let error_block = BlockSnapshot::error_for(error_id, turn_id, payload, "stream error: boom");
+        let siblings = vec![turn];
+        let lookup = |id: &BlockId| siblings.iter().find(|b| &b.id == id).cloned();
+
+        let text = format_single_block(&error_block, None, &lookup);
+        assert!(text.starts_with("stream error \u{2190} assistant turn\n"));
+    }
+
+    #[test]
+    fn error_block_with_no_parent_id_is_reported_as_orphan() {
+        let payload = kaijutsu_types::ErrorPayload {
+            category: kaijutsu_types::ErrorCategory::Rpc,
+            severity: kaijutsu_types::ErrorSeverity::Fatal,
+            code: None,
+            detail: None,
+            span: None,
+            source_kind: None,
+        };
+        let error_block =
+            BlockSnapshot::system_error(test_block_id(), payload, "rpc error: connection lost");
+
+        let text = format_single_block(&error_block, None, &|_| None);
+        assert!(text.starts_with("rpc error \u{2190} orphan (no parent recorded)\n"));
+    }
+
+    #[test]
+    fn error_block_with_unresolvable_parent_is_reported_as_orphan_not_omitted() {
+        let (_, _, error_block) = tool_error_chain();
+        // No lookup match at all — the parent ToolResult isn't in this
+        // document (e.g. excluded past the mirror's window, or a bug).
+        let text = format_single_block(&error_block, None, &|_| None);
+        assert!(text.starts_with("tool error \u{2190} orphan (parent block not found)\n"));
+    }
+
+    #[test]
+    fn error_block_tool_provenance_orphan_when_tool_call_missing() {
+        let (_, result, error_block) = tool_error_chain();
+        // The ToolResult resolves, but its own parent (the ToolCall) does not.
+        let siblings = vec![result];
+        let lookup = |id: &BlockId| siblings.iter().find(|b| &b.id == id).cloned();
+
+        let text = format_single_block(&error_block, None, &lookup);
+        assert!(text.starts_with("tool error \u{2190} orphan (tool call not found)\n"));
     }
 }
