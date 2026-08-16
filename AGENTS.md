@@ -116,7 +116,7 @@ conversation. Amy's ruling and the reasoning: `docs/crdt-position-2026-08.md`.
 `kaijutsu-crdt` (BlockStore; the block text engine, being demoted to a private
 implementation detail), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
 LLM, drift, `kj` builtin), `kaijutsu-server` (SSH server, EmbeddedKaish),
-`kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.18 GUI;
+`kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.19 GUI;
 inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, editor,
 index, telemetry, hyoushigi, viz. Wire schema: `kaijutsu.capnp`. The stdio MCP server (`kaijutsu-mcp`)
 exposes most kernel capabilities and can be called as a hook from client applications.
@@ -214,9 +214,16 @@ sanctioned raw reader (an explicit keyboard grab). `docs/input.md` is
 canonical: Esc doctrine (vi owns Esc where a vi surface is live; elsewhere
 it is exactly one `PopLevel`), the Ctrl+A prefix table, clipboard model.
 
-## Bevy 0.18 Quick Reference
+## Bevy Quick Reference
 
-Trust this table over training memory — Bevy 0.18 renamed the event system and is newer than most model training.
+**We are on Bevy 0.19** (`Cargo.lock`, and `crates/kaijutsu-app/Cargo.toml`
+declares `"0.19"`). This heading said 0.18 until 2026-08-15, when a subagent
+reported the mismatch mid-task — the doc warning below about a stale checkout
+applies to this document too. **The lockfile is the answer to "what are we on";
+check it rather than this line.**
+
+Trust this table over training memory — these renames landed in 0.18, still
+hold in 0.19, and are newer than most model training.
 
 | Old (0.14-0.17) | New (0.18) |
 |-----------------|------------|
@@ -248,5 +255,6 @@ stale the way a checkout can. This applies to subagents too: tell them the
 tag, don't let them assume.
 
 A related trap that already bit us: **a dependency's own version number says
-nothing about which Bevy it targets.** `bevy_brp_extras = "0.19"` requires
-`bevy 0.18.1`; its first release wanting Bevy 0.19 is 0.21.0.
+nothing about which Bevy it targets.** `bevy_brp_extras = "0.19"` required
+`bevy 0.18.1`; its first release wanting Bevy 0.19 was 0.21.0, and the
+workspace now pins `0.22`. Read the pin, never infer it from the number.
