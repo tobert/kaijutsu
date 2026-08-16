@@ -29,8 +29,7 @@ regex = { workspace = true }
 include_dir = { workspace = true }
 clap = { workspace = true }
 
-# CRDT
-diamond-types-extended.workspace = true
+# Block store
 kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-editor.workspace = true

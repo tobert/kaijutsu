@@ -1,7 +1,10 @@
-//! Block-based CRDT storage using kaijutsu-crdt.
+//! Block-based storage using kaijutsu-crdt.
 //!
-//! Each document wraps a `kaijutsu_crdt::block_store::BlockStore` (per-block DTE).
-//! Multi-client sync uses `SyncPayload` exchange.
+//! Each document wraps a `kaijutsu_crdt::block_store::BlockStore` (each block's
+//! content is a plain `String` — see `kaijutsu_crdt::content`'s module doc).
+//! The durable oplog journals a `SyncPayload` per mutation and replays it on
+//! restart; nothing multi-writer merges through it (CLAUDE.md "Durable state
+//! and the wire" — the kernel is the sole sequencer).
 //!
 //! # Concurrency Model
 //!
@@ -9,16 +12,15 @@
 //! - FlowBus for typed pub/sub real-time updates
 //! - parking_lot for efficient locking
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use diamond_types_extended::Frontier;
 use parking_lot::RwLock;
 
 use kaijutsu_crdt::block_store::{
-    BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload,
+    BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit,
 };
 use kaijutsu_crdt::{
     BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, TaskStatus, ToolKind,
@@ -96,7 +98,7 @@ const COMPACTION_BYTE_THRESHOLD: u64 = 1_048_576; // 1 MiB
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
-    /// Per-block CRDT store (each block owns its own DTE Document).
+    /// Per-block store (each block owns its content as a plain `String`).
     pub doc: CrdtBlockStore,
     /// Document metadata.
     pub kind: DocKind,
@@ -1036,42 +1038,6 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Compact every resident document, so `doc_snapshots.content` holds each
-    /// one's current text and every oplog is empty.
-    ///
-    /// This exists for one migration and is deleted with it. `content` is
-    /// written only by compaction, so between compactions a document's newer
-    /// text lives solely in the oplog as diamond-types operations. Retiring
-    /// DTE without this pass would discard every edit made since each
-    /// document's last compaction — silently, because `content` is still
-    /// there and still parses. Running it first makes `content` authoritative,
-    /// which is the precondition the DTE removal needs.
-    ///
-    /// Returns the number of documents compacted. Errors are logged per
-    /// document and do not stop the pass: one unreadable document must not
-    /// block the migration for the rest, and the next run retries it.
-    pub fn compact_all_documents(&self) -> usize {
-        let ids = self.list_ids();
-        let total = ids.len();
-        let mut done = 0usize;
-        for context_id in ids {
-            match self.compact_document(context_id) {
-                Ok(()) => done += 1,
-                Err(e) => tracing::error!(
-                    document_id = %context_id.to_hex(),
-                    error = %e,
-                    "migration compaction failed for this document; its text stays in the oplog",
-                ),
-            }
-        }
-        tracing::info!(
-            compacted = done,
-            total = total,
-            "migration: compacted every document so materialized text is current",
-        );
-        done
-    }
-
     /// Write an initial snapshot for a newly forked document (no oplog).
     fn write_initial_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
         let Some(db) = self.journaling_db()? else {
@@ -1152,11 +1118,6 @@ impl BlockStore {
             // Set the agent for this operation so BlockId gets the right author
             entry.doc.set_principal_id(effective_agent);
 
-            // Capture frontier before the operation for incremental ops.
-            // Clients that are in sync can merge these directly.
-            // Clients that are out of sync will get full oplog via get_document_state.
-            let frontier_before = entry.doc.frontier();
-
             let block_id = entry
                 .doc
                 .insert_block(parent_id, after, role, kind, content, status, content_type)?;
@@ -1165,8 +1126,10 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            // Send incremental ops (just this operation) for efficient sync.
-            let ops = entry.doc.ops_since(&frontier_before);
+            // The journaled payload for a fresh block is just its own
+            // snapshot — nothing to diff against, since nobody knew about
+            // this block a moment ago.
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -1230,9 +1193,6 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            // Capture frontier before the operation for incremental ops
-            let frontier_before = entry.doc.frontier();
-
             let block_id = entry
                 .doc
                 .insert_tool_call(parent_id, after, tool_name, tool_input, tool_kind, role)?;
@@ -1247,8 +1207,9 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            // Send incremental ops (just this operation) for efficient sync
-            let ops = entry.doc.ops_since(&frontier_before);
+            // The journaled payload for a fresh block is just its own
+            // snapshot (captured after set_tool_use_id, so it's included).
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -1318,9 +1279,6 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            // Capture frontier before the operation for incremental ops
-            let frontier_before = entry.doc.frontier();
-
             let block_id = entry.doc.insert_tool_result_block(
                 tool_call_id,
                 after,
@@ -1340,8 +1298,9 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            // Send incremental ops (just this operation) for efficient sync
-            let ops = entry.doc.ops_since(&frontier_before);
+            // The journaled payload for a fresh block is just its own
+            // snapshot (captured after set_tool_use_id, so it's included).
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -1406,15 +1365,13 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            let frontier_before = entry.doc.frontier();
-
             let block_id = entry.doc.insert_from_snapshot(snapshot, after)?;
             let final_snapshot = entry
                 .doc
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            let ops = entry.doc.ops_since(&frontier_before);
+            let ops = SyncPayload::from_new_block(final_snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -1447,11 +1404,13 @@ impl BlockStore {
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let principal_id = self.principal_id();
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_status(block_id, status)?;
             entry.touch(principal_id);
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1513,8 +1472,6 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
-            // Capture frontier before edit
-            let frontier = entry.doc.frontier();
             // Classify inside the mutation lock (docs/change-feed.md): the
             // before-length is only knowable here, and only here is it stable
             // against another writer.
@@ -1534,9 +1491,12 @@ impl BlockStore {
                 )),
             };
             let version = entry.version();
-            // Get ops since frontier (the edit we just applied) — journaled
-            // for the durable oplog; never shipped to the wire.
-            let ops = entry.doc.ops_since(&frontier);
+            // The edit we just applied, journaled for the durable oplog
+            // exactly as it was applied — never shipped to the wire.
+            let ops = SyncPayload::from_text_edit(
+                *block_id,
+                TextEdit { pos: Some(pos), insert: insert.to_string(), delete },
+            );
             (ops, change, after_text, version)
         };
         self.journal_op(context_id, ops)?;
@@ -1595,11 +1555,13 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_ephemeral(block_id, ephemeral)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1630,11 +1592,13 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_excluded(block_id, excluded)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::ExcludedChanged {
@@ -1664,11 +1628,18 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.move_block(block_id, after)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            // `order_key` lives on `BlockSnapshot`, not `BlockHeader` — a
+            // move was never carried through the journaled payload before
+            // this migration either (`ops_since` only ever sent the header
+            // for a known block). Unchanged behavior, just reproduced
+            // directly instead of via a frontier diff.
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::Moved {
@@ -1692,11 +1663,13 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_content_type(block_id, content_type)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1734,11 +1707,13 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_task_status(block_id, status)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1772,11 +1747,13 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_exit_code(block_id, exit_code)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1811,11 +1788,19 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_stderr(block_id, stderr)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            // `stderr` is a write-once snapshot field, not part of
+            // `BlockHeader` — pre-migration `ops_since` didn't carry it
+            // through the journaled payload either (`merge_header` never
+            // touched it). Unchanged behavior: the value durably survives
+            // the next compaction (a full `BlockSnapshot`), not oplog
+            // replay of the window before it. See docs/issues.md.
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1853,10 +1838,15 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_signature(block_id, signature)?;
             entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
+            // `signature` is a write-once snapshot field, not part of
+            // `BlockHeader` — see the same note on `set_stderr` above and
+            // docs/issues.md.
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            SyncPayload::from_updated_header(header)
         };
         self.journal_op(context_id, ops)?;
         Ok(())
@@ -1878,11 +1868,15 @@ impl BlockStore {
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let principal_id = self.principal_id();
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_output(block_id, output.cloned())?;
             entry.touch(principal_id);
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            // `output` is a snapshot field, not part of `BlockHeader` — see
+            // the same note on `set_stderr` above and docs/issues.md.
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::OutputChanged {
@@ -1908,11 +1902,15 @@ impl BlockStore {
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let principal_id = self.principal_id();
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_tool_use_id(block_id, tool_use_id)?;
             entry.touch(principal_id);
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            // `tool_use_id` is a snapshot field, not part of `BlockHeader`
+            // — see the same note on `set_stderr` above and docs/issues.md.
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -2078,14 +2076,17 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
-            // Capture frontier before append
-            let frontier = entry.doc.frontier();
             entry.doc.append_text(block_id, text)?;
             entry.touch(effective_agent);
             let version = entry.version();
-            // Get ops since frontier (the append we just applied) — journaled
-            // for the durable oplog; never shipped to the wire.
-            let ops = entry.doc.ops_since(&frontier);
+            // Journaled for the durable oplog — never shipped to the wire.
+            // `pos: None` defers "where does this land" to replay time
+            // (this block's own length then), so appending never pays for
+            // a `content_len()` scan on the streaming hot path.
+            let ops = SyncPayload::from_text_edit(
+                *block_id,
+                TextEdit { pos: None, insert: text.to_string(), delete: 0 },
+            );
             (ops, version)
         };
         self.journal_op(context_id, ops)?;
@@ -2127,11 +2128,13 @@ impl BlockStore {
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let principal_id = self.principal_id();
-            let frontier_before = entry.doc.frontier();
             entry.doc.set_collapsed(block_id, collapsed)?;
             entry.touch(principal_id);
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_header(header), version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2154,11 +2157,10 @@ impl BlockStore {
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let principal_id = self.principal_id();
-            let frontier_before = entry.doc.frontier();
             entry.doc.delete_block(block_id)?;
             entry.touch(principal_id);
             let version = entry.version();
-            (entry.doc.ops_since(&frontier_before), version)
+            (SyncPayload::from_deletion(*block_id), version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2171,30 +2173,6 @@ impl BlockStore {
         });
 
         Ok(())
-    }
-
-    // =========================================================================
-    // Sync Operations
-    // =========================================================================
-
-    /// Get sync payload since a frontier for a document.
-    pub fn ops_since(
-        &self,
-        context_id: ContextId,
-        frontier: &HashMap<BlockId, Frontier>,
-    ) -> BlockStoreResult<SyncPayload> {
-        let entry = self
-            .get(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        Ok(entry.doc.ops_since(frontier))
-    }
-
-    /// Get the current frontier for a document (per-block frontiers).
-    pub fn frontier(&self, context_id: ContextId) -> BlockStoreResult<HashMap<BlockId, Frontier>> {
-        let entry = self
-            .get(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        Ok(entry.doc.frontier())
     }
 
     // =========================================================================
@@ -2786,8 +2764,6 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            let frontier_before = entry.doc.frontier();
-
             let block_id = entry.doc.insert_drift_block(
                 parent_id,
                 after,
@@ -2801,7 +2777,7 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            let ops = entry.doc.ops_since(&frontier_before);
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -2914,7 +2890,7 @@ impl BlockStore {
     /// Insert a notification block (broker-emitted tool/log event).
     ///
     /// Wraps `CrdtBlockStore::insert_notification_block()` with FlowBus
-    /// emission, journal, and frontier tracking. `parent_id` is typically
+    /// emission and journaling. `parent_id` is typically
     /// `None` (root-level notification tied to the context) but may point at
     /// a specific block when the notification is about that block.
     pub fn insert_notification_block_as(
@@ -2933,8 +2909,6 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            let frontier_before = entry.doc.frontier();
-
             let block_id =
                 entry
                     .doc
@@ -2944,7 +2918,7 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            let ops = entry.doc.ops_since(&frontier_before);
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -2967,8 +2941,8 @@ impl BlockStore {
 
     /// Insert a resource block (MCP resource read-through — Phase 3, D-43).
     ///
-    /// Wraps `CrdtBlockStore::insert_resource_block()` with FlowBus emission,
-    /// journal, and frontier tracking. `parent_id` is `None` for the initial
+    /// Wraps `CrdtBlockStore::insert_resource_block()` with FlowBus emission
+    /// and journaling. `parent_id` is `None` for the initial
     /// read (root block) and `Some(root)` for subscription-update children
     /// emitted by the broker on `ResourceUpdated` flush.
     pub fn insert_resource_block_as(
@@ -2987,8 +2961,6 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            let frontier_before = entry.doc.frontier();
-
             let block_id =
                 entry
                     .doc
@@ -2998,7 +2970,7 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            let ops = entry.doc.ops_since(&frontier_before);
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -3021,8 +2993,8 @@ impl BlockStore {
 
     /// Insert an error block attached to a parent.
     ///
-    /// Wraps `CrdtBlockStore::insert_error_block()` with FlowBus emission,
-    /// journal, and frontier tracking.
+    /// Wraps `CrdtBlockStore::insert_error_block()` with FlowBus emission
+    /// and journaling.
     pub fn insert_error_block_as(
         &self,
         context_id: ContextId,
@@ -3038,8 +3010,6 @@ impl BlockStore {
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
-            let frontier_before = entry.doc.frontier();
-
             let block_id =
                 entry
                     .doc
@@ -3049,7 +3019,7 @@ impl BlockStore {
                 .get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
-            let ops = entry.doc.ops_since(&frontier_before);
+            let ops = SyncPayload::from_new_block(snapshot.clone());
             let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
@@ -3470,73 +3440,6 @@ mod tests {
             store.live_status(ctx),
             Status::Error,
             "Error on the tail (last) block must surface as live_status Error"
-        );
-    }
-
-    /// Landmine: the `live_status` DashMap is empty on kernel boot (a fresh
-    /// `BlockStore` backed by an existing on-disk DB, simulating a systemd
-    /// restart). The FIRST read after "boot" — before any mutation warms the
-    /// cache — must still be correct via a lazy single-context scan, not
-    /// The DTE-removal migration's precondition, and the hazard it exists for.
-    ///
-    /// `doc_snapshots.content` is written only by compaction, so a document
-    /// edited since its last compaction holds its newer text only as DTE
-    /// operations in the oplog. The middle assertion is the point of this
-    /// test: it pins that staleness as REAL. Without it the last assertion
-    /// could pass on a store that never needed migrating, and the migration
-    /// would look proven while protecting nothing.
-    #[test]
-    fn compact_all_documents_makes_materialized_text_current() {
-        use crate::kernel_db::KernelDb;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("migrate.db");
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::open(&db_path).unwrap()));
-        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let store = BlockStore::with_db(db.clone(), ws_id, creator);
-
-        let ctx = ContextId::new();
-        store
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-        let block = store
-            .insert_block(
-                ctx, None, None, Role::Model, BlockKind::Text, "hello",
-                Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        // Compact once: `content` now matches the text.
-        store.compact_all_documents();
-        let after_first = db.lock().load_latest_snapshot(ctx).unwrap().unwrap();
-        assert!(
-            after_first.content.contains("hello"),
-            "compaction should have materialized the text, got {:?}",
-            after_first.content,
-        );
-
-        // Edit past the compaction. The new text lives in the oplog as DTE
-        // operations; `content` does not know about it.
-        store
-            .append_text_as(ctx, &block, " world", Some(creator))
-            .unwrap();
-
-        let stale = db.lock().load_latest_snapshot(ctx).unwrap().unwrap();
-        assert!(
-            !stale.content.contains("hello world"),
-            "PRECONDITION: `content` must be stale after an edit, or this test \
-             proves nothing about the migration. Got {:?}",
-            stale.content,
-        );
-
-        // The migration pass makes it current — which is what lets DTE go.
-        store.compact_all_documents();
-        let migrated = db.lock().load_latest_snapshot(ctx).unwrap().unwrap();
-        assert!(
-            migrated.content.contains("hello world"),
-            "after compact_all_documents the materialized text must be current, got {:?}",
-            migrated.content,
         );
     }
 
@@ -4436,10 +4339,25 @@ mod tests {
         }
     }
 
-    /// Test that text streaming (append_text) produces mergeable SyncPayload.
+    /// Streaming append (`append_text`) does two independent things per
+    /// chunk: publish the classified `TextAppended` flow event (the live
+    /// path), and journal a `TextEdit` to the oplog (the durable-recovery
+    /// path — `test_drop_reload_after_append_chain` covers many-chunk
+    /// correctness of that path end to end via `load_from_db`). This test
+    /// checks both from one streaming run: the events carry the right
+    /// suffixes, and replaying the REAL journaled oplog rows (not a
+    /// hand-built payload) into a fresh store reconstructs the same
+    /// content — the property that used to be named "mergeable
+    /// SyncPayload".
     #[tokio::test]
     async fn test_text_streaming_sync_payload() {
-        let (store, bus) = store_with_flows();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stream.db");
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::open(&db_path).unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let store = BlockStore::with_db_and_flows(db.clone(), ws_id, creator, bus.clone());
         let mut sub = bus.subscribe("block.>");
         let ctx = ContextId::new();
 
@@ -4461,34 +4379,28 @@ mod tests {
             .unwrap();
         let _ = sub.try_recv(); // drain insert event
 
-        // Sync via proper protocol: ops_since with empty frontier sends full DTE
-        // ops for new blocks, establishing shared causal history on the client.
-        let mut client = CrdtBlockStore::new(ctx, PrincipalId::new());
-        let initial_payload = store.ops_since(ctx, &HashMap::new()).unwrap();
-        client.merge_ops(initial_payload).expect("initial sync");
-        assert_eq!(client.block_count(), 1);
-
         let chunks = ["Hello", " ", "World", "!"];
         for chunk in chunks {
-            let client_frontier = client.frontier();
             store.append_text(ctx, &block_id, chunk).unwrap();
 
             // An append publishes the classified `TextAppended` event (the
             // `TextOps` wire event this test used to check alongside it was
-            // deleted in the 2026-08-15 flag day, docs/change-feed.md — the
-            // CRDT ops below are still journaled for `ops_since`/`merge_ops`,
-            // just no longer shipped as a wire event).
+            // deleted in the 2026-08-15 flag day, docs/change-feed.md).
             let msg = sub.try_recv().expect("should receive the classified event");
             match msg.payload {
                 BlockFlow::TextAppended { ref suffix, .. } => assert_eq!(&**suffix, chunk),
                 _ => panic!("expected TextAppended event, got {:?}", msg.payload),
             }
+        }
 
-            // Use frontier-based sync for incremental ops
-            let payload = store.ops_since(ctx, &client_frontier).unwrap();
-            client
-                .merge_ops(payload)
-                .unwrap_or_else(|e| panic!("should merge chunk '{chunk}': {e}"));
+        // Replay the REAL journaled oplog (insert + 4 appends) into a fresh
+        // store, the same primitive `load_from_db` uses.
+        let mut client = CrdtBlockStore::new(ctx, PrincipalId::new());
+        let oplog = db.lock().load_oplog_since(ctx, 0).unwrap();
+        assert_eq!(oplog.len(), 5, "insert + 4 appends should each journal one entry");
+        for (_seq, payload_bytes) in &oplog {
+            let payload: SyncPayload = codec::decode(payload_bytes).expect("decode oplog entry");
+            client.merge_ops(payload).expect("replay oplog entry");
         }
 
         let snapshot = client.get_block_snapshot(&block_id).unwrap();

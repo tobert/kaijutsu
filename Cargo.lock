@@ -932,7 +932,7 @@ dependencies = [
  "petgraph",
  "ron",
  "serde",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "thread_local",
  "tracing",
@@ -1103,7 +1103,7 @@ dependencies = [
  "derive_more 2.1.1",
  "downcast-rs 2.0.2",
  "serde",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "wgpu-types",
 ]
@@ -1266,7 +1266,7 @@ dependencies = [
  "nonmax",
  "serde",
  "slotmap",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "variadics_please",
 ]
@@ -1447,7 +1447,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "tracing",
  "wgpu-types",
@@ -1597,7 +1597,7 @@ dependencies = [
  "bevy_transform",
  "bevy_utils",
  "half",
- "smallvec 1.15.1",
+ "smallvec",
  "tracing",
  "wgpu-types",
 ]
@@ -1648,7 +1648,7 @@ dependencies = [
  "bevy_shader",
  "bevy_utils",
  "encase",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "tracing",
  "variadics_please",
@@ -1757,7 +1757,7 @@ dependencies = [
  "indexmap 2.14.0",
  "nonmax",
  "offset-allocator",
- "smallvec 1.15.1",
+ "smallvec",
  "static_assertions",
  "thiserror 2.0.18",
  "tracing",
@@ -1831,7 +1831,7 @@ dependencies = [
  "bevy_render",
  "bevy_shader",
  "bevy_utils",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -1863,7 +1863,7 @@ dependencies = [
  "inventory",
  "petgraph",
  "serde",
- "smallvec 1.15.1",
+ "smallvec",
  "smol_str",
  "thiserror 2.0.18",
  "uuid",
@@ -1957,7 +1957,7 @@ dependencies = [
  "nonmax",
  "offset-allocator",
  "send_wrapper",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "variadics_please",
  "wasm-bindgen",
@@ -1994,7 +1994,7 @@ dependencies = [
  "bevy_reflect",
  "bevy_scene_macros",
  "bevy_utils",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "tracing",
  "variadics_please",
@@ -2157,7 +2157,7 @@ dependencies = [
  "bevy_utils",
  "parley",
  "serde",
- "smallvec 1.15.1",
+ "smallvec",
  "smol_str",
  "swash",
  "sys-locale",
@@ -2239,7 +2239,7 @@ dependencies = [
  "derive_more 2.1.1",
  "parley",
  "serde",
- "smallvec 1.15.1",
+ "smallvec",
  "swash",
  "taffy",
  "thiserror 2.0.18",
@@ -3195,21 +3195,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
-dependencies = [
- "crc-catalog",
-]
-
-[[package]]
-name = "crc-catalog"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3696,28 +3681,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diamond-types-extended"
-version = "0.2.0"
-source = "git+https://github.com/tobert/diamond-types-extended?rev=1304b24db229bf4cc66f1786963a184f3b0d651c#1304b24db229bf4cc66f1786963a184f3b0d651c"
-dependencies = [
- "bumpalo",
- "crc",
- "humansize",
- "jumprope",
- "lazy_static",
- "libc",
- "lz4_flex",
- "num_enum",
- "ordered-float",
- "serde",
- "serde_json",
- "smallvec 2.0.0-alpha.12",
- "smartstring",
- "str_indices",
- "uuid",
-]
-
-[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4185,7 +4148,7 @@ dependencies = [
  "lebe",
  "miniz_oxide",
  "rayon-core",
- "smallvec 1.15.1",
+ "smallvec",
  "zune-inflate",
 ]
 
@@ -4373,7 +4336,7 @@ dependencies = [
  "parlance",
  "read-fonts 0.39.1",
  "roxmltree 0.21.1",
- "smallvec 1.15.1",
+ "smallvec",
  "windows 0.62.2",
  "windows-core",
  "yeslogic-fontconfig-sys",
@@ -4465,7 +4428,7 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "pin-project",
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -4796,7 +4759,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "itoa",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 
@@ -4836,7 +4799,7 @@ dependencies = [
  "gix-path",
  "gix-zlib",
  "memmap2",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 
@@ -5173,7 +5136,7 @@ dependencies = [
  "bytemuck",
  "core_maths",
  "read-fonts 0.39.1",
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -5422,15 +5385,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "humansize"
-version = "2.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb51c9a029ddc91b07a787f1d86b53ccfa49b0e86688c946ebe8d3555685dd7"
-dependencies = [
- "libm",
-]
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5459,7 +5413,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "smallvec 1.15.1",
+ "smallvec",
  "tokio",
  "want",
 ]
@@ -5600,7 +5554,7 @@ dependencies = [
  "icu_normalizer_data",
  "icu_properties",
  "icu_provider",
- "smallvec 1.15.1",
+ "smallvec",
  "zerovec",
 ]
 
@@ -5688,7 +5642,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
 dependencies = [
  "idna_adapter",
- "smallvec 1.15.1",
+ "smallvec",
  "utf8_iter",
 ]
 
@@ -5917,7 +5871,7 @@ version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "270bc34e57047cab801a8c871c124d9dc7132f6473c6401f645524f4e6edd111"
 dependencies = [
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -6152,16 +6106,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jumprope"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "829c74fe88dda0d2a5425b022b44921574a65c4eb78e6e39a61b40eb416a4ef8"
-dependencies = [
- "rand 0.8.5",
- "str_indices",
-]
-
-[[package]]
 name = "kaijutsu-abc"
 version = "0.1.0"
 dependencies = [
@@ -6345,7 +6289,6 @@ dependencies = [
 name = "kaijutsu-crdt"
 version = "0.1.0"
 dependencies = [
- "diamond-types-extended",
  "kaijutsu-types",
  "rand 0.8.5",
  "serde",
@@ -6435,7 +6378,6 @@ dependencies = [
  "bytes",
  "clap",
  "dashmap",
- "diamond-types-extended",
  "dunce",
  "eventsource-stream",
  "futures",
@@ -6802,7 +6744,7 @@ checksum = "7564e90fe3c0d5771e1f0bc95322b21baaeaa0d9213fa6a0b61c99f8b17b3bfb"
 dependencies = [
  "arrayvec",
  "euclid",
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -6990,15 +6932,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "lz4_flex"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98c23545df7ecf1b16c303910a69b079e8e251d60f7dd2cc9b4177f2afaf1746"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "mach2"
@@ -7356,7 +7289,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
 dependencies = [
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -8101,8 +8034,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
- "rand 0.8.5",
- "serde",
 ]
 
 [[package]]
@@ -8209,7 +8140,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
- "smallvec 1.15.1",
+ "smallvec",
  "windows-link",
 ]
 
@@ -8301,7 +8232,7 @@ dependencies = [
  "color",
  "kurbo",
  "linebender_resource_handle",
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -8903,7 +8834,6 @@ dependencies = [
  "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
- "serde",
 ]
 
 [[package]]
@@ -8954,7 +8884,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
- "serde",
 ]
 
 [[package]]
@@ -9418,7 +9347,7 @@ version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
 dependencies = [
- "smallvec 1.15.1",
+ "smallvec",
  "str_indices",
 ]
 
@@ -9485,7 +9414,7 @@ dependencies = [
  "rten-vecmath",
  "rustc-hash 2.1.2",
  "rustfft",
- "smallvec 1.15.1",
+ "smallvec",
  "typeid",
  "wasm-bindgen",
 ]
@@ -9534,7 +9463,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e8a913c7ca40e2bfbb2a0cd447cce56b33ab19435f56693271a2ef37cf58984"
 dependencies = [
  "rten-tensor",
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -9551,7 +9480,7 @@ checksum = "05dc744a270aa32d154f1a3df8e48740ccc1be9dfbcf23295ada66d83aa98de6"
 dependencies = [
  "rayon",
  "rten-base",
- "smallvec 1.15.1",
+ "smallvec",
  "typeid",
 ]
 
@@ -9592,7 +9521,7 @@ dependencies = [
  "fallible-streaming-iterator",
  "hashlink",
  "libsqlite3-sys",
- "smallvec 1.15.1",
+ "smallvec",
  "sqlite-wasm-rs",
 ]
 
@@ -9898,7 +9827,7 @@ dependencies = [
  "bytemuck",
  "core_maths",
  "log",
- "smallvec 1.15.1",
+ "smallvec",
  "ttf-parser 0.25.1",
  "unicode-bidi-mirroring",
  "unicode-ccc",
@@ -10442,27 +10371,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smallvec"
-version = "2.0.0-alpha.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "smartstring"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
-dependencies = [
- "autocfg",
- "serde",
- "static_assertions",
- "version_check",
-]
-
-[[package]]
 name = "smawk"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10976,7 +10884,7 @@ dependencies = [
  "log",
  "num-complex",
  "rustfft",
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -11083,7 +10991,7 @@ dependencies = [
  "lazy_static",
  "log",
  "regex-lite",
- "smallvec 1.15.1",
+ "smallvec",
  "symphonia-core 0.6.0",
 ]
 
@@ -11773,7 +11681,7 @@ checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
 dependencies = [
  "js-sys",
  "opentelemetry",
- "smallvec 1.15.1",
+ "smallvec",
  "tracing",
  "tracing-core",
  "tracing-log",
@@ -11804,7 +11712,7 @@ dependencies = [
  "once_cell",
  "regex-automata",
  "sharded-slab",
- "smallvec 1.15.1",
+ "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
@@ -11985,7 +11893,7 @@ version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43f613e4fa046e69818dd287fdc4bc78175ff20331479dab6e1b0f98d57062de"
 dependencies = [
- "smallvec 1.15.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -12398,7 +12306,7 @@ dependencies = [
  "downcast-rs 1.2.1",
  "rustix 1.1.4",
  "scoped-tls",
- "smallvec 1.15.1",
+ "smallvec",
  "wayland-sys",
 ]
 
@@ -12587,7 +12495,7 @@ dependencies = [
  "portable-atomic",
  "profiling",
  "raw-window-handle",
- "smallvec 1.15.1",
+ "smallvec",
  "static_assertions",
  "wasm-bindgen",
  "web-sys",
@@ -12619,7 +12527,7 @@ dependencies = [
  "profiling",
  "raw-window-handle",
  "rustc-hash 1.1.0",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-wasm",
@@ -12698,7 +12606,7 @@ dependencies = [
  "raw-window-handle",
  "raw-window-metal",
  "renderdoc-sys",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.18",
  "wasm-bindgen",
  "wayland-sys",
@@ -13586,3 +13494,8 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core 0.5.1",
 ]
+
+[[patch.unused]]
+name = "diamond-types-extended"
+version = "0.2.0"
+source = "git+https://github.com/tobert/diamond-types-extended?rev=1304b24db229bf4cc66f1786963a184f3b0d651c#1304b24db229bf4cc66f1786963a184f3b0d651c"

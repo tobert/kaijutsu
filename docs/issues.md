@@ -6,6 +6,36 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Four write-once block fields don't survive oplog replay before the next compaction (found 2026-08-16, DTE removal)
+
+`set_stderr`, `set_signature`, `set_tool_use_id`, and `set_output`
+(`crates/kaijutsu-kernel/src/block_store.rs`) mutate `BlockContent` fields
+that live outside `BlockHeader` — `merge_header` never touches them. Their
+journaled `SyncPayload` (built via `SyncPayload::from_updated_header`)
+therefore carries the block's header, unchanged, and nothing that would let
+`merge_ops` recover the new value. The value survives fine through the next
+`compact_document` (a full `BlockSnapshot` covers every field) — the exposure
+is only the window between the mutation and the next compaction: a kernel
+restart inside that window replays the oplog and rebuilds the block without
+the stderr/signature/tool_use_id/output change.
+
+This is not new — it predates DTE removal. The pre-migration `ops_since`
+(diamond-types-extended-backed) had exactly the same gap: none of these four
+fields were DTE ops or `BlockHeader` fields, so nothing in the old payload
+carried them either. Found while auditing every `frontier_before`/`ops_since`
+call site during the DTE removal (`docs/crdt-melt.md`), not introduced by it.
+
+`move_block`'s `order_key` has the same shape of gap (`order_key` lives on
+`BlockSnapshot`, not `BlockHeader`) and is likewise pre-existing.
+
+Fix, if worth it: give `SyncPayload` a slot for these snapshot-only fields
+(or journal a full snapshot instead of a bare header for these five
+mutations), then replay it in `merge_ops`. Not done here — out of scope for
+a DTE-removal migration whose job is text, not fixing an unrelated
+pre-existing gap in metadata replay fidelity.
+
+---
+
 ## A context's version is unobservable from `kj` (2026-08-15)
 
 The context version is now load-bearing: it is the client's hydration anchor
@@ -801,6 +831,80 @@ report describes what was visible; a probe finds the shape. Separately, the
 bare-numeric leading-zero normalization is **ruled intended** (coerce to number,
 quote for a string) and becomes a docs task, not a fix — though the `1e2`
 inconsistency is real and should ride the write-up.
+
+### kaish 0.15 gives the gate a real heredoc surface (relayed 2026-08-16, kaish lead)
+
+**Status: on kaish `main` (`b58e492`, PR #340), NOT released.** Built partly for
+our approval-ledger hooks, so it lands in the gate lane rather than the bump.
+Two additions:
+
+1. **`PlannedCommand.heredocs: Vec<PlannedHeredoc>`** — for `python3 <<'PY' …
+   PY` the gate gets the command name, the delimiter word (`PY`, `SQL` — the
+   language hint agents actually write), `literal`, `strip_tabs`, the body
+   **verbatim**, and the body's own free variables. Today that body arrives as a
+   single-quoted `'\''`-escaped blob inside `PlannedRedirect.target` with the
+   delimiter rewritten to `EOF`, which is unreadable to a human confirming a
+   statement.
+2. **`Kernel::expand_fragment(source, FragmentAddr::new(stmt, heredoc), &scope)`**
+   → `Expansion::Complete(String)` or `Blocked { holes }`. **You supply the
+   scope; the kernel never peeks session state** — a `read TOKEN` binds at
+   runtime, so a peeked value is stale exactly when it matters. A `$(…)` in the
+   body does **not** run: it returns as a `Hole` carrying its nested `Plan`, and
+   running it is the embedder's decision.
+
+Three things to know before wiring it, two of which are silent-wrongness shapes:
+
+- **`literal` is the security-relevant field.** Quoted delimiter → the published
+  body IS what the command reads. Unquoted → the shell expands `${…}` and `$(…)`
+  first, so a substitution can land **inside a string literal in the other
+  language**. A gate that renders a statement for human confirmation without
+  reading `literal` shows text that is not what runs.
+- **`Complete` means "this is what runs", NOT "everything was supplied."** An
+  unsupplied variable expands to empty, and **that is correct, not a gap** —
+  verified against the binary, and deliberately not made an error: *a rule
+  stricter than the interpreter would hand you a body the command never sees*,
+  which is the same failure class the feature exists to prevent (kaish lead,
+  2026-08-16). So `Complete` is honest about what it claims. The trap is purely
+  that the word invites a stronger reading than it makes. `free_variables ⊆ your
+  scope` is the stricter check, and the plan publishes exactly that list per
+  heredoc.
+- **BREAKING for any consumer of `PlannedRedirect.target` on a heredoc:** it now
+  carries the delimiter word, not a rendering of the body.
+
+**A gotcha for every consumer of `PlannedStatement.index`, not just this
+feature:** `plan_program` numbers statements **before** dropping empty ones, so
+a leading comment or blank line leaves a gap in the published indices. Anything
+that filters `Stmt::Empty` and then indexes by a published index is off by one.
+It bit `expand_fragment` itself and returned the wrong heredoc's body silently
+until review caught it.
+
+**The mechanism, which generalizes past kaish** (kaish lead, 2026-08-16): it was
+not that the consumer filtered wrongly — it was that the **publisher and the
+consumer disagreed about what an index means, and no type distinguished them.**
+A `usize` looks identical either way. The sibling defect in the same PR had the
+same shape (two AST walks that had to agree), and **both were fixed by deleting
+the second thing rather than by aligning it.** Worth holding next to our own
+rule that a structural impossibility beats a metric: two things that must agree
+is a bug waiting for the day they don't, and the repair is usually subtraction.
+Seven review defects on that PR across two passes, six of them confident-wrong-
+output, none catchable by a gate.
+
+**Scope it does NOT cover** — do not assume otherwise when arguing about gate
+coverage: `python3 -c '…'`, `echo … | python3`, and write-then-run-later. It
+improves the common case; the airtight configuration is still `subprocess` off.
+
+Docs: `docs/EMBEDDING.md` "Command analysis", and
+`crates/kaish-kernel/examples/heredoc_demo.rs`.
+
+**Sequencing — build the confirmation renderer ONCE, against 0.15.** Nothing is
+queued for 0.14.x; kaish `main` carries this surface plus #325/#326/#327, all
+behavior changes aimed at 0.15, and the next work (#255 parser rebuild, #194
+compounds in unquoted `$()`) is 0.15-shaped too. Amy, relayed 2026-08-16: *"I'm
+tempted to go right on to 0.15 fyi"* — **a lean, not a ruling**, and the kaish
+lead deliberately declined to upgrade it into a commitment. Treat 0.14.1 as the
+waypoint that unpins `kaish-help`, and target the gate at 0.15. A hypothetical
+0.14.2 would be a patch and would not carry this surface, so that risk does not
+change the plan.
 
 ## Three findings from the slice-3 cross-model review (2026-08-13, gemini-pro + deepseek)
 
