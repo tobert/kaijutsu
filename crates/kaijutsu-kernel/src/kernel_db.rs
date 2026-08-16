@@ -587,6 +587,19 @@ CREATE TABLE IF NOT EXISTS well_known_contexts (
     assigned_at INTEGER NOT NULL
 );
 
+-- ── One-Time Migration Markers ──────────────────────────────────
+-- A row here means "this named one-time cleanup already ran on this
+-- database". It exists for migrations that CANNOT be made naturally
+-- idempotent-and-cheap the way `apply_additive_migrations`' guarded ALTERs
+-- are — specifically ones whose only way to decide "is there work left?" is
+-- an expensive scan. Do NOT reach for this for ordinary schema evolution:
+-- an `ALTER TABLE ... ADD COLUMN` guarded by the duplicate-column idiom is
+-- still the house style, because it needs no bookkeeping to stay honest.
+CREATE TABLE IF NOT EXISTS kernel_migrations (
+    name       TEXT    NOT NULL PRIMARY KEY,
+    applied_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
+
 -- ── Op-Log Persistence ──────────────────────────────────────────
 -- Append-only journal: each mutation writes one row with the delta.
 CREATE TABLE IF NOT EXISTS oplog (
@@ -1558,6 +1571,27 @@ fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Marker name for the one-time 2026-08-16 diamond-types-extended cutover
+/// oplog cleanup. See [`KernelDb::purge_dte_cutover_oplog_rows`] — the date is
+/// part of the name on purpose: this migration is about one specific day.
+const DTE_CUTOVER_OPLOG_MIGRATION: &str = "drop_dte_oplog_2026_08_16";
+
+/// Accounting from [`KernelDb::purge_dte_cutover_oplog_rows`]. Amy needs these
+/// numbers to compare against the 343 documents the 2026-08-16 boot journal
+/// reported as undecodable, so the caller logs them at INFO.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DteCutoverPurge {
+    /// Oplog rows read and decode-tested.
+    pub examined: u64,
+    /// Rows deleted because they failed to decode.
+    pub deleted: u64,
+    /// Distinct documents at least one deleted row belonged to.
+    pub documents: u64,
+    /// True when the marker was already present, so nothing was scanned. The
+    /// counts are all zero in that case and mean "not measured", not "none".
+    pub already_applied: bool,
+}
+
 // ============================================================================
 // KernelDb
 // ============================================================================
@@ -2208,6 +2242,124 @@ impl KernelDb {
             params![blob_param(document_id.as_bytes()), seq, payload],
         )?;
         Ok(())
+    }
+
+    /// True when the named one-time migration has already been recorded in
+    /// `kernel_migrations` on this database.
+    pub fn migration_applied(&self, name: &str) -> KernelDbResult<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM kernel_migrations WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Delete every oplog row whose payload no longer decodes as the current
+    /// `SyncPayload`, ONE TIME, because of the 2026-08-16 diamond-types-extended
+    /// cutover — and for no other reason.
+    ///
+    /// ## Why this exists (and why it is dated)
+    ///
+    /// Commit `fc616aa6` (2026-08-16 09:32) made block text a plain `String`
+    /// and deleted the diamond-types-extended CRDT. The kernel process running
+    /// that day had started at ~08:47 — 45 minutes BEFORE the commit — so it
+    /// spent the day journalling oplog rows in the *old* DTE shape. When the
+    /// kernel restarted at 16:20 onto the new binary, 343 documents failed to
+    /// decode (`missing field \`insert\``, a required field of the new
+    /// `TextEdit`) and were left out of the in-memory store entirely, so
+    /// `kj block count` answered "document not found" for every one of them.
+    ///
+    /// Those payloads are **not recoverable by parsing**: they are DTE ops and
+    /// DTE is no longer a dependency of any crate, so nothing in the tree can
+    /// interpret them. Their content is gone either way. Amy's ruling
+    /// (2026-08-16) was to drop the ops so the documents load from their
+    /// snapshots plus whatever remains decodable, rather than staying dark.
+    ///
+    /// ## What this is NOT
+    ///
+    /// This is not a general oplog repair and must never be generalized into
+    /// "drop anything we can't parse". The poison-and-skip behaviour in
+    /// `BlockStore::load_from_db` stays exactly as it is: a decode failure on a
+    /// document is still a loud, load-refusing event, because for any corruption
+    /// that is not this one dated cutover, serving a document with a hole in its
+    /// history is worse than not serving it. A dated cleanup is honest; a
+    /// standing silent fallback is not. If a future format break needs the same
+    /// treatment, it gets its OWN dated function and its own marker — not an
+    /// extra `if` in this one.
+    ///
+    /// Rows are only deleted when `decodable` says so, one row at a time — this
+    /// never truncates an oplog to the latest snapshot and never deletes by
+    /// date, so rows written after the cutover survive. The caller supplies
+    /// `decodable` because the payload format belongs to the block store, not to
+    /// this file (see `BlockStore::load_from_db`, the sole caller).
+    ///
+    /// Gated by a `kernel_migrations` marker: the deciding question ("are there
+    /// undecodable rows left?") can only be answered by a full scan of a
+    /// multi-hundred-megabyte table, which is not something to pay on every
+    /// boot. The marker is written in the same transaction as the deletes, so a
+    /// crash mid-migration re-runs the whole thing rather than half-skipping it.
+    pub fn purge_dte_cutover_oplog_rows(
+        &mut self,
+        decodable: &dyn Fn(&[u8]) -> bool,
+    ) -> KernelDbResult<DteCutoverPurge> {
+        if self.migration_applied(DTE_CUTOVER_OPLOG_MIGRATION)? {
+            return Ok(DteCutoverPurge {
+                already_applied: true,
+                ..DteCutoverPurge::default()
+            });
+        }
+
+        let mut examined: u64 = 0;
+        let mut doomed: Vec<(Vec<u8>, i64)> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT document_id, seq, payload FROM oplog ORDER BY document_id, seq")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                examined += 1;
+                // Typed `get` rather than a permissive ValueRef match: a row
+                // whose payload is not a BLOB is a corrupt database, and this
+                // should fail loudly instead of quietly counting it as garbage
+                // and deleting it.
+                let payload: Vec<u8> = row.get(2)?;
+                if decodable(&payload) {
+                    continue;
+                }
+                doomed.push((row.get(0)?, row.get(1)?));
+            }
+        }
+
+        let documents = doomed
+            .iter()
+            .map(|(document_id, _)| document_id.clone())
+            .collect::<HashSet<_>>()
+            .len() as u64;
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut del =
+                tx.prepare("DELETE FROM oplog WHERE document_id = ?1 AND seq = ?2")?;
+            for (document_id, seq) in &doomed {
+                del.execute(params![document_id, seq])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO kernel_migrations (name, applied_at) VALUES (?1, ?2)",
+            params![DTE_CUTOVER_OPLOG_MIGRATION, now_millis()],
+        )?;
+        tx.commit()?;
+
+        Ok(DteCutoverPurge {
+            examined,
+            deleted: doomed.len() as u64,
+            documents,
+            already_applied: false,
+        })
     }
 
     /// Load oplog entries after a given seq (for replay after snapshot restore).
