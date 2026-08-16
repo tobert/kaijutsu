@@ -35,9 +35,11 @@
 //! the Anthropic Messages API merges consecutive same-role messages into one
 //! turn rather than rejecting them.
 //!
-//! Consumers: `mailbox::rehydrate_windowed` (now), fork selection and the
-//! windowed-notation pull primitive (later slices). They share this module so
-//! the cut-and-join semantics are defined exactly once.
+//! Consumers: `mailbox::rehydrate_windowed` and `kj fork`'s
+//! `resolve_fork_selection` (`kj/fork.rs`) — the windowed-notation pull
+//! primitive is a still-open later slice. Both route their positional
+//! keep-set through [`plan_splice`] before it is applied, so the cut-and-join
+//! semantics are defined exactly once instead of twice.
 
 use std::ops::Range;
 

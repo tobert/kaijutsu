@@ -22,6 +22,7 @@ use kaijutsu_types::{
 };
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
+use crate::llm::splice::{SpliceItem, plan_splice};
 
 use super::parse::resolve_model_choice;
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -343,6 +344,24 @@ impl KjDispatcher {
                 ));
             }
         }
+
+        // ── Cut hygiene: route the resolved positional keep-set through the
+        // SAME splicer `mailbox::rehydrate_windowed` uses (`llm::splice`),
+        // instead of applying it raw as `contains_position`. A raw keep-set
+        // is order-blind and can end a run on a `ToolCall` (dropping its
+        // `ToolResult`) or begin one on a `Model` continuation / agent
+        // `ToolResult` (a leading orphan) — exactly the hazards `plan_splice`
+        // exists to close. Snapping only ENLARGES a run (`snap_start`/
+        // `snap_end` never shrink), so this can't violate the include
+        // invariant already checked above. `Seam` items are discarded here:
+        // a seam marks elided material for a *live LLM conversation*
+        // (`push_seam`), and a forked child's durable block log has no
+        // analogous "archived middle" placeholder to inject.
+        let spliced = plan_splice(&snapshots, kept.runs());
+        let kept = IntervalSet::from_ranges(spliced.into_iter().filter_map(|item| match item {
+            SpliceItem::Keep(i) => Some(i..i + 1),
+            SpliceItem::Seam { .. } => None,
+        }));
 
         // Plain full-copy fast path: base `full`, nothing narrowing → keep the
         // history-preserving `fork_document` copy + ForkKind::Full. Any preset
@@ -1950,6 +1969,190 @@ mod tests {
             assert!(!kid.iter().any(|c| c.contains(body.as_str())), "dropped {body:?}: {kid:?}");
         }
         assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Filtered));
+    }
+
+    // ── cut hygiene: fork's selection shares plan_splice with mailbox ─────
+    // `resolve_fork_selection` used to hand its raw positional keep-set
+    // straight to `ForkBlockFilter.selection` (plain `contains_position`, no
+    // adjacency logic). These three route through `llm::splice::plan_splice`
+    // — the same engine `mailbox::rehydrate_windowed` runs its window
+    // keep-set through — to snap every kept run outward to `Role::User`
+    // turn-group boundaries before it is applied.
+
+    /// Insert a role-tagged text block — `insert_text` above is always
+    /// `Role::User`; the cut-hygiene tests need `Role::Model` continuations.
+    fn insert_role_text(
+        d: &crate::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        principal: PrincipalId,
+        role: kaijutsu_types::Role,
+        body: &str,
+    ) -> kaijutsu_types::BlockId {
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                role,
+                kaijutsu_types::BlockKind::Text,
+                body.to_string(),
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap()
+    }
+
+    /// A `kj fork --include` range ENDING on a `ToolCall` must not tear the
+    /// tool_use/tool_result pair apart across the cut. Sequence (mirrors
+    /// `llm::splice::tests::prefix_ending_on_tool_call_extends_to_include_its_result`):
+    /// 0:u0(User) 1:m0(Model) 2:tool_call(Model/ToolCall) 3:tool_result(Tool/ToolResult)
+    /// 4:m1(Model) 5:u1(User) 6:m2(Model).
+    /// `--include 0:3` is a RAW keep-set of positions {0,1,2} — a run that
+    /// ends exactly on the tool_call, genuinely cutting between it and its
+    /// result at position 3. Without splicing, `fork_filtered` applies that
+    /// keep-set as bare `contains_position` and the child comes out with the
+    /// `ToolCall` but no `ToolResult` — a torn pair. Confirmed against the
+    /// pre-fix code (temporarily bypassing the `plan_splice` call): this test
+    /// FAILED with `kinds: [Text, Text, ToolCall]` (no `ToolResult`) before
+    /// the fix, and passes after it.
+    #[tokio::test]
+    async fn fork_include_ending_on_tool_call_keeps_the_matching_result() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        use kaijutsu_types::{BlockKind, Role};
+
+        insert_role_text(&d, source, principal, Role::User, "u0");
+        insert_role_text(&d, source, principal, Role::Model, "m0");
+        let call_id = d
+            .block_store()
+            .insert_tool_call(source, None, None, "search", serde_json::json!({"q": "x"}), None)
+            .unwrap();
+        d.block_store()
+            .insert_tool_result(source, &call_id, None, "result", false, None, None)
+            .unwrap();
+        insert_role_text(&d, source, principal, Role::Model, "m1");
+        insert_role_text(&d, source, principal, Role::User, "u1");
+        insert_role_text(&d, source, principal, Role::Model, "m2");
+
+        let pc = ordered_contents(&d, source);
+        assert_eq!(pc.len(), 7, "source ordering: {pc:?}");
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("paired"), s("--include"), s("0:3")], &c)
+            .await;
+        assert!(result.is_ok(), "fork --include 0:3 failed: {}", result.message());
+
+        let child = child_id(&d, "paired");
+        let kinds: Vec<BlockKind> = d
+            .block_store()
+            .block_snapshots(child)
+            .unwrap()
+            .iter()
+            .map(|b| b.kind)
+            .collect();
+        assert!(kinds.contains(&BlockKind::ToolCall), "child kinds: {kinds:?}");
+        assert!(
+            kinds.contains(&BlockKind::ToolResult),
+            "the ToolResult must ride along with its ToolCall, never torn apart: {kinds:?}"
+        );
+
+        // The end snapped forward past the tool_call/tool_result pair to the
+        // next User turn (index 5), pulling in the answer (m1) too — but not
+        // the following turn group (u1, m2). Membership checks, not an exact
+        // vector, because the child also carries a trailing fork marker + rc
+        // lifecycle blocks (`inject_fork_marker` / `run_rc_lifecycle`) that
+        // aren't part of what this test is verifying.
+        let kid = ordered_contents(&d, child);
+        for body in ["u0", "m0", "result", "m1"] {
+            assert!(kid.iter().any(|c| c == body), "missing {body:?}: {kid:?}");
+        }
+        assert!(!kid.iter().any(|c| c == "u1"), "kept blocks: {kid:?}");
+        assert!(!kid.iter().any(|c| c == "m2"), "kept blocks: {kid:?}");
+    }
+
+    /// A `kj fork --include` range STARTING mid-turn-group snaps back to the
+    /// `Role::User` turn start. Sequence: 0:u0(User) 1:m0(Model, continuation)
+    /// 2:u1(User) 3:m1(Model, continuation). `--include 3:4` is a RAW
+    /// keep-set of just {3} (m1) — a bare assistant continuation with no
+    /// leading user turn. The start snaps back to the nearest turn boundary
+    /// at or before it (index 2, u1), pulling the whole exchange in; it must
+    /// NOT reach further back into u0/m0's unrelated turn group.
+    #[tokio::test]
+    async fn fork_include_starting_mid_turn_snaps_back_to_user() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        use kaijutsu_types::Role;
+
+        insert_role_text(&d, source, principal, Role::User, "u0");
+        insert_role_text(&d, source, principal, Role::Model, "m0");
+        insert_role_text(&d, source, principal, Role::User, "u1");
+        insert_role_text(&d, source, principal, Role::Model, "m1");
+        assert_eq!(ordered_contents(&d, source).len(), 4);
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("midsnap"), s("--include"), s("3:4")], &c)
+            .await;
+        assert!(result.is_ok(), "fork --include 3:4 failed: {}", result.message());
+
+        let child = child_id(&d, "midsnap");
+        let kid = ordered_contents(&d, child);
+        assert!(kid.iter().any(|c| c == "u1"), "snapped back to u1's turn: {kid:?}");
+        assert!(kid.iter().any(|c| c == "m1"), "snapped back to u1's turn: {kid:?}");
+        assert!(!kid.iter().any(|c| c == "u0"), "must not reach u0's unrelated turn: {kid:?}");
+        assert!(!kid.iter().any(|c| c == "m0"), "must not reach u0's unrelated turn: {kid:?}");
+    }
+
+    /// Existing-behavior guard: a `--include` range already aligned to a
+    /// turn boundary is unchanged by the splice — no accidental widening.
+    /// Same fixture as the mid-turn-snap test above; `--include 2:4` already
+    /// starts on `u1` (a `Role::User` boundary) and ends at the log's end, so
+    /// `plan_splice` must be a no-op here and the result is identical to the
+    /// mid-turn-snap case, confirming nothing extra got pulled in.
+    #[tokio::test]
+    async fn fork_include_already_aligned_is_not_widened() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        use kaijutsu_types::Role;
+
+        insert_role_text(&d, source, principal, Role::User, "u0");
+        insert_role_text(&d, source, principal, Role::Model, "m0");
+        insert_role_text(&d, source, principal, Role::User, "u1");
+        insert_role_text(&d, source, principal, Role::Model, "m1");
+        assert_eq!(ordered_contents(&d, source).len(), 4);
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("aligned"), s("--include"), s("2:4")], &c)
+            .await;
+        assert!(result.is_ok(), "fork --include 2:4 failed: {}", result.message());
+
+        let child = child_id(&d, "aligned");
+        let kid = ordered_contents(&d, child);
+        assert!(kid.iter().any(|c| c == "u1"), "already-aligned range: {kid:?}");
+        assert!(kid.iter().any(|c| c == "m1"), "already-aligned range: {kid:?}");
+        assert!(
+            !kid.iter().any(|c| c == "u0"),
+            "already-aligned range must not widen into u0's turn: {kid:?}"
+        );
+        assert!(
+            !kid.iter().any(|c| c == "m0"),
+            "already-aligned range must not widen into u0's turn: {kid:?}"
+        );
     }
 
     /// `--exclude 1:4` carves a middle notch: positions 0 and 4 survive.

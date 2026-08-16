@@ -36,7 +36,7 @@ mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
 pub mod openai;
-mod splice;
+pub(crate) mod splice;
 pub mod stream;
 pub mod system_prompt;
 
