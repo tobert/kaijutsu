@@ -258,6 +258,62 @@ a real host tmpdir mapped in or a VFS-native surface (the latter keeps the
 "one owner" property but means host binaries can't see it, which defeats the
 purpose — probably a real dir, VFS-mounted).
 
+### RULED by Amy, 2026-08-16
+
+**Keep the pair, and make it explicit.** Amy: *"I think we have the pair, one
+that's clearly a text processing space that can't corrupt the system, and
+another that's hot and can edit and rm and stuff… I thought about suggesting
+`shell` be routed transparently but I think that would be even more dangerous
+in the end, so explicit is better."*
+
+Transparent routing (one `shell` that silently escalates when a command
+mutates) is rejected. Beyond the danger: it makes the capability
+**un-auditable**. With two tools, "which contexts can mutate the host" is
+answerable from the loadout; with routing, every context holds the hot
+capability latently and you only find out at runtime — and the approval
+prompt then arrives mid-pipeline, which is the worst possible moment to ask
+a human anything.
+
+**Names: `shell` (safe) and `shell_write` (hot).**
+
+```
+shell         Run commands. Reads anywhere you can read;
+              writes confined to your scratch space.
+shell_write   Same shell, plus modify and remove files
+              outside scratch. Granted, not default.
+```
+
+The deciding argument is **which one gets reached for by accident.** Models
+reach for the unmarked, shortest, most obvious name. Today that is `shell`
+and today `shell` is the hot one, so every casual `ls` routes through the
+dangerous tool — which is exactly what drowns the approval ledger (a gate
+that fires constantly gets clicked through, and then the record exists and
+means nothing). So the safe tool takes the unmarked name.
+
+This is a semantic flag day on `shell`, accepted because **it fails in the
+right direction**: an old caller saying `shell` is denied a write rather than
+silently granted one. `read_only_shell` also goes away as a name — it is a
+negative framing that reads as "the lesser tool", and it will become
+inaccurate the moment scratch writes land.
+
+**`sandbox` is ruled out as a name** in any position. It claims a security
+boundary, and `docs/instrument-design.md` is explicit that capabilities are
+ergonomic nudges inside one trust boundary, never enforcement between
+players. The name would lie about the trust model, and someone would
+eventually rely on the lie.
+
+**Default grants stay per-rc, as today** — each `context_type`'s rc decides.
+Not an unconditional grant in every bucket.
+
+**Sequencing: do this with the kaish 0.14 bump, not after it.** The bump
+deletes the entire latch/nonce confirmation surface (6 call sites, 5 files —
+measured, see the 0.14 entry), which is the same mechanism write approvals
+would otherwise extend. Amy: *"maybe we do the `kaish_ro` thing at the same
+time (and end up with one unified read-only-ish shell with path boundaries
+for all agents)."* Rebuilding confirmation on the new API and defining the
+read/write split in one pass means designing the boundary once instead of
+porting the old shape and immediately reshaping it.
+
 ---
 
 ## `kj rc render <context_type>` — let one context type assimilate another (Amy, 2026-08-16)
