@@ -12,7 +12,11 @@ Sweeping `kaijutsu-crdt`/`CrdtBlockStore` references while melting the crate
 into `kaijutsu_kernel::blocks` (see the "block store is not a CRDT" history,
 now folded into this entry) surfaced staleness the rename sweep didn't fix:
 
-- `docs/architecture/diagrams/06-crate-deps.svg` still draws a `kaijutsu-crdt`
+- ~~`06-crate-deps.svg` draws a stale `kaijutsu-crdt`~~ **RESOLVED 2026-08-16
+  by deletion** — it and `01-system-topology.svg` (which drew the demolished
+  `Kv` store) were removed rather than corrected: both errors are structural,
+  and `scry` is not on zorak. Regenerate when the generator is available.
+  Superseded note: `06-crate-deps.svg` drew a `kaijutsu-crdt`
   box (labeled "BlockStore (DTE)"), arrows into it from kernel/server/client/
   app, and a caption naming `diamond-types-extended`. Regenerating it needs a
   real diagram edit (box removal, layout reflow), not a text sweep — left

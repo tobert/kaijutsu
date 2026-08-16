@@ -51,7 +51,8 @@ another kernel through the VFS.
 
 ## Process & transport model
 
-![System topology](diagrams/01-system-topology.svg)
+> The system-topology diagram was deleted on 2026-08-16: it drew a `Kv` store
+> demolished on 2026-07-04. See `diagrams/README.md`.
 
 There is exactly **one `Kernel` per server process**, shared across every
 connection (`create_shared_kernel`, `kaijutsu-server/src/rpc.rs:974`). Clients do
@@ -277,7 +278,11 @@ format version then ciborium CBOR, fail-loud, additive-evolution-safe.
 
 ## Crate dependency map
 
-![Crate dependencies](diagrams/06-crate-deps.svg)
+> The crate-dependency diagram was deleted on 2026-08-16: it drew a
+> `kaijutsu-crdt` crate that no longer exists. The current layering is
+> `kaijutsu-types` at the leaf, `kaijutsu-kernel` above it (blocks now live
+> there as `kernel::blocks`), then `kaijutsu-server`/`kaijutsu-client`, then
+> `kaijutsu-app`/`kaijutsu-mcp`. See `diagrams/README.md`.
 
 The workspace layers cleanly from leaves up:
 
