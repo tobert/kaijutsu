@@ -53,7 +53,11 @@ impl Default for ScrollConfig {
         // rather than carried over: the old form at 60Hz (the tuning
         // reference) gave t = 0.75, and `1 - exp(-speed/60) = 0.75` solves to
         // `speed = -60 * ln(0.25) ~= 83.18`.
-        Self { line_gain: 40.0, pixel_gain: 3.0, smooth_speed: 83.18 }
+        // line_gain 60: three text lines per wheel detent, the convention
+        // browsers and terminals share (Amy's wezterm feels right at it,
+        // 2026-08-16). The previous 40 (~2 lines) read as "slow clicks do
+        // nothing", especially eased.
+        Self { line_gain: 60.0, pixel_gain: 3.0, smooth_speed: 83.18 }
     }
 }
 
@@ -100,7 +104,7 @@ mod tests {
     #[test]
     fn line_events_ignore_scale_factor() {
         let cfg = ScrollConfig::default();
-        assert_eq!(wheel_delta_px(MouseScrollUnit::Line, 1.0, 2.0, &cfg), 40.0);
+        assert_eq!(wheel_delta_px(MouseScrollUnit::Line, 1.0, 2.0, &cfg), 60.0);
     }
 
     #[test]

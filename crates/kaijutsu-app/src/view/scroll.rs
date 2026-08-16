@@ -175,14 +175,33 @@ pub fn scroll_render_mode(
     let streaming_while_following =
         scroll_state.following && *time_since_content_change < STREAMING_WINDOW_SECS;
 
-    let desired = if easing || streaming_while_following {
+    let active = easing || streaming_while_following;
+    let desired = if active {
         UpdateMode::Continuous
     } else {
         UpdateMode::reactive(std::time::Duration::from_millis(100))
     };
+    // The UNFOCUSED mode matters just as much: Amy's normal setup scrolls
+    // and reads kaijutsu on one screen while another app (a game, a
+    // terminal) holds keyboard focus on the other. Wayland delivers wheel
+    // events to the hovered window regardless of focus, but with
+    // `unfocused_mode` left at its 2Hz `reactive_low_power(500ms)` idle
+    // (main.rs), an unfocused scroll only repainted when an event happened
+    // to arrive — scrolling felt dead exactly when she used it most
+    // (found live 2026-08-16, FFXIV on the focused screen). While scroll
+    // or streaming is active, force full rate on BOTH modes; when idle,
+    // restore each mode's own baseline.
+    let desired_unfocused = if active {
+        UpdateMode::Continuous
+    } else {
+        UpdateMode::reactive_low_power(std::time::Duration::from_millis(500))
+    };
     // Only write when it actually changes, to avoid needless change-detection.
     if winit.focused_mode != desired {
         winit.focused_mode = desired;
+    }
+    if winit.unfocused_mode != desired_unfocused {
+        winit.unfocused_mode = desired_unfocused;
     }
 }
 

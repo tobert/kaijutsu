@@ -95,11 +95,13 @@ pub fn dispatch_input(
         // quantum was bigger than a lot of trackpad wheel travel, so it read
         // as a dead zone (nothing happens, then a 20px jump).
         let delta = wheel_delta_px(event.unit, event.y, scale, &scroll.config);
-        // Diagnosed 2026-08-16 (docs/issues.md "Hi-res wheel"): on Wayland,
-        // sub-detent hi-res wheel motion never reaches us — sctk 0.19 has no
-        // AxisValue120 support, so KWin quantizes to whole detents before
-        // delivery. Whole-integer Line events here are the compositor's
-        // fallback, not a bug in this path. Kept at debug! for feel-tuning.
+        // Wheel-event trace for feel-tuning. Whole-integer Line values are
+        // expected: sub-detent hi-res wheel motion never reaches this app —
+        // the full chain (device driver → libinput → KWin → winit/sctk) was
+        // diagnosed 2026-08-16 and the tap is closed at the kernel driver,
+        // which doesn't manage the MX Master 4's Bolt receiver. See
+        // docs/issues.md "Hi-res wheel" for the evidence and the parked
+        // carried-fork experiment that proved every layer above it ready.
         debug!(
             "wheel: unit={:?} y={} scale={} -> delta={:.2}px",
             event.unit, event.y, scale, delta

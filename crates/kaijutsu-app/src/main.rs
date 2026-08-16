@@ -155,7 +155,11 @@ fn main() {
     // a real ICU data failure still surfaces.
     let registry = tracing_subscriber::registry()
         .with(EnvFilter::new(
-            "warn,kaijutsu_app=debug,kaijutsu_client=debug,icu_provider=error",
+            // sctk=info: inert with stock smithay-client-toolkit, but when
+            // the parked hi-res-wheel fork is wired in (docs/issues.md
+            // "Hi-res wheel") it logs the wl_seat bind version — the receipt
+            // that says whether axis_value120 (v8+) can flow this session.
+            "warn,kaijutsu_app=debug,kaijutsu_client=debug,sctk=info,icu_provider=error",
         ))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .with(fmt::layer().with_writer(std::io::stderr));

@@ -6,7 +6,10 @@
 # its own first, then falls back here, then to this compiled-in default.
 
 # Multiplier for winit Line-unit events (notched wheels / X11): px per notch.
-line_gain = 40.0
+# 60 = three text lines per detent — the convention browsers and terminals
+# share (retuned with Amy's MX Master 4, 2026-08-16; 40 read as "slow clicks
+# do nothing").
+line_gain = 60.0
 
 # Multiplier for winit Pixel-unit events (Wayland high-res wheels /
 # touchpads), applied AFTER converting the physical-px delta to logical px.
