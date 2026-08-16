@@ -137,7 +137,7 @@ pub struct BlockHeader {
     pub role: Role,
     pub kind: BlockKind,
     pub status: Status,
-    /// Whether this block is collapsed (mutable, LWW via `updated_at`).
+    /// Whether this block is collapsed (mutable).
     pub collapsed: bool,
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
     ///
@@ -155,9 +155,9 @@ pub struct BlockHeader {
     /// during staging to shape the conversation before LLM invocation.
     pub excluded: bool,
     pub created_at: u64,
-    /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
-    /// Used for clock advancement in `merge_ops()`.
-    /// NOT wall-clock time — use `created_at` for human-visible timestamps.
+    /// When this block was last changed (Unix millis, wall-clock). Real
+    /// domain data — distinct from `created_at` only once a mutation has
+    /// happened.
     pub updated_at: u64,
     /// Which execution engine (Shell, Mcp, Builtin). Copy-safe subset of tool metadata.
     pub tool_kind: Option<ToolKind>,
@@ -165,13 +165,12 @@ pub struct BlockHeader {
     pub exit_code: Option<i32>,
     /// Whether this is an error result.
     pub is_error: bool,
-    /// Content type for rendering (LWW via `content_type_at`).
+    /// Content type for rendering.
     pub content_type: ContentType,
-    /// Lifecycle status for `BlockKind::Task` blocks (LWW via
-    /// `task_status_at`). Meaningful only when `kind == BlockKind::Task`;
-    /// defaults to `TaskStatus::Open` on every other kind (unused, never
-    /// read). See [`TaskStatus`] for why this is a dedicated field rather
-    /// than a reuse of `status`.
+    /// Lifecycle status for `BlockKind::Task` blocks. Meaningful only when
+    /// `kind == BlockKind::Task`; defaults to `TaskStatus::Open` on every
+    /// other kind (unused, never read). See [`TaskStatus`] for why this is
+    /// a dedicated field rather than a reuse of `status`.
     ///
     /// `#[serde(default)]` is LOAD-BEARING, not style: `BlockHeader` rides
     /// the at-rest oplog CBOR (inside `BlockContent`), so a new field
@@ -181,25 +180,6 @@ pub struct BlockHeader {
     /// Any field added to this struct must carry it.
     #[serde(default)]
     pub task_status: TaskStatus,
-
-    // ── Per-field LWW timestamps ────────────────────────────────────────
-    // Each mutable field group has its own Lamport timestamp for independent
-    // conflict resolution. On tie, value-based tiebreak (greater value wins).
-    /// Lamport timestamp for `status` field.
-    pub status_at: u64,
-    /// Lamport timestamp for `collapsed` field.
-    pub collapsed_at: u64,
-    /// Lamport timestamp for `ephemeral` field.
-    pub ephemeral_at: u64,
-    /// Lamport timestamp for `excluded` field.
-    pub excluded_at: u64,
-    /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
-    pub tool_meta_at: u64,
-    /// Lamport timestamp for `content_type` field.
-    pub content_type_at: u64,
-    /// Lamport timestamp for `task_status` field.
-    #[serde(default)]
-    pub task_status_at: u64,
 }
 
 impl BlockHeader {
@@ -221,25 +201,7 @@ impl BlockHeader {
             is_error: snap.is_error,
             content_type: snap.content_type,
             task_status: snap.task_status,
-            status_at: snap.status_at,
-            collapsed_at: snap.collapsed_at,
-            ephemeral_at: snap.ephemeral_at,
-            excluded_at: snap.excluded_at,
-            tool_meta_at: snap.tool_meta_at,
-            content_type_at: snap.content_type_at,
-            task_status_at: snap.task_status_at,
         }
-    }
-
-    /// Maximum of all per-field timestamps.
-    pub fn max_field_ts(&self) -> u64 {
-        self.status_at
-            .max(self.collapsed_at)
-            .max(self.ephemeral_at)
-            .max(self.excluded_at)
-            .max(self.tool_meta_at)
-            .max(self.content_type_at)
-            .max(self.task_status_at)
     }
 
     /// Check if this is a root block (no parent).
@@ -347,19 +309,23 @@ pub enum ContentType {
 }
 
 impl ContentType {
-    /// LWW merge tiebreak authority for `ContentType`.
+    /// Rank authority for `ContentType`.
     ///
-    /// `BlockHeader::merge_header` (`kaijutsu_kernel::blocks::content`) resolves a
-    /// concurrent `content_type` write at equal Lamport timestamps by keeping
-    /// whichever value is greater under `Ord` — and `Ord` for `ContentType` is
-    /// defined entirely in terms of this rank (see the manual `impl Ord`
-    /// below), never the enum's declaration order. This is the *same pattern*
-    /// `Status` uses (`Error > Done > Running > Pending`), but pulled into an
-    /// explicit method: adding a new variant to the enum can't silently
-    /// reorder existing ranks the way inserting a line into a derived-`Ord`
-    /// enum could.
+    /// `Ord` for `ContentType` is defined entirely in terms of this rank (see
+    /// the manual `impl Ord` below), never the enum's declaration order. This
+    /// is the *same pattern* `Status` uses (`Error > Done > Running >
+    /// Pending`), but pulled into an explicit method: adding a new variant to
+    /// the enum can't silently reorder existing ranks the way inserting a
+    /// line into a derived-`Ord` enum could. Not consumed by conflict
+    /// resolution today — concurrent merge into kernel documents is
+    /// structurally impossible (CLAUDE.md "Durable state and the wire"),
+    /// which retired the LWW tiebreak this rank used to serve — but the rank
+    /// table itself is still a meaningful, pinned ordering (see
+    /// `content_type_richness_order_is_pinned` below) and stays available
+    /// for any future consumer that wants a "how structured is this content"
+    /// comparison.
     ///
-    /// Higher rank = "richer" = wins ties. Current order:
+    /// Higher rank = "richer". Current order:
     /// `Plain < Markdown < Svg < Abc < Diff < Image`. `Diff`'s placement is
     /// `docs/diff.md` Decision 7 (Amy, 2026-08-01): a deliberate diff typing
     /// is highly structured and beats almost any competing claim in a tie;
@@ -999,11 +965,14 @@ pub fn format_task_for_llm(block: &BlockSnapshot) -> String {
     )
 }
 
-/// Execution status for blocks (CRDT-synced).
+/// Execution status for blocks.
 ///
-/// Discriminant order matters for LWW tiebreaking: when two peers write at the
-/// same Lamport timestamp, the greater value wins. `Error > Done > Running > Pending`
-/// ensures errors are never masked by a concurrent completion.
+/// Discriminant order (`Error > Done > Running > Pending`) is a deliberate
+/// rank, not declaration convenience — the same convention `ContentType`
+/// documents on `richness()`. Not consumed by conflict resolution today:
+/// concurrent merge into kernel documents is structurally impossible
+/// (CLAUDE.md "Durable state and the wire"), so nothing races two writes to
+/// the same status.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString,
 )]
@@ -1323,25 +1292,17 @@ impl std::fmt::Display for DriftKind {
 /// Lifecycle status for `BlockKind::Task` blocks.
 ///
 /// A dedicated enum, not a reuse of [`Status`]. `Status` (Pending/Running/
-/// Done/Error) is tool-execution shaped: `Error` means "the tool crashed,"
-/// and its LWW tie-break order (`Error > Done > Running > Pending`) exists
-/// so a concurrent completion report can never mask a real failure. Neither
-/// half of that fits a task: a task doesn't "error," and there's no honest
-/// way to fold `Cancelled` — an intentional groom decision, not a failure —
-/// into `Status` without mislabeling it. `TaskStatus` says what actually
-/// happened; see `BlockHeader::task_status`/`task_status_at` for the CRDT
-/// plumbing (mirrors `content_type`/`content_type_at` exactly, giving task
-/// status the same multi-frontend LWW sync for free).
+/// Done/Error) is tool-execution shaped: `Error` means "the tool crashed."
+/// Neither that nor its rank order fits a task: a task doesn't "error," and
+/// there's no honest way to fold `Cancelled` — an intentional groom
+/// decision, not a failure — into `Status` without mislabeling it.
+/// `TaskStatus` says what actually happened; see `BlockHeader::task_status`.
 ///
-/// LWW tie-break order is the derived (declaration-order) `Ord`:
-/// `Open < InProgress < Done < Cancelled`. Both terminal states dominate
-/// `Open`/`InProgress` (a concurrent groom action should never be masked by
-/// a stale in-progress write), and between the two terminals `Cancelled`
-/// wins a same-timestamp race — treated as the more deliberate of two
-/// concurrent terminal writes on one task. True concurrent done/cancel
-/// races on a single task are rare; this only needs to be *a* deterministic
-/// answer both peers compute independently (same precedent as `Status` and
-/// `ContentType::richness`).
+/// The derived (declaration-order) `Ord`, `Open < InProgress < Done <
+/// Cancelled`, is a deliberate rank rather than incidental — same convention
+/// as `Status` and `ContentType::richness` — not consumed by conflict
+/// resolution today (concurrent merge into kernel documents is structurally
+/// impossible, CLAUDE.md "Durable state and the wire").
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString,
 )]
@@ -1476,8 +1437,8 @@ pub struct BlockSnapshot {
     /// Standard error stream from tool execution (for ToolResult blocks).
     /// Persisted separately from `content` (stdout) so callers can
     /// distinguish the two — a successful-with-warnings command carries
-    /// stderr text with `exit_code == Some(0)`. Set once at completion (LWW
-    /// on the shared `tool_meta_at` clock); `None` until the tool finishes.
+    /// stderr text with `exit_code == Some(0)`. Set once at completion;
+    /// `None` until the tool finishes.
     #[serde(default)]
     pub stderr: Option<String>,
     /// Provider reasoning-continuity token for `Thinking` blocks — an opaque,
@@ -1537,8 +1498,8 @@ pub struct BlockSnapshot {
     // Task-specific fields (Task)
     /// Lifecycle status. Meaningful only when `kind == BlockKind::Task`
     /// (defaults to `TaskStatus::Open` and is unused on every other kind —
-    /// same convention as `content_type`/`ContentType::Plain`). CRDT-synced
-    /// via `task_status_at` (LWW), independent of `status`/`status_at`.
+    /// same convention as `content_type`/`ContentType::Plain`). Independent
+    /// of `status` — a separate register, not a repaint of it.
     #[serde(default)]
     pub task_status: TaskStatus,
 
@@ -1581,35 +1542,10 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub track: Option<TrackId>,
 
-    // CRDT metadata
-    /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
-    /// Propagated during sync so receivers can advance their clocks.
+    /// When this block was last changed (Unix millis, wall-clock).
     /// Defaults to 0 for snapshots from persistence or older wire formats.
     #[serde(default)]
     pub updated_at: u64,
-
-    // Per-field LWW timestamps (CRDT-internal, not on Cap'n Proto wire).
-    /// Lamport timestamp for `status` field.
-    #[serde(default)]
-    pub status_at: u64,
-    /// Lamport timestamp for `collapsed` field.
-    #[serde(default)]
-    pub collapsed_at: u64,
-    /// Lamport timestamp for `ephemeral` field.
-    #[serde(default)]
-    pub ephemeral_at: u64,
-    /// Lamport timestamp for `excluded` field.
-    #[serde(default)]
-    pub excluded_at: u64,
-    /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
-    #[serde(default)]
-    pub tool_meta_at: u64,
-    /// Lamport timestamp for `content_type` field.
-    #[serde(default)]
-    pub content_type_at: u64,
-    /// Lamport timestamp for `task_status` field.
-    #[serde(default)]
-    pub task_status_at: u64,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1717,13 +1653,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -1767,13 +1696,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -1829,13 +1751,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -1891,13 +1806,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -1960,13 +1868,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2017,13 +1918,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2072,13 +1966,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2127,13 +2014,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2178,13 +2058,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2240,13 +2113,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2301,13 +2167,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2361,13 +2220,6 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
-            task_status_at: 0,
         }
     }
 
@@ -2489,13 +2341,6 @@ impl BlockSnapshotBuilder {
                 tick: None,
                 track: None,
                 updated_at: 0,
-                status_at: 0,
-                collapsed_at: 0,
-                ephemeral_at: 0,
-                excluded_at: 0,
-                tool_meta_at: 0,
-                content_type_at: 0,
-                task_status_at: 0,
             },
         }
     }
@@ -2877,13 +2722,13 @@ mod tests {
         stripped
     }
 
-    /// THE 2026-08-05 boot-flood regression: `task_status`/`task_status_at`
-    /// were added to `BlockHeader` — which rides the at-rest oplog CBOR —
-    /// without `#[serde(default)]`. Every document persisted before the
-    /// fields existed failed decode ("missing field `task_status`") and was
+    /// THE 2026-08-05 boot-flood regression: `task_status` was added to
+    /// `BlockHeader` — which rides the at-rest oplog CBOR — without
+    /// `#[serde(default)]`. Every document persisted before the field
+    /// existed failed decode ("missing field `task_status`") and was
     /// skipped at kernel boot: rc scripts unreadable, capability bindings
     /// never granted, every facade denied. New at-rest fields MUST decode
-    /// from old bytes; this pins that for the exact fields that broke.
+    /// from old bytes; this pins that for the exact field that broke.
     #[test]
     fn block_header_decodes_pre_task_status_cbor() {
         let snap = BlockSnapshotBuilder::new(
@@ -2895,11 +2740,10 @@ mod tests {
         .build();
         let header = BlockHeader::from_snapshot(&snap);
 
-        let old_bytes = cbor_without_fields(&header, &["task_status", "task_status_at"]);
+        let old_bytes = cbor_without_fields(&header, &["task_status"]);
         let back: BlockHeader = ciborium::from_reader(old_bytes.as_slice())
             .expect("pre-task-era CBOR must decode with defaults, not fail the whole document");
         assert_eq!(back.task_status, TaskStatus::default());
-        assert_eq!(back.task_status_at, 0);
         assert_eq!(back.id, header.id);
         assert_eq!(back.kind, header.kind);
     }
@@ -3106,8 +2950,7 @@ mod tests {
     }
 
     /// `Ord` must agree with `richness()` in both directions, not just the
-    /// ascending-list spot check above — this is what `field_wins` in
-    /// `kaijutsu_kernel::blocks::content` actually calls on a merge tie.
+    /// ascending-list spot check above.
     #[test]
     fn content_type_ord_matches_richness_both_directions() {
         let all = [
@@ -3661,7 +3504,7 @@ mod tests {
         assert_eq!(header.kind, snap.kind);
         assert_eq!(header.status, snap.status);
         assert_eq!(header.created_at, snap.created_at);
-        assert_eq!(header.updated_at, 0); // Lamport default: no local mutations
+        assert_eq!(header.updated_at, 0); // default: no local mutations
         assert_eq!(header.tool_kind, None);
         assert_eq!(header.exit_code, None);
         assert!(!header.is_error);

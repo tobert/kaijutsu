@@ -4647,17 +4647,14 @@ mod tests {
     }
 
     /// Pins the wire-carried / CRDT-internal split documented at
-    /// `kaijutsu-types/src/block.rs:1578`: `order_key`, `updated_at`, and the
-    /// six per-field LWW Lamport timestamps (`status_at`, `collapsed_at`,
-    /// `ephemeral_at`, `excluded_at`, `tool_meta_at`, `content_type_at`,
-    /// `task_status_at`) are deliberately absent from `kaijutsu.capnp` — they
-    /// are CRDT-internal bookkeeping, not conversation-visible state, and
-    /// `parse_block_snapshot` has no wire field to read them from. That is
-    /// by design, not a gap to "fix" the way `excluded` above was. Wire-carried
-    /// flags (`excluded`, `ephemeral`, `tick`) must still survive the same
-    /// round trip that drops the CRDT-internal ones.
+    /// `kaijutsu-types/src/block.rs:1578`: `order_key` is deliberately absent
+    /// from `kaijutsu.capnp` — internal bookkeeping, not conversation-visible
+    /// state, and `parse_block_snapshot` has no wire field to read it from.
+    /// That is by design, not a gap to "fix" the way `excluded` above was.
+    /// Wire-carried flags (`excluded`, `ephemeral`, `tick`) must still
+    /// survive the same round trip that drops the internal one.
     #[test]
-    fn test_parse_block_snapshot_drops_crdt_internal_fields_by_design() {
+    fn test_parse_block_snapshot_drops_internal_fields_by_design() {
         let id = BlockId {
             context_id: ContextId::new(),
             principal_id: PrincipalId::new(),
@@ -4668,16 +4665,8 @@ mod tests {
             .ephemeral(true)
             .tick(Tick::new(7))
             .build();
-        // CRDT-internal bookkeeping — never on the wire.
+        // Internal bookkeeping — never on the wire.
         snap.order_key = Some("a0".to_string());
-        snap.updated_at = 999;
-        snap.status_at = 999;
-        snap.collapsed_at = 999;
-        snap.ephemeral_at = 999;
-        snap.excluded_at = 999;
-        snap.tool_meta_at = 999;
-        snap.content_type_at = 999;
-        snap.task_status_at = 999;
 
         let round_tripped = roundtrip_snapshot(&snap);
 
@@ -4686,18 +4675,10 @@ mod tests {
         assert!(round_tripped.ephemeral, "ephemeral is on the wire");
         assert_eq!(round_tripped.tick, Some(Tick::new(7)), "tick is on the wire");
 
-        // CRDT-internal fields are intentionally absent from the wire and
-        // must decode to their defaults, not silently carry the sender's
-        // in-memory values.
+        // The internal field is intentionally absent from the wire and must
+        // decode to its default, not silently carry the sender's in-memory
+        // value.
         assert_eq!(round_tripped.order_key, None, "order_key is not on the wire");
-        assert_eq!(round_tripped.updated_at, 0, "updated_at is not on the wire");
-        assert_eq!(round_tripped.status_at, 0, "status_at is not on the wire");
-        assert_eq!(round_tripped.collapsed_at, 0, "collapsed_at is not on the wire");
-        assert_eq!(round_tripped.ephemeral_at, 0, "ephemeral_at is not on the wire");
-        assert_eq!(round_tripped.excluded_at, 0, "excluded_at is not on the wire");
-        assert_eq!(round_tripped.tool_meta_at, 0, "tool_meta_at is not on the wire");
-        assert_eq!(round_tripped.content_type_at, 0, "content_type_at is not on the wire");
-        assert_eq!(round_tripped.task_status_at, 0, "task_status_at is not on the wire");
     }
 
     /// `created_at` (kaijutsu.capnp:207) is written unconditionally by the

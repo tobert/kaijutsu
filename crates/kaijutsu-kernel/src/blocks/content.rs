@@ -10,6 +10,7 @@
 
 use kaijutsu_types::{
     BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus, Tick,
+    now_millis,
 };
 
 // Test-only instrumentation for `BlockContent::text()` — see
@@ -32,14 +33,6 @@ pub(crate) fn reset_text_call_count() {
 #[cfg(test)]
 pub(crate) fn text_call_count() -> usize {
     TEXT_CALL_COUNT.with(|c| c.get())
-}
-
-/// Value-based tiebreaker for per-field LWW merge.
-///
-/// Remote wins if its timestamp is higher, or if timestamps are equal and
-/// the remote value is greater. Both peers compute the same result independently.
-fn field_wins<T: Ord>(remote_ts: u64, local_ts: u64, remote_val: &T, local_val: &T) -> bool {
-    remote_ts > local_ts || (remote_ts == local_ts && remote_val > local_val)
 }
 
 /// Base-62 charset for fractional indexing (0-9, A-Z, a-z).
@@ -254,15 +247,6 @@ pub struct BlockContent {
     drift_kind: Option<kaijutsu_types::DriftKind>,
     file_path: Option<String>,
 
-    /// Whether this block is collapsed (only meaningful for Thinking blocks).
-    collapsed: bool,
-
-    /// Ephemeral blocks are displayed but excluded from LLM hydration.
-    ephemeral: bool,
-
-    /// User-curated exclusion — toggled during staging.
-    excluded: bool,
-
     /// Structured error payload (for error blocks).
     error: Option<kaijutsu_types::ErrorPayload>,
 
@@ -304,9 +288,6 @@ impl BlockContent {
             error: None,
             notification: None,
             resource: None,
-            collapsed: false,
-            ephemeral: false,
-            excluded: false,
             deleted: false,
         }
     }
@@ -356,9 +337,6 @@ impl BlockContent {
         block.error = snap.error.clone();
         block.notification = snap.notification.clone();
         block.resource = snap.resource.clone();
-        block.collapsed = snap.collapsed;
-        block.ephemeral = snap.ephemeral;
-        block.excluded = snap.excluded;
         block
     }
 
@@ -443,19 +421,16 @@ impl BlockContent {
         self.tick = Some(tick);
     }
 
-    /// Set the status, bumping per-field and aggregate timestamps.
-    pub fn set_status(&mut self, status: Status, lamport_ts: u64) {
+    /// Set the status.
+    pub fn set_status(&mut self, status: Status) {
         self.header.status = status;
-        self.header.status_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
-    /// Set collapsed state, bumping per-field and aggregate timestamps.
-    pub fn set_collapsed(&mut self, collapsed: bool, lamport_ts: u64) {
-        self.collapsed = collapsed;
+    /// Set collapsed state.
+    pub fn set_collapsed(&mut self, collapsed: bool) {
         self.header.collapsed = collapsed;
-        self.header.collapsed_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
     /// Whether this block is deleted (tombstone).
@@ -464,9 +439,9 @@ impl BlockContent {
     }
 
     /// Mark as deleted (tombstone).
-    pub fn mark_deleted(&mut self, lamport_ts: u64) {
+    pub fn mark_deleted(&mut self) {
         self.deleted = true;
-        self.header.updated_at = lamport_ts;
+        self.header.updated_at = now_millis();
     }
 
     // ── Snapshot fields ─────────────────────────────────────────────────
@@ -553,10 +528,9 @@ impl BlockContent {
         self.header.content_type
     }
 
-    pub fn set_content_type(&mut self, ct: ContentType, lamport_ts: u64) {
+    pub fn set_content_type(&mut self, ct: ContentType) {
         self.header.content_type = ct;
-        self.header.content_type_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
     /// Get the task lifecycle status (`BlockKind::Task` only — meaningless
@@ -565,44 +539,35 @@ impl BlockContent {
         self.header.task_status
     }
 
-    /// Set the task lifecycle status, bumping per-field and aggregate
-    /// timestamps. Mirrors `set_content_type` exactly — same "Copy field on
-    /// `BlockHeader` with its own LWW clock" mechanism, giving task status
-    /// the same multi-frontend CRDT sync for free.
-    pub fn set_task_status(&mut self, status: TaskStatus, lamport_ts: u64) {
+    /// Set the task lifecycle status. Independent of `status` — a separate
+    /// register, not a repaint of it.
+    pub fn set_task_status(&mut self, status: TaskStatus) {
         self.header.task_status = status;
-        self.header.task_status_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
     pub fn ephemeral(&self) -> bool {
-        self.ephemeral
+        self.header.ephemeral
     }
 
-    pub fn set_ephemeral(&mut self, val: bool, lamport_ts: u64) {
-        self.ephemeral = val;
+    pub fn set_ephemeral(&mut self, val: bool) {
         self.header.ephemeral = val;
-        self.header.ephemeral_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
     pub fn excluded(&self) -> bool {
-        self.excluded
+        self.header.excluded
     }
 
-    pub fn set_excluded(&mut self, val: bool, lamport_ts: u64) {
-        self.excluded = val;
+    pub fn set_excluded(&mut self, val: bool) {
         self.header.excluded = val;
-        self.header.excluded_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
-    /// Update `exit_code` and bump `tool_meta_at` (the tool_meta cluster's
-    /// LWW timestamp covering `tool_kind`, `exit_code`, `is_error`).
-    pub fn set_exit_code(&mut self, val: Option<i32>, lamport_ts: u64) {
+    /// Update `exit_code`.
+    pub fn set_exit_code(&mut self, val: Option<i32>) {
         self.header.exit_code = val;
-        self.header.tool_meta_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
+        self.header.updated_at = now_millis();
     }
 
     // ── Snapshot ─────────────────────────────────────────────────────────
@@ -616,9 +581,9 @@ impl BlockContent {
             status: self.header.status,
             kind: self.header.kind,
             content: self.text(),
-            collapsed: self.collapsed,
-            ephemeral: self.ephemeral,
-            excluded: self.excluded,
+            collapsed: self.header.collapsed,
+            ephemeral: self.header.ephemeral,
+            excluded: self.header.excluded,
             created_at: self.header.created_at,
             tool_kind: self.header.tool_kind,
             tool_name: self.tool_name.clone(),
@@ -643,106 +608,19 @@ impl BlockContent {
             tick: self.tick,
             track: self.track.clone(),
             updated_at: self.header.updated_at,
-            status_at: self.header.status_at,
-            collapsed_at: self.header.collapsed_at,
-            ephemeral_at: self.header.ephemeral_at,
-            excluded_at: self.header.excluded_at,
-            tool_meta_at: self.header.tool_meta_at,
-            content_type_at: self.header.content_type_at,
-            task_status_at: self.header.task_status_at,
         }
     }
 
-    /// Merge a remote header using per-field LWW.
+    /// Apply a header journaled by this same document's own prior mutation.
     ///
-    /// Each mutable field group has its own Lamport timestamp. When timestamps
-    /// tie, the greater value wins (value-based tiebreaker). Both peers
-    /// independently compute the same result, guaranteeing convergence.
-    pub fn merge_header(&mut self, remote: &BlockHeader) {
-        // status
-        if field_wins(
-            remote.status_at,
-            self.header.status_at,
-            &remote.status,
-            &self.header.status,
-        ) {
-            self.header.status = remote.status;
-            self.header.status_at = remote.status_at;
-        }
-
-        // collapsed
-        if field_wins(
-            remote.collapsed_at,
-            self.header.collapsed_at,
-            &remote.collapsed,
-            &self.header.collapsed,
-        ) {
-            self.header.collapsed = remote.collapsed;
-            self.collapsed = remote.collapsed;
-            self.header.collapsed_at = remote.collapsed_at;
-        }
-
-        // ephemeral
-        if field_wins(
-            remote.ephemeral_at,
-            self.header.ephemeral_at,
-            &remote.ephemeral,
-            &self.header.ephemeral,
-        ) {
-            self.header.ephemeral = remote.ephemeral;
-            self.ephemeral = remote.ephemeral;
-            self.header.ephemeral_at = remote.ephemeral_at;
-        }
-
-        // excluded
-        if field_wins(
-            remote.excluded_at,
-            self.header.excluded_at,
-            &remote.excluded,
-            &self.header.excluded,
-        ) {
-            self.header.excluded = remote.excluded;
-            self.excluded = remote.excluded;
-            self.header.excluded_at = remote.excluded_at;
-        }
-
-        // tool_meta (tool_kind, exit_code, is_error)
-        if field_wins(
-            remote.tool_meta_at,
-            self.header.tool_meta_at,
-            &remote.tool_kind,
-            &self.header.tool_kind,
-        ) {
-            self.header.tool_kind = remote.tool_kind;
-            self.header.exit_code = remote.exit_code;
-            self.header.is_error = remote.is_error;
-            self.header.tool_meta_at = remote.tool_meta_at;
-        }
-
-        // content_type
-        if field_wins(
-            remote.content_type_at,
-            self.header.content_type_at,
-            &remote.content_type,
-            &self.header.content_type,
-        ) {
-            self.header.content_type = remote.content_type;
-            self.header.content_type_at = remote.content_type_at;
-        }
-
-        // task_status
-        if field_wins(
-            remote.task_status_at,
-            self.header.task_status_at,
-            &remote.task_status,
-            &self.header.task_status,
-        ) {
-            self.header.task_status = remote.task_status;
-            self.header.task_status_at = remote.task_status_at;
-        }
-
-        // Recompute aggregate timestamp
-        self.header.updated_at = self.header.max_field_ts().max(remote.max_field_ts());
+    /// The kernel is the sole sequencer (CLAUDE.md "Durable state and the
+    /// wire"), so the only caller is oplog replay: reconstructing this
+    /// document's own history in the order it was journaled. That is
+    /// sequential self-application, never two independently-edited replicas
+    /// reconciling a genuine divergence — so the incoming header simply
+    /// replaces the current one; there is no concurrent write to arbitrate.
+    pub fn replace_header(&mut self, header: BlockHeader) {
+        self.header = header;
     }
 }
 

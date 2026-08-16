@@ -33,6 +33,15 @@ now folded into this entry) surfaced staleness the rename sweep didn't fix:
   crate melt (block/document model paths, dependency layering) but not
   independently re-verified line-by-line against current code the way the
   2026-06-16 sweep did originally — treat them as improved, not re-certified.
+- `docs/architecture/foundation.md` and `README.md` still describe per-field
+  LWW / a Lamport clock on `BlockHeader` as current mechanism (`foundation.md`
+  around "LWW-merged via Lamport timestamp", "per-field LWW is metadata";
+  `README.md` around "per-field Last-Write-Wins Lamport timestamps"). That
+  machinery was deleted 2026-08-16 (concurrent merge into kernel documents is
+  structurally impossible — see this commit and `docs/crdt-position-2026-08.md`);
+  `docs/tasks.md` §Decisions 1 also cites the now-gone `merge_header`/
+  `field_wins`/`task_status_at`. `docs/devlog.md`'s Lamport-clock entries are
+  historical narrative and correctly stay as-is.
 
 ---
 
@@ -91,8 +100,10 @@ app-scoped UI slice — it is a wire-schema change and wants its own review.
 
 `set_stderr`, `set_signature`, `set_tool_use_id`, and `set_output`
 (`crates/kaijutsu-kernel/src/block_store.rs`) mutate `BlockContent` fields
-that live outside `BlockHeader` — `merge_header` never touches them. Their
-journaled `SyncPayload` (built via `SyncPayload::from_updated_header`)
+that live outside `BlockHeader` — the header-apply path in `merge_ops`
+(`BlockDocument::replace_header`, formerly `merge_header`) never touches
+them. Their journaled `SyncPayload` (built via
+`SyncPayload::from_updated_header`)
 therefore carries the block's header, unchanged, and nothing that would let
 `merge_ops` recover the new value. The value survives fine through the next
 `compact_document` (a full `BlockSnapshot` covers every field) — the exposure

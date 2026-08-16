@@ -404,17 +404,10 @@ mod tests {
             resource: None,
             task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
-            content_type_at: 0,
-            task_status_at: 0,
             order_key: None,
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
         };
         let snap_b = BlockSnapshot {
             id: id_b,
@@ -446,17 +439,10 @@ mod tests {
             resource: None,
             task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
-            content_type_at: 0,
-            task_status_at: 0,
             order_key: None,
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
         };
 
         // Build DAG manually (from_snapshots would not create cycles)

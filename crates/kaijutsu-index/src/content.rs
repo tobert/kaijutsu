@@ -97,17 +97,10 @@ mod tests {
             tick: None,
             track: None,
             updated_at: 0,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
-            content_type_at: 0,
             error: None,
             notification: None,
             resource: None,
             task_status: kaijutsu_types::TaskStatus::default(),
-            task_status_at: 0,
         }
     }
 

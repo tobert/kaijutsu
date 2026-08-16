@@ -1791,7 +1791,7 @@ impl BlockStore {
             let version = entry.version();
             // `stderr` is a write-once snapshot field, not part of
             // `BlockHeader` — pre-migration `ops_since` didn't carry it
-            // through the journaled payload either (`merge_header` never
+            // through the journaled payload either (header replay never
             // touched it). Unchanged behavior: the value durably survives
             // the next compaction (a full `BlockSnapshot`), not oplog
             // replay of the window before it. See docs/issues.md.
@@ -4859,6 +4859,36 @@ mod tests {
         );
     }
 
+    /// Header metadata — not just text — survives a kernel restart. A
+    /// `set_status`/`set_collapsed` journal entry replays through
+    /// `merge_ops`'s header-apply path (`BlockDocument::replace_header`) on
+    /// reload; this pins that the replayed header lands, not just that the
+    /// oplog decodes.
+    #[test]
+    fn test_status_and_collapsed_survive_drop_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::Model, BlockKind::Thinking,
+                "reasoning", Status::Running, ContentType::Plain,
+            )
+            .unwrap();
+        store.set_status(ctx, &block_id, Status::Done).unwrap();
+        store.set_collapsed(ctx, &block_id, true).unwrap();
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, ws);
+        let snap = {
+            let entry = store2.get(ctx).unwrap();
+            entry.doc.get_block_snapshot(&block_id).unwrap()
+        };
+        assert_eq!(snap.status, Status::Done, "status must survive drop + reload");
+        assert!(snap.collapsed, "collapsed must survive drop + reload");
+    }
+
     // ====================================================================
     // 2. Per-Mutation Journal Verification
     // ====================================================================
@@ -5228,53 +5258,6 @@ mod tests {
             appended_tick > max_tick_before,
             "post-reload append tick {:?} must exceed pre-reload max tick {:?}",
             appended_tick, max_tick_before,
-        );
-    }
-
-    // ====================================================================
-    // 4. Lamport Clock
-    // ====================================================================
-
-    #[test]
-    fn test_lamport_clock_seeded_after_restore() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, ws) = fresh_db_store(dir.path());
-
-        let block_id = store
-            .insert_block(
-                ctx, None, None, Role::Model, BlockKind::Text,
-                "test", Status::Running, ContentType::Plain,
-            )
-            .unwrap();
-
-        store.set_status(ctx, &block_id, Status::Pending).unwrap();
-
-        let status_at_before = {
-            let entry = store.get(ctx).unwrap();
-            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
-            snap.status_at
-        };
-        assert!(status_at_before > 0, "status_at should be nonzero after set_status");
-
-        drop(store);
-
-        let store2 = drop_and_reload(db, ws);
-
-        // Now set_status again — the Lamport clock should have been seeded
-        // from the restored state, so the new timestamp must be strictly greater.
-        store2.set_status(ctx, &block_id, Status::Done).unwrap();
-
-        let status_at_after = {
-            let entry = store2.get(ctx).unwrap();
-            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
-            snap.status_at
-        };
-
-        assert!(
-            status_at_after > status_at_before,
-            "Lamport clock after reload should advance: before={}, after={}",
-            status_at_before,
-            status_at_after
         );
     }
 

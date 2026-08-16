@@ -103,13 +103,8 @@ pub struct BlockDocument {
     /// Store version (bumped on any mutation).
     version: u64,
 
-    /// Lamport clock for LWW conflict resolution on header fields.
-    /// Monotonically increasing. Advanced on local mutations and on merge.
-    lamport_clock: u64,
-
     /// Next hyoushigi timeline tick — a per-context, per-block monotonic ordinal
-    /// stamped on every inserted block (distinct from the Lamport clock, which
-    /// bumps on many metadata ops). The append `order_key` is derived from it.
+    /// stamped on every inserted block. The append `order_key` is derived from it.
     next_tick: i64,
 }
 
@@ -122,24 +117,8 @@ impl BlockDocument {
             blocks: BTreeMap::new(),
             seq_lanes: HashMap::new(),
             version: 0,
-            lamport_clock: 0,
             next_tick: 0,
         }
-    }
-
-    // =========================================================================
-    // Lamport clock
-    // =========================================================================
-
-    /// Advance the Lamport clock and return the new value.
-    fn tick(&mut self) -> u64 {
-        self.lamport_clock += 1;
-        self.lamport_clock
-    }
-
-    /// Advance the Lamport clock to at least `remote_ts + 1`.
-    fn merge_clock(&mut self, remote_ts: u64) {
-        self.lamport_clock = self.lamport_clock.max(remote_ts) + 1;
     }
 
     // =========================================================================
@@ -610,7 +589,7 @@ impl BlockDocument {
         }
 
         let (block_tick, order_key) = self.next_position(after);
-        let ts = self.tick();
+        let now = now_millis();
         let header = BlockHeader {
             id,
             parent_id: parent_id.copied(),
@@ -620,20 +599,13 @@ impl BlockDocument {
             collapsed: false,
             ephemeral: false,
             excluded: false,
-            created_at: now_millis(),
-            updated_at: ts,
+            created_at: now,
+            updated_at: now,
             tool_kind: None,
             exit_code: None,
             is_error: false,
-            status_at: ts,
-            collapsed_at: ts,
-            ephemeral_at: ts,
-            excluded_at: ts,
-            tool_meta_at: ts,
             content_type,
-            content_type_at: ts,
             task_status: TaskStatus::default(),
-            task_status_at: ts,
         };
 
         let block =
@@ -671,7 +643,6 @@ impl BlockDocument {
 
         let (block_tick, order_key) = self.next_position(after);
         let now = now_millis();
-        let ts = self.tick();
         let header = BlockHeader {
             id,
             parent_id: parent_id.copied(),
@@ -682,19 +653,12 @@ impl BlockDocument {
             ephemeral: false,
             excluded: false,
             created_at: now,
-            updated_at: ts,
+            updated_at: now,
             tool_kind,
             exit_code: None,
             is_error: false,
-            status_at: ts,
-            collapsed_at: ts,
-            ephemeral_at: ts,
-            excluded_at: ts,
-            tool_meta_at: ts,
             content_type: ContentType::Plain,
-            content_type_at: ts,
             task_status: TaskStatus::default(),
-            task_status_at: ts,
         };
 
         let mut block =
@@ -731,7 +695,6 @@ impl BlockDocument {
 
         let (block_tick, order_key) = self.next_position(after);
         let now = now_millis();
-        let ts = self.tick();
         let header = BlockHeader {
             id,
             parent_id: Some(*tool_call_id),
@@ -746,19 +709,12 @@ impl BlockDocument {
             ephemeral: false,
             excluded: false,
             created_at: now,
-            updated_at: ts,
+            updated_at: now,
             tool_kind,
             exit_code,
             is_error,
-            status_at: ts,
-            collapsed_at: ts,
-            ephemeral_at: ts,
-            excluded_at: ts,
-            tool_meta_at: ts,
             content_type: ContentType::Plain,
-            content_type_at: ts,
             task_status: TaskStatus::default(),
-            task_status_at: ts,
         };
 
         let mut block =
@@ -1024,12 +980,11 @@ impl BlockDocument {
 
     /// Delete a block (tombstone — preserves DAG integrity).
     pub fn delete_block(&mut self, id: &BlockId) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.mark_deleted(ts);
+        block.mark_deleted();
         self.version += 1;
         Ok(())
     }
@@ -1082,26 +1037,24 @@ impl BlockDocument {
 
     /// Set the status of a block.
     pub fn set_status(&mut self, id: &BlockId, status: Status) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_status(status, ts);
+        block.set_status(status);
         self.version += 1;
         Ok(())
     }
 
     /// Set collapsed state.
     pub fn set_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_collapsed(collapsed, ts);
+        block.set_collapsed(collapsed);
         self.version += 1;
         Ok(())
     }
@@ -1124,8 +1077,8 @@ impl BlockDocument {
 
     /// Set the standard-error stream on a ToolResult block. The shell
     /// execution path calls this at completion so `BlockSnapshot::stderr`
-    /// carries stderr separately from `content` (stdout). Write-once — no
-    /// LWW clock; the value is replicated via `MetadataChanged` / snapshot.
+    /// carries stderr separately from `content` (stdout). Write-once; the
+    /// value is replicated via `MetadataChanged` / snapshot.
     pub fn set_stderr(&mut self, id: &BlockId, stderr: Option<String>) -> Result<()> {
         let block = self
             .blocks
@@ -1163,68 +1116,61 @@ impl BlockDocument {
         Ok(())
     }
 
-    /// Set the content type on a block using LWW semantics.
+    /// Set the content type on a block.
     pub fn set_content_type(&mut self, id: &BlockId, content_type: ContentType) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_content_type(content_type, ts);
+        block.set_content_type(content_type);
         self.version += 1;
         Ok(())
     }
 
-    /// Set the task lifecycle status on a block using LWW semantics.
-    /// Meaningful only on `BlockKind::Task` blocks — mirrors
-    /// `set_content_type` exactly (same per-field-clock mechanism).
+    /// Set the task lifecycle status on a block. Meaningful only on
+    /// `BlockKind::Task` blocks.
     pub fn set_task_status(&mut self, id: &BlockId, status: TaskStatus) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_task_status(status, ts);
+        block.set_task_status(status);
         self.version += 1;
         Ok(())
     }
 
-    /// Set the exit_code on a ToolResult block using LWW semantics on the
-    /// shared tool_meta clock. The shell execution path calls this after the
-    /// underlying command finishes, capturing the real exit code instead of
-    /// truncating to the binary Done/Error status.
+    /// Set the exit_code on a ToolResult block. The shell execution path
+    /// calls this after the underlying command finishes, capturing the real
+    /// exit code instead of truncating to the binary Done/Error status.
     pub fn set_exit_code(&mut self, id: &BlockId, exit_code: Option<i32>) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_exit_code(exit_code, ts);
+        block.set_exit_code(exit_code);
         self.version += 1;
         Ok(())
     }
 
     /// Set the ephemeral flag on a block.
     pub fn set_ephemeral(&mut self, id: &BlockId, ephemeral: bool) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_ephemeral(ephemeral, ts);
+        block.set_ephemeral(ephemeral);
         self.version += 1;
         Ok(())
     }
 
     /// Set the excluded flag on a block (user-curated exclusion during staging).
     pub fn set_excluded(&mut self, id: &BlockId, excluded: bool) -> Result<()> {
-        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_excluded(excluded, ts);
+        block.set_excluded(excluded);
         self.version += 1;
         Ok(())
     }
@@ -1325,9 +1271,6 @@ impl BlockDocument {
     /// records (`BlockContent::edit_text`), not merged against a
     /// CRDT-tracked causal history.
     pub fn merge_ops(&mut self, payload: SyncPayload) -> Result<()> {
-        // Track max remote Lamport timestamp for clock advancement
-        let mut max_remote_ts: u64 = 0;
-
         // Restore the tick high-water across the merge: a freshly-stamped tick
         // after this merge must exceed every merged tick (design §2.3). Mirrors
         // the seq-lane restore — semantic correctness (tick values), separate
@@ -1361,7 +1304,6 @@ impl BlockDocument {
                 // The snapshot carries its content directly — no separate ops
                 // needed to fill it in.
                 let block = BlockContent::from_snapshot(snap, self.principal_id, fallback_key);
-                max_remote_ts = max_remote_ts.max(snap.updated_at);
                 if let Some(t) = snap.tick {
                     max_tick = Some(max_tick.map_or(t.get(), |m| m.max(t.get())));
                 }
@@ -1377,11 +1319,12 @@ impl BlockDocument {
             self.next_tick = self.next_tick.max(t + 1);
         }
 
-        // Apply header updates (LWW merge)
+        // Apply header updates: replay is sequential self-application (see
+        // this method's doc), so the journaled header is simply adopted —
+        // there is no concurrent write to arbitrate against.
         for header in &payload.updated_headers {
-            max_remote_ts = max_remote_ts.max(header.updated_at);
             if let Some(block) = self.blocks.get_mut(&header.id) {
-                block.merge_header(header);
+                block.replace_header(*header);
             }
         }
 
@@ -1392,7 +1335,6 @@ impl BlockDocument {
         // None` resolves to this block's OWN current length (an append) —
         // never the sender's, which single-writer sequential replay
         // guarantees lines up with what it was when the edit was journaled.
-        let mut had_edits = false;
         for (id, edit) in payload.block_ops {
             let Some(block) = self.blocks.get_mut(&id) else {
                 tracing::warn!("sync payload has a text edit for unknown block {id}, skipping");
@@ -1407,25 +1349,15 @@ impl BlockDocument {
                 });
             }
             block.edit_text(pos, &edit.insert, edit.delete);
-            had_edits = true;
         }
 
         // Apply tombstone deletions
         for id in &payload.deleted_blocks {
-            // Tick once per deletion to get a unique Lamport timestamp
-            let ts = self.tick();
             if let Some(block) = self.blocks.get_mut(id)
                 && !block.is_deleted()
             {
-                block.mark_deleted(ts);
+                block.mark_deleted();
             }
-        }
-
-        // Advance Lamport clock past any remote timestamp, or bump if
-        // any text edits were replayed (even without header/new-block
-        // timestamps).
-        if max_remote_ts > 0 || had_edits {
-            self.merge_clock(max_remote_ts);
         }
 
         self.version += 1;
@@ -1692,19 +1624,10 @@ impl BlockDocument {
                 let snap = BlockSnapshotBuilder::new(*id, BlockKind::Text)
                     .build();
                 let mut block = BlockContent::from_snapshot(&snap, principal_id, "Z".to_string());
-                block.mark_deleted(0);
+                block.mark_deleted();
                 store.blocks.insert(*id, block);
             }
         }
-
-        // Seed lamport clock from the max header timestamp so local
-        // metadata mutations produce monotonically higher timestamps.
-        store.lamport_clock = snapshot
-            .blocks
-            .iter()
-            .map(|b| b.updated_at)
-            .max()
-            .unwrap_or(0);
 
         // Seed `next_tick` past the max existing tick, and re-key any pre-tick
         // (legacy) blocks into the tick scheme so the old order_keys don't linger.
@@ -1769,8 +1692,9 @@ pub struct SyncPayload {
     /// Full snapshots of blocks the receiver doesn't know about. Each
     /// snapshot carries its content directly — nothing further to merge.
     pub new_blocks: Vec<BlockSnapshot>,
-    /// Updated headers for known blocks (LWW merge via `merge_header()`).
-    /// Propagates metadata changes like status, collapsed, excluded.
+    /// Updated headers for known blocks (adopted wholesale via
+    /// `replace_header()` — sequential self-replay, not a merge). Propagates
+    /// metadata changes like status, collapsed, excluded.
     pub updated_headers: Vec<BlockHeader>,
     /// Block IDs that have been deleted (tombstoned) on the sender.
     /// Receiver should apply tombstones for these.
@@ -3076,70 +3000,6 @@ mod tests {
         );
     }
 
-    // ── Lamport clock ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_lamport_clock_advances() {
-        let mut store = test_store();
-
-        let id = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Each mutation bumps the Lamport clock
-        // Verify via mutations — each set_status bumps the Lamport clock
-        store.set_status(&id, Status::Running).unwrap();
-        store.set_status(&id, Status::Done).unwrap();
-
-        // The lamport clock should be > 0 now
-        assert!(store.lamport_clock > 0);
-    }
-
-    #[test]
-    fn test_lamport_clock_advances_on_merge() {
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        // Store1 does many operations, advancing its Lamport clock
-        let id = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        for _ in 0..10 {
-            store1.set_status(&id, Status::Running).unwrap();
-            store1.set_status(&id, Status::Done).unwrap();
-        }
-        let store1_clock = store1.lamport_clock;
-
-        // Sync to store2 (which has Lamport = 0)
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-
-        // Store2's clock should have advanced past store1's
-        assert!(
-            store2.lamport_clock > store1_clock,
-            "merge should advance Lamport clock past remote: {} > {}",
-            store2.lamport_clock,
-            store1_clock
-        );
-    }
-
     // ── Order key: agent suffix ───────────────────────────────────────
 
     #[test]
@@ -3328,15 +3188,8 @@ mod tests {
                 tool_kind: None,
                 exit_code: None,
                 is_error: false,
-                status_at: 0,
-                collapsed_at: 0,
-                ephemeral_at: 0,
-                excluded_at: 0,
-                tool_meta_at: 0,
                 content_type: ContentType::Plain,
-                content_type_at: 0,
                 task_status: TaskStatus::default(),
-                task_status_at: 0,
             };
             // tick = None — legacy.
             let block = BlockContent::with_content(header, text, store.principal_id, key.to_string(), None);
@@ -3904,18 +3757,17 @@ mod tests {
     }
 
     // =====================================================================
-    // Lamport clock: text-only merge
+    // Text-only merge
     // =====================================================================
 
-    /// A block already known to a peer, then a text-only edit merged in —
-    /// no header change, no new block — must still advance the receiver's
-    /// Lamport clock. Before this migration this exercised a "DTE-only"
-    /// payload (a header-stripped `ops_since` sync); `ops_since` no longer
-    /// carries incremental text at all (see its doc comment), so this
-    /// builds the direct `TextEdit` payload a real oplog entry actually
-    /// is (see `test_incremental_text_sync_after_merge`).
+    /// A block already known to a peer, then a text-only edit merged in — no
+    /// header change, no new block — must still apply. Before this migration
+    /// this exercised a "DTE-only" payload (a header-stripped `ops_since`
+    /// sync); `ops_since` no longer carries incremental text at all (see its
+    /// doc comment), so this builds the direct `TextEdit` payload a real
+    /// oplog entry actually is (see `test_incremental_text_sync_after_merge`).
     #[test]
-    fn test_lamport_clock_advances_after_text_only_merge() {
+    fn test_text_only_merge_applies() {
         let ctx = ContextId::new();
         let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
         let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
@@ -3926,8 +3778,6 @@ mod tests {
         let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
         assert_eq!(store2.block_count(), 1);
-
-        let clock_after_initial = store2.lamport_clock;
 
         store1.append_text(&id, "Hello world").unwrap();
 
@@ -3943,13 +3793,6 @@ mod tests {
 
         let snap = store2.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.content, "Hello world");
-
-        assert!(
-            store2.lamport_clock > clock_after_initial,
-            "Lamport clock should advance after a text-only merge: got {} (should be > {})",
-            store2.lamport_clock,
-            clock_after_initial
-        );
     }
 
     // =====================================================================
@@ -3985,15 +3828,8 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
             content_type: ContentType::Plain,
-            content_type_at: 0,
             task_status: TaskStatus::default(),
-            task_status_at: 0,
         };
         let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string(), None);
         store.blocks.insert(id1, b1);
@@ -4014,15 +3850,8 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
             content_type: ContentType::Plain,
-            content_type_at: 0,
             task_status: TaskStatus::default(),
-            task_status_at: 0,
         };
         let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string(), None);
         store.blocks.insert(id2, b2);
@@ -4043,15 +3872,8 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
             content_type: ContentType::Plain,
-            content_type_at: 0,
             task_status: TaskStatus::default(),
-            task_status_at: 0,
         };
         let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string(), None);
         store.blocks.insert(id3, b3);
@@ -4110,15 +3932,8 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
             content_type: ContentType::Plain,
-            content_type_at: 0,
             task_status: TaskStatus::default(),
-            task_status_at: 0,
         };
         store.blocks.insert(
             id1,
@@ -4141,15 +3956,8 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
-            status_at: 0,
-            collapsed_at: 0,
-            ephemeral_at: 0,
-            excluded_at: 0,
-            tool_meta_at: 0,
             content_type: ContentType::Plain,
-            content_type_at: 0,
             task_status: TaskStatus::default(),
-            task_status_at: 0,
         };
         store.blocks.insert(
             id2,
@@ -4173,73 +3981,10 @@ mod tests {
         assert_eq!(snaps[0].content, "keep");
     }
 
-    /// Per-field LWW: concurrent mutations to different fields are both preserved.
-    /// (Was: regression baseline showing whole-header LWW dropping one change.)
+    /// A status change on one peer's block reaches the other peer through
+    /// `merge_ops`'s header replay.
     #[test]
-    fn test_lww_race_ephemeral_overwritten_by_status() {
-        let ctx = ContextId::new();
-        let agent_a = PrincipalId::new();
-        let agent_b = PrincipalId::new();
-
-        let mut store_a = BlockDocument::new(ctx, agent_a);
-        let block_id = store_a
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "test",
-                Status::Running,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Sync to store_b so both have the same block
-        let mut store_b = BlockDocument::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashSet::new());
-        store_b.merge_ops(payload).unwrap();
-
-        // Peer A sets ephemeral=true
-        store_a.set_ephemeral(&block_id, true).unwrap();
-        // Peer B sets status=Done (at the same logical time)
-        store_b.set_status(&block_id, Status::Done).unwrap();
-
-        // Merge A→B
-        let payload_a = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload_a).unwrap();
-
-        // Merge B→A
-        let payload_b = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(payload_b).unwrap();
-
-        let header_a = store_a.blocks.get(&block_id).unwrap().header();
-        let header_b = store_b.blocks.get(&block_id).unwrap().header();
-
-        // Both stores converge
-        assert_eq!(
-            header_a.status, header_b.status,
-            "stores must converge on status"
-        );
-        assert_eq!(
-            header_a.ephemeral, header_b.ephemeral,
-            "stores must converge on ephemeral"
-        );
-
-        // Per-field LWW: BOTH concurrent changes are preserved
-        assert!(
-            header_a.ephemeral,
-            "ephemeral=true must survive (independent field)"
-        );
-        assert_eq!(
-            header_a.status,
-            Status::Done,
-            "status=Done must survive (independent field)"
-        );
-    }
-
-    /// Per-field LWW: different fields with different timestamps both preserved.
-    #[test]
-    fn test_per_field_lww_independent_merge() {
+    fn test_status_change_reaches_peer_through_merge_ops() {
         let ctx = ContextId::new();
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
@@ -4261,131 +4006,20 @@ mod tests {
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
-        // A: set collapsed=true (tick 1 after sync)
+        store_a.set_status(&block_id, Status::Done).unwrap();
         store_a.set_collapsed(&block_id, true).unwrap();
-        // A: then set status=Done (tick 2) — higher ts
-        store_a.set_status(&block_id, Status::Done).unwrap();
 
-        // B: just set ephemeral=true (tick 1 after sync)
-        store_b.set_ephemeral(&block_id, true).unwrap();
-
-        // Merge both ways
-        let payload_a = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload_a).unwrap();
-        let payload_b = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(payload_b).unwrap();
-
-        let ha = store_a.blocks.get(&block_id).unwrap().header();
-        let hb = store_b.blocks.get(&block_id).unwrap().header();
-
-        // All three field changes survive
-        assert_eq!(ha.status, Status::Done);
-        assert!(ha.collapsed);
-        assert!(ha.ephemeral);
-
-        // Convergence
-        assert_eq!(ha.status, hb.status);
-        assert_eq!(ha.collapsed, hb.collapsed);
-        assert_eq!(ha.ephemeral, hb.ephemeral);
-    }
-
-    /// Per-field LWW: same field, higher timestamp wins.
-    #[test]
-    fn test_per_field_lww_same_field_higher_ts_wins() {
-        let ctx = ContextId::new();
-        let agent_a = PrincipalId::new();
-        let agent_b = PrincipalId::new();
-
-        let mut store_a = BlockDocument::new(ctx, agent_a);
-        let block_id = store_a
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "test",
-                Status::Running,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        let mut store_b = BlockDocument::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashSet::new());
+        let payload = store_a.ops_since(&store_b.frontier());
         store_b.merge_ops(payload).unwrap();
 
-        // A sets status to Done
-        store_a.set_status(&block_id, Status::Done).unwrap();
-
-        // B does two ticks before setting status to Error → higher Lamport ts
-        store_b.set_collapsed(&block_id, true).unwrap(); // tick to advance clock
-        store_b.set_status(&block_id, Status::Error).unwrap();
-
-        // Merge
-        let payload_a = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload_a).unwrap();
-        let payload_b = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(payload_b).unwrap();
-
-        let ha = store_a.blocks.get(&block_id).unwrap().header();
-        let hb = store_b.blocks.get(&block_id).unwrap().header();
-
-        // B's status wins (higher timestamp)
-        assert_eq!(ha.status, Status::Error, "higher-ts status should win");
-        assert_eq!(ha.status, hb.status, "stores must converge");
+        let header_b = store_b.blocks.get(&block_id).unwrap().header();
+        assert_eq!(header_b.status, Status::Done, "status must reach the peer");
+        assert!(header_b.collapsed, "collapsed must reach the peer");
     }
 
-    /// Per-field LWW tiebreaker: equal timestamps, greater value wins.
-    /// Both peers must converge to the same result.
+    /// `content_type` changes propagate through `merge_ops`'s header replay.
     #[test]
-    fn test_per_field_lww_tiebreaker_convergence() {
-        let ctx = ContextId::new();
-        let agent_a = PrincipalId::new();
-        let agent_b = PrincipalId::new();
-
-        let mut store_a = BlockDocument::new(ctx, agent_a);
-        let block_id = store_a
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "test",
-                Status::Pending,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        let mut store_b = BlockDocument::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashSet::new());
-        store_b.merge_ops(payload).unwrap();
-
-        // Both peers set status at the same Lamport tick.
-        // A sets Done, B sets Error. Error > Done, so Error should win.
-        store_a.set_status(&block_id, Status::Done).unwrap();
-        store_b.set_status(&block_id, Status::Error).unwrap();
-
-        // Merge A→B then B→A
-        let payload_a = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload_a).unwrap();
-        let payload_b = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(payload_b).unwrap();
-
-        let ha = store_a.blocks.get(&block_id).unwrap().header();
-        let hb = store_b.blocks.get(&block_id).unwrap().header();
-
-        // Both converge to Error (greater value wins on tie)
-        assert_eq!(ha.status, Status::Error, "Error > Done on tiebreak");
-        assert_eq!(ha.status, hb.status, "stores must converge");
-    }
-
-    /// Per-field LWW tiebreaker for `content_type`: equal Lamport timestamp,
-    /// the richer type (per `ContentType::richness()`) wins, and both peers
-    /// converge. This is the CRDT-level companion to
-    /// `content_type_richness_order_is_pinned` in kaijutsu-types — that test
-    /// pins the rank table, this one proves the merge path actually consults
-    /// it (via `field_wins`'s `Ord` bound) rather than declaration order.
-    #[test]
-    fn test_per_field_lww_tiebreaker_content_type() {
+    fn test_content_type_reaches_peer_through_merge_ops() {
         let ctx = ContextId::new();
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
@@ -4407,39 +4041,21 @@ mod tests {
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
-        // Both peers set content_type at the same Lamport tick.
-        // A sets Markdown, B sets Svg. Svg is richer, so Svg should win.
         store_a
             .set_content_type(&block_id, ContentType::Markdown)
             .unwrap();
-        store_b
-            .set_content_type(&block_id, ContentType::Svg)
-            .unwrap();
 
-        // Merge A→B then B→A
-        let payload_a = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload_a).unwrap();
-        let payload_b = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(payload_b).unwrap();
+        let payload = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload).unwrap();
 
-        let ha = store_a.blocks.get(&block_id).unwrap().header();
-        let hb = store_b.blocks.get(&block_id).unwrap().header();
-
-        // Both converge to Svg (greater richness wins on tie)
-        assert_eq!(
-            ha.content_type,
-            ContentType::Svg,
-            "Svg.richness() > Markdown.richness() on tiebreak"
-        );
-        assert_eq!(ha.content_type, hb.content_type, "stores must converge");
+        let header_b = store_b.blocks.get(&block_id).unwrap().header();
+        assert_eq!(header_b.content_type, ContentType::Markdown);
     }
 
-    /// `set_task_status` updates the field and bumps its own LWW clock
-    /// (`task_status_at`), independent of `status`/`status_at` — proves the
-    /// two are genuinely separate registers, not the same field under a
-    /// different name.
+    /// `set_task_status` updates the field, independent of `status` — a
+    /// separate register, not a repaint of it.
     #[test]
-    fn test_set_task_status_updates_field_and_clock() {
+    fn test_set_task_status_updates_field_independent_of_status() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
         let mut store = BlockDocument::new(ctx, agent);
@@ -4465,24 +4081,16 @@ mod tests {
 
         let snap_after = store.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snap_after.task_status, TaskStatus::InProgress);
-        assert!(
-            snap_after.task_status_at > snap_before.task_status_at,
-            "task_status_at must advance on update"
-        );
         // status (the tool-execution-shaped field) is untouched by a task
         // status change — confirms task_status is a genuinely separate
         // register, not a repaint of `status`.
         assert_eq!(snap_after.status, Status::Done);
-        assert_eq!(snap_after.status_at, snap_before.status_at);
     }
 
-    /// Per-field LWW tiebreaker for `task_status`: equal Lamport timestamp,
-    /// the declared-order-greater status wins (`Cancelled` beats `Done`),
-    /// and both peers converge. CRDT-level companion to
-    /// `test_task_status_lww_tiebreak_order` in kaijutsu-types (which pins
-    /// the `Ord` — this proves the merge path actually consults it).
+    /// `task_status` changes propagate through `merge_ops`'s header replay,
+    /// same path as `content_type` and `status`.
     #[test]
-    fn test_per_field_lww_tiebreaker_task_status() {
+    fn test_task_status_reaches_peer_through_merge_ops() {
         let ctx = ContextId::new();
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
@@ -4504,53 +4112,15 @@ mod tests {
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
-        // `merge_clock` (block_store.rs) sets the receiver's Lamport clock to
-        // `max(local, remote) + 1` — strictly past whatever it just learned.
-        // After the one-way sync above, store_b's clock (2) is already one
-        // ahead of store_a's (1); a `set_task_status` on each side right now
-        // would NOT tie (B's write would simply have a later timestamp and
-        // win outright, exercising nothing about the value-based tiebreak).
-        // A no-op round trip equalizes them: A learns store_b's
-        // already-known header (unchanged, but still bumps A's clock past
-        // it), landing both stores on the same Lamport value before the
-        // real racing writes below.
-        let equalize = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(equalize).unwrap();
-
-        // Both peers groom the task at the SAME Lamport tick now.
-        // A cancels it, B marks it done. Cancelled > Done, so Cancelled wins.
         store_a
             .set_task_status(&block_id, TaskStatus::Cancelled)
             .unwrap();
-        store_b
-            .set_task_status(&block_id, TaskStatus::Done)
-            .unwrap();
 
-        // Guard the setup itself: if this ever stops being a genuine tie
-        // (e.g. a future change to `merge_clock`), the test must fail LOUD
-        // here rather than silently start passing for the wrong reason
-        // (later timestamp winning outright, not the value-based tiebreak).
-        assert_eq!(
-            store_a.blocks.get(&block_id).unwrap().header().task_status_at,
-            store_b.blocks.get(&block_id).unwrap().header().task_status_at,
-            "test setup must produce a genuine Lamport tie, not a later-write win"
-        );
+        let payload = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload).unwrap();
 
-        // Merge A→B then B→A
-        let payload_a = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload_a).unwrap();
-        let payload_b = store_b.ops_since(&store_a.frontier());
-        store_a.merge_ops(payload_b).unwrap();
-
-        let ha = store_a.blocks.get(&block_id).unwrap().header();
-        let hb = store_b.blocks.get(&block_id).unwrap().header();
-
-        assert_eq!(
-            ha.task_status,
-            TaskStatus::Cancelled,
-            "Cancelled > Done on tiebreak"
-        );
-        assert_eq!(ha.task_status, hb.task_status, "stores must converge");
+        let header_b = store_b.blocks.get(&block_id).unwrap().header();
+        assert_eq!(header_b.task_status, TaskStatus::Cancelled);
     }
 
     // ── Order/tick decoupling + seq lanes (design §2, §3) ─────────────────
