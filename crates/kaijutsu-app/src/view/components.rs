@@ -164,7 +164,7 @@ impl CellEditor {
         self.store.get_block_snapshot(id)
     }
 
-    /// Toggle collapse state of a thinking block.
+    /// Toggle collapse state of a `Thinking` or `Error` block.
     pub fn toggle_block_collapse(&mut self, block_id: &BlockId) {
         if let Some(block) = self.store.get_block_snapshot(block_id) {
             let new_state = !block.collapsed;

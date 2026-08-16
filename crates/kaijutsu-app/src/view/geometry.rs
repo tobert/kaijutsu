@@ -123,14 +123,27 @@ impl Default for EstimateParams {
 /// plausible: they size spacers/scrollbar until the block is first laid out,
 /// and the real measurement replaces them just-in-time as the block enters
 /// the spawn band (before it becomes visible).
+///
+/// Collapsed is a flat `line_height` for every kind except `Error`: a
+/// collapsed `Error` block renders `format::ERROR_STUB_MAX_LINES` lines
+/// (provenance, summary, up to 3 detail lines, a hint line — see
+/// `format::format_error_stub`), not the single-line `Thinking [collapsed]`
+/// stub, so sizing it like `Thinking` would under-reserve space and cause a
+/// visible jump when the row is first measured.
 pub fn estimate_block_height(
     text_len: usize,
     newline_count: usize,
     collapsed: bool,
+    kind: BlockKind,
     params: &EstimateParams,
 ) -> f32 {
     if collapsed {
-        return params.line_height;
+        let lines = if kind == BlockKind::Error {
+            crate::view::format::ERROR_STUB_MAX_LINES
+        } else {
+            1
+        };
+        return lines as f32 * params.line_height;
     }
     let cols = params.cols.max(20);
     let hard_lines = newline_count + 1;
@@ -254,6 +267,7 @@ impl ConversationGeometry {
                             seed.text_len,
                             seed.newline_count,
                             seed.collapsed,
+                            seed.kind,
                             params,
                         ),
                         margin_bottom: params.block_spacing,
@@ -390,6 +404,7 @@ impl ConversationGeometry {
                     row.text_len,
                     row.newline_count,
                     row.collapsed,
+                    row.kind,
                     params,
                 ),
                 RowKey::Header(_) => params.role_header_height,
@@ -661,36 +676,65 @@ mod tests {
 
     #[test]
     fn estimate_single_short_line_is_one_line_height() {
-        assert_eq!(estimate_block_height(40, 0, false, &params()), 30.0);
+        assert_eq!(
+            estimate_block_height(40, 0, false, BlockKind::Text, &params()),
+            30.0
+        );
     }
 
     #[test]
     fn estimate_hard_lines_dominate_short_text() {
         // 5 newlines = 6 hard lines of short text.
-        assert_eq!(estimate_block_height(60, 5, false, &params()), 6.0 * 30.0);
+        assert_eq!(
+            estimate_block_height(60, 5, false, BlockKind::Text, &params()),
+            6.0 * 30.0
+        );
     }
 
     #[test]
     fn estimate_wrapping_dominates_one_long_line() {
         // 350 chars at 100 cols = 4 wrapped rows.
-        assert_eq!(estimate_block_height(350, 0, false, &params()), 4.0 * 30.0);
+        assert_eq!(
+            estimate_block_height(350, 0, false, BlockKind::Text, &params()),
+            4.0 * 30.0
+        );
     }
 
     #[test]
     fn estimate_collapsed_is_one_line() {
-        assert_eq!(estimate_block_height(10_000, 99, true, &params()), 30.0);
+        assert_eq!(
+            estimate_block_height(10_000, 99, true, BlockKind::Thinking, &params()),
+            30.0
+        );
+    }
+
+    #[test]
+    fn estimate_collapsed_error_uses_stub_line_budget() {
+        // A collapsed Error stub renders more than one line (provenance,
+        // summary, detail preview, hint) — sizing it like a one-line
+        // `Thinking [collapsed]` stub would under-reserve space.
+        assert_eq!(
+            estimate_block_height(10_000, 99, true, BlockKind::Error, &params()),
+            crate::view::format::ERROR_STUB_MAX_LINES as f32 * 30.0
+        );
     }
 
     #[test]
     fn estimate_empty_text_is_one_line_minimum() {
-        assert_eq!(estimate_block_height(0, 0, false, &params()), 30.0);
+        assert_eq!(
+            estimate_block_height(0, 0, false, BlockKind::Text, &params()),
+            30.0
+        );
     }
 
     #[test]
     fn estimate_degenerate_cols_clamped() {
         let p = EstimateParams { cols: 0, ..params() };
         // Clamped to 20 cols: 100 chars → 5 rows.
-        assert_eq!(estimate_block_height(100, 0, false, &p), 5.0 * 30.0);
+        assert_eq!(
+            estimate_block_height(100, 0, false, BlockKind::Text, &p),
+            5.0 * 30.0
+        );
     }
 
     // ---- reconcile: structure -------------------------------------------

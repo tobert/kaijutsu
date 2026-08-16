@@ -90,7 +90,7 @@ pub fn sync_block_cell_buffers(
         let block = &block;
 
         let local_ctx = doc_cache.active_id();
-        let text = format_single_block(block, local_ctx);
+        let text = format_single_block(block, local_ctx, &|pid| editor.block_snapshot(pid));
 
         // Debounce large blocks — only while still streaming. Once a block
         // reaches Done/Error, always render the final text so trim_end takes

@@ -1619,6 +1619,62 @@ mod tests {
         assert_eq!(count_block_activity(&blocks), (0, 1));
     }
 
+    #[test]
+    fn count_block_activity_dedupes_tool_result_and_its_error_child() {
+        // One failed tool call mints TWO Status::Error blocks: the
+        // ToolResult and a child BlockKind::Error (parent_id = the
+        // ToolResult) carrying diagnostics. Naive counting sees "2 failed"
+        // for one real failure.
+        let tool_result_id = test_block_id();
+        let blocks = vec![
+            BlockSnapshotBuilder::new(tool_result_id, BlockKind::ToolResult)
+                .status(Status::Error)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Error)
+                .parent_id(tool_result_id)
+                .status(Status::Error)
+                .build(),
+        ];
+        assert_eq!(count_block_activity(&blocks), (0, 1));
+    }
+
+    #[test]
+    fn count_block_activity_counts_standalone_error_block() {
+        // A stream error's parent is a Text turn (never Status::Error) — the
+        // dedup must not eat it just because it's a BlockKind::Error child.
+        let turn_id = test_block_id();
+        let blocks = vec![
+            BlockSnapshotBuilder::new(turn_id, BlockKind::Text)
+                .status(Status::Done)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Error)
+                .parent_id(turn_id)
+                .status(Status::Error)
+                .build(),
+        ];
+        assert_eq!(count_block_activity(&blocks), (0, 1));
+    }
+
+    #[test]
+    fn count_block_activity_counts_error_child_when_parent_excluded() {
+        // The ToolResult was individually excluded but its Error child was
+        // not — the child is the sole remaining representative of the
+        // failure and must still count (excluding the parent alone must not
+        // silently zero the badge).
+        let tool_result_id = test_block_id();
+        let blocks = vec![
+            BlockSnapshotBuilder::new(tool_result_id, BlockKind::ToolResult)
+                .status(Status::Error)
+                .excluded(true)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Error)
+                .parent_id(tool_result_id)
+                .status(Status::Error)
+                .build(),
+        ];
+        assert_eq!(count_block_activity(&blocks), (0, 1));
+    }
+
     // ------------------------------------------------------------------
     // State-derivation proofs — these exercise the REAL join/recovery code
     // path (docs/change-feed.md): `ContextMirror::apply_snapshot` for a
@@ -2369,7 +2425,26 @@ pub(crate) struct BlockActivityState {
 /// removes a deleted block from its list outright (`ContextChange::
 /// BlockDeleted`, docs/change-feed.md), so no explicit check is needed for
 /// those.
+///
+/// One failed tool call mints TWO blocks with `Status::Error`: the
+/// `ToolResult` itself, and a separate `BlockKind::Error` child
+/// (`parent_id` = the ToolResult) carrying structured diagnostics. Counting
+/// `Status::Error` blindly double-counts every tool failure ("36 failed"
+/// meaning 18 real failures). A `BlockKind::Error` child is skipped here
+/// when its parent is itself `Status::Error` and not excluded (the parent
+/// already contributed the count) — a stream error's parent is a `Text`
+/// turn, never `Status::Error`, so it is unaffected and still counts; a
+/// standalone `BlockKind::Error` with no error-status parent (parent
+/// excluded, missing, or simply not an error status) still counts too, so
+/// the failure it represents is never silently dropped.
 fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) {
+    use kaijutsu_types::{BlockKind, Status};
+
+    let live_status_by_id: std::collections::HashMap<_, _> = blocks
+        .iter()
+        .map(|b| (b.id, (b.status, b.excluded)))
+        .collect();
+
     let mut running = 0u32;
     let mut failed = 0u32;
     for b in blocks {
@@ -2377,8 +2452,16 @@ fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) 
             continue;
         }
         match b.status {
-            kaijutsu_types::Status::Running => running += 1,
-            kaijutsu_types::Status::Error => failed += 1,
+            Status::Running => running += 1,
+            Status::Error => {
+                let counted_by_parent = b.kind == BlockKind::Error
+                    && b.parent_id
+                        .and_then(|pid| live_status_by_id.get(&pid))
+                        .is_some_and(|&(status, excluded)| status == Status::Error && !excluded);
+                if !counted_by_parent {
+                    failed += 1;
+                }
+            }
             _ => {}
         }
     }

@@ -221,6 +221,16 @@ pub fn default_bindings() -> Vec<Binding> {
         "Interrupt context",
     ));
 
+    // Jump to the most recent failed block (mnemonic: Error). `e` is free
+    // across the whole Navigation table (checked against every binding
+    // below before picking it) — no Shift/Ctrl needed.
+    b.push(Binding::key(
+        KeyCode::KeyE,
+        InputContext::Navigation,
+        Action::JumpToLatestError,
+        "Jump to latest error",
+    ));
+
     // Collapse toggle (Tab on thinking block — currently reuses Tab, but dispatch priority
     // means CycleFocusForward fires first. CollapseToggle is bound to a dedicated key
     // if needed, or handled by the Activate action on thinking blocks.)

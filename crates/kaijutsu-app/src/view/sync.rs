@@ -282,8 +282,12 @@ pub fn sync_main_cell_to_conversation(
     // `CellEditor.store` is a `RenderBlockStore` (`view::render_store`) —
     // the local render buffer every other view system already reads
     // (block_border.rs, render.rs, diff_view, timeline, …). The change-feed
-    // mirror holds plain `BlockSnapshot`s, not a CRDT, so this materializes
-    // them via `insert_from_snapshot` into a fresh store.
+    // mirror holds plain `BlockSnapshot`s, not a CRDT, so
+    // `RenderBlockStore::rebuild` materializes them into a fresh store via
+    // `insert_from_snapshot`, carrying `collapsed` forward per id across the
+    // rebuild (see that method's doc — this runs nearly every frame during
+    // live streaming, not just at hydration boundaries, so without that a
+    // user's expand/collapse would be wiped within a frame or two).
     // `ContextMirror::blocks()` is already document order, so a plain
     // left-to-right insert reproduces it.
     //
@@ -294,28 +298,16 @@ pub fn sync_main_cell_to_conversation(
     // alone deliberately: watching a neighbor type is a feature, not a bug
     // (see `block_border.rs`'s `Status::Draft` handling).
     let principal_id = editor.store.principal_id();
-    let mut store = crate::view::render_store::RenderBlockStore::new(ctx_id, principal_id);
-    let mut after = None;
-    let mut ok = true;
-    for block in cached.mirror.blocks() {
-        if block.status == kaijutsu_types::Status::Draft && block.id.principal_id == session_principal.0 {
-            continue;
+    let store = editor.store.rebuild(ctx_id, principal_id, cached.mirror.blocks(), |block| {
+        block.status == kaijutsu_types::Status::Draft && block.id.principal_id == session_principal.0
+    });
+    let mut store = match store {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!("Failed to materialize the render buffer: {e}");
+            return;
         }
-        match store.insert_from_snapshot(block.clone(), after.as_ref()) {
-            Ok(id) => after = Some(id),
-            Err(e) => {
-                tracing::error!(
-                    "Failed to materialize block {} into the render buffer: {e}",
-                    block.id
-                );
-                ok = false;
-                break;
-            }
-        }
-    }
-    if !ok {
-        return;
-    }
+    };
     store.set_version(sync_version);
     editor.store = store;
 
