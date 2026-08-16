@@ -1110,28 +1110,6 @@ fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<St
     std::fs::read_to_string(dir.join(name)).ok()
 }
 
-/// Restore a config file to its embedded default by writing the seed body into
-/// the CRDT through the VFS. Returns `(success, error_message)`. Errors loudly
-/// (no silent no-op) when the path ships no embedded default.
-async fn reset_config_to_embedded(kernel: &Arc<Kernel>, path: &str) -> (bool, String) {
-    use kaijutsu_kernel::vfs::VfsOps;
-    let canonical = config_canonical(path);
-    let Some(body) = kaijutsu_kernel::config_seed::config_seed_body(&canonical) else {
-        return (
-            false,
-            format!("no embedded default for config '{canonical}' (nothing to reset to)"),
-        );
-    };
-    match kernel
-        .vfs()
-        .write_all(std::path::Path::new(&canonical), body.as_bytes())
-        .await
-    {
-        Ok(()) => (true, String::new()),
-        Err(e) => (false, format!("{e}")),
-    }
-}
-
 /// Initialize a kernel's LLM registry from the kernel database.
 ///
 /// Model configuration is SQL-native (`backends` / `backend_models` /
@@ -5059,85 +5037,6 @@ impl kernel::Server for KernelImpl {
     // =========================================================================
     // Config Methods (Phase 2: Config as CRDT)
     // =========================================================================
-
-    fn list_configs(
-        self: Rc<Self>,
-        _params: kernel::ListConfigsParams,
-        mut results: kernel::ListConfigsResults,
-    ) -> Promise<(), capnp::Error> {
-        let kernel = self.kernel.kernel.clone();
-        let span = tracing::info_span!("rpc", method = "list_configs");
-        Promise::from_future(
-            async move {
-                use kaijutsu_kernel::vfs::VfsOps;
-                // Config is CRDT-owned; the live set is whatever the /etc/config
-                // mount holds. Bare file names, matching the old surface.
-                let names: Vec<String> = match kernel
-                    .vfs()
-                    .readdir(std::path::Path::new(paths::CONFIG_ROOT))
-                    .await
-                {
-                    Ok(entries) => entries
-                        .into_iter()
-                        .filter(|e| e.kind.is_file())
-                        .map(|e| e.name)
-                        .collect(),
-                    Err(e) => {
-                        log::warn!("list_configs: readdir /etc/config failed: {e}");
-                        Vec::new()
-                    }
-                };
-                let mut builder = results.get().init_configs(names.len() as u32);
-                for (i, name) in names.iter().enumerate() {
-                    builder.set(i as u32, name);
-                }
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    /// Disk reload is meaningless now that the CRDT is the sole owner — there is
-    /// no host file to reload from. `reloadConfig` is repurposed as "restore this
-    /// config to its embedded default" (same as `resetConfig`); kept on the wire
-    /// for client compatibility.
-    fn reload_config(
-        self: Rc<Self>,
-        params: kernel::ReloadConfigParams,
-        mut results: kernel::ReloadConfigResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
-        let kernel = self.kernel.kernel.clone();
-        let span = tracing::info_span!("rpc", method = "reload_config");
-        Promise::from_future(
-            async move {
-                let (ok, err) = reset_config_to_embedded(&kernel, &path).await;
-                results.get().set_success(ok);
-                results.get().set_error(&err);
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    fn reset_config(
-        self: Rc<Self>,
-        params: kernel::ResetConfigParams,
-        mut results: kernel::ResetConfigResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
-        let kernel = self.kernel.kernel.clone();
-        let span = tracing::info_span!("rpc", method = "reset_config");
-        Promise::from_future(
-            async move {
-                let (ok, err) = reset_config_to_embedded(&kernel, &path).await;
-                results.get().set_success(ok);
-                results.get().set_error(&err);
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
 
     fn get_config(
         self: Rc<Self>,

@@ -1726,14 +1726,23 @@ interface Kernel {
   # ==========================================================================
   # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are managed as CRDT documents.
 
-  # List loaded config documents
-  listConfigs @56 () -> (configs :List(Text));
+  # @56 retired (2026-08-15): was listConfigs, listing the /etc/config mount's
+  # loaded documents. Zero production callers (verified independently).
+  # Stub, not a hole — see @79-@83.
+  retired56 @56 ();
 
-  # Reload a config file from disk, discarding CRDT changes (safety valve)
-  reloadConfig @57 (path :Text) -> (success :Bool, error :Text);
+  # @57 retired (2026-08-15): was reloadConfig — already repurposed as
+  # "restore to embedded default" once config became CRDT-owned (no host file
+  # left to reload from), duplicating resetConfig exactly. Zero production
+  # callers. Stub, not a hole — see @79-@83.
+  retired57 @57 ();
 
-  # Reset a config file to embedded default
-  resetConfig @58 (path :Text) -> (success :Bool, error :Text);
+  # @58 retired (2026-08-15): was resetConfig, resetting a config file to its
+  # embedded default. Zero production callers — `docs/crdt-melt.md` Lane B is
+  # melting config CRDT documents into plain files; a reseed tool for shipped
+  # defaults is the surviving shape, not a per-path RPC verb. Stub, not a
+  # hole — see @79-@83.
+  retired58 @58 ();
 
   # Get config content (from CRDT)
   getConfig @59 (path :Text) -> (content :Text, error :Text);
