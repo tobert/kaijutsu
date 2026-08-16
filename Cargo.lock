@@ -6450,6 +6450,7 @@ dependencies = [
  "beat-this",
  "bytes",
  "clap",
+ "claude-code-peer",
  "dashmap",
  "diamond-types-extended",
  "dunce",

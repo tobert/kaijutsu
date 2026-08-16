@@ -65,7 +65,9 @@ pub use error::{Error, Result};
 pub use frame::{
     auth_frame_line, parse_line, user_frame_line, Incoming, IncomingUser, MessageId, OutgoingUser,
 };
-pub use liveness::{classify_reachability, parse_stat_starttime, ProcProbe, Reachable};
+pub use liveness::{
+    classify_reachability, parse_stat_starttime, probe_proc_starttime, ProcProbe, Reachable,
+};
 pub use server::{Inbox, ReceivedMessage};
 
 /// The peer-protocol version this crate speaks. Descriptors advertising any
