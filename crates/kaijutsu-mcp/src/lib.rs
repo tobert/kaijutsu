@@ -1850,19 +1850,7 @@ impl KaijutsuMcp {
         };
 
         match &self.backend {
-            Backend::Local(store) => {
-                // Ensure input doc exists
-                let _ = store.create_input_doc(ctx_id);
-                match store.get_input_text(ctx_id) {
-                    Ok(text) => serde_json::json!({
-                        "context_id": ctx_id.short(),
-                        "content": text,
-                        "length": input_char_len(&text),
-                    })
-                    .to_string(),
-                    Err(e) => format!("Error: {}", e),
-                }
-            }
+            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
             Backend::Remote(remote) => {
                 match remote.actor.get_input_state(ctx_id).await {
                     Ok(state) => serde_json::json!({
@@ -1890,23 +1878,7 @@ impl KaijutsuMcp {
         };
 
         match &self.backend {
-            Backend::Local(store) => {
-                // Ensure input doc exists
-                let _ = store.create_input_doc(ctx_id);
-                // Clear then write
-                let _ = store.clear_input(ctx_id);
-                if !req.text.is_empty()
-                    && let Err(e) = store.edit_input(ctx_id, 0, &req.text, 0)
-                {
-                    return format!("Error: {}", e);
-                }
-                serde_json::json!({
-                    "success": true,
-                    "context_id": ctx_id.short(),
-                    "length": input_char_len(&req.text),
-                })
-                .to_string()
-            }
+            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
             Backend::Remote(remote) => {
                 // Get current state to know how much to delete — in CHARS,
                 // matching edit_input's char-addressed `delete` (found by the
@@ -1946,22 +1918,7 @@ impl KaijutsuMcp {
         };
 
         match &self.backend {
-            Backend::Local(store) => {
-                // Ensure input doc exists
-                let _ = store.create_input_doc(ctx_id);
-                match store.edit_input(ctx_id, req.pos as usize, &req.insert, req.delete as usize) {
-                    Ok(_ops) => {
-                        let text = store.get_input_text(ctx_id).unwrap_or_default();
-                        serde_json::json!({
-                            "success": true,
-                            "context_id": ctx_id.short(),
-                            "length": text.len(),
-                        })
-                        .to_string()
-                    }
-                    Err(e) => format!("Error: {}", e),
-                }
-            }
+            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
             Backend::Remote(remote) => {
                 match remote
                     .actor
@@ -1992,10 +1949,7 @@ impl KaijutsuMcp {
         };
 
         match &self.backend {
-            Backend::Local(_store) => {
-                // Local mode doesn't have submit semantics (no conversation block creation)
-                "Error: submit_input requires --connect to kaijutsu-server".to_string()
-            }
+            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
             Backend::Remote(remote) => {
                 let is_shell = req.mode.as_deref() == Some("shell");
                 match remote.actor.submit_input(ctx_id, is_shell).await {
@@ -2717,6 +2671,19 @@ impl ServerHandler for KaijutsuMcp {
 /// undo the specific double-encoding, never reinterpret real string values.
 /// Length on the input-document surface, counted in CHARACTERS.
 ///
+/// The compose surface exists only against a real kernel.
+///
+/// A draft is a block belonging to a (context, principal), authored through the
+/// kernel's mutation path like any other. Local mode has no connection and no
+/// principal on that path, so it cannot hold one. It previously drove
+/// `BlockStore`'s input document directly, which was already the odd one out —
+/// `submit_input` had always refused here — and once the draft became a block
+/// that document stopped being read by anything. Refusing all four is the
+/// honest answer: reading text nobody can submit, or writing text nobody will
+/// read, is worse than an error, because both look like they worked.
+const LOCAL_INPUT_UNSUPPORTED: &str =
+    "Error: the input/compose tools require --connect to kaijutsu-server";
+
 /// `edit_input`'s `pos`/`delete` are character-addressed (rpc.rs: "insert
 /// text at position, delete characters"), so every length this surface
 /// derives — and reports, since a reported length is the position math a
@@ -2888,159 +2855,65 @@ mod tests {
         );
     }
 
+    /// Every compose tool refuses in local mode, and refuses the same way.
+    ///
+    /// These four used to disagree: `submit_input` errored while read/write/edit
+    /// quietly drove `BlockStore`'s input document. Once the draft became a block
+    /// authored through the kernel, that document stopped being read by anything,
+    /// so the quiet three were writing where nobody looks and reading what nobody
+    /// can send. An error is the honest answer, and one error for all four is the
+    /// only shape an agent can learn.
     #[tokio::test]
-    async fn test_read_input_local_empty() {
+    async fn every_compose_tool_refuses_without_a_kernel() {
         let mcp = KaijutsuMcp::new();
-        let ctx_id = ContextId::new();
-        let result = mcp
+        let hex = ContextId::new().to_hex();
+
+        let read = mcp
             .read_input(Parameters(InputReadRequest {
-                context_id: Some(ctx_id.to_hex()),
+                context_id: Some(hex.clone()),
             }))
             .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str().unwrap(), "");
-        assert_eq!(parsed["length"].as_u64().unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_write_and_read_input_local() {
-        let mcp = KaijutsuMcp::new();
-        let ctx_id = ContextId::new();
-        let hex = ctx_id.to_hex();
-
-        // Write some text
-        let result = mcp
+        let write = mcp
             .write_input(Parameters(InputWriteRequest {
                 context_id: Some(hex.clone()),
                 text: "hello from MCP".to_string(),
             }))
             .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["success"].as_bool().unwrap(),
-            "write_input failed: {result}"
-        );
-        assert_eq!(parsed["length"].as_u64().unwrap(), 14);
-
-        // Read it back
-        let result = mcp
-            .read_input(Parameters(InputReadRequest {
-                context_id: Some(hex.clone()),
-            }))
-            .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str().unwrap(), "hello from MCP");
-    }
-
-    #[tokio::test]
-    async fn test_write_input_overwrite() {
-        let mcp = KaijutsuMcp::new();
-        let ctx_id = ContextId::new();
-        let hex = ctx_id.to_hex();
-
-        mcp.write_input(Parameters(InputWriteRequest {
-            context_id: Some(hex.clone()),
-            text: "first".to_string(),
-        }))
-        .await;
-
-        mcp.write_input(Parameters(InputWriteRequest {
-            context_id: Some(hex.clone()),
-            text: "second".to_string(),
-        }))
-        .await;
-
-        let result = mcp
-            .read_input(Parameters(InputReadRequest {
-                context_id: Some(hex.clone()),
-            }))
-            .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str().unwrap(), "second");
-    }
-
-    #[tokio::test]
-    async fn test_edit_input_insert() {
-        let mcp = KaijutsuMcp::new();
-        let ctx_id = ContextId::new();
-        let hex = ctx_id.to_hex();
-
-        // Write initial text
-        mcp.write_input(Parameters(InputWriteRequest {
-            context_id: Some(hex.clone()),
-            text: "hello world".to_string(),
-        }))
-        .await;
-
-        // Insert " beautiful" at position 5
-        let result = mcp
+        let edit = mcp
             .edit_input(Parameters(InputEditRequest {
                 context_id: Some(hex.clone()),
-                pos: 5,
-                insert: " beautiful".to_string(),
+                pos: 0,
+                insert: "x".to_string(),
                 delete: 0,
             }))
             .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["success"].as_bool().unwrap(),
-            "edit_input failed: {result}"
-        );
-
-        // Read back
-        let result = mcp
-            .read_input(Parameters(InputReadRequest {
-                context_id: Some(hex.clone()),
-            }))
-            .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str().unwrap(), "hello beautiful world");
-    }
-
-    #[tokio::test]
-    async fn test_edit_input_delete() {
-        let mcp = KaijutsuMcp::new();
-        let ctx_id = ContextId::new();
-        let hex = ctx_id.to_hex();
-
-        mcp.write_input(Parameters(InputWriteRequest {
-            context_id: Some(hex.clone()),
-            text: "hello world".to_string(),
-        }))
-        .await;
-
-        // Delete "world" (5 chars starting at position 6)
-        mcp.edit_input(Parameters(InputEditRequest {
-            context_id: Some(hex.clone()),
-            pos: 6,
-            insert: String::new(),
-            delete: 5,
-        }))
-        .await;
-
-        let result = mcp
-            .read_input(Parameters(InputReadRequest {
-                context_id: Some(hex.clone()),
-            }))
-            .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str().unwrap(), "hello ");
-    }
-
-    #[tokio::test]
-    async fn test_submit_input_local_errors() {
-        let mcp = KaijutsuMcp::new();
-        let ctx_id = ContextId::new();
-        let result = mcp
+        let submit = mcp
             .submit_input(Parameters(InputSubmitRequest {
-                context_id: Some(ctx_id.to_hex()),
+                context_id: Some(hex.clone()),
                 mode: None,
             }))
             .await;
-        assert!(
-            result.contains("Error"),
-            "submit_input should error in local mode: {result}"
-        );
+
+        for (name, result) in [
+            ("read_input", &read),
+            ("write_input", &write),
+            ("edit_input", &edit),
+            ("submit_input", &submit),
+        ] {
+            assert_eq!(
+                result.as_str(),
+                LOCAL_INPUT_UNSUPPORTED,
+                "{name} must refuse in local mode with the shared message"
+            );
+        }
+
+        // And specifically NOT a success envelope an agent would believe.
+        for (name, result) in [("write_input", &write), ("edit_input", &edit)] {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(result).is_err(),
+                "{name} must not return parseable JSON that looks like success"
+            );
+        }
     }
 
     // ========================================================================
