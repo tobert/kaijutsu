@@ -1,14 +1,12 @@
-//! Block store — collection of per-block DTE instances.
+//! Block store — collection of blocks.
 //!
-//! A collection of `BlockContent` instances, each owning its own DTE
-//! Document. Metadata lives in `BlockHeader` (plain data), content in
-//! per-block CRDTs. (Superseded the single-shared-Document `BlockDocument`
-//! model, removed 2026-08-09 — see `docs/crdt-position-2026-08.md`.)
+//! A collection of `BlockContent` instances, each owning its content as a
+//! plain `String`. Metadata lives in `BlockHeader` (plain data). (Superseded
+//! the single-shared-Document `BlockDocument` model, removed 2026-08-09; text
+//! itself was a per-block diamond-types-extended CRDT until 2026-08-16 — see
+//! `docs/crdt-position-2026-08.md`.)
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use diamond_types_extended::{Frontier, SerializedOpsOwned};
 
 use crate::content::{BlockContent, base62_encode_padded, order_key_successor, order_midpoint};
 use crate::selection::IntervalSet;
@@ -62,10 +60,11 @@ impl ForkBlockFilter {
     }
 }
 
-/// Collection of blocks with per-block DTE instances.
+/// Collection of blocks.
 ///
-/// Each block owns its own DTE Document for content. Metadata lives in
-/// `BlockHeader` (plain data). Ordering uses fractional indexing.
+/// Each block owns its content as a plain `String` (see `crate::content` for
+/// why no per-block CRDT is needed). Metadata lives in `BlockHeader` (plain
+/// data). Ordering uses fractional indexing.
 ///
 /// Uses a Lamport clock (not wall-clock) for LWW conflict resolution on
 /// mutable header fields (status, collapsed). The clock advances on every
@@ -106,14 +105,6 @@ pub struct BlockStore {
     /// stamped on every inserted block (distinct from the Lamport clock, which
     /// bumps on many metadata ops). The append `order_key` is derived from it.
     next_tick: i64,
-
-    /// Wire-merge classifier counters — see `merge_stats()` and
-    /// `docs/crdt-position-2026-08.md` Part 1, empirical question 1.
-    /// Atomics (not plain u64) so a future read-only accessor never needs
-    /// `&mut self`; the store itself is single-writer, this is just cheap
-    /// insurance against that changing under an observer.
-    merge_fast_forwards: AtomicU64,
-    merge_concurrent_merges: AtomicU64,
 }
 
 impl BlockStore {
@@ -127,8 +118,6 @@ impl BlockStore {
             version: 0,
             lamport_clock: 0,
             next_tick: 0,
-            merge_fast_forwards: AtomicU64::new(0),
-            merge_concurrent_merges: AtomicU64::new(0),
         }
     }
 
@@ -164,8 +153,6 @@ impl BlockStore {
     /// Override the principal ID for subsequent block operations.
     ///
     /// This changes who "authored" newly created blocks (via `BlockId.principal_id`).
-    /// The DTE agent within each per-block Document is unrelated — it tracks
-    /// CRDT operation identity, not block authorship.
     pub fn set_principal_id(&mut self, principal_id: PrincipalId) {
         self.principal_id = principal_id;
     }
@@ -184,15 +171,6 @@ impl BlockStore {
         self.version = v;
     }
 
-    /// Snapshot the wire-merge classifier counters (see [`MergeStats`]).
-    /// Cheap: two atomic loads, no lock.
-    pub fn merge_stats(&self) -> MergeStats {
-        MergeStats {
-            fast_forwards: self.merge_fast_forwards.load(Ordering::Relaxed),
-            concurrent_merges: self.merge_concurrent_merges.load(Ordering::Relaxed),
-        }
-    }
-
     /// Get the number of live (non-deleted) blocks.
     pub fn block_count(&self) -> usize {
         self.blocks.values().filter(|b| !b.is_deleted()).count()
@@ -209,6 +187,19 @@ impl BlockStore {
             .get(id)
             .filter(|b| !b.is_deleted())
             .map(|b| b.snapshot())
+    }
+
+    /// Get one block's header, without materializing its text.
+    ///
+    /// `BlockHeader` is `Copy` — the header-only mutations (`set_status`,
+    /// `set_collapsed`, etc.) use this to build the `SyncPayload` they
+    /// journal, so a status change on a large block never pays
+    /// `get_block_snapshot`'s `BlockContent::text()` clone.
+    pub fn get_block_header(&self, id: &BlockId) -> Option<BlockHeader> {
+        self.blocks
+            .get(id)
+            .filter(|b| !b.is_deleted())
+            .map(|b| *b.header())
     }
 
     /// Get one block's text content, without building a full snapshot.
@@ -252,8 +243,9 @@ impl BlockStore {
     /// Get block statuses in document order (same ordering as
     /// `blocks_ordered`/`block_ids_ordered`) without building `BlockSnapshot`s.
     /// `BlockSnapshot::content` is populated by `BlockContent::text()`, which
-    /// materializes a block's full text out of its DTE document into a fresh
-    /// `String` — the one expensive field on an otherwise-cheap struct of
+    /// clones a block's text into a fresh `String` — the one expensive field
+    /// (well, `.clone()`-expensive, on a large block) on an otherwise-cheap
+    /// struct of
     /// header clones. Status-only callers (e.g. `journal_op`'s per-op live-
     /// status recompute) don't need that text and were paying for it on every
     /// journaled op, context-wide. This does the same order_key sort
@@ -1253,71 +1245,82 @@ impl BlockStore {
     // Sync Operations
     // =========================================================================
 
-    /// Get per-block operations since given frontiers.
+    /// The IDs of every live block this store currently holds — a peer's
+    /// "what I already know about" marker for [`ops_since`](Self::ops_since).
+    /// Named to match the pre-migration DTE `Frontier` concept it replaces
+    /// (a per-block version marker), though this one only ever means
+    /// "known or not" — see `ops_since`'s doc comment for why.
     ///
-    /// For known blocks: sends DTE text delta + current header.
-    /// For new blocks: sends full snapshot (includes order_key for correct positioning).
-    /// For deleted blocks: sends block ID so receiver can apply tombstone.
-    pub fn ops_since(&self, frontiers: &HashMap<BlockId, Frontier>) -> SyncPayload {
-        let mut block_ops = Vec::new();
+    /// No production caller: every kernel mutation builds its own
+    /// single-op `SyncPayload` directly at the point of mutation instead of
+    /// diffing against a captured marker (`block_store.rs`, kernel crate,
+    /// "Durable state and the wire"). This pair exists for the two-store
+    /// integration tests below, which exercise `merge_ops` the way a
+    /// from-scratch peer catching up once did.
+    pub fn frontier(&self) -> HashSet<BlockId> {
+        self.blocks
+            .iter()
+            .filter(|(_, b)| !b.is_deleted())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Build a payload for everything a peer holding `known` doesn't have
+    /// yet: full snapshots for blocks outside `known`, current headers for
+    /// blocks inside it, tombstones for anything `known` that's since been
+    /// deleted here.
+    ///
+    /// Deliberately does NOT attempt incremental text sync for a block
+    /// already in `known` — a bare `BlockId` marker can't distinguish "this
+    /// block's text never changed" from "it changed to the same length,"
+    /// and guessing wrong here would be exactly the silent-corruption class
+    /// this migration exists to close. A block already known to the peer
+    /// keeps whatever text it had; only a fresh snapshot (not yet in
+    /// `known`) carries content through this path.
+    pub fn ops_since(&self, known: &HashSet<BlockId>) -> SyncPayload {
         let mut new_blocks = Vec::new();
         let mut updated_headers = Vec::new();
         let mut deleted_blocks = Vec::new();
 
         for (id, block) in &self.blocks {
             if block.is_deleted() {
-                // If the receiver knows about this block, tell them it's deleted
-                if frontiers.contains_key(id) {
+                if known.contains(id) {
                     deleted_blocks.push(*id);
                 }
                 continue;
             }
-            let frontier = frontiers.get(id);
-            match frontier {
-                Some(f) => {
-                    // Known block: send DTE delta + header
-                    let ops = block.ops_since(f);
-                    if !ops.is_empty() {
-                        block_ops.push((*id, ops));
-                    }
-                    // Always send header for known blocks so metadata
-                    // changes (status, collapsed) propagate via LWW
-                    updated_headers.push(*block.header());
-                }
-                None => {
-                    // New block: send snapshot (metadata) + full DTE ops (content history).
-                    // The receiver creates with empty content then merges the DTE ops,
-                    // preserving causal history for subsequent incremental sync.
-                    new_blocks.push(block.snapshot());
-                    // Full ops from root so receiver gets complete DTE causal graph
-                    let full_ops = block.ops_since(&Frontier::root());
-                    if !full_ops.is_empty() {
-                        block_ops.push((*id, full_ops));
-                    }
-                }
+            if known.contains(id) {
+                updated_headers.push(*block.header());
+            } else {
+                new_blocks.push(block.snapshot());
             }
         }
 
         SyncPayload {
-            block_ops,
+            block_ops: Vec::new(),
             new_blocks,
             updated_headers,
             deleted_blocks,
         }
     }
 
-    /// Merge a sync payload from a remote peer.
+    /// Apply a sync payload — new blocks, header updates, per-block text
+    /// edits, tombstones.
+    ///
+    /// The kernel is the sole sequencer (CLAUDE.md "Durable state and the
+    /// wire"), so the only real caller is oplog replay: applying one
+    /// document's own history, in the order it was journaled, to
+    /// reconstruct current state after a restart. That is a strictly
+    /// sequential replay against a document nobody else is mutating
+    /// concurrently — never two independently-edited replicas reconciling a
+    /// genuine divergence, which is the scenario diamond-types existed to
+    /// handle and which retiring it made structurally impossible. A
+    /// `block_ops` entry is therefore replayed as the literal edit it
+    /// records (`BlockContent::edit_text`), not merged against a
+    /// CRDT-tracked causal history.
     pub fn merge_ops(&mut self, payload: SyncPayload) -> Result<()> {
         // Track max remote Lamport timestamp for clock advancement
         let mut max_remote_ts: u64 = 0;
-
-        // First, create blocks from snapshots (new blocks).
-        // Use empty content — DTE ops in block_ops will fill it in,
-        // preserving causal history for subsequent incremental sync.
-        // Falls back to from_snapshot (with content) if no DTE ops are
-        // present for this block (e.g., persistence restore).
-        let has_ops_for: std::collections::HashSet<BlockId> =
-            payload.block_ops.iter().map(|(id, _)| *id).collect();
 
         // Restore the tick high-water across the merge: a freshly-stamped tick
         // after this merge must exceed every merged tick (design §2.3). Mirrors
@@ -1349,14 +1352,9 @@ impl BlockStore {
                         None => self.order_key_for_tick(self.next_tick),
                     }
                 };
-                let block = if has_ops_for.contains(&snap.id) {
-                    // DTE ops will provide content with proper causal history.
-                    // Bare DTE — no structure creation, sender's ops bring everything.
-                    BlockContent::from_snapshot_for_sync(snap, self.principal_id, fallback_key)
-                } else {
-                    // No DTE ops (persistence restore) — use snapshot content
-                    BlockContent::from_snapshot(snap, self.principal_id, fallback_key)
-                };
+                // The snapshot carries its content directly — no separate ops
+                // needed to fill it in.
+                let block = BlockContent::from_snapshot(snap, self.principal_id, fallback_key);
                 max_remote_ts = max_remote_ts.max(snap.updated_at);
                 if let Some(t) = snap.tick {
                     max_tick = Some(max_tick.map_or(t.get(), |m| m.max(t.get())));
@@ -1381,27 +1379,29 @@ impl BlockStore {
             }
         }
 
-        // Merge per-block incremental DTE ops, classifying each as a
-        // fast-forward or a genuine concurrent merge (see
-        // `frontier_shows_concurrency` — docs/crdt-position-2026-08.md Part 1,
-        // empirical question 1). One payload can touch several blocks; if any
-        // of them show diamond-types reconciling a real concurrent branch,
-        // the whole application counts as one concurrent merge.
-        let mut had_dte_merges = false;
-        let mut saw_concurrent_merge = false;
-        for (id, ops) in payload.block_ops {
-            if let Some(block) = self.blocks.get_mut(&id) {
-                if !ops.is_empty() {
-                    had_dte_merges = true;
-                }
-                let before = block.frontier();
-                block.merge_ops(ops)?;
-                if frontier_shows_concurrency(&before, &block.frontier()) {
-                    saw_concurrent_merge = true;
-                }
-            } else {
-                tracing::warn!("sync payload has ops for unknown block {id}, skipping");
+        // Replay each text edit against the block it targets. Bounds are
+        // re-checked here (not trusted from the payload) — a corrupt or
+        // out-of-order journal entry must fail loud (`CrdtError`) rather
+        // than silently truncate or shift the block's text. `edit.pos ==
+        // None` resolves to this block's OWN current length (an append) —
+        // never the sender's, which single-writer sequential replay
+        // guarantees lines up with what it was when the edit was journaled.
+        let mut had_edits = false;
+        for (id, edit) in payload.block_ops {
+            let Some(block) = self.blocks.get_mut(&id) else {
+                tracing::warn!("sync payload has a text edit for unknown block {id}, skipping");
+                continue;
+            };
+            let len = block.content_len();
+            let pos = edit.pos.unwrap_or(len);
+            if pos > len || pos + edit.delete > len {
+                return Err(CrdtError::PositionOutOfBounds {
+                    pos: pos + edit.delete,
+                    len,
+                });
             }
+            block.edit_text(pos, &edit.insert, edit.delete);
+            had_edits = true;
         }
 
         // Apply tombstone deletions
@@ -1416,40 +1416,14 @@ impl BlockStore {
         }
 
         // Advance Lamport clock past any remote timestamp, or bump if
-        // DTE ops were merged (even without header/new-block timestamps)
-        if max_remote_ts > 0 || had_dte_merges {
+        // any text edits were replayed (even without header/new-block
+        // timestamps).
+        if max_remote_ts > 0 || had_edits {
             self.merge_clock(max_remote_ts);
-        }
-
-        // Wire-merge classifier totals. Fast-forwards are the expected hot
-        // path (no per-event log — see below); a genuine concurrent merge is
-        // rare-expected and gets a loud info! per house rule (silent
-        // anything is a bug).
-        if had_dte_merges {
-            if saw_concurrent_merge {
-                let concurrent_merges = self.merge_concurrent_merges.fetch_add(1, Ordering::Relaxed) + 1;
-                let fast_forwards = self.merge_fast_forwards.load(Ordering::Relaxed);
-                tracing::info!(
-                    context_id = %self.context_id,
-                    fast_forwards,
-                    concurrent_merges,
-                    "merge_ops: genuine concurrent merge — diamond-types reconciled a diverged frontier"
-                );
-            } else {
-                self.merge_fast_forwards.fetch_add(1, Ordering::Relaxed);
-            }
         }
 
         self.version += 1;
         Ok(())
-    }
-
-    /// Get per-block frontiers.
-    pub fn frontier(&self) -> HashMap<BlockId, Frontier> {
-        self.blocks
-            .iter()
-            .map(|(id, block)| (*id, block.frontier()))
-            .collect()
     }
 
     // =========================================================================
@@ -1458,12 +1432,9 @@ impl BlockStore {
 
     /// Fork the store, creating a copy with a new context ID.
     ///
-    /// Each block gets a fresh DTE Document with the current content
-    /// (text is copied, but DTE operation history is NOT preserved).
-    /// This is intentional: forks are isolated explorations. Content
-    /// that "merges back" travels via drift blocks, not DTE merge.
-    /// The clean DTE history also means forked contexts rarely need
-    /// compaction.
+    /// Each block gets a fresh copy of its current text. This is
+    /// intentional: forks are isolated explorations. Content that "merges
+    /// back" travels via drift blocks, never a text merge.
     pub fn fork(&self, new_context_id: ContextId, new_principal_id: PrincipalId) -> Self {
         let mut forked = Self::new(new_context_id, new_principal_id);
 
@@ -1640,20 +1611,13 @@ impl BlockStore {
     // =========================================================================
 
     /// Create a snapshot of the entire store.
-    ///
-    /// Includes full per-block DTE history (ops from root) so that recovery
-    /// from a snapshot followed by incremental oplog replay can merge
-    /// correctly. Without the history, restored blocks have fresh DTE
-    /// Documents whose frontiers don't match journaled ops.
     pub fn snapshot(&self) -> StoreSnapshot {
         let ids = self.block_ids_ordered();
         let mut blocks = Vec::with_capacity(ids.len());
-        let mut block_history = Vec::with_capacity(ids.len());
 
         for id in ids {
             if let Some(block) = self.blocks.get(&id) {
                 blocks.push(block.snapshot());
-                block_history.push(block.root_ops());
             }
         }
 
@@ -1668,24 +1632,17 @@ impl BlockStore {
         StoreSnapshot {
             context_id: self.context_id,
             blocks,
-            block_history,
             deleted_blocks,
         }
     }
 
-    /// Restore from a snapshot, preserving full DTE causal history.
-    ///
-    /// Each block is rebuilt with `from_snapshot_for_sync` (bare DTE Document)
-    /// and then its saved DTE ops are merged in. This preserves the causal
-    /// graph so subsequent oplog replay can merge incremental ops.
+    /// Restore from a snapshot. Each `BlockSnapshot` carries its content
+    /// directly, so restore is a straight rebuild — no separate history to
+    /// replay (see `StoreSnapshot::block_history`'s removal note).
     pub fn from_snapshot(snapshot: StoreSnapshot, principal_id: PrincipalId) -> Result<Self> {
         let mut store = Self::new(snapshot.context_id, principal_id);
 
-        for (block_snap, history) in snapshot
-            .blocks
-            .iter()
-            .zip(snapshot.block_history.iter())
-        {
+        for block_snap in &snapshot.blocks {
             // Seed the seq lane for EVERY observed principal — players, system(),
             // beat(), drift authors. The old `== principal_id` guard left foreign
             // lanes invisible, so the first post-restart materialization re-minted
@@ -1716,16 +1673,8 @@ impl BlockStore {
                 }
             };
 
-            if history.is_empty() {
-                let content =
-                    BlockContent::from_snapshot(block_snap, principal_id, fallback_key);
-                store.blocks.insert(block_snap.id, content);
-            } else {
-                let mut content =
-                    BlockContent::from_snapshot_for_sync(block_snap, principal_id, fallback_key);
-                content.merge_ops(history.clone())?;
-                store.blocks.insert(block_snap.id, content);
-            }
+            let content = BlockContent::from_snapshot(block_snap, principal_id, fallback_key);
+            store.blocks.insert(block_snap.id, content);
         }
 
         // Restore tombstones so deletions propagate to peers after compaction.
@@ -1767,66 +1716,52 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// The wire-merge classifier: did applying a block's incoming DTE ops
-/// require diamond-types to reconcile a genuine concurrent branch?
-///
-/// `before`/`after` are one block's local `Frontier` immediately before and
-/// after `BlockContent::merge_ops`. This reads off diamond-types' own
-/// dominator bookkeeping rather than guessing from op metadata, so it can't
-/// lie: `Frontier::advance_by_known_run` (diamond-types-extended
-/// `src/frontier.rs`) only *removes* a pre-existing frontier entry when the
-/// newly-merged causal-graph entry names it as a parent — i.e. when the
-/// incoming history already knew about it and is a strict continuation. If
-/// the incoming ops were authored without knowledge of `before` (a
-/// concurrent edit), `advance_by_known_run` retains `before`'s entries
-/// alongside the new one, widening the frontier — the mechanical signature
-/// of a real diamond. See docs/crdt-position-2026-08.md Part 1, empirical
-/// question 1.
-///
-/// `before == after` (a duplicate/no-op payload — every op already known)
-/// is fast-forward by definition: nothing new was merged, so nothing was
-/// reconciled.
-fn frontier_shows_concurrency(before: &Frontier, after: &Frontier) -> bool {
-    if before.as_ref() == after.as_ref() {
-        return false;
-    }
-    before.as_ref().iter().any(|lv| after.as_ref().contains(lv))
-}
-
 // =========================================================================
 // Sync + Snapshot types
 // =========================================================================
 
 /// Snapshot of a block store (serializable).
-///
-/// BREAKING: the `block_history` field was added as part of the oplog
-/// persistence migration. Old serialized snapshots will fail to deserialize.
-/// Delete existing databases when upgrading.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StoreSnapshot {
     /// Context ID.
     pub context_id: ContextId,
-    /// Blocks in order.
+    /// Blocks in order. Each `BlockSnapshot` carries its own content
+    /// directly, so this alone is a complete restore — no parallel history
+    /// array needed.
     pub blocks: Vec<BlockSnapshot>,
-    /// Full per-block DTE ops from root, parallel to `blocks`.
-    ///
-    /// Required for round-trip-correct replay: after restoring from a
-    /// snapshot, incremental oplog entries reference DTE frontiers that
-    /// only exist if the per-block DTE history is preserved.
-    pub block_history: Vec<SerializedOpsOwned>,
     /// IDs of deleted blocks (tombstones) so deletions survive compaction.
     #[serde(default)]
     pub deleted_blocks: Vec<BlockId>,
 }
 
+/// A single semantic text edit against one block's content — the
+/// `block_ops` payload shape. `pos` and `delete` are CHARACTER offsets
+/// (never byte offsets), matching `BlockContent::edit_text`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TextEdit {
+    /// Character offset the edit starts at. `None` means "the current end
+    /// of whichever block's content this is applied to" — an append,
+    /// resolved against the applying document's own length rather than a
+    /// position computed by the sender. This is what keeps a streamed
+    /// append O(1): computing an exact `pos` here would mean materializing
+    /// the whole block's char count on every streamed token, just to
+    /// journal a mutation that only ever touches the end.
+    pub pos: Option<usize>,
+    /// Text inserted at `pos` (may be empty, for a pure delete).
+    pub insert: String,
+    /// Character count deleted starting at `pos` (may be 0, for a pure
+    /// insert — this is how a streamed append travels — and MUST be 0 when
+    /// `pos` is `None`, since an append never deletes).
+    pub delete: usize,
+}
+
 /// Per-block sync payload.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SyncPayload {
-    /// Per-block DTE ops (incremental delta for known blocks).
-    pub block_ops: Vec<(BlockId, diamond_types_extended::SerializedOpsOwned)>,
-    /// Full snapshots of blocks the receiver doesn't know about.
-    /// Receivers reconstruct these from scratch rather than merging ops
-    /// against a fresh DTE Document (which would fail with DataMissing).
+    /// Per-block text edits (incremental delta for known blocks).
+    pub block_ops: Vec<(BlockId, TextEdit)>,
+    /// Full snapshots of blocks the receiver doesn't know about. Each
+    /// snapshot carries its content directly — nothing further to merge.
     pub new_blocks: Vec<BlockSnapshot>,
     /// Updated headers for known blocks (LWW merge via `merge_header()`).
     /// Propagates metadata changes like status, collapsed, excluded.
@@ -1844,70 +1779,45 @@ impl SyncPayload {
             && self.updated_headers.is_empty()
             && self.deleted_blocks.is_empty()
     }
-}
 
-/// Snapshot of `BlockStore::merge_ops`'s wire-merge classification.
-///
-/// docs/crdt-position-2026-08.md Part 1, empirical question 1: how often
-/// does a merged `SyncPayload` see a genuinely concurrent frontier vs. a
-/// fast-forward? Read via [`BlockStore::merge_stats`].
-///
-/// **That question has been answered by construction, not by measurement**
-/// (2026-08-15). The `push_ops` handler that exported this as the
-/// `kaijutsu.crdt.merge_application` counter is deleted, and with it the
-/// kernel's wire-merge path: the only remaining caller of `merge_ops` is
-/// oplog replay, which applies a document's own history in order and never
-/// reconciles a concurrent branch. So concurrent merge into kernel documents
-/// is now impossible rather than merely unobserved, and the counter was
-/// removed rather than left reading zero forever.
-///
-/// This type survives because replay still classifies, and because a future
-/// caller would want the same accounting. It has **no production consumer
-/// today** — see `docs/change-feed.md`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MergeStats {
-    /// Applications where the incoming ops were a pure continuation of
-    /// every touched block's local frontier — no concurrent branch existed
-    /// for diamond-types to reconcile.
-    pub fast_forwards: u64,
-    /// Applications where at least one touched block's local frontier had
-    /// diverged from the incoming ops' causal history — diamond-types
-    /// actually widened the frontier to represent, then reconcile, two
-    /// independent branches.
-    pub concurrent_merges: u64,
-}
+    /// A payload carrying exactly one freshly-created block.
+    pub fn from_new_block(snapshot: BlockSnapshot) -> Self {
+        Self {
+            block_ops: Vec::new(),
+            new_blocks: vec![snapshot],
+            updated_headers: Vec::new(),
+            deleted_blocks: Vec::new(),
+        }
+    }
 
-/// How one applied `SyncPayload` was classified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeOutcome {
-    /// Pure continuation — merge did nothing a plain ordered log could not.
-    FastForward,
-    /// diamond-types reconciled a genuinely concurrent branch.
-    Concurrent,
-}
+    /// A payload carrying exactly one updated header (a metadata-only
+    /// mutation — status, collapsed, excluded, etc.).
+    pub fn from_updated_header(header: BlockHeader) -> Self {
+        Self {
+            block_ops: Vec::new(),
+            new_blocks: Vec::new(),
+            updated_headers: vec![header],
+            deleted_blocks: Vec::new(),
+        }
+    }
 
-impl MergeStats {
-    /// Classify the single application that moved `before` to `self`.
-    ///
-    /// Returns `None` when neither counter moved: the payload carried no DTE
-    /// ops at all (headers only), which is not a merge outcome and must not
-    /// be recorded as a fast-forward — doing so would dilute the very ratio
-    /// this measurement exists to establish.
-    ///
-    /// `Concurrent` wins a tie by construction rather than by preference:
-    /// `merge_ops` classifies a whole payload once, so a payload touching
-    /// several blocks counts as concurrent if *any* of them reconciled a real
-    /// branch, and only one of the two counters can move per application. The
-    /// tie case is therefore unreachable through `merge_ops`; the ordering
-    /// here just makes the unreachable case fail safe — toward "merge did
-    /// real work" — rather than silently under-reporting concurrency.
-    pub fn outcome_since(&self, before: &MergeStats) -> Option<MergeOutcome> {
-        if self.concurrent_merges > before.concurrent_merges {
-            Some(MergeOutcome::Concurrent)
-        } else if self.fast_forwards > before.fast_forwards {
-            Some(MergeOutcome::FastForward)
-        } else {
-            None
+    /// A payload carrying exactly one text edit against a known block.
+    pub fn from_text_edit(id: BlockId, edit: TextEdit) -> Self {
+        Self {
+            block_ops: vec![(id, edit)],
+            new_blocks: Vec::new(),
+            updated_headers: Vec::new(),
+            deleted_blocks: Vec::new(),
+        }
+    }
+
+    /// A payload carrying exactly one block tombstone.
+    pub fn from_deletion(id: BlockId) -> Self {
+        Self {
+            block_ops: Vec::new(),
+            new_blocks: Vec::new(),
+            updated_headers: Vec::new(),
+            deleted_blocks: vec![id],
         }
     }
 }
@@ -1927,65 +1837,47 @@ mod tests {
         BlockStore::new(ContextId::new(), PrincipalId::new())
     }
 
-    /// `outcome_since` classifies one merge application as a fast-forward or a
-    /// concurrent reconcile. It used to feed the `kaijutsu.crdt.merge_application`
-    /// metric from the server's `push_ops` handler; both are deleted, because
-    /// removing that handler made concurrent merge structurally impossible
-    /// rather than merely unobserved (see [`MergeStats`]).
-    ///
-    /// The tests stay. The classification is still the thing that would tell us
-    /// if that structural claim ever stopped being true, and it would go wrong
-    /// *quietly*, so it gets real tests rather than trust.
-    #[test]
-    fn outcome_since_reports_a_fast_forward() {
-        let before = MergeStats {
-            fast_forwards: 7,
-            concurrent_merges: 2,
-        };
-        let after = MergeStats {
-            fast_forwards: 8,
-            concurrent_merges: 2,
-        };
-        assert_eq!(after.outcome_since(&before), Some(MergeOutcome::FastForward));
+    /// `StoreSnapshot` used to carry `block_history: Vec<SerializedOpsOwned>`
+    /// (a per-block diamond-types-extended oplog) alongside `blocks`, deleted
+    /// with DTE (see `content.rs`'s module doc). Real databases still hold
+    /// snapshot rows encoded with that key present, and the first boot after
+    /// this change must decode them. ciborium + serde derive encode structs
+    /// as CBOR maps keyed by field name with no `deny_unknown_fields`
+    /// anywhere in this crate — the same additive-evolution contract
+    /// `kaijutsu_types::codec`'s tests establish for `BlockSnapshot` — so an
+    /// old-shape row decodes fine: the unknown `block_history` key is
+    /// tolerated and dropped. Proven here against a mimic of the
+    /// pre-removal shape, not assumed.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OldStoreSnapshotMimic {
+        context_id: ContextId,
+        blocks: Vec<BlockSnapshot>,
+        block_history: Vec<Vec<u8>>,
+        deleted_blocks: Vec<BlockId>,
     }
 
     #[test]
-    fn outcome_since_reports_a_concurrent_merge() {
-        let before = MergeStats {
-            fast_forwards: 7,
-            concurrent_merges: 2,
+    fn old_shape_store_snapshot_with_block_history_still_decodes() {
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 0);
+        let snap = crate::BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello")
+            .build();
+        let old = OldStoreSnapshotMimic {
+            context_id: ctx,
+            blocks: vec![snap],
+            // Arbitrary non-empty bytes standing in for a real per-block DTE
+            // oplog — decode only needs the KEY present and the VALUE
+            // well-formed CBOR; the bytes themselves are never interpreted.
+            block_history: vec![vec![1, 2, 3, 4]],
+            deleted_blocks: Vec::new(),
         };
-        let after = MergeStats {
-            fast_forwards: 7,
-            concurrent_merges: 3,
-        };
-        assert_eq!(after.outcome_since(&before), Some(MergeOutcome::Concurrent));
-    }
-
-    /// A header-only payload moves neither counter. Recording it as a
-    /// fast-forward would inflate the denominator and make concurrency look
-    /// rarer than it is — the exact direction of error that would wrongly
-    /// green-light retiring the merge path.
-    #[test]
-    fn outcome_since_reports_nothing_when_no_dte_ops_applied() {
-        let stats = MergeStats {
-            fast_forwards: 7,
-            concurrent_merges: 2,
-        };
-        assert_eq!(stats.outcome_since(&stats), None);
-    }
-
-    /// Unreachable through `merge_ops` (it classifies each payload once), but
-    /// pinned so the tie fails toward "merge did real work" rather than
-    /// silently under-reporting concurrency if that ever changes.
-    #[test]
-    fn outcome_since_prefers_concurrent_when_both_moved() {
-        let before = MergeStats::default();
-        let after = MergeStats {
-            fast_forwards: 1,
-            concurrent_merges: 1,
-        };
-        assert_eq!(after.outcome_since(&before), Some(MergeOutcome::Concurrent));
+        let bytes = kaijutsu_types::codec::encode(&old).expect("encode old-shape mimic");
+        let restored: StoreSnapshot =
+            kaijutsu_types::codec::decode(&bytes).expect("old-shape row must still decode");
+        assert_eq!(restored.context_id, ctx);
+        assert_eq!(restored.blocks.len(), 1);
+        assert_eq!(restored.blocks[0].content, "hello");
     }
 
     /// Measure the block-insert hot path at coder scale (append-only, the way a
@@ -2846,7 +2738,7 @@ mod tests {
             .unwrap();
 
         // Sync store1 → store2
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
 
         assert_eq!(store2.block_count(), 1);
@@ -2873,7 +2765,7 @@ mod tests {
             .unwrap();
 
         // Initial sync
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
         assert_eq!(store2.block_count(), 1);
 
@@ -2926,7 +2818,7 @@ mod tests {
             .unwrap();
 
         // Initial sync so store2 knows about id1
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
         assert_eq!(store2.block_count(), 1);
 
@@ -2999,7 +2891,7 @@ mod tests {
             .unwrap();
 
         // Initial sync
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
 
         // Store1 changes status
@@ -3041,7 +2933,7 @@ mod tests {
             .unwrap();
 
         // Initial sync
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
 
         // Store1 collapses the block
@@ -3089,7 +2981,7 @@ mod tests {
             .unwrap();
 
         // Initial sync
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
         assert_eq!(store2.block_count(), 2);
 
@@ -3158,7 +3050,7 @@ mod tests {
             .unwrap();
 
         // Sync to store2
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
 
         // Ordering should match
@@ -3230,7 +3122,7 @@ mod tests {
         let store1_clock = store1.lamport_clock;
 
         // Sync to store2 (which has Lamport = 0)
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
 
         // Store2's clock should have advanced past store1's
@@ -3239,116 +3131,6 @@ mod tests {
             "merge should advance Lamport clock past remote: {} > {}",
             store2.lamport_clock,
             store1_clock
-        );
-    }
-
-    // ── Wire-merge classifier (merge_stats) ─────────────────────────────
-    //
-    // docs/crdt-position-2026-08.md Part 1, empirical question 1: does
-    // `merge_ops` see a genuinely concurrent frontier, or a fast-forward?
-    // These are the TDD-first tests for the classifier: written and
-    // confirmed failing (accessor didn't exist) before `merge_stats()` and
-    // the atomics were added.
-
-    #[test]
-    fn test_merge_stats_fast_forward_no_divergence() {
-        // store1 writes, store2 has never diverged from the common (empty)
-        // base — applying store1's ops is a pure continuation, not a merge
-        // of two independently-advanced frontiers.
-        let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
-
-        let id = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        store1.edit_text(&id, 5, ", world", 0).unwrap();
-
-        let payload = store1.ops_since(&HashMap::new());
-        store2.merge_ops(payload).unwrap();
-
-        let stats = store2.merge_stats();
-        assert_eq!(
-            stats.fast_forwards, 1,
-            "a payload with no local divergence must classify as a fast-forward"
-        );
-        assert_eq!(
-            stats.concurrent_merges, 0,
-            "no concurrent branch existed — nothing for DTE to reconcile"
-        );
-
-        // A second, purely-incremental sync is still a fast-forward.
-        store1.edit_text(&id, 12, "!", 0).unwrap();
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
-        store2.merge_ops(payload).unwrap();
-
-        let stats = store2.merge_stats();
-        assert_eq!(stats.fast_forwards, 2);
-        assert_eq!(stats.concurrent_merges, 0);
-    }
-
-    #[test]
-    fn test_merge_stats_concurrent_merge_on_true_divergence() {
-        // Both stores start from a common synced frontier, then BOTH edit
-        // the same block independently before either sees the other's
-        // change — a genuine diamond that diamond-types has to reconcile.
-        let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
-
-        let id = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Common base: store2 has exactly what store1 has right now.
-        let payload = store1.ops_since(&HashMap::new());
-        store2.merge_ops(payload).unwrap();
-        assert_eq!(
-            store2.merge_stats().fast_forwards,
-            1,
-            "the initial sync to a common base is itself a fast-forward"
-        );
-
-        // Diverge BOTH sides from that common frontier.
-        store1.edit_text(&id, 5, " store1", 0).unwrap();
-        store2.edit_text(&id, 5, " store2", 0).unwrap();
-
-        // Bring store1's ops into store2. Deliberately send full history
-        // from root (`ops_since(&HashMap::new())`) rather than an
-        // incremental frontier: a DTE `Frontier` is local-LV-numbered and
-        // not portable across independently-diverged replicas (see
-        // `Document::remote_frontier()`'s doc comment) — `merge_ops`
-        // dedups the already-known prefix, so sending the full history is
-        // the safe way to bring two diverged replicas together, and is the
-        // same pattern `test_concurrent_inserts_no_interleaving` uses above.
-        let payload = store1.ops_since(&HashMap::new());
-        store2.merge_ops(payload).unwrap();
-
-        let stats = store2.merge_stats();
-        assert_eq!(
-            stats.concurrent_merges, 1,
-            "two independently-diverged frontiers must classify as a genuine concurrent merge"
-        );
-        assert_eq!(
-            stats.fast_forwards, 1,
-            "the earlier common-base sync stays the only fast-forward — it must not be double-counted"
         );
     }
 
@@ -3424,8 +3206,8 @@ mod tests {
             .unwrap();
 
         // Sync both ways
-        let payload1 = store1.ops_since(&HashMap::new());
-        let payload2 = store2.ops_since(&HashMap::new());
+        let payload1 = store1.ops_since(&HashSet::new());
+        let payload2 = store2.ops_since(&HashSet::new());
         store1.merge_ops(payload2).unwrap();
         store2.merge_ops(payload1).unwrap();
 
@@ -3568,11 +3350,15 @@ mod tests {
         assert!(ordered.iter().all(|b| b.order_key.as_ref().unwrap().starts_with("V0")));
     }
 
+    /// A text edit on a block already known to a peer reaches that peer
+    /// through `merge_ops` when it travels as an explicit `TextEdit` — the
+    /// shape every real journal entry takes (kernel `edit_text_as`/
+    /// `append_text_as` build exactly this; see `block_store.rs`, kernel
+    /// crate, "Durable state and the wire"). `frontier`/`ops_since`
+    /// deliberately do NOT attempt this for a known block (see their doc
+    /// comments) — this test exercises the actual mechanism that does.
     #[test]
     fn test_incremental_text_sync_after_merge() {
-        // Verifies that ops_since sends full DTE ops for new blocks,
-        // so the receiver gets causal history and subsequent incremental
-        // text ops can merge successfully.
         let ctx = ContextId::new();
         let mut store1 = BlockStore::new(ctx, PrincipalId::new());
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
@@ -3581,17 +3367,20 @@ mod tests {
             .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .unwrap();
 
-        // Sync to store2
-        let payload = store1.ops_since(&HashMap::new());
+        // Sync the new block to store2.
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
         assert_eq!(store2.block_count(), 1);
 
-        // Store1 appends text
+        // Store1 appends text locally...
         store1.append_text(&id, "Hello").unwrap();
 
-        // Try incremental sync using store2's frontier
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
+        // ...and the same edit, expressed as an explicit TextEdit, reaches
+        // store2 through merge_ops.
+        let payload = SyncPayload::from_text_edit(
+            id,
+            TextEdit { pos: None, insert: "Hello".to_string(), delete: 0 },
+        );
         let result = store2.merge_ops(payload);
 
         assert!(result.is_ok(), "incremental text sync failed: {:?}", result);
@@ -4109,59 +3898,49 @@ mod tests {
     }
 
     // =====================================================================
-    // Lamport clock: DTE-only merge
+    // Lamport clock: text-only merge
     // =====================================================================
 
+    /// A block already known to a peer, then a text-only edit merged in —
+    /// no header change, no new block — must still advance the receiver's
+    /// Lamport clock. Before this migration this exercised a "DTE-only"
+    /// payload (a header-stripped `ops_since` sync); `ops_since` no longer
+    /// carries incremental text at all (see its doc comment), so this
+    /// builds the direct `TextEdit` payload a real oplog entry actually
+    /// is (see `test_incremental_text_sync_after_merge`).
     #[test]
-    fn test_lamport_clock_advances_after_dte_only_sync() {
-        // Two stores for the same context
+    fn test_lamport_clock_advances_after_text_only_merge() {
         let ctx = ContextId::new();
         let mut store1 = BlockStore::new(ctx, PrincipalId::new());
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
-        // Create a block in store1 and sync it to store2 (initial sync)
         let id = store1
             .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .unwrap();
-        let payload = store1.ops_since(&HashMap::new());
+        let payload = store1.ops_since(&HashSet::new());
         store2.merge_ops(payload).unwrap();
         assert_eq!(store2.block_count(), 1);
 
-        // Record store2's clock after initial sync
         let clock_after_initial = store2.lamport_clock;
 
-        // Store1 appends text (DTE ops only — no header changes, no new blocks)
         store1.append_text(&id, "Hello world").unwrap();
 
-        // Generate incremental sync and strip headers to simulate a DTE-only payload.
-        // This happens when a relay or middleware forwards only the DTE delta
-        // without header metadata (e.g., ephemeral streaming, partial sync).
-        let frontiers = store2.frontier();
-        let mut payload = store1.ops_since(&frontiers);
-        payload.updated_headers.clear(); // DTE-only: no header updates
-
-        // Confirm this is a DTE-only payload
-        assert!(!payload.block_ops.is_empty(), "payload should have DTE ops");
-        assert!(
-            payload.new_blocks.is_empty(),
-            "payload should have no new blocks"
+        // A text-only payload: no new blocks, no header updates.
+        let payload = SyncPayload::from_text_edit(
+            id,
+            TextEdit { pos: None, insert: "Hello world".to_string(), delete: 0 },
         );
-        assert!(
-            payload.updated_headers.is_empty(),
-            "payload should have no updated headers"
-        );
+        assert!(payload.new_blocks.is_empty(), "payload should have no new blocks");
+        assert!(payload.updated_headers.is_empty(), "payload should have no updated headers");
 
-        // Merge into store2
         store2.merge_ops(payload).unwrap();
 
-        // Verify the text arrived
         let snap = store2.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.content, "Hello world");
 
-        // The bug: store2's Lamport clock should have advanced, but it didn't
         assert!(
             store2.lamport_clock > clock_after_initial,
-            "Lamport clock should advance after DTE-only merge: got {} (should be > {})",
+            "Lamport clock should advance after a text-only merge: got {} (should be > {})",
             store2.lamport_clock,
             clock_after_initial
         );
@@ -4411,7 +4190,7 @@ mod tests {
 
         // Sync to store_b so both have the same block
         let mut store_b = BlockStore::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashMap::new());
+        let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
         // Peer A sets ephemeral=true
@@ -4473,7 +4252,7 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashMap::new());
+        let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
         // A: set collapsed=true (tick 1 after sync)
@@ -4525,7 +4304,7 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashMap::new());
+        let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
         // A sets status to Done
@@ -4571,7 +4350,7 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashMap::new());
+        let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
         // Both peers set status at the same Lamport tick.
@@ -4619,7 +4398,7 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashMap::new());
+        let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
         // Both peers set content_type at the same Lamport tick.
@@ -4716,7 +4495,7 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashMap::new());
+        let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
         // `merge_clock` (block_store.rs) sets the receiver's Lamport clock to

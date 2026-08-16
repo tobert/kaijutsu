@@ -1,11 +1,12 @@
-//! Per-block DTE content with metadata.
+//! Per-block content with metadata.
 //!
-//! Each block owns its own diamond-types-extended `Document` for content,
-//! plus a `BlockHeader` for metadata (kind, role, status, parent_id, etc.).
-//! This replaces the shared-Document model where all blocks lived as paths
-//! in a single DTE Document.
-
-use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uuid};
+//! Each block owns its content as a plain `String`, plus a `BlockHeader` for
+//! metadata (kind, role, status, parent_id, etc.). Text used to be a
+//! per-block diamond-types-extended `Document` (a character-level CRDT); the
+//! kernel is the sole sequencer for every mutation (CLAUDE.md "Durable state
+//! and the wire"), so no block ever needed concurrent-branch reconciliation,
+//! and the CRDT was retired in favor of the plain `String` it always
+//! materialized down to. See `docs/crdt-position-2026-08.md`.
 
 use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus};
 use kaijutsu_types::Tick;
@@ -194,21 +195,27 @@ pub(crate) fn order_key_successor(pred: &str, suffix: &str) -> String {
 
 /// A single block's content and metadata.
 ///
-/// The DTE Document holds the block's text content (character-level CRDT).
-/// The BlockHeader holds identity, kind, role, status, etc. (plain data).
-/// The order_key determines sibling ordering (fractional index).
+/// `text` holds the block's content directly — no per-block CRDT, because no
+/// block is ever concurrently edited (the kernel is the sole sequencer for
+/// every mutation; see CLAUDE.md "Durable state and the wire"). The
+/// BlockHeader holds identity, kind, role, status, etc. (plain data). The
+/// order_key determines sibling ordering (fractional index).
 pub struct BlockContent {
     /// Block identity + metadata.
     header: BlockHeader,
 
-    /// This block's own DTE Document instance — just for content.
-    /// Text blocks: DTE Text CRDT (character-level editing).
-    /// ToolCall blocks: DTE Text for tool_input (streamable JSON).
-    /// File blocks: DTE Text (full file content).
-    doc: Document,
+    /// This block's content, char-indexed (never byte-indexed — the project
+    /// has already been bitten by that confusion once; see `edit_text`).
+    /// Text blocks: the message text. ToolCall blocks: tool_input
+    /// (streamable JSON). File blocks: the full file content.
+    text: String,
 
-    /// DTE agent ID for this replica.
-    agent: AgentId,
+    /// `text.chars().count()`, maintained incrementally on every edit rather
+    /// than recomputed. The kernel reads this once per streamed token (to
+    /// stamp the journaled `TextEdit`'s `pos`); a `chars().count()` rescan
+    /// there would make every token O(the whole block's length so far)
+    /// instead of O(the token's own length) — see `append_text`.
+    char_len: usize,
 
     /// Fractional index for sibling ordering (base-62 lexicographic).
     /// Calculated via order_midpoint() on insertion (or derived from `tick`).
@@ -270,20 +277,15 @@ pub struct BlockContent {
 
 impl BlockContent {
     /// Create a new block with empty content.
-    pub fn new(header: BlockHeader, principal_id: PrincipalId, order_key: String) -> Self {
-        let mut doc = Document::new();
-        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
-        let agent = doc.create_agent(dte_uuid);
-
-        // Create the text CRDT for content
-        doc.transact(agent, |tx| {
-            tx.root().create_text("content");
-        });
-
+    ///
+    /// `_principal_id` is unused now that content has no per-replica CRDT
+    /// agent — kept as a parameter so every call site across the kernel
+    /// (which threads authorship through it) does not need to change.
+    pub fn new(header: BlockHeader, _principal_id: PrincipalId, order_key: String) -> Self {
         Self {
             header,
-            doc,
-            agent,
+            text: String::new(),
+            char_len: 0,
             order_key,
             tick: None,
             track: None,
@@ -319,13 +321,8 @@ impl BlockContent {
     ) -> Self {
         let mut block = Self::new(header, principal_id, order_key);
         block.tick = tick;
-        if !content.is_empty() {
-            block.doc.transact(block.agent, |tx| {
-                if let Some(mut text) = tx.get_text_mut(&["content"]) {
-                    text.insert(0, content);
-                }
-            });
-        }
+        block.char_len = content.chars().count();
+        block.text = content.to_string();
         block
     }
 
@@ -364,88 +361,53 @@ impl BlockContent {
         block
     }
 
-    /// Create from a BlockSnapshot with a **bare** DTE Document (no structure).
-    ///
-    /// Used during sync: metadata comes from the snapshot, but the DTE Document
-    /// is completely empty — no `create_text("content")` op. The sender's full
-    /// DTE ops (including the structure creation) will be merged in, preserving
-    /// causal history so subsequent incremental DTE ops can merge successfully.
-    pub fn from_snapshot_for_sync(
-        snap: &BlockSnapshot,
-        principal_id: PrincipalId,
-        fallback_order_key: String,
-    ) -> Self {
-        let header = BlockHeader::from_snapshot(snap);
-        let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
-
-        // Bare DTE Document — no create_text, no content. Sender's ops provide everything.
-        let mut doc = Document::new();
-        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
-        let agent = doc.create_agent(dte_uuid);
-
-        Self {
-            header,
-            doc,
-            agent,
-            order_key,
-            tick: snap.tick,
-            track: snap.track.clone(),
-            tool_name: snap.tool_name.clone(),
-            tool_input: snap.tool_input.clone(),
-            tool_call_id: snap.tool_call_id,
-            tool_use_id: snap.tool_use_id.clone(),
-            output: snap.output.clone(),
-            stderr: snap.stderr.clone(),
-            signature: snap.signature.clone(),
-            source_context: snap.source_context,
-            source_model: snap.source_model.clone(),
-            drift_kind: snap.drift_kind,
-            file_path: snap.file_path.clone(),
-            error: snap.error.clone(),
-            notification: snap.notification.clone(),
-            resource: snap.resource.clone(),
-            collapsed: snap.collapsed,
-            ephemeral: snap.ephemeral,
-            excluded: snap.excluded,
-            deleted: false,
-        }
-    }
-
     // ── Content access ──────────────────────────────────────────────────
 
     /// Get the current text content.
     pub fn text(&self) -> String {
         #[cfg(test)]
         TEXT_CALL_COUNT.with(|c| c.set(c.get() + 1));
-        self.doc
-            .get_text(&["content"])
-            .map(|t| t.content())
-            .unwrap_or_default()
+        self.text.clone()
     }
 
-    /// Edit text at a position (insert and/or delete).
+    /// Convert a CHARACTER index into the corresponding byte index into
+    /// `s`. `char_idx == s.chars().count()` (one past the last char, the
+    /// append position) maps to `s.len()`. Never byte-indexes directly —
+    /// callers pass character offsets, and this project has already been
+    /// bitten by the byte/char confusion once (see `kaijutsu:read`/`edit`'s
+    /// hashline addressing).
+    fn char_to_byte(s: &str, char_idx: usize) -> usize {
+        s.char_indices()
+            .nth(char_idx)
+            .map(|(byte_idx, _)| byte_idx)
+            .unwrap_or(s.len())
+    }
+
+    /// Edit text at a position (insert and/or delete). `pos` and `delete`
+    /// are CHARACTER offsets, never byte offsets.
     pub fn edit_text(&mut self, pos: usize, insert: &str, delete: usize) {
-        self.doc.transact(self.agent, |tx| {
-            if let Some(mut text) = tx.get_text_mut(&["content"]) {
-                if delete > 0 {
-                    text.delete(pos..pos + delete);
-                }
-                if !insert.is_empty() {
-                    text.insert(pos, insert);
-                }
-            }
-        });
+        if delete == 0 && insert.is_empty() {
+            return;
+        }
+        let byte_start = Self::char_to_byte(&self.text, pos);
+        let byte_end = Self::char_to_byte(&self.text, pos + delete);
+        self.text.replace_range(byte_start..byte_end, insert);
+        self.char_len = self.char_len - delete + insert.chars().count();
     }
 
-    /// Append text to the end.
+    /// Append text to the end. `String::push_str` is amortized O(1) and
+    /// `char_len`'s update is O(the token's own length), never O(the whole
+    /// block) — no re-materialization, since this runs once per streamed
+    /// token.
     pub fn append_text(&mut self, text: &str) {
-        let len = self.text().chars().count();
-        self.edit_text(len, text, 0);
+        self.text.push_str(text);
+        self.char_len += text.chars().count();
     }
 
-    /// Get the character count of the content.
+    /// Get the character count of the content. O(1) — reads the counter
+    /// `edit_text`/`append_text` maintain incrementally, not a rescan.
     pub fn content_len(&self) -> usize {
-        self.text().chars().count()
+        self.char_len
     }
 
     // ── Metadata access ─────────────────────────────────────────────────
@@ -640,39 +602,6 @@ impl BlockContent {
         self.header.exit_code = val;
         self.header.tool_meta_at = lamport_ts;
         self.header.updated_at = self.header.max_field_ts();
-    }
-
-    // ── Sync ────────────────────────────────────────────────────────────
-
-    /// Get operations since a frontier (per-block sync).
-    pub fn ops_since(&self, frontier: &Frontier) -> SerializedOpsOwned {
-        self.doc.ops_since_owned(frontier)
-    }
-
-    /// Get full DTE ops from the root frontier (for persistence snapshots).
-    pub fn root_ops(&self) -> SerializedOpsOwned {
-        self.doc.ops_since_owned(&Frontier::root())
-    }
-
-    /// Merge remote operations into this block's content.
-    pub fn merge_ops(&mut self, ops: SerializedOpsOwned) -> crate::Result<()> {
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.doc.merge_ops(ops)));
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(crate::CrdtError::Internal(format!(
-                "block merge error: {:?}",
-                e
-            ))),
-            Err(_) => Err(crate::CrdtError::Internal(
-                "block CRDT merge panicked".into(),
-            )),
-        }
-    }
-
-    /// Get the current frontier (per-block version).
-    pub fn frontier(&self) -> Frontier {
-        self.doc.version().clone()
     }
 
     // ── Snapshot ─────────────────────────────────────────────────────────
@@ -1014,5 +943,71 @@ mod snapshot_threading_tests {
         let back: BlockSnapshot = kaijutsu_types::codec::decode(&bytes).expect("decode");
         assert_eq!(back.track, Some(TrackId::new("drums").unwrap()));
         assert_eq!(back.tick, Some(Tick::new(3)));
+    }
+}
+
+#[cfg(test)]
+mod text_edit_tests {
+    use super::*;
+    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContextId};
+
+    fn block() -> BlockContent {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string())
+    }
+
+    // `pos`/`delete` are CHARACTER offsets, not byte offsets. The regression
+    // this pins: a byte-indexed `edit_text` either panics (slicing mid
+    // codepoint) or silently corrupts text (wrong byte boundary) on any
+    // edit at a position past a multibyte character — exactly the failure
+    // class DTE's char-indexed API was hiding and this migration must not
+    // reintroduce.
+
+    #[test]
+    fn edit_at_interior_position_past_multibyte_chars() {
+        let mut b = block();
+        b.append_text("日本語 🎵");
+        // Chars: 日(0) 本(1) 語(2) ' '(3) 🎵(4) — 5 chars, but the first three
+        // are 3 bytes each and 🎵 is 4 bytes, so any byte offset derived from
+        // `pos` naively (e.g. `pos` used as a byte index) would split a
+        // codepoint. Insert "X" between 語 and the space (char index 3).
+        b.edit_text(3, "X", 0);
+        assert_eq!(b.text(), "日本語X 🎵");
+        assert_eq!(b.content_len(), 6);
+    }
+
+    #[test]
+    fn delete_spanning_a_multibyte_char() {
+        let mut b = block();
+        b.append_text("日本語 🎵");
+        // Delete "本語" (char indices 1..3) and insert "ABC" in their place.
+        b.edit_text(1, "ABC", 2);
+        assert_eq!(b.text(), "日ABC 🎵");
+        assert_eq!(b.content_len(), 6);
+    }
+
+    #[test]
+    fn append_after_multibyte_content_lands_at_the_true_end() {
+        let mut b = block();
+        b.append_text("日本語");
+        b.append_text(" 🎵 done");
+        assert_eq!(b.text(), "日本語 🎵 done");
+    }
+
+    #[test]
+    fn edit_text_no_op_on_empty_insert_and_zero_delete() {
+        let mut b = block();
+        b.append_text("hello");
+        b.edit_text(2, "", 0);
+        assert_eq!(b.text(), "hello");
+    }
+
+    #[test]
+    fn content_len_counts_characters_not_bytes() {
+        let mut b = block();
+        b.append_text("日本語"); // 3 chars, 9 bytes
+        assert_eq!(b.content_len(), 3);
+        assert_eq!(b.text().len(), 9, "sanity: the fixture really is multibyte");
     }
 }

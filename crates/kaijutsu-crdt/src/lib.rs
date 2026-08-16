@@ -1,15 +1,21 @@
-//! Block-based CRDT document model for Kaijutsu.
+//! Block-based document model for Kaijutsu.
 //!
 //! # Architecture
 //!
-//! `BlockStore` is the storage model: per-block DTE instances. Each block
-//! owns its own diamond-types-extended Document for content. Metadata lives
-//! in `BlockHeader` (plain data).
+//! `BlockStore` is the storage model: each block owns its content as a plain
+//! `String`. Metadata lives in `BlockHeader` (plain data).
+//!
+//! Text used to run through diamond-types-extended, a character-level CRDT —
+//! retired 2026-08-16 because no block is ever concurrently edited (the
+//! kernel is the sole sequencer for every mutation; see CLAUDE.md "Durable
+//! state and the wire") and the CRDT never earned its keep past what it
+//! materialized down to anyway. See `docs/crdt-position-2026-08.md`.
 //!
 //! The legacy `BlockDocument` model (a single shared DTE Document with all
-//! blocks addressed as paths within it) was removed 2026-08-09 — see
-//! `docs/crdt-position-2026-08.md` for the position review that found it
-//! dead weight, with its only outside consumer down to a single test.
+//! blocks addressed as paths within it) was removed 2026-08-09, before this
+//! retirement — see `docs/crdt-position-2026-08.md` for the position review
+//! that found it dead weight, with its only outside consumer down to a
+//! single test.
 //!
 //! # Block Types
 //!
@@ -25,7 +31,6 @@
 pub mod block_store;
 pub(crate) mod content;
 mod error;
-mod ops;
 pub mod selection;
 
 // Re-export types from kaijutsu-types
@@ -39,14 +44,13 @@ pub use kaijutsu_types::{
 };
 
 // New architecture
-pub use block_store::{BlockStore, ForkBlockFilter, MergeStats, StoreSnapshot, SyncPayload};
+pub use block_store::{BlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit};
 pub use selection::{
     IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
 };
 pub use content::BlockContent;
 
 pub use error::CrdtError;
-pub use ops::{Frontier, LV, SerializedOps, SerializedOpsOwned};
 
 /// Result type for CRDT operations.
 pub type Result<T> = std::result::Result<T, CrdtError>;
