@@ -1550,6 +1550,15 @@ pub struct KernelDb {
 }
 
 impl KernelDb {
+    /// Narrow accessor for the DB-injected `approval-ledger` crate, whose
+    /// whole API borrows whatever connection the caller owns. Deliberately
+    /// the ONLY way kernel code reaches the raw connection — the ledger's
+    /// tables live in this DB (see [`Self::migrate_ledger`]), and its
+    /// functions are the sanctioned callers.
+    pub(crate) fn conn_for_ledger(&self) -> &Connection {
+        &self.conn
+    }
+
     fn init_connection(conn: &Connection) -> SqliteResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1812,6 +1821,7 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
+        Self::migrate_ledger(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
@@ -1822,8 +1832,20 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
+        Self::migrate_ledger(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Migrate the approval-ledger schema into the kernel DB. The ledger is
+    /// DB-injected (`approval_ledger::migrate` borrows whatever connection
+    /// the caller owns), so the kernel owns the single connection and the
+    /// ledger's tables live beside the kernel's own — one DB, one backup,
+    /// one WAL. `execute_batch`'s `CREATE TABLE IF NOT EXISTS` makes this
+    /// idempotent across every open.
+    fn migrate_ledger(conn: &Connection) -> KernelDbResult<()> {
+        approval_ledger::migrate(conn)?;
+        Ok(())
     }
 
     /// Read any legacy `rc_scripts` rows from a pre-files DB, as

@@ -671,8 +671,23 @@ impl Tool for KjBuiltin {
         // verbs are wrapped — wrapping every `kj` call would freeze the clock
         // through a tight `while true; do kj …; done` and the watchdog would
         // never catch the runaway. See docs/issues.md (kaish `patient` adoption).
-        let result = if is_distill_verb(&argv) {
-            let budget = self.dispatcher.kernel().timeouts().llm_request_timeout;
+        //
+        // Approval-gated verbs (`kj cc send` today) get the same treatment for
+        // the same reason, one degree worse: they block on a HUMAN answering
+        // from another surface (`kj approve`), up to `gate_wait_timeout`. The
+        // rc/hook kaish budgets are 10–30s, far shorter than that, so without
+        // a patient hold the watchdog would kill the gate long before its own
+        // deadline fired — "passes tests, dies in production" (docs/issues.md,
+        // Gate slice 1a, finding #1). The hold and the gate's poll deadline
+        // read the SAME `gate_wait_timeout` so they cannot drift apart.
+        let budget = if is_distill_verb(&argv) {
+            Some(self.dispatcher.kernel().timeouts().llm_request_timeout)
+        } else if is_gated_verb(&argv) {
+            Some(self.dispatcher.kernel().timeouts().gate_wait_timeout)
+        } else {
+            None
+        };
+        let result = if let Some(budget) = budget {
             let _patient = ctx.patient(budget);
             self.dispatcher.dispatch(&argv, &caller).await
         } else {
@@ -819,6 +834,22 @@ fn is_distill_verb(argv: &[String]) -> bool {
         (Some("fork"), _) => has("--compact"),
         (Some("drift"), Some("pull")) | (Some("drift"), Some("merge")) => true,
         (Some("drift"), Some("push")) => has("--summarize"),
+        _ => false,
+    }
+}
+
+/// Verbs that block on the approval ledger (`kj/gate.rs`) and therefore need
+/// the script clock frozen around them — see the `patient` comment at the
+/// dispatch site. `kj cc send --dry-run` writes nothing and is NOT gated, so
+/// it is not gated here either; and because clap's trailing-variadic message
+/// swallows a `--dry-run` placed AFTER the target, "the flag appears anywhere
+/// in argv" is exactly the right test for "this is really a dry run".
+fn is_gated_verb(argv: &[String]) -> bool {
+    match (
+        argv.first().map(String::as_str),
+        argv.get(1).map(String::as_str),
+    ) {
+        (Some("cc"), Some("send")) => !argv.iter().any(|a| a == "--dry-run"),
         _ => false,
     }
 }
@@ -2001,6 +2032,30 @@ mod tests {
         assert!(!is_distill_verb(&argv("block list")));
         assert!(!is_distill_verb(&argv("context list")));
         assert!(!is_distill_verb(&[]));
+    }
+
+    /// The gate's patient-hold must wrap exactly the verbs that block on the
+    /// approval ledger — today `kj cc send` without `--dry-run` — and nothing
+    /// else. Freezing the script clock for an ungated verb would hide a real
+    /// wedge from the watchdog; missing a gated one lets kaish kill the wait
+    /// before the gate's deadline (Gate slice 1a, finding #1).
+    #[test]
+    fn is_gated_verb_classifies_approval_gated_verbs() {
+        let argv = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+
+        // Positive: a real send blocks on a human answer.
+        assert!(is_gated_verb(&argv("cc send kaijutsu-chan hello there")));
+        assert!(is_gated_verb(&argv("cc send 1234 hi")));
+
+        // Negatives: dry-run writes nothing and is exempt — including the
+        // swallowed-flag position, which clap routes into the message only
+        // when `--dry-run` leads, so "anywhere in argv" is the right test.
+        assert!(!is_gated_verb(&argv("cc send --dry-run kaijutsu-chan hi")));
+        assert!(!is_gated_verb(&argv("cc list")));
+        assert!(!is_gated_verb(&argv("cc")));
+        assert!(!is_gated_verb(&argv("approve list")));
+        assert!(!is_gated_verb(&argv("context list")));
+        assert!(!is_gated_verb(&[]));
     }
 
     /// The headline guarantee of the `patient` adoption: a distill verb whose

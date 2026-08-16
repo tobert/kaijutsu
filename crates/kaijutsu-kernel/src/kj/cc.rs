@@ -13,6 +13,15 @@
 //! `kj cc` is deliberately temporary: hooks give Claude Code sessions
 //! contexts, then drift targets them like anything else and this verb
 //! retires (Amy, 2026-08-15).
+//!
+//! ## The send path is ledger-gated
+//!
+//! Amy, 2026-08-16: *"yeah kj cc send should go through the ledger."*
+//! Injecting a turn into another agent's session is exactly the action a
+//! human should authorize, so every real send first leaves a durable ask
+//! row ([`crate::kj::gate`]) and waits for an answer (`kj approve`) until
+//! `gate_wait_timeout` — fail-closed on elapse. `--dry-run` writes nothing
+//! and is exempt.
 
 use std::path::Path;
 
@@ -58,7 +67,7 @@ enum CcCommand {
 }
 
 impl KjDispatcher {
-    pub(crate) fn dispatch_cc(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_cc(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<CcArgs>();
         }
@@ -77,7 +86,9 @@ impl KjDispatcher {
         };
 
         // `List` is read-only host introspection, same ungated rationale as
-        // `kj cas ls`/`kj mcp list`/`kj midi list`.
+        // `kj cas ls`/`kj mcp list`/`kj midi list`. `Send` writes into
+        // another agent's session, so the real path goes through the
+        // approval ledger first (module docs).
         match parsed.command {
             CcCommand::List => cc_list(),
             CcCommand::Send {
@@ -89,9 +100,65 @@ impl KjDispatcher {
                     Some(d) => d,
                     None => return KjResult::Err("kj cc send: $HOME is not set".to_string()),
                 };
-                cc_send_inner(&sessions_dir, FROM_NAME, &target, &message.join(" "), dry_run)
+                let message = message.join(" ");
+                if dry_run {
+                    return cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, true);
+                }
+                let wait = self.kernel.timeouts().gate_wait_timeout;
+                let spec = gate_spec_for_send(&target, &message, &sessions_dir);
+                let outcome = crate::kj::gate::run_gate(&self.kernel_db, caller, spec, wait).await;
+                if !outcome.allowed {
+                    return KjResult::Err(format!(
+                        "kj cc send: approval gate refused ({}): {}",
+                        outcome.status, outcome.reason
+                    ));
+                }
+                cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, false)
             }
         }
+    }
+}
+
+/// Build the gate's ask for one send. The statement marks the message body
+/// a FREE variable, so the ledger's guarantee 3 keeps allow-always rules
+/// structurally impossible for this verb — every send stays human-approved
+/// until that policy changes deliberately. `authorized_label` is the target
+/// exactly as typed (gate research-pass finding #3: the raw reference,
+/// never a resolved label).
+fn gate_spec_for_send(
+    target: &str,
+    message: &str,
+    sessions_dir: &Path,
+) -> crate::kj::gate::GateSpec {
+    // Enrich the description with the resolution when it's available, so
+    // whoever answers sees *which* session they are authorizing.
+    let resolution = claude_code_peer::scan_sessions_dir(sessions_dir)
+        .ok()
+        .and_then(|scan| {
+            claude_code_peer::resolve_target(&scan.sessions, target)
+                .ok()
+                .map(|s| {
+                    format!(
+                        " (pid {}, name {}, cwd {})",
+                        s.descriptor.pid,
+                        s.descriptor.name.as_deref().unwrap_or("-"),
+                        s.descriptor.cwd
+                    )
+                })
+        })
+        .unwrap_or_default();
+    let preview: String = message.chars().take(200).collect();
+    crate::kj::gate::GateSpec {
+        tool: "cc.send",
+        description: format!(
+            "send a cross-session message to Claude Code session {target:?}{resolution}: {preview}"
+        ),
+        rendered: "kj cc send ${TARGET} ${MESSAGE}".into(),
+        authorized_label: target.to_string(),
+        vars: vec![
+            ("TARGET".into(), approval_ledger::types::VarBinding::Bound),
+            ("MESSAGE".into(), approval_ledger::types::VarBinding::Free),
+        ],
     }
 }
 

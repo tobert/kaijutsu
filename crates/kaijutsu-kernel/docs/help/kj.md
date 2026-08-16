@@ -56,6 +56,8 @@ binding         show, allow, revoke, reset — a context's tool-capability allow
                 operator, exec, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
 block           list, inspect, count, read, cat, append, history, diff, status, create,
                 edit (insert|delete|replace)
+approve         list, show, allow, deny — answer pending approval-ledger asks
+                left by gated verbs (e.g. `kj cc send`)
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
 cast            list, show, create, remove, set, slot set|remove — named model
@@ -63,7 +65,9 @@ cast            list, show, create, remove, set, slot set|remove — named model
                 context_type; `set --desc` edits the description after create
                 ("" clears it to NULL)
 cc              list — roster of live Claude Code sessions on this machine,
-                read from ~/.claude/sessions/*.json (never reads *.key files)
+                read from ~/.claude/sessions/*.json (never reads *.key files);
+                send — deliver a message into a live session's inbox, gated
+                behind the approval ledger (`--dry-run` exempt)
 config          list, show, set, edit, reset — CRDT-owned config at /etc/config
                 (system.md, theme.toml, mcp.toml) + per-client at /etc/client
 context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,

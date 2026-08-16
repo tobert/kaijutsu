@@ -13,6 +13,7 @@ pub mod attach;
 pub mod audio;
 pub mod backend;
 pub mod binding;
+pub mod approve;
 pub mod block;
 pub mod cache;
 pub mod cas;
@@ -29,6 +30,7 @@ pub mod drift;
 pub mod drive;
 pub mod fork;
 pub mod format;
+pub mod gate;
 pub mod kaish;
 pub mod mcp;
 pub mod midi;
@@ -437,8 +439,16 @@ impl KjDispatcher {
         // `kj cc` reads Claude Code's own on-disk session registry
         // (~/.claude/sessions/) — a host-filesystem roster, not a kaijutsu
         // context — same exemption rationale as `kj audio`/`kj midi`.
+        // `send` additionally blocks on the approval ledger (`kj/gate.rs`),
+        // hence the async dispatch.
         if cmd == "cc" {
-            return self.dispatch_cc(&argv[1..], caller);
+            return self.dispatch_cc(&argv[1..], caller).await;
+        }
+        // `kj approve` answers approval-ledger asks — it reads the kernel
+        // DB, not a context, and a human must be able to reach it from a
+        // shell with no context joined (that is the point of the gate).
+        if cmd == "approve" {
+            return self.dispatch_approve(&argv[1..], caller);
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
@@ -864,6 +874,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(alias::AliasArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(cc::CcArgs::command())
+        .subcommand(approve::ApproveArgs::command())
         .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())
         .subcommand(midi::MidiArgs::command())
