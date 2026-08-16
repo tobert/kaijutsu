@@ -95,6 +95,15 @@ pub fn dispatch_input(
         // quantum was bigger than a lot of trackpad wheel travel, so it read
         // as a dead zone (nothing happens, then a 20px jump).
         let delta = wheel_delta_px(event.unit, event.y, scale, &scroll.config);
+        // Diagnosed 2026-08-16 (docs/issues.md "Hi-res wheel"): on Wayland,
+        // sub-detent hi-res wheel motion never reaches us — sctk 0.19 has no
+        // AxisValue120 support, so KWin quantizes to whole detents before
+        // delivery. Whole-integer Line events here are the compositor's
+        // fallback, not a bug in this path. Kept at debug! for feel-tuning.
+        debug!(
+            "wheel: unit={:?} y={} scale={} -> delta={:.2}px",
+            event.unit, event.y, scale, delta
+        );
         if delta.abs() > 0.001 {
             action_writer.write(ActionFired::new(
                 Action::ScrollDelta(-delta),

@@ -6,6 +6,39 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Hi-res wheel (v120) blocked at winit/sctk — slow drags are a compositor dead zone (2026-08-16)
+
+Amy's MX Master free-spin wheel: slow drags produce NOTHING until ~a full
+detent accumulates, then a 40px jump. Diagnosed end-to-end; the app pipeline
+is exonerated (a synthetic BRP Line event moves the view on the first notch,
+and the live wheel log shows only whole-integer `Line` events, never
+fractions, never `Pixel`). Chain: MX Master emits sub-detent v120 → KWin
+(Plasma Wayland) accumulates → our client bound wl_pointer below v8 because
+**sctk 0.19.2 has no `AxisValue120` handler at all** (verified in the cargo
+cache: `seat/pointer/mod.rs` handles `AxisDiscrete` only) → KWin's
+backward-compat path only releases whole detents. winit 0.30.13 (Bevy
+0.19's pin) then prefers `discrete` → integer `LineDelta`. Nothing app-side
+can recover events never delivered.
+
+What to do: track winit/sctk hi-res scroll support and re-check on each
+Bevy winit bump — **our pipeline is already fraction-ready** (no quantum,
+sub-pixel offsets, gain math handles fractional lines), so it lights up
+with zero app work when the events arrive. Do NOT re-add smoothing hacks to
+fake sub-detent motion. Wheel event trace lives at `debug!` in
+`input/dispatch.rs` for feel-tuning.
+
+## Catch-up seam: mark and jump to the read/unread boundary (2026-08-16)
+
+Amy's core loop: flick up, visually hunt for "something I've seen before",
+slow-scroll to the seam, click down while reading. The hunt is the app
+failing to serve a boundary it can know: where the reader last left the
+tail. Proposal: record the seam (app-local first; the kernel roster/context
+could carry per-principal read state later), render a subtle horizontal
+rule at it, and bind a jump-to-seam chord so catch-up starts with one press
+instead of scroll dexterity. Complements (does not replace) scroll-feel
+work; pairs naturally with sticky follow, which already knows the moment
+the user leaves the tail.
+
 ## Error stub polish: dedupe summary-vs-detail, cap wrapped height (2026-08-16)
 
 First light of the collapsed error stub (`view/format.rs` error arm) showed
