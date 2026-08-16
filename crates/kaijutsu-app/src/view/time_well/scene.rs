@@ -85,7 +85,11 @@ pub struct CardParams {
 /// own the well camera: that's the app's one shared `Camera3d`, repurposed
 /// via marker component (`crate::view::room::RoomCamera`), never a child of
 /// anything well-specific.
-#[derive(Component)]
+/// `Default + Clone` (here and on the four markers below) is what `bsn!`
+/// requires of every component it names — it gives them the blanket
+/// `Template` impl [`spawn_well_furniture`]'s scenes build from. Nothing
+/// constructs these markers through `Default`; the derive exists for BSN.
+#[derive(Component, Default, Clone)]
 pub struct TimeWellRoot;
 
 /// The center-bottom reading slot: a single large card floating at a fixed
@@ -93,7 +97,7 @@ pub struct TimeWellRoot;
 /// other card — `ChildOf` the well's placement root (Slice B), not the
 /// camera, despite this doc's old claim. Renders the current selection at
 /// readable size; updated by `text::update_reading_card` on selection change.
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 pub struct ReadingCard;
 
 /// The **event horizon**: the well's ring deck, a flat disc lying on the room
@@ -105,7 +109,7 @@ pub struct ReadingCard;
 /// `well_rings.wgsl` visuals were already accretion-shaped; only its depth
 /// and its name changed. Driven by [`crate::shaders::WellRingsMaterial`]
 /// uniforms from [`sync_deck_material`]. Despawned on exit alongside the root.
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 pub struct EventHorizonDeck;
 
 /// A magic-circle ring for one band (the Konosuba/"Explosion"-spell aesthetic —
@@ -115,7 +119,10 @@ pub struct EventHorizonDeck;
 /// index, 0 = `Active` on top … `N_BANDS-1` = `Recent` just over the
 /// tabletop) so [`dim_nonfocused_rings`] can brighten the focused ring and dim
 /// the rest. Despawned on exit alongside the rest of the well.
-#[derive(Component)]
+/// `Default` here means ring 0, which is meaningless on its own — every
+/// spawn patches the index (`TerraceRing({k})` in [`terrace_ring_scene`]).
+/// It is present only because `bsn!` builds components up from `Default`.
+#[derive(Component, Default, Clone)]
 pub struct TerraceRing(pub usize);
 
 /// The event-horizon "+N" count label, lying on the horizon disc itself
@@ -125,7 +132,7 @@ pub struct TerraceRing(pub usize);
 /// per-band "ACTIVE"/"RECENT" ring labels that once shared this path were
 /// removed 2026-07-06 — the reading card's SPECS `band` line carries that
 /// information without cluttering the rings.)
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 pub struct HorizonLabel;
 
 /// Where a card wants to be. A smoothing system eases `Transform.translation`
@@ -647,6 +654,22 @@ pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3
 /// Not a Bevy system — a plain function taking `&mut Commands`/`&mut Assets`,
 /// the same shape `patch_bay::spawn_furniture` uses, so `room::enter_room`
 /// can call it directly alongside its own furniture spawns.
+///
+/// **BSN trial (2026-08-16, Bevy 0.19's `bsn!`/`spawn_scene`).** The static
+/// furniture is authored as scenes rather than tuple spawns: the placement
+/// root declares the deck and the ring stack as `Children [...]` inline. The
+/// quad meshes stay on `meshes.add(...)` (handles passed into the `bsn!`
+/// blocks) rather than `asset_value(...)`: the latter routes through
+/// `AssetServer::add`, which lands in `Assets<Mesh>` only at the next
+/// `PreUpdate`, giving one frame of invisible furniture on room entry.
+/// Two things did NOT convert, and the seams are deliberate:
+/// * `create_msdf_panel` hands back an opaque `impl Bundle`; `bsn!` can only
+///   name components (`TemplatePatch` is bounded on
+///   `Template<Output: Component>`), so the reading card and horizon label are
+///   spawned as their own scenes and the panel bundle is `insert`ed on top.
+/// * `Assets::add` still builds the three shader materials, since their
+///   `Assets<_>` handles are function parameters and dropping them would
+///   change this signature and `room::enter_room` with it.
 pub(crate) fn spawn_well_furniture(
     commands: &mut Commands,
     parent: Option<Entity>,
@@ -667,29 +690,6 @@ pub(crate) fn spawn_well_furniture(
         state.card_mesh = Some(meshes.add(card_block_mesh()));
     }
 
-    // The placement/root entity (Slice C: seated at the room's center via
-    // `STATION_CENTER_PLACEMENT`, no longer the identity placement Slice B
-    // proved the reparenting with). `Name` says "Placement" (not "Root") for
-    // debuggability, matching patch bay's naming; the `TimeWellRoot` marker is
-    // what the per-frame systems below (and teardown) query for.
-    let mut root_entity = commands.spawn((
-        TimeWellRoot,
-        placement_transform(&STATION_CENTER_PLACEMENT),
-        Visibility::Inherited,
-        Name::new("TimeWellPlacement"),
-    ));
-    if let Some(p) = parent {
-        root_entity.insert(ChildOf(p));
-    }
-    let root = root_entity.id();
-
-    // The event-horizon disc: a flat accretion disc lying ON the room floor
-    // (`RING_DECK_DEPTH` = world y 0), encircling the table plinth the rings
-    // hang over, rendering the well's pulse (concentric rings + spiral core +
-    // activity ripples). Driven per-frame by `sync_deck_material`. Not
-    // billboarded — under the placement's flatten it lies face-up; the shader
-    // fades its square corners to nothing.
-    let deck_mesh = meshes.add(Rectangle::new(RING_DECK_SIZE, RING_DECK_SIZE));
     // Warm gold core (`ScenePalette::gold` — was `[1.0, 0.62, 0.20]`, the
     // concept-art palette's own warm gold; leaned the rest of the way onto the
     // room's shared gold) + indigo-violet neon rings (`ScenePalette::neon` —
@@ -706,70 +706,88 @@ pub(crate) fn spawn_well_furniture(
     // accretion disc, not a wall.
     let tilt = super::card::well_tilt_quat();
     let deck_pos = tilt * Vec3::new(0.0, 0.0, RING_DECK_DEPTH);
-    commands.spawn((
-        EventHorizonDeck,
-        Mesh3d(deck_mesh),
-        MeshMaterial3d(deck_material),
-        Transform {
-            translation: deck_pos,
-            rotation: tilt,
-            scale: Vec3::ONE,
-        },
-        Visibility::Inherited,
-        Name::new("EventHorizonDeck"),
-        ChildOf(root),
-    ));
 
     // Band magic-circle rings: one annulus quad per band ring (the
     // Konosuba/"Explosion"-spell aesthetic), counter-rotating and receding into
     // the funnel on the same tilted axis as the deck/cards. Each quad is sized
     // to ITS ring's radius, and the band is drawn centered on that radius so it
-    // lands on the cards seated around the ring.
+    // lands on the cards seated around the ring. The loop stays imperative
+    // because every ring's material is a distinct `Assets::add`; what it builds
+    // is a `Vec<impl Scene>`, which `bsn!` splices into `Children [...]` below
+    // (`impl<S: Scene> SceneList for Vec<S>`).
     let ring_geometry = super::card::terrace_ring_geometry();
     let ring_count = ring_geometry.len();
-    for (k, (radius, depth)) in ring_geometry.into_iter().enumerate() {
-        let side = TERRACE_RING_QUAD_SCALE * radius;
-        let ring_mesh = meshes.add(Rectangle::new(side, side));
-        // The shader's radial coord is 0 at center → 1 at the quad edge (half
-        // -extent = side/2). Center the band on the ring radius so it sits on the
-        // seated cards: center_frac = radius / half_extent (= 2 / QUAD_SCALE).
-        let center_frac = radius / (side * 0.5);
-        let inner_frac = center_frac - TERRACE_RING_BAND_HALF_WIDTH;
-        let outer_frac = center_frac + TERRACE_RING_BAND_HALF_WIDTH;
-        let spin_dir = if k % 2 == 0 { 1.0 } else { -1.0 };
-        let spin_rate = TERRACE_RING_SPIN_BASE + TERRACE_RING_SPIN_STEP * k as f32;
-        let ring_material = terrace_ring_materials.add(crate::shaders::TerraceRingMaterial::new(
-            inner_frac,
-            outer_frac,
-            spin_rate,
-            spin_dir,
-            ScenePalette::vec3(palette.terrace),
-            TERRACE_RING_ALPHA,
-            k,
-            ring_count,
-            ScenePalette::vec3(palette.gold),
-        ));
-        let ring_pos = tilt * Vec3::new(0.0, 0.0, depth);
-        commands.spawn((
-            TerraceRing(k),
-            Mesh3d(ring_mesh),
-            MeshMaterial3d(ring_material),
-            Transform {
-                translation: ring_pos,
-                rotation: tilt,
-                scale: Vec3::ONE,
-            },
-            Visibility::Inherited,
-            Name::new(format!("TerraceRing{k}")),
-            ChildOf(root),
-        ));
+    let rings: Vec<_> = ring_geometry
+        .into_iter()
+        .enumerate()
+        .map(|(k, (radius, depth))| {
+            let side = TERRACE_RING_QUAD_SCALE * radius;
+            // The shader's radial coord is 0 at center → 1 at the quad edge (half
+            // -extent = side/2). Center the band on the ring radius so it sits on the
+            // seated cards: center_frac = radius / half_extent (= 2 / QUAD_SCALE).
+            let center_frac = radius / (side * 0.5);
+            let inner_frac = center_frac - TERRACE_RING_BAND_HALF_WIDTH;
+            let outer_frac = center_frac + TERRACE_RING_BAND_HALF_WIDTH;
+            let spin_dir = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let spin_rate = TERRACE_RING_SPIN_BASE + TERRACE_RING_SPIN_STEP * k as f32;
+            let ring_material = terrace_ring_materials.add(crate::shaders::TerraceRingMaterial::new(
+                inner_frac,
+                outer_frac,
+                spin_rate,
+                spin_dir,
+                ScenePalette::vec3(palette.terrace),
+                TERRACE_RING_ALPHA,
+                k,
+                ring_count,
+                ScenePalette::vec3(palette.gold),
+            ));
+            let ring_mesh = meshes.add(Rectangle::new(side, side));
+            terrace_ring_scene(k, ring_mesh, tilt * Vec3::new(0.0, 0.0, depth), tilt, ring_material)
+        })
+        .collect();
+
+    // The placement/root entity (Slice C: seated at the room's center via
+    // `STATION_CENTER_PLACEMENT`, no longer the identity placement Slice B
+    // proved the reparenting with). `#TimeWellPlacement` is BSN's name syntax:
+    // it *is* the `Name` component, saying "Placement" (not "Root") for
+    // debuggability, matching patch bay's naming; the `TimeWellRoot` marker is
+    // what the per-frame systems below (and teardown) query for.
+    //
+    // The event-horizon disc hangs under it as an inline child: a flat
+    // accretion disc lying ON the room floor (`RING_DECK_DEPTH` = world y 0),
+    // encircling the table plinth the rings hang over, rendering the well's
+    // pulse (concentric rings + spiral core + activity ripples). Driven
+    // per-frame by `sync_deck_material`. Not billboarded — under the
+    // placement's flatten it lies face-up; the shader fades its square corners
+    // to nothing.
+    let root_transform = placement_transform(&STATION_CENTER_PLACEMENT);
+    let deck_mesh = meshes.add(Rectangle::new(RING_DECK_SIZE, RING_DECK_SIZE));
+    let mut root_entity = commands.spawn_scene(bsn! {
+        #TimeWellPlacement
+        TimeWellRoot
+        template_value(root_transform)
+        Visibility::Inherited
+        Children [
+            (
+                #EventHorizonDeck
+                EventHorizonDeck
+                Mesh3d({deck_mesh})
+                MeshMaterial3d<crate::shaders::WellRingsMaterial>({deck_material})
+                Transform { translation: {deck_pos}, rotation: {tilt} }
+                Visibility::Inherited
+            ),
+            {rings}
+        ]
+    });
+    if let Some(p) = parent {
+        root_entity.insert(ChildOf(p));
     }
+    let root = root_entity.id();
 
     // Focus card: an in-world 3D card floating lower-center at the mouth of the
     // well (not a flat HUD panel — it lives in the scene, billboarded, and the
     // camera dollies into it on focus). It renders the current selection;
     // `update_reading_card` fills its texture (blank until a selection exists).
-    let focus_mesh = meshes.add(Rectangle::new(FOCUS_QUAD_W, FOCUS_QUAD_H));
     let (focus_image, panel) =
         create_msdf_panel(images, READING_TEX_W as u32, READING_TEX_H as u32);
     let focus_material = materials.add(crate::shaders::WellCardMaterial {
@@ -783,26 +801,30 @@ pub(crate) fn spawn_well_furniture(
         // the accidental cyan+gold "cream ring" fixed 2026-07-06).
         dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
     });
-    commands.spawn((
-        ReadingCard,
-        Mesh3d(focus_mesh),
-        MeshMaterial3d(focus_material),
-        Transform::from_translation(FOCUS_CARD_POS),
-        Visibility::Inherited,
-        // MSDF owns this texture (clears + renders text on transparent); the
-        // shader draws the body. No vello — pure MSDF, no UiVectorScene.
-        panel,
-        Name::new("ReadingCard"),
-        ChildOf(root),
-    ));
+    // Spawned as its own scene rather than inline under the root: the MSDF
+    // panel is an opaque `impl Bundle`, which BSN has no way to name, so it
+    // (and the parent link the inline children get for free) is inserted on
+    // top of the resolved scene. MSDF owns this texture (clears + renders text
+    // on transparent); the shader draws the body. No vello, no UiVectorScene.
+    let focus_mesh = meshes.add(Rectangle::new(FOCUS_QUAD_W, FOCUS_QUAD_H));
+    commands
+        .spawn_scene(bsn! {
+            #ReadingCard
+            ReadingCard
+            Mesh3d({focus_mesh})
+            MeshMaterial3d<crate::shaders::WellCardMaterial>({focus_material})
+            Transform { translation: {FOCUS_CARD_POS} }
+            Visibility::Inherited
+        })
+        .insert((panel, ChildOf(root)));
 
     // Event-horizon "+N" count label: lying on the horizon disc, gate-side.
     // Refreshed by `text::build_horizon_label` whenever the count changes (it
     // starts blank — nothing polled yet on first enter). The ambient
     // `apply_horizon_label_lod` owns its visibility from here on — see
     // `HORIZON_LABEL_AT_ROOM_SCALE` for why the old always-hidden-at-room-
-    // scale behaviour was retired with the re-anchor.
-    let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
+    // scale behaviour was retired with the re-anchor. Same panel-bundle seam
+    // as the reading card above.
     let (horizon_image, horizon_panel) =
         create_msdf_panel(images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
     let horizon_material = materials.add(crate::shaders::WellCardMaterial {
@@ -814,19 +836,42 @@ pub(crate) fn spawn_well_furniture(
         // dim.x only — y/z are live chatter/beat lanes, not brightness.
         dim: Vec4::new(LABEL_DIM, 0.0, 0.0, 0.0),
     });
-    commands.spawn((
-        HorizonLabel,
-        Mesh3d(label_mesh),
-        MeshMaterial3d(horizon_material),
-        Transform::from_translation(super::card::horizon_label_pos()),
-        Visibility::Inherited,
-        horizon_panel,
-        Name::new("HorizonLabel"),
-        ChildOf(root),
-    ));
+    let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
+    commands
+        .spawn_scene(bsn! {
+            #HorizonLabel
+            HorizonLabel
+            Mesh3d({label_mesh})
+            MeshMaterial3d<crate::shaders::WellCardMaterial>({horizon_material})
+            Transform { translation: {super::card::horizon_label_pos()} }
+            Visibility::Inherited
+        })
+        .insert((horizon_panel, ChildOf(root)));
 
     info!("time-well: furniture spawned (room-center placement)");
     root
+}
+
+/// One band ring as a [`Scene`] — the body of [`spawn_well_furniture`]'s
+/// per-ring loop, lifted out so the loop reads as "build this ring's material,
+/// then describe the ring". Everything it needs is passed by value because a
+/// [`Scene`] is `Send + Sync + 'static`: it is resolved later, inside the
+/// command queue, not at the call site.
+fn terrace_ring_scene(
+    k: usize,
+    mesh: Handle<Mesh>,
+    translation: Vec3,
+    rotation: Quat,
+    material: Handle<crate::shaders::TerraceRingMaterial>,
+) -> impl Scene {
+    bsn! {
+        TerraceRing({k})
+        Mesh3d({mesh})
+        MeshMaterial3d<crate::shaders::TerraceRingMaterial>({material})
+        Transform { translation: {translation}, rotation: {rotation} }
+        Visibility::Inherited
+        Name({format!("TerraceRing{k}")})
+    }
 }
 
 /// Re-arm [`TimeWellState`]/[`super::rays::WellTracks`] for a fresh room
@@ -1769,6 +1814,153 @@ mod tests {
     fn selection_scale_target_pops_only_when_selected() {
         assert_eq!(selection_scale_target(2.0, true), 2.0 * 1.35, "selected pops by 1.35x its base");
         assert_eq!(selection_scale_target(2.0, false), 2.0, "unselected settles at its own base scale");
+    }
+
+    /// A headless spawn of the whole furniture set, standing behind the `bsn!`
+    /// conversion (2026-08-16): every marker the live systems query must exist
+    /// exactly once (or once per band ring), carry its `Name` and its
+    /// `Transform`, and hang off the placement root. BSN resolves inside the
+    /// command queue, so a failure to resolve is *logged*, not returned —
+    /// which is precisely why this asserts on the resulting entities rather
+    /// than on a `Result`.
+    ///
+    /// Unlike the other headless tests in this crate, a bare `App::new()` is
+    /// not enough: `spawn_scene` reaches for `AssetServer` and
+    /// `Assets<ScenePatch>`, so `AssetPlugin` + `ScenePlugin` (and a
+    /// registered `Mesh` asset) are load-bearing here.
+    #[test]
+    fn spawn_well_furniture_builds_the_whole_scene_under_one_root() {
+        use bevy::asset::AssetPlugin;
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::scene::ScenePlugin;
+        use crate::shaders::{TerraceRingMaterial, WellCardMaterial, WellRingsMaterial};
+
+        let mut app = App::new();
+        app.add_plugins((bevy::app::TaskPoolPlugin::default(), AssetPlugin::default(), ScenePlugin))
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_resource::<TimeWellState>()
+            .init_resource::<ScenePalette>()
+            .insert_resource(Assets::<WellCardMaterial>::default())
+            .insert_resource(Assets::<WellRingsMaterial>::default())
+            .insert_resource(Assets::<TerraceRingMaterial>::default());
+
+        #[allow(clippy::too_many_arguments)]
+        fn spawn(
+            mut commands: Commands,
+            mut state: ResMut<TimeWellState>,
+            palette: Res<ScenePalette>,
+            mut meshes: ResMut<Assets<Mesh>>,
+            mut card_mats: ResMut<Assets<WellCardMaterial>>,
+            mut ring_mats: ResMut<Assets<WellRingsMaterial>>,
+            mut terrace_mats: ResMut<Assets<TerraceRingMaterial>>,
+            mut images: ResMut<Assets<Image>>,
+        ) {
+            spawn_well_furniture(
+                &mut commands,
+                None,
+                &mut state,
+                &palette,
+                &mut meshes,
+                &mut card_mats,
+                &mut ring_mats,
+                &mut terrace_mats,
+                &mut images,
+            );
+        }
+        app.world_mut().run_system_once(spawn).unwrap();
+
+        /// Every entity carrying marker `T`, in spawn order.
+        fn tagged<T: Component>(app: &mut App) -> Vec<Entity> {
+            let mut q = app.world_mut().query_filtered::<Entity, With<T>>();
+            q.iter(app.world()).collect()
+        }
+        /// The one entity carrying marker `T`.
+        fn only<T: Component>(app: &mut App) -> Entity {
+            let found = tagged::<T>(app);
+            assert_eq!(found.len(), 1, "expected exactly one {}", core::any::type_name::<T>());
+            found[0]
+        }
+        /// Name / parent / mesh / visibility, the four things every piece of
+        /// furniture must come out of the scene with.
+        fn check(world: &World, name: &str, root: Entity, entity: Entity) {
+            let e = world.entity(entity);
+            assert_eq!(e.get::<Name>().map(|n| n.to_string()), Some(name.to_string()));
+            assert_eq!(
+                e.get::<ChildOf>().map(|c| c.parent()),
+                Some(root),
+                "{name} must hang off the placement root"
+            );
+            assert!(e.contains::<Mesh3d>(), "{name} must carry its quad mesh");
+            assert_eq!(
+                e.get::<Visibility>().copied(),
+                Some(Visibility::Inherited),
+                "{name} must inherit the root's visibility"
+            );
+        }
+
+        let root = only::<TimeWellRoot>(&mut app);
+        let deck = only::<EventHorizonDeck>(&mut app);
+        let card = only::<ReadingCard>(&mut app);
+        let label = only::<HorizonLabel>(&mut app);
+        let rings = tagged::<TerraceRing>(&mut app);
+        let ring_count = super::super::card::terrace_ring_geometry().len();
+
+        let world = app.world();
+        assert_eq!(
+            world.entity(root).get::<Name>().map(|n| n.to_string()),
+            Some("TimeWellPlacement".to_string()),
+            "the root keeps the name the debugger and patch bay convention expect"
+        );
+        assert_eq!(
+            world.entity(root).get::<Transform>().copied(),
+            Some(placement_transform(&STATION_CENTER_PLACEMENT)),
+            "the room-center placement survives the bsn! rewrite"
+        );
+
+        // Every piece of furniture hangs off the root — that ONE recursive
+        // despawn is the whole teardown.
+        let children = world.entity(root).get::<Children>().expect("root has children");
+        assert_eq!(children.len(), 3 + ring_count, "deck + rings + reading card + label");
+
+        check(world, "EventHorizonDeck", root, deck);
+        check(world, "ReadingCard", root, card);
+        check(world, "HorizonLabel", root, label);
+        assert_eq!(
+            world.entity(card).get::<Transform>().map(|t| t.translation),
+            Some(FOCUS_CARD_POS),
+            "the reading card sits at the well's mouth"
+        );
+        assert_eq!(
+            world.entity(label).get::<Transform>().map(|t| t.translation),
+            Some(super::super::card::horizon_label_pos()),
+            "the horizon label lies on the disc"
+        );
+
+        // The MSDF panel bundle is the piece `bsn!` could not express — assert
+        // it really did get inserted on top of the two scenes that need it.
+        for (what, e) in [("reading card", card), ("horizon label", label)] {
+            assert!(
+                world.entity(e).contains::<crate::view::ui_rtt::UiRttTexture>(),
+                "{what} must still carry its MSDF panel bundle"
+            );
+        }
+
+        // One ring per band-geometry entry, each carrying ITS index — the field
+        // `dim_nonfocused_rings` reads, and the one thing `bsn!`'s `Default` for
+        // `TerraceRing` would silently zero if the patch were ever dropped.
+        let mut bands: Vec<usize> =
+            rings.iter().map(|e| world.entity(*e).get::<TerraceRing>().unwrap().0).collect();
+        bands.sort_unstable();
+        assert_eq!(
+            bands,
+            (0..ring_count).collect::<Vec<_>>(),
+            "every band ring spawns exactly once, with its own index"
+        );
+        for entity in rings {
+            let k = world.entity(entity).get::<TerraceRing>().unwrap().0;
+            check(world, &format!("TerraceRing{k}"), root, entity);
+        }
     }
 }
 
