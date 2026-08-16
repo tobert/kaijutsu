@@ -26,7 +26,8 @@ The months after built the body a layer at a time:
 - **February** — the type system consolidated (`kaijutsu-types`, `ContextId`
   everywhere), contexts learned to survive server restarts, and a first
   constellation view drew contexts as a radial graph.
-- **March** — CRDT correctness (Lamport clocks, fork semantics, order keys),
+- **March** — block-store correctness (Lamport clocks, fork semantics, order
+  keys),
   DocumentDb + KernelDb unified into one database, and the app moved to MSDF
   text + per-block Vello textures — the rendering stack it still rides.
 - **April** — the tool system was redesigned around the MCP broker (everything
@@ -64,7 +65,7 @@ mistake-prevention, never security; your neighbor's wrong note is one you
 cover.
 
 **Context vs conversation** is the load-bearing invariant underneath
-everything: the context is the durable, multi-writer CRDT side; the
+everything: the context is the durable, multi-writer side; the
 conversation is the append-only live session hydrated from it at boundary
 events. `block exclude`/`edit` land at the next hydrate — remediate a poisoned
 conversation by excluding in context, then forking. The per-context mailbox is
@@ -79,17 +80,17 @@ from fork and drift, not from a noun in the schema.
 A silent-fallback bug in rc loading turned into the biggest structural decision
 of June: rather than patch the dual-ownership cluster (stale-bytes reads,
 append file-wipes, mtime no-ops, stale rc seeds), we **deleted the class** —
-the CRDT became the sole owner of `/etc/rc` and `/etc/config`, seeded once from
+the kernel became the sole owner of `/etc/rc` and `/etc/config`, seeded once from
 embedded defaults under `assets/defaults/`, with no host file and no
 write-through. There is nothing to `vim`; `kj rc edit` / `kj config set` are
 the surfaces, and `kj rc reset` restores an embedded default. The bespoke
 debounced-flush/watcher backend was deleted rather than fixed. Design:
-`docs/config-crdt-ownership.md`.
+`docs/config-ownership.md`.
 
 The same weeks put teeth in the fail-loud posture:
 
 - **builtin.file corruption post-mortem.** The kernel's `edit` tool fed BYTE
-  offsets into the CHARACTER-indexed CRDT — a silent splice on any file with
+  offsets into the character-indexed text engine — a silent splice on any file with
   multibyte UTF-8 before the edit site, while honestly reporting success.
   Fixed with byte→char conversion, fail-loud post-write verification (crash
   over corruption), and hashline addressing (`read` prints `LINE:hash→`,
@@ -608,7 +609,7 @@ glow-discipline caps, but *brightness* was thirty scattered per-site
 constants, and the tonemapper had never been chosen — the app's look was
 the accidental sum of local decisions.
 
-The color pass made color a decision again. One CRDT theme.toml now
+The color pass made color a decision again. One kernel-owned theme.toml now
 carries both color lanes — the sRGB post-tonemap UI lane (the old Tokyo
 Night token system, kept) and a new linear-HDR scene lane (`[scene]`:
 identity hues, a named brightness ladder, live-signal gains, and a
@@ -946,7 +947,7 @@ probe confirmed it in one curl.
 
 The design conversation took two turns that mattered. First, Amy pushed past
 "adopt kaibo's TOML": *"I'd like to see the cast data modeled in SQL directly
-and that's the source."* models.toml — the CRDT doc, the embedded asset, the
+and that's the source."* models.toml — the kernel document, the embedded asset, the
 whole TOML parse layer — was demolished, replaced by normalized tables
 (backends with a name/kind split, casts, cast_slots, aliases, llm_defaults)
 edited through `kj backend`/`kj cast`/`kj alias`, with the registry rebuilt
@@ -1036,15 +1037,15 @@ and QwenPaw, both cloned and read cover to cover — turned up one gap kj
 actually had to fix: no task state. Both harnesses lean on a todo tool
 writing JSON to disk; Amy's read was immediate — *"Task BlockKind and tool
 is a great idea"* — and the reason why fell out of the block model itself.
-A task that's a block gets the CRDT for free: create it here, watch it
-converge everywhere, no second store to keep honest.
+A task that's a block gets the block log for free: create it here, watch it
+appear everywhere, no second store to keep honest.
 
 The design took less debate than expected once the precedent was found.
 `content_type` had already solved "one more mutable field on every block,
 independently LWW-clocked, cheap to add" — a `Copy` field on `BlockHeader`
 plus its own Lamport timestamp, merged by the same `field_wins` tiebreak
 every other per-field register uses. `task_status` is that mechanism
-again, verbatim, which meant the CRDT plumbing — `content.rs`'s
+again, verbatim, which meant the block plumbing — `content.rs`'s
 `set_task_status`, `block_store.rs`'s wrapper, the wire fields on
 `BlockSnapshot` and the `MetadataChanged` bundle — was less a design
 problem than a typing exercise. The one real decision was what status
@@ -1160,7 +1161,7 @@ before answering the prompt. Then the arcs converged: Task blocks, one day
 old, wired into ACP's plan updates — cancelled tasks omitted because a
 plan is what the agent intends to do, subtasks flattened, identical
 rebuilds silent — and Amy's flight report closed the loop: *"that task
-tracker worked perfectly though."* Grooming a CRDT task block anywhere now
+tracker worked perfectly though."* Grooming a task block anywhere now
 moves a checklist in every connected frontend.
 
 What toad taught that wasn't ours to fix: it doesn't consume ACP's session

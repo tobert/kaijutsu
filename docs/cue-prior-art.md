@@ -202,7 +202,7 @@ answered by an exporter/adapter (OTIO, SMF, stems), not a native format;
 (2) cross-kernel drift — already answered, since drift offers carry
 hyoushigi data (cells + tempo + PPQ, honoring the SMF tempo-map lesson)
 and at-rest serialization is versioned CBOR with fail-loud decoding;
-(3) archival — the CRDT log + CAS is the archive, and outside-posterity
+(3) archival — the block log + CAS is the archive, and outside-posterity
 export is case 1 again. The only discipline the format-less path demands
 is OTIO's: version the record per-object and keep an extension bag so
 unknown fields survive round-trips.

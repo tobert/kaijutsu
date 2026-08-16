@@ -17,7 +17,7 @@ one owner, no host file, no write-through; embedded defaults under
 `assets/defaults/rc/` seed a fresh kernel once. There is no host file to
 `vim`: edit a live script with `kj rc edit <path> --content <body>`, and `kj rc reset
 <path>` restores one to its embedded default. Change the shipped default by editing
-`assets/defaults/rc/` (the in-repo seed). See `docs/config-crdt-ownership.md`.
+`assets/defaults/rc/` (the in-repo seed). See `docs/config-ownership.md`.
 
 **Config is different from rc, as of 2026-08-15: just write the file.**
 `/etc/config`, `/etc/client` and `/etc/midi` are ordinary write surfaces for
@@ -26,12 +26,10 @@ the file tools and the editor — there is no `kj config set`/`edit` and no
 equivalent: `list`, `show`, and `reset` (restore the embedded default). `/etc/rc`
 stays gated by `rc-write` because rc is executable rather than data.
 
-*Migration in flight:* rc/config are still stored as **kernel documents** in
-`kaijutsu-crdt`'s block store — not host files, and no longer a CRDT either
-(block text became a plain `String` on 2026-08-16). Melting them to real files
-on disk is open work. **Single kernel ownership is the invariant that survives
-the change** — whatever the storage, config must never have two competing
-sources of truth.
+*Open work:* rc/config are stored as **kernel documents** in the block store,
+not as host files. Melting them to real files on disk is unbuilt. **Single
+kernel ownership is the invariant that survives that change** — whatever the
+storage, config must never have two competing sources of truth.
 
 **Permission to get simpler** (Amy, 2026-08-15): *"If the agent can see the
 files and edit them, that's fine, we don't need to complicate it just because
@@ -112,33 +110,27 @@ survived it, because a client fetching its theme at bootstrap step 0 has no
 context to run `kj` in, and reading over the wire is what the rule above already
 sanctions.
 
-**The CRDT is gone — block text is a `String`** (2026-08-16).
-`diamond-types-extended` is not a dependency of any crate and does not appear
+**Block text is a plain `String`.** There is no text CRDT in kaijutsu.
+`diamond-types-extended` is not a dependency of any crate and appears nowhere
 in `Cargo.lock`; the wire carries no storage-engine operations; the compose
-draft is an ordinary block. `kaijutsu-crdt` keeps its name and nothing else —
-it is a block store now, and renaming it is open work rather than a pending
-migration.
-
-Two consequences that outlive the migration, because they are the reason it
-was possible at all:
+draft is an ordinary block. Two rules follow, and both are live:
 
 - **Concurrent merge into kernel documents is structurally impossible**, not
-  merely unobserved. Deleting the `pushOps` handler removed `merge_ops`'s only
-  concurrent caller, and replay is sequential self-application. Code that
-  reasons about conflict resolution here is reasoning about a state the system
-  cannot reach — check before building for it.
+  merely unobserved. There is no concurrent caller of `merge_ops`, and replay
+  is sequential self-application. Code that reasons about conflict resolution
+  here is reasoning about a state the system cannot reach — check before
+  building for it.
 - **Do not reintroduce a text CRDT** for block content. Streaming is 100%
   append and `push_str` is amortized O(1), while per-block merge metadata cost
   a measured ~4x the text it represented. If a surface genuinely needs
   concurrent text merge, that is a design conversation.
 
-Amy's ruling and the reasoning that started it: `docs/crdt-position-2026-08.md`.
+Amy's ruling and the reasoning behind it: `docs/crdt-position-2026-08.md`.
 
 ## Crates
 
 `kaijutsu-types` first — the shared types every other crate depends on. Then
-`kaijutsu-crdt` (BlockStore; the block text engine, being demoted to a private
-implementation detail), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
+`kaijutsu-kernel` (Kernel, the block store, VFS, MCP broker,
 LLM, drift, `kj` builtin), `kaijutsu-server` (SSH server, EmbeddedKaish),
 `kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.19 GUI;
 inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, editor,

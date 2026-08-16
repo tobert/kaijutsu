@@ -19,7 +19,7 @@ State this first, because every gap below is an ergonomics gap sitting on top
 of a genuinely good substrate. None of the fixes should cost us any of this.
 
 - **Delivery is durable.** A drift lands as a first-class `BlockKind::Drift`
-  block on the target's CRDT document (`block_store.rs:3020`), journalled and
+  block on the target's kernel document (`block_store.rs:3020`), journalled and
   broadcast on the FlowBus like any other block. It survives a kernel restart.
   cc messages live and die with the process.
 - **Content is never silently lost.** Failed delivery requeues up to
@@ -31,7 +31,7 @@ of a genuinely good substrate. None of the fixes should cost us any of this.
   player attached to that context — human, model, app, sibling. cc messaging is
   point-to-point between two processes.
 - **Provenance is first-class.** `source_context` and `source_model` are fields
-  on the block (`crdt/src/content.rs:222-224`), not prose in a message body.
+  on the block (`content.rs:245-246`), not prose in a message body.
 - **It carries more than text.** `--summarize` and `pull` LLM-distill a whole
   context rather than shipping a literal string.
 

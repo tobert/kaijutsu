@@ -203,7 +203,7 @@ won't change before the commit deadline. That bet has a real price, so the rule 
 narrow and explicit:
 
 - **Idempotent, reversible, side-effect-free resolves only.** Prefetching a file into
-  the CRDT cache, pre-rendering an audio buffer, pre-resolving a pure transform — all
+  the document cache, pre-rendering an audio buffer, pre-resolving a pure transform — all
   safe to discard on a squash.
 - **Side-effecting tools are never run speculatively.** A `shell`, `write`, or `git`
   resolve waits for commit; its effect can't be un-happened by a pipeline flush.
@@ -230,11 +230,11 @@ that, opportunistic, never required for correctness.
 > implementation tracker.
 
 Each kaijutsu context (`ContextId`, a node in the fork/drift DAG) owns a timeline: its
-CRDT block log *with a temporal structure over it*. Hyoushigi does **not** invent its
+block log *with a temporal structure over it*. Hyoushigi does **not** invent its
 own persistence — it is the temporal schema and the live engine; the durable record
 stays in kaijutsu's existing machinery.
 
-- **Timeline structure → CRDT blocks.** A committed cell is materialized as a block in
+- **Timeline structure → blocks.** A committed cell is materialized as a block in
   the context's block log, tagged with its tick position — a *new* coordinate the block
   model doesn't carry today (blocks order via `order_key`, a fractional index; see open
   questions). The block itself is ordinary, so it syncs across participants and survives
@@ -267,7 +267,7 @@ Error, the speculating states invisible), not a refinement of an existing lifecy
 Likewise the block model has no tick/`Span` coordinate today (only `order_key`), no
 `content_type` companion on `ContentHash`, and no squash/fallback machinery. The genuine
 prior art is *structural, not semantic*: blocks are already a synced, restart-surviving
-CRDT log, so materializing committed cells **as** blocks is cheap. The temporal schema
+log, so materializing committed cells **as** blocks is cheap. The temporal schema
 over them — positions, lifecycle, the resolver dispatch — is the part we build.
 
 ## The musician playhead: beat-aware, turn-reactive
@@ -436,7 +436,7 @@ The app may attach to several contexts at once (the time well / context browser)
 own disciplined clock, so the client crate carries hyoushigi as well and exposes the same
 read/observe/schedule API and per-`ContextId` registry. Only the *role* differs:
 
-- **Authoritative** (kernel): free-running, drives tempo, commits cells into CRDT/CAS.
+- **Authoritative** (kernel): free-running, drives tempo, commits cells into the block store and CAS.
 - **Disciplined** (client): a follower seeded from a `Timebase` and slewed to stay
   locked. The discipline loop lives inside the type, so a client just reads `now()` /
   phase and trusts the lock.
@@ -444,13 +444,13 @@ read/observe/schedule API and per-`ContextId` registry. Only the *role* differs:
 A client may hold its own local open future — ephemeral speculative cells it owns (the
 next beat's UI animation, a pre-rolled buffer) — without touching the write barrier.
 Anything that must become durable shared memory is proposed to the kernel and commits
-there, like an optimistic CRDT edit. On reconnect the follower re-disciplines from a
+there once the kernel accepts and sequences it. On reconnect the follower re-disciplines from a
 fresh timebase and unconfirmed local speculations **squash** — reusing the misprediction
 machinery, mirroring how `ActorHandle` re-registers subscriptions after a reconnect.
 
 ## Visualizing past sessions
 
-Because the timeline structure is durable CRDT blocks with positions, a context's
+Because the timeline structure is durable blocks with positions, a context's
 hyoushigi can be *rendered* — in the Bevy UI a session becomes a literal timeline you can
 scrub and inspect. It is also a forcing function: the committed timeline must stay
 queryable and well-ordered, which is exactly what writing it into the block log buys.
@@ -470,7 +470,7 @@ queryable and well-ordered, which is exactly what writing it into the block log 
   and a Bevy `Time<Hyoushigi>` client context that slews via `set_relative_speed` and reuses
   `Time<Fixed>` overstep for sub-tick phase. Bevy's own `Tick` (u32, change-detection, not
   in prelude) does not collide.
-- **One store:** timeline structure → CRDT blocks, content → CAS. No parallel history.
+- **One store:** timeline structure → blocks, content → CAS. No parallel history.
 - **Per-context timeline.** fork branches the timeline (same scale, optionally a synced
   disciplined follower); drift is a **receiver-resolved offer** carrying hyoushigi data,
   never an automatic merge. The associative graph is delegated to the existing DAG +
@@ -512,31 +512,32 @@ queryable and well-ordered, which is exactly what writing it into the block log 
   is genuinely policy; the rest is automatic from the blocking axis. (Beat *period* and
   sibling-shared clocks remain open — see below.)
 - **The write barrier holds because the kernel is the sole *timeline sequencer*.** kaijutsu
-  already separates two layers: each block owns its own diamond-types content CRDT (file
-  text, message text, tool input — character-level, multi-writer), while block *membership
-  and ordering* are structural. The barrier governs only the **structure layer of
-  `Conversation` documents** — which cell exists at which `Tick`. It does **not** gate block
-  content, and does not touch `Code` / `Text` / `Config` documents: a code file or a future
-  musicxml doc stays a fully independent multi-writer CRDT, because timelines layer onto
-  `Conversation` docs only. Committed-past immutability comes from **crystallizing the
-  cell's content to CAS** at commit (a content-addressed snapshot), so the live content
-  document may keep evolving without violating the barrier. And the sequencer is continuous
-  with the existing per-context **mailbox** — already the atomicity gate that serializes
-  block insertion and keeps tool_use/tool_result paired — it merely also assigns the `Tick`.
-  (With the track-owned score, the per-track `Timeline` lock plays the same sequencer role:
-  N producers queue at the track's lock — the per-track analog of the mailbox.)
-  So no CRDT capability in actual use is lost: content co-editing and cross-context sync are
-  untouched. (Enforcement — rejecting or re-sequencing client-proposed blocks that backdate
-  behind the commit point — lands when *client-proposed* multi-writer timelines do. Note the
-  distinction: N kernel-side *producers* on one track already ship and serialize at the
-  track lock, above; the deferred enforcement is only about clients proposing blocks that
-  backdate the barrier. Rejected alternatives: per-author/per-lane barriers, which leave
-  global state at a tick undefined and force vector-clock-aware cells; conflict-as-squash,
-  where a late packet could squash seconds of paid generation.)
-- **`order_key` and `Tick` coexist cleanly.** `order_key` stays the CRDT's sibling-ordering
-  index; `Tick` is the kernel's semantic coordinate; at materialization the kernel emits an
-  `order_key` that appends so CRDT order matches `Tick` order. (DAG parentage is a third,
-  orthogonal axis — *across* contexts, not within one timeline.)
+  already separates two layers: block *content* (file text, message text, tool input — a
+  plain `String`, kernel-sequenced) and block *membership and ordering* (structural). The
+  barrier governs only the **structure layer of `Conversation` documents** — which cell
+  exists at which `Tick`. It does **not** gate block content, and does not touch `Code` /
+  `Text` / `Config` documents: editing a code file or a future musicxml doc is an ordinary
+  sequenced write, because timelines layer onto `Conversation` docs only. Committed-past
+  immutability comes from **crystallizing the cell's content to CAS** at commit (a
+  content-addressed snapshot), so the live content document may keep evolving without
+  violating the barrier. And the sequencer is continuous with the existing per-context
+  **mailbox** — already the atomicity gate that serializes block insertion and keeps
+  tool_use/tool_result paired — it merely also assigns the `Tick`. (With the track-owned
+  score, the per-track `Timeline` lock plays the same sequencer role: N producers queue at
+  the track's lock — the per-track analog of the mailbox.) Concurrent merge into a document
+  is structurally impossible — every write lands through the kernel in sequence — so
+  content editing and cross-context sync are untouched by the barrier. (Enforcement —
+  rejecting or re-sequencing client-proposed blocks that backdate behind the commit point —
+  lands when *client-proposed* multi-writer timelines do. Note the distinction: N
+  kernel-side *producers* on one track already ship and serialize at the track lock, above;
+  the deferred enforcement is only about clients proposing blocks that backdate the
+  barrier. Rejected alternatives: per-author/per-lane barriers, which leave global state at
+  a tick undefined and force vector-clock-aware cells; conflict-as-squash, where a late
+  packet could squash seconds of paid generation.)
+- **`order_key` and `Tick` coexist cleanly.** `order_key` stays the block log's
+  sibling-ordering index; `Tick` is the kernel's semantic coordinate; at materialization the
+  kernel emits an `order_key` that appends so block order matches `Tick` order. (DAG
+  parentage is a third, orthogonal axis — *across* contexts, not within one timeline.)
 
 **Open / deferred:**
 
@@ -576,7 +577,7 @@ fallback are exercised by their first user.
 >   rides `BlockSnapshot` through the full capnp wire. `block.tick` is a
 >   **shared per-context coordinate** (ties allowed; `BlockId` is the unique
 >   row id), while append `order_key`s derive from the predecessor's key
->   (successor-derived, strictly increasing) — CRDT order matches tick order
+>   (successor-derived, strictly increasing) — block order matches tick order
 >   without the two ever being the same number.
 > - **The engine:** `crates/kaijutsu-hyoushigi` — `Cell` carries `track` (the
 >   lane identity) + `played_by` (who played; never a lane key — `track ==
@@ -645,12 +646,12 @@ fallback are exercised by their first user.
    TDD: assert the arithmetic, plus a compile-fail check (`trybuild`) that `Tick + Tick`
    is rejected. Per-context PPQ rides on the binding, not the coordinate.
 2. ✅ **Create the crate** `crates/kaijutsu-hyoushigi`, depending on `kaijutsu-cas` for
-   content refs and on the CRDT block model for materialization. (New surface — the doc no
+   content refs and on the block model for materialization. (New surface — the doc no
    longer assumes anything is latent in the block model; see "the reuse is structural.")
 3. ✅ **Plumb materialization** — committed cells → blocks. This is where the open data-model
    questions get answered, not deferred: `order_key`-vs-`tick`, and `content`/`output`/
-   `ContentType` vs. `ContentRef`. Single-writer to start, so the write-barrier-vs-CRDT
-   problem is sidestepped (and gated before any collaborative timeline).
+   `ContentType` vs. `ContentRef`. Single-writer to start, so the write-barrier problem
+   is sidestepped (and gated before any collaborative timeline).
 4. ✅ **First proof — musician-lite.** A context driven by a minimal *internal* beat (no
    external MIDI yet) whose playhead can't block, one `Resolver`, and a real
    speculate→commit-or-squash→fallback loop against a first `compute_basis`. This forces

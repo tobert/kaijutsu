@@ -41,9 +41,9 @@ two additive `ALTER TABLE` guards (`:868`). ~20 tables:
 | `kernel` | singleton identity |
 | `workspaces`, `workspace_paths` | named path collections |
 | `presets`, `preset_args` | model/filter patches (full/window/spawn) |
-| `documents` | CRDT document registry |
+| `documents` | document registry |
 | `contexts`, `context_edges` | per-conversation metadata + DAG edges (fork/drift provenance) |
-| `oplog`, `doc_snapshots` | append-only CRDT op journal + compaction checkpoints |
+| `oplog`, `doc_snapshots` | append-only op journal + compaction checkpoints |
 | `input_oplog`, `input_doc_snapshots` | same, for per-context compose input docs |
 | `context_shell`, `context_env` | per-context cwd + env overrides |
 | `context_bindings` (+5 children) | per-context capability allow-sets (deny by default) |
@@ -78,9 +78,9 @@ desynchronize. To restore a backup: stop the kernel, replace `kernel.db`
 
 ### Block documents — `BlockStore` (`src/block_store.rs:180`)
 
-Kernel-level wrapper around `crate::blocks::BlockDocument` (formerly the
-standalone `kaijutsu-crdt` crate, melted in 2026-08-16): a `DashMap<ContextId,
-DocumentEntry>`, threaded with the `DbHandle` for journaling.
+Kernel-level wrapper around `crate::blocks::BlockDocument`: a
+`DashMap<ContextId, DocumentEntry>`, threaded with the `DbHandle` for
+journaling.
 `create_document`/`fork_document`/`fork_document_filtered` (`:387`/`:535`/`:669`),
 `insert_block`/`insert_tool_call`/`insert_tool_result`, `set_excluded` (`:1474`),
 `edit_text` (`:1388`), `ops_since`/`merge_ops`, and cold-start
@@ -117,11 +117,10 @@ oneshot with a timeout.
 
 `KernelState` (`state.rs:16`) — **in-memory only** vars/history/checkpoints (lost
 on restart). `execution.rs` — `ExecContext`/`ExecResult` data shims.
-`input_doc.rs` — per-context compose scratchpad (a single-text DTE doc, separate
-oplog tables). `config_backend.rs` (`:193`) — theme/models/mcp/system.md as CRDT
-docs, debounced flush to disk + `notify` watcher reload. `seed_presets.rs`,
-`seed_scripts.rs` — idempotent boot-time seeding (presets; the `/etc/rc` tree via
-`include_dir!`).
+`config_doc.rs`, `config_seed.rs` — config and rc as kernel documents, one per
+path, with no host file and no write-through (`docs/config-ownership.md`).
+`seed_presets.rs`, `seed_scripts.rs` — idempotent boot-time seeding (presets; the
+`/etc/rc` tree via `include_dir!`).
 
 ---
 
@@ -134,19 +133,19 @@ embeds it.** See [overview](README.md#process--transport-model).
 
 Owns one `kaish_kernel::Kernel`, a `SessionContextMap`, a `SessionId`, and the
 timeout policy. `with_identity_mode` (`:166`) is the builder: registers the
-session→context pair, builds the CRDT input filesystem, gets the shared
+session→context pair, builds the input filesystem, gets the shared
 `FileDocumentCache`, builds `KaijutsuBackend`, clones the `Arc<MountTable>`, wraps
 it in a `MountBackend` (writable or read-only), and constructs the kaish kernel
 with `/v/docs` and `/v/input` mounted. `execute_with_options` (`:309`) is the
 single entry. cwd persists in the kaish kernel and is restored from the DB via the
 **backend namespace**, not host-FS `is_dir()` (`restore_cwd_from_db`, `:399`).
 
-Backends: **`KaijutsuBackend`** (routes `/docs/{ctx}/{block}` into the CRDT store +
-tool dispatch), **`MountBackend`** (the primary `KernelBackend`; routes file I/O
-through the CRDT cache on writable mounts, raw VFS otherwise; `deny_if_read_only`
-gates mutations), **`KaijutsuFilesystem`** / **`InputFilesystem`** (adapt CRDT
-docs/input to the kaish `Filesystem` trait), **`ReadOnlyFs`** (refuses all
-mutations). `SessionContextMap` is a global `DashMap<SessionId, ContextId>`.
+Backends: **`KaijutsuBackend`** (routes `/docs/{ctx}/{block}` into the block
+store + tool dispatch), **`MountBackend`** (the primary `KernelBackend`; routes
+file I/O through the document cache on writable mounts, raw VFS otherwise;
+`deny_if_read_only` gates mutations), **`KaijutsuFilesystem`** /
+**`InputFilesystem`** (adapt kernel documents and input to the kaish
+`Filesystem` trait), **`ReadOnlyFs`** (refuses all mutations). `SessionContextMap` is a global `DashMap<SessionId, ContextId>`.
 
 ### VFS (`src/vfs/`)
 
@@ -162,7 +161,7 @@ frozen.
 ### File cache (`src/file_tools/cache.rs:45`)
 
 `FileDocumentCache` is the bridge that makes shell builtins and MCP file tools
-share **one CRDT document per real file**. Key = `file_context_id(path)` (UUIDv5
+share **one kernel document per real file**. Key = `file_context_id(path)` (UUIDv5
 over `"kaijutsu:file:{path}"`) after lexical canonicalization (`path.rs`), so
 `foo.rs`, `./foo.rs`, `/abs/foo.rs` all collapse to one key. Cache miss loads via
 VFS → creates a `DocKind::Code` doc; hits check `disk_mtime > loaded_mtime` and
@@ -236,7 +235,7 @@ Context creation writes `KernelDb` rows, then `DriftRouter::register[_fork]`, th
 runs the **rc lifecycle scripts** under `/etc/rc/<context_type>/<verb>/` (kaish
 scripts, sort-key order): `create` on new, `fork` on fork, `drift` on drift,
 `tick` on each beat. These set cache breakpoints, tool bindings, and the
-hydration marker. On fork, `fork_document_filtered` copies the parent CRDT doc,
+hydration marker. On fork, `fork_document_filtered` copies the parent document,
 applying `ForkBlockFilter` to drop curated-out blocks — which is why exclude/edit
 take effect "at fork."
 

@@ -7,7 +7,7 @@ RPC client library all apps/CLIs use to reach the kernel. Code is truth; verifie
 `kaijutsu-client` provides four things: an SSH transport (three multiplexed
 channels), a typed Cap'n Proto facade over `World`/`Kernel`, a `Send+Sync`
 `ActorHandle` that bridges multithreaded callers into the `!Send` Cap'n Proto
-`LocalSet`, and client-side CRDT mirrors that apply server-pushed events
+`LocalSet`, and per-context mirrors that apply server-pushed events
 incrementally.
 
 ---
@@ -45,31 +45,21 @@ supports agent/file/in-memory keys, and does TOFU host-key checking via
 
 ---
 
-## Client-side mirror — STALE, see `docs/change-feed.md`
+## Client-side mirror
 
-Everything below this heading describes `SyncManager`/`SyncedDocument`
-(`src/sync.rs`, `src/synced_document.rs`), a client-side CRDT mirror keyed on
-a `CrdtBlockStore`. **That code is gone** — neither file exists in
-`kaijutsu-client` any more, replaced by the change-feed architecture
-(`docs/change-feed.md`, `project_change_feed.md`): a `ContextMirror`
-(`src/context_feed.rs`) fed by `ActorHandle::subscribe_context` +
-`get_blocks_versioned`, held per context by `document_store.rs`'s
-multi-context store. This section is left unrewritten — a full
-architecture-doc pass for the change-feed migration is separate,
-larger work than the `kaijutsu-crdt` → `kaijutsu_kernel::blocks` crate melt
-that prompted this flag (see `docs/issues.md`).
+`ContextMirror` (`src/context_feed.rs`) is the client's view of one context. It
+is fed by `ActorHandle::subscribe_context` plus `get_blocks_versioned`, and
+`document_store.rs` holds one per context. The wire contract is
+`docs/change-feed.md`.
 
 ### Compose input
 
-`src/synced_input.rs` is deleted (2026-08-16). The
-compose draft used to be a separate `SyncedInput` CRDT document, hydrated via
-`getInputState` and kept live by `InputTextOps`/`InputCleared` server events.
-It is now an ordinary block (`Role::User`, `Status::Draft`, `ephemeral`, one
-per `(context, principal)`) sent via `editInput`/`submitInput` and read back
-like any other block off the per-context change feed — it lands in
-`mirror.blocks()` and is exposed as [`DocumentEntry::draft_text`]
-(`src/document_store.rs:22`). `document_store.rs` never held a `SyncedInput`
-of its own, so no separate document type survives to replace it.
+The compose draft is an ordinary block — `Role::User`, `Status::Draft`,
+`ephemeral`, one per `(context, principal)`. It is sent via
+`editInput`/`submitInput` and read back like any other block off the per-context
+change feed: it lands in `mirror.blocks()` and is exposed as
+[`DocumentEntry::draft_text`] (`src/document_store.rs:22`). There is no separate
+document type for it.
 
 ### `subscriptions.rs`
 
@@ -88,14 +78,10 @@ loop → `spawn_local(run_rpc_call(...))` → `KernelHandle` method → capnp
 `request.send()` → SSH rpc channel → server → reply via oneshot. Per-call timeout
 30 s; disconnect-class errors trigger the `Closing` transition.
 
-**Inbound (STALE — pre-change-feed):** server emits an event → SSH events
-channel → capnp callback (in the `LocalSet`) → `BlockEventsForwarder` →
-`broadcast` (cap 256) → consumer (`subscribe_events`) →
-`SyncedDocument::apply_event` (buffer-if-unknown, else merge, then
-`replay_pending`) → `CrdtBlockStore` mutated → consumer reads `blocks()`. See
-the flag at "Client-side mirror" above — this path no longer exists; the
-current inbound path is the per-context change feed
-(`docs/change-feed.md`).
+**Inbound:** server emits an event → SSH events channel → capnp callback (in the
+`LocalSet`) → `BlockEventsForwarder` → `broadcast` (cap 256) → consumer →
+`ContextMirror` updated → consumer reads `mirror.blocks()`. The wire contract is
+`docs/change-feed.md`.
 
 **Handshake** (`connect_handshake`, `:1852`): SSH dial+auth (5 s) → `bind_kernel`
 (5 s) → `join_context` if set (5 s) → `attach_peer` if remembered (best-effort,
@@ -117,10 +103,6 @@ non-fatal) → `subscribe_blocks_filtered` + `subscribe_mcp_resources` in parall
 - **String-matched disconnect classification** — `is_disconnect_error` matches on
   the capnp error `Display` text (`actor.rs:1214`); fragile if capnp changes
   formatting (would stop triggering reconnect).
-- **Escape hatches** — `doc_mut()`/`sync_mut()` (`synced_document.rs:465`) hand out
-  `&mut` past all invariant maintenance.
 - **Wrong-context events buffered** — events for another context with an unknown
   block id are buffered and never replayed (bounded, so not a leak, just wasted
   slots).
-- **Dead `SyncReset` path** — wired and tested client-side but the server never
-  emits it.

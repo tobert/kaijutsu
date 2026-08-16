@@ -1,7 +1,7 @@
 # In-App vi Editor
 
 `vi /etc/rc/thing/whatever.kai` (and bare `kj rc edit <path>`) opens a real
-vi-like editor on that file's CRDT block. The editor is a **kernel-owned
+vi-like editor on that file's block. The editor is a **kernel-owned
 session** driven through a small tool-shaped surface; the Bevy app is one
 *renderer* of it, a model is another *player* of it, and a headless test is a
 third *driver* of it. Same surface for all three.
@@ -132,7 +132,8 @@ graph.** The key *types* don't need a live TTY, so this is sound — accepted
 The kernel holds a registry of open editor sessions
 (`crates/kaijutsu-kernel/src/editor.rs`). Each session = one `EditorCore`
 bound to a `(context_id, block_id)`. Multi-user: many sessions (each its own
-cursor/mode) can target one shared block; their edits merge through the CRDT.
+cursor/mode) can target one shared block; the kernel sequences every
+session's edits onto it, and siblings reconcile via the mechanism below.
 The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 `EditorCore` stays inside sync critical sections), exposed as
 `Kernel::editor_open/keys/state/save/quit`.
@@ -140,17 +141,17 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 | Verb | Does |
 |---|---|
 | `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
-| `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the CRDT block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. **Async** since `:r` — sync-lock, release, await the fetch, sync-lock again; `EditorCore` never crosses the await, only the fetched `String` does. |
+| `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. **Async** since `:r` — sync-lock, release, await the fetch, sync-lock again; `EditorCore` never crosses the await, only the fetched `String` does. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty (what a renderer draws). |
-| `editor_save(session)` | `ZZ` / `:w` — flush the CRDT doc to its owner; advance the checkpoint. |
+| `editor_save(session)` | `ZZ` / `:w` — flush the document to its owner; advance the checkpoint. |
 | `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. |
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`) +
 `editorOpen/Keys/State/Save/Quit @84–88` + `subscribeEditor @89` with
 `EditorEvents` callbacks. **The render channel is push, not poll** (decided
-2026-06-23): remote CRDT merges into an open block must reach every renderer
-the instant they land — collaborative editing is the point, and poll would lag
+2026-06-23): a remote write landing in an open block must reach every renderer
+the instant it lands — collaborative editing is the point, and poll would lag
 it. `EditorFlow::StateChanged/Closed` ride an `editor_flows` bus; the kernel's
 `editor_keys/save/quit` publish after the registry mutates.
 
@@ -205,7 +206,7 @@ keys. The app never detects mode: app-side mode detection races the mode push
    motions, operators, counts, linewise ops, inserts, registers, undo/redo,
    visual-mode + operator, find-char.
 2. **Editing lifecycle (kernel + wire e2e, tool-shaped).** Drive the `editor_*`
-   surface against a live kernel; assert the CRDT block, flush-to-owner, `ZQ`
+   surface against a live kernel; assert the block, flush-to-owner, `ZQ`
    rollback, and concurrent second-session merge — including over real SSH +
    Cap'n Proto (`crates/kaijutsu-server/tests/editor_wire.rs`). No GPU.
 
@@ -220,12 +221,15 @@ The same surface a test drives is what a model plays.
    `kj editor open` alias. `kj editor` and bare `kj rc edit` reach the editor
    through the same shared `Kernel::editor_open` primitive; three front doors,
    one kernel method, one `EditorState::to_json` shape.
-2. **Save model: the session buffer binds to the CRDT block.** Edits are CRDT
-   ops (a merge), never a whole-file replace, so concurrent edits are never
-   clobbered.
+2. **Save model: the session buffer binds to the block.** Typing lands as
+   range edits (`block_store.edit_text`), never a whole-file replace. The
+   kernel sequences every write, so concurrent merge into a block is
+   structurally impossible — edits never clobber each other; a sibling
+   session's buffer reconciles against the block's latest text instead.
 3. **Binding tightness: live keystroke sync.** `editor_keys` mirrors each edit
-   to the CRDT immediately; remote ops merge back via the reconciler. Fully
-   collaborative; the rollback story keeps a clean `ZQ` possible.
+   to the block immediately; a sibling session's buffer resyncs via the
+   reconciler when its edits land. Fully collaborative; the rollback story
+   keeps a clean `ZQ` possible.
 4. **Render path: Design A** (decided 2026-06-23). The app renders the editor
    from the kernel-served editor subscription and **never joins the editor's
    context into `DocumentCache`** — the app's cache only holds contexts it
@@ -268,39 +272,35 @@ load-bearing:
   unmounted tree).
 - **ordinary file**: `FileDocumentCache::get_or_load(path)`.
 
-The CRDT-owned-config work made rc/config sole-owned single-block
-`DocKind::Config` documents. Running a config path through `get_or_load` would
-mint a *separate* `FileDocumentCache` copy shadowing that owner — reviving the
-dual-ownership write-through bug class that work deleted
-(`docs/config-crdt-ownership.md`). Missing config docs **fail loud** (no empty
-editor).
+rc/config are sole-owned single-block `DocKind::Config` documents. Running a
+config path through `get_or_load` would mint a *separate* `FileDocumentCache`
+copy shadowing that owner — reviving the dual-ownership write-through bug
+class (`docs/config-ownership.md`). Missing config docs **fail loud** (no
+empty editor).
 
 ---
 
-## Rollback / checkpoint (diamond-types-extended)
+## Rollback / checkpoint
 
-We run `diamond-types-extended` 0.2 (eg-walker list CRDT). The checkpoint
-lives in the session.
+The checkpoint is the session's last-saved text (`EditorSession.saved_content`),
+set at `editor_open` and refreshed by `editor_save`.
 
-- **Checkpoint primitive: yes.** `Document::version() -> &Frontier` is a
-  checkpoint token — captured at each `editor_save`/`ZZ`.
-  `ops_since(&frontier)` returns *precisely* the op-set since that checkpoint.
-- **Op-truncation / history deletion: no — by design.** No public
-  `truncate`/`revert`; deleting shared ops would corrupt merge for any peer who
-  already pulled them. Append-only is load-bearing.
-- **Trap:** `Branch::checkout_at_version(_frontier)` *looks* like "materialize
-  document as of version X" but **ignores its argument — it is a stub.** Do
-  not build on it.
-
-**Therefore rollback = inverse forward edit, not history erasure:**
+- **`editor_save`/`ZZ`** sets the checkpoint to the current buffer text and
+  clears the peer-wrote flag (see the entanglement guard below) — the
+  checkpoint now contains every merged peer edit.
+- **`editor_quit`/`ZQ`** compares the checkpoint against the block's current
+  text. If they differ, it writes the checkpoint back with one
+  `block_store.edit_text` call — an inverse forward edit, not history
+  erasure: concurrent merge into a block is structurally impossible, and
+  there is no oplog to erase from.
 
 ```
-editor_save / ZZ  →  checkpoint = (saved_text, version())   // session holds saved_text
-…editor_keys…     →  live CRDT ops (shared, collaborative)
-editor_quit / ZQ  →  diff(current, saved_text) → edit ops   // forward "undo" edit
+editor_save / ZZ  →  checkpoint = current buffer text     // session holds saved_content
+…editor_keys…     →  edits land on the block, kernel-sequenced
+editor_quit / ZQ  →  restore = checkpoint (+ terminator)  // written back if it differs from current
 ```
 
-Cheap, restart-safe, collaboration-safe (peers see an undo edit land).
+Cheap, restart-safe, collaboration-safe (peers see the rollback edit land).
 
 **Entanglement guard — detach, don't retract (Amy, 2026-07-07).** The rollback
 runs only when the session was provably *alone* with the block since its
@@ -363,7 +363,7 @@ push channel; the app renders it read-only.
   vim-exact. Flags: `g` (all-per-line), `i` (case-insensitive); unknown flag
   fails loud. Arbitrary delimiter (`:s#a#b#`). `:s` is an **edit**, not a
   kernel `CommandRequest`: it mutates the `EditorCore` buffer and rides the
-  existing diff→`EditOp`→CRDT-mirror path.
+  existing diff→`EditOp`→block-mirror path.
 - **Read:** `:r <file>` reads via `FileDocumentCache::read_content`; `:r !cmd`
   materializes a kaish in the **opener's** `(principal, context_id,
   session_id)` (the same `materialize_context_kaish` helper the model shell +
@@ -388,7 +388,7 @@ push channel; the app renders it read-only.
   a failed `:r` (missing file, denied/failed command, no opener) — sets the
   transient `EditorState.message` and keeps the session open; it clears on the
   next keystroke batch. Hard `editor_keys` errors are **reserved for
-  session/infrastructure failures** (no such session, a CRDT mirror failure) —
+  session/infrastructure failures** (no such session, a block-mirror failure) —
   the app's session-lost detection keys on exactly that distinction, and a
   dialect failure surfaced as an RPC error never reached the GUI at all (the
   app only logs it) while the un-pushed state left the `:`-strip showing the
@@ -410,7 +410,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`) |
 | `vi`/`edit` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `kj/context_shell.rs` |
 | `kj editor` / `kj rc edit` | `kaijutsu-kernel/src/kj/editor.rs`, `kj/rc.rs` (`rc_edit`) |
-| CRDT text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
+| Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |
 | Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @84` … `subscribeEditor @89`) |

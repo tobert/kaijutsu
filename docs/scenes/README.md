@@ -152,7 +152,7 @@ first anyway — it will look cool and guide the journey:
   declared but down, lit wire = live, a neighbor's manual patch rendered
   *warm* — additive-by-default, never an alarm (crosstalk is a feature).
 - Design homes for the backend when it matures:
-  `docs/config-crdt-ownership.md` (per-client namespace), `docs/mounts.md`
+  `docs/config-ownership.md` (per-client namespace), `docs/mounts.md`
   (the wire-ownership note), `docs/midi.md` (distribute intent, not pulses).
 
 ## Concept findings (running)

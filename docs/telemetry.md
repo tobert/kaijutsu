@@ -60,7 +60,7 @@ the server extracts it via `extract_rpc_trace()`.
 | MCP tools | `mcp.{tool}` | `mcp.block_read` | 10% (default) |
 | LLM | Auto-named with `llm.*` fields | `prompt{llm.model, llm.provider}` | 100% |
 | Turn outcome | `turn.{op}`, `turn.*` fields | `turn.events_push{turn.stop_reason}` | 100% |
-| CRDT sync | `sync.{op}` | `sync.push_ops` | 1% |
+| Document sync | `sync.{op}` | `sync.push_ops` | 1% |
 
 ### Server RPC
 
@@ -73,7 +73,7 @@ Sync methods use `span.entered()` guards.
 | Execution | `execute`, `execute_tool`, `shell_execute`, `prompt` |
 | Context | `create_context`, `join_context`, `list_contexts`, `get_context_id` |
 | Fork/Thread | `fork`, `thread`, `cherry_pick_block` |
-| CRDT / history | `push_ops`, `get_context_history`, `compact_context` |
+| Document / history | `push_ops`, `get_context_history`, `compact_context` |
 | Drift | `drift_queue`, `drift_cancel` (push/pull/merge/flush moved into `kj` dispatch, `kaijutsu-kernel/src/kj/drift.rs`) |
 | MCP | `register_mcp`, `unregister_mcp`, `list_mcp_servers`, `call_mcp_tool`, `list_mcp_resources`, `read_mcp_resource` |
 | LLM config | `configure_llm`, `get_llm_config`, `set_default_provider`, `set_default_model` |
@@ -187,7 +187,7 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 | `drift.*` | 100% | Cross-context operations |
 | `turn.*` | 100% | One span per turn ending — as rare as turns, and the whole story of how one ended |
 | `rpc.*` | 10% | High volume |
-| `sync.*` | 1% | Very high volume CRDT ops |
+| `sync.*` | 1% | Very high volume document-sync ops |
 | Errors | 100% | Always captured |
 | Other | 10% | Default |
 
@@ -275,5 +275,5 @@ trace without an extra lookup.
 ## Deferred (not yet instrumented)
 
 - **VFS methods** (~15 filesystem ops in `impl vfs::Server`) — high volume, low debugging value
-- **BlockStore internals** — CRDT ops, add when sync debugging needed
+- **BlockStore internals** — block store ops, add when sync debugging needed
 - **Unimplemented schema methods** — instrument when implemented

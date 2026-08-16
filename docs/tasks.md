@@ -4,38 +4,37 @@ The enabler for kaijutsu as a daily-task-grooming household agent (Amy:
 *"Task BlockKind and tool is a great idea"* — `docs/issues.md` "Household-agent
 arc"). Neither reference harness we surveyed (hermes-agent, QwenPaw) beats a
 todo tool writing JSON to a file on disk; a `BlockKind::Task` gets
-multi-frontend task sync from the CRDT for free — the model, the app, and a
-sibling context all see the same task state converge, the same way every
+multi-frontend task sync from the kernel for free — the model, the app, and a
+sibling context all see the same task state, the same way every
 other block already does.
 
 ## Status
 
 **Designed + SHIPPED 2026-08-04.** `BlockKind::Task`, the `TaskStatus`
-CRDT-synced field, `builtin.tasks` (create/update/complete/cancel/list),
+kernel-synced field, `builtin.tasks` (create/update/complete/cancel/list),
 hydration. **Deferred, on purpose** (see "Deferred" below): `kaijutsu-app`
 rendering beyond a placeholder line, a `task_reparent` verb, and the
 out-of-band-change notification companion described in "Hydration" below.
 
 ## Decisions
 
-1. **Task is Text-shaped plus one new CRDT field, not a payload struct.**
+1. **Task is Text-shaped plus one new field, not a payload struct.**
    Compare `Notification`/`Resource`, which carry a dedicated payload struct
    (`NotificationPayload`/`ResourcePayload`) because they're broker-emitted,
    write-once records of something that already happened. A task is the
    opposite: ordinary authored content (a title/description, same as any
    `Text` block's `content`) plus ONE thing that mutates —
    its lifecycle status. So `content` carries the title, and `task_status`
-   (+ its own LWW clock `task_status_at`) rides directly on `BlockHeader`/
-   `BlockSnapshot` as a `Copy` field, mirroring `content_type`/
-   `content_type_at` field-for-field (same per-field-clock mechanism in
-   `kaijutsu-kernel/src/blocks/content.rs`: `set_task_status`, `merge_header`'s
-   `field_wins` tiebreak). No new payload struct, no new mutation plumbing
-   to invent — the exact machinery `content_type` already proved out.
+   rides directly on `BlockHeader`/`BlockSnapshot` as a `Copy` field,
+   mirroring `content_type` field-for-field (`set_task_status` in
+   `kaijutsu-kernel/src/blocks/content.rs`). No new payload struct and no new
+   mutation plumbing to invent — the exact machinery `content_type` already
+   proved out.
 
 2. **`TaskStatus` is a dedicated enum — `Open`/`InProgress`/`Done`/
    `Cancelled` — not a reuse of the existing block `Status`
    (Pending/Running/Done/Error).** `Status` is tool-execution shaped: its
-   `Error` variant means "the tool crashed," and its LWW tie-break order
+   `Error` variant means "the tool crashed," and its tie-break order
    (`Error > Done > Running > Pending`) exists specifically so a concurrent
    completion report can never mask a real failure. Neither half fits a
    task. A task never "errors" — and there is no honest way to fold
@@ -44,12 +43,9 @@ out-of-band-change notification companion described in "Hydration" below.
    ask for a cancel verb, and the house rule that silent fallbacks are a
    mistake, a small dedicated enum was the only honest option.
    `TaskStatus`'s own tie-break order (`Cancelled > Done > InProgress >
-   Open`, pinned by `test_task_status_lww_tiebreak_order` in
-   `kaijutsu-types` and exercised end-to-end by
-   `test_per_field_lww_tiebreaker_task_status` in `kaijutsu-kernel`) makes
-   both terminal states dominate the non-terminal ones, and treats a
-   same-timestamp cancel as the more deliberate of two concurrent terminal
-   writes.
+   Open`, pinned by `test_task_status_lww_tiebreak_order` in `kaijutsu-types`)
+   makes both terminal states dominate the non-terminal ones, and treats a
+   cancel as the more deliberate of two terminal writes.
 
 3. **Subtasks reuse the ordinary DAG `parent_id` edge — no bespoke
    hierarchy.** `task_create` accepts an optional `parent_id`; `task_list`
@@ -136,7 +132,7 @@ Two mechanisms make that precedent transfer cleanly to Task:
    - **Bootstrap** (`hydrate_from_blocks`, full re-hydrate at a boundary
      event — fork, new context, cold start, attach) walks the block log and
      calls `translate_block` once per block, using whatever the block's
-     CRDT-merged fields currently say. So a boundary re-hydrate always
+     current field values say. So a boundary re-hydrate always
      shows the *true current* task state — an edit made an hour ago and a
      status flip made a second ago both show up identically, because
      bootstrap has no memory of a "previous" render to be stale relative
@@ -147,7 +143,7 @@ Two mechanisms make that precedent transfer cleanly to Task:
      once** — `feed`/`catch_up` silently skip a block already in `seen`.
      This is the mechanism, not a side effect of it: a task's `content`/
      `task_status` mutating in place (exactly what `task_update`/
-     `task_complete`/`task_cancel` do — same `BlockId`, LWW-merged fields)
+     `task_complete`/`task_cancel` do — same `BlockId`, mutated in place)
      is invisible to `catch_up` from the second call onward, because the
      id was already folded in. **The already-hydrated message's bytes
      never change, so whatever cache breakpoint it landed under never
@@ -185,7 +181,7 @@ block ("task \<id\> marked done") whenever the write's principal differs from
 the task's own author, reusing the existing `NotificationKind`/broker-event
 convention verbatim rather than inventing a "TaskChanged" hydration path.
 Not built here because it's speculative (household-agent multi-principal
-grooming isn't live yet) and the CRDT-sync half of the promise — every
+grooming isn't live yet) and the sync half of the promise — every
 frontend converging on the same `task_status` — already works today via the
 `BlockFlow::MetadataChanged` event any subscriber (the app, a sibling
 context) can observe directly, with or without an LLM in the loop. See

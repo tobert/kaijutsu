@@ -13,7 +13,7 @@ is the direction; that file is why.** Claims here cite code and are meant to
 be re-verified by grepping next to them.
 
 Related: [`crdt-position-2026-08.md`](crdt-position-2026-08.md) (the DTE
-doctrine this sits under), [`config-crdt-ownership.md`](config-crdt-ownership.md)
+doctrine this sits under), [`config-ownership.md`](config-ownership.md)
 (the ownership pattern deliberately *not* used here),
 [`issues.md`](issues.md) (open work).
 
@@ -24,8 +24,8 @@ doctrine this sits under), [`config-crdt-ownership.md`](config-crdt-ownership.md
 Six settled outcomes. These bind future work, including work that only
 *touches* memory.
 
-1. **The CRDT owns nothing memory-shaped** — not storage, not history, not
-   fact identity. Dead: a CRDT memory tree, memory-as-contexts, any
+1. **The kernel owns nothing memory-shaped** — not storage, not history, not
+   fact identity. Dead: a kernel-owned memory tree, memory-as-contexts, any
    facts/tags schema.
 2. **Multi-writer merge is REJECTED pending observed demand** — not
    "deferred value." Fleet practice treats concurrent same-file editing as a
@@ -97,28 +97,29 @@ Four caveats, all of which matter more than the headline:
 
 Re-run this before locking slice order, ideally over a calmer week.
 
-### Why not port the files into the CRDT
+### Why not port the files into the kernel
 
 Four reasons that stand on their own, plus one that confirms:
 
 - **The audit trail.** `git log -p` is a complete, diffable, mirrored-off-box
-  history of every fact's evolution. The CRDT oplog is durable but not
-  human-facing, lives in one `kernel.db` on one no-UPS machine, and has been
-  through a genesis demolition already.
+  history of every fact's evolution. Kernel documents keep no comparable
+  history — block text is a plain string, no oplog — and what state they do
+  hold lives in one `kernel.db` on one no-UPS machine, which has already been
+  through a genesis demolition.
 - **Availability without a kernel.** Four machines, one kernel. `fleet.md`
   gets read where no kernel will ever answer. A single kernel *cannot* have
   this property.
-- **Amy's hands.** CRDT ownership deliberately retired vim-the-file — correct
-  for rc scripts, whose only executor is the kernel. Memory's most important
-  writer and reviewer is Amy.
+- **Amy's hands.** Kernel ownership deliberately retired vim-the-file —
+  correct for rc scripts, whose only executor is the kernel. Memory's most
+  important writer and reviewer is Amy.
 - **The practice, not the bytes.** Receipts, delete-when-resolved, promotion
   tests, hand-curated indexes — conventions among readers, not properties of
   a store. A migration ports none of them.
 
 The confirming one is standing doctrine, not a trend: the 2026-08-09 ruling
 in [`crdt-position-2026-08.md`](crdt-position-2026-08.md) is **"refine, don't
-shed"** — clients released from replication, the kernel keeping the CRDT as
-its private at-rest engine — and its coda says **"No new DTE integration…
+shed"** — clients released from replication, the kernel keeping block storage
+as its own private engine — and its coda says **"No new DTE integration…
 CRDT-based features are admitted deliberately, on merit — never by default
 coupling."** A memory system is a new surface. The reader design does not
 approach the bar, and that is checkable rather than asserted: read-only
@@ -126,7 +127,7 @@ mounts serve straight from disk (`kernel/src/runtime/mount_backend.rs:264-267`)
 and hashline edit safety is content-hash reverification, not merge.
 
 Two findings from that same review cut the same way and are worth knowing
-before anyone re-proposes CRDT ownership: the MCP doc task is *"1,044 lines
+before anyone re-proposes kernel ownership: the MCP doc task is *"1,044 lines
 of concurrency control whose entire purpose is to re-impose single-writer
 discipline inside a CRDT client,"* and the `/etc/*` precedent's value is on
 record as **sole ownership, not merge** — *"a SQL blob would have delivered
@@ -217,7 +218,7 @@ fix wants building; see `issues.md`.
 Both memory trees are **already reachable from inside the running kernel**
 through the existing catch-all `LocalBackend::read_only("/")` mount
 (`kaijutsu-server/src/rpc.rs:1649`) — verified live on zorak. Reads on
-read-only mounts bypass the CRDT `FileDocumentCache` entirely by explicit
+read-only mounts bypass `FileDocumentCache` entirely by explicit
 design (`mount_backend.rs:264-267`), so they are straight-from-disk with no
 staleness window, and a backend error refuses to serve disk bytes rather than
 serving stale ones.
@@ -265,7 +266,7 @@ owner (git); recall gets one owner (kernel) — the same shape as "host exec
 has one owner."
 
 **Grep first.** Measure before indexing; on a corpus this size plain search
-may be embarrassingly competitive. `kj search` is already grep-over-CRDT and
+may be embarrassingly competitive. `kj search` is already grep-over-blocks and
 `builtin.file:grep` already works over the VFS.
 
 ### Slice 3 — write-back as proposals
@@ -350,7 +351,7 @@ variable.** This is a silent fallback and should probably be made loud; see
 
 **Addressing doctrine.** Host-truth trees are addressed at their **real
 paths** (like `~/src`). `/etc/memory` would be actively wrong — `/etc/*`
-means CRDT-owned. Riding the catch-all mount is convenience, not contract:
+means kernel-owned. Riding the catch-all mount is convenience, not contract:
 prove the shape free, then decide whether to pay for a declared read-only
 const in `paths.rs`.
 

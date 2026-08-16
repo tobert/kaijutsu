@@ -14,7 +14,7 @@ Five concepts compose. Most confusion comes from mixing them up.
 | **User**    | The human owner. One per kernel session.                                                            |
 | **Agent**   | An AI driving via MCP. Multiple Agents can share a User.                                            |
 | **Peer**    | An addressable endpoint registered with the kernel — `amy@kaijutsu-app@<uuid>`, `amy@claude-code-mcp@<uuid>`. Today: kinds `app` and `mcp`. |
-| **Context** | A CRDT node: document, drift mailbox, model binding, current state. The atom of conversation.       |
+| **Context** | A kernel node: document, drift mailbox, model binding, current state. The atom of conversation.       |
 | **Binding** | The model wired to a context. A context bound to Haiku will run Haiku turns regardless of who's driving. |
 
 ### Two graphs
@@ -105,7 +105,7 @@ The kernel pumps the binding for as long as the consent budget allows
 (see [Turn Pump](#the-turn-pump)), then pauses. New blocks accumulate in the
 document. Read them with `block_list`.
 
-The input document is CRDT-backed and shared — the User in `kaijutsu-app`,
+The input document is kernel-owned and shared — the User in `kaijutsu-app`,
 an Agent over MCP, and other peers all see the same buffer. `submit_input`
 snapshots it into a user block and clears it.
 

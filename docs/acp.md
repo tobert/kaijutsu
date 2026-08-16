@@ -41,12 +41,12 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/prompt` | `get_input_state` → `edit_input(0, text, len)` → `submit_input(ctx, false)` | built; text-only |
 | turn end → `stopReason` | `ServerEvent::TurnCompleted{stop_reason}` (1:1 by construction) | built |
 | turn broke | `ServerEvent::TurnFailed` → JSON-RPC error, **not** a stop reason | built |
-| `session/update` text/thought | `BlockKind::Text`/`Thinking` char deltas off the CRDT mirror | built |
+| `session/update` text/thought | `BlockKind::Text`/`Thinking` char deltas off the context mirror | built |
 | `session/update` tool_call / tool_call_update | `BlockKind::ToolCall` create, then patch; `ToolResult` patches the call it links to | built |
 | `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
 | `session/request_permission` | `ActorHandle::take_permission_asks` → `permission::run_permission_pump` → `contextId` → ACP session (`rank::session_id_of`) → real round trip; fail-closed on no session/client error/timeout | built |
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
-| `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the CRDT mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
+| `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the context mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `session/update` commands | curated, loadout-aware kj catalog; exact single-text `/name input` prompts execute addressed kj | built |
 | `session/update` usage / mode / config | context usage, casts/presets/config | planned |
 | `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
@@ -370,11 +370,11 @@ sessions take `context_type=coder` (the model-facing stance bundle), not
 
 **Decisions worth remembering:**
 
-- *Snapshots, not events.* `BlockTextOps` carries opaque CRDT ops, so decoding
-  a delta means owning a `SyncedDocument` anyway. The pump applies the event
-  and hands the resulting `BlockSnapshot` to a mapper that keeps per-block
-  high-water marks. That makes translation idempotent, which is also how
-  `session/load` replays history through the same code path.
+- *Snapshots, not events.* The pump keeps a `ContextMirror` and applies each
+  `ContextChange` (`textAppended`/`textReplaced`, never an opaque op) as it
+  arrives, then hands the resulting `BlockSnapshot` to a mapper that keeps
+  per-block high-water marks. That makes translation idempotent, which is
+  also how `session/load` replays history through the same code path.
 - *Char deltas, never byte.* A chunk boundary mid-codepoint is a corrupt frame.
   Same for the input-doc write: `edit_input`'s delete count is characters.
 - *Kernel-wide block events* (`scope_blocks_to_context: false`). An ACP client

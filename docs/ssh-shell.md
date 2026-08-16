@@ -187,8 +187,8 @@ Playing the shell out, smallest surprises first:
 - **Two cursors in play.** `cd /v/ctx/…` to browse while still acting as `home`; your
   prompt shows `home`, your `pwd` shows where you're looking. Switching contexts moves
   `/v/docs` but not your `pwd`.
-- **Many hands.** Two logins both `kj context switch feature-x` and both write — CRDT
-  multi-writer, both visible in `ls -l /v/session`. This is the literal shared
+- **Many hands.** Two logins both `kj context switch feature-x` and both write —
+  kernel-sequenced multi-writer, both visible in `ls -l /v/session`. This is the literal shared
   instrument. **Principal is the Unix model:** the authorship lane
   (`BlockId.principal_id`) is the authenticated *user's* principal — two logins by one
   user are two ttys for one uid, same lane, no per-session principal. The connection

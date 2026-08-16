@@ -160,12 +160,12 @@ content is outside" — fits panels-as-screens cleanly but is undecided.
 ## Ownership zones and object states
 
 - **Zones follow the mount table** (`docs/mounts.md`,
-  `docs/config-crdt-ownership.md`). The pre-world reading — CRDT-owned
+  `docs/config-ownership.md`). The pre-world reading — kernel-owned
   regions warm amber, read-only regions cool cyan behind glass
   (`read_only_shell` made visible) — predates the magenta-violet-at-rest
   decision. Proposed reconciliation, to test in a future wave: at-rest
   joint hue stays magenta-violet everywhere; *zone identity tints the
-  boundary/glass treatment* (read-only = cool glass, CRDT-owned = warm seam
+  boundary/glass treatment* (read-only = cool glass, kernel-owned = warm seam
   accents); activity always warms toward gold. Not yet decided.
 - **rc scripts are objects with visible state**: `kj rc list` already knows
   `[in-sync]` / `[differs from seed]` — staleness renders as a material

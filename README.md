@@ -42,9 +42,9 @@ server and ssh keys exclusively to identify users.
 Kaijutsu is deliberately **not** a partition-tolerant peer-to-peer system. Contexts
 are multi-writer because many players share one kernel, not because replicas
 reconcile: there is one place that decides what happened, and recovery is asking it
-again rather than merging with a peer. Block text is still stored in a CRDT
-underneath, but that is an implementation detail being retired from the contract —
-see [Status](#status).
+again rather than merging with a peer. Block text is a plain Rust `String`; there
+is no text CRDT anywhere in the system, and concurrent merge into a kernel
+document is structurally impossible.
 
 The stance behind all of it: kaijutsu is an instrument, not a harness. You play
 it, a model plays it, and if you hand someone a connected app they play it too —
@@ -62,19 +62,11 @@ kaijutsu. This can be inspected and visualized in the app or over MCP.
 **Kaijutsu is not released yet**. The kernel feels solid and reliable, and the UI
 is coming along.
 
-**Durable storage is mid-migration.** Kaijutsu was built on a CRDT
-(diamond-types-extended) as the shared state everyone edits concurrently. That bet
-bought less than it cost: the real concurrency need is "many players, one kernel,"
-which a kernel-side sequencer serves directly, while a CRDT's operation encoding
-leaked outward and became the de facto client contract and the de facto meaning of
-history. So the vocabulary is moving to Kaijutsu's own domain operations, and DTE
-is being demoted to a private text buffer kept only where it earns its keep.
-Reasoning and the ruling: [docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md).
-
-Practically, if you are reading the code: the `kaijutsu-crdt` crate is still here
-and still load-bearing, some clients still consume raw sync payloads, and rc/config
-still live as CRDT documents. Treat all of that as scaffolding on its way out
-rather than as the design.
+**Do not add a text CRDT for block content.** Streaming is 100% append and
+`push_str` is amortized O(1), while per-block merge metadata measured about 4x the
+size of the text it represented. A surface that genuinely needs concurrent text
+merge is a design conversation, not a patch. Reasoning and the ruling:
+[docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md).
 
 You may need my branch of kaish for this to build. Kaish will go back to
 cargo versions soon.
@@ -133,16 +125,9 @@ tool dispatch, an LLM registry, a drift router, and a pub/sub FlowBus. Contexts 
 be forked any time, at which point the context can be edited and even switch models
 and tools.
 
-### kaijutsu-crdt
-
-The block document model and `BlockStore`. Documents are DAGs of blocks — each
-block carries metadata (role, kind, status, parent) and a text buffer built on
-[diamond-types-extended][dte].
-
-Being demoted, deliberately. This crate's operation encoding is not the client
-contract and not the meaning of kaijutsu history; the kernel sequences domain
-operations and projects them outward. The text engine survives only where merge
-actually does work. Don't build new code against its raw ops.
+`kaijutsu_kernel::blocks` holds the block document model and `BlockStore`.
+Documents are DAGs of blocks — each block carries metadata (role, kind, status,
+parent) and a plain `String` of text.
 
 ### kaijutsu-server
 
@@ -258,17 +243,9 @@ text rendering, theming, and the UI architecture.
 | Doc | Purpose |
 |-----|---------|
 | [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
-| [docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md) | Why the CRDT is being demoted, and what replaces it |
+| [docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md) | Why block text is a plain `String` and not a CRDT |
 | [docs/architecture/](docs/architecture/) | Code-verified architecture map, per crate |
 | [docs/devlog.md](docs/devlog.md) | The story of how kaijutsu took shape — arcs, decisions, lessons |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
 | [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
 | [docs/issues.md](docs/issues.md) | Live work items not yet in code |
-
-## Forked Dependencies
-
-| Fork | Why |
-|------|-----|
-| [diamond-types-extended][dte] | Completes Map/Set/Register types alongside Text CRDT. Being narrowed to block text only; the Map/Set/Register work is what the domain-operation vocabulary replaces. |
-
-[dte]: https://github.com/tobert/diamond-types-extended

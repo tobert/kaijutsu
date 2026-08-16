@@ -17,10 +17,10 @@ on a `Notify` (the fix for the dropped-stdout bug — see memory
 `register_session`, `whoami`, `invoke_peer`, `kaish_exec`, `list_kernel_tools`,
 and the input tools (`read`/`write`/`edit`/`submit`). `HookListener`
 (`hook_listener.rs:29`) is a Unix-socket server that turns Claude Code lifecycle
-events into CRDT blocks and injects drift context into responses.
+events into blocks and injects drift context into responses.
 
 It is the **terminal consumer** — depends on `-kernel`, `-server`, `-client`,
-`-crdt`, `-types`, `-agent-tools`, `-telemetry`. Smells: op-count estimated as
+`-types`, `-agent-tools`, `-telemetry`. Smells: op-count estimated as
 `bytes/50`; Phase-2 full-snapshot fetch per shell command (per-block RPC is a
 TODO); the `KAIJUTSU_MCP_TOOLS` dedup list must be hand-synced and has stale names.
 
@@ -70,8 +70,8 @@ outlives the guard.
 ## `kaijutsu-hyoushigi` (拍子木) — the timing substrate
 
 The shared-timeline-coordinate engine. A `Tick` (from `-types`) is a pure `i64`
-logical coordinate (PPQ/beat counter), distinct from `order_key` (CRDT ordering)
-and `BlockId` (CRDT identity). `Timeline` (`engine.rs:154`) holds a **playhead**
+logical coordinate (PPQ/beat counter), distinct from `order_key` (block ordering)
+and `BlockId` (block identity). `Timeline` (`engine.rs:154`) holds a **playhead**
 that only moves forward (`pump`/`advance_to`), a future schedule, committed cells,
 an in-memory CAS, and misprediction ledgers. A `Cell` (`cell.rs:114`) is `{ span,
 body, state, track, played_by }`; `Body` is `Concrete(ContentRef)` or

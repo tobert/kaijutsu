@@ -2,8 +2,8 @@
 
 > **Status:** high-level sketch, captured 2026-06-28 from a framing conversation
 > (the same session that sketched the now-retired myaku pulse facility).
-> Directions, not commitments. Companion to `docs/slash-v.md` (the `/v` sysfs/CRDT
-> surfaces); the pulse/sampling design that lived in `docs/myaku.md` is **retired —
+> Directions, not commitments. Companion to `docs/slash-v.md` (the `/v` sysfs and
+> document surfaces); the pulse/sampling design that lived in `docs/myaku.md` is **retired —
 > recover its detail from git history** and migrate it here (see *Open* below).
 > Code is truth; this is where we're aiming.
 
@@ -16,17 +16,16 @@ the file tools, MCP, SFTP — sees the same trees because they're ordinary
 `VfsBackend`s. This is the "instrument you play" stance made literal, and it's the
 same move `slash-v.md` already makes for context/session introspection.
 
-The corollary: **the CRDT KV store (`KvDocument`/`Kv`) was deleted** (2026-07-04).
-It had no production callers beyond the one real tie — the app's durable
-context-restore — which moved to a typed per-client store first. Two stores for
-"durable shared" was the silent-fallback smell. See *KV retired* below.
+The corollary: **there is no KV store.** `KvDocument`/`Kv` was deleted; two
+stores for "durable shared" was the silent-fallback smell. See *KV retired*
+below.
 
 ## Tiers are mounts, not abstractions
 
 | Need | Mount | Backend | Semantics |
 |------|-------|---------|-----------|
 | **Ephemeral, shared-within-kernel, read-write** | `/run` | `MemoryBackend` (exists, `vfs/backends/memory.rs`) | tmpfs/XDG `RUNTIME_DIR` vibe. `/run/pulse/` = metric/probe data (design in git history, removed `docs/myaku.md`); `/run/<…>/` = agent/user scratchpad + OODA working trees. KV-replacement. |
-| **Durable, peer-synced, introspectable** | `/v/...` | CRDT + synthesized backends (`/v/docs`, `/v/ctx`, `/v/session`) | the durable + sysfs namespace `slash-v.md` designs |
+| **Durable, peer-synced, introspectable** | `/v/...` | Kernel documents plus synthesized backends (`/v/docs`, `/v/ctx`, `/v/session`). | The durable and sysfs namespace `slash-v.md` designs. |
 
 `/run` is its **own** mount (the existing `/scratch` `MemoryBackend` is likely
 retired — nothing uses it; `/run` is the better-named home for all ephemeral
@@ -51,12 +50,12 @@ Two clean lines fall out:
   `cp /run/foo /v/docs/foo` (or out to the host FS). The tiers compose through plain
   file ops; no write-through, no dual ownership. (XDG framing: a probe's volatile
   data is `RUNTIME_DIR` → `/run`; if one ever wants persistence, `STATE_DIR` → a `/v`
-  CRDT mount.)
+  mount.)
 
-"Shared" needs no CRDT *within one kernel*: every app/agent/MCP session talks to the
-one kernel, so they all see the one `MemoryBackend`. CRDT (the `/v` tier) earns its
-keep only for **durability and cross-kernel peer sync** — exactly what `slash-v.md`
-already builds.
+Sharing needs no merge machinery *within one kernel*: every app, agent, and MCP
+session talks to the one kernel, so they all see the one `MemoryBackend`. The
+`/v` tier earns its keep for **durability and cross-kernel peer sync** — exactly
+what `slash-v.md` already builds.
 
 ## The file-layout convention (a kaish helper, not a backend)
 

@@ -1,39 +1,20 @@
 # The context change feed
 
-Status: **built, in use, and the flag day has landed** (Amy, 2026-08-15 —
-*"yes change feed, it's been creeping around my thoughts and is the right
-move"*). The kernel classifies, the `ContextObserver` feed ships,
-`kaijutsu-client` carries the shared applier (`ContextMirror`), and ACP
-consumes it. `BlockEvents`' block-text half — `onBlockTextOps`,
-`onSyncReset`, `onBlockTextOpsBatch`, `getContextSync`,
-`declareEventCapabilities` — is deleted; see "Deleted by this change" for
-exactly what went and what deliberately stayed (`onRenderCue`/`onBeatSync`/
-`exchange`/`onSubscriptionTerminated`, the musical-timebase and
-lag-kick directives `subscribeBlocks`/`subscribeBlocksFiltered` still carry).
-
-Authority: `docs/crdt-position-2026-08.md` (one authoritative kernel sequencer,
-no client dependency on DTE). This document specifies the wire surface that
-replaces the CRDT projection.
+A client follows a context through one feed: `ContextObserver`. The kernel
+classifies each mutation and ships an ordered batch; `kaijutsu-client` carries
+the shared applier (`ContextMirror`), and ACP and the Bevy app consume it.
 
 ## Why one feed instead of many events
 
-Today a client learns about a context through thirteen separate `BlockEvents`
-methods, and text arrives as **serialized diamond-types operations**
-(`onBlockTextOps @5`, `onBlockTextOpsBatch @17`). Clients therefore link the CRDT
-to understand what happened. That is the thing the migration exists to end.
+One feed gets three things a set of per-change events cannot:
 
-A first design proposed two replacement events, `onBlockTextAppended` and
-`onBlockTextReplaced`. Review found it sound in shape and wrong in placement, and
-found that a single feed gets three things the pair cannot:
-
-1. **Coalescing becomes native.** `onBlockTextOpsBatch @17` exists only because
-   per-event methods cannot express "here are fifty changes". A list can.
+1. **Coalescing is native.** A list expresses "here are fifty changes"; a
+   per-event method cannot.
 2. **Transactional delivery.** A tool's final output text and its `Done` status
-   arrive in one message. A client can no longer render a completed tool with
-   missing output — a race the current surface allows.
-3. **One clock instead of two.** `seqNum` (per-context op counter) and `subSeq`
-   (per-subscription delivery counter) collapse into a single monotonic
-   `version` the client compares against.
+   arrive in one message, so a client can never render a completed tool with
+   missing output.
+3. **One clock instead of two.** A single monotonic `version` replaces a
+   per-context op counter plus a per-subscription delivery counter.
 
 ## Shape
 
@@ -74,15 +55,13 @@ getBlocks @35 (contextId :Data, query :BlockQuery, trace :TraceContext)
 
 This is the correction that matters most, and the first proposal got it wrong.
 
-`BlockFlow::TextOps` carries **opaque CRDT bytes**. A bridge holding those bytes
-cannot decide whether a change was an append without linking the CRDT — the exact
-dependency being removed. Worse, defining "the text we last sent" *per
-subscription* would force the server to keep one `String` per block per
-subscriber.
+**The kernel classifies inside the mutation lock**, where both the before text
+and the after text are in hand, and publishes already-classified variants. The
+bridge forwards; it never decides.
 
-**The kernel classifies inside the mutation lock**, where both the old and new
-text are already in hand, and publishes already-classified variants. The bridge
-forwards; it never decides.
+Classifying at the wire is impossible: by then the change is opaque bytes, and
+defining "the text we last sent" per subscription would force the server to keep
+one `String` per block per subscriber.
 
 ## Normative rules
 
@@ -176,11 +155,10 @@ corrupts the text.
 
 ## The feed is read-only, and that is the whole client contract
 
-A client **follows** a context here and **mutates** it by asking the kernel to
-run something. There is no client-facing RPC for editing block text: `pushOps`
-was the only one, and deleting it left none. Text reaches a block through the
-LLM stream, an MCP block tool, `kj block append`/`edit`, or a kaish write — all
-kernel-side, all behind the same capability checks.
+**There is no client-facing RPC for editing block text.** A client follows a
+context here and mutates it by asking the kernel to run something. Text reaches
+a block through the LLM stream, an MCP block tool, `kj block append`/`edit`, or
+a kaish write — all kernel-side, all behind the same capability checks.
 
 That is a decision, not an omission (Amy, 2026-08-15: *"clients should rely on
 stuff in kaish anyways most of the time"*). A parallel authoring RPC would be a
@@ -204,101 +182,35 @@ artifact is exactly the mistake the timebase doctrine forbids.**
 29. The server MUST NOT place a timing artifact in a batched delivery.
 30. The server MUST NOT delay a timing artifact for batching.
 
-## Deleted by this change
+## Two subscriptions, on purpose
 
-Flag day. Every client is in-repo and rebuilt together.
+`BlockEvents` carries four members the feed does not replace: `onRenderCue` and
+`onBeatSync` (musical-timebase directives, excluded from the feed by the section
+above), `exchange` (the MIDI request/reply the kernel calls back on), and
+`onSubscriptionTerminated`, their termination signal.
+`subscribeBlocks`/`subscribeBlocksFiltered` stay for them.
 
-**`BlockEvents` survives the flag day, reduced.** The table below deletes its
-block half, not the interface. Three members have no replacement and must stay:
-`onRenderCue` and `onBeatSync` (musical-timebase directives, excluded from the
-feed by the section above), `exchange` (the MIDI request/reply the kernel calls
-back on), and `onSubscriptionTerminated`, which is still their termination
-signal. `subscribeBlocks`/`subscribeBlocksFiltered` therefore stay too.
+A client that draws blocks *and* plays sound holds both: a `ContextObserver`
+feed per followed context, and a `BlockEvents` subscription for directives. That
+is the intended end state, not a transitional wart — one is a change log where
+batching is a feature, the other is a directive channel where batching is
+forbidden.
 
-A client that draws blocks *and* plays sound ends up holding both: a
-`ContextObserver` feed per followed context, and a `BlockEvents` subscription
-for directives. That is the intended end state, not a transitional wart — one is
-a change log where batching is a feature, the other is a directive channel where
-batching is forbidden.
-
-| Deleted | Reason |
-|---|---|
-| `onBlockTextOps @5`, `onBlockTextOpsBatch @17` | replaced by `textAppended` / `textReplaced` |
-| ~~`onInputTextOps`~~ | **NOT this flag day** — see below |
-| the other per-event `BlockEvents` methods | folded into `ContextEvent` (except the four named above) |
-| `getContextSync @36` | returns raw oplog bytes; `getBlocks` + version replaces it |
-| `getContextState @34` | already a tombstone, redundant with `getBlocks` |
-| `pushOps @37`, `pushInputOps` | clients do not author operations |
-| `ops` on `onBlockInserted` | dead weight; the snapshot is what renders |
-| `declareEventCapabilities @104` | a flag day needs no negotiation |
-| `onSyncReset` | oplog compaction is server maintenance; a client holding materialized state is not affected by it |
-
-**`onInputTextOps` stays, and this is a correction to an earlier draft of this
-table.** The compose input is a separate document on a separate API surface
-(`editInput`, `getInputState`, `onInputTextOps`, `onInputCleared`) and it is
-still CRDT-backed — open question 2 below, deliberately out of scope here.
-Deleting its event because it looks like a sibling of `onBlockTextOps` would
-break the app's compose box for no gain: nothing in this change replaces it.
-It goes when the input document is migrated, which is its own decision and
-probably its own shape (a block with a draft status would delete six
-endpoints).
-
-## Migration order (Amy, 2026-08-15)
-
-> *"do the kernel, get it and its tests refined, then have subagents chew on the
-> clients later. maybe keep kaijutsu-client synced and tested but mcp, app, and
-> acp can break while we migrate."*
-
-1. **Kernel + schema + server + `kaijutsu-client`.** These move together and stay
-   green. `kaijutsu-client` is the wire's tested consumer — it is how we know the
-   design works before any UI depends on it.
-2. **`kaijutsu-mcp`, `kaijutsu-app`, `kaijutsu-acp` may break** during step 1.
-   They are migrated afterwards, by subagents, one at a time.
-3. Breaking them is permitted; leaving them broken is not. The series ends when
-   all three are green, and the handoff must say plainly that moltar needs a
-   rebuild.
-
-**Known client migration costs — not hand-waved:**
-
-- **ACP relies on `SyncedDocument` for document order**, not only for text. Its
-  task-plan rendering needs blocks in DAG order, which the CRDT maintained for
-  free. ACP must maintain that ordering itself from `blockInserted` /
-  `blockMoved` / `blockDeleted`.
-
-  **Corrected while implementing (2026-08-15).** The sketch above originally
-  had `blockInserted` carry a bare `BlockSnapshot`, which cannot support that:
-  the wire `BlockSnapshot` has **no ordering key** — no `orderKey`, no `tick`
-  that ordinarily applies — so a client receiving one learns that a block
-  exists and not where it goes. `getBlocks` hides this because the kernel
-  returns blocks already ordered. Hence `BlockInsert { block, afterId,
-  hasAfterId }`, mirroring `BlockMove` and the old `onBlockInserted`. The
-  alternative — putting `orderKey` on `BlockSnapshot` so any snapshot sorts
-  itself — is the tidier answer and a wider change; it stays open.
-- **The Bevy app cannot ingest plain text into its CRDT mirror.** `DocumentCache`
-  wraps a `SyncedDocument`; appending a raw `String` to a CRDT is not a supported
-  operation. That cache is rewritten, not toggled.
-
-  **Done 2026-08-15** (`1a9985fd`), and the rewrite deleted more than it added:
-  the `generation`/`stale_active` counter and the poll systems built on it went
-  with it, because a feed that announces `Resubscribed`/`Terminated`/`Desynced`
-  leaves a periodic "is anything stale?" scan nothing to find.
-
-  One integration cost every Bevy consumer will hit: a live
-  `mpsc::Receiver<FeedEvent>` cannot ride Bevy's `MessageReader`, which hands
-  out shared references only. The receiver travels through a drain-once channel
-  resource instead. ACP, being plain tokio, never had this problem.
+The compose input keeps its own surface, `editInput` and `getInputState`. It may
+simply be a block with a draft status, which would delete both endpoints — open
+question 2 below.
 
 ## Open questions
 
 1. **`ContextSwitched`** is published on the block flow but is a shell concern,
    not a block change. Decide whether it joins `ContextEvent` or gets its own
    method.
-2. **The input document is a parallel API surface** — `editInput`,
-   `getInputState`, `onInputTextOps`, `onInputCleared`. It may simply be a block
-   with a draft status, which would delete six endpoints. Out of scope here;
-   worth deciding before Lane C builds on the current shape.
+2. **The input document is a parallel API surface** — `editInput` and
+   `getInputState`. It may simply be a block with a draft status, which would
+   delete both endpoints. Worth deciding before Lane C builds on the current
+   shape.
 3. **`BlockId` is a Lamport timestamp** (`{contextId, principalId, seq}`) —
-   multi-writer CRDT identity that a single sequencer does not need. A
+   multi-writer identity that a single sequencer does not need. A
    kernel-assigned UUIDv7 would do. Large blast radius; deliberately deferred.
 4. **`retired79 @79 ()` … `retired83 @83 ()`** are placeholder stubs from the KV
    deletion. A flag day is when they could go, if we accept renumbering.

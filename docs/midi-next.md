@@ -10,7 +10,7 @@
 > Companions: `docs/midi.md` (transport/clock/realtime doctrine — settled
 > direction), `docs/tracks.md` (the substrate), `docs/chameleon.md` (the
 > music application; its "per-track MIDI channel" open item is what slice 2
-> pays for), `docs/config-crdt-ownership.md` (the storage + rc precedent).
+> pays for), `docs/config-ownership.md` (the storage + rc precedent).
 
 ## The problem
 
@@ -50,8 +50,7 @@ the one surface every player uses to act on it?
 Two things every DAW conflates, kept separate here:
 
 1. **Device profile** — durable facts about the gear, independent of any
-   session. Portable, shareable, slowly changing. A CRDT-owned document in
-   the kernel.
+   session. Portable, shareable, slowly changing. A kernel document.
 2. **Binding** — this setup, this session: track *bass* → Poly 2, drum lane →
    ch 10 on TiMidity, KSP is clock master. Routing state; lives where routing
    lives — on the track / attachment model (`tracks.md`), *referencing*
@@ -174,8 +173,8 @@ tweaks. Side channel now, promotable later.
 
 ## Storage and identity
 
-- **`/etc/midi/devices/<name>`** — CRDT-owned per
-  `docs/config-crdt-ownership.md`: kernel sole owner, edited via `kj` (a
+- **`/etc/midi/devices/<name>`** — kernel-owned per
+  `docs/config-ownership.md`: kernel sole owner, edited via `kj` (a
   `kj midi` verb family), no host files. Optional embedded seeds for gear we
   ship knowledge of.
 - **Identity**: the universal **MIDI Identity Request** (`F0 7E 7F 06 01 F7`)

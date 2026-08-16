@@ -52,7 +52,7 @@ kept = (base ∩ ∪includes) \ ∪excludes
   rules; stacking repeatable flags cannot change meaning by position.
 - Resolved **at fork instant** — positions are one-shot addresses, never
   stored, which is what makes positional addressing safe in a multi-writer
-  CRDT log.
+  block log.
 - Implementation home: `ForkBlockFilter` (kaijutsu_kernel::blocks) grows interval
   support; `select_hydration_window` (kernel mailbox) becomes a consumer of
   the same algebra — its keep-set IS the `window` preset's base, one

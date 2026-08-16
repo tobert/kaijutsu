@@ -9,7 +9,7 @@ patching stays **CLI-only for a good long time** — the scene's first job is
 to render observed reality, look cool, and guide the backend's design by
 being looked at. If our backend ever grows complex, that is the signal to
 lean into PipeWire control rather than overbuild our own. Backend design
-homes when it matures: `docs/config-crdt-ownership.md` (per-client
+homes when it matures: `docs/config-ownership.md` (per-client
 namespace), `docs/mounts.md` (the wire-ownership note), `docs/midi.md`
 (distribute intent, not pulses).
 
@@ -165,7 +165,7 @@ dependency either way. Semantics:
 - Kernel-side declared-wire store, ClientId-keyed. Storage-shape fork
   (recorded, not decided): **typed KernelDb table** —
   `patchbay_wires(client_id, source, dest, enabled, …)`, the `client_views`
-  precedent, the current lean — vs a **CRDT surface** you rewire from any
+  precedent, the current lean — vs a **kernel document** you rewire from any
   peer (most kaijutsu-flavored; heavier, and routing is per-client so
   multi-writer buys less). Decide at build time against real use.
 - `kj patchbay connect|disconnect|list` — the CLI *is* the patching surface
@@ -192,7 +192,7 @@ symmetry for this station.
 
 Carried from the metronome-session handoff notes plus new ones:
 
-1. **Storage shape** (slice 2): typed KernelDb store vs CRDT surface.
+1. **Storage shape** (slice 2): typed KernelDb store vs kernel document.
 2. **Symbolic endpoint naming**: ALSA client-name substring match vs a small
    named-endpoint registry in config ("gm-synth" → pattern).
 3. **Headless edge reconciler**: the app is the obvious audio edge; where

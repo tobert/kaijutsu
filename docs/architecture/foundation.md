@@ -2,8 +2,7 @@
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-types`,
 `kaijutsu_kernel::blocks`, and `kaijutsu.capnp`. Code is truth; verified
-2026-06-16, block/document section updated 2026-08-16 for the CRDT retirement
-and the `kaijutsu-crdt` → `kaijutsu_kernel::blocks` melt.*
+2026-08-16.*
 
 These three things are the shared vocabulary every other crate builds on:
 `kaijutsu-types` defines the identities and data shapes, `kaijutsu.capnp` is how
@@ -14,7 +13,7 @@ they travel on the wire, and `kaijutsu_kernel::blocks` holds them per context.
 ## `kaijutsu-types` — the leaf
 
 A dependency-free foundation crate (no in-repo deps; `lib.rs:5`). Every identity,
-block, and CRDT-metadata shape lives here as a plain Rust type so the workspace
+block, and block-metadata shape lives here as a plain Rust type so the workspace
 DAG has no cycles.
 
 ### Identities (`ids.rs`)
@@ -39,13 +38,11 @@ Birth-certificate structs: `Context` (`context.rs:16`, with `forked_from` +
 - **`BlockKind`** (`block.rs:945`) — 10 structural variants: Text, Thinking,
   ToolCall, ToolResult, Drift, File, Error, Notification, Resource, Trace.
 - **`ContentType`** (`block.rs:310`) — 5 render hints: Plain, Markdown, Svg, Abc,
-  Image. LWW-merged via Lamport timestamp; richer discriminant wins ties. For
-  `Image`, the `content` string holds a 32-char CAS hash, not bytes.
+  Image. For `Image`, the `content` string holds a 32-char CAS hash, not bytes.
 - **`BlockSnapshot`** (`block.rs:1172`) — the serializable replication unit: a flat
   struct with all fields present, mechanism-specific fields (`tool_*`, `drift_*`,
-  `error`, `notification`, `resource`, `file_*`) as `Option`, plus per-field LWW
-  timestamps, `parent_id`, `order_key`, `tick`, and `updated_at` (the aggregate
-  `max` of all field timestamps).
+  `error`, `notification`, `resource`, `file_*`) as `Option`, plus `parent_id`,
+  `order_key`, `tick`, `created_at`, and `updated_at` (wall-clock millis).
 - **`BlockHeader`** (`block.rs:134`) — a `Copy` ~99-byte subset for DAG traversal
   without content.
 
@@ -77,20 +74,24 @@ Versioned CBOR: one format byte (`FORMAT_V1 = 0x01`) then ciborium CBOR.
 Schema id `@0xb8e3f4a9c2d1e0f7`, ~1,260 lines. Major shapes mirror the Rust types
 1:1: `BlockId` (line 35), `BlockSnapshot` (line 131, 41 fields with `has*`
 sentinels for null-less value types), `BlockMetadata`, `ErrorPayload`,
-`NotificationPayload`, `ResourcePayload`, `ContextState` (full CRDT sync: blocks +
-ops + version), `TimeoutPolicy`.
+`NotificationPayload`, `ResourcePayload`, `VersionSnapshot` (line 503),
+`TimeoutPolicy`.
 
 Interfaces:
 
 - **`World`** (line 879) — entry point: `whoami`, `listKernels`, `bindKernel`.
-- **`Kernel`** (line 888) — the main surface, ~84 methods: kaish exec, VFS, CRDT
-  sync (`pushOps`/`getContextSync`), block queries, subscriptions, MCP, peers,
-  timeline nav, context lifecycle.
-- **`BlockEvents`** (line 373) — server→client callback (13 events; carries
-  `seqNum` for dropped-event detection).
-- **`Vfs`** (line 1237) — 16-method filesystem interface.
-- **`PeerCommands`**, **`KvEvents`**, plus MCP callbacks (`ResourceEvents`,
-  `ProgressEvents`, `ElicitationEvents`, `LoggingEvents`).
+- **`Kernel`** (line 1576) — the main surface: kaish exec, VFS, block queries,
+  subscriptions, MCP, peers, timeline nav, context lifecycle. **There is no
+  client-facing method for editing block text** — clients follow a context
+  through `subscribeContext` and mutate by asking the kernel to run something
+  (`docs/change-feed.md`).
+- **`ContextObserver`** (line 472) — the per-context change feed a client
+  subscribes to.
+- **`BlockEvents`** (line 560) — server→client callback; carries `seqNum` for
+  dropped-event detection.
+- **`Vfs`** (line 1100) — filesystem interface.
+- **`PeerCommands`**, plus MCP callbacks (`ResourceEvents`, `ProgressEvents`,
+  `ElicitationEvents`, `LoggingEvents`).
 
 Evolution is tracked **only in comments** (no `@version`): see lines 921, 933,
 1169 documenting removed methods whose ordinals were *renumbered/reused* — flagged
@@ -100,47 +101,44 @@ in [issues](../issues.md) because Cap'n Proto treats ordinals as permanent.
 
 ## `kaijutsu_kernel::blocks` — the block/document model
 
-Formerly the standalone `kaijutsu-crdt` crate; melted into the kernel
-2026-08-16 once retiring the CRDT (below) left it with no dependency the
-kernel didn't already have (`docs/crdt-position-2026-08.md`). No longer a
-CRDT: the kernel is the sole sequencer for every mutation, so nothing ever
-needs concurrent-branch reconciliation. What is described below as "the CRDT
-layer" until 2026-08-16 is now an ordered block log per context; block order
-is fractional indexing, metadata is per-field LWW, and text is a plain
-`String`.
+One ordered block log per context. The kernel is the sole sequencer for every
+mutation, so nothing ever needs concurrent-branch reconciliation. Block order is
+fractional indexing, metadata in `BlockHeader` is plain data, and text is a
+plain `String`.
+
+**Do not reintroduce a text CRDT for block content.** Streaming is 100% append
+and `push_str` is amortized O(1), while per-block merge metadata measured about
+4x the size of the text it represented (`docs/crdt-position-2026-08.md`).
 
 ### One storage impl: `BlockDocument`
 
 `BlockDocument` (`blocks/block_store.rs:78`) is the single per-context storage
 path — a `BTreeMap<BlockId, BlockContent>` where each block owns its content
-as a plain `String`. Manages a Lamport clock (LWW), per-principal `seq_lanes`,
-a monotonic `next_tick`, and a `version` counter. `block_ids_ordered()`
+as a plain `String`. Manages per-principal `seq_lanes`, a monotonic
+`next_tick`, and a `version` counter. `block_ids_ordered()`
 (`blocks/block_store.rs:238`) sorts by `order_key` (tiebreak `BlockId`) — never
 iterate the `BTreeMap` for timeline order, it's principal-major. Append
 `order_key` is the *successor* of the predecessor's key (`blocks/content.rs`),
 decoupled from `tick` to avoid stale-counter mis-sorts. Sync via
 `ops_since(frontiers) → SyncPayload` / `merge_ops`
-(`blocks/block_store.rs:1286`, `:1327`) — retained for the client mirror's
-incremental-fetch path, not for concurrent-write merge, which cannot happen;
-persistence via `StoreSnapshot` (`Vec<BlockSnapshot>`, CBOR).
+(`blocks/block_store.rs:1232`, `:1273`) serves the client mirror's
+incremental-fetch path only. **Concurrent merge is structurally impossible** —
+`merge_ops` has no concurrent caller, and replay is sequential
+self-application, so code that reasons about conflict resolution here is
+reasoning about a state the system cannot reach. Persistence via `StoreSnapshot`
+(`Vec<BlockSnapshot>`, CBOR).
 
-**Naming note:** an *earlier, different* `BlockDocument` — a single shared DTE
-document holding all blocks as paths, kept alongside this struct (then named
-`BlockStore`) during an unfinished migration — was demolished 2026-08-09
-(commit `75e31b60`) and its file (`document.rs`) deleted. `BlockStore` was
-renamed to `BlockDocument` 2026-08-16, after the old model was long gone, to
-stop colliding with the kernel's *own* `BlockStore` (the documents map,
-persistence, journaling, and flows wrapper around this one). The name is
-reused; the two things it names are unrelated.
+`BlockDocument` is one context's block log. The kernel's own `BlockStore` is the
+documents map, persistence, journaling, and flows wrapper around it — two
+different types, one letter apart.
 
 `BlockContent` (`blocks/content.rs:204`) is the per-block unit: `content:
 String`, the `order_key`, an `Option<Tick>`, an `Option<TrackId>`, and
-write-once snapshot fields. No `catch_unwind`-wrapped CRDT ops remain — that
-machinery went with diamond-types-extended.
+write-once snapshot fields.
 
 ### Other documents
 
-- **`ConversationDAG`** (`dag.rs:15`) — an *ephemeral computed index* (not a CRDT)
+- **`ConversationDAG`** (`dag.rs:15`) — an *ephemeral computed index*, not durable storage,
   over an ordered `Vec<BlockSnapshot>`; DFS/BFS, subtree, ancestors, depth, all
   circuit-broken at `MAX_DAG_DEPTH`.
 

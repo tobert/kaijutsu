@@ -164,7 +164,7 @@ token. Therefore:
   Nothing downstream may treat `fromName` as authorization.
 - Keep *sending* auth anyway: a future CC that begins enforcing it would drop
   our messages **silently**, since there is no ack to notice with.
-- Tokens are **read at send time and never stored** — not in the CRDT, not
+- Tokens are **read at send time and never stored** — not in a kernel document, not
   cached, not logged, not in a `Debug` impl. A per-session secret in a durable
   multi-writer log would outlive the session it authenticates and replicate to
   every client, for no gain: the 0600 keyfile is already the durable truth.
@@ -202,7 +202,7 @@ inbox path with an unguessable name.** Then which socket a message arrived on
 identifies the sender.
 
 That pairs with what `PeerRegistry` already guarantees: the principal is
-**stamped server-side and never trusted from the client**. So inside the CRDT
+**stamped server-side and never trusted from the client**. So inside the block
 log a CC session's messages carry a kernel-stamped principal rather than a
 forgeable `from-name` — kaijutsu is *more* trustworthy than the transport it
 rides.
@@ -268,7 +268,7 @@ Layers 1 and 4 keep 2 and 3 honest. Do not ship the actor without both.
 
 - **Sibling-agent coordination stops being ephemeral.** Cross-session
   conversation today lives in two transcripts and dies with them. Routed
-  through the actor it is blocks in the CRDT log: durable, addressable,
+  through the actor it is blocks in the block log — durable, addressable,
   rendered in the app, searchable, forkable. "Crosstalk is a feature" gets
   infrastructure instead of goodwill.
 - **Bidirectional CC integration with nothing wrapped**, and no metered spend.

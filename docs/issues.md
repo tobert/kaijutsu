@@ -6,6 +6,84 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Serialized-struct changes need a restart, not a migration framework (2026-08-16)
+
+Filed after 343 documents went dark, then **right-sized on Amy's pushback**:
+*"to be fair, a schema migration like this was unexpected, and is incredibly
+rare, and probably will not happen again."* She is right, and the first draft
+of this entry proposed a migration framework, a writer-version column, and a
+`kj db check` verb. That is generalizing where the house rule is to delete.
+What survives is the small part.
+
+### The schema mechanism is fine — today was not a schema failure
+
+No table changed. `SCHEMA` (`CREATE TABLE IF NOT EXISTS`, re-run every open)
+plus `apply_additive_migrations` (guarded `ALTER TABLE ... ADD COLUMN`) plus a
+handful of `migrate_*` functions is honest, cheap, and has not failed. **Do not
+replace it.** The `kernel_migrations` marker added the same day is for the
+narrow case of a one-time cleanup whose "is there work left?" question costs a
+full scan; it is not the start of a framework.
+
+### What actually broke
+
+`TextEdit` gained a required `insert` field when diamond-types-extended was
+removed. `kaijutsu_types::codec` puts a `FORMAT_V1` byte in front of every
+buffer, but **that byte versions the envelope, not the struct** — it still read
+V1, ciborium still parsed the CBOR, and serde rejected a map missing a field
+that had been optional the day before.
+
+- Adding an **optional** field is safe — the additive-evolution contract the
+  codec tests establish, and it holds.
+- Adding a **required** field, dropping one a decoder needs, or changing a
+  type breaks every row the previous binary wrote.
+
+Removing a storage engine is a once-in-a-project event. Do not build for its
+recurrence.
+
+### The part that is NOT rare
+
+**A running process is a version, and a commit does not reach it.** The kernel
+started 08:46:44; the format-changing commit landed 09:32; the process kept
+journalling the old shape until 16:20:13. That skew exists every day we commit
+with the kernel up, which is every day. Today it only mattered because the
+change happened to touch a serialized struct.
+
+**The rule, and it costs nothing: restart the kernel promptly after committing
+a change to a serialized struct** (`SyncPayload`, `BlockSnapshot`,
+`StoreSnapshot`, `BlockHeader`, `TextEdit`, or anything reachable from them).
+The window between such a commit and the next restart is the window that
+produces unreadable rows. It is procedure, not code, and it is proportionate
+to a risk this rare.
+
+### The one piece of code that might still earn its place
+
+A CI test that decodes a small corpus of **recorded payload bytes from the
+previous release**. The 2026-08-16 break was detectable — a stored
+`SyncPayload` blob from yesterday would have failed to decode the moment
+`TextEdit` gained a required field, in CI, before any restart. Cheap, no
+framework, and it fails at the moment of the change rather than hours later on
+someone else's boot.
+
+Not urgent. Weigh it against the fact that it guards a class of change we
+expect approximately never.
+
+### Cleanup with an expiry
+
+`purge_dte_cutover_oplog_rows` and its `drop_dte_oplog_2026_08_16` marker row
+are dated code. Delete both once every live kernel has booted past 2026-08-16.
+Nothing tracks that — an undead pile of one-time migrations is how this file
+would rot.
+
+### The distinction worth preserving
+
+A **dated, named, one-time cleanup is honest**; a standing "skip whatever we
+cannot parse" fallback is not. The purge deliberately did not generalize, and
+the poison-and-skip load path stayed byte-for-byte unchanged: for any
+corruption that is not a known dated cutover, refusing to serve a document
+beats serving one with a hole in its history.
+
+---
+
 ## Triage of a real context's 37 "failed tool calls" (2026-08-16)
 
 Amy noticed `kaijutsu-chan` (a `director` seat on deepseek-v4-flash) showing
@@ -101,7 +179,7 @@ boundary was misread; `## [0.14.0]` sits at line 137, above both. We are on
 
 The second is the one that matters structurally: `S05-kaish.kai` composes
 `kj kaish primer` from the linked `kaish-help` crate at every context create,
-with **no static copy in the CRDT to rot**. So a kaish bump delivers those
+with **no static copy in the kernel document to rot**. So a kaish bump delivers those
 warnings into every new context's system prompt with zero kaijutsu edits —
 exactly the payoff that design was for.
 
@@ -430,6 +508,7 @@ cache: `seat/pointer/mod.rs` handles `AxisDiscrete` only) → KWin's
 backward-compat path only releases whole detents. winit 0.30.13 (Bevy
 0.19's pin) then prefers `discrete` → integer `LineDelta`. Nothing app-side
 can recover events never delivered.
+## `docs/architecture/` needs re-certification, and two diagrams are missing (2026-08-16)
 
 Upstream status (checked 2026-08-16): sctk **master** handles AxisValue120
 (exposes `value120: i32` on AxisScroll), but winit has **zero** value120
@@ -532,6 +611,19 @@ flag on a single-char insert-then-escape path rather than a buffer-state bug,
 given `dw` + retype (a full replace) recovered cleanly. Vi input handling
 lives in `crates/kaijutsu-app/src/input/vim/mod.rs`; worth checking whatever
 marks the input view dirty for repaint against the insert-mode commit path.
+- `06-crate-deps.svg` and `01-system-topology.svg` were **deleted**, not
+  corrected — one drew a crate that no longer exists, the other the demolished
+  `Kv` store. Both errors are structural, and `scry` is not on zorak.
+  Regenerate when the generator is available.
+- `docs/architecture/README.md`, `foundation.md`, and `client.md` have been
+  swept for vocabulary and for the deleted last-write-wins machinery, but not
+  re-verified line-by-line against current code the way the 2026-06-16 sweep
+  did originally — treat them as improved, not re-certified.
+- `test_per_field_lww_tiebreaker_task_status` no longer exists in
+  `kaijutsu-kernel`; only `test_task_status_lww_tiebreak_order`
+  (`kaijutsu-types/src/block.rs:5064`) pins the `TaskStatus` order. Decide
+  whether that order still needs pinning at all now that concurrent merge into
+  a kernel document is structurally impossible.
 
 ---
 
@@ -649,7 +741,7 @@ earlier, not inventing a destination.
 silence` (`crates/kaijutsu-acp/src/update.rs:1088`) failed once during a
 `cargo test --workspace` run, then passed 3 isolated runs, 5 full `-p
 kaijutsu-acp --lib` runs, and a second full workspace run. **Not a regression
-from the DTE removal** — the ACP crate no longer links `kaijutsu-crdt` at all.
+from the text-engine removal** — the ACP crate never linked a text engine.
 
 **What the failure looked like:** the test asserts two warnings land in a
 captured buffer — one naming a shrink, one naming a divergence. The buffer
@@ -740,18 +832,18 @@ Also from the same slice: `init_or_open` hand-writes `HEAD` and a minimal
 but it is one more piece of git's on-disk format this crate now owns and must
 keep correct by hand.
 
-## Lane B storage half is unbuilt — config documents are still CRDT documents, not files (2026-08-16)
+## Lane B storage half is unbuilt — config documents are not files (2026-08-16)
 
 `kaijutsu-configgit` (the git write seam above) is tested and unwired — see
-`docs/config-crdt-ownership.md`, "Lane B — the git-worktree seam". `/etc/config`,
+`docs/config-ownership.md`, "Lane B — the git-worktree seam". `/etc/config`,
 `/etc/client`, and `/etc/midi` are still `ConfigCrdtFs` mounts backed by
 `kernel.db`; nothing reads or writes `<data_dir>/config`. What shipped
 2026-08-15/16 (`988122f9`) was only the write *gate* — the file tools can now
-reach the CRDT-backed mounts directly — not a storage migration.
+reach the kernel-owned mounts directly — not a storage migration.
 
 Two shapes are live candidates, not decided: wire `kaijutsu-configgit` in as
 designed (one git worktree, auto-commit per mutation, service-authored
-commits — the rulings in `docs/config-crdt-ownership.md`), or go simpler per
+commits — the rulings in `docs/config-ownership.md`), or go simpler per
 Amy's 2026-08-15 lean — plain files on disk, keep the reset-to-embedded-
 default tool, and demote git to a skill invoked through rc or the help
 system rather than kernel machinery. Whoever picks this up should settle
@@ -785,8 +877,8 @@ and unit-tested, and nothing calls `record` (see the module doc in
 What it did before was count kernel events as a pulse — token streaming loudest,
 because it means a model is writing right now. True, and it cost the entire
 kernel-wide event stream to learn: the app received every token of every context
-to choose a brightness. It was also the last consumer of the raw CRDT wire, which
-is how it surfaced.
+to choose a brightness. It was also the last consumer of the raw operation wire,
+which is how it surfaced.
 
 Amy: *"we'll be doing embeddings for a lot of that content kernel side and maybe
 we can emit something more useful and derived."* So the replacement is not the
@@ -810,8 +902,8 @@ To re-enable: feed `RingActivity::record` and re-register an ingest system in
 
 Drift-arrival notifications detect `ServerEvent::BlockInserted` with
 `kind == Drift`. That is a real feature, not decoration, so it kept its source
-through the flag day — the per-block *semantic* events are not CRDT-carrying and
-were not part of that deletion.
+through the flag day — the per-block *semantic* events carry no storage-engine
+operations and were not part of that deletion.
 
 Moving it onto the change feed has a genuine question in it rather than being
 mechanical: the feed is per-context, so only contexts the app follows would
@@ -849,6 +941,7 @@ without building a `String`. **Resolved by the representation change** (2026-08-
 plain `String`, so a character count no longer requires materializing one.
 
 ### 2. kaish VFS write passes a byte length as a character count
+## kaish VFS write passes a byte length as a character count (2026-08-15, kaibo/DeepSeek)
 
 `kaish_backend.rs`'s write path computes `current_len` as `b.content.len()`
 (bytes) and passes it to `edit_text` as the `delete` **character** count. On a
@@ -917,7 +1010,8 @@ changes a general shell contract to solve one VFS's problem, and every other
 consumer of that VFS still gets the wrong order. Encode the order in the name.
 
 `order_key` is already a **base-62 lexicographic fractional index** built for
-exactly this (`crdt/content.rs`, "Fractional index for sibling ordering"), so a
+exactly this (`kaijutsu-kernel/src/blocks/content.rs`, "Fractional index for
+sibling ordering"), so a
 name like `<order_key>__<short_block_id>` sorts into document order by
 construction, stays unique, and needs no shell change. Open questions before
 building it: `order_key` changes when a block moves, so the filename is not a
@@ -943,7 +1037,7 @@ Amy: *"I don't think the principal plumbing should gate the git work. Let's make
 a local note to do a sweep across the code and look at principal plumbing
 holistically and wire it down to more places."*
 
-**Trigger.** The CRDT melt's Lane B rules that config mutations auto-commit to
+**Trigger.** Lane B rules that config mutations auto-commit to
 git, one commit per accepted mutation, each recording principal and operation id.
 But config mutation APIs don't carry honest principal metadata today — a VFS write
 arrives without knowing who asked for it, so those commits would be
@@ -999,7 +1093,7 @@ context join.** `crates/kaijutsu-app/src/view/sync.rs`'s
 `handle_block_events` only builds `cached.input` when
 `RpcResultMessage::InputStateReceived` arrives AND `cached.input.is_none()`
 (line ~140-168) — true on the initial `ContextJoined`, never true again once
-an input doc exists. Unlike the block CRDT (which gets a real resync via
+an input doc exists. Unlike the block log (which gets a real resync via
 `get_context_sync` → `ContextResynced`, fired eagerly in
 `RpcActor::enter_connected` on every reconnect — `crates/kaijutsu-client/src/actor.rs`
 line ~2038-2064), an `EditInput`/`SubmitInput` a peer issued *during* the
@@ -1611,7 +1705,7 @@ change). But live BRP verification exposed the deeper contributing factor
 the old entry got wrong: **`ThemeReceived` has exactly one send site, the
 connect-time bootstrap fetch** (`actor_plugin.rs`), and `ServerEvent` has no
 config/theme variant at all. `kj config set /etc/config/theme.toml` updates
-the CRDT and nothing tells a running app — verified pixel-identical
+the kernel document and nothing tells a running app — verified pixel-identical
 before/after a live set, while the same change applied fine across a
 restart. The 08-12 dock A/Bs must have ridden restarts/reconnects.
 
@@ -1666,7 +1760,7 @@ crushing it since birth, so its tuned values have never actually been seen
 on screen. At a 960×600 window it reads as fuzz (it was most of the "text
 looks fuzzy" report), with glow off the text is *crisp*; at 4k it may well be
 the intended synthwave neon. Decisions: strength/alpha, and whether a
-fixed-pixel radius should scale with font size / scale factor. Live CRDT
+fixed-pixel radius should scale with font size / scale factor. The live kernel
 currently has it OFF for Amy to eyeball; repo seed still ships 2.5.
 
 ---
@@ -1865,7 +1959,7 @@ variable** (`head -n`, a filter) — recorded in `memory.md`'s mechanics section
 Direction is now canonical in [`memory.md`](memory.md): **the kernel is
 memory's best reader, not its new owner** — git keeps storage, kaijutsu grows
 recall. Read it before proposing anything memory-shaped; several attractive
-designs are explicitly dead there (CRDT memory tree, memory-as-contexts, fact
+designs are explicitly dead there (a kernel-owned memory tree, memory-as-contexts, fact
 schemas), and one rule binds work well outside memory:
 
 - **The derived-state rule.** "No second store" is enforced by asking *"can
@@ -2082,7 +2176,7 @@ compliant server offers it otherwise.
   durable to-do item tracked in a conversation, theirs is an in-flight RPC
   handle. Do not unify them.
 - **MCP tasks do NOT replace `background_exec`.** Ours streams output into a
-  CRDT block every player can see; an MCP task's result goes only to the one
+  block every player can see; an MCP task's result goes only to the one
   client polling it. In a many-hands model that is a downgrade. Tasks are for
   the *outbound* long-call problem (kaibo), not for kernel-owned background
   work.
@@ -2135,7 +2229,7 @@ hermetic cwd/env ← `apply_context_config`), plus an `is_dir()` check
 canonical owner, one silent copy, no mechanism keeping them in sync.
 
 **Preserve across the swap** (all in `background_exec.rs`): live output into
-the CRDT block (not buffered to completion); `Running`→`Done`/`Error` tied to
+the block (not buffered to completion); `Running`→`Done`/`Error` tied to
 exit; `kill_all_for_context` (`:486`); process-group kill (`:583`); the
 PDEATHSIG orphan guard (`:586` — `kill_on_drop` only covers a clean unwind);
 output cap with a loud marker. Characterization tests come first.
@@ -2191,7 +2285,7 @@ shared-trust model and with how `BackgroundRegistry` already works.
 Fleet direction from tonight's planning: brak (always-on N100 on UPS,
 tailnet 100.113.35.53) should eventually run the kaijutsu kernel as the
 fleet's coordination service — machine sessions on zorak/brak/moltar talk
-via shared CRDT docs + invoke_peer instead of the current
+via shared kernel documents + invoke_peer instead of the current
 sftp-handoff-mail protocol. brak is NOT a build box: zorak builds and
 syncs binaries. What kaijutsu owes when this gets picked up: a server
 build/config profile for a small x86_64 box (release build, modest
@@ -2226,7 +2320,7 @@ so kaijutsu-server binaries reach brak via launcher sync from zorak's
 builds. And brak is dropping MinIO (license): assume NO object storage on
 the fleet coordinator.
 
-**CRDT-record note**: this plan is ONE kernel with many tailnet clients —
+**Storage-model note**: this plan is ONE kernel with many tailnet clients —
 the one-body model stretched across machines, not multi-kernel
 federation. It therefore *supports* the option-2 verdict in
 docs/crdt-position-2026-08.md rather than triggering its federation
@@ -2571,7 +2665,7 @@ gap worth closing.
 Amy: *"I want to get kaijutsu's coding functionality up to a level I can use for
 my day job."* Verified against a running kernel (probed via `kaijutsu-mcp
 --connect`) plus source. The **tool surface is not the gap** — `builtin.file`'s
-hashline anchors and CRDT-aware `grep` are ahead of Claude Code's equivalents.
+hashline anchors and document-aware `grep` are ahead of Claude Code's equivalents.
 The gap is **context economics**: nothing measures or bounds what a turn costs.
 
 Complements the Gemini CLI comparison below (2026-06-23) — that pass found the
@@ -2673,7 +2767,7 @@ these are the ones that block *using* the thing.
 - ~~**Background process management.**~~ **SHIPPED 2026-07-30.** `shell` takes
   `background: true`, spawning `/bin/sh -c` directly on the host (bypassing the
   per-call kaish materialization, which can't host a registry that outlives the
-  call) and streaming into a CRDT block; a kernel-owned `BackgroundRegistry`
+  call) and streaming into a block; a kernel-owned `BackgroundRegistry`
   (`background_exec.rs`) plus a `builtin.background` sibling server
   (`list_background_processes` / `read_background_output` /
   `kill_background_process`). Orphan-proof via `PR_SET_PDEATHSIG`.
@@ -2699,7 +2793,7 @@ these are the ones that block *using* the thing.
   and later `blocks.set_status(..., Done/Error)` at the same call site that
   updates the registry, ~`background_exec.rs:691-699`) is one of the blocks
   `count_block_activity` counts — so `block_activity` reflects a background
-  job's start/finish the instant the CRDT op broadcasts, sub-second, no
+  job's start/finish the instant the block mutation broadcasts, sub-second, no
   polling. `background_jobs` reads the *same* start/finish only through
   `BackgroundRegistry::summary_by_context` via the 5s-throttled `DriftState`
   poll (`ui/drift.rs:16`, `poll_drift_state`). Both badges can visibly
@@ -2715,11 +2809,11 @@ these are the ones that block *using* the thing.
   cosmetic and self-healing, exactly because the kernel writes the block status
   and the registry entry in the same `match final_status` arm — the next poll
   always sees a matching terminal state. But the two badges measure genuinely
-  different things (visible CRDT block status vs. OS process registry lifetime),
+  different things (visible block status vs. OS process registry lifetime),
   and there are three ways they diverge **permanently**, which the entry above
   understated:
   1. **Kernel restart.** `BackgroundRegistry` is in-memory, so a restarted
-     kernel reports zero background processes while the persisted CRDT document
+     kernel reports zero background processes while the persisted block document
      may still hold `Running` blocks — `background_jobs` goes idle,
      `block_activity` keeps counting. Non-transient.
   2. **`set_status` fails while the registry update succeeds** (same call site;
@@ -2849,7 +2943,7 @@ the loop). Threads to pull, together or separately:
   map the whole world before speaking. Consider a light tool budget nudge.
 - **kaish quirks primer in the stance** (or a `/etc/rc` .md slot): the
   live models rediscover the same parse rules every session. The stance
-  is CRDT-seeded June-era content; kaish is at 0.13 — audit for staleness
+  is seeded June-era content; kaish is at 0.13 — audit for staleness
   while in there (`kj rc` surface, embedded defaults are only the seed).
 - **Per-surface stance**: ACP/toad sessions may want a snappier stance
   than the desk coder seat — ties into the client-identity-preset seed
@@ -2889,13 +2983,13 @@ Amy is pointing kaijutsu at always-on household duty (daily task grooming,
 proactive check-ins, chat access). We read the two flagship harnesses —
 clones at `~/src/research/hermes-agent` + `~/src/research/QwenPaw` — and wrote
 the comparison to `~/src/meadow-lab/docs/kaijutsu-gap-analysis.md`. kj already
-wins model switching, semantic memory, OTel, and CRDT-native state; the gaps:
+wins model switching, semantic memory, OTel, and kernel-owned state; the gaps:
 
 - **Task BlockKind + tool — SHIPPED 2026-08-04** (Amy: *"Task BlockKind and
-  tool is a great idea"*). `BlockKind::Task` + a dedicated CRDT-synced
+  tool is a great idea"*). `BlockKind::Task` + a dedicated kernel-synced
   `task_status`/`task_status_at` field (mirrors `content_type`'s exact
   mechanism — its own `TaskStatus` enum, not a reuse of the tool-execution-
-  shaped `Status`) get multi-frontend task sync from the CRDT for free.
+  shaped `Status`) get multi-frontend task sync from the block log for free.
   Closes the "no task/plan state — compare TodoWrite" gap noted in the
   day-job entry above. `builtin.tasks` (`mcp/servers/tasks.rs`) exposes
   create/update/complete/cancel/list (open/done buckets); subtasks reuse
@@ -3022,7 +3116,7 @@ adapter, as built".
   name+version) and capabilities — enough to recognize *which* frontend
   connected. Wire that into the existing per-client config machinery: derive
   a ClientId from the client identity, let the `/etc/client` cascade
-  (docs/config-crdt-ownership.md; metronome was the first consumer) and/or a
+  (docs/config-ownership.md; metronome was the first consumer) and/or a
   preset/cast mapping key off it — "toad connections get preset X / cast Y,
   Happy gets Z." Today every ACP context gets the row-stamped default
   (ds-v4-flash) regardless of who connected; this is also where the pending
@@ -3674,7 +3768,7 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
 - **audio/beat-this model config**: the verb hardcodes the model dir
   convention; a config home now means a kj-managed kernel-db table (the
   2026-08-03 SQL model-config shape — models.toml is gone, and the
-  seeded-once CRDT caveat died with it).
+  seeded-once caveat died with it).
 - **Vendor risk note**: beat-this is v1.0.0, single maintainer (danigb), MIT —
   small enough to vendor/fork if it stalls. rten GPU support (Metal-first) is
   on its author's 2026 roadmap; CPU is fine for our workloads.
@@ -3687,7 +3781,7 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
 
 ## MIDI device profiles + device contexts (seeded 2026-07-15, `docs/midi-next.md`)
 
-Design direction captured in `docs/midi-next.md` (living doc): CRDT-owned
+Design direction captured in `docs/midi-next.md` (living doc): kernel-owned
 device profiles under `/etc/midi/devices/` (rc-style buckets: static `.md` +
 kai-synthesized current picture; settings vs capabilities ground-truth
 split), track bindings as *device.role* not raw
@@ -3829,11 +3923,11 @@ Scheduled background operations as **tracks**: a slow clock + probe
 attachments (`ooda_armed: false`) firing kai scripts on beats. Kinship:
 chameleon's cue traps are "cron in musical time" (`docs/chameleon.md`,
 unbuilt); this is the same machinery at ops tempo, and the rc synergy is
-direct (groomer scripts are CRDT-owned, `kj rc edit`-able). Use cases
+direct (groomer scripts are kernel-owned, `kj rc edit`-able). Use cases
 queued up: device-profile refresh (`kj midi identify`/`pull` sweeps,
 `/run/midi` staleness, pulled-vs-document drift flags — likely first
 consumer, `docs/midi-next.md` "Keeping it current"), archive rotation,
-index/synthesis grooming, oplog/CRDT compaction, auto-memory grooming.
+index/synthesis grooming, oplog compaction, auto-memory grooming.
 Needs a design round before code — write the companion doc when the first
 consumer is real.
 
@@ -4028,7 +4122,7 @@ Remaining, roughly in order:
 High-level sketches landed 2026-06-28; dedicated design sessions to follow. The
 thesis: the VFS *is* the shared-state namespace; tiers are mounts (`/run`
 `MemoryBackend` for ephemeral read-write — its own mount, `/scratch` likely retired
-— and `/v` for read-only/CRDT durable). No bespoke store. Open work that's already
+— and `/v` for read-only durable kernel documents). No bespoke store. Open work that's already
 concrete:
 
 - **`VfsOps::append` (or open-for-append cursor).** No append primitive today;
@@ -4531,19 +4625,20 @@ key-value store demolished 2026-07-04.*
   `kaijutsu-types/src/codec.rs`) — today they must live forever, because
   compaction is threshold-triggered and a quiet document may never be
   re-snapshotted.
-- **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`) — slices 1+2
-  shipped 2026-06-16/17 and long since exercised live** (`kj rc edit`/`kj config
-  set` are the daily surface). Remaining: the deferred CRDT scratch mount.
+- **Kernel-owned config/rc (design: `docs/config-ownership.md`) — shipped and
+  long since exercised live** (`kj rc edit` is the daily surface). Remaining: the
+  deferred scratch mount.
 - **rc cutover follow-ups (from slice 1):**
   - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_crdt_rc`
+
     (DB-backed block store sharing the in-memory `KernelDb` handle) hangs the
     `kj::fork` tests — a latent lock-ordering / re-entrant-`parking_lot` issue.
     Worked around by keeping the *global* `test_dispatcher` db-less + LocalBackend;
-    only rc-scoped tests use the CRDT dispatcher. Production runs db-backed and fork
+    only rc-scoped tests use that dispatcher. Production runs db-backed and fork
     works there, so it's likely test-harness-specific — but worth a look (could flag
     a real reentrancy risk). Until fixed, the global rc test tree is still host-disk
     (`ensure_rc_seed_files` + LocalBackend), inconsistent with production.
-  - **Teach `FileDocumentCache` to pass through CRDT-native mounts.** `ConfigCrdtFs`
+  - **Teach `FileDocumentCache` to pass through kernel-owned mounts.** `ConfigCrdtFs`
     carries an in-memory advancing mtime purely so the cache (used by agent
     `builtin.file:read /etc/rc/…`) reloads after a `kj rc` write. Cleaner: the cache
     skips mirroring `real_path()==None` mounts entirely (read straight through),
@@ -4567,8 +4662,6 @@ key-value store demolished 2026-07-04.*
   during LLM streams. Note SQLite serializes *writes* regardless of pooling, so
   the win is concurrent reads (WAL only) — verify WAL first; narrowing lock scope
   may matter as much.
-- **Config CRDT ops:** config docs (`DocKind::Config` on `ConfigCrdtFs`) need DTE
-  integration so config/rc changes replicate across peers.
 - **Theme hot-reload-on-edit (slice 2 follow-up):** the app fetches `theme.toml`
   over RPC only on connect (`apply_theme_from_rpc`). A live `kj config set
   /etc/config/theme.toml` won't re-theme a running app until reconnect. Closing it
@@ -4840,7 +4933,7 @@ key-value store demolished 2026-07-04.*
   handlers) to async. Unify when that path is reworked, or add a sync
   mount-ownership lookup. Low stakes (cache-coherence optimization), but it's a
   second source of truth for config-ownership.
-- **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
+- **User presence (novel surface):** The compose input is a shared draft block. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.
 - **Card-stack texture quality (3D direction):** the renderer presents vello/MSDF
@@ -5049,8 +5142,8 @@ key-value store demolished 2026-07-04.*
   history except this doc's own bug report — `models.toml`'s
   `default_model`/aliases and `DEFAULT_MODEL` have always read the valid
   `claude-haiku-4-5-20251001` since the TOML config was introduced. But
-  `/etc/config/models.toml` is CRDT-owned and seeded absent-only
-  (`config_seed.rs`, `config_crdt_fs.rs:349-378`) — a kernel whose CRDT
+  `/etc/config/models.toml` is kernel-owned and seeded absent-only
+  (`config_seed.rs`, `config_crdt_fs.rs:349-378`) — a kernel whose
   config predates whatever earlier fix corrected this would still be
   serving the stale value, since a context's model is baked in at creation
   time from the live registry (`rpc.rs` `create_context_inner`) and restarts
@@ -5062,12 +5155,12 @@ key-value store demolished 2026-07-04.*
   hashline addressing shipped 2026-06-17, story in devlog +
   `project_file_tools_hashline`):** the in-context recovery affordance
   *shipped* 2026-08-01 as `kj diff` (`docs/diff.md` slice 3) — one path diffs
-  disk against the CRDT document that owns it, and `--from <seq>` replays the
+  disk against the kernel document that owns it, and `--from <seq>` replays the
   journal, so "what did the agent change, and what did it used to say?" is
   answerable in the shell. Still open: (1) the post-write verification reads the
-  CRDT cache, not the VFS disk, so a faulty flush is only caught by
+  document cache, not the VFS disk, so a faulty flush is only caught by
   `flush_one`'s own error (documented in `edit.rs`); (2) `FileDocumentCache`
-  CRDT-native pass-through (tracked under Persistence & Sync) would let `read`'s
+  pass-through for kernel-owned mounts (tracked under Persistence & Sync) would let `read`'s
   hashes anchor `/etc/rc` cleanly.
   - **kaish-side build-out — design direction (not yet built).** The hash is an
     *edit-addressing* feature, so the kaish read surface wants **two read modes**:
@@ -5165,7 +5258,7 @@ key-value store demolished 2026-07-04.*
   Individual entries below fold into those stages as they ship.
 - **Live tail misses streaming model text (found building the live layer,
   2026-07-04).** `live::tail_line` skips empty inserts because model prose
-  streams in via CRDT `BlockTextOps` the well doesn't decode — the HUD South
+  streams in via text-append events the well doesn't decode — the HUD South
   tail shows whole-content blocks (prompts, tool calls, score cells, errors)
   while a streaming turn only reads as chatter glow + running rim. Refinement
   candidates: decode ops for the *selected* context only (the conversation
@@ -5374,7 +5467,7 @@ key-value store demolished 2026-07-04.*
     - **Write ergonomics** — `--global` flag + caller-scoped write default (so a
       client tweaks its own `/etc/client/<id>/…` without spelling the id); needs
       `kj` to resolve the caller's client-id, the same MCP/headless durable-id
-      prereq (`docs/config-crdt-ownership.md` "Per-client config" → Open).
+      prereq (`docs/config-ownership.md` "Per-client config" → Open).
     - **Config-change push** — the app applies `metronome.toml` once per
       (re)connect; a live `kj config set` doesn't reach it without a reconnect.
 - **Metronome controller — graduate to PI/PID later.** The slosh was fixed
@@ -5740,7 +5833,7 @@ substrate deserves a systematic pass rather than per-claim firefighting. The tri
 this round: SFTP rides `Arc<MountTable>` directly (`sftp.rs:115`, from
 `kernel.vfs()`), while the `FileDocumentCache` write-through lives one layer up in
 `MountBackend` (`runtime/mount_backend.rs:43-49`), which SFTP never traverses. Not
-the "silent divergence" the review claimed (CRDT mounts still hit `ConfigCrdtFs`
+the "silent divergence" the review claimed (kernel-owned mounts still hit `ConfigCrdtFs`
 in-table; the generation/mtime staleness reload exists precisely to catch
 bypassing writers — that's how host `vim` stays coherent) — but the two-layer split
 is real and under-tested.
@@ -5753,7 +5846,7 @@ Scope a deliberate audit covering three axes:
   mtime staleness reload actually fire? Map the **dirty-cache-wins** windows (an
   in-flight cached edit shadows an external/SFTP write until flush) and the
   byte-offset-write vs document-level `WriteMode` impedance (SFTP `write(path,
-  offset, data)` onto a UTF-8 CRDT doc). Fold in the residual cross-alias staleness
+  offset, data)` onto a UTF-8 kernel document). Fold in the residual cross-alias staleness
   above — it's the same family.
 - **Code consistency (async-correctness).** `LocalBackend` mixes `tokio::fs` and
   blocking `std::fs` on the async worker: `write`/`read`/`truncate` use `tokio::fs`
@@ -5843,8 +5936,8 @@ the *remaining* findings, triaged.
   HIGH hook-authoring-vs-resync entry is RESOLVED — sole writer, dedicated
   pushed frontier, flush→apply window closed by construction, resyncs
   coalesce, flush-failure aborts the swap).
-  **SUPERSEDED 2026-08-13 by slice 3 of the CRDT-position migration**
-  (`docs/crdt-position-2026-08.md`): the hook path authors over
+  **SUPERSEDED 2026-08-13** (`docs/crdt-position-2026-08.md`): the hook path
+  authors over
   `authorBlock`/`completeBlock`, so the mirror has no local writer and the
   pushed frontier, the flush, and the flush-failure abort are all *deleted*
   rather than fixed. The guarantees above still hold; they are now structural.
@@ -5962,7 +6055,7 @@ New observations from the crate-by-crate architecture sweep (see
 `docs/architecture/`). Not fixed; recorded for later. Items that confirm an
 existing entry are marked *(confirms above)*.
 
-**CRDT data model:**
+**Block data model:**
 - `calc_order_key` calls `block_ids_ordered()` (O(N) sort) on **every** insert
   (`kaijutsu-crdt/src/block_store.rs:390`); the bench exposing it is `#[ignore]`d.
 - Tombstones aren't a first-class `BlockSnapshot` field — they ride a side

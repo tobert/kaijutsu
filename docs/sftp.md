@@ -12,7 +12,7 @@ marked. The first real SFTP consumer is **client CAS sync against `/v/cas`**
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
 client (sshfs, `sftp`, Nautilus, an editor's remote-FS plugin) can read and
-write the unified tree — host FS, CRDT-backed `/etc/rc` and `/v/...`, and the
+write the unified tree — host FS, kernel-owned `/etc/rc` and `/v/...`, and the
 memory scratch at `/tmp` — through the same SSH server that already carries the
 Cap'n Proto RPC channel.
 
@@ -34,13 +34,13 @@ state are kept as design record.
   the full `SSH_FXP_*` opcode set. SFTP is path-based too, so there is no
   semantic model to invent.
 - **`MountTable` already unifies the tree** (`crates/kaijutsu-kernel/src/vfs/mount.rs`).
-  Longest-prefix routing means one SFTP client sees host FS, CRDT mounts, and
-  memory scratch side by side, each op dispatched to the right backend with the
-  mount prefix stripped. Backends (`LocalBackend`, `MemoryBackend`,
-  `ConfigCrdtFs`) implement the full trait today.
-- **CRDT write-through is already unified and crash-safe**
+  Longest-prefix routing means one SFTP client sees host FS, kernel-owned
+  mounts, and memory scratch side by side, each op dispatched to the right
+  backend with the mount prefix stripped. Backends (`LocalBackend`,
+  `MemoryBackend`, `ConfigCrdtFs`) implement the full trait today.
+- **Kernel-owned-mount write-through is already unified and crash-safe**
   (`crates/kaijutsu-kernel/src/runtime/mount_backend.rs:293`). A write to a
-  CRDT mount flows through `FileDocumentCache` → `flush_one` → backend, with
+  kernel-owned mount flows through `FileDocumentCache` → `flush_one` → backend, with
   rollback-on-flush-error and mtime-staleness reload. An SFTP write is just
   another client of that cache — no new correctness work.
 - **russh is already the SSH library** (0.61.x), and the per-connection
@@ -193,7 +193,7 @@ question.
 **Pipelining.** SFTP clients do *not* wait for a `WRITE` reply before sending
 the next — they pipeline. Sequential processing throttles throughput to one
 round-trip per block; concurrent processing forces interior mutability on the
-handle map and hammers the CRDT cache with overlapping writes to one path. The
+handle map and hammers the document cache with overlapping writes to one path. The
 adapter has to choose deliberately, not fall into either by accident.
 
 **Directory-handle leaks.** A cached `readdir` held across `READDIR` pages is a
@@ -209,7 +209,7 @@ mtime work below is a prerequisite, not an afterthought.
 SFTP makes the kernel's mtime semantics load-bearing in a way the in-app tools
 never did, because caching clients (sshfs, editor indexers, `make`, `rsync`)
 treat mtime as ground truth. mtime was **never** "a counter" — across backends
-`FileAttr.mtime` is a real `SystemTime` — but the CRDT-backed `ConfigCrdtFs`
+`FileAttr.mtime` is a real `SystemTime` — but the kernel-owned `ConfigCrdtFs`
 carried two footguns plus one latent coherence bug:
 
 - Unwritten/seeded files reported `UNIX_EPOCH` (1970).
@@ -254,7 +254,7 @@ above — so the handle guard and the cache now share one primitive.
   tools because a human drives them intentionally. SFTP turns that into an
   *unconstrained programmatic crawl*: mount via sshfs in VS Code/IntelliJ and
   the background indexer immediately walks the whole tree, reading every file to
-  build its search index — pulling every `/tmp` blob and CRDT doc over the
+  build its search index — pulling every `/tmp` blob and kernel document over the
   channel, with potential to OOM the kernel or saturate the link. This needs
   **rate-limiting and traversal-depth/size limits** on the adapter; the
   "ergonomic nudge" framing does not cover it.
@@ -297,7 +297,7 @@ above — so the handle guard and the cache now share one primitive.
    survive editor-indexer crawls (the `/v/ctx` tree makes this sharper);
    directory-handle eviction.
 5. **Tests.** A live test that mounts the SFTP endpoint, reads a host file,
-   writes a `/tmp` file, confirms a CRDT round-trip (`/etc/rc` write visible to
+   writes a `/tmp` file, confirms a kernel-document round-trip (`/etc/rc` write visible to
    `kj rc`/kaish), confirms an ungranted principal is denied `/etc/rc` writes,
    and exercises the rename-replace TOCTOU guard. Grow it per slice, the way the
    e2e live-eval harness does.
@@ -313,7 +313,7 @@ later tenant of the same scaffold.
 
 - `crates/kaijutsu-kernel/src/vfs/ops.rs:20` — `VfsOps` trait
 - `crates/kaijutsu-kernel/src/vfs/mount.rs` — `MountTable` routing
-- `crates/kaijutsu-kernel/src/runtime/mount_backend.rs:293` — CRDT write-through
+- `crates/kaijutsu-kernel/src/runtime/mount_backend.rs:293` — kernel-document write-through
 - `crates/kaijutsu-server/src/ssh.rs:632` — `ConnectionHandler` (subsystem gap)
 - `crates/kaijutsu-server/src/ssh.rs:686` — ordinal `channel_index == 1` RPC selection (historical — replaced by named-subsystem dispatch in slice 0)
 - `crates/kaijutsu-server/src/ssh.rs:696` — RPC per-connection thread pattern
@@ -323,13 +323,13 @@ later tenant of the same scaffold.
 - `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (`RcWrite`, `ConfigWrite`)
 - `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write`
 - `crates/kaijutsu-types/src/principal.rs:16` — `Principal`
-- `crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:199,230,258,605` — CRDT mtime (now-on-write, epoch default, setattr no-op)
+- `crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:199,230,258,605` — kernel-document mtime (now-on-write, epoch default, setattr no-op)
 - `crates/kaijutsu-kernel/src/vfs/backends/local.rs:141` / `memory.rs:451` — host mtime / `MemoryBackend` honoring `setattr(mtime)`
 
 ---
 
 *Reviewed by Gemini Pro (gpal batch, 2026-06-25). Findings folded in: TOCTOU
-handle hazard, sshfs caching vs. CRDT mtime, the adapter/effort underestimate
+handle hazard, sshfs caching vs. kernel-document mtime, the adapter/effort underestimate
 (REALPATH, OpenSSH extensions, error mapping, pipelining), editor-indexer crawl
 DoS, and path-based context routing as a candidate binding option. Pushed back
 on the host-FS RCE claim — root `/` is read-only, so it doesn't hold as stated.*

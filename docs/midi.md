@@ -347,7 +347,7 @@ click horizon was 250 ms. A frame stalled past that by synchronous text
 shaping (a streaming turn dirtying dozens of blocks) audibly interrupted the
 music *while the data sat already-arrived on the actor thread*. Worse, the
 cascade: a long stall overflows the 256-slot broadcast → `Lagged` → generation
-bump → full CRDT re-sync → a bigger dirty burst → a longer stall.
+bump → full document re-sync → a bigger dirty burst → a longer stall.
 
 **The move:** a dedicated thread — the **DJ** — owns everything musically
 time-critical, end to end. ("Conductor" is reserved for the human at the

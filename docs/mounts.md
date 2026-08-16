@@ -5,8 +5,8 @@
 > compiled out three layers deep. **Slice 1 (subprocess enablement) shipped
 > the same day** — see "Slice 1" below. The rest is direction, not
 > commitment; code is truth. Companions: `docs/instrument-design.md` (the
-> shared-trust doctrine this leans on), `docs/config-crdt-ownership.md`
-> (the CRDT mounts that stay untouched by all of this), and the kaish-side
+> shared-trust doctrine this leans on), `docs/config-ownership.md`
+> (the kernel-owned mounts that stay untouched by all of this), and the kaish-side
 > mounts rework in flight for the next kaish release (`/dev` kernel-owned in
 > the `with_backend` path — fixes `> /dev/null` under our read-only root).
 
@@ -19,7 +19,7 @@ The direction inverts the default:
 
 - **Nothing visible by default.** Drop the host-root mount. The VFS
   namespace is the curated set: `/mnt/project` (or `~/src`), `/tmp`,
-  `/etc/rc` + `/etc/config` (CRDT), `/v/*`, `/dev` (kaish-owned, next
+  `/etc/rc` + `/etc/config` (kernel-owned), `/v/*`, `/dev` (kaish-owned, next
   release), plus the bin mounts below.
 - **PATH dirs mounted deliberately.** At kernel startup, read the host
   `PATH`, canonicalize + dedupe its directories, and hold them as the
@@ -48,12 +48,12 @@ profile). Named here so nobody reinvents it; deliberately not now.
 
 ## The per-context seam
 
-The kernel `MountTable` is **shared** (one CRDT-backed table for every
+The kernel `MountTable` is **shared** (one kernel-owned table for every
 context), but each materialized shell gets its own kaish `VfsRouter`
 (where `/v/docs` / `/v/input` already mount per-shell,
 `embedded_kaish.rs`). That router is the curation seam: per-context bin
 mounts ride the shell's router, and the shared table keeps the
-project/config/CRDT mounts. Sketch of the per-type exposure:
+project/config/kernel-owned mounts. Sketch of the per-type exposure:
 
 | context_type | bin mounts | rationale |
 |---|---|---|
@@ -89,14 +89,14 @@ survives the inversion (later slices only narrow what's visible and what
 - **`MountBackend::resolve_real_path`** now resolves (it returned `None`
   unconditionally): sync mount-table walk
   (`MountTable::resolve_real_path_sync`, longest-prefix owner + the new
-  sync `VfsOps::real_root`). Virtual cwds (`/v/*`, CRDT mounts) still
+  sync `VfsOps::real_root`). Virtual cwds (`/v/*`, kernel-owned mounts) still
   yield `None` → external exec is skipped there, correctly.
 - **`$PATH` seeded from the kernel process env** (`Kernel::host_path`,
   captured once) into exec-granted shells only. kaish never reads OS env
   itself.
 
 Deploy note: rc seeds are **once-only** on a fresh kernel — the live
-kernel's CRDT copies of `lib/create/S10-binding.kai` and
+kernel's copies of `lib/create/S10-binding.kai` and
 `director/create/S10-binding.kai` need a `kj rc reset <path>` (or live
 edit) to pick up the `exec` grant, and only *newly created* contexts run
 create-rc; existing coder/director contexts need a one-time

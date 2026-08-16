@@ -9,12 +9,12 @@ deferred by Amy — see track B. Track V (`/v/ctx` + `/v/session`) remains the a
 unbuilt plan. Compressed 2026-07-04: `docs/devlog.md` carries the track-B story, git
 history keeps every cut line.*
 
-`/v` is kaijutsu's virtual / CRDT namespace. This note covers three **sysfs-style**
+`/v` is kaijutsu's virtual namespace. This note covers three **sysfs-style**
 surfaces under it:
 
 - **`/v/cas`** — the kernel's CAS object pool, rendered as immutable files
   (**shipped** — the substrate for client CAS sync).
-- **`/v/ctx`** — every context and its CRDT block log, rendered as files (planned).
+- **`/v/ctx`** — every context and its block log, rendered as files (planned).
 - **`/v/session`** — the live participants (app, MCP, SFTP) and, read-only, the
   context each one is currently acting as (planned).
 
@@ -189,7 +189,7 @@ returns `EROFS` on every write.
 │       ├── index                 # timeline-ordered TSV: seq  tick  role  kind  status  excl  bytes  key
 │       └── <block-key>/          # flat, NOT sharded (see Sharding); <key> = BlockId.to_key()
 │           ├── role kind status tick seq principal excluded ephemeral created
-│           ├── content                   # the Text CRDT body; size = BlockHeader.content_len (O(1))
+│           ├── content                   # the block's text content; size = BlockHeader.content_len (O(1))
 │           ├── json                       # opt-in: scalars + content pointer
 │           ├── parent  -> ../<parentkey>  # DAG edge
 │           │   # flat, kind-conditional — readdir only shows files that apply:
@@ -215,7 +215,7 @@ farm whose ordinals would be unstable under multi-writer.
 
 **Enumeration — per-context stores, not a global filter.** The kernel's
 `SharedBlockStore` is a `DashMap<ContextId, DocumentEntry>`
-(`crates/kaijutsu-kernel/src/block_store.rs:182`) — **one inner CRDT `BlockStore`
+(`crates/kaijutsu-kernel/src/block_store.rs:182`) — **one inner `BlockStore`
 per context**, each with its own `block_ids_ordered()`; there is no global block
 list to filter. The canonical context roster is `KernelDb::list_all_contexts()`
 (`kernel_db.rs:1823`), which also surfaces non-resident/archived contexts the
@@ -273,7 +273,7 @@ stable across two stats. The wrong wiring (to `sync_generation`) fails both.
 
 **`content` size is O(1) via `BlockHeader.content_len` (slice 0).** A block's byte
 size isn't stored today, so synthesizing it in `getattr` would force `text()` to
-materialize the whole CRDT body — a 5 MB tool result re-allocated to fill an `ls -l`
+materialize the whole block body — a 5 MB tool result re-allocated to fill an `ls -l`
 size. Add a `content_len` field to `BlockHeader`
 (`crates/kaijutsu-types/src/block.rs:134`, absent today), set on write/merge: a
 core-type field + additive CBOR schema evolution (fail-loud per
@@ -282,7 +282,7 @@ core-type field + additive CBOR schema evolution (fail-loud per
 followed symlink — the `read_all`/symlink-sizing gotcha).
 
 **`content` reads snapshot at open** — `text()` taken once at open, so a `cat` over a
-streaming block reads a coherent body, not one spliced across a mid-read CRDT merge.
+streaming block reads a coherent body, not one spliced across a mid-read write.
 Eventual consistency across *separate* reads is the natural state of this FS — you
 poll again to see growth (that's what `generation` is for). A free-running tail is a
 possible explicit future mode, not the default.
@@ -362,7 +362,7 @@ ambiently — the **kaish shell** has `ExecContext.context_id`, **MCP** has it, 
 the real write paths; `bound` was a wart on it, not the prize.
 
 So the model is **per-operation join**: a privileged write joins a context as a
-transient CRDT co-writer for that one op, then leaves. The context comes from where
+transient co-writer for that one op, then leaves. The context comes from where
 the operation runs — the session's *current* context, read at the moment of the op —
 not from a separate stashed capability grant. (The rejected `bound` was such a grant;
 the current context is ordinary ambient state, like cwd, not a capability token.)

@@ -3,8 +3,8 @@
 Diffs where the work happens — in the conversation. A model emits a diff block
 as it edits; Amy reads a small preview inline and expands it into a vi-motion
 full view with yank. Not git-dependent: the first-class source is kaijutsu's own
-CRDT file documents; git arrives later as *another source* feeding the same
-block type.
+file documents; git arrives later as *another source* feeding the same block
+type.
 
 ## Status
 
@@ -24,8 +24,8 @@ per-slice "Build notes" sections below correct it where the build disagreed.
 
 1. **Block shape: `ContentType::Diff` (`text/x-diff`) on a `BlockKind::Text`
    block** — the SVG/ABC rail exactly. `contentType` is a free-form MIME string
-   on the wire (`BlockSnapshot.contentType`), so **no `kaijutsu.capnp` change,
-   nothing in the CRDT or client**. Content is standard **unified diff text**:
+   on the wire (`BlockSnapshot.contentType`), so **no `kaijutsu.capnp` change and
+   nothing in the block store or client**. Content is standard **unified diff text**:
    models read it natively in hydration, old clients degrade to plain text.
    ⚠ `ContentType`'s discriminant order is an LWW merge rule ("richer types win
    ties", `kaijutsu-types/src/block.rs:301`) — place `Diff` deliberately, don't
@@ -36,7 +36,7 @@ per-slice "Build notes" sections below correct it where the build disagreed.
    diffs **arbitrary token streams**, so word-level refinement is the same
    engine with a word tokenizer. We write no diff algorithm ourselves.
 3. **First source: agent edits, zero git.** Every file an agent touches is
-   already a CRDT document with a full oplog
+   already a kernel document with a full oplog
    (`FileDocumentCache`, `kaijutsu-kernel/src/file_tools/cache.rs`) — before
    and after are both in hand at `apply_edit_plan`
    (`mcp/servers/file.rs`). **On-demand emission first**: a `diff_block` MCP
@@ -46,7 +46,7 @@ per-slice "Build notes" sections below correct it where the build disagreed.
    pipeline.
 4. **Full view: `Screen::Diff` + an app-local, read-only modalkit motion
    machine (`DiffCore`).** Not a kernel editor session. `docs/vi.md` Decision 6
-   ("mode lives kernel-side, period") protects *edit/mode sync with a CRDT
+   ("mode lives kernel-side, period") protects *edit/mode sync with a kernel
    block*; `DiffCore` has no edit state — it emits motions, folds, and yanks,
    never an `EditOp` — so there is nothing to race or corrupt. Real vi grammar
    (counts, `gg`/`G`, `]c`/`[c` hunk motions, visual-line select) via modalkit,
@@ -111,7 +111,7 @@ per-slice "Build notes" sections below correct it where the build disagreed.
 
 ### Kernel
 
-- **`kj diff <a> [<b>]`** — sources: two VFS paths; a file's CRDT document vs
+- **`kj diff <a> [<b>]`** — sources: two VFS paths; a file's kernel document vs
   its on-disk state; two frontier versions of one document (the oplog makes any
   historical pair derivable). Output is a typed block via
   `KjResult::ok_typed(text, ContentType::Diff)`. Subsumes the
@@ -169,8 +169,7 @@ per-slice "Build notes" sections below correct it where the build disagreed.
    Source resolution is **ownership-aware from day one** — the
    `resolve_editor_target` pattern (config-owned docs answer through the
    mount table; never raw `get_or_load` for a config path, which would mint a
-   shadow CRDT doc — the exact bug class `docs/config-crdt-ownership.md`
-   killed). Internally a typed source descriptor even while the CLI stays
+   shadow document — the exact bug class `docs/config-ownership.md` killed). Internally a typed source descriptor even while the CLI stays
    simple. **Hydration is a projection, not a passthrough**: the canonical
    block keeps the full diff; the model-facing envelope gets diffstat +
    whole-hunk-bounded content with an explicit complete/truncated marker
@@ -328,7 +327,7 @@ discoveries only:
   `stroke_line_quad` — a band *is* a butt-capped horizontal stroke.
 - **Theme colors are compiled-in**, like the markdown and sparkline colors
   beside them — `ThemeData`/`theme.toml` exposes neither. Wiring rich-content
-  colors through the CRDT-owned theme is its own (unscheduled) piece of work.
+  colors through the kernel-owned theme is its own (unscheduled) piece of work.
 - **The kernel arm landed with this slice**, not after it: `validate_diff`
   in `validate_content_and_attach_errors` + the `Diff` gate in `set_status`,
   with `DiffError::line()` added so the `ErrorPayload` gets a real span.
@@ -757,7 +756,7 @@ line-wise `V` only until multi-rect). Still open:
 ## Future / adjacent (recorded, not scheduled)
 
 - **Live diff blocks** — a diff block that references `(context, block,
-  frontier_a, frontier_b)` and recomputes as the underlying CRDT document
+  frontier_a, frontier_b)` and recomputes as the underlying kernel document
   changes; "watch the change grow" while a model works. Rad if performance
   holds (Amy); strictly after on-demand ships.
 - **Auto-emit policy** — emitting a diff block per file edit (hook point:

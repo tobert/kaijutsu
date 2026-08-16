@@ -12,14 +12,13 @@ older doc disagree, the code wins and this document tries to say so.
 
 - **[overview](README.md)** — this file: the system in one read.
 - **[foundation.md](foundation.md)** — `kaijutsu-types` + the Cap'n Proto wire
-  schema. The shared vocabulary and, historically, the CRDT data model (see
-  "Stale docs & surprises" below).
+  schema. The shared vocabulary and the block document model.
 - **[kernel.md](kernel.md)** — `kaijutsu-kernel`: the instrument's body (VFS,
   block store, MCP broker, LLM, drift, persistence, the embedded shell).
 - **[server.md](server.md)** — `kaijutsu-server`: SSH transport, the Cap'n Proto
   RPC surface, LLM streaming, the beat scheduler, auth.
 - **[client.md](client.md)** — `kaijutsu-client`: the `Send+Sync` actor bridge and
-  the client-side CRDT mirror.
+  the client-side context mirror.
 - **[app.md](app.md)** — `kaijutsu-app`: the Bevy 0.18 GUI and its render pipeline.
 - **[supporting.md](supporting.md)** — `kaijutsu-mcp`, `-cas`, `-index`,
   `-hyoushigi`, `-abc`, `-viz`, `-telemetry`, `-agent-tools`.
@@ -95,7 +94,7 @@ together:
 | Subsystem | Type | Role |
 |---|---|---|
 | VFS | `Arc<MountTable>` | Path-routed multiplexer over Local/Memory backends; `Kernel` itself impls `VfsOps` so a kernel can be mounted. |
-| CRDT documents | `SharedBlockStore` | The durable, multi-writer conversation block log (per-context CRDT). Registered into the broker at startup, not owned by `Kernel` directly. |
+| Block documents | `SharedBlockStore` | The durable, multi-writer conversation block log, one document per context. Registered into the broker at startup, not owned by `Kernel` directly. |
 | Tool dispatch | `Arc<Broker>` | The **single** MCP tool pipeline — builtins (virtual in-process servers) and external rmcp servers, with capability gating and hooks. |
 | Context registry | `SharedDriftRouter` | Single source of truth for live contexts; also the drift staging queue + dead-letter/lost+found. |
 | Events | `FlowBus` ×3 | Topic pub/sub for block events, input-doc events, and autonomous-turn requests. |
@@ -112,7 +111,7 @@ block storage, event broadcast, context lookup, hydration, and drift staging.
 Embedded inside the kernel (this is the big change from the old design) is
 **kaish**, the shell. `EmbeddedKaish`
 (`kaijutsu-kernel/src/runtime/embedded_kaish.rs:56`) runs the kaish interpreter
-**in-process** against the VFS and a CRDT-backed file cache. There is no separate
+**in-process** against the VFS and a kernel-owned file cache. There is no separate
 kaish process and no Unix socket.
 
 ---
@@ -123,11 +122,10 @@ kaish process and no Unix socket.
 
 This is the distinction that most shapes the system, so it gets its own diagram.
 
-- **Context** is the durable side: a CRDT block log plus metadata
-  (model/provider, fork lineage, exclusions, edits). It is **multi-writer** — the
-  user, the model, tool calls, and sibling agents all append concurrently and the
-  CRDT merges. It is journaled to `KernelDb.oplog` and compacted to
-  `doc_snapshots`.
+- **Context** is the durable side: a block log plus metadata (model/provider,
+  fork lineage, exclusions, edits). It is **multi-writer** — the user, the model,
+  tool calls, and sibling agents all append, and the kernel sequences every
+  append. It is journaled to `KernelDb.oplog` and compacted to `doc_snapshots`.
 
 - **Conversation** is the live side: an append-only `Vec<Message>` shipped to the
   LLM, materialized per-turn by the `ConversationMailbox`
@@ -164,13 +162,13 @@ Two more orthogonal axes that read like overlap but aren't:
 
 Storage is `kaijutsu_kernel::blocks::BlockDocument`: a `BTreeMap<BlockId,
 BlockContent>` per context, each block's content a plain `String`, ordered by
-fractional indexing, with per-field Last-Write-Wins Lamport timestamps for
-metadata. Text ran through a per-block diamond-types-extended CRDT until
-2026-08-16; the standalone `kaijutsu-crdt` crate that housed it melted into
-`kaijutsu-kernel::blocks` the same day, once retiring the CRDT left it with no
-dependency the kernel didn't already have (see `docs/crdt-position-2026-08.md`
-for the retirement, `docs/issues.md`'s architecture-mapping entries for the
-open questions this section used to describe).
+fractional indexing. Block metadata in `BlockHeader` is plain data — the
+last-write-wins conflict-resolution machinery was deleted, because concurrent
+merge into a kernel document is structurally impossible.
+
+**Do not reintroduce a text CRDT for block content.** Streaming is 100% append
+and `push_str` is amortized O(1), while per-block merge metadata measured about
+4x the size of the text it represented (`docs/crdt-position-2026-08.md`).
 
 ---
 
@@ -182,7 +180,7 @@ The end-to-end path, prompt to pixels:
 
 1. **Client → server.** The app sends a prompt (or submits the compose input)
    over RPC. `KernelImpl::prompt` (`rpc.rs:2563`) checks the context's facade
-   capability, inserts the user message as a CRDT block, and calls
+   capability, inserts the user message as a block, and calls
    `spawn_llm_for_prompt` (`llm_stream.rs:184`).
 2. **Hydrate.** The turn driver acquires the per-context conversation lock,
    reads the hydration policy (full vs windowed), and hydrates a
@@ -193,7 +191,7 @@ The end-to-end path, prompt to pixels:
    (`llm/mod.rs:353`): Claude and OpenAI-compatible/DeepSeek are real; **Gemini is
    a stub** that returns `Unavailable`.
 4. **Blocks.** `StreamEvent`s (Thinking/Text deltas, ToolUse, Done) are written
-   **directly into the CRDT block store** as they arrive. Thinking blocks keep
+   **directly into the block store** as they arrive. Thinking blocks keep
    their provider `signature` for cross-turn reasoning continuity.
 5. **Tools.** On `ToolUse`, the server calls `dispatch_tool_via_broker`. The
    broker checks the capability binding, acquires a per-instance semaphore,
@@ -201,8 +199,8 @@ The end-to-end path, prompt to pixels:
    or an external rmcp server. The result becomes a `ToolResult` block.
 6. **Fan-out.** Every block mutation publishes a `BlockFlow` event on the
    `FlowBus`. Server-side subscribers push it down the events channel.
-7. **Client mirror.** `kaijutsu-client`'s `SyncedDocument` applies events into a
-   local CRDT mirror, buffering out-of-order events until their `BlockInserted`
+7. **Client mirror.** `kaijutsu-client`'s `ContextMirror` applies events into a
+   local mirror, buffering out-of-order events until their `BlockInserted`
    arrives (the cross-topic ordering fix).
 8. **Render.** The Bevy app copies mirror blocks into per-block cells and renders
    each to its own GPU texture via the two-pass vello/MSDF pipeline.
@@ -264,11 +262,11 @@ retroactively).
 
 | Store | Backed by | Holds |
 |---|---|---|
-| `KernelDb` | SQLite (WAL) | Contexts, edges, presets, workspaces, document registry, CRDT **oplog + snapshots**, input-doc oplog, per-context shell cwd/env, tool bindings, hooks, cache breakpoints, hydration markers. |
-| CRDT documents | in-memory + oplog | Live block stores; cold start = latest snapshot + oplog replay. |
+| `KernelDb` | SQLite (WAL) | Contexts, edges, presets, workspaces, document registry, the **oplog + snapshots**, input-doc oplog, per-context shell cwd/env, tool bindings, hooks, cache breakpoints, hydration markers. |
+| Block documents | in-memory + oplog | Live block stores; cold start = latest snapshot + oplog replay. |
 | CAS (`FileStore`) | sharded files | Content-addressed blobs (BLAKE3-truncated 128-bit hash), images, large bodies. |
-| Config | CRDT doc → TOML | `theme.toml`, `mcp.toml`, `system.md`; CRDT is source of truth, disk is a debounced flush + reload-on-change. Model config is NOT here — it lives in kernel-db tables (`kj backend/cast/alias`, 2026-08-03). |
-| rc scripts | real files | `~/.config/kaijutsu/rc/...` lifecycle scripts; seeded once from embedded defaults. |
+| Config | kernel documents | `theme.toml`, `mcp.toml`, `system.md`. The kernel is the sole owner and there is no host file (`docs/config-ownership.md`). Model config is NOT here — it lives in kernel-db tables (`kj backend/cast/alias`). |
+| rc scripts | kernel documents | `/etc/rc/...` lifecycle scripts, seeded once from embedded defaults. There is no host file to edit. |
 | `auth.db` | SQLite | Principals + SSH credentials. |
 
 Codec everywhere is **versioned CBOR** (`kaijutsu-types/src/codec.rs`): a 1-byte
@@ -278,13 +276,8 @@ format version then ciborium CBOR, fail-loud, additive-evolution-safe.
 
 ## Crate dependency map
 
-> The crate-dependency diagram was deleted on 2026-08-16: it drew a
-> `kaijutsu-crdt` crate that no longer exists. The current layering is
-> `kaijutsu-types` at the leaf, `kaijutsu-kernel` above it (blocks now live
-> there as `kernel::blocks`), then `kaijutsu-server`/`kaijutsu-client`, then
-> `kaijutsu-app`/`kaijutsu-mcp`. See `diagrams/README.md`.
-
-The workspace layers cleanly from leaves up:
+There is no crate-dependency diagram. The workspace layers cleanly from leaves
+up:
 
 - **Leaves** (no in-repo deps): `kaijutsu-types`, `kaijutsu-cas`,
   `kaijutsu-abc`, `kaijutsu-viz`, `kaijutsu-telemetry`, `kaijutsu-agent-tools`.
@@ -292,8 +285,7 @@ The workspace layers cleanly from leaves up:
 - **`kaijutsu-hyoushigi`** depends on `-types` + `-cas`.
 - **`kaijutsu-kernel`** sits on `-types`, `-cas`, `-index`,
   `-hyoushigi`, `-abc`, `-telemetry`, plus the external `kaish-kernel`. It
-  owns the block/document model directly (`src/blocks/`) — the standalone
-  `kaijutsu-crdt` crate melted into it 2026-08-16.
+  owns the block/document model directly (`src/blocks/`).
 - **`kaijutsu-server`** depends on `-kernel`, `-types`, `-index`,
   `-telemetry`.
 - **`kaijutsu-client`** depends on `-types`, `-telemetry`.

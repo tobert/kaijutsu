@@ -232,7 +232,7 @@ must not leak `~/.ssh`:
 
 Sizing honesty: the forward adapter came in at ~1,300 lines against a
 200–300 estimate. The reverse handler is smaller in kind — real files, no
-CRDT write-through, and the kernel is the **only** client, so the
+document write-through, and the kernel is the **only** client, so the
 sshfs-appeasement extensions (`posix-rename@`, `statvfs@`, …) are simply not
 implemented — but it is still a real piece of code, not an afternoon.
 
@@ -253,7 +253,7 @@ pump in `kaijutsu-kernel/src/vfs/` :
   latency, the 4 GB ISO case dead on arrival. So slice 0 adds a streaming
   primitive to `VfsOps` (`open_read_stream(path)` returning a chunk stream):
   the **default impl** loops the backend's own `read` (free and correct for
-  local/memory/CRDT backends), and `ShareFs` **overrides** it to hold one
+  local/memory/kernel-owned backends), and `ShareFs` **overrides** it to hold one
   SFTP handle open, pipeline `READ`s, and close on drop. The pump consumes
   the stream; sinks stay generic: write-at-offset to another `VfsOps` path
   (`cp`), a hashing CAS stage (`cas put`), or both. 256 KiB chunks match the

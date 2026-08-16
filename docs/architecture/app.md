@@ -4,7 +4,7 @@
 0.18 GUI and its render pipeline. Code is truth; verified 2026-06-16.*
 
 `kaijutsu-app` connects to a remote kernel over SSH (via `kaijutsu-client`),
-maintains a multi-context CRDT mirror, and renders conversation blocks as
+maintains a multi-context document mirror, and renders conversation blocks as
 individual GPU textures using a **kaijutsu-owned vello rasterizer** (the
 `bevy_vello` dependency was removed).
 

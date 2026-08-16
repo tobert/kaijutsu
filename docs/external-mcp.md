@@ -6,7 +6,7 @@
 > that closed that gap: config loading, the reconciler that's the actual
 > caller, per-server QoS, visibility, and the `kj mcp` operator surface.
 
-`mcp.toml` (CRDT-owned, `docs/config-crdt-ownership.md`) declares MCP servers
+`mcp.toml` (kernel-owned, `docs/config-ownership.md`) declares MCP servers
 the kernel spawns and registers on the broker alongside the in-process
 builtins (`builtin.file`, `builtin.block`, …), under the `external.<name>`
 instance-id namespace so a context binding can grant/deny the two

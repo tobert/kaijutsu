@@ -6,7 +6,7 @@ Code is truth; verified 2026-06-16.*
 
 `kaijutsu-server` is the only process that holds a live `Kernel`. It authenticates
 SSH clients, multiplexes many RPC sessions onto the one shared kernel, streams LLM
-tokens into CRDT blocks, drives the musician beat loop, and persists SSH identity.
+tokens into blocks, drives the musician beat loop, and persists SSH identity.
 
 ---
 
@@ -45,11 +45,11 @@ Connection count is capped (default 100).
 
 `KernelImpl` methods group by domain (see the report for the full table): lifecycle
 (`get_info`, `ping`), shell exec (`execute`, `interrupt`, `complete`,
-`subscribe_output`), VFS, tools (`execute_tool`, `get_tool_schemas`), **block
-CRDT** (`subscribe_blocks[_filtered]`, `push_ops`, `get_blocks`, `move_block`,
+`subscribe_output`), VFS, tools (`execute_tool`, `get_tool_schemas`), **blocks**
+(`subscribe_context`, `subscribe_blocks[_filtered]`, `get_blocks`, `move_block`,
 `set_block_excluded`, `cherry_pick_block`), **LLM** (`prompt`, `configure_llm`,
-`drift_queue`/`cancel`), **context ops** (`get_context_state`/`sync`,
-`create`/`join`/`leave`/`conclude`/`compact`/`interrupt_context`), MCP, peers,
+`drift_queue`/`cancel`), **context ops**
+(`create`/`join`/`leave`/`conclude`/`compact`/`interrupt_context`), MCP, peers,
 kaish (`shell_execute`, cwd/vars), **per-client view state**
 (`set_last_context`/`get_client_view`),
 **input doc** (`edit_input`/`submit_input`/`clear_input`), semantic index, config,
@@ -88,7 +88,7 @@ conversation lock, read hydration policy (full vs windowed), hydrate the mailbox
 (consent-capped: 50 collaborative / 100 autonomous iterations). Each iteration
 builds `BuildOpts` with cache breakpoints, calls `provider.stream` with
 exponential backoff, and processes `StreamEvent`s under a two-layer timeout
-(per-chunk idle + total wall-clock). Tokens write directly to the CRDT block
+(per-chunk idle + total wall-clock). Tokens write directly to the block
 store; clients observe via `BlockFlow`. Tool calls run concurrently via
 `dispatch_tool_via_broker_with_cancel` (120 s per-tool). On completion it
 publishes `TurnFlow::Completed { output_block_id }` for autonomous turns.
@@ -122,7 +122,7 @@ clobber stream-B. Created fresh per prompt.
 unique username) and `credentials` (SSH fingerprint → principal, CASCADE).
 `authenticate` (`:94`) is a single join on the hot path via `spawn_blocking`.
 Authorization is binary (key in DB = allowed); anonymous mode auto-registers with
-a sanitized username. Identity flows into every CRDT block insert as the author.
+a sanitized username. Identity flows into every block insert as the author.
 Management CLI in `main.rs`: add-key, remove-user, list-users/keys, import,
 set-nick.
 

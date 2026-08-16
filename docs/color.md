@@ -35,8 +35,8 @@ Rules that keep the lanes honest:
 
 ## One source of truth: `theme.toml`
 
-The theme is **CRDT-owned** (`/etc/config/theme.toml`, seeded from
-`assets/defaults/theme.toml` — see `docs/config-crdt-ownership.md`) and reaches
+The theme is **kernel-owned** (`/etc/config/theme.toml`, seeded from
+`assets/defaults/theme.toml` — see `docs/config-ownership.md`) and reaches
 the app over RPC on connect. It carries:
 
 - **Flat keys + `[ansi]`** → `ui/theme.rs::Theme` — every conversation-view,
@@ -122,7 +122,7 @@ watch the room. (BRP `world_mutate_components` on the camera works too.)
 
 - Tokyo Night was the UI default from the rhai-theme era through 2026-07;
   the rhai system itself was deleted in Phase 6 (`5dbca599`), replaced by the
-  CRDT theme. The synthwave re-skin (this pass) replaced Tokyo Night as the
+  kernel-owned theme. The synthwave re-skin (this pass) replaced Tokyo Night as the
   shipped default; the Tokyo Night values live on in git history.
 - The conversation view was already fully theme-tokened before this pass —
   the pass unified *identity*, it didn't have to invent UI plumbing.
