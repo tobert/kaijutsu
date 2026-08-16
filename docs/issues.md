@@ -36,6 +36,34 @@ pre-existing gap in metadata replay fidelity.
 
 ---
 
+## Flaky: ACP's tracing-capture test fails about 1 run in 9 (2026-08-16)
+
+`kaijutsu-acp`'s `update::tests::shrink_and_divergence_log_a_loud_warning_not_
+silence` (`crates/kaijutsu-acp/src/update.rs:1088`) failed once during a
+`cargo test --workspace` run, then passed 3 isolated runs, 5 full `-p
+kaijutsu-acp --lib` runs, and a second full workspace run. **Not a regression
+from the DTE removal** — the ACP crate no longer links `kaijutsu-crdt` at all.
+
+**What the failure looked like:** the test asserts two warnings land in a
+captured buffer — one naming a shrink, one naming a divergence. The buffer
+held **only the first**. The divergence branch cannot have been skipped by
+logic: `prefix_hash` uses `DefaultHasher::new()`, which is fixed-seed, so
+`prefix_hash("Xabcdef", 6) != mark_for("abcdef").hash` is deterministic. The
+warning fired and was not captured.
+
+**Mechanism unknown, and stated as unknown rather than guessed.** The test
+installs a thread-local subscriber via `tracing::subscriber::with_default` with
+a shared `CaptureWriter`, and both `observe` calls run on that thread, so the
+obvious explanations do not hold up. Suspicion is an interaction with parallel
+test execution under load — it only appeared in a full-workspace run, which is
+the most contended case — but that is a hypothesis, not a diagnosis.
+
+**Why it matters more than one flaky test:** a suite that fails once in nine
+runs for an unexplained reason trains everyone to re-run and move on, which is
+exactly how a real failure gets waved through. Worth fixing by making the
+capture deterministic (a subscriber the test fully owns, or asserting on a
+returned value instead of on log output) rather than by adding a retry.
+
 ## A context's version is unobservable from `kj` (2026-08-15)
 
 The context version is now load-bearing: it is the client's hydration anchor
