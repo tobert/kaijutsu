@@ -418,6 +418,14 @@ pub fn handle_context_switch(
         }
 
         // Restore the incoming context's saved scroll (default: top).
+        //
+        // `following` is deliberately flattened to false here, even for a
+        // context that was at the bottom when last viewed: a context switch
+        // is a jump to a fixed remembered offset, not a live "go to bottom"
+        // request, so it should never auto-engage follow. If the restored
+        // context happens to be at the bottom and the user wants live
+        // tracking again, `scroll_by`/`ScrollToEnd`/a submit re-engages it
+        // through the normal explicit paths.
         if doc_cache.contains(ctx_id) {
             let offset = scroll_offsets.0.get(&ctx_id).copied().unwrap_or(0.0);
             scroll_state.offset = offset;

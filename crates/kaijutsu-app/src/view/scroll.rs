@@ -149,6 +149,11 @@ pub fn scroll_render_mode(
     scroll_state: Res<crate::cell::ConversationScrollState>,
     time: Res<Time>,
     mut winit: ResMut<WinitSettings>,
+    // Both `Local`s default to 0.0, which reads as "content just changed"
+    // the first time `content_height` becomes nonzero (initial load) —
+    // spuriously forcing Continuous for the first ~250ms of app life.
+    // Harmless and self-correcting (STREAMING_WINDOW_SECS below elapses on
+    // its own), not worth a sentinel init just to skip one early window.
     mut last_content_height: Local<f32>,
     mut time_since_content_change: Local<f32>,
 ) {
