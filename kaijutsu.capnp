@@ -372,7 +372,7 @@ struct ResourcePayload {
 # One ordered feed per context, replacing the thirteen separate `BlockEvents`
 # methods and — the point of the exercise — the serialized diamond-types
 # operations they carried. A client applies domain facts here; it never decodes
-# a storage engine's encoding of them, and therefore never links the CRDT.
+# a storage engine's encoding of them, and therefore never links a text engine.
 #
 # `BlockEvents` still exists while the clients migrate. It goes away with them,
 # in a flag day; see the "Deleted by this change" table in the design.
@@ -400,9 +400,8 @@ struct TextReplace {
 #
 # The position is not redundant with the snapshot: the wire `BlockSnapshot`
 # carries no ordering key, so a client that received only the snapshot would
-# know the block exists and not where it goes. That is precisely what ACP used
-# the CRDT for — document order, not text — and it has to come from somewhere
-# once the CRDT is gone. `hasAfterId` false means "at the beginning".
+# know the block exists and not where it goes. `hasAfterId` false means "at
+# the beginning".
 struct BlockInsert {
   block @0 :BlockSnapshot;
   afterId @1 :BlockId;
@@ -562,6 +561,9 @@ interface BlockEvents {
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
+  # `ops` is retired: the server always sends an empty list and no client
+  # reads it. Removing the field renumbers `subSeq`, so it waits for a flag
+  # day.
   onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data, subSeq :UInt64);
   onBlockDeleted @1 (contextId :Data, blockId :BlockId, subSeq :UInt64);
   onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool, subSeq :UInt64);
@@ -674,8 +676,8 @@ struct EditorState {
 }
 
 # Callback for receiving editor-session state pushes (the in-app vi editor).
-# The push channel exists so a peer's CRDT merge into an open block reaches
-# every renderer the instant it lands — collaborative editing, not poll lag.
+# The push channel exists so a peer's write to an open block reaches every
+# renderer the instant it lands — collaborative editing, not poll lag.
 interface EditorEvents {
   # Next free ordinal: 2. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
@@ -1803,7 +1805,7 @@ interface Kernel {
   getClientView @81 (clientId :Text) -> (contextId :Text, found :Bool);
 
   # ==========================================================================
-  # Blocks: queries & CRDT sync
+  # Blocks: queries
   # ==========================================================================
 
   # Fetch blocks by query: all, byIds, or byFilter.
@@ -1880,7 +1882,7 @@ interface Kernel {
 
   # ── RPC authoring (docs/crdt-position-2026-08.md, migration step 3) ───────
   #
-  # The verbs that let a client author blocks WITHOUT being a CRDT replica.
+  # The verbs that let a client author blocks WITHOUT being a storage replica.
   # `kaijutsu-mcp` was the last client that still pushed ops; these verbs
   # replaced that path, and the 2026-08-15 flag day then retired `pushOps`
   # (@37, zero production callers) outright — the Option-2 client contract
@@ -1971,11 +1973,12 @@ interface Kernel {
   subscribeTurnEvents @91 (callback :TurnEvents);
 
   # ==========================================================================
-  # Input document (CRDT scratchpad per context)
+  # Input document (compose draft per context)
   # ==========================================================================
 
-  # Each context has a companion CRDT text document for compose input.
-  # Any participant can read/write it. Submit snapshots to conversation block.
+  # Each context has a companion draft block for compose input — an ordinary
+  # block at `Status::Draft`, one per (context, principal). Any participant
+  # can read/write it. Submit snapshots it to a conversation block.
 
   # High-level edit: insert text at position, delete characters
   editInput @43 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
@@ -2026,12 +2029,13 @@ interface Kernel {
   replayDeadLetter @55 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
 
   # ==========================================================================
-  # Configuration (config as CRDT)
+  # Configuration (config as kernel documents)
   # ==========================================================================
 
-  # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are managed as CRDT documents.
+  # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are kernel
+  # documents — the kernel is their sole owner, and there is no host file.
 
-  # Get config content (from CRDT)
+  # Get config content
   getConfig @56 (path :Text) -> (content :Text, error :Text);
 
   # ==========================================================================
@@ -2097,10 +2101,10 @@ interface Kernel {
   # In-app editor sessions (the vi/edit builtin; see docs/vi.md)
   # ==========================================================================
 
-  # A kernel-owned vi session bound to the CRDT block that owns a path's text.
+  # A kernel-owned vi session bound to the block that owns a path's text.
   # Session ids are global (no contextId needed); the path resolves the owner.
   # Renderers draw `editorState`/`subscribeEditor` and forward keys to
-  # `editorKeys`. Edits mirror onto the CRDT block — rc/config permission errors
+  # `editorKeys`. Edits mirror onto the block — rc/config permission errors
   # surface here loudly (crash over corruption).
 
   editorOpen @74 (path :Text, trace :TraceContext) -> (state :EditorState);
