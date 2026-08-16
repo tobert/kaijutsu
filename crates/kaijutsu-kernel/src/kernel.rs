@@ -148,6 +148,14 @@ pub struct Kernel {
     /// tool call is still queryable/killable from the next — see the module
     /// docs for the full ownership/cleanup contract.
     background: Arc<crate::background_exec::BackgroundRegistry>,
+    /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
+    /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
+    /// `beat_ingress`/`file_cache`: the server binds the real socket and
+    /// installs it once at startup, after the kernel exists, so no test
+    /// kernel binds one unless it explicitly asks — a socket bind on every
+    /// `new`/`new_ephemeral`/`with_flows` call would race dozens of
+    /// concurrently-running test kernels over the same runtime directory.
+    cc_inbox: OnceLock<Arc<crate::cc_inbox::CcInboxHandle>>,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -244,6 +252,7 @@ impl Kernel {
                 bg.spawn_reaper();
                 bg
             },
+            cc_inbox: OnceLock::new(),
         }
     }
 
@@ -319,6 +328,7 @@ impl Kernel {
                 bg.spawn_reaper();
                 bg
             },
+            cc_inbox: OnceLock::new(),
         }
     }
 
@@ -969,6 +979,22 @@ impl Kernel {
         tx: tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatRequest>,
     ) -> bool {
         self.beat_ingress.set(tx).is_ok()
+    }
+
+    /// Install the bound Claude Code peer inbox. Called once by the server at
+    /// startup, after a successful [`crate::cc_inbox::CcInboxHandle::bind`].
+    /// Returns whether it was set (`false` if already installed) — same
+    /// once-only shape as [`Self::set_beat_ingress`]/[`Self::set_file_cache`].
+    pub fn set_cc_inbox(&self, handle: Arc<crate::cc_inbox::CcInboxHandle>) -> bool {
+        self.cc_inbox.set(handle).is_ok()
+    }
+
+    /// The bound Claude Code peer inbox, if the server installed one.
+    /// `None` in every test/embedded kernel and in a production kernel whose
+    /// bind attempt failed (logged loudly at bind time, never silently) —
+    /// callers must treat absence as "no inbox this run", not as an error.
+    pub fn cc_inbox(&self) -> Option<&Arc<crate::cc_inbox::CcInboxHandle>> {
+        self.cc_inbox.get()
     }
 
     /// Send a fire-and-forget command to the beat scheduler, if one is installed.

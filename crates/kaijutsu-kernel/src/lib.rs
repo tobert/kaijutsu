@@ -14,6 +14,7 @@
 pub mod background_exec;
 pub mod block_store;
 pub mod block_tools;
+pub mod cc_inbox;
 pub mod image;
 pub mod config_doc;
 pub mod config_export;

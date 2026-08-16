@@ -1860,6 +1860,35 @@ pub async fn create_shared_kernel(
     kernel.freeze_mounts();
 
     let kernel_arc = Arc::new(kernel);
+
+    // Bind the Claude Code peer inbox (`docs/cc-peer.md` "Order from here":
+    // kernel wiring of the inbox; `kaijutsu_kernel::cc_inbox` module docs).
+    // Named by kernel id, not a fixed name — the id is already this kernel's
+    // unique cross-process identity, and a fixed name would collide with
+    // every other kernel (including test callers of this very function)
+    // sharing one `$XDG_RUNTIME_DIR`. A bind failure is logged loudly and
+    // the kernel boots without an inbox rather than refusing to start: the
+    // inbox has no consumer yet (receive-and-log only, Phase 1), so it is
+    // not load-bearing enough to fail startup over.
+    let cc_inbox_dir = kaish_kernel::xdg_runtime_dir().join("kaijutsu").join("cc");
+    match kaijutsu_kernel::cc_inbox::CcInboxHandle::bind(&cc_inbox_dir, &format!("{id_str}.sock"))
+    {
+        Ok(handle) => {
+            log::info!("cc inbox: bound at {}", handle.address());
+            if !kernel_arc.set_cc_inbox(Arc::new(handle)) {
+                log::error!("cc inbox: kernel already had one installed — dropping the new bind");
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "cc inbox: failed to bind under {}: {} — this kernel run will not receive \
+                 Claude Code peer messages",
+                cc_inbox_dir.display(),
+                e
+            );
+        }
+    }
+
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
         kernel_db_arc.clone(),
     ));
