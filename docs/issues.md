@@ -83,10 +83,12 @@ than diagnosed. The freehand-model trap list (bare `===`, bare `yes`/`no`, bare
 paragraph, and every one is a *lexer* error on a construct that is idiomatic
 in bash — which is precisely why a model reaches for all of them.
 
-**And most of that lever is already built upstream — it just isn't pulled.**
+**And most of that lever SHIPPED with the 0.14.1 bump the same afternoon.**
 Amy, 2026-08-16: *"the unquoted comma gets better after kaish upgrades I
-think."* Confirmed against `~/src/kaish` `CHANGELOG.md` `[Unreleased]`
-(a891cc5), i.e. past the 0.14.1 we have not yet bumped to:
+think."* Correct — and both items below are in **`[0.14.0]`** (CHANGELOG
+lines 137–315), not `[Unreleased]` as first reported here. The section
+boundary was misread; `## [0.14.0]` sits at line 137, above both. We are on
+0.14.1 as of commit `6ebb0a8b`, so **we already have these**:
 
 - **BREAKING: comma is significant only inside a `[...]`/`{...}` literal or
   pattern** — `sed -n 1,3p`, `cut -f 1,3`, `sort -k 2,2n`, `echo a,b,c` all
@@ -103,11 +105,23 @@ with **no static copy in the CRDT to rot**. So a kaish bump delivers those
 warnings into every new context's system prompt with zero kaijutsu edits —
 exactly the payoff that design was for.
 
-Scoring the five traps against a bump: comma **fixed outright**, `yes`/`no` and
-compound-into-pipe **now warned in the primer**, leaving only bare `===`
-(word-pasting) and `grep -e` unaddressed. That reframes the kaish 0.14 → 0.15
-bump (filed separately below) from a dependency chore into a **tool-call
-reliability fix** — it is worth re-weighting against other work on that basis.
+Scoring the five traps as of 0.14.1 (`6ebb0a8b`): comma **fixed outright**,
+`yes`/`no` and compound-into-pipe **now warned in the primer**, leaving only
+bare `===` (word-pasting) and `grep -e` unaddressed. **Three of five, live
+now** — the bump was a tool-call reliability fix, not just a dependency chore,
+and it has already been taken.
+
+Two consequences worth acting on:
+
+- **Re-measure before re-filing.** The nine parse errors triaged above were
+  produced against 0.13. A context driven on 0.14.1 should produce a
+  materially different failure profile; anyone quoting the 9/12 number after
+  today needs to re-run it rather than cite it.
+- **A running kernel does not have this yet.** The primer is composed at
+  *context create* from the linked `kaish-help`, so the fragments reach new
+  contexts only after the server binary is rebuilt and restarted — and
+  existing contexts never, since their system block was already written. Old
+  contexts keep the old primer until they fork.
 
 ### 5. One real bug, unrelated to the rest
 
