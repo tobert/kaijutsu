@@ -1,6 +1,6 @@
 //! Mouse-wheel scroll sensitivity — a reflected, per-client-configurable
 //! resource mirroring the metronome click config (`crate::metronome`,
-//! `docs/config-crdt-ownership.md` "Per-client config"). The backing file is
+//! `docs/config-ownership.md` "Per-client config"). The backing file is
 //! kernel-owned but a plain write surface for the file tools, not a CRDT
 //! document (see that doc's superseded note).
 //!
@@ -21,7 +21,7 @@ use bevy::prelude::*;
 
 /// Per-client scroll gains, resolved from `/etc/client/scroll.toml` — a
 /// plain, kernel-owned file written through the file tools, not a CRDT
-/// document (`docs/config-crdt-ownership.md` "Per-client config" and its
+/// document (`docs/config-ownership.md` "Per-client config" and its
 /// superseded note). Serde `default` makes every field optional in the
 /// TOML — falls back to the shipped gains — so a partial file is valid and
 /// a missing/failed fetch keeps the default.

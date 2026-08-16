@@ -1,8 +1,8 @@
-//! CRDT-backed file document cache.
+//! kernel-owned file document cache.
 //!
-//! Maps VFS files into CRDT documents, enabling concurrent editing
-//! with the same operational semantics as block editing. Files are
-//! loaded on demand and cached with LRU eviction.
+//! Maps VFS files into kernel documents, giving file edits the same
+//! storage and edit semantics as block edits. Files are loaded on
+//! demand and cached with LRU eviction.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,9 +22,9 @@ const DEFAULT_MAX_CACHED: usize = 64;
 ///
 /// The two variants must be treated differently by callers:
 /// - [`CacheReadError::NotCached`] is **benign**: the file is absent, binary,
-///   or otherwise not representable in the CRDT text substrate. Callers *may*
+///   or otherwise not decodable as UTF-8 text. Callers *may*
 ///   fall through to a raw VFS read or treat the file as absent.
-/// - [`CacheReadError::Backend`] is a **real failure** (CRDT store I/O, block
+/// - [`CacheReadError::Backend`] is a **real failure** (block store I/O, block
 ///   not found in a live document, etc.). Callers *must* surface it — serving
 ///   stale or empty bytes in place of a Backend error is silent data corruption.
 #[derive(Debug)]
@@ -32,7 +32,7 @@ pub enum CacheReadError {
     /// File is absent, became binary, or can't be decoded as UTF-8.
     /// Benign: fall through to a raw read or treat as absent.
     NotCached,
-    /// A real backend or CRDT store error. Surface it; never silently substitute
+    /// A real backend or block store error. Surface it; never silently substitute
     /// stale bytes or an empty string.
     Backend(String),
 }
@@ -40,13 +40,13 @@ pub enum CacheReadError {
 impl std::fmt::Display for CacheReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CacheReadError::NotCached => write!(f, "file not in CRDT cache (binary or missing)"),
+            CacheReadError::NotCached => write!(f, "file not in document cache (binary or missing)"),
             CacheReadError::Backend(e) => write!(f, "{e}"),
         }
     }
 }
 
-/// A cached file backed by a CRDT document.
+/// A cached file backed by a kernel document.
 struct CachedFileDoc {
     /// Deterministic ContextId derived from the file path.
     context_id: ContextId,
@@ -68,11 +68,10 @@ struct CachedFileDoc {
     loaded_generation: Option<u64>,
 }
 
-/// Cache that maps VFS files to CRDT documents.
+/// Cache that maps VFS files to kernel documents.
 ///
 /// Each file becomes a document with `DocKind::File` and a single
-/// `BlockKind::Text` block. Edits go through the CRDT, enabling
-/// concurrent modification with proper conflict resolution.
+/// `BlockKind::Text` block; edits apply directly to that block.
 pub struct FileDocumentCache {
     cache: RwLock<HashMap<ContextId, CachedFileDoc>>,
     block_store: SharedBlockStore,
@@ -103,7 +102,7 @@ impl FileDocumentCache {
 
     /// Replace a cached block's content with the current on-disk bytes. Used to
     /// pick up external edits when a clean entry's file mtime has advanced.
-    /// Only emits a CRDT edit when the content actually differs.
+    /// Only emits an edit when the content actually differs.
     ///
     /// Error classification (matches [`try_get_or_load`](Self::try_get_or_load)):
     /// - VFS not-found / UTF-8 failure → [`CacheReadError::NotCached`] (benign:
@@ -147,7 +146,7 @@ impl FileDocumentCache {
         };
 
         // Fetch the existing block content so we can diff and apply a minimal
-        // CRDT edit. A store error here is a real backend failure — propagate it
+        // edit. A store error here is a real backend failure — propagate it
         // rather than defaulting to "" which would wipe the whole block.
         let snaps = self
             .block_store
@@ -165,7 +164,7 @@ impl FileDocumentCache {
             })?;
 
         if old != text {
-            // Char-indexed delete (CRDT text positions are chars, not bytes).
+            // Char-indexed delete (block text positions are chars, not bytes).
             self.block_store
                 .edit_text(ctx_id, block_id, 0, &text, old.chars().count())
                 .map_err(|e| {
@@ -182,7 +181,7 @@ impl FileDocumentCache {
         Ok(())
     }
 
-    /// Whether a file already exists — cached as a CRDT document or present
+    /// Whether a file already exists — cached as a kernel document or present
     /// on the backing VFS. Used to report created-vs-updated on write.
     pub async fn exists(&self, path: &str) -> bool {
         let ctx_id = file_context_id(path);
@@ -192,7 +191,7 @@ impl FileDocumentCache {
         self.vfs.exists(std::path::Path::new(path)).await
     }
 
-    /// Read the current content of a file (reflects any CRDT edits).
+    /// Read the current content of a file (reflects any edits applied since load).
     ///
     /// This is the legacy opaque-error wrapper kept for call sites that already
     /// have an appropriate error context (e.g. `ExecResult::failure`). New call
@@ -211,7 +210,7 @@ impl FileDocumentCache {
     /// Error classification:
     /// - VFS "not found" → [`CacheReadError::NotCached`] (file absent; benign)
     /// - UTF-8 decode failure → [`CacheReadError::NotCached`] (binary file; benign)
-    /// - Any other VFS or CRDT store error → [`CacheReadError::Backend`] (real)
+    /// - Any other VFS or block store error → [`CacheReadError::Backend`] (real)
     pub async fn try_read_content(&self, path: &str) -> Result<String, CacheReadError> {
         let (ctx_id, block_id) = self
             .try_get_or_load(path)
@@ -308,7 +307,7 @@ impl FileDocumentCache {
         let text = match String::from_utf8(content) {
             Ok(s) => s,
             Err(_) => {
-                // Binary file — not an error, just not representable as CRDT text.
+                // Binary file — not an error, just not decodable as UTF-8 text.
                 return Err(CacheReadError::NotCached);
             }
         };
@@ -410,7 +409,7 @@ impl FileDocumentCache {
                     })
                     .unwrap_or_default();
 
-                // `edit_text` indexes in CHARACTERS (CRDT text positions),
+                // `edit_text` indexes in CHARACTERS (block text positions),
                 // not bytes — delete the whole block by char count. Using
                 // `old_content.len()` (bytes) over-counts on multi-byte
                 // UTF-8 (e.g. 改善, em-dashes) and panics out-of-bounds.
@@ -432,9 +431,9 @@ impl FileDocumentCache {
         self.get_or_load_with_content(path, content).await
     }
 
-    /// Drop a path's cached CRDT document, if any. Used when a write bypasses
+    /// Drop a path's cached kernel document, if any. Used when a write bypasses
     /// the text substrate (e.g. binary content) so a later text read reloads
-    /// fresh rather than serving a stale CRDT doc.
+    /// fresh rather than serving a stale document.
     pub fn invalidate(&self, path: &str) {
         let ctx_id = file_context_id(path);
         self.cache.write().remove(&ctx_id);
@@ -443,7 +442,7 @@ impl FileDocumentCache {
     /// Like [`invalidate`](Self::invalidate), but also drops the **backing shadow
     /// document** so the next read fully reloads from the VFS.
     ///
-    /// Plain `invalidate` only removes the in-memory entry; the shadow CRDT doc
+    /// Plain `invalidate` only removes the in-memory entry; the shadow document
     /// (at `file_context_id(path)`) survives, and the next `get_or_load`
     /// re-registers that same — now stale — block (the `create_document` already
     /// exists → snapshot-and-reuse path). That's correct for a self-contained
@@ -599,7 +598,7 @@ impl FileDocumentCache {
         let ctx_id = file_context_id(path);
         let language = detect_language(path);
 
-        // The CRDT block store persists file documents across restarts while
+        // The kernel block store persists file documents across restarts while
         // this in-memory cache starts cold. So a cache miss does NOT imply the
         // document is new — it may already exist in the store (e.g. after a
         // kernel restart). create_document fails in that case; fall back to
@@ -699,7 +698,7 @@ impl FileDocumentCache {
 ///
 /// `pub(crate)` so ownership tests can assert the *absence* of a document at
 /// this id: for a config-owned path the file-doc id must never be minted at all
-/// (`docs/config-crdt-ownership.md`), and only this function knows where such a
+/// (`docs/config-ownership.md`), and only this function knows where such a
 /// shadow would live.
 pub(crate) fn file_context_id(path: &str) -> ContextId {
     let uuid = uuid::Uuid::new_v5(
@@ -781,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn create_or_replace_handles_multibyte_when_cached() {
         // Regression: create_or_replace deleted `old_content.len()` (bytes)
-        // chars from a CRDT block, panicking out-of-bounds when the cached
+        // chars from a kernel block, panicking out-of-bounds when the cached
         // content held multi-byte UTF-8 (the rc stance files: 改善, em-dashes,
         // …). It must delete by CHARACTER count.
         let (_vfs, cache) = tmp_cache().await;
@@ -879,13 +878,13 @@ mod tests {
     /// flattens Backend into NotCached (e.g. via `unwrap_or(NotCached)`).
     ///
     /// Technique: write a file through the cache to populate the in-memory entry,
-    /// then delete the CRDT document from the block store so the next
+    /// then delete the kernel document from the block store so the next
     /// `block_snapshots` call fails — simulating a store inconsistency.
     #[tokio::test]
     async fn try_read_content_backend_error_is_not_swallowed_as_not_cached() {
         let (vfs, cache) = tmp_cache().await;
 
-        // Write through the cache so the CRDT document exists.
+        // Write through the cache so the kernel document exists.
         vfs.write_all(p("/tmp/backend_err.txt"), b"content")
             .await
             .unwrap();
@@ -894,7 +893,7 @@ mod tests {
             "content"
         );
 
-        // Destroy the CRDT document (simulates store corruption / inconsistency).
+        // Destroy the kernel document (simulates store corruption / inconsistency).
         // The cache entry (in-memory) still points to the now-gone context_id.
         let ctx_id = file_context_id("/tmp/backend_err.txt");
         cache
@@ -959,7 +958,7 @@ mod tests {
     /// Regression (F1 / stale-reload): when a clean cache entry's file has a
     /// greater generation on disk, `try_get_or_load` enters the stale-reload
     /// path and calls `reload_block_from_disk`. If the block store fails at that
-    /// point (e.g. the CRDT document was deleted), the error MUST propagate as
+    /// point (e.g. the kernel document was deleted), the error MUST propagate as
     /// `CacheReadError::Backend` — not be swallowed as `NotCached`.
     ///
     /// The old code blanket-converted every reload error to `NotCached`, which

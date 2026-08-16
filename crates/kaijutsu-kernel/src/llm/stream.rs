@@ -1,7 +1,7 @@
 //! Streaming primitives for LLM responses.
 //!
 //! Provider-agnostic types that flow from per-provider `Client::stream()`
-//! into the CRDT block writer in `kaijutsu-server`. Each per-provider
+//! into the kernel block writer in `kaijutsu-server`. Each per-provider
 //! client (`super::claude`, `super::openai`, `super::deepseek`) owns
 //! translation from kaijutsu's `Message` / `ContentBlock` into the
 //! provider's native wire shape and emits the events below.
@@ -15,7 +15,7 @@
 //!          ▼                      ▼
 //!          ┌──────────────────────────────────┐
 //!          │       StreamEvent (this file)    │
-//!          │   (CRDT block writer in server)  │
+//!          │   (kernel block writer in server)  │
 //!          └──────────────────────────────────┘
 //! ```
 
@@ -34,7 +34,7 @@ use super::config::SlotTunables;
 ///    `InlineToolUse { … }` followed by a provider callback result
 /// 4. `Done { … }` or `Error(_)` — terminal
 ///
-/// The CRDT block writer relies on `*Start` / `*End` bracketing each
+/// The kernel block writer relies on `*Start` / `*End` bracketing each
 /// text/thinking run — provider implementations must close the current
 /// block before opening another or before emitting a tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,7 +126,7 @@ pub enum StreamEvent {
 ///
 /// This deliberately carries only the portable tool-result shape.  A
 /// provider owns its wire-specific callback envelope (Codex uses
-/// `contentItems`); kaijutsu owns execution and its durable CRDT blocks.
+/// `contentItems`); kaijutsu owns execution and its durable kernel blocks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InlineToolResult {
     pub content: String,

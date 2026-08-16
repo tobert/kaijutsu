@@ -172,7 +172,7 @@ impl MountTable {
 
     /// Whether the mount backing `path` is writable (longest-prefix match).
     /// Returns `false` when no mount matches — you can't write where nothing
-    /// is mounted. Used to decide whether a path is eligible for CRDT-backed
+    /// is mounted. Used to decide whether a path is eligible for kernel-owned
     /// editing (writable) or should pass straight through (read-only/OS).
     pub async fn is_writable(&self, path: &Path) -> bool {
         match self.find_mount(path).await {
@@ -324,7 +324,7 @@ impl MountTable {
 
     /// If `vfs_dir` is backed by real files (`real_path` resolves) and has a
     /// `.gitignore`, build a matcher from its content — read through the VFS
-    /// (`self.read_all`, never `std::fs` directly) so virtual/CRDT backends
+    /// (`self.read_all`, never `std::fs` directly) so virtual/document backends
     /// are structurally exempt and nested mounts are respected. `None` on
     /// any miss: no real backing, no file, or unreadable. A malformed
     /// pattern line is skipped by the builder itself rather than failing the
@@ -607,7 +607,7 @@ impl MountTable {
     /// The mount point owning `path` (longest-prefix match) paired with its
     /// backend — the "what owns this path?" question. `None` when nothing is
     /// mounted over `path`. Used by the editor resolver to decide config-owned
-    /// (bind straight to the CRDT block) vs. an ordinary file, and to recover the
+    /// (bind straight to the kernel block) vs. an ordinary file, and to recover the
     /// config mount root without a hardcoded prefix — see
     /// [`VfsOps::owns_config_docs`].
     pub async fn owner_of(&self, path: &Path) -> Option<(PathBuf, Arc<dyn VfsOps>)> {
@@ -898,7 +898,7 @@ impl VfsOps for MountTable {
     /// default (getattr + read). The default sizes from `getattr`, which is
     /// lstat-like for a symlink and reports the *link path* length — that would
     /// truncate a followed target (e.g. a short link path masking a long rc
-    /// script). A backend that follows symlinks (`ConfigCrdtFs`) sizes from the
+    /// script). A backend that follows symlinks (`ConfigDocFs`) sizes from the
     /// resolved target in its own `read_all`, so the read must reach it.
     async fn read_all(&self, path: &Path) -> VfsResult<Vec<u8>> {
         let (fs, relative) = self.find_mount(path).await?;

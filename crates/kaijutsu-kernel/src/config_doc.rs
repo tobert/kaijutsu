@@ -1,18 +1,18 @@
 //! Shared CRDT config-document model.
 //!
-//! One backend, [`ConfigCrdtFs`], owns all config-class content as CRDT
+//! One backend, [`ConfigDocFs`], owns all config-class content as CRDT
 //! documents — `/etc/rc`, `/etc/config`, `/etc/client`, and `/etc/midi` are
 //! each one mounted instance of it. (An earlier design split rc and config
-//! across two backends, `ConfigCrdtBackend` and `ConfigCrdtFs`; the former was
-//! deleted when the config TOMLs moved onto this same CRDT-native model — see
-//! `config_seed.rs` and `config_crdt_fs.rs` module docs for that history.)
+//! across two backends, `ConfigDocBackend` and `ConfigDocFs`; the former was
+//! deleted when the config TOMLs moved onto this same kernel-owned model — see
+//! `config_seed.rs` and `config_doc_fs.rs` module docs for that history.)
 //! Every mount shares one doc model — a single-block `DocKind::File` (or
 //! `DocKind::Symlink`) document keyed by a deterministic UUIDv5 of its path
 //! — so the four trees can never drift into near-identical-but-subtly-different
-//! stores. These free functions ARE that shared model; `ConfigCrdtFs` calls
+//! stores. These free functions ARE that shared model; `ConfigDocFs` calls
 //! them rather than re-deriving the id or re-implementing the read.
 //!
-//! [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
+//! [`ConfigDocFs`]: crate::runtime::config_doc_fs::ConfigDocFs
 
 use kaijutsu_types::{BlockId, ContextId};
 

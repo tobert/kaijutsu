@@ -884,7 +884,7 @@ impl Provider {
 
 /// Closed-set wrapper over per-provider stream types.
 ///
-/// The CRDT block writer in `kaijutsu-server` consumes [`StreamEvent`]s
+/// The kernel block writer in `kaijutsu-server` consumes [`StreamEvent`]s
 /// via [`Self::next_event`] and signals cancellation via [`Self::cancel`].
 /// Each call dispatches with an explicit `match` — no trait object.
 pub enum ProviderStream {

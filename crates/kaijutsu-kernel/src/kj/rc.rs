@@ -217,7 +217,7 @@ impl KjDispatcher {
         {
             return denied;
         }
-        // A direct rc write touches the ConfigCrdtFs block, not the
+        // A direct rc write touches the ConfigDocFs block, not the
         // FileDocumentCache shadow that backs kaish `cat`/file tools — capture
         // the path so we can drop that stale shadow after a successful write.
         // (The `edit`-opens-editor branch is covered too: invalidation is a
@@ -286,8 +286,8 @@ impl KjDispatcher {
     }
 
     /// Write `content` to the rc script at `path` straight through the VFS to
-    /// the CRDT-native `/etc/rc` backend. There is no host file and no
-    /// FileDocumentCache mirror: the CRDT document IS the script. Dispatch
+    /// the kernel-owned `/etc/rc` backend. There is no host file and no
+    /// FileDocumentCache mirror: the kernel document IS the script. Dispatch
     /// (`load_rc_scripts`) reads the same document through the same VFS.
     async fn write_rc_file(&self, path: &str, content: &str) -> Result<(), String> {
         use crate::vfs::VfsOps;
@@ -423,7 +423,7 @@ impl KjDispatcher {
     /// target` annotation, so this reuses it instead of re-issuing the same
     /// VFS readlink).
     ///
-    /// A seed whose body is itself a link-target path ([`config_crdt_fs::
+    /// A seed whose body is itself a link-target path ([`config_doc_fs::
     /// seed_link_target`], the init.d composition seeding reconstructs as a
     /// symlink) compares link-target-to-link-target; every other seed compares
     /// literal body-to-body. Mixing the two (a live file where the seed wants
@@ -437,7 +437,7 @@ impl KjDispatcher {
             .map(|(p, _)| p)
             .collect();
         let expected_link =
-            crate::runtime::config_crdt_fs::seed_link_target(path, seed, &known);
+            crate::runtime::config_doc_fs::seed_link_target(path, seed, &known);
 
         match (expected_link.as_deref(), live_link) {
             (Some(want), Some(got)) => {
@@ -502,7 +502,7 @@ impl KjDispatcher {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
         };
-        // Read straight from the CRDT-native backend. NotFound = absent script;
+        // Read straight from the kernel-owned backend. NotFound = absent script;
         // any other VfsError is a real backend failure (surfaced, not masked as
         // "not found").
         let content = match self.read_rc_content(path).await {
@@ -516,7 +516,7 @@ impl KjDispatcher {
         let symlink_target = self.rc_link_target(path).await;
 
         // Metadata is derived from the canonical path; provenance lives in
-        // the CRDT block, not here.
+        // the kernel block, not here.
         let record = serde_json::json!({
             "path": path,
             "context_type": parts.context_type,
@@ -634,7 +634,7 @@ impl KjDispatcher {
             .into_iter()
             .map(|(p, _)| p)
             .collect();
-        let link = crate::runtime::config_crdt_fs::seed_link_target(path, body, &known);
+        let link = crate::runtime::config_doc_fs::seed_link_target(path, body, &known);
 
         // create-or-replace: drop any existing doc (file OR link) first, so a
         // write never accidentally follows a live symlink into its target.
@@ -671,7 +671,7 @@ impl KjDispatcher {
         if !self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc rm: '{path}' not found"));
         }
-        // Delete the CRDT document directly (no host file, no cache mirror).
+        // Delete the kernel document directly (no host file, no cache mirror).
         if let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(path)).await {
             return KjResult::Err(format!("kj rc rm: unlink '{path}': {e}"));
         }
@@ -765,7 +765,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -817,7 +817,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -834,7 +834,7 @@ mod tests {
     }
 
     /// Read an rc script's content back through the VFS (the same path
-    /// dispatch reads), so tests verify the live CRDT document.
+    /// dispatch reads), so tests verify the live kernel document.
     async fn read_rc(d: &KjDispatcher, path: &str) -> Option<String> {
         use crate::vfs::VfsOps;
         let bytes = d
@@ -852,7 +852,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -911,7 +911,7 @@ mod tests {
                 .content
         }
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
         let path = "/etc/rc/cachetest/create/S00-foo.kai";
@@ -954,7 +954,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1003,7 +1003,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1047,7 +1047,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1083,7 +1083,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1132,7 +1132,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1168,7 +1168,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1195,7 +1195,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1226,7 +1226,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1288,7 +1288,7 @@ mod tests {
         use crate::kj::KjResult;
         use crate::vfs::VfsOps;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1373,7 +1373,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1400,7 +1400,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1439,7 +1439,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1475,7 +1475,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1505,7 +1505,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -1555,7 +1555,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 

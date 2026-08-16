@@ -198,7 +198,7 @@ pub enum DocKind {
     /// Symbolic link. Git-style: the single block's content *is* the link
     /// target path; this kind is the authoritative "mode bit" that tells a
     /// reader to follow rather than treat the content as a file body. See
-    /// `ConfigCrdtFs`.
+    /// `ConfigDocFs`.
     #[strum(serialize = "symlink")]
     Symlink,
 }

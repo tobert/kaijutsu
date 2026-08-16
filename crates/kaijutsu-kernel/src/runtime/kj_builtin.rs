@@ -928,7 +928,7 @@ mod tests {
     //! handles instead of the rendered table.
     use super::*;
     use crate::block_store::shared_block_store;
-    use crate::kj::test_helpers::{register_context, test_dispatcher, test_dispatcher_crdt_rc};
+    use crate::kj::test_helpers::{register_context, test_dispatcher, test_dispatcher_rc};
     use crate::runtime::context_engine::session_context_map;
     use crate::runtime::embedded_kaish::EmbeddedKaish;
     use kaijutsu_types::SessionId;
@@ -1890,7 +1890,7 @@ mod tests {
     /// never asked for it.
     #[tokio::test]
     async fn literal_json_content_value_survives_argv_reconstruction() {
-        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        let dispatcher = Arc::new(test_dispatcher_rc().await);
         dispatcher.set_self_arc();
 
         let principal = PrincipalId::new();
@@ -1940,7 +1940,7 @@ mod tests {
     /// shape table.
     #[tokio::test]
     async fn literal_json_content_value_coexists_with_real_json_flag() {
-        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        let dispatcher = Arc::new(test_dispatcher_rc().await);
         dispatcher.set_self_arc();
 
         let principal = PrincipalId::new();

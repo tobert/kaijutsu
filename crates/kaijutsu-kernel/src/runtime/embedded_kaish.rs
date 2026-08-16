@@ -2,7 +2,7 @@
 //!
 //! Instead of spawning kaish as a subprocess, this module embeds the kaish
 //! interpreter directly, routing I/O through the kaijutsu kernel's MountTable
-//! for real filesystem access and VFS adapters for CRDT blocks.
+//! for real filesystem access and VFS adapters for kernel blocks.
 //!
 //! # Architecture
 //!
@@ -13,7 +13,7 @@
 //!             │
 //!             ├── kaish::Kernel (in-process)
 //!             │       │
-//!             │       ├── /v/docs → KaijutsuFilesystem (CRDT blocks)
+//!             │       ├── /v/docs → KaijutsuFilesystem (kernel blocks)
 //!             │       ├── /v/jobs, /v/cas → kaish builtins
 //!             │       └── everything else → MountBackend
 //!             │               │
@@ -23,7 +23,7 @@
 //!             └── Shared state with kaijutsu kernel
 //! ```
 //!
-//! This enables kaish scripts to access both CRDT blocks and real files,
+//! This enables kaish scripts to access both kernel blocks and real files,
 //! with tool dispatch routed through the kernel's tool registry.
 
 use std::path::PathBuf;
@@ -50,7 +50,7 @@ use super::mount_backend::MountBackend;
 use super::read_only_fs::ReadOnlyFs;
 use super::context_engine::{SessionContextExt, SessionContextMap};
 
-/// Embedded kaish executor backed by CRDT blocks.
+/// Embedded kaish executor backed by kernel blocks.
 ///
 /// Embeds the kaish interpreter directly and routes all I/O through
 /// `KaijutsuBackend`.
@@ -211,7 +211,7 @@ impl EmbeddedKaish {
 
     /// Like [`Self::with_identity`] but the materialized shell is **read-only**:
     /// every filesystem mutation and every external command is refused by
-    /// construction, while reads — real files *and* the CRDT document views at
+    /// construction, while reads — real files *and* the kernel document views at
     /// `/v/docs` / `/v/input` — still work. Backs the toolie's
     /// `read_only_shell` (see `mcp/servers/shell.rs`).
     // See with_identity's doc above for why this family's argument count is
@@ -255,7 +255,7 @@ impl EmbeddedKaish {
     /// `MountBackend` refuses every mutation, the `/v/*` CRDT mounts are wrapped
     /// read-only, and external command execution is disabled — three structural
     /// levers, mirroring kaibo's read-only sandbox recipe (`sandbox.rs`) adapted
-    /// to kaijutsu's *shared*, CRDT-backed mount table.
+    /// to kaijutsu's *shared*, kernel-owned mount table.
     // See with_identity's doc for why this family's argument count is what
     // it is — this is the shared implementation both public constructors
     // above funnel into.
@@ -391,7 +391,7 @@ impl EmbeddedKaish {
             }
         }
 
-        // The CRDT document views (`/v/docs`, `/v/input`) are mounted directly
+        // The kernel document views (`/v/docs`, `/v/input`) are mounted directly
         // on the kaish VFS, bypassing MountBackend — so in read-only mode they
         // get their own structural gate via `ReadOnlyFs` (reads delegate,
         // writes refuse). Otherwise they mount writable.
@@ -763,7 +763,7 @@ mod tests {
     /// The kaish surface for init.d-style rc composition: an agent shell does
     /// `ln -s` over the `/etc/rc` CRDT mount, and `cat` through the link returns
     /// the *target's* content. This proves the path is wired end-to-end —
-    /// kaish `ln`/`cat` builtins → MountBackend → MountTable → ConfigCrdtFs —
+    /// kaish `ln`/`cat` builtins → MountBackend → MountTable → ConfigDocFs —
     /// with no rc-specific shell code. (KaijutsuBackend's `/docs/` block scheme
     /// is a separate thing and keeps its honest "not supported" stub.)
     #[tokio::test]
@@ -772,7 +772,7 @@ mod tests {
         let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-ln").await);
         // Mount the production rc backend over the same block store the shell uses.
         let rc_fs =
-            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
         kernel.mount(RC_ROOT, rc_fs).await;
         let kaish = EmbeddedKaish::new("test-ln", blocks, kernel, None).unwrap();
 

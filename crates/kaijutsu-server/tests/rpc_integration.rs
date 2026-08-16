@@ -102,11 +102,11 @@ fn test_kernel_appears_in_list() {
     });
 }
 
-/// get_config reads the CRDT-owned config over the wire (client → SSH → capnp →
+/// get_config reads the kernel-owned config over the wire (client → SSH → capnp →
 /// rpc.rs → /etc/config VFS). A fresh kernel seeds the embedded defaults, so
 /// theme.toml comes back non-empty; an unknown file is a loud error, not "".
 #[test]
-fn test_get_config_reads_crdt_owned_theme() {
+fn test_get_config_reads_kernel_owned_theme() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
@@ -125,7 +125,7 @@ fn test_get_config_reads_crdt_owned_theme() {
 /// `Vfs.snapshot` round-trip over the real wire: client → SSH → capnp →
 /// rpc.rs `VfsImpl::snapshot` → kernel `MountTable::snapshot` → recursive
 /// capnp `SnapshotNode` reply → client's owned tree. `/etc/rc` is a
-/// CRDT-native (virtual) mount seeded with lifecycle scripts at kernel boot,
+/// kernel-owned (virtual) mount seeded with lifecycle scripts at kernel boot,
 /// so it's guaranteed non-empty without touching the host filesystem — and
 /// it doubles as coverage that a virtual backend reports `ignored: false`
 /// (no gitignore semantics off the real filesystem) over the wire, not just

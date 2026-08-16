@@ -94,7 +94,7 @@ fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str
 /// The embedded seed set as `(canonical /etc/rc path, body)` pairs, derived
 /// by walking [`RC_SEED_DIR`]. The path encodes
 /// `context_type / verb / sort_key / name / ext`; nothing else is stored
-/// (provenance comes from the CRDT block's principal on write).
+/// (provenance comes from the kernel block's principal on write).
 pub fn seed_files() -> Vec<(String, &'static str)> {
     let mut out = Vec::new();
     collect_seeds(&RC_SEED_DIR, &mut out);
@@ -172,7 +172,7 @@ mod tests {
             .unwrap()
             .contains("kj cache add --target=tools"));
         // …and the per-type copy is a seed symlink — its body is just the
-        // target path (ConfigCrdtFs reconstructs the link on seed; the legacy
+        // target path (ConfigDocFs reconstructs the link on seed; the legacy
         // host-disk path writes the path string verbatim).
         assert_eq!(
             read(dir.path(), "default/create/S20-cache.kai").unwrap().trim(),
@@ -226,7 +226,7 @@ mod tests {
             .expect("lib cache seed must exist");
         assert!(body.contains("kj cache add --target=tools"));
         // …and a per-type path's seed body is just the link target (a seed
-        // symlink — reconstructed into an actual link by ConfigCrdtFs::seed).
+        // symlink — reconstructed into an actual link by ConfigDocFs::seed).
         assert_eq!(
             seed_body("/etc/rc/default/create/S20-cache.kai").unwrap().trim(),
             "/etc/rc/lib/create/S20-cache.kai"

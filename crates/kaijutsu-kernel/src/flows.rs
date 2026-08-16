@@ -277,10 +277,6 @@ pub enum BlockFlow {
         block: Arc<BlockSnapshot>,
         /// Block to insert after (None = beginning).
         after_id: Option<BlockId>,
-        /// CRDT operations that created this block (for sync).
-        /// Clients should merge these ops instead of creating their own.
-        /// Arc-wrapped to avoid per-subscriber deep cloning.
-        ops: Arc<[u8]>,
         /// The context's mutation version **after** this insert, captured
         /// inside the mutation lock. Lets the server bridge order concurrent
         /// writers' events before delivery.
@@ -291,7 +287,7 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-    /// Text was added at the end of a block's text — a classified, CRDT-free
+    /// Text was added at the end of a block's text — a classified, operation-free
     /// event (docs/change-feed.md).
     ///
     /// A subscriber applies this by appending `suffix` to the text it already
@@ -316,7 +312,7 @@ pub enum BlockFlow {
     },
 
     /// A block's text changed in a way that is not an append — a classified,
-    /// CRDT-free event (docs/change-feed.md) for every non-append path.
+    /// operation-free event (docs/change-feed.md) for every non-append path.
     ///
     /// Carries the whole after-text: a subscriber replaces what it holds. An
     /// insert in the middle, a delete, and a splice are all this variant.
@@ -1718,7 +1714,6 @@ mod tests {
                 context_id: ctx,
                 block: Arc::new(block),
                 after_id: None,
-                ops: Arc::from(Vec::<u8>::new()),
                 version: 1,
                 source: OpSource::Local,
             }
@@ -1846,7 +1841,6 @@ mod tests {
             context_id: ctx,
             block: block.clone(),
             after_id: None,
-            ops: Arc::from(vec![]),
             version: 1,
             source: OpSource::Local,
         });
@@ -1925,7 +1919,6 @@ mod tests {
             context_id: ctx,
             block,
             after_id: None,
-            ops: Arc::from(vec![]),
             version: 1001,
             source: OpSource::Local,
         });
@@ -1951,7 +1944,6 @@ mod tests {
             context_id: ctx,
             block,
             after_id: None,
-            ops: Arc::from(vec![]),
             version: 1,
             source: OpSource::Local,
         });
@@ -2040,7 +2032,6 @@ mod tests {
             context_id: ctx,
             block,
             after_id: None,
-            ops: Arc::from(vec![42u8]),
             version: 1,
             source: OpSource::Local,
         });
@@ -2050,16 +2041,11 @@ mod tests {
 
         // Both subscribers should have the same Arc (pointer equality)
         if let (
-            BlockFlow::Inserted {
-                block: b1, ops: o1, ..
-            },
-            BlockFlow::Inserted {
-                block: b2, ops: o2, ..
-            },
+            BlockFlow::Inserted { block: b1, .. },
+            BlockFlow::Inserted { block: b2, .. },
         ) = (&msg1.payload, &msg2.payload)
         {
             assert!(Arc::ptr_eq(b1, b2), "block Arcs should share allocation");
-            assert!(Arc::ptr_eq(o1, o2), "ops Arcs should share allocation");
         } else {
             panic!("expected Inserted events");
         }
@@ -2083,7 +2069,6 @@ mod tests {
                 context_id: ctx,
                 block: block_clone,
                 after_id: None,
-                ops: Arc::from(Vec::<u8>::new()),
                 version: 1,
                 source: OpSource::Local,
             });
@@ -2409,7 +2394,6 @@ mod tests {
                 context_id: ctx,
                 block: block.clone(),
                 after_id: None,
-                ops: Arc::from(Vec::<u8>::new()),
                 version: 1,
                 source: OpSource::Local,
             },
@@ -2774,7 +2758,6 @@ mod tests {
             context_id: ctx,
             block,
             after_id: None,
-            ops: Arc::from(Vec::<u8>::new()),
             version: 0,
             source: OpSource::Local,
         });

@@ -1,6 +1,6 @@
-//! KaijutsuBackend: kaish KernelBackend implementation backed by CRDT blocks.
+//! KaijutsuBackend: kaish KernelBackend implementation backed by kernel blocks.
 //!
-//! This backend maps kaish file operations to kaijutsu's CRDT block store,
+//! This backend maps kaish file operations to kaijutsu's kernel block store,
 //! enabling collaborative editing through the shell interface.
 //!
 //! # Architecture
@@ -63,7 +63,7 @@ use kaish_kernel::{
 
 use super::context_engine::{SessionContextExt, SessionContextMap};
 
-/// Backend that routes kaish operations to kaijutsu's CRDT block store.
+/// Backend that routes kaish operations to kaijutsu's kernel block store.
 ///
 /// File operations become block operations:
 /// - `cat /docs/{ctx_hex}/block-key` → read block content
@@ -74,7 +74,7 @@ use super::context_engine::{SessionContextExt, SessionContextMap};
 /// - Block tools (block_create, block_edit, etc.)
 /// - MCP tools (when McpServerPool is implemented)
 pub struct KaijutsuBackend {
-    /// CRDT document/block storage.
+    /// kernel document/block storage.
     blocks: SharedBlockStore,
     /// The kaijutsu kernel for tool dispatch.
     kernel: Arc<KaijutsuKernel>,
@@ -630,7 +630,7 @@ impl KernelBackend for KaijutsuBackend {
     // Symlinks are unsupported in *this* backend on purpose: it serves the
     // `/docs/{ctx_hex}/{block}` conversation-block scheme, where a link between
     // blocks has no meaning. This is NOT the rc path — `ln -s /etc/rc/…` routes
-    // through MountBackend → MountTable → ConfigCrdtFs, which does support links
+    // through MountBackend → MountTable → ConfigDocFs, which does support links
     // (init.d-style rc composition). Failing loud here keeps the two schemes
     // from quietly conflating.
     async fn read_link(&self, _path: &Path) -> BackendResult<std::path::PathBuf> {
@@ -739,7 +739,7 @@ impl KernelBackend for KaijutsuBackend {
         vec![MountInfo {
             path: std::path::PathBuf::from("/docs"),
             read_only: false,
-            // CRDT-backed mount; residency lives in the BlockStore, not tracked here.
+            // kernel-owned mount; residency lives in the BlockStore, not tracked here.
             resident_bytes: None,
         }]
     }
@@ -1166,7 +1166,7 @@ mod tests {
 
     /// A store + document + one block with the given content; returns the
     /// pieces `apply_patch_op` needs. CRDT-side content is read back through
-    /// `crdt_content`.
+    /// `block_content`.
     fn patch_fixture(content: &str) -> (SharedBlockStore, ContextId, BlockId) {
         let blocks = shared_block_store(PrincipalId::system());
         let ctx_id = ContextId::new();
@@ -1188,7 +1188,7 @@ mod tests {
         (blocks, ctx_id, block_id)
     }
 
-    fn crdt_content(blocks: &SharedBlockStore, ctx_id: ContextId, block_id: &BlockId) -> String {
+    fn block_content(blocks: &SharedBlockStore, ctx_id: ContextId, block_id: &BlockId) -> String {
         blocks
             .get_block_snapshot(ctx_id, block_id)
             .unwrap()
@@ -1215,7 +1215,7 @@ mod tests {
         .expect("insert line after a multibyte line must succeed");
         assert_eq!(result, "改善 → done\nINSERTED\nsecond");
         assert_eq!(
-            crdt_content(&blocks, ctx_id, &block_id),
+            block_content(&blocks, ctx_id, &block_id),
             result,
             "CRDT content must match the returned mirror"
         );
@@ -1236,7 +1236,7 @@ mod tests {
         )
         .expect("delete line after a multibyte line must not trip bounds");
         assert_eq!(result, "改善 → done\nkeep");
-        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+        assert_eq!(block_content(&blocks, ctx_id, &block_id), result);
     }
 
     #[test]
@@ -1260,7 +1260,7 @@ mod tests {
         )
         .expect("replace line after a multibyte line must succeed");
         assert_eq!(result, "→ arrows ✅\nnew\ntail");
-        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+        assert_eq!(block_content(&blocks, ctx_id, &block_id), result);
     }
 
     /// Pins the byte-offset ruling for the positional ops: PatchOp::Replace's
@@ -1287,7 +1287,7 @@ mod tests {
         )
         .expect("byte-offset replace after multibyte prefix must succeed");
         assert_eq!(result, "改善Y");
-        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+        assert_eq!(block_content(&blocks, ctx_id, &block_id), result);
     }
 
     #[test]
@@ -1304,7 +1304,7 @@ mod tests {
         )
         .expect("byte-offset insert after multibyte prefix must succeed");
         assert_eq!(result, "改善QX");
-        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+        assert_eq!(block_content(&blocks, ctx_id, &block_id), result);
     }
 
     #[test]
@@ -1321,7 +1321,7 @@ mod tests {
         )
         .expect("byte-offset delete after multibyte prefix must succeed");
         assert_eq!(result, "改善B");
-        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+        assert_eq!(block_content(&blocks, ctx_id, &block_id), result);
     }
 
     /// A wire byte offset that lands MID-CHAR is a loud error, not a panic —
@@ -1345,7 +1345,7 @@ mod tests {
             err.to_string().contains("char boundary"),
             "error should name the boundary problem: {err}"
         );
-        // The CRDT block is untouched — the guard fired before any splice.
-        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), "改善");
+        // The kernel block is untouched — the guard fired before any splice.
+        assert_eq!(block_content(&blocks, ctx_id, &block_id), "改善");
     }
 }

@@ -977,7 +977,7 @@ pub fn sync_hud_detach(
 ///
 /// When the user is in a text-editing surface (Compose/Dialog), shows the vim
 /// editing mode (NORMAL/INSERT/VISUAL). Otherwise shows the app-level mode.
-/// All labels come from the `mode_label_*` fields of `theme.toml` (CRDT-owned,
+/// All labels come from the `mode_label_*` fields of `theme.toml` (kernel-owned,
 /// fetched over RPC from the kernel) — except the detached screens (Room/Fsn),
 /// whose slot shows *where you are* ([`room_slot_label`]) instead of a vim
 /// mode that has no surface behind it there.

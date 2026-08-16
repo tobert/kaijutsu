@@ -1,8 +1,8 @@
-//! `kj midi` — read the CRDT-owned MIDI device profile library.
+//! `kj midi` — read the kernel-owned MIDI device profile library.
 //!
-//! Device profiles live at `/etc/midi/devices/<name>` on the same CRDT-native
+//! Device profiles live at `/etc/midi/devices/<name>` on the same kernel-owned
 //! backend that owns `/etc/rc` and `/etc/config`
-//! (`docs/config-crdt-ownership.md`): the kernel is the sole owner, no host
+//! (`docs/config-ownership.md`): the kernel is the sole owner, no host
 //! file, no write-through. Embedded seeds (`assets/defaults/midi/devices/*.md`,
 //! `crate::midi_seed`) bootstrap a fresh kernel once — see `docs/midi-next.md`
 //! "Storage and identity" (slice 1 step 2).
@@ -1020,12 +1020,12 @@ mod tests {
         assert_eq!(doc_title("plain first line\nmore"), "plain first line");
     }
 
-    /// A fresh kernel (the real CRDT-native `/etc/midi` mount, seeded from
+    /// A fresh kernel (the real kernel-owned `/etc/midi` mount, seeded from
     /// embedded defaults) already carries the shipped device profiles — no
     /// separate bootstrap step needed by callers.
     #[tokio::test]
     async fn fresh_kernel_seeds_midi_devices_into_the_vfs() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         use crate::vfs::VfsOps;
         let names: Vec<_> = d
             .kernel()
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_shows_all_four_shipped_devices_with_titles() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
         match result {
@@ -1075,7 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_non_json_renders_a_labelled_line_per_device() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         match result {
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn show_returns_the_seeded_document_content() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("midi"), s("show"), s("minibrute"), s("--json")], &c)
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn show_raw_emits_exactly_the_stored_document() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("midi"), s("show"), s("timidity"), s("--raw")], &c)
@@ -1128,7 +1128,7 @@ mod tests {
     /// empty-content fallback (the house crash-over-corruption stance).
     #[tokio::test]
     async fn show_unknown_device_errors_loudly() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("midi"), s("show"), s("nonesuch")], &c)
@@ -1146,7 +1146,7 @@ mod tests {
     /// the grammar, not turned into a confusing VFS error.
     #[tokio::test]
     async fn show_rejects_nested_or_escaping_names() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("midi"), s("show"), s("../../etc/passwd")], &c)
@@ -1160,18 +1160,18 @@ mod tests {
     /// A directory under `/etc/midi/devices` (the shape a future rc-style
     /// bucket device will take, `docs/midi-next.md` "The core split") must
     /// render as a visible, clearly-labelled row — not silently vanish behind
-    /// the old `is_file()` filter. Built through the real CRDT-native
+    /// the old `is_file()` filter. Built through the real kernel-owned
     /// `/etc/midi` mount (same fixture `fresh_kernel_seeds_midi_devices_into_the_vfs`
-    /// uses): `ConfigCrdtFs` synthesizes directories from descendant paths
+    /// uses): `ConfigDocFs` synthesizes directories from descendant paths
     /// (see `readdir_synthesizes_virtual_directories` in
-    /// `runtime::config_crdt_fs`), so writing a leaf file under
+    /// `runtime::config_doc_fs`), so writing a leaf file under
     /// `/etc/midi/devices/<bucket>/...` is enough to make `<bucket>` itself
     /// appear as a real `FileType::Directory` readdir entry — no fixture
     /// workaround needed.
     #[tokio::test]
     async fn list_renders_a_placeholder_row_for_a_bucket_directory() {
         use crate::vfs::VfsOps;
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         d.kernel()
             .vfs()
             .write_all(
@@ -1211,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn list_non_json_renders_the_bucket_placeholder_too() {
         use crate::vfs::VfsOps;
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         d.kernel()
             .vfs()
             .write_all(
@@ -1274,7 +1274,7 @@ mod tests {
     /// ephemeral, so silence means we don't know, not that nothing is there.
     #[tokio::test]
     async fn list_presence_is_unknown_until_a_sink_reports() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
         match result {
@@ -1292,7 +1292,7 @@ mod tests {
     /// unplug turns it absent. Both are visible to `kj midi list` on any node.
     #[tokio::test]
     async fn list_presence_follows_sink_reports_through_plug_and_unplug() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let presence = d.kernel().midi_presence().clone();
 
@@ -1329,7 +1329,7 @@ mod tests {
     /// The human view carries the column too (this is what a player reads).
     #[tokio::test]
     async fn list_non_json_renders_the_presence_column() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1358,7 +1358,7 @@ mod tests {
     /// other half is WHERE, and it rides the same row.
     #[tokio::test]
     async fn list_says_which_host_a_device_is_live_on() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1387,7 +1387,7 @@ mod tests {
     /// The human table grows a where-column once somebody has answered it.
     #[tokio::test]
     async fn list_non_json_renders_the_host_column() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1408,7 +1408,7 @@ mod tests {
     /// With nothing reported the column is pure padding — don't draw it.
     #[tokio::test]
     async fn list_non_json_omits_the_host_column_when_nobody_reported() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let KjResult::Ok { message, .. } = d.dispatch(&[s("midi"), s("list")], &c).await else {
             panic!("expected Ok");
@@ -1429,7 +1429,7 @@ mod tests {
     /// sink reported) alongside the durable document.
     #[tokio::test]
     async fn show_includes_the_presence_record() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1454,7 +1454,7 @@ mod tests {
     /// The human view of `show` answers "where" too.
     #[tokio::test]
     async fn show_non_json_names_the_reporting_host() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1476,7 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn a_reaped_connection_takes_its_rows_and_run_files_with_it() {
         use crate::vfs::{VfsError, VfsOps};
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let record = sink_report_from("minibrute", true, 1, "moltar");
         let connection = record.sink.connection;
@@ -1518,7 +1518,7 @@ mod tests {
     #[tokio::test]
     async fn the_run_midi_view_agrees_with_the_list_column() {
         use crate::vfs::VfsOps;
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         d.kernel()
             .midi_presence()
             .record(sink_report("minibrute", true, 5))
@@ -1588,7 +1588,7 @@ mod tests {
     /// sounding note.
     #[tokio::test]
     async fn send_note_publishes_a_device_addressed_control_cue() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
 
@@ -1616,7 +1616,7 @@ mod tests {
     /// nibble 0xF, not a wrapped 0x0.
     #[tokio::test]
     async fn send_uses_front_panel_channel_numbering_on_the_wire() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d
@@ -1632,7 +1632,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_pc_is_a_two_byte_program_change() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d
@@ -1649,7 +1649,7 @@ mod tests {
     /// than the one typed.
     #[tokio::test]
     async fn an_ungated_note_sends_exactly_one_message() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d
@@ -1668,7 +1668,7 @@ mod tests {
     /// cheerful "sent!" would be a lie.
     #[tokio::test]
     async fn send_to_an_unknown_device_errors_and_publishes_nothing() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d
@@ -1692,7 +1692,7 @@ mod tests {
     /// result. The sink drops what it can't route, loudly, in its own logs.
     #[tokio::test]
     async fn send_to_an_unreported_device_warns_but_still_sends() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d
@@ -1720,7 +1720,7 @@ mod tests {
     /// the warning stays worth reading.
     #[tokio::test]
     async fn send_to_a_live_device_carries_no_presence_warning() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1750,7 +1750,7 @@ mod tests {
     /// "unknown" are different facts all the way to the CLI.
     #[tokio::test]
     async fn send_to_an_absent_device_says_absent_not_unknown() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -1780,7 +1780,7 @@ mod tests {
     /// especially its warnings) is never ephemeral.
     #[tokio::test]
     async fn a_send_result_is_visible_to_the_model_not_ephemeral() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(
@@ -1800,7 +1800,7 @@ mod tests {
     /// rather than let a player debug a cable that's fine.
     #[tokio::test]
     async fn a_send_with_no_attached_sink_warns_about_zero_listeners() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         // Deliberately NO subscriber.
         let result = d
@@ -1825,7 +1825,7 @@ mod tests {
     /// `kj midi panic <device>` = CC 123 then CC 120 on all 16 channels.
     #[tokio::test]
     async fn panic_sends_all_notes_off_then_all_sound_off_on_every_channel() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d.dispatch(&[s("midi"), s("panic"), s("minibrute")], &c).await;
@@ -1846,7 +1846,7 @@ mod tests {
     /// player name the offender.
     #[tokio::test]
     async fn panic_with_no_device_fans_out_to_every_live_device() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let presence = d.kernel().midi_presence();
         presence.record(sink_report("minibrute", true, 1)).unwrap();
@@ -1868,7 +1868,7 @@ mod tests {
     /// cheerful no-op that leaves a droning synth droning.
     #[tokio::test]
     async fn panic_with_nothing_live_is_a_loud_error() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         match d.dispatch(&[s("midi"), s("panic")], &c).await {
@@ -1885,7 +1885,7 @@ mod tests {
     /// gates, it only warns (the same rule `send` follows).
     #[tokio::test]
     async fn a_named_panic_works_on_an_unreported_device() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d.dispatch(&[s("midi"), s("panic"), s("timidity")], &c).await;
@@ -1895,7 +1895,7 @@ mod tests {
 
     #[tokio::test]
     async fn panic_on_an_unknown_device_errors_and_publishes_nothing() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         match d.dispatch(&[s("midi"), s("panic"), s("nonesuch")], &c).await {
@@ -1950,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_out_of_range_value_is_refused_before_anything_is_published() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         match d
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_sysex_publishes_the_bytes_verbatim() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let mut sub = cue_sub(&d);
         let result = d
@@ -2025,7 +2025,7 @@ mod tests {
     /// and the whole point of the day-one escape hatch.
     #[tokio::test]
     async fn send_sysex_reads_a_raw_syx_file() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("identity.syx");
@@ -2050,7 +2050,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_sysex_file_is_a_loud_error() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         match d
             .dispatch(
@@ -2122,7 +2122,7 @@ mod tests {
     /// `/run/midi/<device>` as a **pulled** fact.
     #[tokio::test]
     async fn identify_asks_the_sink_that_reported_the_device_and_files_the_answer() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let report = sink_report("keystep-pro", true, 100);
         let connection = report.sink.connection;
@@ -2173,7 +2173,7 @@ mod tests {
     /// (it holds the wire), the kernel only bounds it from outside.
     #[tokio::test]
     async fn identify_passes_the_requested_timeout_to_the_sink() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let report = sink_report("keystep-pro", true, 100);
         let connection = report.sink.connection;
@@ -2195,7 +2195,7 @@ mod tests {
     /// made — the load-bearing distinction of the whole presence store.
     #[tokio::test]
     async fn identify_names_unknown_and_absent_as_different_states() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
 
         match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
@@ -2223,7 +2223,7 @@ mod tests {
     /// unknown device has nothing to resolve anywhere.
     #[tokio::test]
     async fn identify_refuses_a_device_with_no_profile() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         match d.dispatch(&[s("midi"), s("identify"), s("nonesuch")], &c).await {
             KjResult::Err(msg) => assert!(msg.contains("unknown device"), "msg: {msg}"),
@@ -2236,7 +2236,7 @@ mod tests {
     /// and never a pretend-success.
     #[tokio::test]
     async fn identify_refuses_loudly_when_the_reporting_sink_serves_no_exchanges() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.kernel()
             .midi_presence()
@@ -2255,7 +2255,7 @@ mod tests {
     /// player verbatim — it knows why, and we would only blur it.
     #[tokio::test]
     async fn identify_surfaces_the_sinks_refusal_verbatim() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let report = sink_report("keystep-pro", true, 100);
         let connection = report.sink.connection;
@@ -2285,7 +2285,7 @@ mod tests {
     /// an invention.
     #[tokio::test]
     async fn identify_refuses_an_unparseable_reply_and_shows_the_bytes() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let report = sink_report("keystep-pro", true, 100);
         let connection = report.sink.connection;
@@ -2304,7 +2304,7 @@ mod tests {
     /// The human view names the device, what it said, and where it was filed.
     #[tokio::test]
     async fn identify_renders_a_human_line_naming_the_maker_and_the_record() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let report = sink_report("keystep-pro", true, 100);
         let connection = report.sink.connection;

@@ -1,7 +1,7 @@
 //! Canonical path resolution shared by the MCP file engines and the kaish
 //! `MountBackend`.
 //!
-//! Why this exists: `FileDocumentCache` keys every CRDT document by
+//! Why this exists: `FileDocumentCache` keys every kernel document by
 //! `file_context_id(path)` — a UUIDv5 of the path *string* (see `cache.rs`).
 //! If two callers address the same real file with different strings
 //! (`foo.rs`, `./foo.rs`, `/abs/foo.rs`), they get three different CRDT

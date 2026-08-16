@@ -93,7 +93,7 @@ pub struct Kernel {
     timeouts: kaijutsu_types::TimeoutPolicy,
     /// Shared CRDT file-document cache. Both the MCP `builtin.file` tools and
     /// the kaish `MountBackend` resolve through this one instance so a single
-    /// real file maps to a single CRDT document regardless of surface. Set
+    /// real file maps to a single kernel document regardless of surface. Set
     /// explicitly by the server at startup; lazily initialized from a block
     /// store otherwise (tests, embedded callers).
     file_cache: OnceLock<Arc<crate::file_tools::FileDocumentCache>>,
@@ -1149,7 +1149,7 @@ impl Kernel {
     /// `blocks` + the kernel VFS if the server never installed one (tests,
     /// embedded callers). The lazy instance is backed by the same block store
     /// and mount table, so it stays coherent with any other instance over the
-    /// shared CRDT documents.
+    /// shared kernel documents.
     pub fn file_cache(
         &self,
         blocks: &crate::block_store::SharedBlockStore,
@@ -1166,8 +1166,8 @@ impl Kernel {
 
     // ── Editor sessions ───────────────────────────────────────────────────
 
-    /// Open an in-app editor on `path`, binding to the CRDT block that owns its
-    /// text (config/rc → the ConfigCrdtFs block; ordinary file → its file-doc).
+    /// Open an in-app editor on `path`, binding to the kernel block that owns its
+    /// text (config/rc → the ConfigDocFs block; ordinary file → its file-doc).
     /// Returns the session handle + initial state; fails loud if the path names
     /// no editable document.
     pub async fn editor_open(
@@ -1197,7 +1197,7 @@ impl Kernel {
         self.editor_sessions.lock().0.open(path, target, blocks, opener)
     }
 
-    /// Feed keys to an open session, mirroring the edits onto the CRDT block.
+    /// Feed keys to an open session, mirroring the edits onto the kernel block.
     /// Publishes the new state on the editor push channel so every renderer of
     /// this session updates. A `ZZ`/`ZQ` in the batch saves/discards and closes
     /// the session (modalkit disambiguates it from an inserted `ZZ`), publishing
@@ -1391,7 +1391,7 @@ impl Kernel {
     }
 
     /// Invalidate the shared [`FileDocumentCache`] shadow for a **config** path
-    /// after a write that touched the `ConfigCrdtFs` block **directly** (the vi
+    /// after a write that touched the `ConfigDocFs` block **directly** (the vi
     /// editor's block mirror, `kj rc edit/reset/add/rm`, `kj config set/reset`).
     ///
     /// Config paths get a separate `file_context_id` shadow doc that backs the
@@ -1913,26 +1913,26 @@ mod tests {
     async fn editor_session_roundtrip_through_kernel() {
         use crate::block_store::shared_block_store_with_db;
         use crate::kernel_db::KernelDb;
-        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
 
-        // Seed an rc script through its owning ConfigCrdtFs backend.
+        // Seed an rc script through its owning ConfigDocFs backend.
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
-        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
+        ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
         // Mount it so the resolver's mount-table query routes the path to the
         // config backend (same blocks, so it finds the seeded block).
         kernel
-            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
         let path = "/etc/rc/coder/create/S00.kai";
 
@@ -1953,14 +1953,14 @@ mod tests {
     #[tokio::test]
     async fn editor_edit_invalidates_the_file_cache_shadow() {
         // A config path gets a *shadow* copy in the FileDocumentCache (keyed by
-        // file_context_id) separate from the ConfigCrdtFs block the editor writes
+        // file_context_id) separate from the ConfigDocFs block the editor writes
         // (config_context_id). A direct editor block write would leave that shadow
         // stale — so a kaish `cat` after an in-app edit would serve old bytes.
         // Kernel::editor_keys must invalidate the shadow so the next read reloads.
         use crate::block_store::{shared_block_store_with_db, SharedBlockStore};
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
-        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::{BlockId, ContextId, PrincipalId};
         use std::path::Path;
@@ -1984,9 +1984,9 @@ mod tests {
         // Mount the rc backend on the kernel VFS (so the cache reads through it),
         // then seed a config script over the same store.
         kernel
-            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
+        ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
@@ -2028,7 +2028,7 @@ mod tests {
         use crate::block_store::shared_block_store_with_db;
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
-        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::PrincipalId;
         use std::path::Path;
@@ -2040,9 +2040,9 @@ mod tests {
         let blocks = shared_block_store_with_db(db, ws, creator);
 
         kernel
-            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         // The block we'll edit, and a separate file we'll read into it.
         rc.write_all(Path::new("coder/create/S00.kai"), b"AB")
             .await
@@ -2076,7 +2076,7 @@ mod tests {
         use crate::block_store::shared_block_store_with_db;
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
-        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::{ContextId, PrincipalId};
         use std::path::Path;
@@ -2087,9 +2087,9 @@ mod tests {
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
         kernel
-            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
+        ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
@@ -2133,12 +2133,12 @@ mod tests {
         // production shape — `set_self_arc` + `broker().set_kj_dispatcher`) so
         // `fetch_editor_io` can reach it.
         use crate::kj::test_helpers::{
-            install_rc_script_file, register_context, test_dispatcher_crdt_rc,
+            install_rc_script_file, register_context, test_dispatcher_rc,
         };
         use kaijutsu_types::PrincipalId;
         use kaijutsu_types::SessionId;
 
-        let d = Arc::new(test_dispatcher_crdt_rc().await);
+        let d = Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         d.kernel().broker().set_kj_dispatcher(&d).await;
         let kernel = d.kernel();
@@ -2181,7 +2181,7 @@ mod tests {
         use crate::block_store::shared_block_store_with_db;
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
-        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::PrincipalId;
         use std::path::Path;
@@ -2192,9 +2192,9 @@ mod tests {
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
         kernel
-            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
+        ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();
@@ -2227,7 +2227,7 @@ mod tests {
         use crate::block_store::shared_block_store_with_db;
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
-        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::PrincipalId;
         use std::path::Path;
@@ -2238,9 +2238,9 @@ mod tests {
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
         kernel
-            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
+        ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();

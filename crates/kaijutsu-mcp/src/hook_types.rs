@@ -169,7 +169,7 @@ pub struct PingResponse {
 /// Known MCP tool names that the hook listener should skip to avoid double-writes.
 ///
 /// When Claude calls a kaijutsu MCP tool, the MCP server already creates the
-/// appropriate CRDT blocks. If the PostToolUse hook also fires for that same
+/// appropriate kernel blocks. If the PostToolUse hook also fires for that same
 /// tool call, we'd create duplicate blocks. This list filters those out.
 /// Compare against [`normalize_tool_name`]'s output, not the raw hook payload
 /// name — Claude Code delivers MCP tool calls as `mcp__<server>__<tool>`.

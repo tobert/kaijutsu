@@ -62,7 +62,7 @@ impl BlockId {
     /// Convert to a compact string key: `"{context_hex}_{principal_hex}_{seq}"`.
     ///
     /// Uses `_` as delimiter — safe because UUIDs are hex-only, avoids
-    /// collision with `/` used as path separator in CRDT engines, and
+    /// collision with `/` used elsewhere as a path separator, and
     /// satisfies the Anthropic API tool_use_id pattern `^[a-zA-Z0-9_-]+$`.
     pub fn to_key(&self) -> String {
         format!(

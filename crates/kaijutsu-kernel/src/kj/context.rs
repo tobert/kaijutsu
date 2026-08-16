@@ -905,8 +905,8 @@ impl KjDispatcher {
             None => (None, None),
         };
 
-        // base: the CRDT-owned /etc/config/system.md — never a host file
-        // (docs/config-crdt-ownership.md). Fallback mirrors
+        // base: the kernel-owned /etc/config/system.md — never a host file
+        // (docs/config-ownership.md). Fallback mirrors
         // llm_stream.rs's `spawn_llm_for_prompt` exactly: a read/UTF-8
         // failure falls back to the embedded default, loudly logged, never
         // a silent empty prompt.
@@ -4235,13 +4235,13 @@ mod tests {
     /// `assets/defaults/rc/coder/create/S00-stance.kai`, which drops a
     /// `(Role::System, BlockKind::Text)` stance block via `kj block
     /// create`. `kj context prompt` must show that block, the real
-    /// CRDT-owned base (`/etc/config/system.md` — `test_dispatcher_crdt_rc`
+    /// kernel-owned base (`/etc/config/system.md` — `test_dispatcher_rc`
     /// seeds it for real, unlike the plain `test_dispatcher`), and the
     /// `<situation>` addendum, in that order — the order `build_system_prompt`
     /// documents and the turn path relies on.
     #[tokio::test]
     async fn context_prompt_layers_base_rc_and_situation() {
-        let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
@@ -4264,7 +4264,7 @@ mod tests {
         assert!(result.is_ok(), "prompt failed: {}", result.message());
         let msg = result.message();
 
-        // Base: the real CRDT-owned /etc/config/system.md content.
+        // Base: the real kernel-owned /etc/config/system.md content.
         assert!(msg.contains("改善"), "base content missing from prompt: {msg}");
         // rc: S00-stance.kai's real output — both branches (crisp/synth)
         // share this opening line, so this holds regardless of which the

@@ -24,31 +24,31 @@
 //! to reimplement this check by hand (correctly, as it happens); now there is
 //! one implementation, so a future site can't get it wrong.
 
-/// Root of the CRDT-owned rc lifecycle-script tree
-/// (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`). CRDT-owned: no host
-/// file, no write-through — see `docs/config-crdt-ownership.md`.
+/// Root of the kernel-owned rc lifecycle-script tree
+/// (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`). kernel-owned: no host
+/// file, no write-through — see `docs/config-ownership.md`.
 pub const RC_ROOT: &str = "/etc/rc";
 
-/// Root of the CRDT-owned kernel-global config tree. A flat namespace:
+/// Root of the kernel-owned kernel-global config tree. A flat namespace:
 /// `/etc/config/<name>` (e.g. `theme.toml`, `mcp.toml`).
 pub const CONFIG_ROOT: &str = "/etc/config";
 
-/// Root of the CRDT-owned per-client config tree. Hierarchical:
+/// Root of the kernel-owned per-client config tree. Hierarchical:
 /// `/etc/client/<name>` is the shared client default; `/etc/client/<client_id>/<name>`
 /// is one client's override.
 pub const CLIENT_ROOT: &str = "/etc/client";
 
-/// Root of the CRDT-owned MIDI device profile tree
+/// Root of the kernel-owned MIDI device profile tree
 /// (`docs/midi-next.md` "Storage and identity"): kernel sole owner, no host
 /// file, optional embedded seeds for gear we ship knowledge of. Devices live
 /// under `/etc/midi/devices/<name>` — today a single `.md` document per
-/// device, but the tree is directory-capable on the same CRDT-native backend
+/// device, but the tree is directory-capable on the same kernel-owned backend
 /// as `/etc/rc`, so a device can grow into an rc-style bucket of
 /// `SXX-*.{md,kai}` files later without a storage migration.
 pub const MIDI_ROOT: &str = "/etc/midi";
 
 /// Root of the kernel's **ephemeral runtime state** tree. Nothing under `/run`
-/// is CRDT-owned, nothing is a host file, and nothing survives a kernel
+/// is kernel-owned, nothing is a host file, and nothing survives a kernel
 /// restart: each tenant is a read-only view synthesized from in-memory state,
 /// so a kernel that just booted with no sinks connected truthfully knows
 /// nothing. The unix `/run` convention, kept deliberately (it is what

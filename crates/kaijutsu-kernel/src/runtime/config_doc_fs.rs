@@ -1,14 +1,14 @@
-//! `ConfigCrdtFs` — a CRDT-native VFS backend for config/rc content.
+//! `ConfigDocFs` — a kernel-owned VFS backend for config/rc content.
 //!
 //! This is the backend that lets the CRDT be the **sole owner** of the
 //! `/etc/rc` tree (and, later, the config TOMLs): file ops map straight onto
 //! `BlockStore` documents, with **no host-disk backing, no write-through flush,
 //! and no mtime-vs-disk reload**. That deletes — by construction, for this
 //! mount — the dual-ownership silent-fallback cluster documented in
-//! `docs/config-crdt-ownership.md` (stale-bytes serve, append-wipe, mtime no-op,
-//! stale-rc-seed). There is one truth here: the CRDT document.
+//! `docs/config-ownership.md` (stale-bytes serve, append-wipe, mtime no-op,
+//! stale-rc-seed). There is one truth here: the kernel document.
 //!
-//! ## Model (shared with `ConfigCrdtBackend`)
+//! ## Model (shared with `ConfigDocBackend`)
 //!
 //! Each path maps to a single-block [`DocKind::File`] document keyed by
 //! [`config_context_id`]. The `documents` table — which `create_document_with_path`
@@ -43,9 +43,9 @@ use crate::vfs::{DirEntry, FileAttr, FileType, SetAttr, StatFs, VfsError, VfsOps
 /// composition needs only one or two hops, so 8 is generous.
 const MAX_SYMLINK_DEPTH: usize = 8;
 
-/// CRDT-native VFS backend owning a path subtree (e.g. `/etc/rc`).
-pub struct ConfigCrdtFs {
-    /// CRDT document/block storage — the single source of truth.
+/// kernel-owned VFS backend owning a path subtree (e.g. `/etc/rc`).
+pub struct ConfigDocFs {
+    /// kernel document/block storage — the single source of truth.
     blocks: SharedBlockStore,
     /// Canonical mount root (e.g. `/etc/rc`). The MountTable hands us
     /// mount-relative paths; we re-prepend this to key documents by their
@@ -68,7 +68,7 @@ pub struct ConfigCrdtFs {
     created: SystemTime,
 }
 
-impl ConfigCrdtFs {
+impl ConfigDocFs {
     /// Create a backend rooted at canonical path `root` (e.g. `/etc/rc`).
     pub fn new(blocks: SharedBlockStore, root: impl Into<String>) -> Self {
         let mut root = root.into();
@@ -207,11 +207,11 @@ impl ConfigCrdtFs {
     /// at the path.
     fn put_link(&self, canonical: &str, target: &str) -> VfsResult<()> {
         let ctx = config_context_id(canonical);
-        let crdt_err = |e: String| VfsError::other(format!("crdt: {e}"));
+        let doc_err = |e: String| VfsError::other(format!("document store: {e}"));
         self.blocks
             .create_document_with_path(ctx, DocKind::Symlink, None, canonical.to_string())
-            .map_err(|e| crdt_err(e.to_string()))?;
-        self.insert_block(ctx, target).map_err(crdt_err)?;
+            .map_err(|e| doc_err(e.to_string()))?;
+        self.insert_block(ctx, target).map_err(doc_err)?;
         self.bump(canonical);
         Ok(())
     }
@@ -220,17 +220,17 @@ impl ConfigCrdtFs {
     /// Creates the document — carrying its path into the manifest — when absent.
     fn put_content(&self, canonical: &str, text: &str) -> VfsResult<()> {
         let ctx = config_context_id(canonical);
-        let crdt_err = |e: String| VfsError::other(format!("crdt: {e}"));
+        let doc_err = |e: String| VfsError::other(format!("document store: {e}"));
 
         if self.blocks.contains(ctx) {
             if let Some(block_id) = config_doc::first_block_id(&self.blocks, ctx) {
                 let old_len = config_doc::content_char_len(&self.blocks, ctx);
                 self.blocks
                     .edit_text(ctx, &block_id, 0, text, old_len)
-                    .map_err(|e| crdt_err(e.to_string()))?;
+                    .map_err(|e| doc_err(e.to_string()))?;
             } else {
                 // Registered but blockless (halted replay) — seed the block.
-                self.insert_block(ctx, text).map_err(crdt_err)?;
+                self.insert_block(ctx, text).map_err(doc_err)?;
             }
         } else {
             self.blocks
@@ -240,8 +240,8 @@ impl ConfigCrdtFs {
                     None,
                     canonical.to_string(),
                 )
-                .map_err(|e| crdt_err(e.to_string()))?;
-            self.insert_block(ctx, text).map_err(crdt_err)?;
+                .map_err(|e| doc_err(e.to_string()))?;
+            self.insert_block(ctx, text).map_err(doc_err)?;
         }
         self.bump(canonical);
         Ok(())
@@ -431,7 +431,7 @@ pub fn seed_link_target(
 }
 
 #[async_trait]
-impl VfsOps for ConfigCrdtFs {
+impl VfsOps for ConfigDocFs {
     async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
         let canonical = self.canonical(path);
         // lstat-like: report the link itself, not its target (matches
@@ -603,7 +603,7 @@ impl VfsOps for ConfigCrdtFs {
             return Ok(FileAttr::directory(0o755));
         }
         Err(VfsError::other(format!(
-            "mkdir unsupported on this CRDT-backed mount: \"{canonical}\" would be an \
+            "mkdir unsupported on this kernel-owned mount: \"{canonical}\" would be an \
              empty virtual directory, which can't be persisted here — directories are \
              synthesized from file paths, so create a file under this path instead"
         )))
@@ -737,7 +737,7 @@ impl VfsOps for ConfigCrdtFs {
     }
 
     async fn real_path(&self, _path: &Path) -> VfsResult<Option<PathBuf>> {
-        // CRDT-native: no host filesystem backing.
+        // kernel-owned: no host filesystem backing.
         Ok(None)
     }
 }
@@ -755,12 +755,12 @@ mod tests {
     /// manifest — which backs readdir — is actually populated by
     /// `create_document_with_path`. A bare `shared_block_store` has no DB and
     /// would make every readdir empty.
-    fn fs() -> ConfigCrdtFs {
+    fn fs() -> ConfigDocFs {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws_id, creator);
-        ConfigCrdtFs::new(blocks, RC_ROOT)
+        ConfigDocFs::new(blocks, RC_ROOT)
     }
 
     fn p(s: &str) -> &Path {
@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_path_is_none_crdt_native() {
+    async fn real_path_is_none_for_document_backed_paths() {
         let fs = fs();
         assert!(fs.real_path(p("a/create/S00-x.kai")).await.unwrap().is_none());
     }
@@ -1040,7 +1040,7 @@ mod tests {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws_id, creator);
-        let fs = ConfigCrdtFs::new(blocks, CONFIG_ROOT);
+        let fs = ConfigDocFs::new(blocks, CONFIG_ROOT);
 
         assert!(fs.is_empty(), "fresh config mount owns nothing");
         let n = fs.seed_entries(crate::config_seed::config_seed_files()).unwrap();

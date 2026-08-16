@@ -360,8 +360,8 @@ impl KernelBridge {
     /// Returns the block id `submit_input` minted for the prompt.
     pub async fn send_prompt(&self, context_id: ContextId, text: &str) -> Result<BlockId> {
         let state = self.actor.get_input_state(context_id).await?;
-        // Char count, not `.len()`. The input doc is a text CRDT addressed in
-        // characters; a byte length here truncates or over-deletes the moment
+        // Char count, not `.len()`. `edit_input`'s `pos`/`delete` are character
+        // offsets; a byte length here truncates or over-deletes the moment
         // anyone types non-ASCII. (kaijutsu-mcp's `write_input` still uses
         // bytes — logged in docs/issues.md.)
         let existing = state.content.chars().count() as u64;

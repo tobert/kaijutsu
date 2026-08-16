@@ -123,8 +123,8 @@ pub enum ServerEvent {
     ResourceListChanged { server: String },
     /// Server-side context switch (fork, context switch command).
     ContextSwitched { context_id: ContextId },
-    /// An in-app editor session's state changed (keystroke, save, or — later —
-    /// a remote CRDT merge). Carries the full renderer-facing snapshot.
+    /// An in-app editor session's state changed (keystroke or save). Carries
+    /// the full renderer-facing snapshot.
     EditorStateChanged { state: EditorState },
     /// An in-app editor session closed (`ZQ`/quit). Renderers drop it.
     EditorClosed { session_id: u64 },
@@ -138,10 +138,7 @@ pub enum ServerEvent {
     /// This is the *coarse* signal: it marks every cached doc stale so a
     /// non-joined context re-syncs when next viewed. The finer-grained catch-up
     /// for the context the client was actively on rides `subscribe_context`'s
-    /// change feed instead (`FeedEvent::Resubscribed` — docs/change-feed.md):
-    /// the eager CRDT-oplog resync push this doc comment used to describe
-    /// (`ServerEvent::ContextResynced`) was deleted in the 2026-08-15 wire flag
-    /// day, superseded by that feed-native path.
+    /// change feed instead (`FeedEvent::Resubscribed` — docs/change-feed.md).
     Reconnected,
     /// Render a cue (`kj play`, later the track render seam; docs/pcm.md,
     /// docs/midi.md "Render is a wire cue"). A kernel directive, not a

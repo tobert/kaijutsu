@@ -1,7 +1,7 @@
-//! File-level tools for CRDT-backed file editing.
+//! File-level tools for kernel-owned file editing.
 //!
 //! Provides read, edit, write, glob, and grep tools that operate through
-//! the VFS and cache files as CRDT documents. This enables concurrent
+//! the VFS and cache files as kernel documents. This enables concurrent
 //! editing of source files with the same operational semantics as block editing.
 //!
 //! # Architecture
@@ -21,7 +21,7 @@
 //!            ▼                    ▼
 //! ┌──────────────────┐  ┌──────────────────┐
 //! │ FileDocumentCache │  │ VfsWalkerAdapter │
-//! │ (CRDT-backed)     │  │ (kaish-glob)     │
+//! │ (kernel-owned)     │  │ (kaish-glob)     │
 //! └────────┬─────────┘  └────────┬─────────┘
 //!          │                     │
 //!          ▼                     ▼

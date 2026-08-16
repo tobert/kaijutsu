@@ -24,11 +24,11 @@
 //! [`resolve_editor_target`](crate::editor::resolve_editor_target) — the same
 //! function the vi editor binds with, for the same reason. The mount table
 //! answers "what owns this path?": a config-owned path (`/etc/rc/*`,
-//! `/etc/config/*`) binds straight to its `ConfigCrdtFs` block, everything else
+//! `/etc/config/*`) binds straight to its `ConfigDocFs` block, everything else
 //! goes through the file-doc cache. Running a config path through
-//! `FileDocumentCache::get_or_load` would mint a *second* CRDT document
+//! `FileDocumentCache::get_or_load` would mint a *second* kernel document
 //! shadowing the original — the dual-ownership bug class
-//! `docs/config-crdt-ownership.md` deleted by construction. Reusing the
+//! `docs/config-ownership.md` deleted by construction. Reusing the
 //! editor's resolver rather than reimplementing it means the two surfaces
 //! cannot drift on what owns a path.
 //!
@@ -63,7 +63,7 @@ use crate::vfs::VfsOps;
     about = "Unified diff between two kernel-held versions of a file",
     long_about = "Unified diff between two kernel-held versions of a file.\n\
         \n\
-        With one path, diffs the bytes on disk against the CRDT document that \
+        With one path, diffs the bytes on disk against the kernel document that \
         owns that path's text — the recovery view: what have edits changed that \
         the backing store has not seen? With two paths, diffs both documents. \
         With --from, diffs a point in the document's journalled history \
@@ -100,7 +100,7 @@ pub(crate) enum DiffSource {
     /// The bytes on the backing store behind a VFS path — what a cold reader
     /// sees, ignoring any CRDT edits that have not been flushed.
     Disk(String),
-    /// The live CRDT document that owns a path's text (ownership-aware: config
+    /// The live kernel document that owns a path's text (ownership-aware: config
     /// documents answer through the mount table, never the file-doc cache).
     Document(String),
     /// A path's owning document as of oplog sequence `seq`, reconstructed by
@@ -247,7 +247,7 @@ impl KjDispatcher {
         }
     }
 
-    /// The text of the CRDT document that owns `path`.
+    /// The text of the kernel document that owns `path`.
     ///
     /// Ownership-aware by delegation: `resolve_editor_target` asks the mount
     /// table, so a config document answers as itself and never as a shadow copy
@@ -488,7 +488,7 @@ mod tests {
         let (dispatcher, dir) = dispatcher_with_mount().await;
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("write");
 
-        // Load the file into a CRDT document, then edit it there — the state
+        // Load the file into a kernel document, then edit it there — the state
         // `kj diff <path>` exists to reveal: an edit disk has not seen.
         let blocks = dispatcher.block_store();
         let cache = dispatcher.kernel().file_cache(blocks);
@@ -579,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_pre_image_diffs_as_an_addition() {
         let (dispatcher, _dir) = dispatcher_with_mount().await;
-        // Never written to disk; created directly as a CRDT document.
+        // Never written to disk; created directly as a kernel document.
         let blocks = dispatcher.block_store();
         let cache = dispatcher.kernel().file_cache(blocks);
         cache
@@ -603,9 +603,9 @@ mod tests {
     /// that has to fail loudly rather than silently diff against "now".
     #[tokio::test]
     async fn from_a_journalled_seq_diffs_against_that_point_in_history() {
-        use crate::kj::test_helpers::test_dispatcher_crdt_rc;
+        use crate::kj::test_helpers::test_dispatcher_rc;
 
-        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        let dispatcher = Arc::new(test_dispatcher_rc().await);
         dispatcher.set_self_arc();
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(dir.path().join("h.txt"), "first\n").expect("write");
@@ -649,15 +649,15 @@ mod tests {
     }
 
     /// Ownership-awareness, asserted by absence: a config-owned path must
-    /// answer through the mount table's `ConfigCrdtFs` block and must NOT mint
+    /// answer through the mount table's `ConfigDocFs` block and must NOT mint
     /// a `FileDocumentCache` copy shadowing it. That shadow is the exact bug
-    /// class `docs/config-crdt-ownership.md` deleted by construction, and
+    /// class `docs/config-ownership.md` deleted by construction, and
     /// `resolve_editor_target` is what keeps it deleted here.
     #[tokio::test]
     async fn a_config_path_answers_through_its_owner_and_mints_no_shadow_document() {
-        use crate::kj::test_helpers::test_dispatcher_crdt_rc;
+        use crate::kj::test_helpers::test_dispatcher_rc;
 
-        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        let dispatcher = Arc::new(test_dispatcher_rc().await);
         dispatcher.set_self_arc();
         let path = "/etc/rc/coder/create/S00-stance.kai";
 

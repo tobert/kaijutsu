@@ -460,7 +460,7 @@ impl BlockStore {
     }
 
     /// Create a document that carries a filesystem `path` in its `documents`
-    /// row. Used by the CRDT-native config/rc backend (`ConfigCrdtFs`): the
+    /// row. Used by the kernel-owned config/rc backend (`ConfigDocFs`): the
     /// path makes the `documents` table double as the readdir manifest
     /// (`list_documents_under_path`), so the doc and its manifest entry are one
     /// write, not two stores to drift. Otherwise identical to
@@ -504,7 +504,7 @@ impl BlockStore {
     /// List the persisted `documents` rows whose path falls under `dir`
     /// (the readdir manifest for [`create_document_with_path`]). Empty when
     /// there is no DB. Returns `(path, context_id, doc_kind)` for every
-    /// descendant — `doc_kind` lets `ConfigCrdtFs::readdir` emit
+    /// descendant — `doc_kind` lets `ConfigDocFs::readdir` emit
     /// `FileType::Symlink` for link docs without a second lookup per entry.
     pub fn documents_under_path(
         &self,
@@ -595,7 +595,7 @@ impl BlockStore {
     }
 
     /// The [`DocKind`] of a document, or `None` if it does not exist. Used by
-    /// `ConfigCrdtFs` to tell a symlink doc (`DocKind::Symlink`, content = link
+    /// `ConfigDocFs` to tell a symlink doc (`DocKind::Symlink`, content = link
     /// target) apart from a regular file doc whose content happens to look like
     /// a path — the git-style "mode bit" check.
     pub fn document_kind(&self, context_id: ContextId) -> Option<DocKind> {
@@ -1107,7 +1107,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1128,11 +1128,9 @@ impl BlockStore {
             // snapshot — nothing to diff against, since nobody knew about
             // this block a moment ago.
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1141,7 +1139,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -1184,7 +1181,7 @@ impl BlockStore {
         role: Option<Role>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1208,11 +1205,9 @@ impl BlockStore {
             // The journaled payload for a fresh block is just its own
             // snapshot (captured after set_tool_use_id, so it's included).
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1221,7 +1216,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -1270,7 +1264,7 @@ impl BlockStore {
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1299,11 +1293,9 @@ impl BlockStore {
             // The journaled payload for a fresh block is just its own
             // snapshot (captured after set_tool_use_id, so it's included).
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1312,7 +1304,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -1356,7 +1347,7 @@ impl BlockStore {
             }
         }
         let after_id = after.cloned();
-        let (block_id, final_snapshot, ops, ops_bytes, version) = {
+        let (block_id, final_snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1370,11 +1361,9 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = SyncPayload::from_new_block(final_snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, final_snapshot, ops, ops_bytes, version)
+            (block_id, final_snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -1382,7 +1371,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(final_snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -2363,7 +2351,7 @@ impl BlockStore {
             // context version the snapshot was taken AT — the durable half of
             // the version this document resumes from (see `base_version`
             // below).
-            let (mut crdt_store, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
+            let (mut document, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
                 Ok(Some(snap_row)) => {
                     match codec::decode::<StoreSnapshot>(&snap_row.state) {
                         Ok(store_snapshot) => {
@@ -2407,7 +2395,7 @@ impl BlockStore {
             for (seq, payload_bytes) in &oplog_entries {
                 match codec::decode::<SyncPayload>(payload_bytes) {
                     Ok(payload) => {
-                        if let Err(e) = crdt_store.merge_ops(payload) {
+                        if let Err(e) = document.merge_ops(payload) {
                             tracing::error!(
                                 document_id = %context_id.to_hex(),
                                 seq = seq,
@@ -2459,7 +2447,7 @@ impl BlockStore {
             // mutator bumps the version once under the document guard and
             // journals exactly one op, so the version at the snapshot plus the
             // ops replayed since it is the version this document was at when
-            // the kernel stopped. `crdt_store.version()` counts merged
+            // the kernel stopped. `document.version()` counts merged
             // payloads instead, which after a restart is "how many ops
             // survived past the last compaction" — a number that starts near
             // zero on a context that had run for weeks.
@@ -2470,7 +2458,7 @@ impl BlockStore {
             // makes both meaningless.
             let version = base_version + replayed;
             let entry = DocumentEntry {
-                doc: crdt_store,
+                doc: document,
                 kind: doc.doc_kind,
                 language: doc.language.clone(),
                 version: AtomicU64::new(version),
@@ -2520,7 +2508,7 @@ impl BlockStore {
 
         // Load base snapshot if available. `snap_row.version` is the context
         // version it was taken at — see the version note in `load_from_db`.
-        let (mut crdt_store, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
+        let (mut document, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
             Ok(Some(snap_row)) => {
                 match codec::decode::<StoreSnapshot>(&snap_row.state) {
                     Ok(store_snapshot) => {
@@ -2564,7 +2552,7 @@ impl BlockStore {
             total_bytes += payload_bytes.len() as u64;
             match codec::decode::<SyncPayload>(payload_bytes) {
                 Ok(payload) => {
-                    if let Err(e) = crdt_store.merge_ops(payload) {
+                    if let Err(e) = document.merge_ops(payload) {
                         tracing::warn!(
                             document_id = %context_id.to_hex(),
                             seq = seq,
@@ -2600,7 +2588,7 @@ impl BlockStore {
         // entry count is the number of mutations since the snapshot.
         let version = base_version + oplog_entries.len() as u64;
         let entry = DocumentEntry {
-            doc: crdt_store,
+            doc: document,
             kind: doc.doc_kind,
             language: doc.language.clone(),
             version: AtomicU64::new(version),
@@ -2780,7 +2768,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2801,11 +2789,9 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2813,7 +2799,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -2925,7 +2910,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = parent_id.copied();
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2942,11 +2927,9 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -2954,7 +2937,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -2977,7 +2959,7 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = parent_id.copied();
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -2994,11 +2976,9 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -3006,7 +2986,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -3026,7 +3005,7 @@ impl BlockStore {
         summary: impl Into<String>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let (block_id, snapshot, ops, ops_bytes, version) = {
+        let (block_id, snapshot, ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -3043,11 +3022,9 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = SyncPayload::from_new_block(snapshot.clone());
-            let ops_bytes = codec::encode(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, ops_bytes, version)
+            (block_id, snapshot, ops, version)
         };
         self.journal_op(context_id, ops)?;
 
@@ -3055,7 +3032,6 @@ impl BlockStore {
             context_id,
             block: Arc::new(snapshot),
             after_id: Some(*parent_id),
-            ops: Arc::from(ops_bytes),
             version,
             source: OpSource::Local,
         });
@@ -4118,6 +4094,44 @@ mod tests {
         (store, bus)
     }
 
+    /// A store that journals to a real `KernelDb`, plus its FlowBus and the
+    /// `KernelDb` handle. Replay tests need the DB — flow events carry no
+    /// operation bytes, so the durable oplog is the only place a journaled
+    /// `SyncPayload` can be read back.
+    ///
+    /// The returned `TempDir` owns the database file; drop it last.
+    #[allow(clippy::type_complexity)]
+    fn store_with_db_and_flows() -> (
+        BlockStore,
+        SharedBlockFlowBus,
+        Arc<parking_lot::Mutex<KernelDb>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("journal.db");
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::open(&db_path).unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let store = BlockStore::with_db_and_flows(db.clone(), ws_id, creator, bus.clone());
+        (store, bus, db, dir)
+    }
+
+    /// Replay every journaled payload for `ctx` into a fresh document, the
+    /// same primitive `load_from_db` uses. Returns the replayed document.
+    fn replay_journal(db: &Arc<parking_lot::Mutex<KernelDb>>, ctx: ContextId) -> BlockDocument {
+        let mut client = BlockDocument::new(ctx, PrincipalId::new());
+        let oplog = db.lock().load_oplog_since(ctx, 0).unwrap();
+        for (seq, payload_bytes) in &oplog {
+            let payload: SyncPayload =
+                codec::decode(payload_bytes).unwrap_or_else(|e| panic!("decode oplog {seq}: {e}"));
+            client
+                .merge_ops(payload)
+                .unwrap_or_else(|e| panic!("replay oplog {seq}: {e}"));
+        }
+        client
+    }
+
     /// `set_output` must publish a dedicated `OutputChanged` flow event — not
     /// piggyback the output on `StatusChanged`. A subscriber on the bus should
     /// see the structured output ride its own event, which is what the server
@@ -4166,10 +4180,11 @@ mod tests {
         }
     }
 
-    /// Test that insert_block emits SyncPayload that can be merged by a client store.
+    /// `insert_block` journals a `SyncPayload` that replays into a fresh
+    /// document — the restart path, not a client sync path.
     #[tokio::test]
-    async fn test_insert_block_emits_sync_payload() {
-        let (store, bus) = store_with_flows();
+    async fn test_insert_block_journals_replayable_payload() {
+        let (store, bus, db, _dir) = store_with_db_and_flows();
         let mut sub = bus.subscribe("block.>");
         let ctx = ContextId::new();
 
@@ -4177,12 +4192,6 @@ mod tests {
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
 
-        // Client syncs from snapshot
-        let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = BlockDocument::from_snapshot(snapshot, PrincipalId::new()).unwrap();
-        assert_eq!(client.block_count(), 0);
-
-        // Server inserts a block
         let block_id = store
             .insert_block(
                 ctx,
@@ -4196,25 +4205,14 @@ mod tests {
             )
             .unwrap();
 
-        // Get the BlockInserted event with ops
         let msg = sub.try_recv().expect("should receive BlockInserted event");
-        let ops = match msg.payload {
-            BlockFlow::Inserted { ops, .. } => ops,
-            _ => panic!("expected BlockInserted event"),
-        };
+        assert!(matches!(msg.payload, BlockFlow::Inserted { .. }));
 
-        // Deserialize SyncPayload and merge on client
-        let payload: SyncPayload =
-            codec::decode(&ops).expect("should deserialize SyncPayload");
-        client
-            .merge_ops(payload)
-            .expect("client should merge sync payload");
-
-        // Verify client has the block
-        assert_eq!(client.block_count(), 1);
-        let snapshot = client
+        let replayed = replay_journal(&db, ctx);
+        assert_eq!(replayed.block_count(), 1);
+        let snapshot = replayed
             .get_block_snapshot(&block_id)
-            .expect("block should exist on client");
+            .expect("block should exist after replay");
         assert_eq!(snapshot.content, "Hello from server");
     }
 
@@ -4270,19 +4268,16 @@ mod tests {
         assert_eq!(rtexts, turn.to_vec(), "order preserved across reload");
     }
 
-    /// Test that insert_tool_call emits mergeable SyncPayload.
+    /// `insert_tool_call` journals a payload that replays with the tool
+    /// fields intact.
     #[tokio::test]
-    async fn test_insert_tool_call_emits_sync_payload() {
-        let (store, bus) = store_with_flows();
-        let mut sub = bus.subscribe("block.>");
+    async fn test_insert_tool_call_journals_replayable_payload() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
         let ctx = ContextId::new();
 
         store
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
-
-        let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = BlockDocument::from_snapshot(snapshot, PrincipalId::new()).unwrap();
 
         let block_id = store
             .insert_tool_call(
@@ -4295,38 +4290,25 @@ mod tests {
             )
             .unwrap();
 
-        let msg = sub.try_recv().expect("should receive event");
-        let ops = match msg.payload {
-            BlockFlow::Inserted { ops, .. } => ops,
-            _ => panic!("expected BlockInserted"),
-        };
-
-        let payload: SyncPayload = codec::decode(&ops).unwrap();
-        client
-            .merge_ops(payload)
-            .expect("should merge tool_call sync payload");
-
-        let snapshot = client.get_block_snapshot(&block_id).unwrap();
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.kind, BlockKind::ToolCall);
         assert_eq!(snapshot.tool_name.as_deref(), Some("bash"));
     }
 
-    /// Test multiple sequential block inserts all produce mergeable SyncPayloads.
+    /// Five sequential inserts journal five payloads, and replaying them all
+    /// reproduces the store's block order and text.
     #[tokio::test]
-    async fn test_multiple_incremental_syncs() {
-        let (store, bus) = store_with_flows();
-        let mut sub = bus.subscribe("block.>");
+    async fn test_multiple_inserts_replay_in_order() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
         let ctx = ContextId::new();
 
         store
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
 
-        let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = BlockDocument::from_snapshot(snapshot, PrincipalId::new()).unwrap();
-
         for i in 0..5 {
-            let _ = store
+            store
                 .insert_block(
                     ctx,
                     None,
@@ -4338,24 +4320,15 @@ mod tests {
                     ContentType::Plain,
                 )
                 .unwrap();
-
-            let msg = sub.try_recv().expect("should receive event");
-            let ops = match msg.payload {
-                BlockFlow::Inserted { ops, .. } => ops,
-                _ => panic!("expected BlockInserted"),
-            };
-
-            let payload: SyncPayload = codec::decode(&ops).unwrap();
-            client
-                .merge_ops(payload)
-                .unwrap_or_else(|e| panic!("should merge block {i}: {e}"));
         }
 
-        assert_eq!(client.block_count(), 5);
+        let replayed = replay_journal(&db, ctx);
+        assert_eq!(replayed.block_count(), 5);
 
         let server_blocks = store.block_snapshots(ctx).unwrap();
-        let client_blocks = client.blocks_ordered();
-        for (sb, cb) in server_blocks.iter().zip(client_blocks.iter()) {
+        let replayed_blocks = replayed.blocks_ordered();
+        assert_eq!(server_blocks.len(), replayed_blocks.len());
+        for (sb, cb) in server_blocks.iter().zip(replayed_blocks.iter()) {
             assert_eq!(sb.content, cb.content);
         }
     }

@@ -6,7 +6,7 @@
 # prose, so a kaish release reaches every newly-created context without a
 # kaijutsu edit.
 #
-# No static copy lives in the CRDT to rot: this recomposes fresh on every
+# No static copy is stored to rot: this recomposes fresh on every
 # `create` and lands as an ordinary Role::System/BlockKind::Text block (folds
 # into the cached system prompt like S00-stance.kai — see that script's
 # comment for why S25-datetime.kai deliberately does NOT do this).

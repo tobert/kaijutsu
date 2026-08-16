@@ -164,7 +164,7 @@ impl Tool for FgBuiltin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kj::test_helpers::{test_caller, test_dispatcher_crdt_rc};
+    use crate::kj::test_helpers::{test_caller, test_dispatcher_rc};
     use crate::runtime::context_engine::{session_context_map, SessionContextMap};
     use crate::runtime::embedded_kaish::EmbeddedKaish;
     use kaijutsu_types::{ContextId, PrincipalId, SessionId};
@@ -174,7 +174,7 @@ mod tests {
     const P: &str = "/etc/rc/vitest/create/S00-foo.kai";
 
     /// Build an `EmbeddedKaish` wired with the `vi` + `edit` builtins against the
-    /// CRDT-rc dispatcher (so `/etc/rc` is the real ConfigCrdtFs mount).
+    /// CRDT-rc dispatcher (so `/etc/rc` is the real ConfigDocFs mount).
     async fn embedded_with_vi(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
         let blocks = dispatcher.block_store().clone();
         let kernel = dispatcher.kernel().clone();
@@ -216,7 +216,7 @@ mod tests {
     /// This is the front-door equivalent of the `kj editor open` e2e.
     #[tokio::test]
     async fn vi_opens_a_session_on_the_owning_rc_block() {
-        let d = Arc::new(test_dispatcher_crdt_rc().await);
+        let d = Arc::new(test_dispatcher_rc().await);
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -248,7 +248,7 @@ mod tests {
     /// `edit` is the same behaviour under a second name.
     #[tokio::test]
     async fn edit_is_an_alias_for_vi() {
-        let d = Arc::new(test_dispatcher_crdt_rc().await);
+        let d = Arc::new(test_dispatcher_rc().await);
         let c = test_caller();
         let s = |v: &str| v.to_string();
         d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("world")], &c)
@@ -268,7 +268,7 @@ mod tests {
     /// resolver's fail-loud contract surfaced through the front door.
     #[tokio::test]
     async fn vi_on_a_missing_config_path_fails_loud() {
-        let d = Arc::new(test_dispatcher_crdt_rc().await);
+        let d = Arc::new(test_dispatcher_rc().await);
         let kaish = embedded_with_vi(d.clone(), ContextId::new()).await;
         let missing = "/etc/rc/vitest/create/S99-nope.kai";
         let res = kaish

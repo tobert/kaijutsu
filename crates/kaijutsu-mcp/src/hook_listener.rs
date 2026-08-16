@@ -5,7 +5,7 @@
 //! one JSON response, and disconnect.
 //!
 //! On each event the listener:
-//! 1. Creates CRDT blocks in the shared store
+//! 1. Creates kernel blocks in the shared store
 //! 2. Pushes ops to the server (if remote)
 //! 3. Checks for pending drift and injects it into the response
 
@@ -133,7 +133,7 @@ impl Drop for CallReservation {
     }
 }
 
-/// Hook listener — receives events over a Unix socket and writes CRDT blocks.
+/// Hook listener — receives events over a Unix socket and writes kernel blocks.
 pub struct HookListener {
     /// Local-mode block store (in-process). `None` in remote mode, where blocks
     /// are authored by RPC through `RemoteState`'s actor — this process holds

@@ -20,7 +20,7 @@
 //! gone with it; there is nothing left for it to gate.
 //!
 //! **Compose input (Lane C slice 3, retired Lane C slice 4).** The compose
-//! draft used to be a separate `SyncedInput` CRDT document, hydrated via
+//! draft used to be a separate `SyncedInput` kernel document, hydrated via
 //! `getInputState` and kept live by `InputTextOps`/`InputCleared` server
 //! events. It is now an ordinary block (`Role::User`, `Status::Draft`,
 //! `ephemeral`, one per `(context, principal)`) that rides the same change
@@ -75,7 +75,7 @@ impl DocumentEntry {
     /// There is at most one per (context, principal) by construction
     /// (`BlockStore::get_or_create_draft`), so the first match is the only
     /// one. The mirror is version-ordered, so unlike the old (deleted)
-    /// `SyncedInput` CRDT document there is no stale-arrival window to guard
+    /// `SyncedInput` kernel document there is no stale-arrival window to guard
     /// against here.
     pub fn draft_text(&self, principal: PrincipalId) -> Option<&str> {
         self.mirror

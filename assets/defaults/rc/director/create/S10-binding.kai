@@ -14,7 +14,7 @@ kj binding allow "admin"
 kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
 kj binding allow "rc-write"
-# config-write opens `kj config set/reset` over the CRDT-owned /etc/config files
+# config-write opens `kj config set/reset` over the kernel-owned /etc/config files
 # (system.md, theme.toml, mcp.toml) AND the SQL-native model config surfaces
 # (`kj backend`, `kj cast`, `kj alias`) — i.e. which model runs. The config
 # analogue of rc-write: dedicated, not implied by the grants above.

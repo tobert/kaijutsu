@@ -958,7 +958,7 @@ mod tests {
     // ── Cross-client visibility ────────────────────────────────────────
     //
     // Full SSH/two-broker e2e is out of reach for a unit test, but the
-    // thing that actually makes task state "CRDT-native multi-frontend
+    // thing that actually makes task state "kernel-owned multi-frontend
     // sync for free" is that grooming rides the SAME `BlockFlow` bus every
     // other block mutation does — so a second subscriber (an app view, a
     // sibling context) sees a task's creation and status changes exactly

@@ -1,6 +1,6 @@
 //! App-side handle to the client-owned multi-context document store.
 //!
-//! The CRDT document state — and, incrementally, the sync logic that maintains
+//! The kernel document state — and, incrementally, the sync logic that maintains
 //! it — lives in [`kaijutsu_client::DocumentStore`]; the app holds it as a Bevy
 //! `Resource` and reads snapshots to render. [`DocumentCache`] is a thin newtype
 //! so existing call-sites (`doc_cache.active_id()`, `.get_mut()`, …) keep working

@@ -1215,7 +1215,7 @@ impl KernelHandle {
     // In-app editor sessions (the vi/edit builtin; see docs/vi.md)
     // =========================================================================
 
-    /// Open an editor session on `path`, binding to the CRDT block that owns its
+    /// Open an editor session on `path`, binding to the kernel block that owns its
     /// text. Returns the initial state (carrying the new session id).
     #[tracing::instrument(skip(self), name = "rpc_client.editor_open")]
     pub async fn editor_open(&self, path: &str) -> Result<EditorState, RpcError> {
@@ -2021,7 +2021,7 @@ impl KernelHandle {
         })
     }
 
-    /// Read a CRDT-owned config file's content (e.g. `theme.toml`). The kernel
+    /// Read a kernel-owned config file's content (e.g. `theme.toml`). The kernel
     /// is the sole owner; this is how out-of-kernel surfaces (the app) read
     /// config without touching a host file. Returns the content on success or a
     /// `ServerError` carrying the kernel's message.
@@ -2637,7 +2637,7 @@ impl KernelHandle {
     /// Read a whole VFS file over the existing `Vfs` capability — no new wire
     /// method. Chunked at [`VFS_READ_CHUNK`] and stopping on the documented
     /// zero-length-read EOF signal, so it works against every backend
-    /// (`ConfigCrdtFs`, `MemoryBackend`, `MidiPresenceFs`, a share) without
+    /// (`ConfigDocFs`, `MemoryBackend`, `MidiPresenceFs`, a share) without
     /// asking any of them for a size first.
     ///
     /// The app's device-profile fetch rides this: a sink reads

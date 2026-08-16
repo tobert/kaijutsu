@@ -2219,7 +2219,7 @@ impl KernelDb {
 
     /// List documents whose `path` falls strictly *under* `dir` (i.e. matches
     /// `<dir>/...`), ordered by path. This is the prefix-scan that backs
-    /// `readdir` for the CRDT-native config/rc backend: the `documents` table
+    /// `readdir` for the kernel-owned config/rc backend: the `documents` table
     /// *is* the path manifest (every path-carrying doc is one entry). `dir`
     /// must not end in `/`; the exact `dir` row itself is excluded.
     pub fn list_documents_under_path(&self, dir: &str) -> KernelDbResult<Vec<DocumentRow>> {

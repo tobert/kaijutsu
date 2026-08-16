@@ -120,16 +120,16 @@ fn resolve_target_range(
     }
 }
 
-/// Apply a text deletion to the overlay and fire the CRDT sync RPC.
+/// Apply a text deletion to the overlay and send the `editInput` RPC.
 ///
-/// `skip_crdt`: true for shell surface (local-only, no CRDT sync).
+/// `skip_sync`: true for the shell surface — its input never leaves this client.
 fn apply_delete(
     overlay: &mut crate::cell::InputOverlay,
     start: usize,
     end: usize,
     actor: &Option<Res<crate::connection::RpcActor>>,
     doc_cache: &crate::cell::DocumentCache,
-    skip_crdt: bool,
+    skip_sync: bool,
 ) {
     let del_len = end - start;
     if del_len == 0 {
@@ -141,8 +141,8 @@ fn apply_delete(
     overlay.cursor = start.min(overlay.text.len());
     overlay.selection_anchor = None;
 
-    // Fire CRDT sync (chat only)
-    if !skip_crdt
+    // Sync to the kernel (chat only)
+    if !skip_sync
         && let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id())
     {
         let handle = actor.handle.clone();
@@ -158,16 +158,16 @@ fn apply_delete(
     }
 }
 
-/// Apply a text insertion to the overlay and fire the CRDT sync RPC.
+/// Apply a text insertion to the overlay and send the `editInput` RPC.
 ///
-/// `skip_crdt`: true for shell surface (local-only, no CRDT sync).
+/// `skip_sync`: true for the shell surface — its input never leaves this client.
 fn apply_insert(
     overlay: &mut crate::cell::InputOverlay,
     pos: usize,
     text_to_insert: &str,
     actor: &Option<Res<crate::connection::RpcActor>>,
     doc_cache: &crate::cell::DocumentCache,
-    skip_crdt: bool,
+    skip_sync: bool,
 ) {
     if text_to_insert.is_empty() {
         return;
@@ -177,7 +177,7 @@ fn apply_insert(
     overlay.cursor = pos + text_to_insert.len();
     overlay.selection_anchor = None;
 
-    if !skip_crdt
+    if !skip_sync
         && let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id())
     {
         let handle = actor.handle.clone();
@@ -382,7 +382,7 @@ fn translate_action(
     doc_cache: &crate::cell::DocumentCache,
     action_writer: &mut MessageWriter<ActionFired>,
     text_writer: &mut MessageWriter<TextInputReceived>,
-    skip_crdt: bool,
+    skip_sync: bool,
 ) {
     match action {
         // --- Insert mode: character typing ---
@@ -429,7 +429,7 @@ fn translate_action(
                 } else {
                     format!("{}\n", paste_text)
                 };
-                apply_insert(overlay, pos, &text, actor, doc_cache, skip_crdt);
+                apply_insert(overlay, pos, &text, actor, doc_cache, skip_sync);
             } else {
                 // Charwise paste: insert after cursor (p) or at cursor (P)
                 use editor_types::prelude::PasteStyle;
@@ -443,7 +443,7 @@ fn translate_action(
                     }
                     _ => overlay.cursor,
                 };
-                apply_insert(overlay, pos, &paste_text, actor, doc_cache, skip_crdt);
+                apply_insert(overlay, pos, &paste_text, actor, doc_cache, skip_sync);
             }
         }
 
@@ -479,7 +479,7 @@ fn translate_action(
                         // Yank deleted text to unnamed register
                         motion_state.register = overlay.text[start..end].to_string();
                         motion_state.register_linewise = linewise;
-                        apply_delete(overlay, start, end, actor, doc_cache, skip_crdt);
+                        apply_delete(overlay, start, end, actor, doc_cache, skip_sync);
                     }
                 }
 

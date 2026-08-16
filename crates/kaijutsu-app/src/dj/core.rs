@@ -158,7 +158,7 @@ pub struct ClockFallback {
 
 /// Click sound + gate config, resolved from the per-client `metronome.toml`
 /// — a plain, kernel-owned file written through the file tools, not a CRDT
-/// document (`docs/config-crdt-ownership.md` "Per-client config" and its
+/// document (`docs/config-ownership.md` "Per-client config" and its
 /// superseded note) — and applied via
 /// `DjCtl::MetronomeConfig` (`dj::thread::forward_metronome_config_to_dj`).
 /// Was a straight copy of the deleted `metronome.rs::MetronomeConfig` while

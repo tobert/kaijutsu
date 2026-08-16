@@ -375,7 +375,8 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<(), CallError>>,
     },
     /// Author one block over RPC — `authorBlock @106`, the path that lets a
-    /// client write blocks without being a CRDT replica.
+    /// client write blocks without authoring or decoding storage-engine
+    /// operations.
     AuthorBlock {
         req: Box<crate::rpc::AuthorBlock>,
         reply: oneshot::Sender<Result<BlockId, CallError>>,
@@ -421,7 +422,7 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Option<crate::rpc::ContextInfo>, CallError>>,
     },
 
-    // ── CRDT Sync ────────────────────────────────────────────────────────
+    // ── Blocks / Change Feed ─────────────────────────────────────────────
     GetBlocks {
         context_id: ContextId,
         query: BlockQuery,
@@ -1159,7 +1160,7 @@ impl ActorHandle {
         .await
     }
 
-    // ── CRDT Sync ────────────────────────────────────────────────────────
+    // ── Blocks / Change Feed ─────────────────────────────────────────────
 
     #[tracing::instrument(skip(self, query))]
     pub async fn get_blocks_query(
@@ -1661,7 +1662,7 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::GetLlmConfig { reply }).await
     }
 
-    /// Read a CRDT-owned config file's content (e.g. `theme.toml`) over RPC.
+    /// Read a kernel-owned config file's content (e.g. `theme.toml`) over RPC.
     #[tracing::instrument(skip(self))]
     pub async fn get_config(&self, path: String) -> Result<String, CallError> {
         self.send(|reply| RpcCommand::GetConfig { path, reply }).await
@@ -2179,16 +2180,12 @@ impl RpcActor {
         // re-subscribed stream can't backfill. Best-effort: no subscribers
         // (e.g. a headless client) is fine.
         //
-        // The eager CRDT-oplog resync push that used to live here
-        // (`get_context_sync` → `ServerEvent::ContextResynced { sync: SyncState }`)
-        // was deleted in the 2026-08-15 wire flag day (docs/change-feed.md) —
-        // it is superseded, not merely removed. `subscribe_context`'s change
-        // feed already re-subscribes on every new connection and sends
+        // This send carries no state. `subscribe_context`'s change feed
+        // already re-subscribes on every new connection and sends
         // `FeedEvent::Resubscribed` first (see its doc comment), which is the
         // consumer's cue to throw away its stale `ContextMirror` and refetch a
-        // snapshot with `get_blocks_versioned` — the same "converge on what the
-        // stream missed during the outage" job, without decoding a CRDT
-        // oplog. `document_store.rs` already implements that path.
+        // snapshot with `get_blocks_versioned`. `document_store.rs` already
+        // implements that path.
         if is_reconnect {
             let _ = self.event_tx.send(ServerEvent::Reconnected);
         }
@@ -3260,7 +3257,7 @@ async fn dispatch_kernel_command(
             dispatch!(kernel, reply, close_tx, k, k.resolve_context_label(&label));
         }
 
-        // ── CRDT Sync ──
+        // ── Blocks / Change Feed ──
         RpcCommand::GetBlocks {
             context_id,
             query,

@@ -1,4 +1,4 @@
-//! Materialize a committed cell into a CRDT block.
+//! Materialize a committed cell into a kernel block.
 //!
 //! This answers the data-model reconciliation in code (no longer deferred):
 //!

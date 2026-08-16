@@ -7,7 +7,7 @@
 //!   copy (see "Bind to the owner" below).
 //! - [`EditorSessions`] is the registry of open editors. Each session is a pure
 //!   [`EditorCore`](kaijutsu_editor::EditorCore) bound to a target; keystrokes
-//!   mirror onto the CRDT block, and a checkpoint backs `ZQ` rollback. This is
+//!   mirror onto the kernel block, and a checkpoint backs `ZQ` rollback. This is
 //!   the tool-shaped surface the app renders, a model plays, and tests drive —
 //!   all headless. See `docs/vi.md`.
 //!
@@ -17,16 +17,16 @@
 //!
 //! - **config-owned** paths (`/etc/rc/*`, `/etc/config/*`) are sole-owned
 //!   single-block [`DocKind::File`] documents
-//!   ([`ConfigCrdtFs`](crate::runtime::ConfigCrdtFs)). The CRDT *is* the owner —
+//!   ([`ConfigDocFs`](crate::runtime::ConfigDocFs)). The CRDT *is* the owner —
 //!   there is no host file. We resolve straight to that document's block.
 //! - **ordinary files** resolve through
 //!   [`FileDocumentCache::get_or_load`](crate::file_tools::FileDocumentCache),
 //!   which mints/loads a working-copy file-doc.
 //!
 //! Running a config path through `get_or_load` would create a *second* CRDT doc
-//! (a `FileDocumentCache` copy) shadowing the ConfigCrdtFs original —
-//! reintroducing the dual-ownership write-through bug class the CRDT-owned-config
-//! work (`docs/config-crdt-ownership.md`) deleted by construction. So the branch
+//! (a `FileDocumentCache` copy) shadowing the ConfigDocFs original —
+//! reintroducing the dual-ownership write-through bug class the kernel-owned-config
+//! work (`docs/config-ownership.md`) deleted by construction. So the branch
 //! is the whole point. See `docs/vi.md` ("Path resolution").
 
 use kaijutsu_types::{BlockId, ContextId};
@@ -65,10 +65,10 @@ pub fn config_owned(path: &str) -> bool {
     kaijutsu_types::paths::is_rc_path(path) || kaijutsu_types::paths::is_config_path(path)
 }
 
-/// Resolve `path` to the `(context, block)` of the CRDT document that owns its
+/// Resolve `path` to the `(context, block)` of the kernel document that owns its
 /// text. The mount table answers "what owns this path?": a backend that
 /// [`owns_config_docs`](crate::vfs::VfsOps::owns_config_docs) (the rc/config
-/// `ConfigCrdtFs`) binds straight to its block; anything else goes through the
+/// `ConfigDocFs`) binds straight to its block; anything else goes through the
 /// file-doc cache. Fails loud (no silent empty/placeholder) when a config path
 /// names a document that does not exist — an editor must not open on a phantom
 /// block.
@@ -84,15 +84,15 @@ pub async fn resolve_editor_target(
         && fs.owns_config_docs()
     {
         // Follow any rc/config symlink to its terminal document FIRST, exactly
-        // as the read/exec path (`ConfigCrdtFs`) does. Without this the editor
+        // as the read/exec path (`ConfigDocFs`) does. Without this the editor
         // binds the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
         // composition) while reads resolve to the target — so saved edits land
         // on a block nothing else reads (docs/issues.md). Resolving here makes
         // the editor and the executor agree on one block. A fresh
-        // `ConfigCrdtFs` at the mount root does the lexical walk (it is
+        // `ConfigDocFs` at the mount root does the lexical walk (it is
         // stateless — blocks + root); `resolve_canonical` is not on `VfsOps`.
         let root = mount_root.to_string_lossy().into_owned();
-        let config_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), root);
+        let config_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), root);
         let resolved = config_fs
             .resolve_canonical(path)
             .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
@@ -236,7 +236,7 @@ pub struct EditorOpener {
     pub session_id: SessionId,
 }
 
-/// One open editor: a pure [`EditorCore`] bound to the CRDT block that owns the
+/// One open editor: a pure [`EditorCore`] bound to the kernel block that owns the
 /// text, plus the rollback checkpoint.
 struct EditorSession {
     core: EditorCore,
@@ -353,7 +353,7 @@ impl EditorSessions {
             .map(|(id, s)| (*id, s.path.clone()))
     }
 
-    /// Feed keys to a session, mirror the produced edits onto the CRDT block,
+    /// Feed keys to a session, mirror the produced edits onto the kernel block,
     /// and report the outcome. Fails loud if a mirror write fails — the buffer
     /// and the block must never silently diverge.
     ///
@@ -543,7 +543,7 @@ impl EditorSessions {
 
     /// Insert kernel-fetched `text` at `offset` (the cursor captured when the
     /// `:r` was submitted — see [`session_cursor`](Self::session_cursor)), mirror
-    /// the produced ops onto the owning CRDT block, and return the new state.
+    /// the produced ops onto the owning kernel block, and return the new state.
     /// Fails loud if the mirror write fails.
     pub fn insert_text(
         &mut self,
@@ -717,7 +717,7 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store_with_db;
     use crate::kernel_db::KernelDb;
-    use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+    use crate::runtime::config_doc_fs::ConfigDocFs;
     use crate::vfs::VfsOps as _;
     use kaijutsu_types::PrincipalId;
     use std::path::Path;
@@ -725,7 +725,7 @@ mod tests {
 
     /// A block store backed by an in-memory KernelDb, so config docs created via
     /// `create_document_with_path` land in the `documents` manifest (mirrors the
-    /// ConfigCrdtFs test fixture).
+    /// ConfigDocFs test fixture).
     fn blocks_with_db() -> SharedBlockStore {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
@@ -733,11 +733,11 @@ mod tests {
         shared_block_store_with_db(db, ws_id, creator)
     }
 
-    /// A mount table with the rc `ConfigCrdtFs` mounted at `/etc/rc` — the
+    /// A mount table with the rc `ConfigDocFs` mounted at `/etc/rc` — the
     /// production shape the resolver queries to decide config-ownership.
     async fn mounts_with_rc(blocks: &SharedBlockStore) -> Arc<crate::vfs::MountTable> {
         let mt = crate::vfs::MountTable::new();
-        mt.mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+        mt.mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
         Arc::new(mt)
     }
@@ -756,16 +756,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_rc_path_to_its_configcrdtfs_owner_block() {
+    async fn resolves_rc_path_to_its_configdocfs_owner_block() {
         let blocks = blocks_with_db();
         // Seed an rc script through the owning backend, exactly as `kj rc` does.
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(Path::new("coder/create/S00-stance.kai"), b"be kind")
             .await
             .unwrap();
 
         // The mount table owns the answer: it routes the path to the rc
-        // ConfigCrdtFs (config-owned), so the file cache is never consulted.
+        // ConfigDocFs (config-owned), so the file cache is never consulted.
         let mounts = mounts_with_rc(&blocks).await;
         let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
 
@@ -774,7 +774,7 @@ mod tests {
             .await
             .expect("rc path resolves to its owning block");
 
-        // The target is the ConfigCrdtFs-owned document, NOT a file-doc copy.
+        // The target is the ConfigDocFs-owned document, NOT a file-doc copy.
         let expected_ctx = config_context_id(full);
         assert_eq!(
             target.context_id, expected_ctx,
@@ -794,7 +794,7 @@ mod tests {
         // one the executor reads — not the symlink's own block, or saved edits
         // land on a doc nothing else reads (docs/issues.md, fixed here).
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         // The real source lives under lib/.
         rc.write_all(Path::new("lib/create/S10-binding.kai"), b"kj binding allow \"*\"")
             .await
@@ -860,7 +860,7 @@ mod session_tests {
     use super::*;
     use crate::block_store::shared_block_store_with_db;
     use crate::kernel_db::KernelDb;
-    use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+    use crate::runtime::config_doc_fs::ConfigDocFs;
     use crate::vfs::{MountTable, VfsOps as _};
     use kaijutsu_types::PrincipalId;
     use std::path::Path;
@@ -869,19 +869,19 @@ mod session_tests {
     const RC_PATH: &str = "/etc/rc/coder/create/S00.kai";
 
     /// A block store seeded with one rc script (`"hello"`) through its owning
-    /// ConfigCrdtFs backend, plus the resolved editor target for it.
+    /// ConfigDocFs backend, plus the resolved editor target for it.
     async fn seeded(initial: &[u8]) -> (SharedBlockStore, EditorTarget) {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(Path::new("coder/create/S00.kai"), initial)
             .await
             .unwrap();
         let mounts = Arc::new({
             let mt = MountTable::new();
-            mt.mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            mt.mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
                 .await;
             mt
         });
@@ -905,7 +905,7 @@ mod session_tests {
         assert_eq!(outcome.state().text, "Xhello");
         assert!(outcome.state().dirty, "buffer diverged from checkpoint");
 
-        // The invariant that makes this surface trustworthy: the CRDT block now
+        // The invariant that makes this surface trustworthy: the kernel block now
         // equals the editor buffer (edit mirroring is faithful).
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
     }
@@ -1265,7 +1265,7 @@ mod session_tests {
 
     #[tokio::test]
     async fn colon_s_substitutes_onto_the_block() {
-        // `:s` is an edit — it must mirror onto the owning CRDT block like any
+        // `:s` is an edit — it must mirror onto the owning kernel block like any
         // keystroke, so a `cat`/exec of the path sees the substituted text.
         let (blocks, target) = seeded(b"alpha beta alpha").await;
         let mut sessions = EditorSessions::new();

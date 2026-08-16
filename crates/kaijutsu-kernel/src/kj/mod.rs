@@ -966,8 +966,8 @@ pub(crate) mod test_helpers {
         // Mount a host-backed /etc/rc tree (LocalBackend). `kj rc` is now
         // VFS-direct, so it works over either backend; this keeps the broadly-
         // used dispatcher db-less (a DB-backed block store deadlocks unrelated
-        // fork tests — see test_dispatcher_crdt_rc). The CRDT-native backend is
-        // covered by its own unit tests + test_dispatcher_crdt_rc.
+        // fork tests — see test_dispatcher_rc). The document-backed backend is
+        // covered by its own unit tests + test_dispatcher_rc.
         kernel
             .mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_tmp))
             .await;
@@ -975,11 +975,12 @@ pub(crate) mod test_helpers {
     }
 
     /// A dispatcher whose `/etc/rc` (plus `/etc/config`, `/etc/client`, and
-    /// `/etc/midi`) is the **real CRDT-native backend** ([`ConfigCrdtFs`]),
+    /// `/etc/midi`) is the **real document-backed backend** ([`ConfigDocFs`]),
     /// seeded from the embedded defaults — the production wiring. Use this for
     /// `kj rc` / `kj config` / `kj midi` / lifecycle tests that must exercise
-    /// the CRDT path end-to-end (readdir over the `documents` manifest +
-    /// VFS-direct reads/writes), not just the backend-agnostic kj layer.
+    /// the kernel-document path end-to-end (readdir over the `documents`
+    /// manifest + VFS-direct reads/writes), not just the backend-agnostic kj
+    /// layer.
     ///
     /// It uses a **DB-backed block store** (the manifest needs the `documents`
     /// table populated). That is faithful to production but currently deadlocks
@@ -987,8 +988,8 @@ pub(crate) mod test_helpers {
     /// lock-ordering issue tracked separately — so it is deliberately *not* the
     /// global `test_dispatcher`; only rc-scoped tests (which never fork) use it.
     ///
-    /// [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
-    pub async fn test_dispatcher_crdt_rc() -> KjDispatcher {
+    /// [`ConfigDocFs`]: crate::runtime::config_doc_fs::ConfigDocFs
+    pub async fn test_dispatcher_rc() -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
             KernelDb::in_memory().expect("in-memory KernelDb"),
@@ -1008,13 +1009,13 @@ pub(crate) mod test_helpers {
                 .await
                 .with_temp_cleanup(root),
         );
-        let rc_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc_fs.seed_from_embedded().expect("seed rc into CRDT");
         kernel.mount(RC_ROOT, rc_fs).await;
-        // Config files live on the same CRDT-native backend type at /etc/config
+        // Config files live on the same kernel-owned backend type at /etc/config
         // (slice 2) — seed it too so `kj config` tests exercise the real path.
         let config_fs =
-            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), CONFIG_ROOT);
+            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
         config_fs
             .seed_entries(crate::config_seed::config_seed_files())
             .expect("seed config into CRDT");
@@ -1023,7 +1024,7 @@ pub(crate) mod test_helpers {
         // (mirrors production's `create_shared_kernel` mount trio) — seed and
         // mount it too so `kj config list` tests exercise the real path.
         let client_fs =
-            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), CLIENT_ROOT);
+            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CLIENT_ROOT);
         client_fs
             .seed_entries(crate::config_seed::client_seed_files())
             .expect("seed client config into CRDT");
@@ -1032,7 +1033,7 @@ pub(crate) mod test_helpers {
         // (docs/midi-next.md "Storage and identity") — seed and mount it too
         // so `kj midi list/show` tests exercise the real path.
         let midi_fs =
-            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), MIDI_ROOT);
+            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), MIDI_ROOT);
         midi_fs
             .seed_entries(crate::midi_seed::seed_files())
             .expect("seed midi devices into CRDT");
@@ -1056,7 +1057,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Install an rc script in the mounted `/etc/rc` tree, through the same
-    /// VFS-direct path `kj rc` uses (write straight to the CRDT-native backend,
+    /// VFS-direct path `kj rc` uses (write straight to the kernel-owned backend,
     /// no FileDocumentCache mirror).
     pub async fn install_rc_script_file(dispatcher: &KjDispatcher, path: &str, content: &str) {
         use crate::vfs::VfsOps;

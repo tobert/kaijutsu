@@ -1,7 +1,7 @@
 //! `kj config` — read config files, and restore one to its shipped default.
 //!
 //! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at `/etc/config`
-//! (`docs/config-crdt-ownership.md`), with per-client overrides at
+//! (`docs/config-ownership.md`), with per-client overrides at
 //! `/etc/client`.
 //!
 //! **There is no write verb here, deliberately.** Config is a file: write it
@@ -147,7 +147,7 @@ impl KjDispatcher {
         // identical result with `builtin.file:write`. `rc-write` still guards
         // `/etc/rc`, which is executable rather than data.
         //
-        // A `reset` touches the ConfigCrdtFs block, not the FileDocumentCache
+        // A `reset` touches the ConfigDocFs block, not the FileDocumentCache
         // shadow that backs kaish `cat`/file tools — capture the canonical path
         // so we can drop the stale shadow after a success.
         let write_path = match &parsed.command {
@@ -187,7 +187,7 @@ impl KjDispatcher {
             .map_err(|e| format!("not valid UTF-8: {e}"))
     }
 
-    /// Write `content` straight through the VFS to the CRDT-native config
+    /// Write `content` straight through the VFS to the kernel-owned config
     /// backend. There is no host file and no FileDocumentCache mirror.
     async fn write_config_content(&self, canonical: &str, content: &str) -> Result<(), String> {
         use crate::vfs::VfsOps;
@@ -372,7 +372,7 @@ mod tests {
     /// `kj config show theme.toml` round-trips the seeded default.
     #[tokio::test]
     async fn show_round_trips_seeded_theme() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("config"), s("show"), s("theme.toml")], &c)
@@ -393,7 +393,7 @@ mod tests {
     /// `kj config list` emits the seeded file names as a JSON array.
     #[tokio::test]
     async fn list_emits_seeded_names() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d.dispatch(&[s("config"), s("list")], &c).await;
         match result {
@@ -417,7 +417,7 @@ mod tests {
     /// per-client override written under a client id — not just `/etc/config`.
     #[tokio::test]
     async fn list_also_surfaces_client_namespace() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         // A per-client override, written the way anything writes config now.
         d.write_config_content("/etc/client/abc-123/metronome.toml", "enabled = false")
@@ -453,7 +453,7 @@ mod tests {
     /// A write then `show` reflects the new content via the live backend.
     #[tokio::test]
     async fn a_write_then_show_reflects_new_content() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.write_config_content("/etc/config/theme.toml", "bg = \"#000000\"")
             .await
@@ -475,7 +475,7 @@ mod tests {
     /// back through a write instead of storing the decoration.
     #[tokio::test]
     async fn show_raw_round_trips_byte_identical() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let body = "bg = \"#123456\"\nfg = \"#abcdef\"\n";
         d.write_config_content("/etc/config/theme.toml", body)
@@ -510,7 +510,7 @@ mod tests {
     /// `kj config reset` restores a file to its embedded default after an edit.
     #[tokio::test]
     async fn reset_restores_embedded_default() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         d.write_config_content("/etc/config/theme.toml", "# clobbered")
             .await
@@ -553,7 +553,7 @@ mod tests {
     /// `kj config reset` on an unknown file errors instead of silently no-oping.
     #[tokio::test]
     async fn reset_unknown_file_errors() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("config"), s("reset"), s("nonesuch.toml")], &c)
@@ -573,7 +573,7 @@ mod tests {
     /// the door is now the same one every other file uses.
     #[tokio::test]
     async fn a_file_tool_write_reaches_config_and_show_sees_it() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let body = "bg = \"#0d0d0d\"\n";
 

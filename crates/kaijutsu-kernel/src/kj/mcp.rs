@@ -69,7 +69,7 @@ impl KjDispatcher {
             }
         };
 
-        // `reload` re-reads the CRDT-owned mcp.toml and materializes it as
+        // `reload` re-reads the kernel-owned mcp.toml and materializes it as
         // running processes — the same authority tier as being able to edit
         // that file (`kj config set/reset mcp.toml`), so it's gated on the
         // same capability rather than a bespoke one. `list` is a read.
@@ -296,14 +296,14 @@ mod tests {
     use crate::vfs::VfsOps;
     use kaijutsu_types::paths;
 
-    /// A dispatcher whose `/etc/config` is the real CRDT-native backend
-    /// (`test_dispatcher_crdt_rc` seeds every config file including
+    /// A dispatcher whose `/etc/config` is the real kernel-owned backend
+    /// (`test_dispatcher_rc` seeds every config file including
     /// mcp.toml), with mcp.toml then overwritten to the given body — enough
     /// to exercise `kj mcp list`/`reload` through the real VFS path without
     /// standing up a full `create_shared_kernel` (which also boots
     /// LLM/semantic-index/etc.).
     async fn test_dispatcher(mcp_toml: &str) -> KjDispatcher {
-        let d = test_helpers::test_dispatcher_crdt_rc().await;
+        let d = test_helpers::test_dispatcher_rc().await;
         d.kernel()
             .vfs()
             .write_all(

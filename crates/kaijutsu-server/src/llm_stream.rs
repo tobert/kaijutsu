@@ -1,7 +1,7 @@
 //! LLM streaming + agentic tool-call loop.
 //!
 //! This module owns the background task that talks to a `Provider`, parses
-//! `StreamEvent`s into CRDT blocks, dispatches tool calls, and re-prompts until
+//! `StreamEvent`s into kernel blocks, dispatches tool calls, and re-prompts until
 //! the model stops. Extracted from `rpc.rs` so the stream semantics sit in one
 //! file rather than interleaved with the RPC dispatch surface.
 //!
@@ -294,7 +294,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     let (interrupt, interrupt_generation) = kernel.create_interrupt(context_id).await;
     let context_interrupts = kernel.context_interrupts.clone();
 
-    // Load system prompt from the CRDT-owned config (sole owner; seeded from the
+    // Load system prompt from the kernel-owned config (sole owner; seeded from the
     // embedded default on a fresh kernel). A read/UTF-8 failure falls back to the
     // embedded default — loudly, never a silent empty prompt.
     let system_prompt = {
@@ -1424,7 +1424,7 @@ async fn process_llm_stream(
 
         // Start streaming with exponential backoff retry for transient failures.
         // Retries cover network blips and rate limits before any content is emitted;
-        // mid-stream errors are not retried to avoid duplicate CRDT blocks.
+        // mid-stream errors are not retried to avoid duplicate kernel blocks.
         let mut stream = {
             let mut attempt = 0u32;
             loop {
@@ -1614,7 +1614,7 @@ async fn process_llm_stream(
 
                 StreamEvent::ThinkingDelta(text) => {
                     // In-call thinking continuity (A3): accumulate alongside
-                    // the CRDT block so the next agentic-loop iteration can
+                    // the kernel block so the next agentic-loop iteration can
                     // include reasoning in the assistant message. Append to the
                     // current block's entry (defensive: open one if a delta
                     // arrives before ThinkingStart).
@@ -3299,7 +3299,7 @@ mod usage_tests {
         // FK-references `documents.document_id` — both rows must exist
         // before a usage write will stick. Production always creates them
         // at `kj context create`/fork time, well before any LLM call; this
-        // test harness talks to `documents` (the CRDT block store) directly
+        // test harness talks to `documents` (the kernel block store) directly
         // and never goes through that path, so it must seed the same two
         // rows by hand.
         {

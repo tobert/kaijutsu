@@ -1,7 +1,7 @@
 //! `kj editor` — drive the kernel-owned editor sessions over the kj surface.
 //!
 //! The programmatic face of the in-app editor (`docs/vi.md`): `open` resolves a
-//! path to its owning CRDT block and starts a session; `keys` feeds vim input
+//! path to its owning kernel block and starts a session; `keys` feeds vim input
 //! and mirrors the edits onto the block; `state` reads the buffer; `save`/`quit`
 //! are `ZZ`/`ZQ`. The Bevy app renders these same kernel sessions, and a model
 //! drives them through here — one surface, many hands.
@@ -25,7 +25,7 @@ pub(crate) struct EditorArgs {
 
 #[derive(Subcommand, Debug)]
 enum EditorCommand {
-    /// Open an editor on a path, binding to the CRDT block that owns it.
+    /// Open an editor on a path, binding to the kernel block that owns it.
     Open {
         /// File or rc/config path to edit (e.g. /etc/rc/coder/create/S00.kai).
         path: String,
@@ -234,10 +234,10 @@ mod tests {
 
     /// The headline e2e for the kj surface: `open` → `keys` mutates the *actual*
     /// rc document (read back through the VFS, proving editor → block →
-    /// ConfigCrdtFs), and `quit` rolls it back to the opened content.
+    /// ConfigDocFs), and `quit` rolls it back to the opened content.
     #[tokio::test]
     async fn kj_editor_edits_the_rc_doc_and_quit_rolls_back() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -282,7 +282,7 @@ mod tests {
     /// opened, must show up with its session id and path.
     #[tokio::test]
     async fn kj_editor_list_reports_the_open_session() {
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 

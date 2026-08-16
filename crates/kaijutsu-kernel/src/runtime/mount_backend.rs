@@ -2,7 +2,7 @@
 //!
 //! Delegates filesystem operations to the kaijutsu kernel's `MountTable`
 //! (which routes to `LocalBackend` for real files) and tool dispatch to
-//! the CRDT backends.
+//! the document backends.
 //!
 //! # Architecture
 //!
@@ -35,7 +35,7 @@ use super::kaish_backend::KaijutsuBackend;
 /// kaijutsu's `MountTable`.
 ///
 /// This is what makes kaish "shell scripting on the same CRDT substrate":
-/// a `cat`/`read`/`write`/`edit` from the shell hits the same CRDT document
+/// a `cat`/`read`/`write`/`edit` from the shell hits the same kernel document
 /// the MCP `builtin.file` tools use, keyed by the canonical absolute path.
 /// Binary files (not representable as CRDT text) fall through to the raw
 /// `MountTable`; that fallthrough is a deliberate type distinction, not a
@@ -47,12 +47,12 @@ pub struct MountBackend {
     /// Shared CRDT file-document cache — the source of truth for text file
     /// content across both the kaish and MCP surfaces.
     file_cache: Arc<FileDocumentCache>,
-    /// CRDT backend for document tool dispatch.
+    /// document backend for document tool dispatch.
     docs_tools: Arc<KaijutsuBackend>,
     /// When true, every mutating op is refused structurally with
     /// `PermissionDenied` *before* it can reach the shared mount table or CRDT
     /// cache — the read-only invariant for the toolie's `read_only_shell`.
-    /// Reads (real files and CRDT documents) still pass through. This gates the
+    /// Reads (real files and kernel documents) still pass through. This gates the
     /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` and
     /// `/v/input` mounts are gated separately by wrapping them in
     /// [`super::read_only_fs::ReadOnlyFs`] (they don't route through here).
@@ -106,7 +106,7 @@ impl MountBackend {
     }
 
     /// Canonicalize an (already absolute) backend path into the cache key form,
-    /// so the kaish surface and the MCP surface address one CRDT document per
+    /// so the kaish surface and the MCP surface address one kernel document per
     /// real file. Rejects `..`-escapes above root (untrusted input → refuse,
     /// never silently clamp).
     fn cache_key(&self, path: &Path) -> BackendResult<String> {
@@ -115,7 +115,7 @@ impl MountBackend {
     }
 
     /// Write straight to the VFS, honoring `WriteMode`, without touching the
-    /// CRDT cache. Used for read-only/OS mounts (so the VFS rejects cleanly)
+    /// document cache. Used for read-only/OS mounts (so the VFS rejects cleanly)
     /// and for binary content on writable mounts.
     async fn raw_write(&self, path: &Path, content: &[u8], mode: WriteMode) -> BackendResult<()> {
         match mode {
@@ -263,7 +263,7 @@ impl KernelBackend for MountBackend {
 
     async fn read(&self, path: &Path, range: Option<ReadRange>) -> BackendResult<Vec<u8>> {
         // CRDT-back only writable mounts. Reading a read-only/OS path shouldn't
-        // mint a CRDT document — pass it straight through the VFS.
+        // mint a kernel document — pass it straight through the VFS.
         if self.mount_table.is_writable(path).await {
             let key = self.cache_key(path)?;
             match self.file_cache.try_read_content(&key).await {
@@ -391,7 +391,7 @@ impl KernelBackend for MountBackend {
 
     async fn patch(&self, path: &Path, ops: &[PatchOp]) -> BackendResult<()> {
         self.deny_if_read_only("patch", path)?;
-        // Writable mounts apply through the CRDT cache (source of truth);
+        // Writable mounts apply through the document cache (source of truth);
         // read-only/OS paths read+write straight through the VFS (which rejects
         // the write cleanly).
         let writable = self.mount_table.is_writable(path).await;
@@ -873,7 +873,7 @@ mod tests {
     }
 
     /// The reason this whole change exists: a write from the kaish surface and
-    /// a read from the MCP surface address one CRDT document. We exercise both
+    /// a read from the MCP surface address one kernel document. We exercise both
     /// directions over a single shared `FileDocumentCache`.
     #[tokio::test]
     async fn kaish_and_mcp_share_one_crdt_document() {
@@ -982,7 +982,7 @@ mod tests {
 
     /// `new_read_only` is the structural read-only *mode* (for the toolie's
     /// `read_only_shell`): it refuses every mutation regardless of whether the
-    /// underlying mount is writable, while reads — including CRDT-backed text —
+    /// underlying mount is writable, while reads — including kernel-owned text —
     /// still pass through. This is the gate that lets the toolie inspect a
     /// live, *writable* project tree without a write path. Distinct from
     /// `readonly_mount_passes_through_and_does_not_poison`, which exercises a
@@ -1019,7 +1019,7 @@ mod tests {
         let ro = MountBackend::new_read_only(mount_table, docs, file_cache);
         assert!(ro.read_only(), "read_only() must report the mode");
 
-        // Reads pass through (CRDT-backed text included).
+        // Reads pass through (kernel-owned text included).
         assert_eq!(ro.read(Path::new("/tmp/seed.txt"), None).await.unwrap(), b"seeded");
         assert!(ro.list(Path::new("/tmp")).await.is_ok(), "listing is a read");
 
@@ -1101,7 +1101,7 @@ mod tests {
             b"keep me"
         );
 
-        // Destroy the CRDT document from the block store to simulate a Backend
+        // Destroy the kernel document from the block store to simulate a Backend
         // error on the next read — the in-memory cache entry still points to
         // the now-gone context_id.
         let ctx_id = {
@@ -1166,13 +1166,13 @@ mod tests {
         ));
         let backend = MountBackend::new(mount_table.clone(), docs, file_cache.clone());
 
-        // Write the file through the backend so it's in the CRDT cache AND on disk.
+        // Write the file through the backend so it's in the document cache AND on disk.
         backend
             .write(Path::new("/tmp/stale.txt"), b"crdt-content", WriteMode::Overwrite)
             .await
             .unwrap();
 
-        // Destroy the CRDT document to force a Backend error on next read.
+        // Destroy the kernel document to force a Backend error on next read.
         let ctx_id = {
             use uuid::Uuid;
             use kaijutsu_types::ContextId;

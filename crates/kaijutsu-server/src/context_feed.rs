@@ -4,12 +4,13 @@
 //!
 //! # What makes it different from the `BlockEvents` bridge
 //!
-//! The old bridge forwards thirteen separate methods, two of which carry
-//! **serialized diamond-types operations**. A client therefore has to link the
-//! text engine to learn what happened, which is the dependency the CRDT melt
-//! exists to end. This feed carries decisions instead of encodings: the kernel
-//! classified an append or a replace while it held the mutation lock, and this
-//! module forwards that classification without ever looking at operation bytes.
+//! `BlockEvents` forwards thirteen separate methods. It used to carry
+//! **serialized text-engine operations** on `onBlockTextOpsBatch`, which meant
+//! a client had to link a text engine to learn what happened; that method was
+//! deleted in the 2026-08-15 wire flag day. This feed carries decisions
+//! instead of encodings: the kernel classified an append or a replace while
+//! it held the mutation lock, and this module forwards that classification
+//! without ever looking at operation bytes.
 //!
 //! Three properties follow, and each is load-bearing:
 //!

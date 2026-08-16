@@ -1,4 +1,4 @@
-//! Filesystem adapter for CRDT blocks.
+//! Filesystem adapter for kernel blocks.
 //!
 //! Wraps `KaijutsuBackend` as a kaish `Filesystem`, enabling it to be mounted
 //! in the kaish VFS router at `/v/docs`.
@@ -16,7 +16,7 @@ use super::kaish_backend::KaijutsuBackend;
 
 /// Adapts `KaijutsuBackend` to the kaish `Filesystem` trait.
 ///
-/// This allows CRDT block operations to be mounted as `/v/docs` in kaish's
+/// This allows kernel block operations to be mounted as `/v/docs` in kaish's
 /// VFS router, so agents can access blocks via standard file paths.
 pub struct KaijutsuFilesystem {
     backend: Arc<KaijutsuBackend>,
@@ -128,7 +128,7 @@ impl Filesystem for KaijutsuFilesystem {
     }
 
     fn real_path(&self, _path: &Path) -> Option<PathBuf> {
-        None // CRDT blocks have no real filesystem path
+        None // kernel blocks have no real filesystem path
     }
 }
 

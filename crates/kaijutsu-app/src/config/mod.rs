@@ -3,7 +3,7 @@
 //! Loads **bindings** from the host `bindings.toml` (app-only config). The
 //! **theme** is no longer a host file: it lives in the kernel-owned
 //! `/etc/config` (a plain file written through the file tools, see
-//! `docs/config-crdt-ownership.md`'s superseded note) and is fetched over RPC
+//! `docs/config-ownership.md`'s superseded note) and is fetched over RPC
 //! on connect (`apply_theme_from_rpc`), so the app starts on
 //! `Theme::default()` and the real theme arrives once connected. Bindings
 //! stay host-side because they are purely client-local and the kernel has no
@@ -42,7 +42,7 @@ pub struct AppConfig {
 ///
 /// Reads `bindings.toml` from `~/.config/kaijutsu/` (merged over the
 /// built-in defaults). The theme never touches host disk: it starts on
-/// `Theme::default()` and the CRDT-owned `theme.toml` arrives over RPC on
+/// `Theme::default()` and the kernel-owned `theme.toml` arrives over RPC on
 /// connect. File-level and per-entry errors are accumulated in
 /// `AppConfig::errors`; good values still load and the app continues to boot.
 pub fn load_app_config() -> AppConfig {
@@ -56,7 +56,7 @@ pub fn load_app_config() -> AppConfig {
     };
 
     let mut errors = Vec::new();
-    // Theme is CRDT-owned and fetched over RPC on connect; start on the default.
+    // Theme is kernel-owned and fetched over RPC on connect; start on the default.
     let theme = Theme::default();
     let bindings = load_bindings_toml(&config_dir, &mut errors);
 
@@ -102,7 +102,7 @@ fn load_bindings_toml(config_dir: &Path, errors: &mut Vec<String>) -> Vec<Bindin
 }
 
 /// Write default app-only config files to the user config dir if they don't
-/// exist. Only `bindings.toml` lives on host disk now — the theme is CRDT-owned
+/// exist. Only `bindings.toml` lives on host disk now — the theme is kernel-owned
 /// by the kernel (slice 2) and seeded there, so the app no longer writes a host
 /// `theme.toml`.
 pub fn write_default_configs_if_missing() {

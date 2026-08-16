@@ -325,7 +325,7 @@ impl KjDispatcher {
         let mut scripts = Vec::with_capacity(names.len());
         for name in names {
             let path = paths::rc_script_path(context_type, verb, &name);
-            // Read straight from the CRDT-native rc backend (no FileDocumentCache
+            // Read straight from the kernel-owned rc backend (no FileDocumentCache
             // mirror). Any read failure on a file we just enumerated is
             // corruption — boot WITHOUT the stance is worse than failing loud
             // (stance = the model's ethical posture), so this stays fatal.
@@ -798,10 +798,10 @@ mod tests {
     #[tokio::test]
     async fn rc_create_follows_symlinked_md() {
         use crate::vfs::VfsOps;
-        // The CRDT-native /etc/rc mount (production backend) — symlink targets
+        // The kernel-owned /etc/rc mount (production backend) — symlink targets
         // are VFS-absolute paths it resolves within the mount, unlike the
         // host-backed LocalBackend the plain test_dispatcher uses.
-        let d = test_dispatcher_crdt_rc().await;
+        let d = test_dispatcher_rc().await;
         // The shared, canonical stance lives once under a `lib` type.
         install_rc_script_file(
             &d,
@@ -2201,13 +2201,13 @@ esac
     // synthetic install_script fixtures, because the mechanism under test is
     // the per-type `SXX-datetime.kai` seed *and* its init.d-style symlink
     // composition (`coder/create/S25-datetime.kai` → `lib/create/S25-
-    // datetime.kai`). That composition only resolves over the CRDT-native
-    // `/etc/rc` backend (`ConfigCrdtFs::seed_from_embedded` reconstructs a
+    // datetime.kai`). That composition only resolves over the kernel-owned
+    // `/etc/rc` backend (`ConfigDocFs::seed_from_embedded` reconstructs a
     // real symlink from a seed body that's just a path); the plain
     // `test_dispatcher()`'s host-disk seeding writes the path string
     // verbatim and does not follow it (see `rc_create_follows_symlinked_md`
     // for the same distinction). So all tests below use
-    // `test_dispatcher_crdt_rc()`.
+    // `test_dispatcher_rc()`.
 
     /// The marker every rc-seeded datetime notification's content starts
     /// with — kept in one place so a wording tweak in the seed scripts
@@ -2271,7 +2271,7 @@ esac
         // `kj` is only registered inside rc `.kai` scripts once the
         // dispatcher's self-Arc is wired (see `rc_kai_can_call_kj` above) —
         // and the coder stance/binding/datetime scripts all call `kj`.
-        let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let caller = unjoined_caller();
         let r = d
@@ -2338,7 +2338,7 @@ esac
     #[tokio::test]
     async fn create_seeds_datetime_notification_for_time_aware_types() {
         for context_type in ["coder", "director", "mcp", "default"] {
-            let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = unjoined_caller();
             let label = format!("c-{context_type}");
@@ -2367,7 +2367,7 @@ esac
     #[tokio::test]
     async fn create_seeds_no_datetime_notification_for_clockless_types() {
         for context_type in ["musician", "toolie"] {
-            let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = unjoined_caller();
             let label = format!("c-{context_type}");
@@ -2394,7 +2394,7 @@ esac
     /// exactly one, not to exactly one).
     #[tokio::test]
     async fn coder_fork_reseeds_datetime_notification() {
-        let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let caller = unjoined_caller();
         let r = d

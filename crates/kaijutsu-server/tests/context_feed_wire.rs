@@ -4,7 +4,7 @@
 //! This is the test that says the migration works. Everything else in the lane
 //! is a means to one end: a client can follow a context **without linking the
 //! text engine**. So the assertions here are made through `ContextMirror`,
-//! which decodes no operations and holds no CRDT — if its text matches the
+//! which decodes no operations — if its text matches the
 //! kernel's, the wire carried enough.
 //!
 //! Mutations are driven through `kj` because that is what a client can
@@ -122,7 +122,7 @@ async fn kernel_version(kernel: &KernelHandle, context_id: ContextId) -> u64 {
 }
 
 /// Streamed appends reassemble byte-for-byte through the feed, and a
-/// non-append edit arrives as a whole-text replace. No CRDT on the client side.
+/// non-append edit arrives as a whole-text replace. No merge on the client side.
 #[test]
 fn appends_and_an_edit_reproduce_the_kernel_text() {
     run_local(async {

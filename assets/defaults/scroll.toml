@@ -1,5 +1,5 @@
 # Mouse-wheel scroll sensitivity — the app's scroll feel.
-# (docs/config-crdt-ownership.md "Per-client config".)
+# (docs/config-ownership.md "Per-client config".)
 #
 # This is the shared client default (/etc/client/scroll.toml). A specific
 # client overrides it at /etc/client/<client-id>/scroll.toml; the app reads

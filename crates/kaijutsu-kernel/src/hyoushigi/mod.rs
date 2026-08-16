@@ -5,7 +5,7 @@
 //! speculate→commit-or-squash→fallback loop, the internal-beat `pump`). This
 //! module is where the kernel *owns* those timelines, registers real
 //! [`Resolver`](kaijutsu_hyoushigi::Resolver)s onto them, and bridges committed
-//! cells into the CRDT block log + CAS. The wall-clock timer that drives the
+//! cells into the kernel block log + CAS. The wall-clock timer that drives the
 //! beat lives one layer out, in `kaijutsu-server` (see its `beat` module), so
 //! this crate stays free of any interval-timer runtime.
 
@@ -791,7 +791,7 @@ pub struct MaterializeCursor {
     pub source_block_id: Option<BlockId>,
 }
 
-/// Bridge a timeline's newly-committed cells into the context's CRDT block log —
+/// Bridge a timeline's newly-committed cells into the context's kernel block log —
 /// the write-barrier crossing (§5).
 ///
 /// Notation-first: the committed body is the *source* (ABC text). For each

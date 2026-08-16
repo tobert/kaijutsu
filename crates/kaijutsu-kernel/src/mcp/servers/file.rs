@@ -477,12 +477,12 @@ impl FileToolsServer {
     async fn write_file(&self, path: String, content: String) -> ExecResult {
         let vfs_path = std::path::Path::new(&path);
 
-        // Read-only / OS mounts never touch the CRDT cache: let the VFS
+        // Read-only / OS mounts never touch the document cache: let the VFS
         // reject the write cleanly instead of poisoning the cache with an
         // un-flushable edit. Mirrors the gate `MountBackend::raw_write`
         // already applies on the kaish surface (`runtime/mount_backend.rs`).
         // Without it, `create_or_replace` below lands the new content in the
-        // CRDT block store *before* the flush is even attempted, and a
+        // kernel block store *before* the flush is even attempted, and a
         // failed flush is never undone: the cache entry's `dirty` flag has
         // no path back to `false` on failure, and staleness detection keys
         // off the VFS file's `generation` — which a failed write never
@@ -565,7 +565,7 @@ impl FileToolsServer {
         }
 
         // Same gate as `write_file`: a read-only/OS mount must refuse before
-        // anything touches the CRDT cache, not after a flush fails. `edit`
+        // anything touches the document cache, not after a flush fails. `edit`
         // has no raw-VFS fallback (it needs the current content to compute a
         // diff against, and a read-only target can never accept the result
         // anyway) — refuse outright.
@@ -1689,12 +1689,12 @@ mod tests {
     }
 
     /// Regression: `write` to a read-only mount must fail cleanly AND must
-    /// NOT leave the CRDT cache holding the rejected content — a later
+    /// NOT leave the document cache holding the rejected content — a later
     /// `read` on the same path must still see the real (untouched) file, not
     /// a phantom edit that never reached disk.
     ///
     /// Before the `is_writable` gate in `write_file`, `create_or_replace`
-    /// landed the new content in the CRDT block store unconditionally, and a
+    /// landed the new content in the kernel block store unconditionally, and a
     /// failed `flush_one` never rolled it back: `dirty` had no path back to
     /// `false` on failure, and staleness detection is keyed on the VFS
     /// file's `generation`, which a failed write never advances. Live
@@ -1750,7 +1750,7 @@ mod tests {
     }
 
     /// `edit` on a read-only mount must refuse up front, before it ever
-    /// touches the CRDT cache — there is no raw-VFS fallback for edit (it
+    /// touches the document cache — there is no raw-VFS fallback for edit (it
     /// needs the current content to diff against, and the result could never
     /// be written anyway). A subsequent `read` must see the untouched file.
     #[tokio::test]

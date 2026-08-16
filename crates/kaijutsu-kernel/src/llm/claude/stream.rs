@@ -1,6 +1,6 @@
 //! Anthropic SSE → kaijutsu [`StreamEvent`] state machine.
 //!
-//! The CRDT block writer in `kaijutsu-server` needs bracketed
+//! The kernel block writer in `kaijutsu-server` needs bracketed
 //! `*Start` / `*Delta` / `*End` events for each text/thinking block,
 //! atomic `ToolUse { id, name, input }` events for tool calls (input
 //! assembled across `input_json_delta` partials), and a terminal
@@ -249,7 +249,7 @@ impl StateMachine {
 
 // ============================================================================
 // Tests — drive fixtures through SSE parser + state machine and assert
-// the StreamEvent sequence the CRDT block writer will see.
+// the StreamEvent sequence the kernel block writer will see.
 // ============================================================================
 
 #[cfg(test)]

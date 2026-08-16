@@ -1075,7 +1075,7 @@ fn config_canonical(path: &str) -> String {
     let trimmed = path.trim();
     // Already an absolute config-namespace path — the flat kernel-global
     // `/etc/config`, or the per-client `/etc/client` (hierarchical:
-    // `<root>/<client-id>/<file>`, docs/config-crdt-ownership.md). Pass it
+    // `<root>/<client-id>/<file>`, docs/config-ownership.md). Pass it
     // through so per-client config is reachable through the same config RPCs.
     // The boundary check (component-correct, not a bare prefix match) comes
     // from the shared `kaijutsu_types::paths` predicates.
@@ -1674,9 +1674,9 @@ pub async fn create_shared_kernel(
     // or narrow it, update that test's fixture alongside.
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
-    // The rc tree at /etc/rc is CRDT-owned (docs/config-crdt-ownership.md): no
+    // The rc tree at /etc/rc is kernel-owned (docs/config-ownership.md): no
     // host mount, no host-disk seeding. It is mounted below, once the block
-    // store exists (the CRDT-native backend maps onto it) — and the mount table
+    // store exists (the kernel-owned backend maps onto it) — and the mount table
     // is frozen there, after every mount is in place.
 
     // Wrap KernelDb in Arc<Mutex> and create auto-workspaces
@@ -1712,7 +1712,7 @@ pub async fn create_shared_kernel(
     )
     .map_err(capnp::Error::failed)?;
 
-    // Mount the CRDT-native rc backend at /etc/rc (longest-prefix wins over the
+    // Mount the kernel-owned rc backend at /etc/rc (longest-prefix wins over the
     // read-only `/`; the host's real /etc is never touched). The block store's
     // load_from_db has already replayed any persisted rc Config docs; seed from
     // the embedded defaults only when the rc namespace is still empty (a
@@ -1720,7 +1720,7 @@ pub async fn create_shared_kernel(
     // you `rm`'d stays gone, a repo-dropped seed does not resurrect. Per-file
     // recovery is `kj rc reset <path>`. Seeding failure is fatal — a kernel
     // without its stance scripts must not come up pretending all is well.
-    let rc_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+    let rc_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
         paths::RC_ROOT,
     );
@@ -1733,12 +1733,12 @@ pub async fn create_shared_kernel(
     kernel.mount(paths::RC_ROOT, rc_fs).await;
 
     // Config files (theme/models/mcp.toml + system.md) at /etc/config are
-    // CRDT-owned too (slice 2, docs/config-crdt-ownership.md): the SAME backend
+    // kernel-owned too (slice 2, docs/config-ownership.md): the SAME backend
     // type as rc, one rule, no host file. Seed the embedded defaults only when
     // the config namespace is still empty (a genuinely fresh kernel); after that
     // the CRDT owns the content. Per-file recovery is `kj config reset`. Seeding
     // failure is fatal — a kernel without a system prompt is useless.
-    let config_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+    let config_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
         paths::CONFIG_ROOT,
     );
@@ -1765,14 +1765,14 @@ pub async fn create_shared_kernel(
     }
     kernel.mount(paths::CONFIG_ROOT, config_fs).await;
 
-    // Per-client config at /etc/client (docs/config-crdt-ownership.md
-    // "Per-client config"): the SAME CRDT-native backend, one more mount. Seeded
+    // Per-client config at /etc/client (docs/config-ownership.md
+    // "Per-client config"): the SAME kernel-owned backend, one more mount. Seeded
     // with the shared *client* defaults (the metronome click today) at the mount
     // root; per-client overrides at /etc/client/<client-id>/… are written lazily
     // and never seeded (there is no client id at build time). Seed only on a
     // fresh (empty) namespace — new even on an already-seeded kernel, so a
     // restart brings the shared defaults up once, then the CRDT owns them.
-    let client_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+    let client_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
         paths::CLIENT_ROOT,
     );
@@ -1788,13 +1788,13 @@ pub async fn create_shared_kernel(
     }
     kernel.mount(paths::CLIENT_ROOT, client_fs).await;
 
-    // MIDI device profiles at /etc/midi/devices/<name> are CRDT-owned too
+    // MIDI device profiles at /etc/midi/devices/<name> are kernel-owned too
     // (docs/midi-next.md "Storage and identity"): the SAME backend type as
     // rc/config/client, one more mount. Seeded from the embedded profiles
     // (`assets/defaults/midi/devices/*.md`, `kaijutsu_kernel::midi_seed`) only
     // when the namespace is still empty (a genuinely fresh kernel); after that
     // the CRDT owns the content. `kj midi list`/`show` read it.
-    let midi_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+    let midi_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
         paths::MIDI_ROOT,
     );
@@ -1811,7 +1811,7 @@ pub async fn create_shared_kernel(
     // by construction over the kernel's in-memory presence store — the ONLY
     // writer is a `reportMidiPresence` call from a sink, so nothing that
     // reaches the VFS can invent a presence fact. Deliberately NOT seeded and
-    // deliberately not CRDT-owned: a restarted kernel with no sinks connected
+    // deliberately not kernel-owned: a restarted kernel with no sinks connected
     // knows nothing, and saying so is the honest answer.
     let presence_fs =
         kaijutsu_kernel::midi_presence::MidiPresenceFs::new(kernel.midi_presence().clone());
@@ -1902,7 +1902,7 @@ pub async fn create_shared_kernel(
         kernel_arc.vfs().clone(),
     ));
     // Share this exact instance with the kaish MountBackend so both surfaces
-    // map a real file to the same CRDT document.
+    // map a real file to the same kernel document.
     kernel_arc.set_file_cache(file_cache_for_broker.clone());
 
     if let Err(e) = kernel_arc
@@ -3166,7 +3166,7 @@ impl kernel::Server for KernelImpl {
 
     // ── In-app editor sessions (the vi/edit builtin; see docs/vi.md) ────────
     // Thin wire wrappers over the kernel's `editor_*` primitives. Session ids
-    // are global; the path resolves the owning CRDT block. Edits mirror onto
+    // are global; the path resolves the owning kernel block. Edits mirror onto
     // that block — rc/config permission errors surface here loudly.
 
     fn editor_open(
@@ -9419,7 +9419,6 @@ async fn send_block_event(
             context_id,
             block,
             after_id,
-            ops,
             ..
         } => {
             let mut req = callback.on_block_inserted_request();
@@ -9430,7 +9429,11 @@ async fn send_block_event(
                 if let Some(after) = after_id {
                     set_block_id_builder(&mut params.reborrow().init_after_id(), after);
                 }
-                params.set_ops(ops);
+                // `ops` is always empty: clients never decode storage-engine
+                // operations, and no in-tree client ever read this field. The
+                // field stays on the wire until a later commit removes it from
+                // the schema.
+                params.set_ops(&[]);
                 params.set_sub_seq(sub_seq);
                 let mut block_state = params.init_block();
                 set_block_snapshot(&mut block_state, block);

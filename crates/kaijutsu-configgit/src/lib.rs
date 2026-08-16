@@ -1,5 +1,5 @@
 //! Git write seam for Lane B of the CRDT melt — rc/config documents becoming
-//! plain files in a kernel-owned git worktree (`docs/config-crdt-ownership.md`,
+//! plain files in a kernel-owned git worktree (`docs/config-ownership.md`,
 //! "Lane B — the git-worktree seam, shipped and deliberately unwired").
 //!
 //! This crate is **not wired into the kernel**. It is the write half of the
@@ -29,11 +29,11 @@
 //!
 //! ## What this crate does not do
 //!
-//! No CRDT types, no kernel `ContextId`/`BlockStore`, no `ConfigCrdtFs`
+//! No CRDT types, no kernel `ContextId`/`BlockStore`, no `ConfigDocFs`
 //! wiring, no migration of existing documents. It does not stage changes
 //! through an on-disk git index — `commit_all` rewalks the live worktree
 //! directory on every call and always commits its full current state, which
-//! is what "auto-commit per accepted mutation" (`docs/config-crdt-ownership.md`,
+//! is what "auto-commit per accepted mutation" (`docs/config-ownership.md`,
 //! "Rulings (Amy, 2026-08-15)", ruling 2) actually needs: the kernel's VFS is
 //! the index, not git's.
 //!
@@ -68,7 +68,7 @@ use gix_ref::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 /// footer convention on every message.
 const OPERATION_ID_HEADER: &str = "kaijutsu-operation-id";
 
-/// Ruling 5 (`docs/config-crdt-ownership.md`, "Rulings (Amy, 2026-08-15)"):
+/// Ruling 5 (`docs/config-ownership.md`, "Rulings (Amy, 2026-08-15)"):
 /// commits are service-authored for now, and principal plumbing does not
 /// gate this work. This name is the placeholder until that retrofit lands —
 /// tracked as its own holistic sweep in `docs/issues.md` ("Principal
@@ -157,7 +157,7 @@ impl std::fmt::Display for CommitId {
 /// Carries only paths and gitoxide's own low-level store handles — no
 /// kaijutsu kernel type appears in this struct or in any method signature on
 /// it. That's what makes this "liftable into `kaish-tools-git` as a write
-/// profile later without a rewrite" (`docs/config-crdt-ownership.md`, "Lane B
+/// profile later without a rewrite" (`docs/config-ownership.md`, "Lane B
 /// — the git-worktree seam, shipped and deliberately unwired"): the
 /// kernel-wiring slice adapts kernel calls to this API, not the other way
 /// around.
@@ -178,7 +178,7 @@ pub struct Repo {
 /// the same path is the same as calling it once.
 ///
 /// "Open" is deliberately narrow — it checks for `.git/HEAD` and nothing
-/// more. Lane B's ruling (`docs/config-crdt-ownership.md`, "Rulings (Amy,
+/// more. Lane B's ruling (`docs/config-ownership.md`, "Rulings (Amy,
 /// 2026-08-15)", ruling 3) is "no watcher, no implicit import; detect
 /// unexpected dirtiness and fail loud", and an existing directory that lacks
 /// `.git/HEAD` is exactly that: something this seam did not create and
@@ -210,7 +210,7 @@ pub fn init_or_open(worktree_dir: impl AsRef<Path>) -> Result<Repo, Error> {
             // Force a reflog on every ref update rather than git's normal
             // rules (which only start logging once `logs/HEAD` already
             // exists). This worktree is an operator-visible recovery
-            // surface (`docs/config-crdt-ownership.md`, "Rulings (Amy,
+            // surface (`docs/config-ownership.md`, "Rulings (Amy,
             // 2026-08-15)", ruling 2); `git reflog` is exactly the kind of
             // thing an operator reaches for, and there is never a reason for
             // it to be empty here.
@@ -497,7 +497,7 @@ impl Repo {
     /// documents, but nothing about the format lets a parent tree reference
     /// an empty child by name and have `git ls-tree` show a directory there —
     /// real git worktrees can't preserve empty directories either). This
-    /// mirrors `docs/config-crdt-ownership.md`'s already-accepted limitation
+    /// mirrors `docs/config-ownership.md`'s already-accepted limitation
     /// ("Rulings (Amy, 2026-08-15)", ruling 6: empty directories … git
     /// cannot track them either), not a new gap this crate introduces.
     fn collect_tree_entries(&self, dir: &Path) -> Result<Vec<TreeEntry>, Error> {

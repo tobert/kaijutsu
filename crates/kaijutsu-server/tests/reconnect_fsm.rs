@@ -711,7 +711,7 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // Land a baseline block (`kj block create` writes a real CRDT block to
+        // Land a baseline block (`kj block create` writes a real kernel block to
         // the current context — shell stdout does not) and let it settle.
         let pre = block_count(&writer, ctx).await;
         writer
@@ -789,7 +789,7 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         // ...and the reconnected actor can immediately PULL the joined
         // context's current state via `get_blocks_versioned`
         // (docs/change-feed.md rules 21-26) — the flag-day replacement for the
-        // eager CRDT-oplog `ContextResynced` push this test used to assert
+        // eager `ContextResynced` push this test used to assert
         // here. `subscribe_context`'s change feed (`FeedEvent::Resubscribed`)
         // is the consumer's cue to make exactly this call and hydrate a fresh
         // `ContextMirror`; this asserts what it recovers reflects the whole

@@ -1,4 +1,4 @@
-//! `kj doc` — manage CRDT documents directly.
+//! `kj doc` — manage kernel documents directly.
 //!
 //! A document is the storage primitive; a context layers conversation
 //! metadata (model binding, system prompt, fork lineage) on top of a
@@ -16,7 +16,7 @@
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
-use kaijutsu_types::{BlockId, BlockKind as CrdtBlockKind, ConversationDAG};
+use kaijutsu_types::{BlockId, BlockKind as BlockKind, ConversationDAG};
 use kaijutsu_types::{ContentType, ContextId, DocKind};
 use serde::Serialize;
 
@@ -25,7 +25,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "doc",
-    about = "Manage CRDT documents (storage layer)",
+    about = "Manage kernel documents (storage layer)",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -508,11 +508,11 @@ fn format_dag_node(
 
     let children = dag.get_children(block_id);
     let can_collapse = !expand_tools
-        && block.kind == CrdtBlockKind::ToolCall
+        && block.kind == BlockKind::ToolCall
         && children.len() == 1
         && dag
             .get(&children[0])
-            .is_some_and(|c| c.kind == CrdtBlockKind::ToolResult);
+            .is_some_and(|c| c.kind == BlockKind::ToolResult);
 
     if can_collapse {
         let result_block = dag.get(&children[0]).unwrap();

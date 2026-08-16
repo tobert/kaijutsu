@@ -2,7 +2,7 @@
 # shared memory surfaces (docs/memory.md, "Slice 1 — the recall block").
 # Both trees are already reachable read-only through the kernel's catch-all
 # "/" mount (LocalBackend::read_only, kaijutsu-server/src/rpc.rs:1649) with
-# no CRDT staleness window (mount_backend.rs:264-267) — straight off disk
+# no document-cache staleness window (mount_backend.rs:264-267) — straight off disk
 # at read time, same guarantee docs/memory.md relies on.
 #
 # Hard constraints this script exists to satisfy (docs/memory.md "Mechanics

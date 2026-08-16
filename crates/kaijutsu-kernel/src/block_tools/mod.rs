@@ -1,4 +1,4 @@
-//! Block tools for CRDT-native editing.
+//! Block tools for kernel-owned editing.
 //!
 //! This module provides the tool interface for blocks, bridging the
 //! model-friendly line-based editing with the CRDT's character-based operations.

@@ -1,8 +1,8 @@
-//! Embedded default MIDI device profile seeds, seeded onto the CRDT-owned
+//! Embedded default MIDI device profile seeds, seeded onto the kernel-owned
 //! `/etc/midi/devices/<name>` tree (`docs/midi-next.md` "Storage and
 //! identity", slice 1 step 2).
 //!
-//! Same ownership contract as rc/config (`docs/config-crdt-ownership.md`):
+//! Same ownership contract as rc/config (`docs/config-ownership.md`):
 //! the kernel is the **sole owner** of `/etc/midi` — no host file, no
 //! write-through. The bodies live as real files under
 //! `assets/defaults/midi/devices/` and are embedded here via [`include_dir!`],
@@ -17,7 +17,7 @@
 //! Each embedded `<name>.md` seeds one canonical path:
 //! `/etc/midi/devices/<name>` — the `.md` extension is dropped. Today that's
 //! a single prose+JSON document per device; the mount is the same
-//! directory-capable `ConfigCrdtFs` backend `/etc/rc` uses, so a device can
+//! directory-capable `ConfigDocFs` backend `/etc/rc` uses, so a device can
 //! grow into an rc-style bucket of `SXX-*.{md,kai}` files later
 //! (`docs/midi-next.md` "The core split") without a storage migration — only
 //! this collector (and `kj midi list/show`'s traversal) would need to widen
@@ -26,7 +26,7 @@
 //! ## Seed contract — bootstrap-once, not a floor
 //!
 //! Identical to rc/config: [`seed_files`] feeds
-//! [`crate::runtime::config_crdt_fs::ConfigCrdtFs::seed_entries`], which
+//! [`crate::runtime::config_doc_fs::ConfigDocFs::seed_entries`], which
 //! writes only paths absent from the CRDT (a live edit or a deleted profile
 //! is never resurrected by a later boot). There is no bulk reseed for a
 //! single device yet (nothing needs `kj midi reset` today — profiles are

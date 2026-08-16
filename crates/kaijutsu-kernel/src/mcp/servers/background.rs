@@ -870,7 +870,7 @@ mod tests {
     }
 
     /// CHARACTERIZATION: the whole point of `background: true` is that
-    /// output is observable in the CRDT block WHILE the process is still
+    /// output is observable in the kernel block WHILE the process is still
     /// running — not only after it exits. A test that only checked the final
     /// block content would pass even under a regression that buffered
     /// everything and only wrote to the block at process exit; this is the

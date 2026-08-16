@@ -1,7 +1,7 @@
 //! Block → ACP `session/update` translation.
 //!
 //! This is the mapping layer proper, and it is deliberately **pure**: it takes
-//! `BlockSnapshot`s (whatever the CRDT currently says a block is) and returns
+//! `BlockSnapshot`s (whatever the kernel currently says a block is) and returns
 //! the `SessionUpdate`s the ACP client has not been told about yet. No RPC, no
 //! I/O, no clock — so it is unit-testable without a kernel, which is where the
 //! tests for this crate live.
@@ -11,7 +11,7 @@
 //! The pump keeps a `kaijutsu_client::ContextMirror` (docs/change-feed.md): it
 //! applies each delivery's already-classified `ContextChange`s —
 //! `textAppended` carries a suffix, `textReplaced` carries the full content,
-//! never opaque CRDT ops — and maintains document order for free. This type
+//! never an opaque storage-engine op — and maintains document order for free. This type
 //! does not react to those changes directly, though; the pump hands it the
 //! block's CURRENT snapshot after a delivery lands, and this type diffs that
 //! against a per-block high-water mark of what it already emitted. That keeps

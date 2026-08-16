@@ -4,7 +4,7 @@
 //! is synchronous-only — a model can't start `cargo build`/a test suite/a dev
 //! server and get control back. This module is the kernel-owned substrate that
 //! closes the gap: a durable registry of spawned host processes, keyed by an
-//! opaque [`BackgroundId`], with their output streaming into a CRDT block as
+//! opaque [`BackgroundId`], with their output streaming into a kernel block as
 //! it arrives.
 //!
 //! # Why not kaish's own `&`/`JobManager`?
@@ -106,7 +106,7 @@
 //! `read()`-starved) so a `yes`-style runaway process can't block on a full
 //! pipe buffer and hang. This is deliberately smaller than kaish's own 10MB
 //! `BoundedStream` ring: that ring is ephemeral, in-process-only memory
-//! discarded when the shell materialization drops; a CRDT block is
+//! discarded when the shell materialization drops; a kernel block is
 //! persistent and replicated to every connected viewer, so unbounded growth
 //! there is a much sharper cost.
 
@@ -521,7 +521,7 @@ impl Default for BackgroundRegistry {
 }
 
 /// Everything needed to start a background process and stream its output
-/// into a pre-created CRDT block.
+/// into a pre-created kernel block.
 pub struct SpawnBackgroundParams {
     pub command: String,
     pub cwd: PathBuf,
@@ -1497,7 +1497,7 @@ mod tests {
     // (docs/issues.md, "Functional gate exists (2026-08-09)") — that
     // suite is the actual pin for this behavior.
 
-    /// Preserve-across-the-swap item: output must land in the CRDT block
+    /// Preserve-across-the-swap item: output must land in the kernel block
     /// WHILE the process is still running, not buffered until it exits.
     /// This is exactly the defect the module docs call out in kaish 0.13's
     /// own `execute_background` ("Why not kaish's own `&`/`JobManager`?",

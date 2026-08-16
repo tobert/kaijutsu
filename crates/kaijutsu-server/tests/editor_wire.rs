@@ -17,7 +17,7 @@ use tokio::sync::broadcast::Receiver;
 use common::{connect_client, run_local, start_server};
 use kaijutsu_client::{EditorState, PeerConfig, ServerEvent, editor_events_channel};
 
-/// A script the server seeds into the rc CRDT on a fresh kernel — guaranteed to
+/// A script the server seeds into rc on a fresh kernel — guaranteed to
 /// exist, so `editorOpen` binds to a real config-owned block.
 const RC_PATH: &str = "/etc/rc/coder/create/S00-stance.kai";
 
@@ -73,7 +73,7 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
         kernel.subscribe_editor(callback).await.unwrap();
 
         // Open a kernel-seeded rc script over the wire. A freshly opened block
-        // is clean and binds to its config-owned CRDT block.
+        // is clean and binds to its config-owned kernel block.
         let opened = kernel.editor_open(RC_PATH).await.unwrap();
         assert!(!opened.dirty, "a freshly opened block must be clean");
         let session = opened.session;
@@ -106,7 +106,7 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
         assert_eq!(recv_closed(&mut rx).await, session, "quit pushes Closed");
 
         // Re-open to prove the rollback restored the original text faithfully
-        // (mirror onto / off the CRDT block is lossless over the wire).
+        // (mirror onto / off the kernel block is lossless over the wire).
         let reopened = kernel.editor_open(RC_PATH).await.unwrap();
         assert_eq!(
             reopened.text, original,
@@ -170,7 +170,7 @@ fn a_peer_edit_reconciles_and_pushes_merged_state_to_a_sibling_session() {
         assert!(!b.dirty, "B opens clean");
 
         // Session A inserts 'Z' at the start; the edit mirrors onto the shared
-        // CRDT block and emits a block.text_ops the reconciler observes.
+        // kernel block and emits a block.text_ops the reconciler observes.
         let a_after = kernel.editor_keys(a.session, "iZ<Esc>").await.unwrap();
         assert_eq!(a_after.text, format!("Z{original}"));
 
@@ -237,7 +237,7 @@ fn colon_commands_save_and_close_over_the_wire() {
 #[test]
 fn colon_substitute_edits_the_block_over_the_wire() {
     // Slice 3 step 2: `:s` is an edit that rides the existing `editorKeys` wire
-    // (keystrokes → EditOps → CRDT). Open a clean block, prepend a known marker
+    // (keystrokes → EditOps → kernel block). Open a clean block, prepend a known marker
     // so we have something deterministic to substitute, run `:s`, and read the
     // result back over the wire.
     run_local(async {

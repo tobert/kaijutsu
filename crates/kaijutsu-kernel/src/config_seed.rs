@@ -1,16 +1,16 @@
 //! Embedded default config-file bodies + the config seed manifest.
 //!
 //! The config TOMLs (`theme.toml`, `mcp.toml`) and the system prompt
-//! (`system.md`) are **CRDT-owned**, exactly like `/etc/rc`: a fresh
-//! kernel seeds them from these compiled-in defaults into a [`ConfigCrdtFs`]
+//! (`system.md`) are **kernel-owned**, exactly like `/etc/rc`: a fresh
+//! kernel seeds them from these compiled-in defaults into a [`ConfigDocFs`]
 //! mounted at [`CONFIG_VFS_ROOT`], and the CRDT is the sole owner thereafter
-//! (no host file, no write-through). See `docs/config-crdt-ownership.md`.
+//! (no host file, no write-through). See `docs/config-ownership.md`.
 //!
-//! These consts used to live on `ConfigCrdtBackend`; that disk-coupled backend
+//! These consts used to live on `ConfigDocBackend`; that disk-coupled backend
 //! was deleted in slice 2. The bodies moved here so the embedded defaults — the
 //! one thing still needed — survive independently of any backend.
 //!
-//! [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
+//! [`ConfigDocFs`]: crate::runtime::config_doc_fs::ConfigDocFs
 
 /// Embedded default theme content (TOML).
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.toml");
@@ -29,12 +29,12 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/system.md");
 
 /// Embedded default metronome click config (TOML). The shared *client* default;
-/// see [`CLIENT_VFS_ROOT`] and `docs/config-crdt-ownership.md` "Per-client config".
+/// see [`CLIENT_VFS_ROOT`] and `docs/config-ownership.md` "Per-client config".
 pub const DEFAULT_METRONOME: &str = include_str!("../../../assets/defaults/metronome.toml");
 
 /// Embedded default mouse-wheel scroll-gain config (TOML). The shared
 /// *client* default; see [`CLIENT_VFS_ROOT`] and
-/// `docs/config-crdt-ownership.md` "Per-client config".
+/// `docs/config-ownership.md` "Per-client config".
 pub const DEFAULT_SCROLL: &str = include_str!("../../../assets/defaults/scroll.toml");
 
 /// The VFS mount root the kernel-wide config singletons live under. Parallel to
@@ -42,7 +42,7 @@ pub const DEFAULT_SCROLL: &str = include_str!("../../../assets/defaults/scroll.t
 /// [`kaijutsu_types::paths::CONFIG_ROOT`] — the single source of truth.
 pub use kaijutsu_types::paths::CONFIG_ROOT as CONFIG_VFS_ROOT;
 
-/// The VFS mount root for **per-client** config (`docs/config-crdt-ownership.md`
+/// The VFS mount root for **per-client** config (`docs/config-ownership.md`
 /// "Per-client config"). Client-facing config that is machine-local — the
 /// metronome click, mouse-wheel scroll gains, later the patch bay — lives here, cascading
 /// `/etc/client/<client-id>/<file>` → `/etc/client/<file>` → embedded. The
@@ -55,7 +55,7 @@ pub use kaijutsu_types::paths::CLIENT_ROOT as CLIENT_VFS_ROOT;
 /// The embedded config seed manifest: `(canonical /etc/config path, body)`.
 ///
 /// Mirrors [`crate::seed_scripts::seed_files`] for the config namespace, so the
-/// same `ConfigCrdtFs::seed_entries` absent-only, fail-loud seeding serves both.
+/// same `ConfigDocFs::seed_entries` absent-only, fail-loud seeding serves both.
 /// Unlike rc (a directory tree), config is a fixed, flat set, so the manifest is
 /// hand-listed here rather than walked from an embedded directory.
 pub fn config_seed_files() -> Vec<(String, &'static str)> {

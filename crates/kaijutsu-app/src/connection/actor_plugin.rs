@@ -296,7 +296,7 @@ pub enum RpcResultMessage {
     /// so it travels the same join path as any switch. Closes the reattach bug
     /// (tech_debt_peer_reattach_on_reconnect).
     RestoreContext(ContextId),
-    /// CRDT-owned `theme.toml` content, fetched over RPC on connect (the app no
+    /// kernel-owned `theme.toml` content, fetched over RPC on connect (the app no
     /// longer reads a host theme file — slice 2). Parsed and applied to the
     /// `Theme` resource by `apply_theme_from_rpc`.
     ThemeReceived(String),
@@ -462,7 +462,7 @@ fn refetch_config_on_reconnect(
         .detach();
 }
 
-/// Fetch the CRDT-owned per-client config trio (theme, metronome, scroll)
+/// Fetch the kernel-owned per-client config trio (theme, metronome, scroll)
 /// and forward each into its existing `RpcResultMessage` sink
 /// (`apply_theme_from_rpc` below; `dj::thread`'s `MetronomeConfigReceived`
 /// handler; `input::scroll_config::apply_scroll_config`).
@@ -978,7 +978,7 @@ fn poll_bootstrap_results(
                             }
                         }
 
-                        // 0/0b/0c. Fetch the CRDT-owned theme + per-client
+                        // 0/0b/0c. Fetch the kernel-owned theme + per-client
                         // metronome/scroll configs over RPC. Shared with
                         // `refetch_config_on_reconnect` — see that fn's doc
                         // comment for why cold start and reconnect must run

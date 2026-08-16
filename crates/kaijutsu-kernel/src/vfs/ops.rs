@@ -105,7 +105,7 @@ pub trait VfsOps: Send + Sync {
     /// documents* (the rc/config trees). The editor binds such a path straight
     /// to its owning block; routing it through a file-doc cache would mint a
     /// shadow copy and revive the dual-ownership write-through bug class
-    /// (`docs/config-crdt-ownership.md`). Default `false`; `ConfigCrdtFs`
+    /// (`docs/config-ownership.md`). Default `false`; `ConfigDocFs`
     /// overrides to `true`. Asking the owning backend keeps the editor and the
     /// VFS from disagreeing on ownership — no hardcoded path prefix.
     fn owns_config_docs(&self) -> bool {
@@ -140,7 +140,7 @@ pub trait VfsOps: Send + Sync {
     /// that can't await, like subprocess cwd resolution
     /// (`MountBackend::resolve_real_path`, a sync kaish trait method). Purely
     /// structural: no existence check, no per-path symlink resolution — pair
-    /// it with [`Self::real_path`] when those matter. Virtual/CRDT backends
+    /// it with [`Self::real_path`] when those matter. Virtual/document backends
     /// keep the `None` default.
     fn real_root(&self) -> Option<PathBuf> {
         None

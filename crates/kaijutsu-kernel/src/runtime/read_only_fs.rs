@@ -11,7 +11,7 @@
 //! This wrapper closes that gap the same way kaish's own read-only mounts do:
 //! reads delegate to the inner filesystem; every mutation is refused with
 //! `PermissionDenied` *before* it reaches the inner fs. The toolie can read a
-//! live CRDT document view but cannot author it — the differentiator from
+//! live kernel document view but cannot author it — the differentiator from
 //! kaibo, whose read-only sandbox has only host files + ephemeral scratch and
 //! no CRDT surface at all.
 

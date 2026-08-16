@@ -1,6 +1,6 @@
 //! TOML-based theme parser for Kaijutsu.
 //!
-//! The theme arrives over RPC from the kernel's CRDT-owned config (see
+//! The theme arrives over RPC from the kernel's kernel-owned config (see
 //! `connection/actor_plugin.rs`); this module only parses the TOML payload.
 //! There is no host-side theme file and no disk-load path — the kernel is
 //! the sole owner of theme configuration.

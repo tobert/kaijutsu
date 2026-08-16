@@ -37,7 +37,7 @@ fn default_empty_params() -> String {
 /// Execute a kaish command in the caller's kernel context. The shell is
 /// context-bound — `.` references the current context in kj commands, durable
 /// cwd/env carry across calls, and `kj` builtins are available for
-/// context/drift/fork management. Output is written to CRDT blocks and
+/// context/drift/fork management. Output is written to kernel blocks and
 /// observable in kaijutsu-app.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ShellRequest {

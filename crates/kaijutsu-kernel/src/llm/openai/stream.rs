@@ -246,7 +246,7 @@ impl StateMachine {
 
 // ============================================================================
 // Tests — drive fixtures through SSE parser + state machine and assert
-// the StreamEvent sequence the CRDT block writer will see.
+// the StreamEvent sequence the kernel block writer will see.
 // ============================================================================
 
 #[cfg(test)]

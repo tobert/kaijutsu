@@ -149,9 +149,9 @@ fn write_new_file_to_readonly_mount_fails_clean_and_creates_nothing() {
 }
 
 /// `write` to an EXISTING file under the read-only root mount must fail
-/// cleanly AND must not leave the CRDT cache serving the rejected content on
+/// cleanly AND must not leave the document cache serving the rejected content on
 /// a later `read` — the corruption this suite was written to catch: before
-/// the fix, a failed flush left `write_file`'s CRDT cache entry holding the
+/// the fix, a failed flush left `write_file`'s document cache entry holding the
 /// unflushed edit forever (`dirty` had no path back to `false`, and
 /// staleness detection is keyed on a disk `generation` a failed write never
 /// advances), so a later `read` served the phantom tampered content while

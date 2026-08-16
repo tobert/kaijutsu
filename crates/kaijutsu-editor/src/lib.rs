@@ -11,7 +11,7 @@
 //! - state accessors ([`EditorCore::text`], [`cursor`](EditorCore::cursor),
 //!   [`mode`](EditorCore::mode)) are what a renderer draws and a test asserts.
 //!
-//! The kernel binds this to a CRDT block: load block text in, mirror the
+//! The kernel binds this to a kernel block: load block text in, mirror the
 //! returned [`EditOp`]s onto the block, and feed peer ops back (later). See
 //! `docs/vi.md`.
 
@@ -190,7 +190,7 @@ impl EditorCore {
     }
 
     /// Insert `text` at the leader cursor, returning the char-indexed
-    /// [`EditOp`]s for the kernel to mirror onto the CRDT block. The cursor ends
+    /// [`EditOp`]s for the kernel to mirror onto the kernel block. The cursor ends
     /// just past the inserted text. Used by the kernel to complete a `:r` after
     /// the async fetch. `set_text` resets undo (a bulk paste is disruptive
     /// anyway — same trade-off as `:s`).
@@ -263,7 +263,7 @@ impl EditorCore {
     }
 
     /// Reconcile the buffer to `new_text` — the authoritative, already-merged
-    /// CRDT block content after a **peer's** edit landed on the bound block —
+    /// kernel block content after a **peer's** edit landed on the bound block —
     /// and transform the leader cursor so it tracks the change. Returns whether
     /// the buffer actually changed; `false` when `new_text` already equals the
     /// buffer (e.g. this session's own mirrored write echoing back through the
@@ -302,7 +302,7 @@ impl EditorCore {
         for key in parse_keys(keys) {
             // Diff against the normalized (terminator-stripped) view so emitted
             // offsets are char-indexed into the logical content, matching the
-            // CRDT block — not modalkit's trailing-newline'd rope.
+            // kernel block — not modalkit's trailing-newline'd rope.
             let before = strip_one_trailing_newline(&self.buffer.get_text());
             self.machine.input_key(key);
             while let Some((action, ctx)) = self.machine.pop() {
@@ -372,7 +372,7 @@ impl EditorCore {
                 }
             }
             // A submitted `:s` edits the document here, so the diff below turns
-            // it into the EditOp(s) the kernel mirrors onto the CRDT block.
+            // it into the EditOp(s) the kernel mirrors onto the kernel block.
             if let Some(sub) = self.pending_substitution.take() {
                 self.apply_substitution(&sub);
             }
@@ -1066,7 +1066,7 @@ mod tests {
 
         #[test]
         fn a_real_substitution_emits_an_editop() {
-            // The kernel mirrors these ops onto the CRDT block — they must exist.
+            // The kernel mirrors these ops onto the kernel block — they must exist.
             let mut ed = EditorCore::new("foo");
             let ops = ed.apply_keys(":s/foo/barbaz/<CR>");
             assert_eq!(ed.text(), "barbaz");

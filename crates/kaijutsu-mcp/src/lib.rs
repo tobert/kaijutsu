@@ -1303,7 +1303,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as CRDT blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as kernel blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]
@@ -1839,7 +1839,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Read the current input document text for a context. The input document is a CRDT-backed scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.",
+        description = "Read the current input document text for a context. The input document is a kernel-owned scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.read_input")]
@@ -2313,7 +2313,7 @@ impl ServerHandler for KaijutsuMcp {
         // when rmcp learns a newer version. See docs/issues.md "rmcp
         // protocol-version fallback".
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
-        .with_instructions("Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with CRDT-backed consistency.")
+        .with_instructions("Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with kernel-owned consistency.")
     }
 
     // ========================================================================

@@ -1,19 +1,19 @@
-//! Lossless export/import of the CRDT-owned config trees to/from a real
+//! Lossless export/import of the kernel-owned config trees to/from a real
 //! directory — the precondition for ever trusting the eventual git-worktree
-//! flip (`docs/config-crdt-ownership.md`, "Lane B — the git-worktree seam,
+//! flip (`docs/config-ownership.md`, "Lane B — the git-worktree seam,
 //! shipped and deliberately unwired").
 //!
-//! [`ConfigCrdtFs`] mounts four roots — `/etc/rc`, `/etc/config`,
+//! [`ConfigDocFs`] mounts four roots — `/etc/rc`, `/etc/config`,
 //! `/etc/client`, `/etc/midi` — all sharing one doc model
 //! ([`crate::config_doc`]): a document is either a [`DocKind::File`] or a
 //! [`DocKind::Symlink`], and directories are virtual, synthesized from
-//! the set of document paths (see `runtime::config_crdt_fs` module docs).
+//! the set of document paths (see `runtime::config_doc_fs` module docs).
 //! This module is purely additive: it does not touch mount wiring, delete any
 //! document, or add a git dependency. It builds the export model
 //! ([`ConfigTreeEntry`]) and proves — via the round-trip test below — that
 //! walking the CRDT out to disk and back loses nothing.
 //!
-//! [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
+//! [`ConfigDocFs`]: crate::runtime::config_doc_fs::ConfigDocFs
 //!
 //! # What does NOT round-trip
 //!
@@ -21,12 +21,12 @@
 //! below is invisible to [`export_config_tree`] by construction — not a bug
 //! in this module, but a gap this module makes visible for the eventual flip:
 //!
-//! - **File permissions / modes.** `ConfigCrdtFs::getattr` reports a fixed
+//! - **File permissions / modes.** `ConfigDocFs::getattr` reports a fixed
 //!   `0o644` for every file and `0o755` for every directory (see `getattr` in
-//!   `runtime/config_crdt_fs.rs`) — there is no per-document mode bit stored
+//!   `runtime/config_doc_fs.rs`) — there is no per-document mode bit stored
 //!   anywhere. A materialized tree cannot recover a mode the CRDT never held.
 //! - **Empty directories.** Directories are virtual, synthesized from
-//!   descendant document paths (`is_dir`/`readdir` in `config_crdt_fs.rs`).
+//!   descendant document paths (`is_dir`/`readdir` in `config_doc_fs.rs`).
 //!   A directory with zero documents under it does not exist as far as the
 //!   CRDT is concerned, so it materializes to nothing and a git worktree
 //!   (which also cannot track an empty directory) loses no *additional*
@@ -44,7 +44,7 @@
 //!   see [`ConfigExportError::BlocklessDocument`].
 //! - **`language`** on the `documents` row (used elsewhere for e.g.
 //!   syntax-highlighting hints on `Code`/`Text` docs) is not carried — config
-//!   docs never set it (`ConfigCrdtFs` always passes `None`), so there is
+//!   docs never set it (`ConfigDocFs` always passes `None`), so there is
 //!   nothing to lose today, but a future doc that does set it would silently
 //!   drop that field through this export. Worth a note if `language` is ever
 //!   pressed into service for config docs.
@@ -55,12 +55,12 @@
 //! [`crate::block_store::BlockStore::documents_under_path`], which is a straight read of
 //! the persisted `documents` table (`KernelDb::list_documents_under_path`,
 //! `WHERE path LIKE '<root>/%' ORDER BY path`) — the same manifest
-//! `ConfigCrdtFs::readdir` uses. It returns every row with a `path` under the
+//! `ConfigDocFs::readdir` uses. It returns every row with a `path` under the
 //! root; there is no separate "cache-shadow" document kind under these four
 //! roots to miss — the deterministic `file_context_id` cache document
 //! (`FileDocumentCache`) lives under a *different* id derivation and is only
 //! ever consulted for non-config-owned paths (`owns_config_docs()` is `true`
-//! for every `ConfigCrdtFs` mount, which short-circuits the file cache
+//! for every `ConfigDocFs` mount, which short-circuits the file cache
 //! entirely — see `editor.rs`). So there is nothing under `/etc/rc`,
 //! `/etc/config`, `/etc/client`, or `/etc/midi` that this enumeration could
 //! silently skip.
@@ -72,16 +72,16 @@ use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, RC_ROOT};
 
 use crate::block_store::{BlockStoreError, SharedBlockStore};
 use crate::config_doc;
-use crate::runtime::config_crdt_fs::normalize_abs;
+use crate::runtime::config_doc_fs::normalize_abs;
 
-/// The four CRDT-owned config mount roots, in the fixed order this module
+/// The four kernel-owned config mount roots, in the fixed order this module
 /// always walks them. (Their lexical string order happens to match —
 /// `client` < `config` < `midi` < `rc` — but ordering is enforced explicitly
 /// by sorting output, not by relying on this array's order.)
 const MOUNT_ROOTS: [&str; 4] = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT];
 
 /// Directory name a mount root materializes under, inside the export
-/// directory (`docs/config-crdt-ownership.md`, "Rulings (Amy, 2026-08-15)",
+/// directory (`docs/config-ownership.md`, "Rulings (Amy, 2026-08-15)",
 /// ruling 1: one worktree at `<data_dir>/config` holding `rc/`, `config/`,
 /// `client/`, `midi/`). A `match` rather than a derived strip so an
 /// unrecognized root fails loud at compile-adjacent time instead of silently
@@ -163,7 +163,7 @@ pub enum ConfigExportError {
     /// An imported symlink's target resolves outside its mount root. Refused
     /// loudly rather than materialized into the CRDT (which would let it
     /// escape the mount's cross-mount permission gate — the same escape
-    /// `ConfigCrdtFs::resolve_target` refuses at read time).
+    /// `ConfigDocFs::resolve_target` refuses at read time).
     #[error(
         "symlink {root}/{rel_path} -> {target:?} escapes its mount root \
          (resolves to {resolved})"
@@ -227,7 +227,7 @@ pub fn export_config_tree(
 
             // Git-style mode bit: a doc is a symlink iff its DocKind says so,
             // never inferred from content. Any other kind reads as a file —
-            // mirrors `ConfigCrdtFs::readdir`'s own `if kind == Symlink`
+            // mirrors `ConfigDocFs::readdir`'s own `if kind == Symlink`
             // branch, so this enumeration can never disagree with the live
             // VFS about what a document is.
             let kind = if doc_kind == DocKind::Symlink {
@@ -283,7 +283,7 @@ pub fn materialize(entries: &[ConfigTreeEntry], dir: &Path) -> Result<(), Config
 /// Read a directory tree materialized by [`materialize`] back into the same
 /// model, in the same deterministic order. Refuses (loudly) any symlink whose
 /// target resolves outside its mount root — the same escape
-/// `ConfigCrdtFs::resolve_target` refuses at live-read time, checked here
+/// `ConfigDocFs::resolve_target` refuses at live-read time, checked here
 /// with the identical normalization ([`normalize_abs`]) so import and the
 /// live VFS can never disagree about what counts as an escape.
 pub fn import_config_tree(dir: &Path) -> Result<Vec<ConfigTreeEntry>, ConfigExportError> {
@@ -358,7 +358,7 @@ fn walk_dir(
     Ok(())
 }
 
-/// The same escape check `ConfigCrdtFs::resolve_target` applies at live-read
+/// The same escape check `ConfigDocFs::resolve_target` applies at live-read
 /// time, reused here (via [`normalize_abs`]) rather than re-derived, so
 /// import and the live VFS can never quietly disagree about what "escapes the
 /// mount" means.
@@ -393,7 +393,7 @@ mod tests {
     use crate::block_store::shared_block_store_with_db;
     use crate::config_doc::config_context_id;
     use crate::kernel_db::KernelDb;
-    use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+    use crate::runtime::config_doc_fs::ConfigDocFs;
     use crate::vfs::VfsOps as _;
     use kaijutsu_types::PrincipalId;
     use std::path::Path as StdPath;
@@ -402,7 +402,7 @@ mod tests {
     /// A block store backed by an in-memory `KernelDb`, so config docs
     /// created via `create_document_with_path` land in the `documents`
     /// manifest `documents_under_path` reads. Mirrors the fixture in
-    /// `runtime/config_crdt_fs.rs` and `editor.rs`.
+    /// `runtime/config_doc_fs.rs` and `editor.rs`.
     fn blocks_with_db() -> SharedBlockStore {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
@@ -420,9 +420,9 @@ mod tests {
     #[tokio::test]
     async fn round_trip_seeded_store_is_lossless() {
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.seed_from_embedded().unwrap();
-        let config = ConfigCrdtFs::new(blocks.clone(), CONFIG_ROOT);
+        let config = ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
         config
             .seed_entries(crate::config_seed::config_seed_files())
             .unwrap();
@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn symlink_fidelity_relative_and_dangling() {
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(StdPath::new("coder/create/real.kai"), b"body")
             .await
             .unwrap();
@@ -514,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn ordering_is_deterministic_and_lexical_not_iteration_order() {
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         // Write out of lexical order on purpose.
         for name in ["zzz.kai", "aaa.kai", "mmm.kai"] {
             rc.write_all(StdPath::new(&format!("t/create/{name}")), b"x")
@@ -539,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn non_ascii_content_round_trips() {
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         let body = "# 会術\n練習になります — 日本語のテスト 🎵\n";
         rc.write_all(StdPath::new("coder/create/S00-ja.md"), body.as_bytes())
             .await
@@ -563,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn import_rejects_symlink_escaping_mount_root() {
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(StdPath::new("coder/create/S00-x.kai"), b"x")
             .await
             .unwrap();
@@ -588,7 +588,7 @@ mod tests {
     #[tokio::test]
     async fn blockless_document_is_an_explicit_error_not_a_silent_skip() {
         let blocks = blocks_with_db();
-        // Register a document directly (bypassing ConfigCrdtFs::put_content),
+        // Register a document directly (bypassing ConfigDocFs::put_content),
         // leaving it blockless — the halted-replay case.
         let canonical = format!("{RC_ROOT}/coder/create/S00-halted.kai");
         let ctx = config_context_id(&canonical);
@@ -607,7 +607,7 @@ mod tests {
     async fn export_covers_all_four_mount_roots() {
         let blocks = blocks_with_db();
         for root in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
-            let fs = ConfigCrdtFs::new(blocks.clone(), root);
+            let fs = ConfigDocFs::new(blocks.clone(), root);
             fs.write_all(StdPath::new("probe.txt"), b"present")
                 .await
                 .unwrap();

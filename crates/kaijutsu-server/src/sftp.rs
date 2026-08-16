@@ -2,7 +2,7 @@
 //!
 //! Bridges `russh_sftp::server::Handler` onto the kernel's [`VfsOps`] mount
 //! tree, so any off-the-shelf SFTP client (sshfs, `sftp`, an editor's remote-FS
-//! plugin) reads and writes the unified tree — host FS, CRDT-backed `/etc/rc`
+//! plugin) reads and writes the unified tree — host FS, kernel-owned `/etc/rc`
 //! and `/v/...`, and the memory scratch at `/tmp` — over the same SSH server
 //! that carries the Cap'n Proto RPC channel. See `docs/sftp.md`.
 //!
@@ -181,7 +181,7 @@ impl SftpSession {
 /// as relative to `/`, so `realpath(".")` resolves to `/`. Its job is to hand
 /// `MountTable` a clean absolute path that routes to the right mount; the
 /// authoritative escape check (symlinks resolved, `starts_with(root)`) lives in
-/// the backends (`LocalBackend::resolve`, `ConfigCrdtFs::resolve`), which a
+/// the backends (`LocalBackend::resolve`, `ConfigDocFs::resolve`), which a
 /// lexical normalizer structurally cannot replace.
 fn canonicalize(raw: &str) -> PathBuf {
     let mut out: Vec<std::ffi::OsString> = Vec::new();
