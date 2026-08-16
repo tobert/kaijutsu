@@ -23,7 +23,7 @@ This is not new — it predates DTE removal. The pre-migration `ops_since`
 (diamond-types-extended-backed) had exactly the same gap: none of these four
 fields were DTE ops or `BlockHeader` fields, so nothing in the old payload
 carried them either. Found while auditing every `frontier_before`/`ops_since`
-call site during the DTE removal (`docs/crdt-melt.md`), not introduced by it.
+call site during the DTE removal, not introduced by it.
 
 `move_block`'s `order_key` has the same shape of gap (`order_key` lives on
 `BlockSnapshot`, not `BlockHeader`) and is likewise pre-existing.
@@ -64,23 +64,6 @@ exactly how a real failure gets waved through. Worth fixing by making the
 capture deterministic (a subscriber the test fully owns, or asserting on a
 returned value instead of on log output) rather than by adding a retry.
 
-## Source citations of `docs/crdt-melt.md` need repointing before the file can go (found 2026-08-16, updated 2026-08-16)
-
-Resolved the "does not exist" half: the file was never lost. It was
-untracked on purpose — its own header said "do not commit" — so a tree grep
-or `git log` search never found it, but it was on disk the whole time.
-`document_store.rs:29`, `kernel_db.rs:581`, `config_export.rs`,
-`kaijutsu-configgit/src/lib.rs` (×7), `compose_draft_wire.rs`, and
-`rpc.rs:5801` all cite it as the authoritative design record.
-
-Its durable content has now melted into the repo: the git-worktree rulings
-into `docs/config-crdt-ownership.md` ("Lane B — the git-worktree seam"), the
-migration narrative into `docs/devlog.md`. What is left is mechanical —
-repoint each citation above at the doc that now actually carries the ruling
-it names, then delete `docs/crdt-melt.md`. Not a research task: the content
-already has a home, this is a sweep-and-delete.
-
----
 
 ## A context's version is unobservable from `kj` (2026-08-15)
 
@@ -255,9 +238,8 @@ each streamed token materializes the entire block. `08793e71` removed a
 *different* one (per-op re-materialization while journaling), and the kernel's
 classification deliberately avoids adding a *third* — but the per-token cost
 remains, inside the CRDT layer. The fix belongs there: get the DTE text length
-without building a `String`. This is one more reason the block-text
-representation is headed for a plain `String` (docs/crdt-melt.md, "What replaces
-DTE").
+without building a `String`. **Resolved by the representation change** (2026-08-16): block text is a
+plain `String`, so a character count no longer requires materializing one.
 
 ### 2. kaish VFS write passes a byte length as a character count
 
