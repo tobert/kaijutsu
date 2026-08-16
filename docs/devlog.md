@@ -1821,3 +1821,60 @@ boot a server take the serving path. The default now ships empty, with the real
 entries kept in the file as commented reference, and the test asserting the
 default configures *nothing* says why in its name. A shipped default is not
 inert: it is a decision made on every machine that has not overridden it.
+
+### The text engine itself leaves (August 16)
+
+One question from the plan was still open going into the next day: whether to
+replace diamond-types-extended as the block-text representation at all. The
+plan had gated that on instrumentation — measure whether real merge ever
+happened inside the kernel, then decide. The measurement never ran, because
+the question it would have answered was already closed by construction: with
+`pushOps` gone, `merge_ops` had exactly one caller, and that caller was the
+one just deleted. Two independently-diverged stores editing the same block
+had gone from unmeasured to impossible to construct. An instrument built to
+watch for something that cannot happen is not a pending task; it is a stale
+question, and the day's work treated it as one.
+
+What decided the timing, rather than the principle, was a number. A
+read-only copy of an 861 MB production `kernel.db` (Amy's permission, opened
+`immutable=1`, never the live file) showed diamond-types-extended's own
+snapshot encoding running 564 MB against 141 MB for those same documents'
+materialized text and 137 MB of oplog — the text engine was costing about
+four times the text it stored. The multiplier did not accumulate with age or
+size: bucketed by version count it read 4.34x under ten versions, 4.82x
+under a hundred, 4.95x under a thousand, and 4.32x for the two documents
+over a thousand — a document with four versions carried nearly the same
+overhead as one with 1,942. Flat across that range is what marked it as a
+structural cost, paid by every block for reconciliation machinery most
+blocks never used, rather than debt that had built up over time. The
+sole-sequencer ruling was already reason enough to remove the text engine;
+the measurement is why removing it also gives back roughly 560 of the 861
+megabytes.
+
+One migration had to land first to make the removal safe rather than merely
+plausible. `doc_snapshots.content` — the column holding a document's
+materialized text — is written only by compaction. Any document edited since
+its last compaction held its newer text solely as operations in the oplog,
+so deleting the engine without materializing everything first would have
+discarded those edits, silently, with `content` still present and still
+parsing — the exact failure shape the whole migration had spent the day
+closing, reappearing as its own last act. A forced compaction pass, run once
+at boot with the compaction code already in service, closed the gap: walk
+every document, write its current text into `content`, truncate its oplog.
+Against a live 909 MB database it compacted all 1,569 documents with zero
+failures — the same work ordinary compaction already does, run once,
+deliberately, ahead of the change that depended on it.
+
+With every document's text proven current, block content became a plain
+`String`. Streaming is a hundred percent append, and `String::push_str` is
+amortized O(1) — the bound a rope was offering, without the rope. The
+representation question turned out to matter more for what a rope would have
+cost than for what it would have gained: `ropey::Rope`'s tree node allocates
+roughly a kilobyte even for an empty rope, and a conversation context holds
+thousands of small tool-call and short-turn blocks, most nowhere near that
+floor. A rope earns its allocation on large, splice-heavy text, which
+describes the editor and file-document surfaces exactly — modalkit already
+runs on `ropey` underneath, so those keep it — and describes compose input
+not at all, so a draft stays a `String` with a revision counter beside it.
+Three surfaces ended up with three representations, each chosen against what
+it actually does to its own text rather than handed one engine to share.

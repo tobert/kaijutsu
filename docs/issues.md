@@ -64,17 +64,21 @@ exactly how a real failure gets waved through. Worth fixing by making the
 capture deterministic (a subscriber the test fully owns, or asserting on a
 returned value instead of on log output) rather than by adding a retry.
 
-## `docs/crdt-melt.md` is cited ~15 times and does not exist (found 2026-08-16)
+## Source citations of `docs/crdt-melt.md` need repointing before the file can go (found 2026-08-16, updated 2026-08-16)
 
-Source files across the DTE-removal effort cite `docs/crdt-melt.md` as the
-authoritative design record — `document_store.rs:29`, `kernel_db.rs:581`,
-`config_export.rs`, `kaijutsu-configgit/src/lib.rs` (×7),
-`compose_draft_wire.rs`, `rpc.rs:5801`, and two entries in this file — but no
-such file exists anywhere in the tree or its git history. Either the doc was
-never committed from whichever session authored it (check zorak checkouts),
-or the citations drifted from a different name. Every citation of the
-load-bearing design record for Lanes B/C is currently a dead link: find the
-doc or write it, then leave the citations pointing at something real.
+Resolved the "does not exist" half: the file was never lost. It was
+untracked on purpose — its own header said "do not commit" — so a tree grep
+or `git log` search never found it, but it was on disk the whole time.
+`document_store.rs:29`, `kernel_db.rs:581`, `config_export.rs`,
+`kaijutsu-configgit/src/lib.rs` (×7), `compose_draft_wire.rs`, and
+`rpc.rs:5801` all cite it as the authoritative design record.
+
+Its durable content has now melted into the repo: the git-worktree rulings
+into `docs/config-crdt-ownership.md` ("Lane B — the git-worktree seam"), the
+migration narrative into `docs/devlog.md`. What is left is mechanical —
+repoint each citation above at the doc that now actually carries the ruling
+it names, then delete `docs/crdt-melt.md`. Not a research task: the content
+already has a home, this is a sweep-and-delete.
 
 ---
 
@@ -145,6 +149,42 @@ Also from the same slice: `init_or_open` hand-writes `HEAD` and a minimal
 `gix-repository`, deliberately outside the aligned set). Two `fs::write` calls,
 but it is one more piece of git's on-disk format this crate now owns and must
 keep correct by hand.
+
+## Lane B storage half is unbuilt — config documents are still CRDT documents, not files (2026-08-16)
+
+`kaijutsu-configgit` (the git write seam above) is tested and unwired — see
+`docs/config-crdt-ownership.md`, "Lane B — the git-worktree seam". `/etc/config`,
+`/etc/client`, and `/etc/midi` are still `ConfigCrdtFs` mounts backed by
+`kernel.db`; nothing reads or writes `<data_dir>/config`. What shipped
+2026-08-15/16 (`988122f9`) was only the write *gate* — the file tools can now
+reach the CRDT-backed mounts directly — not a storage migration.
+
+Two shapes are live candidates, not decided: wire `kaijutsu-configgit` in as
+designed (one git worktree, auto-commit per mutation, service-authored
+commits — the rulings in `docs/config-crdt-ownership.md`), or go simpler per
+Amy's 2026-08-15 lean — plain files on disk, keep the reset-to-embedded-
+default tool, and demote git to a skill invoked through rc or the help
+system rather than kernel machinery. Whoever picks this up should settle
+that question first; building the kernel-wiring slice for the git-worktree
+shape before it is confirmed as the plan would be work a later decision
+could throw away.
+
+## `kaijutsu-crdt` is a block store now, not a CRDT (2026-08-16)
+
+diamond-types-extended left the crate, and the build graph, on 2026-08-16
+(`fc616aa6`, `133b5814`): block text is a plain `String`, and concurrent
+merge into a kernel document is structurally impossible (the sole-sequencer
+ruling; `pushOps`'s deletion removed `merge_ops`'s only concurrent caller).
+What is left in `kaijutsu-crdt` is a Lamport-clocked, fractional-index,
+DAG-validating block store with document/snapshot/oplog persistence — a
+real thing, just not a conflict-free replicated data type.
+
+The name now promises merge semantics the crate does not have and will not
+need again. Only `kaijutsu-kernel` and `kaijutsu-server` still depend on it
+(client, acp, mcp, and app all dropped it during the melt). Renaming the
+crate — `kaijutsu-blockstore` is the obvious candidate — is open work: pure
+churn with no behavior change across two dependents, which is exactly why
+it has stayed a name change rather than a priority.
 
 ## The well's activity glow wants a derived signal (2026-08-15)
 

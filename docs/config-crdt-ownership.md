@@ -20,11 +20,105 @@ build order. It supersedes the earlier `FileDocumentCache`-era design
 > `system.md`, and all of `/etc/rc` remain CRDT-owned exactly as described.
 
 > **Superseded in part (2026-08-15/16):** `/etc/config`, `/etc/client`, and
-> `/etc/midi` are no longer CRDT documents — they are plain write surfaces
-> for the file tools, git-backed via `kaijutsu-configgit`. `/etc/rc` keeps
-> the model this doc describes. The invariant that survives unchanged is
+> `/etc/midi` are still `ConfigCrdtFs` mounts — CRDT documents in
+> `kernel.db`, exactly as this doc describes. What changed is the *gate*,
+> not the storage: `deny_etc_write` narrowed to the host's real `/etc`, so
+> the file tools and the editor now reach these mounts directly, and `kj
+> config set`/`edit` were deleted as a redundant second door rather than
+> because the storage moved (`988122f9`). `/etc/rc` is unchanged — still
+> `rc-write`-gated, still `ConfigCrdtFs`. The storage half of Lane B —
+> these documents becoming real files in a kernel-owned git worktree — has
+> **not** shipped: `kaijutsu-configgit`, the git write seam, exists and is
+> tested but is not called from anywhere in the kernel, and Amy has been
+> leaning toward a simpler shape that may not use it at all. See "Lane B"
+> below. The invariant that survives regardless of which shape wins is
 > single kernel ownership: one source of truth, no host write-through. See
 > CLAUDE.md ("Config is different from rc").
+
+---
+
+## Lane B — the git-worktree seam, shipped and deliberately unwired (2026-08-15/16)
+
+`crates/kaijutsu-configgit` is the write half of a `<data_dir>/config` git
+worktree meant to eventually replace `ConfigCrdtFs` as the storage for
+`rc/`, `config/`, `client/`, and `midi/`. It landed 2026-08-15 (`9a8cd9f0`),
+tested — a lossless round trip in `config_export.rs`, a spawn-free tripwire
+in `tests/spawn_free.rs` — and is **not called from anywhere in the
+kernel**. Nothing reads or writes `<data_dir>/config` today; the mounts
+above are still `ConfigCrdtFs`, unchanged.
+
+Amy has been ambivalent about whether this shape ships at all, in the same
+conversation that produced the rulings below:
+
+> "I'm leaning towards simplifying more, maybe just config files, keep the
+> reseed tool, the edit config verbs go away. and the git process is just a
+> skill we have handy via rc or help system"
+
+Read literally, that replaces the git worktree with plain files on disk plus
+a reset-to-embedded-default tool, and moves git out of the kernel entirely —
+a skill reached through rc or the help system, not a mechanism the kernel
+runs. The permission behind it, from the same conversation and recorded in
+CLAUDE.md as "Permission to get simpler": *"if the agent can see the files
+and edit them, that's fine, we don't need to complicate it just because it's
+config."* The write-gate change described above (`988122f9`) already takes
+that permission literally for the CRDT-backed mounts in place today. Whether
+`kaijutsu-configgit`'s git worktree is still the intended storage, or gets
+replaced outright by the simpler shape, is unresolved. Read the rulings
+below as what was decided *if* the git-worktree shape is the one that ships
+— not as a settled design.
+
+### Rulings (Amy, 2026-08-15)
+
+1. One git worktree at `<data_dir>/config`, holding all four config-like
+   roots — `rc/`, `config/`, `client/`, `midi/` — under one `.git`. One
+   history joins an rc edit to a config edit; there is no per-root
+   repository.
+2. Auto-commit per accepted mutation. The git log *is* the config oplog —
+   that is the reason to melt these documents into files at all, so the 1:1
+   join between a kernel operation and a commit is worth the noisy log it
+   produces. Commits carry the operation id from the start, as a
+   `kaijutsu-operation-id` extra header on the commit object — invisible to
+   `git log --format=%(trailers)`, visible to `git cat-file -p`. The writer
+   never stages through `.git/index`; it walks the live worktree and commits
+   its full current state on every call, because the kernel's VFS is already
+   the index and a second index would be a second copy of the truth.
+3. No watcher, no implicit import on the worktree. An unexpectedly dirty
+   worktree is a fail-loud condition, not something the kernel resolves by
+   guessing. An explicit `kj … import` verb may be added later; nothing
+   reads the directory back into the kernel today.
+4. Seeding stays namespace-bootstrap-only through the migration: seed once
+   on a fresh kernel, never again. A file the operator deletes stays
+   deleted; a shipped default added after a kernel already exists does not
+   retroactively appear on it. No tombstones — that limitation is unchanged
+   by this migration and gets its own decision later, separately.
+5. Commits are service-authored (`kaijutsu-kernel <kernel@kaijutsu.internal>`)
+   for now. Principal plumbing — giving a config mutation its real actor —
+   does **not** gate this work: *"I don't think the principal plumbing
+   should gate the git work."* The gap is filed as a holistic sweep across
+   the codebase, not a Lane B task (`docs/issues.md`, "Principal plumbing").
+6. Empty virtual config directories keep their current limitation: they are
+   synthesized from descendant paths today and have never round-tripped to a
+   real filesystem, and a git tree cannot represent an empty directory
+   either — a tree with zero entries can be written, but nothing lets a
+   parent tree name an empty child the way `git ls-tree` would show one.
+   Preserve the inability rather than build around a limit git itself has.
+
+Known not to round-trip, from the export work (`config_export.rs`) — each is
+an accepted limitation, not a blocking gap: file permissions and modes (the
+CRDT backend has none; `getattr` reports a fixed mode), empty directories
+(above), and the `documents.language` column (never set for config today).
+Duplicate paths are structurally impossible under the UUIDv5-per-path
+scheme.
+
+**Git write mechanism, if this shape ships:** build on gitoxide's
+**plumbing** crates only (`gix-object`, `gix-odb`, `gix-ref`, …), never the
+`gix` facade — it links `gix-command` unconditionally and reintroduces
+subprocess-spawn machinery — and never invoke the `git` executable (the
+host-exec-has-one-owner rule: a `git` subprocess here is a second exec site
+kaish already owns). Pin at the same versions as `~/src/kaish-extras`'s
+`kaish-tools-git` (inspected 2026-08-15 at `96e9825`, read-only today), so
+the write half can move there as a `Profile::Write` later instead of being
+reimplemented.
 
 ---
 
