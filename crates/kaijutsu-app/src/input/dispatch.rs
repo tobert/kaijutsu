@@ -229,14 +229,12 @@ pub fn dispatch_input(
     // --- Gamepad buttons ---
     // Use first connected gamepad (single-player). Multi-gamepad later.
     if let Some(gamepad) = gamepads.iter().next() {
-        for binding in &input_map.bindings {
-            if let InputSource::GamepadButton(btn) = &binding.source
-                && gamepad.just_pressed(*btn)
-                && binding.modifiers == Modifiers::NONE
-                && active_contexts.contains(binding.context)
-            {
-                action_writer.write(ActionFired::new(binding.action.clone(), binding.context));
-            }
+        for (action, ctx) in resolve_gamepad_bindings(
+            &input_map,
+            |btn| gamepad.just_pressed(btn),
+            |ctx| active_contexts.contains(ctx),
+        ) {
+            action_writer.write(ActionFired::new(action, ctx));
         }
 
         // --- Analog stick → AnalogInput resource ---
@@ -361,6 +359,55 @@ fn find_direct_match(
     best_match.map(|(_, binding)| (binding.action.clone(), binding.context))
 }
 
+/// Resolve this frame's just-pressed gamepad buttons to actions, **one per
+/// button**, using the same "more specific context wins" rule
+/// [`find_direct_match`] applies to keys ([`context_priority`]).
+///
+/// This used to fire *every* matching binding, which was invisible while no
+/// two active contexts bound the same button — and then stopped being
+/// invisible: East is `PopLevel` in `Global` and `UnpinQuickContext` in
+/// `QuickContext`, so a held overlay would have popped the scene underneath
+/// at the same time it released itself (input-rework audit, 2026-08-16). The
+/// keyboard has never had that bug; the pad now shares the fix.
+///
+/// Pure over its two predicates so the priority rule is testable without a
+/// gamepad, a window, or a schedule.
+fn resolve_gamepad_bindings(
+    input_map: &InputMap,
+    just_pressed: impl Fn(bevy::input::gamepad::GamepadButton) -> bool,
+    context_active: impl Fn(InputContext) -> bool,
+) -> Vec<(Action, InputContext)> {
+    // One winner per button. A `Vec` rather than a map: the pressed set is a
+    // handful of buttons at most, and this preserves binding-table order for
+    // the buttons themselves, which keeps multi-button frames deterministic.
+    let mut best: Vec<(bevy::input::gamepad::GamepadButton, usize, &super::binding::Binding)> =
+        Vec::new();
+
+    for binding in &input_map.bindings {
+        let InputSource::GamepadButton(btn) = &binding.source else {
+            continue;
+        };
+        if binding.modifiers != Modifiers::NONE
+            || !just_pressed(*btn)
+            || !context_active(binding.context)
+        {
+            continue;
+        }
+        let priority = context_priority(binding.context);
+        match best.iter_mut().find(|(b, _, _)| b == btn) {
+            // Strictly greater, so the first binding in table order wins a
+            // tie — identical to `find_direct_match`'s behavior on keys.
+            Some(slot) if priority > slot.1 => *slot = (*btn, priority, binding),
+            Some(_) => {}
+            None => best.push((*btn, priority, binding)),
+        }
+    }
+
+    best.into_iter()
+        .map(|(_, _, b)| (b.action.clone(), b.context))
+        .collect()
+}
+
 /// Context priority for conflict resolution (higher = more specific = wins).
 fn context_priority(ctx: InputContext) -> usize {
     match ctx {
@@ -372,6 +419,93 @@ fn context_priority(ctx: InputContext) -> usize {
         | InputContext::PatchBayZoomed
         | InputContext::StationZoomed
         | InputContext::FsnFly => 1,
-        InputContext::Dialog => 2, // Dialog beats everything
+        // A held quick-context overlay outranks the surface it floats over,
+        // so its Esc claims the key outright and no `PopLevel` is emitted for
+        // the level underneath. It does NOT outrank a modal: a dialog on
+        // screen still owns Esc.
+        InputContext::QuickContext => 2,
+        InputContext::Dialog => 3, // Dialog beats everything
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::input::gamepad::GamepadButton;
+
+    fn shipped_map() -> InputMap {
+        // The shipped table, not `InputMap::default()` — that one reads the
+        // user's bindings.toml, which would make this test depend on the
+        // machine it runs on.
+        InputMap {
+            bindings: super::super::defaults::default_bindings(),
+        }
+    }
+
+    /// East is the pad's Esc. With the quick-context overlay held, it must
+    /// release the overlay and NOT also pop the scene underneath — the
+    /// gamepad lane used to fire every matching binding, so both would have
+    /// gone off from one press.
+    #[test]
+    fn east_releases_a_held_overlay_without_popping_the_scene() {
+        let map = shipped_map();
+        let fired = resolve_gamepad_bindings(
+            &map,
+            |b| b == GamepadButton::East,
+            |ctx| matches!(ctx, InputContext::Global | InputContext::RoomNav | InputContext::QuickContext),
+        );
+        assert_eq!(
+            fired,
+            vec![(Action::UnpinQuickContext, InputContext::QuickContext)],
+            "exactly one action, and it is the overlay's"
+        );
+    }
+
+    /// Without the overlay held, East is still the plain pop it always was.
+    #[test]
+    fn east_is_still_pop_level_with_no_overlay_held() {
+        let map = shipped_map();
+        let fired = resolve_gamepad_bindings(
+            &map,
+            |b| b == GamepadButton::East,
+            |ctx| matches!(ctx, InputContext::Global | InputContext::RoomNav),
+        );
+        assert_eq!(fired, vec![(Action::PopLevel, InputContext::Global)]);
+    }
+
+    /// One winner per button, but different buttons pressed in the same
+    /// frame all still resolve.
+    #[test]
+    fn distinct_buttons_in_one_frame_all_fire() {
+        let map = shipped_map();
+        let fired = resolve_gamepad_bindings(
+            &map,
+            |b| matches!(b, GamepadButton::East | GamepadButton::Start),
+            |ctx| ctx == InputContext::Global,
+        );
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        assert!(fired.contains(&(Action::PopLevel, InputContext::Global)));
+        assert!(fired.contains(&(Action::GoToWell, InputContext::Global)));
+    }
+
+    /// A button nobody pressed, and a context nobody activated, both produce
+    /// nothing.
+    #[test]
+    fn nothing_pressed_fires_nothing() {
+        let map = shipped_map();
+        assert!(resolve_gamepad_bindings(&map, |_| false, |_| true).is_empty());
+        assert!(resolve_gamepad_bindings(&map, |_| true, |_| false).is_empty());
+    }
+
+    /// The priority ladder the overlay depends on: a modal still outranks a
+    /// held overlay, which outranks every ordinary surface, which outranks
+    /// Global.
+    #[test]
+    fn context_priority_ranks_dialog_over_overlay_over_surface_over_global() {
+        assert!(context_priority(InputContext::Dialog) > context_priority(InputContext::QuickContext));
+        assert!(
+            context_priority(InputContext::QuickContext) > context_priority(InputContext::RoomNav)
+        );
+        assert!(context_priority(InputContext::RoomNav) > context_priority(InputContext::Global));
     }
 }

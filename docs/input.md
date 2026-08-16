@@ -82,6 +82,18 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
    screenful; per-user prefix chords would defeat the muscle memory).
    While armed, the footer hint line shows the chord table
    (`ui/dock.rs::update_hints`).
+4. **The quick-context overlay follows the prefix** (`ui/quick_context.rs`,
+   2026-08-16). Arming Ctrl+A also *peeks* a translucent panel at the
+   top-right — the live roster today, more sections later; it is the
+   prefix's panel, not a screen. It appears with `PrefixState::armed()` and
+   goes when the prefix does: resolved, cancelled with Esc, or timed out at
+   `PREFIX_TIMEOUT_MS`. There is no separate show/hide chord and no second
+   timer — the panel mirrors the resource, so the timeout cannot drift into
+   two constants. `Ctrl+A h` **holds** it: the panel stays after the prefix
+   clears and solidifies (opaque, foreground). Held, it contributes
+   `InputContext::QuickContext`, whose one binding is Esc →
+   `UnpinQuickContext` — see the Escape section for why that is a distinct
+   action rather than `PopLevel`.
 
 ## The prefix table
 
@@ -102,6 +114,7 @@ list.
 | `Ctrl+A A` | Rename current context: prefilled-`kj` prompt, `kj context rename ` (verb added 2026-07-16; label-stealing stays `retag`'s latched job) | title |
 | `Ctrl+A n` / `p` | Next / previous ring-0 seat | next/prev |
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
+| `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
 
 **The prefilled-`kj` prompt pattern** (Amy, 2026-07-16: "pop a kj so the
@@ -121,7 +134,20 @@ exactly one action.
 | Vi editor (`Screen::Editor`) | Forwarded to kernel vi, never stolen |
 | Diff viewer (`Screen::Diff`) | To the app-local `DiffCore` (visual → normal). **Never closes the screen** — that is `q`/`ZQ`/`:q` (`docs/diff.md` slice 5) |
 | Compose overlay | To the VimMachine (mode switch); double-Esc in Normal mode dismisses (kept — works in practice) |
+| Quick-context overlay, **held** | Releases the hold, and nothing else — the level underneath stays put |
 | Everywhere else | `PopLevel`, one resolver walking the level ladder: well focus → overview → room; patch bay → room; fsn → room; room → conversation; dialog → cancel |
+
+The held overlay is the one surface that floats over *every* screen, so it
+cannot rely on the usual mutual exclusion (each `PopLevel` consumer is gated
+by the screen it belongs to). It gets its Esc the way the doctrine says to:
+an `InputContext` in the table, `QuickContext`, ranked above every surface
+and below `Dialog` (a modal still owns Esc). Because context priority makes
+the dispatcher pick exactly one binding, Esc there fires
+`UnpinQuickContext` and **no `PopLevel` is emitted at all** — that is what
+keeps "exactly one action per Esc" true without adding a consumed flag.
+Under a keyboard grab only `Global` bindings match, so with the editor, the
+diff viewer, or compose live, Esc still belongs to vi and `Ctrl+A h`
+releases the hold instead.
 
 ## Scene contexts (same keys, now table-driven and rebindable)
 
@@ -132,6 +158,7 @@ exactly one action.
 | PatchBayZoomed | `←/→/Tab` wires · `r` rescan · `↑/Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
 | FsnFly | arrows + WASD fly (WASD kept until the keys are needed elsewhere) · `PgUp/PgDn` altitude · `Esc` pop |
+| QuickContext (overlay held) | `Esc` release the hold — the only binding it carries; layered over whichever surface is underneath |
 
 `Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,
 so its keys never reach the binding table. `v` in Navigation opens it; inside,
@@ -161,7 +188,7 @@ The scene should be fully navigable by pad once the contexts land.
 | Start (`\|\|\|`) | Go to the well, from anywhere — pad-side `Ctrl+A w` |
 | DPad | Context-sensitive arrows: blocks / carousel / rings / seats |
 | South | Activate / dive / commit |
-| East | `PopLevel` |
+| East | `PopLevel` — or `UnpinQuickContext` while the quick-context overlay is held, never both (`resolve_gamepad_bindings` resolves by context priority, as the keyboard always has) |
 | Left stick | Scroll (conversation) · fly (fsn) · ring spin (well) |
 | Triggers | Page up / down |
 | North | Cycle focus |

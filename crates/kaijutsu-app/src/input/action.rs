@@ -212,6 +212,20 @@ pub enum Action {
     PromptContextRename,
     /// `Ctrl+A '` — same pattern, `kj context switch ` (switch-by-prompt).
     PromptContextSwitch,
+    /// `Ctrl+A h` — hold (pin) the quick-context overlay up after the prefix
+    /// clears, and promote it from the translucent peek to a solid panel.
+    /// Firing it again releases the hold. The overlay itself needs no chord
+    /// to *appear*: it peeks for as long as the prefix is armed
+    /// (`ui::quick_context`, docs/input.md).
+    HoldQuickContext,
+    /// Esc while the quick-context overlay is held — release it, and only
+    /// it. A distinct action rather than [`Action::PopLevel`] on purpose:
+    /// PopLevel has many context-blind consumers (room, well, fsn, compose),
+    /// so reusing it would pop the overlay AND the level underneath from one
+    /// keypress. The overlay's own `InputContext` outranks the surface
+    /// beneath it, so exactly one action fires — docs/input.md "Escape — two
+    /// meanings total".
+    UnpinQuickContext,
 
     // ========================================================================
     // Context Interrupt (Ctrl+C in TextInput/Navigation)

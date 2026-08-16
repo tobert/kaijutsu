@@ -253,6 +253,16 @@ pub enum RpcResultMessage {
     PeersReceived {
         peers: Vec<kaijutsu_client::PeerInfo>,
     },
+    /// The kernel's roster index (`/run/roster/index`) as fetched by
+    /// `connection::roster::poll_roster_index` — the raw document, or the
+    /// error text that stopped us reading it. Carries a `Result` rather than
+    /// a second failure variant because the drain's whole job is telling the
+    /// two apart honestly: an empty roster and an unreadable one must never
+    /// render the same ("unknown, never absent", `kaijutsu-kernel`'s
+    /// `roster` module doc).
+    RosterIndexReceived {
+        result: Result<String, String>,
+    },
     /// Semantic clusters received (time-well band-2 poll). Drained into
     /// `TimeWellState.clusters` to drive the haystack's cluster-grouped angle.
     ClustersReceived {

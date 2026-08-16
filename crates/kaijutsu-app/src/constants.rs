@@ -37,9 +37,21 @@ impl ZLayer {
     pub const CURSOR: i32 = 20;
     /// HUD panels (agent status, keybinds, etc.)
     pub const HUD: i32 = 50;
+    /// The quick-context overlay (`ui::quick_context`) — above the HUD it
+    /// annotates, deliberately BELOW [`Self::MODAL`].
+    ///
+    /// **Painting order must agree with input priority.** In
+    /// `input::dispatch::context_priority`, `Dialog` outranks
+    /// `QuickContext`: a modal owns Esc while it is up. A panel that painted
+    /// over that dialog would show the player a surface the keyboard does
+    /// not control, so it sits under the modal layer instead.
+    pub const QUICK_CONTEXT: i32 = 75;
     /// Modal overlays (input layer, command palette)
     pub const MODAL: i32 = 100;
-    /// Dropdown menus (above modals)
+    /// Dropdown menus (above modals). No user today: the quick-context
+    /// overlay deliberately takes [`Self::QUICK_CONTEXT`] instead (see
+    /// there), so this stays reserved rather than deleted — a real dropdown
+    /// over a modal is still the layer it describes.
     #[allow(dead_code)]
     pub const DROPDOWN: i32 = 200;
     /// Toast notifications

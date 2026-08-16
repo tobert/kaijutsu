@@ -105,6 +105,10 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         KeyCode::KeyP => Some(Action::ActiveSeatStep(-1)),
         // d — detach to the conversation view from any scene/editor.
         KeyCode::KeyD => Some(Action::DetachToConversation),
+        // h — hold (hud) the quick-context overlay. The overlay is already
+        // on screen by the time this key is pressed: arming the prefix peeks
+        // it (`ui::quick_context`), and `h` is what keeps it there.
+        KeyCode::KeyH => Some(Action::HoldQuickContext),
         // Esc cancels the pending prefix quietly.
         KeyCode::Escape => None,
         _ => None,
@@ -162,6 +166,24 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyA, true, true),
             Some(Action::SwitchToPreviousContext)
+        );
+    }
+
+    /// `h` holds the quick-context overlay. It is deliberately NOT a
+    /// show/hide toggle: the overlay is already peeking (the prefix is armed
+    /// — that is what put it on screen), so this chord's job is only to keep
+    /// it after the prefix clears.
+    #[test]
+    fn h_holds_the_quick_context_overlay() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyH, false, false),
+            Some(Action::HoldQuickContext)
+        );
+        // Ctrl held through the second key is a screen habit; it must not
+        // change what `h` means.
+        assert_eq!(
+            resolve_chord(KeyCode::KeyH, true, false),
+            Some(Action::HoldQuickContext)
         );
     }
 
