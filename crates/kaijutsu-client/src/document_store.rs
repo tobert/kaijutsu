@@ -1,10 +1,9 @@
 //! Multi-context document store.
 //!
-//! Holds a [`ContextMirror`] (the change-feed applier, `context_feed.rs`) and
-//! a [`SyncedInput`] compose-input CRDT per joined context, enabling instant
-//! context switching and LRU eviction. This is the client-owned home for
-//! *all* conversation document state — the app is a renderer over it, not
-//! the owner of the recovery mechanics.
+//! Holds a [`ContextMirror`] (the change-feed applier, `context_feed.rs`) per
+//! joined context, enabling instant context switching and LRU eviction. This
+//! is the client-owned home for *all* conversation document state — the app
+//! is a renderer over it, not the owner of the recovery mechanics.
 //!
 //! Bevy-free on purpose: the app wraps this in a `Resource` newtype, but the
 //! store itself is plain Rust so its logic is unit-testable without a world.
@@ -18,21 +17,28 @@
 //! `FeedEvent::Resubscribed`/`Terminated`) — it only holds the mirror, holds
 //! the live feed receiver alongside it, and drains that receiver on request.
 //! The old `generation`/`stale_active`/`mark_synced` staleness dance is gone
-//! with it; there is nothing left for it to gate. The compose-input CRDT
-//! (`SyncedInput`) is untouched — it stays a raw DTE surface by design (see
-//! docs/change-feed.md open question 2).
+//! with it; there is nothing left for it to gate.
+//!
+//! **Compose input (Lane C slice 3).** The compose draft used to be a
+//! separate [`SyncedInput`] CRDT document, hydrated via `getInputState` and
+//! kept live by `InputTextOps`/`InputCleared` server events. It is now an
+//! ordinary block (`Role::User`, `Status::Draft`, `ephemeral`, one per
+//! `(context, principal)`) that rides the same change feed as every other
+//! block, so it already lands in `mirror.blocks()` — see
+//! [`DocumentEntry::draft_text`]. `SyncedInput` itself is untouched here
+//! (slice 4 territory) but this store no longer holds one.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use kaijutsu_types::{BlockSnapshot, ContextId};
+use kaijutsu_types::{BlockSnapshot, ContextId, PrincipalId, Status};
 use tokio::sync::mpsc;
 
-use crate::{ContextMirror, FeedEvent, MirrorError, SyncedInput};
+use crate::{ContextMirror, FeedEvent, MirrorError};
 
 /// A cached document for a single context: its change-feed mirror, the live
-/// feed receiver that keeps it current, compose input, and the bookkeeping
-/// the store needs to pick eviction victims.
+/// feed receiver that keeps it current, and the bookkeeping the store needs
+/// to pick eviction victims.
 #[allow(dead_code)]
 pub struct DocumentEntry {
     /// The context's projected block state, maintained from the change feed
@@ -42,22 +48,15 @@ pub struct DocumentEntry {
     /// and the app re-subscribing — draining is a no-op while it's `None`,
     /// never a panic.
     pub feed: Option<mpsc::Receiver<FeedEvent>>,
-    /// CRDT-backed input document (compose scratchpad).
-    /// `None` until the input state is fetched from the server.
-    pub input: Option<SyncedInput>,
     /// Context name (e.g. the kernel_id or user-supplied name).
     pub context_name: String,
     /// When this document was last accessed (for LRU eviction).
     pub last_accessed: Instant,
-    /// Set after submit/escape×3 to suppress late-arriving TextOps and
-    /// SyncedInput restoration. Cleared when `InputCleared` arrives from
-    /// the server and triggers a clean re-fetch.
-    pub input_pending_clear: bool,
 }
 
 impl DocumentEntry {
     /// A freshly-installed entry around `mirror`, optionally already wired to
-    /// a live `feed`. Input is unset until fetched.
+    /// a live `feed`.
     pub fn new(
         mirror: ContextMirror,
         feed: Option<mpsc::Receiver<FeedEvent>>,
@@ -66,11 +65,23 @@ impl DocumentEntry {
         Self {
             mirror,
             feed,
-            input: None,
             context_name,
             last_accessed: Instant::now(),
-            input_pending_clear: false,
         }
+    }
+
+    /// `principal`'s compose draft, if it has one — the block in the mirror
+    /// with `status == Status::Draft` and `id.principal_id == principal`.
+    /// There is at most one per (context, principal) by construction
+    /// (`BlockStore::get_or_create_draft`), so the first match is the only
+    /// one. The mirror is version-ordered, so unlike the old `SyncedInput`
+    /// there is no stale-arrival window to guard against here.
+    pub fn draft_text(&self, principal: PrincipalId) -> Option<&str> {
+        self.mirror
+            .blocks()
+            .iter()
+            .find(|b| b.status == Status::Draft && b.id.principal_id == principal)
+            .map(|b| b.content.as_str())
     }
 
     /// Drain every event currently queued on this entry's feed, applying
@@ -343,6 +354,15 @@ mod tests {
         snap
     }
 
+    fn draft(context_id: ContextId, principal: PrincipalId, seq: u64, content: &str) -> BlockSnapshot {
+        let id = kaijutsu_types::BlockId::new(context_id, principal, seq);
+        let mut snap = BlockSnapshot::text(id, None, Role::User, content);
+        snap.kind = BlockKind::Text;
+        snap.status = Status::Draft;
+        snap.ephemeral = true;
+        snap
+    }
+
     /// A delivery batching several mutations, each carrying its OWN version —
     /// the real wire shape (`context_feed.rs`'s `apply()`: "two carried events
     /// never share a version"). A delivery with a single change just gives
@@ -381,8 +401,8 @@ mod tests {
     #[test]
     fn install_over_an_existing_entry_replaces_mirror_and_feed_in_place() {
         // The `FeedEvent::Terminated` recovery path: a brand-new mirror and
-        // receiver replace the dead ones on the SAME entry, so MRU/active/
-        // input bookkeeping survives the recovery untouched.
+        // receiver replace the dead ones on the SAME entry, so MRU/active
+        // bookkeeping survives the recovery untouched.
         let mut store = DocumentStore::default();
         let c = ctx();
         store.install(c, ContextMirror::new(c), None, || "ctx".into());
@@ -504,5 +524,33 @@ mod tests {
         let entry = store.get(c).unwrap();
         assert!(!entry.mirror.is_hydrated());
         assert!(entry.feed.is_none(), "Terminated is not resumable — the dead receiver must be dropped");
+    }
+
+    /// The Lane C slice 3 seam: a draft is an ordinary block in the mirror
+    /// now, so `draft_text` finds it purely by `(Status::Draft, principal)` —
+    /// no CRDT, no separate fetch, other principals' drafts and non-draft
+    /// blocks all ignored.
+    #[test]
+    fn draft_text_finds_the_calling_principals_draft_block_only() {
+        let c = ctx();
+        let me = PrincipalId::new();
+        let someone_else = PrincipalId::new();
+
+        let mut mirror = ContextMirror::new(c);
+        mirror
+            .apply_snapshot(
+                vec![
+                    block(c, 1, "an ordinary message"),
+                    draft(c, someone_else, 1, "a co-player's draft"),
+                    draft(c, me, 1, "my draft"),
+                ],
+                1,
+            )
+            .unwrap();
+        let entry = DocumentEntry::new(mirror, None, "ctx".into());
+
+        assert_eq!(entry.draft_text(me), Some("my draft"));
+        assert_eq!(entry.draft_text(someone_else), Some("a co-player's draft"));
+        assert_eq!(entry.draft_text(PrincipalId::new()), None, "a principal with no draft gets None");
     }
 }

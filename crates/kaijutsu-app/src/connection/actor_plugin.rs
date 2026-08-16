@@ -279,11 +279,6 @@ pub enum RpcResultMessage {
     /// Deliberately carries no auto-requeue semantics (a permanently-failing
     /// path would hot-loop) — see `view::fsn::sync::apply_fsn_snapshot`.
     VfsSnapshotFailed { path: String },
-    /// Input document state received (for initializing SyncedInput on context join).
-    InputStateReceived {
-        context_id: ContextId,
-        state: kaijutsu_client::InputState,
-    },
     /// Context created on server — spawn an actor to join it.
     ContextCreated(ContextId),
     /// Restore the last-viewed context on (re)connect, read from the kernel KV

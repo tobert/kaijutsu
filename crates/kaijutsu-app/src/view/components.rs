@@ -12,9 +12,11 @@ pub use kaijutsu_types::{ContextId, PrincipalId};
 /// Session-scoped agent identity for CRDT operations.
 ///
 /// Created once at startup, reused for the `CellEditor` render buffer's
-/// local `BlockStore` and for `SyncedInput` (the compose-input CRDT).
-/// Without this, each frame or context switch would generate a fresh
-/// PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
+/// local `BlockStore`, and — since Lane C slice 3 — for finding this
+/// principal's own compose draft among the ordinary blocks in a context's
+/// `ContextMirror` (`DocumentEntry::draft_text`). Without this, each frame
+/// or context switch would generate a fresh PrincipalId, fragmenting CRDT
+/// authorship and wasting DTE agent slots.
 #[derive(Resource)]
 pub struct SessionPrincipal(pub PrincipalId);
 

@@ -53,6 +53,7 @@ pub fn handle_focus_compose(
     mut surface: ResMut<super::focus::ActiveSurface>,
     mut overlay: Query<&mut crate::cell::InputOverlay, With<crate::cell::InputOverlayMarker>>,
     doc_cache: Res<crate::cell::DocumentCache>,
+    session_principal: Res<crate::cell::SessionPrincipal>,
     mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
     for ActionFired { action, .. } in actions.read() {
@@ -65,19 +66,18 @@ pub fn handle_focus_compose(
         // Set the overlay mode and restore text from CRDT if available
         if let Ok(mut overlay) = overlay.single_mut() {
             overlay.mode = crate::cell::InputMode::Chat;
-            // Restore draft from CRDT InputDocEntry if overlay is empty
-            // and no clear is pending (submit/escape×3 in flight).
+            // Restore draft from the mirror if the overlay is empty. The
+            // draft is an ordinary block now (Lane C slice 3) — no CRDT, no
+            // pending-clear suppression: the mirror is version-ordered and
+            // has nothing stale to arrive late.
             if overlay.text.is_empty()
                 && let Some(ctx_id) = doc_cache.active_id()
                 && let Some(cached) = doc_cache.get(ctx_id)
-                && !cached.input_pending_clear
-                && let Some(ref input) = cached.input
+                && let Some(draft_text) = cached.draft_text(session_principal.0)
+                && !draft_text.is_empty()
             {
-                let crdt_text = input.text();
-                if !crdt_text.is_empty() {
-                    overlay.text = crdt_text;
-                    overlay.cursor = overlay.text.len();
-                }
+                overlay.text = draft_text.to_string();
+                overlay.cursor = overlay.text.len();
             }
 
             // Always reset vim state to Normal first — clears any stale
@@ -278,7 +278,7 @@ pub fn handle_interrupt(
         ),
     >,
     surface: Res<super::focus::ActiveSurface>,
-    mut doc_cache: ResMut<crate::cell::DocumentCache>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
     for ActionFired { action, .. } in actions.read() {
@@ -327,11 +327,7 @@ pub fn handle_interrupt(
                 ov.selection_anchor = None;
             }
             if let Some(ctx_id) = doc_cache.active_id() {
-                // Suppress late TextOps until InputCleared re-fetch
-                if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                    cached.input_pending_clear = true;
-                }
-                // Tell the kernel to clear — emits InputCleared
+                // Tell the kernel to clear the draft block.
                 if let Some(ref actor) = actor {
                     let handle = actor.handle.clone();
                     bevy::tasks::IoTaskPool::get()
@@ -814,8 +810,11 @@ pub fn handle_tiling(mut actions: MessageReader<ActionFired>, mut tree: ResMut<T
 /// editing actions (Submit, Backspace, Delete, cursor movement).
 /// Uses `ActiveSurface` to determine shell vs chat routing on Submit.
 ///
-/// Dual-writes to CRDT input document via `edit_input` RPC for persistence.
-/// Submit uses `submit_input` RPC — overlay cleared only on `InputCleared`.
+/// Writes to the server-side draft block via `edit_input` RPC for
+/// persistence. Submit uses `submit_input` RPC; the overlay is cleared
+/// optimistically since the draft block itself (not a copy) becomes the
+/// submitted message — the mirror will reflect that on the next feed
+/// delivery.
 pub fn handle_compose_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
@@ -832,7 +831,7 @@ pub fn handle_compose_input(
     >,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
     actor: Option<Res<crate::connection::RpcActor>>,
-    mut doc_cache: ResMut<crate::cell::DocumentCache>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     mut focus: ResMut<FocusArea>,
     surface: Res<super::focus::ActiveSurface>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -908,7 +907,13 @@ pub fn handle_compose_input(
                         overlay.cursor = 0;
                         overlay.selection_anchor = None;
                     } else {
-                        // Chat: submit via CRDT → submit_input RPC
+                        // Chat: submit_input flips the draft block's status
+                        // away from Draft, turning it into a regular message
+                        // in place (a status transition, not a copy — see
+                        // `Status::Draft`'s doc comment). The mirror will
+                        // carry that change back on the feed; clear the
+                        // overlay optimistically now so the compose box
+                        // doesn't sit full in the meantime.
                         bevy::tasks::IoTaskPool::get()
                             .spawn(async move {
                                 match handle.submit_input(ctx, false).await {
@@ -920,16 +925,9 @@ pub fn handle_compose_input(
                             })
                             .detach();
 
-                        // Clear overlay optimistically. The server's InputCleared
-                        // confirms via re-fetch (see handle_input_doc_events).
                         overlay.text.clear();
                         overlay.cursor = 0;
                         overlay.selection_anchor = None;
-
-                        // Suppress late TextOps until InputCleared re-fetch
-                        if let Some(cached) = doc_cache.get_mut(ctx) {
-                            cached.input_pending_clear = true;
-                        }
                     }
 
                     // Dismiss overlay by transitioning focus

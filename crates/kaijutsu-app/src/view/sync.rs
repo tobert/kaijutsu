@@ -3,9 +3,12 @@
 //! docs/change-feed.md is normative here. The block document is a
 //! `ContextMirror` (crates/kaijutsu-client/src/context_feed.rs) fed by a
 //! per-context change feed, not a CRDT fed by `ServerEvent::BlockTextOps`.
-//! `handle_block_events` still owns `ContextJoined`/input-state bootstrap;
-//! `drain_context_feeds` is the new steady-state and recovery driver,
-//! replacing the old `check_cache_staleness` poll.
+//! `handle_block_events` still owns `ContextJoined`; `drain_context_feeds`
+//! is the steady-state and recovery driver, replacing the old
+//! `check_cache_staleness` poll. The compose draft (Lane C slice 3) rides
+//! this same mirror as an ordinary `Status::Draft` block — there is no more
+//! separate input-doc hydration or `InputTextOps`/`InputCleared` handling
+//! here; see `kaijutsu_client::DocumentEntry::draft_text`.
 
 use bevy::prelude::*;
 
@@ -39,8 +42,7 @@ fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
     }
 }
 
-/// Handle context-join bookkeeping: membership (`RpcResultMessage::
-/// ContextJoined`) and compose-input hydration (`InputStateReceived`).
+/// Handle context-join bookkeeping (`RpcResultMessage::ContextJoined`).
 ///
 /// The block document itself is no longer hydrated here. A `ContextJoined`
 /// carries no CRDT state to apply any more — `drain_context_hydrations`
@@ -49,10 +51,12 @@ fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
 /// ride `RpcResultMessage`: `MessageReader` hands out shared references, and
 /// a receiver can't be moved out of one — see `ContextHydrationChannel`).
 /// This function only reacts to the join *event* — set active, satisfy a
-/// pending switch, kick off the input-doc fetch — plus the scroll-follow
-/// bookkeeping that used to piggyback on the streamed-block loop this
-/// function no longer has (streamed block/text changes ride the per-context
-/// change feed now; see `drain_context_feeds`).
+/// pending switch — plus the scroll-follow bookkeeping that used to
+/// piggyback on the streamed-block loop this function no longer has
+/// (streamed block/text changes ride the per-context change feed now; see
+/// `drain_context_feeds`). Compose-input hydration is gone too (Lane C
+/// slice 3): the draft is an ordinary block, so it arrives on the same
+/// change feed as everything else — no separate fetch needed.
 pub fn handle_block_events(
     mut result_events: MessageReader<RpcResultMessage>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -60,46 +64,13 @@ pub fn handle_block_events(
     layout_gen: Res<LayoutGeneration>,
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    session_principal: Res<crate::cell::SessionPrincipal>,
-    actor: Option<Res<crate::connection::RpcActor>>,
-    channel: Res<crate::connection::RpcResultChannel>,
 ) {
     let was_at_bottom = scroll_state.is_at_bottom();
-    let principal_id = session_principal.0;
 
     for result in result_events.read() {
         match result {
             RpcResultMessage::ContextJoined { membership } => {
                 let ctx_id = membership.context_id;
-
-                // Fetch input document state for the joined context.
-                if let Some(ref actor) = actor {
-                    let handle = actor.handle.clone();
-                    let tx = channel.sender();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            match handle.get_input_state(ctx_id).await {
-                                Ok(state) => {
-                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
-                                        context_id: ctx_id,
-                                        state,
-                                    });
-                                }
-                                Err(e) => {
-                                    log::warn!("get_input_state failed for {}: {}", ctx_id, e);
-                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
-                                        context_id: ctx_id,
-                                        state: kaijutsu_client::InputState {
-                                            content: String::new(),
-                                            ops: Vec::new(),
-                                            version: 0,
-                                        },
-                                    });
-                                }
-                            }
-                        })
-                        .detach();
-                }
 
                 if doc_cache.active_id().is_none() {
                     doc_cache.set_active(ctx_id);
@@ -112,36 +83,6 @@ pub fn handle_block_events(
                     );
                     pending_switch.0 = None;
                     switch_writer.write(crate::cell::ContextSwitchRequested { context_id: ctx_id });
-                }
-            }
-            RpcResultMessage::InputStateReceived { context_id, state } => {
-                let ctx_id = *context_id;
-                if let Some(cached) = doc_cache.get_mut(ctx_id)
-                    && cached.input.is_none()
-                {
-                    if state.ops.is_empty() {
-                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, principal_id));
-                        info!("Initialized empty SyncedInput for {}", ctx_id);
-                    } else {
-                        match kaijutsu_client::SyncedInput::from_state(ctx_id, principal_id, &state.ops)
-                        {
-                            Ok(input) => {
-                                info!(
-                                    "Initialized SyncedInput for {} (text='{}')",
-                                    ctx_id, state.content
-                                );
-                                cached.input = Some(input);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to create SyncedInput from state for {}: {}",
-                                    ctx_id, e
-                                );
-                                cached.input =
-                                    Some(kaijutsu_client::SyncedInput::new(ctx_id, principal_id));
-                            }
-                        }
-                    }
                 }
             }
             _ => {}
@@ -302,118 +243,11 @@ fn spawn_full_rehydrate(
         .detach();
 }
 
-/// Handle input document events (InputTextOps, InputCleared).
-///
-/// After submit or escape×3, `input_pending_clear` is set on the
-/// CachedDocument. While set, TextOps are suppressed (they may carry
-/// stale inserts from before the server cleared). When the server
-/// confirms via InputCleared, the flag is cleared and a fresh input
-/// state is re-fetched to restore SyncedInput with clean CRDT history.
-pub fn handle_input_doc_events(
-    mut server_events: MessageReader<ServerEventMessage>,
-    mut doc_cache: ResMut<crate::cell::DocumentCache>,
-    mut overlay: Query<&mut crate::cell::InputOverlay, With<crate::cell::InputOverlayMarker>>,
-    mut scroll_state: ResMut<ConversationScrollState>,
-    mut focus: ResMut<crate::input::focus::FocusArea>,
-    session_principal: Res<crate::cell::SessionPrincipal>,
-    actor: Option<Res<crate::connection::RpcActor>>,
-    channel: Res<crate::connection::RpcResultChannel>,
-) {
-    use kaijutsu_client::ServerEvent;
-
-    for ServerEventMessage(event) in server_events.read() {
-        match event {
-            ServerEvent::InputTextOps { context_id, ops, .. } => {
-                if let Some(cached) = doc_cache.get_mut(*context_id) {
-                    // Suppress late TextOps during pending clear — they carry
-                    // stale inserts from before the server's clear_input.
-                    if cached.input_pending_clear {
-                        trace!("Suppressed InputTextOps for {} (pending clear)", context_id);
-                        continue;
-                    }
-                    if let Some(input) = &mut cached.input
-                        && let Err(e) = input.apply_remote_ops(ops)
-                    {
-                        warn!(
-                            "Failed to apply remote input ops for {}: {}, dropping input for re-sync",
-                            context_id, e
-                        );
-                        cached.input = None;
-                    }
-                }
-            }
-            ServerEvent::InputCleared { context_id } => {
-                let ctx_id = *context_id;
-
-                // Clear the pending flag and drop the stale SyncedInput.
-                // Re-fetch from server to get clean CRDT history.
-                if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                    cached.input_pending_clear = false;
-                    cached.input = None;
-                }
-
-                // Re-fetch input state — server's doc is now clean post-clear.
-                // InputStateReceived handler will recreate SyncedInput.
-                let principal_id = session_principal.0;
-                if let Some(ref actor) = actor {
-                    let handle = actor.handle.clone();
-                    let tx = channel.sender();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            match handle.get_input_state(ctx_id).await {
-                                Ok(state) => {
-                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
-                                        context_id: ctx_id,
-                                        state,
-                                    });
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "get_input_state re-fetch after clear failed for {}: {}",
-                                        ctx_id,
-                                        e
-                                    );
-                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
-                                        context_id: ctx_id,
-                                        state: kaijutsu_client::InputState {
-                                            content: String::new(),
-                                            ops: Vec::new(),
-                                            version: 0,
-                                        },
-                                    });
-                                }
-                            }
-                        })
-                        .detach();
-                } else {
-                    // No actor — create empty SyncedInput directly
-                    if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, principal_id));
-                    }
-                }
-
-                if doc_cache.active_id() == Some(ctx_id) {
-                    // Overlay may already be cleared by optimistic local clear.
-                    if let Ok(mut overlay) = overlay.single_mut() {
-                        overlay.text.clear();
-                        overlay.cursor = 0;
-                        overlay.selection_anchor = None;
-                    }
-                    if matches!(*focus, crate::input::focus::FocusArea::Compose) {
-                        *focus = crate::input::focus::FocusArea::Conversation;
-                    }
-                    scroll_state.start_following();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Sync the MainCell's content with the active document in DocumentCache.
 pub fn sync_main_cell_to_conversation(
     doc_cache: Res<crate::cell::DocumentCache>,
     entities: Res<EditorEntities>,
+    session_principal: Res<crate::cell::SessionPrincipal>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
 ) {
@@ -454,11 +288,21 @@ pub fn sync_main_cell_to_conversation(
     // fresh store) instead of `BlockStore::from_snapshot`'s CRDT-snapshot
     // round trip. `ContextMirror::blocks()` is already document order, so a
     // plain left-to-right insert reproduces it.
+    //
+    // The local principal's own compose draft (Lane C slice 3: an ordinary
+    // `Status::Draft` block riding this same mirror) is skipped here — it
+    // already renders in the compose box, so materializing it into the
+    // transcript too would double-render it. A co-player's draft is left
+    // alone deliberately: watching a neighbor type is a feature, not a bug
+    // (see `block_border.rs`'s `Status::Draft` handling).
     let principal_id = editor.store.principal_id();
     let mut store = kaijutsu_crdt::BlockStore::new(ctx_id, principal_id);
     let mut after = None;
     let mut ok = true;
     for block in cached.mirror.blocks() {
+        if block.status == kaijutsu_types::Status::Draft && block.id.principal_id == session_principal.0 {
+            continue;
+        }
         match store.insert_from_snapshot(block.clone(), after.as_ref()) {
             Ok(id) => after = Some(id),
             Err(e) => {
