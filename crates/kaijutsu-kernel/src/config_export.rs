@@ -5,8 +5,8 @@
 //!
 //! [`ConfigCrdtFs`] mounts four roots — `/etc/rc`, `/etc/config`,
 //! `/etc/client`, `/etc/midi` — all sharing one doc model
-//! ([`crate::config_doc`]): a document is either a [`DocKind::Config`] file
-//! or a [`DocKind::Symlink`], and directories are virtual, synthesized from
+//! ([`crate::config_doc`]): a document is either a [`DocKind::File`] or a
+//! [`DocKind::Symlink`], and directories are virtual, synthesized from
 //! the set of document paths (see `runtime::config_crdt_fs` module docs).
 //! This module is purely additive: it does not touch mount wiring, delete any
 //! document, or add a git dependency. It builds the export model
@@ -593,7 +593,7 @@ mod tests {
         let canonical = format!("{RC_ROOT}/coder/create/S00-halted.kai");
         let ctx = config_context_id(&canonical);
         blocks
-            .create_document_with_path(ctx, DocKind::Config, None, canonical)
+            .create_document_with_path(ctx, DocKind::File, None, canonical)
             .unwrap();
 
         let err = export_config_tree(&blocks).unwrap_err();

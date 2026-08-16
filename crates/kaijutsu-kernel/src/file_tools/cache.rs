@@ -70,7 +70,7 @@ struct CachedFileDoc {
 
 /// Cache that maps VFS files to CRDT documents.
 ///
-/// Each file becomes a document with `DocKind::Code` and a single
+/// Each file becomes a document with `DocKind::File` and a single
 /// `BlockKind::Text` block. Edits go through the CRDT, enabling
 /// concurrent modification with proper conflict resolution.
 pub struct FileDocumentCache {
@@ -318,7 +318,7 @@ impl FileDocumentCache {
 
         let block_id = match self
             .block_store
-            .create_document(ctx_id, DocKind::Code, language)
+            .create_document(ctx_id, DocKind::File, language)
         {
             Ok(()) => self
                 .block_store
@@ -606,7 +606,7 @@ impl FileDocumentCache {
         // replacing the existing block's content rather than erroring.
         let block_id = match self
             .block_store
-            .create_document(ctx_id, DocKind::Code, language)
+            .create_document(ctx_id, DocKind::File, language)
         {
             Ok(()) => self
                 .block_store

@@ -3833,7 +3833,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::system());
         let ctx = ContextId::new();
         store
-            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
         broker.set_documents(store.clone()).await;
         (broker, store, ctx)
@@ -4083,7 +4083,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::system());
         let ctx = ContextId::new();
         store
-            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
         broker.set_documents(store.clone()).await;
 
@@ -4260,7 +4260,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::system());
         let ctx = ContextId::new();
         store
-            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
         broker.set_documents(store.clone()).await;
         bind(&broker, ctx, "chatty").await;
@@ -4885,10 +4885,10 @@ mod tests {
         let ctx_a = ContextId::new();
         let ctx_b = ContextId::new();
         store
-            .create_document(ctx_a, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx_a, DocumentKind::File, Some("rust".into()))
             .unwrap();
         store
-            .create_document(ctx_b, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx_b, DocumentKind::File, Some("rust".into()))
             .unwrap();
         broker.set_documents(store.clone()).await;
         for ctx in [ctx_a, ctx_b] {
@@ -5647,7 +5647,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::system());
         let ctx = ContextId::new();
         store
-            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
         broker.set_documents(store.clone()).await;
         bind(&broker, ctx, "chatty").await;
@@ -6988,7 +6988,7 @@ mod tests {
             db.insert_document(&DocumentRow {
                 document_id: ctx,
                 workspace_id: ws_id,
-                doc_kind: DocKind::Code,
+                doc_kind: DocKind::File,
                 language: None,
                 path: None,
                 created_at: now_millis() as i64,

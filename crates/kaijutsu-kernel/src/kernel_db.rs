@@ -1654,6 +1654,7 @@ impl KernelDb {
         Self::migrate_preset_cast_narrowing(conn)?;
         Self::migrate_backends_kind_check(conn)?;
         Self::migrate_well_known_lost_found(conn)?;
+        Self::migrate_doc_kind_file_collapse(conn)?;
         Ok(())
     }
 
@@ -1875,6 +1876,23 @@ impl KernelDb {
                FROM contexts WHERE label = 'lost+found'
                ORDER BY created_at LIMIT 1",
             params![now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Collapse the retired `code`, `text`, and `config` document kinds into
+    /// the one `file` kind. The three tags described a single-block,
+    /// path-addressed document whose content is the file body; the `language`
+    /// column already carried whatever distinguished them.
+    ///
+    /// Idempotent by construction — after the first run the `WHERE` clause
+    /// matches zero rows, so this needs no `kernel_migrations` marker and is
+    /// safe on every `open()`.
+    fn migrate_doc_kind_file_collapse(conn: &Connection) -> KernelDbResult<()> {
+        conn.execute(
+            "UPDATE documents SET doc_kind = 'file'
+              WHERE doc_kind IN ('code', 'text', 'config')",
+            [],
         )?;
         Ok(())
     }
@@ -11321,6 +11339,108 @@ mod tests {
         // registry pointer, it does not delete or rename anything.
         let incumbent_row = db.find_context_by_label("lost+found").unwrap().unwrap();
         assert_eq!(incumbent_row.context_id, incumbent.context_id);
+    }
+
+    /// Write one `documents` row per legacy tag, bypassing `DocKind` so the
+    /// retired spellings reach SQLite verbatim. Returns the row ids in the
+    /// order the tags were given.
+    fn insert_raw_kind_docs(db: &KernelDb, ws_id: WorkspaceId, tags: &[&str]) -> Vec<ContextId> {
+        tags.iter()
+            .map(|tag| {
+                let id = ContextId::new();
+                db.conn
+                    .execute(
+                        "INSERT INTO documents (
+                            document_id, workspace_id, doc_kind,
+                            language, path, created_at, created_by
+                        ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                        params![
+                            blob_param(id.as_bytes()),
+                            blob_param(ws_id.as_bytes()),
+                            tag,
+                            if *tag == "code" { Some("rust") } else { None },
+                            now_millis(),
+                            blob_param(PrincipalId::system().as_bytes()),
+                        ],
+                    )
+                    .unwrap();
+                id
+            })
+            .collect()
+    }
+
+    fn raw_doc_kind(db: &KernelDb, id: ContextId) -> String {
+        db.conn
+            .query_row(
+                "SELECT doc_kind FROM documents WHERE document_id = ?1",
+                params![blob_param(id.as_bytes())],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `code`, `text`, and `config` collapse into `file`, and no row is lost:
+    /// the migration rewrites a tag, it never deletes or inserts.
+    #[test]
+    fn migrate_doc_kind_file_collapse_remaps_legacy_tags() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ids = insert_raw_kind_docs(&db, ws_id, &["code", "text", "config"]);
+        let before = db.list_documents().unwrap().len();
+
+        KernelDb::migrate_doc_kind_file_collapse(&db.conn).unwrap();
+
+        for id in &ids {
+            assert_eq!(raw_doc_kind(&db, *id), "file");
+            let row = db.get_document(*id).unwrap().unwrap();
+            assert_eq!(row.doc_kind, DocKind::File);
+        }
+        assert_eq!(
+            db.list_documents().unwrap().len(),
+            before,
+            "the migration rewrites tags; it must not drop a row"
+        );
+    }
+
+    /// `conversation` and `symlink` rows survive the collapse untouched — the
+    /// `WHERE` clause names three tags and only those three.
+    #[test]
+    fn migrate_doc_kind_file_collapse_leaves_conversation_and_symlink() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ids = insert_raw_kind_docs(&db, ws_id, &["conversation", "symlink"]);
+        let before = db.list_documents().unwrap().len();
+
+        KernelDb::migrate_doc_kind_file_collapse(&db.conn).unwrap();
+
+        assert_eq!(raw_doc_kind(&db, ids[0]), "conversation");
+        assert_eq!(raw_doc_kind(&db, ids[1]), "symlink");
+        assert_eq!(
+            db.get_document(ids[0]).unwrap().unwrap().doc_kind,
+            DocKind::Conversation
+        );
+        assert_eq!(
+            db.get_document(ids[1]).unwrap().unwrap().doc_kind,
+            DocKind::Symlink
+        );
+        assert_eq!(db.list_documents().unwrap().len(), before);
+    }
+
+    /// Running the collapse twice is safe — the second run matches zero rows,
+    /// which is why it carries no `kernel_migrations` marker.
+    #[test]
+    fn migrate_doc_kind_file_collapse_is_idempotent() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ids = insert_raw_kind_docs(&db, ws_id, &["code", "text", "config"]);
+
+        KernelDb::migrate_doc_kind_file_collapse(&db.conn).unwrap();
+        KernelDb::migrate_doc_kind_file_collapse(&db.conn).unwrap();
+
+        for id in &ids {
+            assert_eq!(raw_doc_kind(&db, *id), "file");
+        }
+        assert_eq!(db.list_documents().unwrap().len(), 3);
     }
 
     /// The backfill migration (`migrate_well_known_lost_found`) adopts a

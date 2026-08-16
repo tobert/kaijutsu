@@ -30,7 +30,7 @@ data.
 ## Storage model
 
 One path maps to one document: `UUIDv5("kaijutsu:config:{path}")` →
-a single-block `DocKind::Config` document, over hierarchical paths, with one seed
+a single-block `DocKind::File` document, over hierarchical paths, with one seed
 mechanism.
 
 **The `documents` table is the manifest.** `documents(document_id, workspace_id,
@@ -179,7 +179,7 @@ about. The cascade is **opt-in by the reader**: kernel-global readers keep
 reading `/etc/config/<name>` with no id and get no cascade; a client-facing read
 passes its client-id and gets the two-level resolution. It reuses the
 hierarchical config store unchanged — `/etc/client/<id>/x` is just another
-`DocKind::Config` document at a deeper path, readdir via the existing manifest
+`DocKind::File` document at a deeper path, readdir via the existing manifest
 prefix scan. **No new backend machinery** — a mount at `/etc/client`, a
 resolver, and a write-target policy.
 

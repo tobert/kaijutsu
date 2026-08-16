@@ -16,7 +16,7 @@
 //! Resolution is **path-kind aware**, and this is load-bearing, not cosmetic:
 //!
 //! - **config-owned** paths (`/etc/rc/*`, `/etc/config/*`) are sole-owned
-//!   single-block [`DocKind::Config`] documents
+//!   single-block [`DocKind::File`] documents
 //!   ([`ConfigCrdtFs`](crate::runtime::ConfigCrdtFs)). The CRDT *is* the owner —
 //!   there is no host file. We resolve straight to that document's block.
 //! - **ordinary files** resolve through

@@ -995,7 +995,7 @@ mod tests {
             g.insert_document(&DocumentRow {
                 document_id: ctx.context_id,
                 workspace_id: ws_id,
-                doc_kind: DocumentKind::Code,
+                doc_kind: DocumentKind::File,
                 language: None,
                 path: None,
                 created_at: now_millis() as i64,
@@ -1004,7 +1004,7 @@ mod tests {
             .unwrap();
         }
         store
-            .create_document(ctx.context_id, DocumentKind::Code, None)
+            .create_document(ctx.context_id, DocumentKind::File, None)
             .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1434,7 +1434,7 @@ mod tests {
         // Create blocks in different documents
         let ctx2 = ContextId::new();
         store
-            .create_document(ctx2, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx2, DocumentKind::File, Some("rust".into()))
             .unwrap();
 
         store

@@ -144,7 +144,7 @@ write-once snapshot fields.
 
 ### Document kinds
 
-`DocKind` is defined in `kaijutsu-types` (`enums.rs:184`) but *implemented* here —
+`DocKind` is defined in `kaijutsu-types` (`enums.rs`, three variants: `Conversation`, `File`, `Symlink`) but *implemented* here —
 `kaijutsu_kernel::blocks` doesn't map kinds to backends; the kernel does.
 Variants: **Conversation** (the dialog block log), **Code** (file-tool cache, one
 doc per tracked file), **Text** (static markdown), **Config** (theme/models TOML),

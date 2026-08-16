@@ -36,11 +36,11 @@ pub(crate) struct DocArgs {
 
 #[derive(Subcommand, Debug)]
 enum DocCommand {
-    /// List all documents. Includes non-conversation kinds (Code, Text,
-    /// Config) that `kj context list` hides. Filter with `--kind`.
+    /// List all documents. Includes the File and Symlink kinds that
+    /// `kj context list` hides. Filter with `--kind`.
     #[command(alias = "ls")]
     List {
-        /// Filter by kind: conversation|code|text|config
+        /// Filter by kind: conversation|file|symlink
         #[arg(long)]
         kind: Option<String>,
         /// Emit a JSON object instead of a table
@@ -62,9 +62,9 @@ enum DocCommand {
     },
     /// Create a new document. For Conversation kind, prefer
     /// `kj context create` (which also registers contexts metadata).
-    /// Use this verb for Code/Text/Config docs that aren't conversations.
+    /// Use this verb for File docs that aren't conversations.
     Create {
-        /// Kind: conversation|code|text|config (default: conversation)
+        /// Kind: conversation|file|symlink (default: conversation)
         #[arg(long, default_value = "conversation")]
         kind: String,
         /// Programming language (for code documents)
@@ -162,7 +162,7 @@ impl KjDispatcher {
                     // strum::EnumString — fall through if it doesn't parse;
                     // surfaces a friendly error instead of returning nothing.
                     return KjResult::Err(format!(
-                        "kj doc list: invalid kind '{s}' (expected conversation|code|text|config)"
+                        "kj doc list: invalid kind '{s}' (expected conversation|file|symlink)"
                     ));
                 }
             },
@@ -349,7 +349,7 @@ impl KjDispatcher {
             Some(k) => k,
             None => {
                 return KjResult::Err(format!(
-                    "kj doc create: invalid kind '{kind}' (expected conversation|code|text|config)"
+                    "kj doc create: invalid kind '{kind}' (expected conversation|file|symlink)"
                 ));
             }
         };
@@ -663,12 +663,13 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
 
-        // Create three docs: one Conversation (with context), one Code, one Config.
+        // Three docs: one Conversation (with context) and two Files — a rust
+        // source and a config, which differ only by `language`.
         let conv_ctx = register_context_with_doc(&d, Some("chat"), principal);
         let code_id = ContextId::new();
-        register_doc_in_db(&d, code_id, DocKind::Code, Some("rust"), principal);
+        register_doc_in_db(&d, code_id, DocKind::File, Some("rust"), principal);
         let cfg_id = ContextId::new();
-        register_doc_in_db(&d, cfg_id, DocKind::Config, None, principal);
+        register_doc_in_db(&d, cfg_id, DocKind::File, None, principal);
 
         let c = caller_with_context(conv_ctx);
         let result = d.dispatch(&[s("doc"), s("list"), s("--json")], &c).await;
@@ -677,17 +678,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
         assert_eq!(v["count"], 3, "must include non-conversation docs: {v}");
 
-        // The kind filter is honored; code-only returns the code doc.
-        let result = d
-            .dispatch(
-                &[s("doc"), s("list"), s("--kind"), s("code"), s("--json")],
-                &c,
-            )
-            .await;
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["count"], 1);
-        assert_eq!(v["documents"][0]["kind"], "code");
-        assert_eq!(v["documents"][0]["language"], "rust");
+        // The kind filter is honored: `file` returns both files and skips the
+        // conversation. The retired tag `code` is an alias for `file`, so it
+        // selects the same two rows.
+        for kind in ["file", "code"] {
+            let result = d
+                .dispatch(
+                    &[s("doc"), s("list"), s("--kind"), s(kind), s("--json")],
+                    &c,
+                )
+                .await;
+            let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
+            assert_eq!(v["count"], 2, "--kind {kind}: {v}");
+            for doc in v["documents"].as_array().unwrap() {
+                assert_eq!(doc["kind"], "file");
+            }
+        }
     }
 
     #[tokio::test]
@@ -827,7 +833,7 @@ mod tests {
         assert!(result.is_ok());
         let id = ContextId::parse(result.message().trim()).unwrap();
         let entry = d.block_store().get(id).unwrap();
-        assert_eq!(entry.kind, DocKind::Code);
+        assert_eq!(entry.kind, DocKind::File);
         assert_eq!(entry.language.as_deref(), Some("rust"));
     }
 

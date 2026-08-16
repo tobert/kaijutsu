@@ -10,7 +10,7 @@
 //!
 //! ## Model (shared with `ConfigCrdtBackend`)
 //!
-//! Each path maps to a single-block [`DocKind::Config`] document keyed by
+//! Each path maps to a single-block [`DocKind::File`] document keyed by
 //! [`config_context_id`]. The `documents` table — which `create_document_with_path`
 //! populates — doubles as the **readdir manifest**: directories are virtual,
 //! synthesized from the set of descendant paths. So the doc and its manifest
@@ -35,7 +35,7 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use kaijutsu_types::DocKind;
 
 use crate::block_store::SharedBlockStore;
-use crate::config_doc::{self, config_context_id, CONFIG_DOC_KIND};
+use crate::config_doc::{self, config_context_id};
 use crate::vfs::{DirEntry, FileAttr, FileType, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
 
 /// Max symlink hops before [`VfsError::TooManySymlinks`]. Guards against cycles
@@ -236,7 +236,7 @@ impl ConfigCrdtFs {
             self.blocks
                 .create_document_with_path(
                     ctx,
-                    CONFIG_DOC_KIND,
+                    DocKind::File,
                     None,
                     canonical.to_string(),
                 )

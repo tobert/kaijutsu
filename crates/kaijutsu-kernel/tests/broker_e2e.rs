@@ -59,7 +59,7 @@ async fn setup() -> Fixture {
         g.insert_document(&DocumentRow {
             document_id: ctx_id,
                         workspace_id: ws_id,
-            doc_kind: DocumentKind::Code,
+            doc_kind: DocumentKind::File,
             language: None,
             path: None,
             created_at: now_millis() as i64,
@@ -67,7 +67,7 @@ async fn setup() -> Fixture {
         })
         .unwrap();
     }
-    store.create_document(ctx_id, DocumentKind::Code, None).unwrap();
+    store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
     let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
     kernel
@@ -1236,7 +1236,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
         g.insert_document(&DocumentRow {
             document_id: ctx_id,
                         workspace_id: ws_id,
-            doc_kind: DocumentKind::Code,
+            doc_kind: DocumentKind::File,
             language: None,
             path: None,
             created_at: now_millis() as i64,
@@ -1271,7 +1271,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
         })
         .unwrap();
     }
-    store.create_document(ctx_id, DocumentKind::Code, None).unwrap();
+    store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
     let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
     kernel

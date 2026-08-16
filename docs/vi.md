@@ -272,7 +272,7 @@ load-bearing:
   unmounted tree).
 - **ordinary file**: `FileDocumentCache::get_or_load(path)`.
 
-rc/config are sole-owned single-block `DocKind::Config` documents. Running a
+rc/config are sole-owned single-block `DocKind::File` documents. Running a
 config path through `get_or_load` would mint a *separate* `FileDocumentCache`
 copy shadowing that owner — reviving the dual-ownership write-through bug
 class (`docs/config-ownership.md`). Missing config docs **fail loud** (no

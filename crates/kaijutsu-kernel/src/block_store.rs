@@ -3686,7 +3686,7 @@ mod tests {
         let ctx = ContextId::new();
 
         store
-            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
 
         // Insert a text block using new API
@@ -3771,7 +3771,7 @@ mod tests {
         let ctx = ContextId::new();
 
         store
-            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
 
         store
@@ -3798,8 +3798,8 @@ mod tests {
         let store = BlockStore::new(test_agent());
         let conv1 = ContextId::new();
         let conv2 = ContextId::new();
-        let code1 = ContextId::new();
-        let config1 = ContextId::new();
+        let source = ContextId::new();
+        let config = ContextId::new();
 
         store
             .create_document(conv1, DocumentKind::Conversation, None)
@@ -3808,10 +3808,10 @@ mod tests {
             .create_document(conv2, DocumentKind::Conversation, None)
             .unwrap();
         store
-            .create_document(code1, DocumentKind::Code, Some("rust".into()))
+            .create_document(source, DocumentKind::File, Some("rust".into()))
             .unwrap();
         store
-            .create_document(config1, DocumentKind::Config, None)
+            .create_document(config, DocumentKind::File, None)
             .unwrap();
 
         assert_eq!(store.list_ids().len(), 4);
@@ -3821,16 +3821,14 @@ mod tests {
         assert!(convs.contains(&conv1));
         assert!(convs.contains(&conv2));
 
-        let codes = store.list_ids_by_kind(DocumentKind::Code);
-        assert_eq!(codes.len(), 1);
-        assert!(codes.contains(&code1));
+        // A rust source file and a config file are both `File` — the
+        // `language` field carries the difference, so the filter returns both.
+        let files = store.list_ids_by_kind(DocumentKind::File);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&source));
+        assert!(files.contains(&config));
 
-        let configs = store.list_ids_by_kind(DocumentKind::Config);
-        assert_eq!(configs.len(), 1);
-        assert!(configs.contains(&config1));
-
-        let texts = store.list_ids_by_kind(DocumentKind::Text);
-        assert!(texts.is_empty());
+        assert!(store.list_ids_by_kind(DocumentKind::Symlink).is_empty());
     }
 
     #[test]
@@ -3935,7 +3933,7 @@ mod tests {
         let store = Arc::new(BlockStore::new(test_agent()));
         let ctx = ContextId::new();
         store
-            .create_document(ctx, DocumentKind::Code, None)
+            .create_document(ctx, DocumentKind::File, None)
             .unwrap();
 
         let mut tasks = JoinSet::new();
@@ -3997,7 +3995,7 @@ mod tests {
         let doc_ids: Vec<ContextId> = (0..num_docs).map(|_| ContextId::new()).collect();
         for &ctx in &doc_ids {
             store
-                .create_document(ctx, DocumentKind::Code, None)
+                .create_document(ctx, DocumentKind::File, None)
                 .unwrap();
         }
 
@@ -4049,7 +4047,7 @@ mod tests {
         let store = Arc::new(BlockStore::new(test_agent()));
         let ctx = ContextId::new();
         store
-            .create_document(ctx, DocumentKind::Code, None)
+            .create_document(ctx, DocumentKind::File, None)
             .unwrap();
 
         // Insert initial content
@@ -5528,7 +5526,7 @@ mod tests {
                 .insert_document(&DocumentRow {
                     document_id: ctx,
                     workspace_id: ws_id,
-                    doc_kind: DocumentKind::Code, // diverges from Conversation below
+                    doc_kind: DocumentKind::File, // diverges from Conversation below
                     language: None,
                     path: None,
                     created_at: now_millis() as i64,

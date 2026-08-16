@@ -1397,7 +1397,7 @@ mod tests {
             .get_or_create_default_workspace(creator)
             .unwrap();
         let store = shared_block_store_with_db(db, ws_id, creator);
-        let _ = (&store, DocumentKind::Code);
+        let _ = (&store, DocumentKind::File);
 
         let vfs = Arc::new(MountTable::new());
         let cache = Arc::new(FileDocumentCache::new(store, vfs.clone()));

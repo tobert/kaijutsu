@@ -321,7 +321,7 @@ impl KernelBackend for KaijutsuBackend {
                             return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
                         }
                         self.blocks
-                            .create_document(ctx_id, DocKind::Code, None)
+                            .create_document(ctx_id, DocKind::File, None)
                             .map_err(|e| BackendError::Io(e.to_string()))?;
                     }
                     WriteMode::UpdateOnly => {
@@ -332,7 +332,7 @@ impl KernelBackend for KaijutsuBackend {
                     WriteMode::Overwrite | WriteMode::Truncate => {
                         if !self.blocks.contains(ctx_id) {
                             self.blocks
-                                .create_document(ctx_id, DocKind::Code, None)
+                                .create_document(ctx_id, DocKind::File, None)
                                 .map_err(|e| BackendError::Io(e.to_string()))?;
                         }
                     }
@@ -533,7 +533,7 @@ impl KernelBackend for KaijutsuBackend {
                     return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
                 }
                 self.blocks
-                    .create_document(ctx_id, DocKind::Code, None)
+                    .create_document(ctx_id, DocKind::File, None)
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }

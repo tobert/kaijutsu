@@ -164,7 +164,7 @@ frozen.
 share **one kernel document per real file**. Key = `file_context_id(path)` (UUIDv5
 over `"kaijutsu:file:{path}"`) after lexical canonicalization (`path.rs`), so
 `foo.rs`, `./foo.rs`, `/abs/foo.rs` all collapse to one key. Cache miss loads via
-VFS → creates a `DocKind::Code` doc; hits check `disk_mtime > loaded_mtime` and
+VFS → creates a `DocKind::File` doc; hits check `disk_mtime > loaded_mtime` and
 reload if stale (dirty entries are never refreshed — local edits win). Write-through
 is `create_or_replace → mark_dirty → flush_one`; flush stamps `loaded_mtime` from
 the post-write `getattr` so the flush isn't mistaken for an external change. LRU

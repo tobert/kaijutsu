@@ -182,18 +182,19 @@ pub enum DocKind {
         serialize = "agent_message"
     )]
     Conversation,
-    /// Executable code.
-    Code,
-    /// Static markdown/text.
-    #[strum(serialize = "text", serialize = "markdown")]
-    Text,
-    /// Configuration file (theme.toml, mcp.toml).
-    #[strum(serialize = "config")]
-    Config,
-    // `Kv` retired 2026-07-04 (KV store deleted). Do not reuse the `"kv"`
-    // serialize tag — a live DB may still hold document rows tagged `kv`,
-    // which now fall back to `Conversation` via `doc_kind_from_sql`'s
-    // unknown-variant handling rather than panicking.
+    /// File body in a single block — source, markdown, and config are one
+    /// kind, because the `language` field already carries the distinction.
+    /// The `code`, `text`, `markdown`, and `config` tags are the retired
+    /// spellings and still parse, so a row written before the collapse reads.
+    #[strum(
+        serialize = "file",
+        serialize = "code",
+        serialize = "text",
+        serialize = "markdown",
+        serialize = "config"
+    )]
+    #[serde(alias = "code", alias = "text", alias = "markdown", alias = "config")]
+    File,
     /// Symbolic link. Git-style: the single block's content *is* the link
     /// target path; this kind is the authoritative "mode bit" that tells a
     /// reader to follow rather than treat the content as a file body. See
@@ -206,9 +207,7 @@ impl DocKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Conversation => "conversation",
-            Self::Code => "code",
-            Self::Text => "text",
-            Self::Config => "config",
+            Self::File => "file",
             Self::Symlink => "symlink",
         }
     }
@@ -469,13 +468,7 @@ mod tests {
 
     #[test]
     fn doc_kind_as_str_roundtrip() {
-        for kind in [
-            DocKind::Conversation,
-            DocKind::Code,
-            DocKind::Text,
-            DocKind::Config,
-            DocKind::Symlink,
-        ] {
+        for kind in [DocKind::Conversation, DocKind::File, DocKind::Symlink] {
             let s = kind.as_str();
             let parsed = DocKind::from_str(s).unwrap();
             assert_eq!(kind, parsed);
@@ -488,7 +481,7 @@ mod tests {
             DocKind::from_str("CONVERSATION").unwrap(),
             DocKind::Conversation
         );
-        assert_eq!(DocKind::from_str("Code").unwrap(), DocKind::Code);
+        assert_eq!(DocKind::from_str("File").unwrap(), DocKind::File);
     }
 
     #[test]
@@ -503,32 +496,38 @@ mod tests {
             DocKind::from_str("agent_message").unwrap(),
             DocKind::Conversation
         );
-        assert_eq!(DocKind::from_str("markdown").unwrap(), DocKind::Text);
+    }
+
+    /// `code`, `text`, `markdown`, and `config` are the pre-collapse
+    /// spellings of `File`. A row or CBOR snapshot written before the collapse
+    /// must still read, so both parse paths — strum and serde — keep them.
+    #[test]
+    fn doc_kind_legacy_file_tags() {
+        for tag in ["code", "text", "markdown", "config"] {
+            assert_eq!(DocKind::from_str(tag).unwrap(), DocKind::File, "strum: {tag}");
+            let parsed: DocKind = serde_json::from_str(&format!("\"{tag}\"")).unwrap();
+            assert_eq!(parsed, DocKind::File, "serde: {tag}");
+        }
     }
 
     #[test]
     fn doc_kind_display() {
         assert_eq!(format!("{}", DocKind::Conversation), "conversation");
-        assert_eq!(format!("{}", DocKind::Config), "config");
+        assert_eq!(format!("{}", DocKind::File), "file");
     }
 
     #[test]
     fn doc_kind_serde_roundtrip() {
-        let kind = DocKind::Config;
+        let kind = DocKind::File;
         let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, "\"config\"");
+        assert_eq!(json, "\"file\"");
         let parsed: DocKind = serde_json::from_str(&json).unwrap();
         assert_eq!(kind, parsed);
     }
 
     #[test]
     fn doc_kind_cbor_roundtrip() {
-        for kind in [
-            DocKind::Conversation,
-            DocKind::Code,
-            DocKind::Text,
-            DocKind::Config,
-        ] {
+        for kind in [DocKind::Conversation, DocKind::File, DocKind::Symlink] {
             let bytes = crate::codec::encode(&kind).unwrap();
             let parsed: DocKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);

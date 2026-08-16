@@ -6,8 +6,8 @@
 //! across two backends, `ConfigCrdtBackend` and `ConfigCrdtFs`; the former was
 //! deleted when the config TOMLs moved onto this same CRDT-native model — see
 //! `config_seed.rs` and `config_crdt_fs.rs` module docs for that history.)
-//! Every mount shares one doc model — a single-block [`DocKind::Config`] (or
-//! [`DocKind::Symlink`]) document keyed by a deterministic UUIDv5 of its path
+//! Every mount shares one doc model — a single-block `DocKind::File` (or
+//! `DocKind::Symlink`) document keyed by a deterministic UUIDv5 of its path
 //! — so the four trees can never drift into near-identical-but-subtly-different
 //! stores. These free functions ARE that shared model; `ConfigCrdtFs` calls
 //! them rather than re-deriving the id or re-implementing the read.
@@ -15,7 +15,6 @@
 //! [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
 
 use kaijutsu_types::{BlockId, ContextId};
-use kaijutsu_types::DocKind;
 
 use crate::block_store::SharedBlockStore;
 
@@ -32,10 +31,6 @@ pub fn config_context_id(path: &str) -> ContextId {
     );
     ContextId::from_bytes(*uuid.as_bytes())
 }
-
-/// `DocKind` every config/rc document carries. Centralized so a doc seeded by
-/// one backend is recognized (and enumerated) by the other.
-pub const CONFIG_DOC_KIND: DocKind = DocKind::Config;
 
 /// The id of a config doc's first (and only) block, or `None` when the
 /// document is absent or — the halted-replay case — registered but blockless.
