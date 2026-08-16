@@ -1,13 +1,17 @@
-//! Virtual filesystem for the input document (`/v/input`).
+//! Virtual filesystem for compose input (`/v/input`).
 //!
-//! Provides read/write access to the current context's input document
+//! Provides read/write access to the current context's compose draft
 //! through kaish's VFS. Mounted at `/v/input` so agents and scripts can:
 //!
 //! - `cat /v/input` — read the current input text
 //! - `echo "text" > /v/input` — replace the input content
 //!
-//! The input document is a CRDT-backed scratchpad per context, shared
-//! across all participants (human compose box, agents, MCP tools).
+//! As of the draft-block melt, there is no longer one shared input document
+//! per context. There is **one draft block per (context, principal)** — an
+//! ordinary block carrying `Status::Draft` + `ephemeral`. `/v/input` reads
+//! and writes the calling principal's own draft, so two players sharing a
+//! context each see and edit their own text through this mount, not a
+//! scratchpad shared across every participant the way it used to be.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,18 +20,20 @@ use async_trait::async_trait;
 
 use crate::block_store::SharedBlockStore;
 use super::context_engine::{SessionContextExt, SessionContextMap};
-use kaijutsu_types::{ContextId, SessionId};
+use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 use kaish_kernel::vfs::{DirEntry, DirEntryKind, Filesystem};
 
-/// Virtual filesystem exposing the input document at `/v/input`.
+/// Virtual filesystem exposing the calling principal's compose draft at
+/// `/v/input`.
 ///
-/// Only a single virtual file exists: the root path itself represents
-/// the input document text for the current context. Subdirectories
-/// and other paths return NotFound.
+/// Only a single virtual file exists: the root path itself represents the
+/// draft text for the current context and principal. Subdirectories and
+/// other paths return NotFound.
 pub struct InputFilesystem {
     blocks: SharedBlockStore,
     session_contexts: SessionContextMap,
     session_id: SessionId,
+    principal_id: PrincipalId,
 }
 
 impl InputFilesystem {
@@ -36,11 +42,13 @@ impl InputFilesystem {
         blocks: SharedBlockStore,
         session_contexts: SessionContextMap,
         session_id: SessionId,
+        principal_id: PrincipalId,
     ) -> Self {
         Self {
             blocks,
             session_contexts,
             session_id,
+            principal_id,
         }
     }
 
@@ -64,13 +72,11 @@ impl Filesystem for InputFilesystem {
 
         let ctx = self.current_context()?;
 
-        // Ensure the input doc exists (idempotent)
-        self.blocks
-            .create_input_doc(ctx)
-            .map_err(io::Error::other)?;
-
-        match self.blocks.get_input_text(ctx) {
-            Ok(text) => Ok(text.into_bytes()),
+        // Deliberately does NOT call get_or_create_draft: a read must not
+        // mint a block as a side effect (the old input document did, via
+        // create_input_doc). No draft yet reads as empty.
+        match self.blocks.draft_block(ctx, self.principal_id) {
+            Ok(draft) => Ok(draft.map(|d| d.content).unwrap_or_default().into_bytes()),
             Err(e) => Err(io::Error::other(e)),
         }
     }
@@ -91,16 +97,16 @@ impl Filesystem for InputFilesystem {
             io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8: {}", e))
         })?;
 
-        // Ensure the input doc exists (idempotent)
+        // Default behavior for write is overwrite: discard any existing
+        // draft, then re-create it from scratch if the new text is
+        // non-empty. clear_draft is a no-op (returns "") when there is no
+        // draft yet.
         self.blocks
-            .create_input_doc(ctx)
+            .clear_draft(ctx, self.principal_id)
             .map_err(io::Error::other)?;
-
-        // Default behavior for write is overwrite
-        self.blocks.clear_input(ctx).map_err(io::Error::other)?;
         if !new_text.is_empty() {
             self.blocks
-                .edit_input(ctx, 0, &new_text, 0)
+                .edit_draft(ctx, self.principal_id, 0, &new_text, 0)
                 .map_err(io::Error::other)?;
         }
 
@@ -138,11 +144,14 @@ impl Filesystem for InputFilesystem {
 
         let ctx = self.current_context()?;
 
-        // Get text length for size, or 0 if no input doc
+        // Get text length for size, or 0 if no draft yet. Does not create
+        // one — same side-effect-free contract as read().
         let size = self
             .blocks
-            .get_input_text(ctx)
-            .map(|t| t.len() as u64)
+            .draft_block(ctx, self.principal_id)
+            .ok()
+            .flatten()
+            .map(|d| d.content.len() as u64)
             .unwrap_or(0);
 
         Ok(DirEntry {
@@ -175,7 +184,9 @@ impl Filesystem for InputFilesystem {
 
         // "Removing" the input file clears its content
         let ctx = self.current_context()?;
-        self.blocks.clear_input(ctx).map_err(io::Error::other)?;
+        self.blocks
+            .clear_draft(ctx, self.principal_id)
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -201,16 +212,35 @@ impl Filesystem for InputFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_store::shared_block_store;
-    use kaijutsu_types::PrincipalId;
+    use crate::block_store::{shared_block_store, SharedBlockStore};
+    use kaijutsu_types::{DocKind, PrincipalId};
 
+    /// One context, one document, one principal, one filesystem — the common
+    /// case every test but the multi-principal one needs.
     fn test_fs() -> (InputFilesystem, ContextId) {
-        let ctx = ContextId::new();
-        let sid = SessionId::new();
         let blocks = shared_block_store(PrincipalId::system());
+        let ctx = ContextId::new();
+        blocks
+            .create_document(ctx, DocKind::Conversation, None)
+            .unwrap();
+        let principal = PrincipalId::system();
+        let fs = test_fs_for(blocks, ctx, principal);
+        (fs, ctx)
+    }
+
+    /// Build an `InputFilesystem` for an existing context/store, under its
+    /// own session id, as the given principal — the building block the
+    /// multi-principal test uses to give two players independent sessions
+    /// pointed at the same context.
+    fn test_fs_for(
+        blocks: SharedBlockStore,
+        ctx: ContextId,
+        principal: PrincipalId,
+    ) -> InputFilesystem {
+        let sid = SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, ctx);
-        (InputFilesystem::new(blocks, session_contexts, sid), ctx)
+        InputFilesystem::new(blocks, session_contexts, sid, principal)
     }
 
     #[tokio::test]
@@ -268,5 +298,65 @@ mod tests {
     async fn test_list_is_not_directory() {
         let (fs, _ctx) = test_fs();
         assert!(fs.list(Path::new("")).await.is_err());
+    }
+
+    /// The reason Amy chose re-point over delete: two principals sharing a
+    /// context now get *independent* `/v/input` content, one draft block
+    /// each. This could not have been true of the old context-wide input
+    /// document — assert it explicitly.
+    #[tokio::test]
+    async fn test_two_principals_have_independent_drafts() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let ctx = ContextId::new();
+        blocks
+            .create_document(ctx, DocKind::Conversation, None)
+            .unwrap();
+
+        let alice = PrincipalId::for_agent_session("alice");
+        let bob = PrincipalId::for_agent_session("bob");
+        let fs_alice = test_fs_for(blocks.clone(), ctx, alice);
+        let fs_bob = test_fs_for(blocks.clone(), ctx, bob);
+
+        fs_alice
+            .write(Path::new(""), b"alice's draft")
+            .await
+            .unwrap();
+        fs_bob.write(Path::new(""), b"bob's draft").await.unwrap();
+
+        let alice_data = fs_alice.read(Path::new("")).await.unwrap();
+        let bob_data = fs_bob.read(Path::new("")).await.unwrap();
+        assert_eq!(String::from_utf8(alice_data).unwrap(), "alice's draft");
+        assert_eq!(String::from_utf8(bob_data).unwrap(), "bob's draft");
+    }
+
+    /// Reading `/v/input` before anyone has typed anything must not mint a
+    /// draft block — a deliberate improvement over the old input document,
+    /// which created its backing doc as a side effect of read. Assert the
+    /// block count in the context is unchanged across the read.
+    #[tokio::test]
+    async fn test_read_with_no_draft_creates_no_block() {
+        let (fs, ctx) = test_fs();
+        let before = fs.blocks.block_snapshots(ctx).unwrap().len();
+
+        let data = fs.read(Path::new("")).await.unwrap();
+        assert_eq!(String::from_utf8(data).unwrap(), "");
+
+        let after = fs.blocks.block_snapshots(ctx).unwrap().len();
+        assert_eq!(
+            before, after,
+            "reading /v/input with no draft must not create a block"
+        );
+    }
+
+    /// The draft path is char-indexed (`edit_text_as`); the old input path
+    /// byte-bounds-checked. Multibyte text must round-trip without a
+    /// byte/char mismatch panicking or corrupting content.
+    #[tokio::test]
+    async fn test_multibyte_roundtrip() {
+        let (fs, _ctx) = test_fs();
+        let text = "日本語 🎵 café";
+        fs.write(Path::new(""), text.as_bytes()).await.unwrap();
+        let data = fs.read(Path::new("")).await.unwrap();
+        assert_eq!(String::from_utf8(data).unwrap(), text);
     }
 }

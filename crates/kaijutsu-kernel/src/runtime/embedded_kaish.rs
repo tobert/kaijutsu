@@ -281,6 +281,7 @@ impl EmbeddedKaish {
             blocks.clone(),
             session_contexts.clone(),
             session_id,
+            principal_id,
         ));
         // The shared CRDT file cache: same instance the MCP file tools use
         // (installed at server startup), or lazily built from this block store

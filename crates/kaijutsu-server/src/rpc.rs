@@ -1072,9 +1072,6 @@ fn create_block_store_with_kernel_db(
         format!("Failed to load documents from DB (refusing to start with empty store): {e}")
     })?;
     log::info!("Loaded {} documents from database", store.len());
-    if let Err(e) = store.load_input_docs_from_db() {
-        log::warn!("Failed to load input docs from DB: {}", e);
-    }
     Ok(store)
 }
 
@@ -2381,15 +2378,6 @@ async fn ensure_context_joinable(
 
     log::debug!("Re-joining existing context {}", context_id);
 
-    // Ensure input doc exists (idempotent)
-    if let Err(e) = kernel.documents.create_input_doc(context_id) {
-        log::warn!(
-            "Failed to create input doc for context {}: {}",
-            context_id,
-            e
-        );
-    }
-
     let needs_heal = { kernel.kernel.drift().read().get(context_id).is_none() };
     if needs_heal {
         let row = {
@@ -2469,15 +2457,6 @@ async fn create_context_inner(
             "Failed to create document for context {}: {}",
             context_id, e
         )));
-    }
-
-    // Create the input document for this context (non-fatal).
-    if let Err(e) = state.documents.create_input_doc(context_id) {
-        log::warn!(
-            "Failed to create input doc for context {}: {}",
-            context_id,
-            e
-        );
     }
 
     // Neither creation path stamps provider/model onto the row (closed
