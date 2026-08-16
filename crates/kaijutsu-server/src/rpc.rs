@@ -1062,6 +1062,13 @@ fn create_block_store_with_kernel_db(
         format!("Failed to load documents from DB (refusing to start with empty store): {e}")
     })?;
     log::info!("Loaded {} documents from database", store.len());
+    // One-shot migration ahead of the diamond-types removal: compaction is the
+    // only writer of `doc_snapshots.content`, so a document edited since its
+    // last compaction carries its newer text only as DTE operations in the
+    // oplog. Materialize all of it now, while DTE can still read it. Deleted
+    // together with DTE in the following change.
+    let compacted = store.compact_all_documents();
+    log::info!("Migration: compacted {compacted} documents so their text is current");
     Ok(store)
 }
 

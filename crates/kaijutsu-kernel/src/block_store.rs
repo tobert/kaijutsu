@@ -1036,6 +1036,42 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Compact every resident document, so `doc_snapshots.content` holds each
+    /// one's current text and every oplog is empty.
+    ///
+    /// This exists for one migration and is deleted with it. `content` is
+    /// written only by compaction, so between compactions a document's newer
+    /// text lives solely in the oplog as diamond-types operations. Retiring
+    /// DTE without this pass would discard every edit made since each
+    /// document's last compaction — silently, because `content` is still
+    /// there and still parses. Running it first makes `content` authoritative,
+    /// which is the precondition the DTE removal needs.
+    ///
+    /// Returns the number of documents compacted. Errors are logged per
+    /// document and do not stop the pass: one unreadable document must not
+    /// block the migration for the rest, and the next run retries it.
+    pub fn compact_all_documents(&self) -> usize {
+        let ids = self.list_ids();
+        let total = ids.len();
+        let mut done = 0usize;
+        for context_id in ids {
+            match self.compact_document(context_id) {
+                Ok(()) => done += 1,
+                Err(e) => tracing::error!(
+                    document_id = %context_id.to_hex(),
+                    error = %e,
+                    "migration compaction failed for this document; its text stays in the oplog",
+                ),
+            }
+        }
+        tracing::info!(
+            compacted = done,
+            total = total,
+            "migration: compacted every document so materialized text is current",
+        );
+        done
+    }
+
     /// Write an initial snapshot for a newly forked document (no oplog).
     fn write_initial_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
         let Some(db) = self.journaling_db()? else {
@@ -3441,6 +3477,69 @@ mod tests {
     /// `BlockStore` backed by an existing on-disk DB, simulating a systemd
     /// restart). The FIRST read after "boot" — before any mutation warms the
     /// cache — must still be correct via a lazy single-context scan, not
+    /// The DTE-removal migration's precondition, and the hazard it exists for.
+    ///
+    /// `doc_snapshots.content` is written only by compaction, so a document
+    /// edited since its last compaction holds its newer text only as DTE
+    /// operations in the oplog. The middle assertion is the point of this
+    /// test: it pins that staleness as REAL. Without it the last assertion
+    /// could pass on a store that never needed migrating, and the migration
+    /// would look proven while protecting nothing.
+    #[test]
+    fn compact_all_documents_makes_materialized_text_current() {
+        use crate::kernel_db::KernelDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("migrate.db");
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::open(&db_path).unwrap()));
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block = store
+            .insert_block(
+                ctx, None, None, Role::Model, BlockKind::Text, "hello",
+                Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // Compact once: `content` now matches the text.
+        store.compact_all_documents();
+        let after_first = db.lock().load_latest_snapshot(ctx).unwrap().unwrap();
+        assert!(
+            after_first.content.contains("hello"),
+            "compaction should have materialized the text, got {:?}",
+            after_first.content,
+        );
+
+        // Edit past the compaction. The new text lives in the oplog as DTE
+        // operations; `content` does not know about it.
+        store
+            .append_text_as(ctx, &block, " world", Some(creator))
+            .unwrap();
+
+        let stale = db.lock().load_latest_snapshot(ctx).unwrap().unwrap();
+        assert!(
+            !stale.content.contains("hello world"),
+            "PRECONDITION: `content` must be stale after an edit, or this test \
+             proves nothing about the migration. Got {:?}",
+            stale.content,
+        );
+
+        // The migration pass makes it current — which is what lets DTE go.
+        store.compact_all_documents();
+        let migrated = db.lock().load_latest_snapshot(ctx).unwrap().unwrap();
+        assert!(
+            migrated.content.contains("hello world"),
+            "after compact_all_documents the materialized text must be current, got {:?}",
+            migrated.content,
+        );
+    }
+
     /// silently default to `Pending` for everything.
     #[test]
     fn live_status_cold_cache_after_boot_is_correct_not_pending_default() {
