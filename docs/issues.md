@@ -6,6 +6,57 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The roster index has no kernel-now reference, so client-rendered ages mix two clocks (2026-08-16)
+
+`/run/roster/index` gives each row a `recorded_at` on the **kernel's** wall
+clock (`kaijutsu-kernel/src/roster.rs` — deliberately the kernel's own stamp,
+per `docs/midi.md` "The one timebase": never trust a source's clock). The
+document then says nothing about when the kernel thinks *now* is, so a client
+rendering "◐ 4m" (`kaijutsu-app/src/ui/quick_context.rs::row_line`) subtracts
+the kernel's stamp from its own `now_millis()`. The one-timebase discipline
+stops at the kernel boundary.
+
+Accepted for now: kaijutsu's machines share an NTP-disciplined LAN, so the
+skew is far below the display's resolution (coarse from a minute up, negative
+deltas clamp to "now"). It becomes wrong the moment a client is somewhere
+with a clock nobody is disciplining.
+
+Fix, two candidates:
+- a kernel-now value in the index itself — a second header line, or a column
+  — so the client can compute `kernel_now - recorded_at` entirely in kernel
+  time and never involve its own clock;
+- `FileAttr::mtime` on the index, once a client can read attrs at all — which
+  needs the wire work in the `FileAttr`/`generation` entry below, so the two
+  are worth doing together.
+
+---
+
+## The wire `FileAttr` carries no `generation`, so clients cannot do a conditional VFS fetch (2026-08-16)
+
+The kernel stamps `FileAttr::generation` precisely so a caching reader can
+skip a re-read (`crates/kaijutsu-kernel/src/vfs/types.rs`: *"Coherence
+decisions use `generation`, not mtime"*), and the roster VFS backend sets it
+on every `getattr` (`vfs/backends/roster.rs`). None of that reaches a client:
+the capnp `FileAttr` (`kaijutsu.capnp`, next free ordinal 6) has size/kind/
+perm/mtime/nlink and no generation field, and `Vfs.snapshot` reports
+generation `0` for any non-directory (`MountTable::snapshot_node`), so the
+one other path that *does* carry a generation cannot carry a file's.
+
+Consequence: `connection::roster` (the app's roster poll) reads the whole
+`/run/roster/index` every 5s and diffs the bytes, because a
+getattr-then-maybe-read poll would be two round trips that can never skip the
+second. Fine at this size; wrong shape for the next VFS-backed feed that is
+not a handful of lines.
+
+Fix: append `generation @6 :UInt64;` to `FileAttr` (dense append, backward
+compatible), set it in `set_file_attr` (`kaijutsu-server/src/rpc.rs`), and add
+a thin `RpcClient::vfs_getattr` + `ActorHandle` passthrough. Then the roster
+poll becomes getattr-gated and `RosterFeed::revision` can carry the kernel's
+generation instead of a local content counter. Deliberately not done inside an
+app-scoped UI slice — it is a wire-schema change and wants its own review.
+
+---
+
 ## Four write-once block fields don't survive oplog replay before the next compaction (found 2026-08-16, DTE removal)
 
 `set_stderr`, `set_signature`, `set_tool_use_id`, and `set_output`

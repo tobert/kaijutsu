@@ -38,6 +38,14 @@ pub enum InputContext {
     StationZoomed,
     /// Screen::Fsn — landscape camera fly + select
     FsnFly,
+    /// The quick-context overlay is HELD (`Ctrl+A h`, `ui::quick_context`).
+    /// Active on top of whatever surface is underneath, and outranked only
+    /// by `Dialog` — a modal still owns Esc. Its single binding is Esc →
+    /// `UnpinQuickContext`, which is how "exactly one PopLevel" survives an
+    /// overlay that floats over every screen: the higher-priority context
+    /// claims the key, so no `PopLevel` is emitted at all and the level
+    /// underneath stays put (docs/input.md "Escape — two meanings total").
+    QuickContext,
 }
 
 /// Exclusive keyboard capture — who receives raw keyboard events that the
@@ -81,16 +89,30 @@ impl ActiveInputContexts {
     }
 }
 
-/// Pure derivation: (screen, zoomed station, focus) → (contexts, grab).
+/// Pure derivation: (screen, zoomed station, focus, held overlay) →
+/// (contexts, grab).
 ///
 /// Kept free of ECS types on the input side so it unit-tests without a
 /// schedule (see `gotcha_bevy_b0001`: unit suites never init schedules).
+///
+/// `quick_context_held` rides alongside the screen rather than being derived
+/// from it: the overlay floats over every screen, so it is a fourth
+/// independent axis, not a state of any one surface.
 pub fn derive_contexts(
     screen: Screen,
     zoomed: Option<Station>,
     focus: &FocusArea,
+    quick_context_held: bool,
 ) -> (Vec<InputContext>, KeyboardGrab) {
     let mut contexts = vec![InputContext::Global];
+    if quick_context_held {
+        // Pushed before every early return below so the held overlay owns
+        // its Esc on the scenes too. Under a keyboard grab (editor, diff,
+        // compose vim) only Global bindings are matchable, so this is inert
+        // there — which is the doctrine, not an oversight: Esc belongs to vi
+        // wherever a vi surface is live, and `Ctrl+A h` releases the hold.
+        contexts.push(InputContext::QuickContext);
+    }
 
     match screen {
         // The vi editor owns the keyboard as an explicit grab; only Global
@@ -152,15 +174,21 @@ pub fn sync_input_context(
     focus: Res<FocusArea>,
     screen: Res<State<Screen>>,
     room: Res<crate::view::room::RoomState>,
+    quick: Res<crate::ui::quick_context::QuickContextState>,
     mut active: ResMut<ActiveInputContexts>,
     mut grab: ResMut<KeyboardGrab>,
 ) {
     // Only update if an input changed (RoomState changes on zoom/unzoom).
-    if !focus.is_changed() && !screen.is_changed() && !room.is_changed() && !active.is_added() {
+    if !focus.is_changed()
+        && !screen.is_changed()
+        && !room.is_changed()
+        && !quick.is_changed()
+        && !active.is_added()
+    {
         return;
     }
 
-    let (contexts, new_grab) = derive_contexts(*screen.get(), room.zoomed, &focus);
+    let (contexts, new_grab) = derive_contexts(*screen.get(), room.zoomed, &focus, quick.held);
     active.0 = contexts;
     // Avoid spurious change-detection on the grab resource.
     if *grab != new_grab {
@@ -174,7 +202,7 @@ mod tests {
 
     #[test]
     fn conversation_compose_grabs_for_vim() {
-        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Compose);
+        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Compose, false);
         assert!(ctxs.contains(&InputContext::Global));
         assert!(ctxs.contains(&InputContext::TextInput));
         assert_eq!(grab, KeyboardGrab::ComposeVim);
@@ -182,7 +210,7 @@ mod tests {
 
     #[test]
     fn conversation_navigation_no_grab() {
-        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Conversation, false);
         assert!(ctxs.contains(&InputContext::Navigation));
         assert!(!ctxs.contains(&InputContext::TextInput));
         assert_eq!(grab, KeyboardGrab::None);
@@ -190,7 +218,7 @@ mod tests {
 
     #[test]
     fn dialog_gets_both_contexts() {
-        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Dialog);
+        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Dialog, false);
         assert!(ctxs.contains(&InputContext::Dialog));
         assert!(ctxs.contains(&InputContext::TextInput));
         assert_eq!(grab, KeyboardGrab::None);
@@ -200,7 +228,7 @@ mod tests {
     fn editor_is_a_grab_with_global_only() {
         // Focus parks on Conversation while the editor owns the screen —
         // the grab must not depend on focus (the Ctrl+1/2/3 stray bug).
-        let (ctxs, grab) = derive_contexts(Screen::Editor, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Editor, None, &FocusArea::Conversation, false);
         assert_eq!(ctxs, vec![InputContext::Global]);
         assert_eq!(grab, KeyboardGrab::EditorSession);
     }
@@ -211,7 +239,7 @@ mod tests {
         // viewer owns the screen, so the grab must not depend on focus. Only
         // Global stays matchable — in particular Navigation must NOT, or `q`
         // would fire the app's Quit binding instead of reaching DiffCore.
-        let (ctxs, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Conversation, false);
         assert_eq!(ctxs, vec![InputContext::Global]);
         assert_eq!(grab, KeyboardGrab::DiffView);
     }
@@ -221,13 +249,13 @@ mod tests {
         // A stale FocusArea::Compose (e.g. the viewer opened from a state that
         // hadn't parked focus yet) must not hand the keyboard to the compose
         // VimMachine — the screen decides, not the focus.
-        let (_, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Compose);
+        let (_, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Compose, false);
         assert_eq!(grab, KeyboardGrab::DiffView);
     }
 
     #[test]
     fn room_unzoomed_is_carousel() {
-        let (ctxs, grab) = derive_contexts(Screen::Room, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Room, None, &FocusArea::Conversation, false);
         assert!(ctxs.contains(&InputContext::RoomNav));
         assert!(!ctxs.contains(&InputContext::Navigation));
         assert_eq!(grab, KeyboardGrab::None);
@@ -239,6 +267,7 @@ mod tests {
             Screen::Room,
             Some(Station::TimeWell),
             &FocusArea::Conversation,
+            false,
         );
         assert!(ctxs.contains(&InputContext::WellZoomed));
         assert!(!ctxs.contains(&InputContext::RoomNav));
@@ -250,6 +279,7 @@ mod tests {
             Screen::Room,
             Some(Station::PatchBay),
             &FocusArea::Conversation,
+            false,
         );
         assert!(ctxs.contains(&InputContext::PatchBayZoomed));
     }
@@ -260,6 +290,7 @@ mod tests {
             Screen::Room,
             Some(Station::Tracks),
             &FocusArea::Conversation,
+            false,
         );
         assert!(ctxs.contains(&InputContext::StationZoomed));
         assert!(!ctxs.contains(&InputContext::WellZoomed));
@@ -269,9 +300,55 @@ mod tests {
     fn fsn_has_its_own_context_not_navigation() {
         // The old suppression list forgot Fsn — Navigation leaked in and
         // central Esc→pop double-fired with fsn_keyboard's Esc.
-        let (ctxs, grab) = derive_contexts(Screen::Fsn, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Fsn, None, &FocusArea::Conversation, false);
         assert!(ctxs.contains(&InputContext::FsnFly));
         assert!(!ctxs.contains(&InputContext::Navigation));
         assert_eq!(grab, KeyboardGrab::None);
+    }
+
+    /// A held quick-context overlay adds its context ON TOP of whatever
+    /// surface is underneath, on every screen — it floats, so it must not be
+    /// a state of any one surface.
+    #[test]
+    fn a_held_overlay_layers_over_every_surface() {
+        for (screen, zoomed, under) in [
+            (Screen::Conversation, None, InputContext::Navigation),
+            (Screen::Room, None, InputContext::RoomNav),
+            (Screen::Fsn, None, InputContext::FsnFly),
+            (
+                Screen::Room,
+                Some(Station::TimeWell),
+                InputContext::WellZoomed,
+            ),
+        ] {
+            let (ctxs, _) = derive_contexts(screen, zoomed, &FocusArea::Conversation, true);
+            assert!(
+                ctxs.contains(&InputContext::QuickContext),
+                "held overlay missing on {screen:?}"
+            );
+            assert!(
+                ctxs.contains(&under),
+                "the surface under the overlay must stay live on {screen:?}"
+            );
+        }
+    }
+
+    /// Releasing the hold takes the context away again — nothing lingers to
+    /// swallow a later Esc.
+    #[test]
+    fn a_released_overlay_leaves_no_context_behind() {
+        let (ctxs, _) = derive_contexts(Screen::Room, None, &FocusArea::Conversation, false);
+        assert!(!ctxs.contains(&InputContext::QuickContext));
+    }
+
+    /// A vi surface still owns the keyboard with the overlay held: the grab
+    /// is unchanged, and under a grab only `Global` bindings match, so the
+    /// overlay's Esc never reaches vi's.
+    #[test]
+    fn a_held_overlay_never_steals_the_keyboard_from_vi() {
+        let (_, grab) = derive_contexts(Screen::Editor, None, &FocusArea::Conversation, true);
+        assert_eq!(grab, KeyboardGrab::EditorSession);
+        let (_, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Compose, true);
+        assert_eq!(grab, KeyboardGrab::ComposeVim);
     }
 }

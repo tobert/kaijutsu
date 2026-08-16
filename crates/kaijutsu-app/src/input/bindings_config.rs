@@ -335,6 +335,7 @@ fn context_to_str(ctx: InputContext) -> String {
         InputContext::PatchBayZoomed => "PatchBayZoomed",
         InputContext::StationZoomed => "StationZoomed",
         InputContext::FsnFly => "FsnFly",
+        InputContext::QuickContext => "QuickContext",
     }
     .to_string()
 }
@@ -350,6 +351,7 @@ fn parse_context(s: &str) -> Result<InputContext, String> {
         "PatchBayZoomed" => Ok(InputContext::PatchBayZoomed),
         "StationZoomed" => Ok(InputContext::StationZoomed),
         "FsnFly" => Ok(InputContext::FsnFly),
+        "QuickContext" => Ok(InputContext::QuickContext),
         _ => Err(format!("unknown context '{s}'")),
     }
 }
@@ -431,6 +433,8 @@ fn action_to_str(a: &Action) -> String {
         Action::SendLiteralPrefix => "SendLiteralPrefix".into(),
         Action::PromptContextRename => "PromptContextRename".into(),
         Action::PromptContextSwitch => "PromptContextSwitch".into(),
+        Action::HoldQuickContext => "HoldQuickContext".into(),
+        Action::UnpinQuickContext => "UnpinQuickContext".into(),
         Action::FlyAxis { x, y } => format!("FlyAxis:{x},{y}"),
         Action::FlyAltitude(v) => format!("FlyAltitude:{v}"),
     }
@@ -508,6 +512,8 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "SendLiteralPrefix" => Ok(Action::SendLiteralPrefix),
         "PromptContextRename" => Ok(Action::PromptContextRename),
         "PromptContextSwitch" => Ok(Action::PromptContextSwitch),
+        "HoldQuickContext" => Ok(Action::HoldQuickContext),
+        "UnpinQuickContext" => Ok(Action::UnpinQuickContext),
         "SwitchToActiveSeat" => Ok(Action::SwitchToActiveSeat(0)),
         "ActiveSeatStep" => Ok(Action::ActiveSeatStep(1)),
         // Payloaded variants without an explicit payload default to a
@@ -748,6 +754,8 @@ mod tests {
         "SendLiteralPrefix",
         "PromptContextRename",
         "PromptContextSwitch",
+        "HoldQuickContext",
+        "UnpinQuickContext",
     ];
 
     const ALL_KEYS: &[&str] = &[

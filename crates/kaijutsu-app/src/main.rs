@@ -277,6 +277,14 @@ fn main() {
         .add_plugins(ui::tiling::TilingPlugin)
         .add_plugins(ui::tiling_reconciler::TilingReconcilerPlugin)
         .add_plugins(ui::dock::DockPlugin)
+        // The kernel's live roster (`/run/roster/index`) — MUST be added
+        // before the surfaces that read it: DockPlugin's presence badge and
+        // QuickContextPlugin's panel both take `Res<RosterFeed>`, and a
+        // missing resource is a startup panic rather than a quiet blank.
+        .add_plugins(connection::roster::RosterFeedPlugin)
+        // The Ctrl+A prefix's own overlay — peeks while the prefix is armed,
+        // `Ctrl+A h` holds it (docs/input.md).
+        .add_plugins(ui::quick_context::QuickContextPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(connection::drift::DriftPlugin)
         // Attached-peer roster polling (kernel peer registry) — powers the

@@ -124,6 +124,13 @@ pub struct DockState {
     /// process management"). Empty text = nothing running and nothing ever
     /// finished, same "hidden when idle" convention as `block_activity`.
     pub background_jobs: DockText,
+    /// Who is around, at a glance: `2\u{25cf} 1\u{25d0}` — connections
+    /// observed, plus presence inferred from recent activity
+    /// (`connection::roster`). Ambient, not context-bound, so it survives
+    /// [`DockState::detached`]; empty unless the feed is genuinely fresh,
+    /// because a count is a claim and a stale one is worse than none. The
+    /// panel behind it (`ui::quick_context`) has the honest long form.
+    pub presence: DockText,
     pub hints: DockText,
     pub contexts: ContextsState,
     /// True while the active screen is a fleet/world view (`Room`, `Fsn`) —
@@ -194,6 +201,11 @@ impl Default for DockState {
                 color: Color::WHITE,
                 font_size: 13.0,
             },
+            presence: DockText {
+                text: String::new(),
+                color: Color::WHITE,
+                font_size: 13.0,
+            },
             hints: DockText {
                 text: "Enter: submit │ Shift+Enter: newline │ Esc: normal".into(),
                 color: Color::WHITE,
@@ -237,7 +249,7 @@ pub struct SouthDock;
 /// origin. Single-color text — no span brushes, `brush` is the fallback for
 /// every glyph — same as a block cell's checkbox glyphs
 /// (`view::block_render::build_block_scenes`).
-fn collect_dock_text_glyphs(
+pub(crate) fn collect_dock_text_glyphs(
     glyphs: &mut Vec<PositionedGlyph>,
     text: &str,
     x: f64,
@@ -273,7 +285,7 @@ fn collect_dock_text_glyphs(
 
 /// Measure text width without drawing. Pure Parley shaping — no vello, no
 /// MSDF; unchanged by the dock's move off vello.
-fn measure_text(text: &str, font_size: f32, font: &VelloFont) -> f64 {
+pub(crate) fn measure_text(text: &str, font_size: f32, font: &VelloFont) -> f64 {
     if text.is_empty() {
         return 0.0;
     }
@@ -657,6 +669,7 @@ pub fn render_south_dock(
     let hints_x = (width - pad_h - hints_w).max(x + gap);
 
     // context_usage sits immediately left of hints, in the same right-aligned group.
+    let mut right_x = hints_x;
     if !dock_state.detached {
         let usage_brush = bevy_color_to_brush(dock_state.context_usage.color);
         let usage_w = measure_text(
@@ -674,6 +687,30 @@ pub fn render_south_dock(
             dock_state.context_usage.font_size,
             font,
             &usage_brush,
+            atlas,
+            &mut font_data_map,
+        );
+        right_x = usage_x;
+    }
+
+    // Presence rides in the same right-aligned group but survives
+    // `detached`: who is around is a fleet fact, not this context's.
+    if !dock_state.presence.text.is_empty() {
+        let presence_brush = bevy_color_to_brush(dock_state.presence.color);
+        let presence_w = measure_text(
+            &dock_state.presence.text,
+            dock_state.presence.font_size,
+            font,
+        );
+        let presence_x = (right_x - gap - presence_w).max(x + gap);
+        collect_dock_text_glyphs(
+            &mut glyphs,
+            &dock_state.presence.text,
+            presence_x,
+            pad_v,
+            dock_state.presence.font_size,
+            font,
+            &presence_brush,
             atlas,
             &mut font_data_map,
         );
@@ -1128,9 +1165,89 @@ mod tests {
     use super::{
         classify_connection_error, count_block_activity, format_background_activity,
         format_block_activity, format_context_usage, format_elapsed_ms, format_global_error_badge,
-        format_token_count, hud_detached, room_slot_label, BackgroundActivityLevel,
+        format_presence, format_token_count, hud_detached, room_slot_label,
+        BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
     use crate::ui::theme::Theme;
+
+    /// The dock's presence summary is allowed to say only what a *current*
+    /// feed on a *live* connection supports. Every other condition renders
+    /// NOTHING — a bare number has no room beside it to qualify itself, and
+    /// a stale or invented count is worse than an empty slot
+    /// (`ui::quick_context` is where the honest long form lives).
+    #[test]
+    fn the_presence_badge_only_speaks_for_a_current_feed() {
+        use crate::connection::roster::{parse_roster_index, RosterFeed, RosterFetch};
+
+        let header = "entity_kind\tentity_id\tlabel\tliveness_kind\tlive\thost\tstatus_text\tavailability\trecorded_at";
+        let doc = format!(
+            "{header}\n\
+             principal\t1\tamy\tbound\ttrue\t\t\t\t\n\
+             principal\t2\tbob\tbound\tfalse\t\t\t\t\n\
+             context\t3\tagent\trecent\ttrue\t\t\t\t\n"
+        );
+        let parsed = parse_roster_index(&doc).unwrap();
+
+        let mut feed = RosterFeed::default();
+        feed.set_for_test(parsed.clone(), RosterFetch::Fresh, 100.0);
+        assert_eq!(format_presence(&feed, true, 101.0), "1\u{25cf} 1\u{25d0}");
+
+        // A fresh but empty fleet says nothing rather than "0".
+        let mut empty = RosterFeed::default();
+        empty.set_for_test(Default::default(), RosterFetch::Fresh, 100.0);
+        assert_eq!(format_presence(&empty, true, 101.0), "");
+
+        // Never fetched / no roster / failed: all silent in the dock.
+        for state in [
+            RosterFetch::Never,
+            RosterFetch::NoRoster { detail: "not found".into() },
+            RosterFetch::Error { detail: "boom".into() },
+        ] {
+            let mut bad = RosterFeed::default();
+            bad.set_for_test(parsed.clone(), state.clone(), 100.0);
+            assert_eq!(
+                format_presence(&bad, true, 101.0),
+                "",
+                "{state:?} must not claim a count"
+            );
+        }
+    }
+
+    /// The disconnect trap: the poll stops, no error ever arrives, and the
+    /// feed stays `Fresh` with real rows in it. Both guards must silence the
+    /// badge — the connection flag immediately, and the age even if the flag
+    /// somehow lied.
+    #[test]
+    fn a_stale_or_disconnected_feed_renders_no_badge() {
+        use crate::connection::roster::{parse_roster_index, RosterFeed, RosterFetch};
+
+        let header = "entity_kind\tentity_id\tlabel\tliveness_kind\tlive\thost\tstatus_text\tavailability\trecorded_at";
+        let doc = format!("{header}\nprincipal\t1\tamy\tbound\ttrue\t\t\t\t\n");
+        let mut feed = RosterFeed::default();
+        feed.set_for_test(parse_roster_index(&doc).unwrap(), RosterFetch::Fresh, 100.0);
+
+        // Connected and recent: the one case that speaks.
+        assert_eq!(format_presence(&feed, true, 101.0), "1\u{25cf}");
+
+        // Disconnected, same feed.
+        assert_eq!(
+            format_presence(&feed, false, 101.0),
+            "",
+            "a dropped connection must silence the badge at once"
+        );
+
+        // Still nominally connected, but nothing has landed in three poll
+        // intervals — the poll is wedged or the actor is gone.
+        assert_eq!(
+            format_presence(&feed, true, 100.0 + PRESENCE_MAX_AGE + 0.1),
+            "",
+            "a Fresh feed nobody refreshed must expire"
+        );
+        assert!(
+            feed.is_fresh(),
+            "the state never moved off Fresh — that is exactly the trap"
+        );
+    }
 
     /// Room and Fsn are the fleet/world views — the HUD detaches from the
     /// active context there. Everything else (Conversation, and the two
@@ -1755,7 +1872,7 @@ pub fn update_hints(
     // not the reference.
     if prefix.armed() {
         let hints = "^A: 0-9 seat \u{2502} ^A last \u{2502} q close \u{2502} \
-                     w well \u{2502} ' switch \u{2502} A rename \u{2502} d detach";
+                     w well \u{2502} ' switch \u{2502} A rename \u{2502} d detach \u{2502} h hold";
         if dock.hints.text != hints {
             dock.hints.text = hints.to_string();
         }
@@ -1797,6 +1914,83 @@ pub fn update_hints(
 
     if dock.hints.text != hints {
         dock.hints.text = hints.to_string();
+    }
+}
+
+/// How stale a roster read may be before the dock stops asserting a count:
+/// three poll intervals, so two missed polls are tolerated and a genuinely
+/// dead feed goes quiet.
+pub(crate) const PRESENCE_MAX_AGE: f64 =
+    crate::connection::roster::ROSTER_POLL_INTERVAL * 3.0;
+
+/// The presence summary, or empty when there is nothing honest to say.
+///
+/// Only a *current* feed on a *live* connection produces a count. "Never
+/// fetched", "this kernel has no roster" and "the read failed" all render as
+/// nothing — and so does a `Fresh` picture nobody has refreshed lately,
+/// which is what a dropped connection looks like from here: the `RpcActor`
+/// resource goes away, `poll_roster_index` stops running, and no error reply
+/// ever arrives to move the state off `Fresh`. The connection flag catches
+/// that immediately and the age catches every other way the poll can go
+/// quiet.
+///
+/// Going silent is the only honest option for this widget specifically: a
+/// number in the dock is a claim, and there is no room beside it to qualify
+/// one. `Ctrl+A` peeks the panel, which does have room and names its state.
+pub(crate) fn format_presence(
+    feed: &crate::connection::roster::RosterFeed,
+    connected: bool,
+    now: f64,
+) -> String {
+    if !connected || !feed.is_current(now, PRESENCE_MAX_AGE) {
+        return String::new();
+    }
+    let (bound, recent) = feed.presence_counts();
+    if bound == 0 && recent == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    if bound > 0 {
+        out.push_str(&format!("{bound}\u{25cf}"));
+    }
+    if recent > 0 {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("{recent}\u{25d0}"));
+    }
+    out
+}
+
+/// Keep the dock's presence summary in step with the roster feed.
+///
+/// Unlike the other data-gathering systems this cannot be gated purely on
+/// change detection: the badge must expire on its own when nothing arrives
+/// (see [`format_presence`]), and "nothing arrived" is by definition not a
+/// change. A one-second tick drives the expiry — the threshold is
+/// [`PRESENCE_MAX_AGE`], so second granularity is ample — and `DockState` is
+/// still written only when the rendered text actually differs, so an idle
+/// frame never dirties it.
+pub fn update_presence_badge(
+    feed: Res<crate::connection::roster::RosterFeed>,
+    conn: Res<RpcConnectionState>,
+    theme: Res<Theme>,
+    time: Res<Time>,
+    mut dock: ResMut<DockState>,
+    mut next_tick: Local<f64>,
+) {
+    let now = time.elapsed_secs_f64();
+    if !feed.is_changed() && !conn.is_changed() && !theme.is_changed() && now < *next_tick {
+        return;
+    }
+    *next_tick = now + 1.0;
+
+    let text = format_presence(&feed, conn.connected, now);
+    if dock.presence.text != text {
+        dock.presence.text = text;
+    }
+    if dock.presence.color != theme.fg_dim {
+        dock.presence.color = theme.fg_dim;
     }
 }
 
@@ -2279,6 +2473,7 @@ impl Plugin for DockPlugin {
                     update_context_usage_badge,
                     update_block_activity,
                     update_background_jobs,
+                    update_presence_badge,
                     // Conversation-only: the dock's ComputedNode/GlobalTransform
                     // survive Visibility::Hidden, so without the gate a click
                     // in the dock's footprint would switch contexts UNDER a

@@ -573,6 +573,31 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
+    // QuickContext (the Ctrl+A overlay, HELD via `Ctrl+A h`)
+    // ====================================================================
+    // The one binding this context carries. `UnpinQuickContext` rather than
+    // `PopLevel` because PopLevel's consumers are context-blind — see the
+    // action's own doc. The context outranks every surface below it (but not
+    // Dialog), so Esc here fires exactly one action.
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::QuickContext,
+        Action::UnpinQuickContext,
+        "Release the quick-context overlay",
+    ));
+    // East is the pad's Esc (the Global `East -> PopLevel` binding below).
+    // Without this arm a held overlay would release on the keyboard but pop
+    // the scene underneath on the pad. `resolve_gamepad_bindings` picks the
+    // higher-priority context, exactly as the keyboard does, so only one of
+    // the two fires.
+    b.push(Binding::gamepad(
+        GamepadButton::East,
+        InputContext::QuickContext,
+        Action::UnpinQuickContext,
+        "Release the quick-context overlay",
+    ));
+
+    // ====================================================================
     // Gamepad bindings
     // ====================================================================
 
