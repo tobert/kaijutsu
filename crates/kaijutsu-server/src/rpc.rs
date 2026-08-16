@@ -93,7 +93,6 @@ use kaijutsu_kernel::{
     BlockFlow,
     // Conversation session
     ConversationMailbox,
-    InputDocFlow,
     InvokeRequest,
     InvokeResponse,
     Kernel,
@@ -104,7 +103,6 @@ use kaijutsu_kernel::{
     PeerInfo,
     SharedBlockFlowBus,
     SharedBlockStore,
-    SharedInputDocFlowBus,
     VfsOps,
     // VFS activity digest stream (Lane K, FSN slice-1)
     ActivityCursor,
@@ -113,7 +111,6 @@ use kaijutsu_kernel::{
     flows::FlowMessage,
     flows::{TurnFlow, TurnOrigin, TurnStopReason},
     shared_block_flow_bus,
-    shared_input_doc_flow_bus,
 };
 // D-57 (docs/acp.md gap #2): the `HookAction::Ask` <-> `PermissionEvents`
 // bridge. `kaijutsu-kernel` has no capnp dependency, so the trait + plain
@@ -1058,15 +1055,8 @@ fn create_block_store_with_kernel_db(
     default_workspace_id: kaijutsu_types::WorkspaceId,
     principal_id: PrincipalId,
     block_flows: SharedBlockFlowBus,
-    input_flows: SharedInputDocFlowBus,
 ) -> Result<SharedBlockStore, String> {
-    let inner = BlockStore::with_db_and_flows(
-        db,
-        default_workspace_id,
-        principal_id,
-        block_flows,
-        input_flows,
-    );
+    let inner = BlockStore::with_db_and_flows(db, default_workspace_id, principal_id, block_flows);
     let store = Arc::new(inner);
     store.load_from_db().map_err(|e| {
         format!("Failed to load documents from DB (refusing to start with empty store): {e}")
@@ -1617,7 +1607,6 @@ pub async fn create_shared_kernel(
     // literal that would kick clients sooner here than anywhere else.
     let flow_depth = kaijutsu_kernel::flows::configured_queue_depth();
     let block_flows = shared_block_flow_bus(flow_depth);
-    let input_flows = shared_input_doc_flow_bus(flow_depth);
 
     // Resolve stable data directory (used for block store DB, kernel DB, semantic index)
     let resolved_data_dir = match data_dir {
@@ -1720,7 +1709,6 @@ pub async fn create_shared_kernel(
         default_ws_id,
         PrincipalId::system(),
         block_flows,
-        input_flows,
     )
     .map_err(capnp::Error::failed)?;
 
@@ -3037,7 +3025,6 @@ impl kernel::Server for KernelImpl {
 
         {
             let block_flows = self.kernel.kernel.block_flows().clone();
-            let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
             // Connection-lifetime cancellation. Cleared on ConnectionState
             // Drop, so the bridge unwinds when the RPC system tears down (even
@@ -3053,12 +3040,9 @@ impl kernel::Server for KernelImpl {
             // Cap'n Proto callbacks are not Send, so spawn_local.
             tokio::task::spawn_local(async move {
                 let block_sub = block_flows.subscribe("block.*");
-                // Input flows are optional at this subscription site.
-                let input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 run_block_bridge(
                     callback,
                     block_sub,
-                    input_sub,
                     None,
                     kernel_id,
                     conn_cancel,
@@ -5811,9 +5795,10 @@ impl kernel::Server for KernelImpl {
             Ok(draft) => {
                 let mut r = results.get();
                 r.set_content(draft.as_ref().map(|d| d.content.as_str()).unwrap_or(""));
-                // `ops` is a corpse: the draft is a block, so there is no input
-                // oplog to project. It stays on the wire only until slice 4
-                // deletes this method along with the rest of the input surface.
+                // `ops` is always empty: the draft is a block, not a CRDT
+                // document, so there is no input oplog to project into it.
+                // The field stays on the wire until a later commit removes it
+                // from the schema (docs/crdt-melt.md).
                 r.set_ops(&[]);
                 r.set_version(documents.version(context_id).unwrap_or(0));
                 Promise::ok(())
@@ -6243,7 +6228,6 @@ impl kernel::Server for KernelImpl {
 
         {
             let block_flows = self.kernel.kernel.block_flows().clone();
-            let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
             let (conn_cancel, disconnect, principal_id, session_id) = {
                 let conn = self.connection.borrow();
@@ -6260,7 +6244,6 @@ impl kernel::Server for KernelImpl {
 
             let task = tokio::task::spawn_local(async move {
                 let block_sub = block_flows.subscribe(subscribe_pattern);
-                let input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 log::debug!(
                     "Started filtered FlowBus subscription for kernel {} (filter_active={}, \
                      pattern={})",
@@ -6271,7 +6254,6 @@ impl kernel::Server for KernelImpl {
                 run_block_bridge(
                     callback,
                     block_sub,
-                    input_sub,
                     wire_filter,
                     kernel_id,
                     conn_cancel,
@@ -9347,18 +9329,11 @@ impl BridgeSeq {
             }
         }
     }
-
-    /// Input-doc events ride the ordered lane too — they are content, not time.
-    fn next_ordered(&mut self) -> u64 {
-        self.ordered += 1;
-        self.ordered
-    }
 }
 
 /// One item the bridge has pulled off a bus and still owes the client.
 enum BridgeItem {
     Block(FlowMessage<BlockFlow>),
-    Input(FlowMessage<InputDocFlow>),
 }
 
 /// Forward ONE block event. Returns whether the peer accepted it.
@@ -9556,42 +9531,6 @@ async fn send_block_event(
     }
 }
 
-/// Forward one input-doc (compose scratchpad) event.
-async fn send_input_event(
-    callback: &block_events::Client,
-    payload: &InputDocFlow,
-    sub_seq: u64,
-    kernel_id: impl std::fmt::Display + Copy,
-) -> bool {
-    match payload {
-        InputDocFlow::TextOps {
-            context_id,
-            ops,
-            seq_num,
-            ..
-        } => {
-            let mut req = callback.on_input_text_ops_request();
-            {
-                let mut params = req.get();
-                params.set_context_id(context_id.as_bytes());
-                params.set_ops(ops);
-                params.set_seq_num(*seq_num);
-                params.set_sub_seq(sub_seq);
-            }
-            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
-        }
-        InputDocFlow::Cleared { context_id } => {
-            let mut req = callback.on_input_cleared_request();
-            {
-                let mut params = req.get();
-                params.set_context_id(context_id.as_bytes());
-                params.set_sub_seq(sub_seq);
-            }
-            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
-        }
-    }
-}
-
 /// Tell the client its subscription was terminated, then take the connection
 /// down so it reconnects and resyncs.
 ///
@@ -9645,7 +9584,6 @@ async fn kick_slow_subscriber(
 async fn run_block_bridge(
     callback: block_events::Client,
     mut block_sub: kaijutsu_kernel::flows::Subscription<BlockFlow>,
-    mut input_sub: Option<kaijutsu_kernel::flows::Subscription<InputDocFlow>>,
     filter: Option<kaijutsu_types::BlockEventFilter>,
     kernel_id: kaijutsu_types::KernelId,
     conn_cancel: CancellationToken,
@@ -9693,20 +9631,6 @@ async fn run_block_bridge(
                     None => break,
                 }
             }
-            if outcome.is_ok()
-                && let Some(sub) = input_sub.as_mut()
-            {
-                while pending.len() < BRIDGE_DRAIN_MAX {
-                    match sub.try_recv_event() {
-                        Some(FlowRecv::Message(m)) => pending.push(BridgeItem::Input(m)),
-                        Some(FlowRecv::Terminated(info)) => {
-                            outcome = Err(info);
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            }
             outcome
         }};
     }
@@ -9728,12 +9652,11 @@ async fn run_block_bridge(
 
         // 2. Nothing ready — wait for the next event (or the connection dying).
         if pending.is_empty() {
-            // Which bus woke us. Both arms are cancel-safe because we always
-            // drain before parking: a lost `Notify` permit can only ever
-            // correspond to an event we have already taken.
+            // Which bus woke us. Cancel-safe because we always drain before
+            // parking: a lost `Notify` permit can only ever correspond to an
+            // event we have already taken.
             enum Woke {
                 Block(FlowRecv<BlockFlow>),
-                Input(FlowRecv<InputDocFlow>),
                 Closed,
             }
             let woke = tokio::select! {
@@ -9742,12 +9665,6 @@ async fn run_block_bridge(
                     break;
                 }
                 ev = block_sub.recv_event() => ev.map(Woke::Block).unwrap_or(Woke::Closed),
-                ev = async {
-                    match input_sub.as_mut() {
-                        Some(sub) => sub.recv_event().await,
-                        None => std::future::pending().await,
-                    }
-                } => ev.map(Woke::Input).unwrap_or(Woke::Closed),
             };
             match woke {
                 Woke::Closed => break,
@@ -9756,9 +9673,7 @@ async fn run_block_bridge(
                         pending.push(BridgeItem::Block(m));
                     }
                 }
-                Woke::Input(FlowRecv::Message(m)) => pending.push(BridgeItem::Input(m)),
-                Woke::Block(FlowRecv::Terminated(info))
-                | Woke::Input(FlowRecv::Terminated(info)) => {
+                Woke::Block(FlowRecv::Terminated(info)) => {
                     kick_slow_subscriber(&callback, &info, kernel_id, label).await;
                     disconnect.cancel();
                     break;
@@ -9778,12 +9693,6 @@ async fn run_block_bridge(
         let mut i = 0;
         while i < pending.len() {
             let success = match &pending[i] {
-                BridgeItem::Input(msg) => {
-                    let s = seq.next_ordered();
-                    let ok = send_input_event(&callback, &msg.payload, s, kernel_id).await;
-                    i += 1;
-                    ok
-                }
                 BridgeItem::Block(msg) => {
                     // Server-side filter before serializing to the wire.
                     if let Some(f) = &filter

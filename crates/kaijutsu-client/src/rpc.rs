@@ -2575,9 +2575,10 @@ impl KernelHandle {
 
     /// Clear the input document for a context (discard draft).
     ///
-    /// The server clears the CRDT input doc and emits `InputCleared` to all
-    /// subscribers. Use this for Escape×3 (discard draft) — `submit_input`
-    /// already clears internally.
+    /// The server clears the draft block; there is no dedicated clear event —
+    /// the change rides the ordinary block-event / change-feed stream like
+    /// any other block deletion. Use this for Escape×3 (discard draft) —
+    /// `submit_input` already clears internally.
     #[tracing::instrument(skip(self), name = "rpc_client.clear_input")]
     pub async fn clear_input(&self, context_id: ContextId) -> Result<(), RpcError> {
         let mut request = self.kernel.clear_input_request();

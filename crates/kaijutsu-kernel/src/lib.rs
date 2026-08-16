@@ -134,22 +134,19 @@ pub use drift::{
 };
 pub use file_tools::FileDocumentCache;
 
-// Non-MCP flow buses (block / config / input-doc). The MCP-specific buses
-// (Resource / Progress / Logging / Elicitation) were removed in Phase 1 M5
-// per D-32; external MCP notifications now ride the ServerNotification
-// broadcast on each ExternalMcpServer.
+// Non-MCP flow buses (block / config). The MCP-specific buses (Resource /
+// Progress / Logging / Elicitation) were removed in Phase 1 M5 per D-32;
+// external MCP notifications now ride the ServerNotification broadcast on
+// each ExternalMcpServer.
 pub use flows::{
     BlockFlow,
     FlowBus,
     FlowMessage,
     HasSubject,
-    InputDocFlow,
     OpSource,
     SharedBlockFlowBus,
-    SharedInputDocFlowBus,
     Subscription,
     shared_block_flow_bus,
-    shared_input_doc_flow_bus,
 };
 pub use input_doc::InputDocEntry;
 pub use kernel_db::{

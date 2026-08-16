@@ -27,7 +27,7 @@ use kaijutsu_types::codec;
 use kaijutsu_types::{BlockFilter, BlockQuery};
 use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
 
-use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
+use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
 use crate::input_doc::InputDocEntry;
 use crate::kernel_db::{DocumentRow, KernelDb, KernelDbError};
 
@@ -207,8 +207,6 @@ pub struct BlockStore {
     input_journal_seqs: DashMap<ContextId, AtomicU64>,
     /// Per-input-doc uncompacted op counts (for compaction trigger).
     input_uncompacted: DashMap<ContextId, AtomicU64>,
-    /// Per-context monotonic seq for `InputDocFlow::TextOps` (M2-B2).
-    input_text_seqs: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
     /// Whether this store is expected to persist (kernel-side). When `true`, a
@@ -225,8 +223,6 @@ pub struct BlockStore {
     principal_id: RwLock<PrincipalId>,
     /// FlowBus for typed pub/sub.
     block_flows: Option<SharedBlockFlowBus>,
-    /// FlowBus for input doc events.
-    input_flows: Option<SharedInputDocFlowBus>,
     /// Stage 1 (time-well) incremental live-status cache: one
     /// `derive_context_live_status` reduction per context, bumped inside
     /// `journal_op` (the one chokepoint every mutating block op funnels
@@ -252,13 +248,11 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            input_text_seqs: DashMap::new(),
             db: None,
             persistent: false,
                         default_workspace_id: None,
             principal_id: RwLock::new(principal_id),
             block_flows: None,
-            input_flows: None,
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
@@ -272,13 +266,11 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            input_text_seqs: DashMap::new(),
             db: None,
             persistent: false,
                         default_workspace_id: None,
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
-            input_flows: None,
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
@@ -296,43 +288,34 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            input_text_seqs: DashMap::new(),
             db: Some(db),
             persistent: true,
                         default_workspace_id: Some(default_workspace_id),
             principal_id: RwLock::new(principal_id),
             block_flows: None,
-            input_flows: None,
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Create a block store with unified KernelDb persistence and both FlowBuses.
-    ///
-    /// Takes `input_flows` by value (not a forgettable `set_input_flows` call):
-    /// the input-doc bus is wired at construction so input events can't silently
-    /// vanish because a setter was missed.
+    /// Create a block store with unified KernelDb persistence and a FlowBus.
     pub fn with_db_and_flows(
         db: DbHandle,
                 default_workspace_id: WorkspaceId,
         principal_id: PrincipalId,
         block_flows: SharedBlockFlowBus,
-        input_flows: SharedInputDocFlowBus,
     ) -> Self {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
-            input_text_seqs: DashMap::new(),
             db: Some(db),
             persistent: true,
                         default_workspace_id: Some(default_workspace_id),
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
-            input_flows: Some(input_flows),
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
@@ -373,18 +356,6 @@ impl BlockStore {
         if let Some(bus) = &self.block_flows {
             bus.publish(flow);
         }
-    }
-
-    /// Allocate the next monotonic seq number for `InputDocFlow::TextOps` in
-    /// the given context. Per-context (not per-block) — gap detection is at
-    /// context granularity, which is enough to trigger an `ops_since`
-    /// re-fetch when the broadcast channel overflows.
-    fn next_input_text_seq(&self, context_id: ContextId) -> u64 {
-        let counter = self
-            .input_text_seqs
-            .entry(context_id)
-            .or_insert_with(|| AtomicU64::new(0));
-        counter.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Get the current agent ID.
@@ -2875,18 +2846,6 @@ impl BlockStore {
     // Input Document Operations
     // =========================================================================
 
-    /// Get the input flow bus.
-    pub fn input_flows(&self) -> Option<&SharedInputDocFlowBus> {
-        self.input_flows.as_ref()
-    }
-
-    /// Emit an input doc flow event if the bus is configured.
-    fn emit_input(&self, flow: InputDocFlow) {
-        if let Some(bus) = &self.input_flows {
-            bus.publish(flow);
-        }
-    }
-
     /// Create an input document for a context.
     ///
     /// Idempotent — returns Ok if the input doc already exists.
@@ -2926,14 +2885,6 @@ impl BlockStore {
         drop(entry);
 
         self.journal_and_maybe_compact_input(context_id, &ops)?;
-
-        let seq_num = self.next_input_text_seq(context_id);
-        self.emit_input(InputDocFlow::TextOps {
-            context_id,
-            ops: Arc::from(ops.clone()),
-            source: crate::flows::OpSource::Local,
-            seq_num,
-        });
 
         Ok(ops)
     }
@@ -2988,8 +2939,6 @@ impl BlockStore {
 
         let (text, ops) = entry.clear().map_err(BlockStoreError::Serialization)?;
         drop(entry);
-
-        self.emit_input(InputDocFlow::Cleared { context_id });
 
         if !ops.is_empty() {
             self.journal_and_maybe_compact_input(context_id, &ops)?;
@@ -3942,31 +3891,6 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.max_tick(ctx).unwrap(), Some(Tick::new(3)), "max_tick is the live high-water");
-    }
-
-    #[test]
-    fn test_input_text_ops_seq_monotonic_per_context() {
-        // M2-B2: each emitted InputDocFlow::TextOps event carries a
-        // per-context monotonic seq so clients can detect dropped
-        // broadcasts. (The parallel BlockFlow::TextOps counter was deleted
-        // in the 2026-08-15 wire flag day along with the event itself —
-        // docs/change-feed.md.)
-        let store = BlockStore::new(test_agent());
-        let ctx = ContextId::new();
-        store
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-        let i0 = store.next_input_text_seq(ctx);
-        let i1 = store.next_input_text_seq(ctx);
-        assert_eq!(i0, 0);
-        assert_eq!(i1, 1);
-
-        // Different context starts at 0 again.
-        let other = ContextId::new();
-        store
-            .create_document(other, DocumentKind::Conversation, None)
-            .unwrap();
-        assert_eq!(store.next_input_text_seq(other), 0);
     }
 
     #[test]

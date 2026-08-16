@@ -247,10 +247,6 @@ impl FlowTopics for BlockFlow {
     }
 }
 
-impl FlowTopics for InputDocFlow {
-    const TOPICS: &[&'static str] = &["input.text_ops", "input.cleared"];
-}
-
 impl FlowTopics for TurnFlow {
     const TOPICS: &[&'static str] = &["turn.requested", "turn.completed", "turn.failed"];
 }
@@ -1337,64 +1333,6 @@ impl<T: Clone + Send + 'static> std::fmt::Debug for Subscription<T> {
 
 
 // ============================================================================
-// Input Doc Flow Events
-// ============================================================================
-
-/// Input document flow events for compose scratchpad changes.
-///
-/// These events are emitted when the per-context input document is modified.
-/// Used to broadcast typing to other participants on the same context.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum InputDocFlow {
-    /// Text operations applied to the input document.
-    TextOps {
-        /// The context whose input doc was modified.
-        context_id: ContextId,
-        /// Serialized DTE operations (CBOR-encoded SerializedOpsOwned).
-        /// Arc-wrapped to avoid per-subscriber deep cloning.
-        ops: Arc<[u8]>,
-        /// Origin of this operation.
-        source: OpSource,
-        /// Per-context monotonic sequence number (M2-B2), for the same
-        /// gap-detection idiom the block flow used before its wire event
-        /// (`BlockFlow::TextOps`) was deleted in the 2026-08-15 flag day
-        /// (docs/change-feed.md). The input document is still CRDT-backed by
-        /// design, so this counter stays live.
-        #[serde(default)]
-        seq_num: u64,
-    },
-
-    /// The input document was cleared (after submit).
-    Cleared {
-        /// The context whose input doc was cleared.
-        context_id: ContextId,
-    },
-}
-
-impl InputDocFlow {
-    /// Get the subject string for this event.
-    pub fn subject(&self) -> &'static str {
-        match self {
-            Self::TextOps { .. } => "input.text_ops",
-            Self::Cleared { .. } => "input.cleared",
-        }
-    }
-
-    /// Get the context ID for this event.
-    pub fn context_id(&self) -> ContextId {
-        match self {
-            Self::TextOps { context_id, .. } | Self::Cleared { context_id, .. } => *context_id,
-        }
-    }
-}
-
-impl HasSubject for InputDocFlow {
-    fn subject(&self) -> &'static str {
-        InputDocFlow::subject(self)
-    }
-}
-
-// ============================================================================
 // Turn Flow Events
 // ============================================================================
 
@@ -1697,9 +1635,6 @@ impl HasSubject for EditorFlow {
 /// Thread-safe handle to a BlockFlow bus.
 pub type SharedBlockFlowBus = Arc<FlowBus<BlockFlow>>;
 
-/// Thread-safe handle to an InputDocFlow bus.
-pub type SharedInputDocFlowBus = Arc<FlowBus<InputDocFlow>>;
-
 /// Thread-safe handle to a TurnFlow bus.
 pub type SharedTurnFlowBus = Arc<FlowBus<TurnFlow>>;
 
@@ -1708,11 +1643,6 @@ pub type SharedEditorFlowBus = Arc<FlowBus<EditorFlow>>;
 
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
-    Arc::new(FlowBus::new(capacity))
-}
-
-/// Create a new shared input doc flow bus.
-pub fn shared_input_doc_flow_bus(capacity: usize) -> SharedInputDocFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 
@@ -2172,27 +2102,6 @@ mod tests {
     // ====================================================================
 
     #[tokio::test]
-    async fn test_input_doc_flow_topics() {
-        let bus: FlowBus<InputDocFlow> = FlowBus::new(16);
-        let mut ops_sub = bus.subscribe("input.text_ops");
-        let mut cleared_sub = bus.subscribe("input.cleared");
-
-        let ctx = ContextId::new();
-        bus.publish(InputDocFlow::TextOps {
-            context_id: ctx,
-            ops: Arc::from(vec![1u8]),
-            source: OpSource::Local,
-            seq_num: 0,
-        });
-        bus.publish(InputDocFlow::Cleared { context_id: ctx });
-
-        assert!(ops_sub.try_recv().is_some());
-        assert!(ops_sub.try_recv().is_none());
-        assert!(cleared_sub.try_recv().is_some());
-        assert!(cleared_sub.try_recv().is_none());
-    }
-
-    #[tokio::test]
     async fn test_turn_flow_topics() {
         let bus: FlowBus<TurnFlow> = FlowBus::new(16);
         let mut sub = bus.subscribe("turn.requested");
@@ -2622,28 +2531,6 @@ mod tests {
             flow.matches_filter(&constrained),
             "RenderCue must bypass context/event-type filtering unconditionally"
         );
-    }
-
-    #[test]
-    fn test_input_doc_flow_all_subjects_in_topics() {
-        let ctx = ContextId::new();
-        let variants = vec![
-            InputDocFlow::TextOps {
-                context_id: ctx,
-                ops: Arc::from(Vec::<u8>::new()),
-                source: OpSource::Local,
-                seq_num: 0,
-            },
-            InputDocFlow::Cleared { context_id: ctx },
-        ];
-
-        for v in &variants {
-            match v {
-                InputDocFlow::TextOps { .. } | InputDocFlow::Cleared { .. } => {}
-            }
-        }
-
-        assert_subjects_registered(&variants, InputDocFlow::TOPICS);
     }
 
     #[test]

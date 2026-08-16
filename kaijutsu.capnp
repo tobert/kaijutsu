@@ -431,9 +431,16 @@ interface BlockEvents {
   onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool, subSeq :UInt64);
   onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, subSeq :UInt64);
 
-  # Input document events (compose scratchpad)
-  onInputTextOps @5 (contextId :Data, ops :Data, seqNum :UInt64, subSeq :UInt64);
-  onInputCleared @6 (contextId :Data, subSeq :UInt64);
+  # @5 retired (2026-08-16): was onInputTextOps, streaming CRDT text ops for
+  # the compose scratchpad. Zero production callers — the input document was
+  # replaced by the draft block (Status::Draft + ephemeral), which rides the
+  # ordinary block event stream instead. Stub, not a hole — see @79-@83.
+  retired5 @5 ();
+
+  # @6 retired (2026-08-16): was onInputCleared, the companion clear event
+  # for the same input document. Same replacement, same reason. Stub, not a
+  # hole — see @79-@83.
+  retired6 @6 ();
 
   # Session control events (server → client)
   onContextSwitched @7 (contextId :Data, subSeq :UInt64);

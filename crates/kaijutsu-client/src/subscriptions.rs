@@ -100,15 +100,6 @@ pub enum ServerEvent {
         block_id: BlockId,
         after_id: Option<BlockId>,
     },
-    /// CRDT text operations applied to a context's input document.
-    InputTextOps {
-        context_id: ContextId,
-        ops: Vec<u8>,
-        /// Per-context monotonic seq (M2-B2).
-        seq_num: u64,
-    },
-    /// A context's input document was cleared (after submit).
-    InputCleared { context_id: ContextId },
     /// The kernel TERMINATED this client's block subscription because the
     /// client could not drain it fast enough (the 2026-08-05 backpressure
     /// rework). The view is incomplete as of `delivered`; the connection drops
@@ -1241,68 +1232,6 @@ impl block_events::Server for BlockEventsForwarder {
         };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockOutputChanged event");
-        }
-        Promise::ok(())
-    }
-
-    fn on_input_text_ops(
-        self: Rc<Self>,
-        params: block_events::OnInputTextOpsParams,
-        _results: block_events::OnInputTextOpsResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
-        self.note_ordered_seq(params.get_sub_seq());
-
-        let context_id = match params.get_context_id() {
-            Ok(s) => match parse_context_id_data(s) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(e),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let ops = match params.get_ops() {
-            Ok(data) => data.to_vec(),
-            Err(e) => return Promise::err(e),
-        };
-
-        let seq_num = params.get_seq_num();
-        let event = ServerEvent::InputTextOps {
-            context_id,
-            ops,
-            seq_num,
-        };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping InputTextOps event");
-        }
-        Promise::ok(())
-    }
-
-    fn on_input_cleared(
-        self: Rc<Self>,
-        params: block_events::OnInputClearedParams,
-        _results: block_events::OnInputClearedResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
-        self.note_ordered_seq(params.get_sub_seq());
-
-        let context_id = match params.get_context_id() {
-            Ok(s) => match parse_context_id_data(s) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(e),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let event = ServerEvent::InputCleared { context_id };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping InputCleared event");
         }
         Promise::ok(())
     }
