@@ -13,7 +13,6 @@ pub mod sftp;
 pub mod share_server;
 pub mod ssh;
 pub mod subscriptions;
-pub mod synced_input;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {
@@ -50,7 +49,6 @@ pub use subscriptions::{
 pub use midi_exchange::{
     MidiExchangeReceiver, MidiExchangeRequest, MidiExchangeSender, MidiExchangeSlot,
 };
-pub use synced_input::SyncedInput;
 
 /// Connect to a server via SSH and return an RPC client
 ///

@@ -301,7 +301,8 @@ impl InputMode {
 ///
 /// Text lives here temporarily while the overlay is visible. On submit,
 /// text is routed through the existing `submit_input` RPC. On dismiss
-/// (Escape), text stays in the CRDT InputDocEntry for recall.
+/// (Escape), text stays in the draft block (Status::Draft + ephemeral) for
+/// recall.
 ///
 /// Think rofi/dmenu:
 /// summon → orient (mode ring) → act → gone.

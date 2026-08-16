@@ -19,14 +19,15 @@
 //! The old `generation`/`stale_active`/`mark_synced` staleness dance is gone
 //! with it; there is nothing left for it to gate.
 //!
-//! **Compose input (Lane C slice 3).** The compose draft used to be a
-//! separate [`SyncedInput`] CRDT document, hydrated via `getInputState` and
-//! kept live by `InputTextOps`/`InputCleared` server events. It is now an
-//! ordinary block (`Role::User`, `Status::Draft`, `ephemeral`, one per
-//! `(context, principal)`) that rides the same change feed as every other
-//! block, so it already lands in `mirror.blocks()` — see
-//! [`DocumentEntry::draft_text`]. `SyncedInput` itself is untouched here
-//! (slice 4 territory) but this store no longer holds one.
+//! **Compose input (Lane C slice 3, retired Lane C slice 4).** The compose
+//! draft used to be a separate `SyncedInput` CRDT document, hydrated via
+//! `getInputState` and kept live by `InputTextOps`/`InputCleared` server
+//! events. It is now an ordinary block (`Role::User`, `Status::Draft`,
+//! `ephemeral`, one per `(context, principal)`) that rides the same change
+//! feed as every other block, so it already lands in `mirror.blocks()` — see
+//! [`DocumentEntry::draft_text`]. `SyncedInput` and the input-doc wire events
+//! it depended on are deleted (2026-08-16, docs/crdt-melt.md); this store
+//! never held one.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -74,8 +75,9 @@ impl DocumentEntry {
     /// with `status == Status::Draft` and `id.principal_id == principal`.
     /// There is at most one per (context, principal) by construction
     /// (`BlockStore::get_or_create_draft`), so the first match is the only
-    /// one. The mirror is version-ordered, so unlike the old `SyncedInput`
-    /// there is no stale-arrival window to guard against here.
+    /// one. The mirror is version-ordered, so unlike the old (deleted)
+    /// `SyncedInput` CRDT document there is no stale-arrival window to guard
+    /// against here.
     pub fn draft_text(&self, principal: PrincipalId) -> Option<&str> {
         self.mirror
             .blocks()

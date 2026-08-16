@@ -889,7 +889,7 @@ pub struct PaneFocus;
 ///
 /// When focus switches between panes, the outgoing pane's scroll state
 /// is saved here and the incoming pane's is restored. Input text lives
-/// in the CRDT InputDocEntry (not per-pane state).
+/// in the draft block (Status::Draft + ephemeral), not per-pane state.
 #[derive(Component, Debug, Clone, Default, Reflect)]
 #[reflect(Component)]
 pub struct PaneSavedState {

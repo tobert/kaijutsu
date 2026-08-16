@@ -25,7 +25,6 @@ pub mod execution;
 pub mod file_tools;
 pub mod flows;
 pub mod hyoushigi;
-pub mod input_doc;
 pub mod kernel;
 pub mod kernel_db;
 pub mod kj;
@@ -148,11 +147,10 @@ pub use flows::{
     Subscription,
     shared_block_flow_bus,
 };
-pub use input_doc::InputDocEntry;
 pub use kernel_db::{
     ContextEdgeRow, ContextEnvRow, ContextRow, ContextShellRow, ContextUsageRow, DocSnapshotRow,
-    DocumentRow, InputDocSnapshotRow, KernelDb, KernelDbError, KernelDbResult, PresetRow,
-    WorkspacePathRow, WorkspaceRow, context_used_pct,
+    DocumentRow, KernelDb, KernelDbError, KernelDbResult, PresetRow, WorkspacePathRow,
+    WorkspaceRow, context_used_pct,
 };
 pub use kj::{KjCaller, KjDispatcher, KjResult};
 

@@ -323,16 +323,6 @@ pub struct DocSnapshotRow {
     pub created_at: i64,
 }
 
-/// An input_doc_snapshots row — compaction checkpoint for input docs.
-#[derive(Debug, Clone)]
-pub struct InputDocSnapshotRow {
-    pub document_id: ContextId,
-    pub seq: i64,
-    pub state: Vec<u8>,
-    pub content: String,
-    pub created_at: i64,
-}
-
 /// Per-context shell configuration.
 #[derive(Debug, Clone)]
 pub struct ContextShellRow {
@@ -581,24 +571,14 @@ CREATE TABLE IF NOT EXISTS doc_snapshots (
     FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
 );
 
--- ── Input Document Op-Log ───────────────────────────────────────
-CREATE TABLE IF NOT EXISTS input_oplog (
-    document_id BLOB    NOT NULL,
-    seq         INTEGER NOT NULL,
-    payload     BLOB    NOT NULL,
-    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    PRIMARY KEY (document_id, seq),
-    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS input_doc_snapshots (
-    document_id BLOB    NOT NULL PRIMARY KEY,
-    seq         INTEGER NOT NULL,
-    state       BLOB    NOT NULL,
-    content     TEXT    NOT NULL,
-    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
-);
+-- `input_oplog` and `input_doc_snapshots` (the CRDT input-document tables)
+-- are abandoned, not dropped, as of 2026-08-16: the compose scratchpad moved
+-- to the draft block (Status::Draft + ephemeral), so the kernel stops
+-- reading and writing these two tables here. Neither has a `PRAGMA
+-- user_version` gate, so this is not a migration — an existing kernel.db
+-- keeps both tables and their rows exactly as they were; a fresh DB never
+-- creates them. Do not add DROP TABLE for either; do not touch existing
+-- data (docs/crdt-melt.md).
 
 -- ── Context Shell / Env ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS context_shell (
@@ -2267,103 +2247,6 @@ impl KernelDb {
         })?;
         self.conn.execute("VACUUM INTO ?1", params![path_str])?;
         Ok(())
-    }
-
-    // ========================================================================
-    // Input Document Op-Log
-    // ========================================================================
-
-    /// Append an input doc op to the journal.
-    pub fn append_input_op(
-        &self,
-        document_id: ContextId,
-        seq: i64,
-        payload: &[u8],
-    ) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT INTO input_oplog (document_id, seq, payload) VALUES (?1, ?2, ?3)",
-            params![blob_param(document_id.as_bytes()), seq, payload],
-        )?;
-        Ok(())
-    }
-
-    /// Load input oplog entries after a given seq.
-    pub fn load_input_oplog_since(
-        &self,
-        document_id: ContextId,
-        after_seq: i64,
-    ) -> KernelDbResult<Vec<(i64, Vec<u8>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, payload FROM input_oplog
-             WHERE document_id = ?1 AND seq > ?2
-             ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(
-            params![blob_param(document_id.as_bytes()), after_seq],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// Load the latest input doc compaction snapshot.
-    pub fn load_latest_input_snapshot(
-        &self,
-        document_id: ContextId,
-    ) -> KernelDbResult<Option<InputDocSnapshotRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT document_id, seq, state, content, created_at
-             FROM input_doc_snapshots WHERE document_id = ?1",
-        )?;
-        let mut rows = stmt.query(params![blob_param(document_id.as_bytes())])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(InputDocSnapshotRow {
-                document_id: read_context_id(row, 0)?,
-                seq: row.get(1)?,
-                state: row.get(2)?,
-                content: row.get(3)?,
-                created_at: row.get(4)?,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Write an input doc compaction snapshot and truncate its oplog.
-    pub fn write_input_snapshot_and_truncate(
-        &mut self,
-        document_id: ContextId,
-        seq: i64,
-        state: &[u8],
-        content: &str,
-    ) -> KernelDbResult<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO input_doc_snapshots (document_id, seq, state, content)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                blob_param(document_id.as_bytes()),
-                seq,
-                state,
-                content,
-            ],
-        )?;
-        tx.execute(
-            "DELETE FROM input_oplog WHERE document_id = ?1 AND seq <= ?2",
-            params![blob_param(document_id.as_bytes()), seq],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// List document IDs that have input oplog entries or snapshots.
-    pub fn list_input_doc_ids(&self) -> KernelDbResult<Vec<ContextId>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT d.document_id FROM documents d
-             WHERE EXISTS (SELECT 1 FROM input_oplog o WHERE o.document_id = d.document_id)
-                OR EXISTS (SELECT 1 FROM input_doc_snapshots s WHERE s.document_id = d.document_id)",
-        )?;
-        let rows = stmt.query_map([], |row| read_context_id(row, 0))?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
     // ========================================================================

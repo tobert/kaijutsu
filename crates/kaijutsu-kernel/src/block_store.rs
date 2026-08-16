@@ -28,7 +28,6 @@ use kaijutsu_types::{BlockFilter, BlockQuery};
 use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
 
 use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
-use crate::input_doc::InputDocEntry;
 use crate::kernel_db::{DocumentRow, KernelDb, KernelDbError};
 
 /// Backward-compatible alias during migration.
@@ -43,9 +42,6 @@ pub type DocumentKind = DocKind;
 pub enum BlockStoreError {
     #[error("document not found: {0}")]
     DocumentNotFound(ContextId),
-
-    #[error("input document not found: {0}")]
-    InputDocNotFound(ContextId),
 
     #[error("document already exists: {0}")]
     DocumentAlreadyExists(ContextId),
@@ -97,9 +93,6 @@ pub type DbHandle = Arc<parking_lot::Mutex<KernelDb>>;
 /// Compaction thresholds for the block document oplog.
 const COMPACTION_OP_THRESHOLD: u64 = 500;
 const COMPACTION_BYTE_THRESHOLD: u64 = 1_048_576; // 1 MiB
-
-/// Compaction threshold for input document oplog (lower — scratchpads are small).
-const INPUT_COMPACTION_OP_THRESHOLD: u64 = 200;
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
@@ -201,12 +194,6 @@ impl DocumentEntry {
 pub struct BlockStore {
     /// Concurrent document storage.
     documents: DashMap<ContextId, DocumentEntry>,
-    /// Per-context input documents (compose scratchpads).
-    input_docs: DashMap<ContextId, InputDocEntry>,
-    /// Per-input-doc journal sequence counters.
-    input_journal_seqs: DashMap<ContextId, AtomicU64>,
-    /// Per-input-doc uncompacted op counts (for compaction trigger).
-    input_uncompacted: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
     /// Whether this store is expected to persist (kernel-side). When `true`, a
@@ -245,9 +232,6 @@ impl BlockStore {
     pub fn new(principal_id: PrincipalId) -> Self {
         Self {
             documents: DashMap::new(),
-            input_docs: DashMap::new(),
-            input_journal_seqs: DashMap::new(),
-            input_uncompacted: DashMap::new(),
             db: None,
             persistent: false,
                         default_workspace_id: None,
@@ -263,9 +247,6 @@ impl BlockStore {
     pub fn with_flows(principal_id: PrincipalId, block_flows: SharedBlockFlowBus) -> Self {
         Self {
             documents: DashMap::new(),
-            input_docs: DashMap::new(),
-            input_journal_seqs: DashMap::new(),
-            input_uncompacted: DashMap::new(),
             db: None,
             persistent: false,
                         default_workspace_id: None,
@@ -285,9 +266,6 @@ impl BlockStore {
     ) -> Self {
         Self {
             documents: DashMap::new(),
-            input_docs: DashMap::new(),
-            input_journal_seqs: DashMap::new(),
-            input_uncompacted: DashMap::new(),
             db: Some(db),
             persistent: true,
                         default_workspace_id: Some(default_workspace_id),
@@ -308,9 +286,6 @@ impl BlockStore {
     ) -> Self {
         Self {
             documents: DashMap::new(),
-            input_docs: DashMap::new(),
-            input_journal_seqs: DashMap::new(),
-            input_uncompacted: DashMap::new(),
             db: Some(db),
             persistent: true,
                         default_workspace_id: Some(default_workspace_id),
@@ -1083,102 +1058,6 @@ impl BlockStore {
         db_guard
             .write_snapshot_and_truncate(context_id, 0, version, &snapshot_bytes, &content)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Journal an input doc op and trigger compaction if needed.
-    ///
-    /// IMPORTANT: the `entry()` guards on `input_journal_seqs` and
-    /// `input_uncompacted` are scoped tightly around the `fetch_add` and
-    /// dropped before SQLite IO and before any call to `compact_input_doc`.
-    /// Holding them across the compact call self-deadlocks: `compact_input_doc`
-    /// re-reads both maps via `get()`, and parking_lot's RwLock (which DashMap
-    /// shards use internally) is not reentrant — write-then-read on the same
-    /// shard from the same thread blocks forever.
-    fn journal_and_maybe_compact_input(
-        &self,
-        context_id: ContextId,
-        ops: &[u8],
-    ) -> BlockStoreResult<()> {
-        let Some(db) = self.journaling_db()? else {
-            return Ok(());
-        };
-
-        let seq = {
-            let seq_entry = self
-                .input_journal_seqs
-                .entry(context_id)
-                .or_insert_with(|| AtomicU64::new(0));
-            seq_entry.fetch_add(1, Ordering::SeqCst) + 1
-        };
-
-        let count = {
-            let count_entry = self
-                .input_uncompacted
-                .entry(context_id)
-                .or_insert_with(|| AtomicU64::new(0));
-            count_entry.fetch_add(1, Ordering::SeqCst) + 1
-        };
-
-        {
-            let db_guard = db.lock();
-            db_guard
-                .append_input_op(context_id, seq as i64, ops)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
-
-        if count >= INPUT_COMPACTION_OP_THRESHOLD {
-            self.compact_input_doc(context_id)?;
-        }
-        Ok(())
-    }
-
-    /// Compact an input document: snapshot + truncate oplog.
-    fn compact_input_doc(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let Some(db) = self.journaling_db()? else {
-            return Ok(());
-        };
-
-        let (state_bytes, content, max_seq) = {
-            let entry = self
-                .input_docs
-                .get(&context_id)
-                .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-            let state_bytes = entry.all_ops().map_err(BlockStoreError::Serialization)?;
-            let content = entry.get_text();
-            let max_seq = self
-                .input_journal_seqs
-                .get(&context_id)
-                .map(|s| s.load(Ordering::SeqCst))
-                .unwrap_or(0);
-            (state_bytes, content, max_seq)
-        };
-
-        {
-            let mut db_guard = db.lock();
-            db_guard
-                .write_input_snapshot_and_truncate(
-                    context_id,
-                    max_seq as i64,
-                    &state_bytes,
-                    &content,
-                )
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            // Flush the just-truncated input oplog out of the WAL too.
-            if let Ok((busy, _, _)) = db_guard.checkpoint()
-                && busy != 0
-            {
-                tracing::debug!(
-                    document_id = %context_id.to_hex(),
-                    "wal_checkpoint(TRUNCATE) busy after input compaction",
-                );
-            }
-        }
-
-        if let Some(count) = self.input_uncompacted.get(&context_id) {
-            count.store(0, Ordering::SeqCst);
-        }
 
         Ok(())
     }
@@ -2840,189 +2719,6 @@ impl BlockStore {
                     context_id.short()
                 ))
             })
-    }
-
-    // =========================================================================
-    // Input Document Operations
-    // =========================================================================
-
-    /// Create an input document for a context.
-    ///
-    /// Idempotent — returns Ok if the input doc already exists.
-    /// The input doc is persisted to DB lazily when the first edit is journaled.
-    pub fn create_input_doc(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        use dashmap::mapref::entry::Entry;
-
-        match self.input_docs.entry(context_id) {
-            Entry::Occupied(_) => Ok(()), // Already exists
-            Entry::Vacant(vacant) => {
-                let principal_id = self.principal_id();
-                let entry = InputDocEntry::new(principal_id);
-                vacant.insert(entry);
-                Ok(())
-            }
-        }
-    }
-
-    /// Edit the input document for a context.
-    ///
-    /// Returns serialized ops for broadcasting.
-    pub fn edit_input(
-        &self,
-        context_id: ContextId,
-        pos: usize,
-        insert: &str,
-        delete: usize,
-    ) -> BlockStoreResult<Vec<u8>> {
-        let mut entry = self
-            .input_docs
-            .get_mut(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-
-        let ops = entry
-            .edit_text(pos, insert, delete)
-            .map_err(BlockStoreError::Serialization)?;
-        drop(entry);
-
-        self.journal_and_maybe_compact_input(context_id, &ops)?;
-
-        Ok(ops)
-    }
-
-    /// Get the current input text for a context.
-    pub fn get_input_text(&self, context_id: ContextId) -> BlockStoreResult<String> {
-        let entry = self
-            .input_docs
-            .get(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-        Ok(entry.get_text())
-    }
-
-    /// Get the full input document state (text + ops + version) for sync.
-    pub fn get_input_state(
-        &self,
-        context_id: ContextId,
-    ) -> BlockStoreResult<(String, Vec<u8>, u64)> {
-        let entry = self
-            .input_docs
-            .get(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-        let text = entry.get_text();
-        let ops = entry.all_ops().map_err(BlockStoreError::Serialization)?;
-        let version = entry.version();
-        Ok((text, ops, version))
-    }
-
-    /// Get input ops since a frontier (for incremental sync).
-    pub fn input_ops_since(
-        &self,
-        context_id: ContextId,
-        frontier: &Frontier,
-    ) -> BlockStoreResult<Vec<u8>> {
-        let entry = self
-            .input_docs
-            .get(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-        entry
-            .ops_since(frontier)
-            .map_err(BlockStoreError::Serialization)
-    }
-
-    /// Clear the input document for a context.
-    ///
-    /// Returns the text that was in the input doc before clearing.
-    pub fn clear_input(&self, context_id: ContextId) -> BlockStoreResult<String> {
-        let mut entry = self
-            .input_docs
-            .get_mut(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-
-        let (text, ops) = entry.clear().map_err(BlockStoreError::Serialization)?;
-        drop(entry);
-
-        if !ops.is_empty() {
-            self.journal_and_maybe_compact_input(context_id, &ops)?;
-        }
-
-        Ok(text)
-    }
-
-    /// Load input documents from database on startup.
-    ///
-    /// Restores each input doc from its latest snapshot (if any) then replays
-    /// oplog entries written after that snapshot.
-    pub fn load_input_docs_from_db(&self) -> BlockStoreResult<()> {
-        let db = self
-            .db
-            .as_ref()
-            .ok_or(BlockStoreError::NoDatabaseConfigured)?;
-        let db_guard = db.lock();
-        let doc_ids = db_guard
-            .list_input_doc_ids()
-            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-
-        let principal_id = self.principal_id();
-
-        for context_id in doc_ids {
-            // Load base snapshot if available
-            let (mut input_entry, base_seq) =
-                match db_guard.load_latest_input_snapshot(context_id) {
-                    Ok(Some(snap_row)) => {
-                        match InputDocEntry::from_ops(&snap_row.state, principal_id) {
-                            Ok(entry) => {
-                                tracing::debug!(
-                                    context_id = %context_id.to_hex(),
-                                    snap_seq = snap_row.seq,
-                                    "Restored input doc from snapshot"
-                                );
-                                (entry, snap_row.seq)
-                            }
-                            Err(e) => {
-                                tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to restore input snapshot, creating empty");
-                                (InputDocEntry::new(principal_id), 0)
-                            }
-                        }
-                    }
-                    Ok(None) => (InputDocEntry::new(principal_id), 0),
-                    Err(e) => {
-                        tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to load input snapshot, creating empty");
-                        (InputDocEntry::new(principal_id), 0)
-                    }
-                };
-
-            // Replay oplog entries since the snapshot
-            let oplog_entries = db_guard
-                .load_input_oplog_since(context_id, base_seq)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-
-            let mut max_seq = base_seq;
-            for (seq, payload_bytes) in &oplog_entries {
-                max_seq = max_seq.max(*seq);
-                if let Err(e) = input_entry.merge_ops(payload_bytes) {
-                    tracing::warn!(
-                        context_id = %context_id.to_hex(),
-                        seq = seq,
-                        error = %e,
-                        "Failed to replay input oplog entry, skipping"
-                    );
-                }
-            }
-
-            if !oplog_entries.is_empty() {
-                tracing::debug!(
-                    context_id = %context_id.to_hex(),
-                    replayed = oplog_entries.len(),
-                    text_len = input_entry.get_text().len(),
-                    "Replayed input oplog entries"
-                );
-            }
-
-            self.input_docs.insert(context_id, input_entry);
-            self.input_journal_seqs
-                .insert(context_id, AtomicU64::new(max_seq as u64));
-        }
-
-        Ok(())
     }
 
     /// Insert a drift block with an explicit author identity.
@@ -5571,138 +5267,6 @@ mod tests {
             status_at_before,
             status_at_after
         );
-    }
-
-    // ====================================================================
-    // 5. Input Documents
-    // ====================================================================
-
-    #[test]
-    fn test_input_oplog_independent() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
-
-        store.create_input_doc(ctx).unwrap();
-
-        // 5 block operations
-        let block_id = store
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "a", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-        for _ in 0..4 {
-            store.append_text(ctx, &block_id, "x").unwrap();
-        }
-
-        // 5 input edits
-        for i in 0..5 {
-            let ch = (b'A' + i) as char;
-            store
-                .edit_input(ctx, i as usize, &ch.to_string(), 0)
-                .unwrap();
-        }
-
-        let db_guard = db.lock();
-        let oplog_entries = db_guard.load_oplog_since(ctx, 0).unwrap();
-        let input_entries = db_guard.load_input_oplog_since(ctx, 0).unwrap();
-
-        assert_eq!(
-            oplog_entries.len(),
-            5,
-            "block oplog should have 5 rows (1 insert + 4 appends), got {}",
-            oplog_entries.len()
-        );
-        assert_eq!(
-            input_entries.len(),
-            5,
-            "input oplog should have 5 rows, got {}",
-            input_entries.len()
-        );
-    }
-
-    #[test]
-    fn test_input_drop_reload() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, ws) = fresh_db_store(dir.path());
-
-        store.create_input_doc(ctx).unwrap();
-
-        // 100 single-char edits
-        let expected: String = (0..100).map(|i| (b'a' + (i % 26)) as char).collect();
-        for (i, ch) in expected.chars().enumerate() {
-            store
-                .edit_input(ctx, i, &ch.to_string(), 0)
-                .unwrap();
-        }
-
-        let text_before = store.get_input_text(ctx).unwrap();
-        assert_eq!(text_before, expected);
-
-        drop(store);
-
-        let store2 = drop_and_reload(db, ws);
-        store2.load_input_docs_from_db().unwrap();
-        let text_after = store2.get_input_text(ctx).unwrap();
-        assert_eq!(
-            text_after, expected,
-            "input doc should survive drop+reload"
-        );
-    }
-
-    /// Regression: triggering input doc compaction must not self-deadlock.
-    ///
-    /// `journal_and_maybe_compact_input` previously held `entry()` write
-    /// guards on `input_journal_seqs` and `input_uncompacted` while calling
-    /// `compact_input_doc`, which then re-read those same DashMaps via
-    /// `get()`. parking_lot's RwLock (which DashMap shards use) is not
-    /// reentrant — write-then-read on the same shard from the same thread
-    /// blocks forever. After 200 input ops (`INPUT_COMPACTION_OP_THRESHOLD`)
-    /// on one context, the next edit would wedge the whole RPC thread,
-    /// holding shard locks that subsequently broke all join_context calls
-    /// system-wide (creating the user-visible "one prompt then reconnect
-    /// loop" symptom).
-    ///
-    /// The test runs the edits on a background thread and aborts the
-    /// process if they don't finish in 10s — a deadlock would otherwise
-    /// hang the entire test binary.
-    #[test]
-    fn test_input_compaction_does_not_deadlock() {
-        use std::sync::mpsc;
-        use std::thread;
-        use std::time::Duration;
-
-        let dir = tempfile::tempdir().unwrap();
-        let (_db, store, ctx, _ws) = fresh_db_store(dir.path());
-        store.create_input_doc(ctx).unwrap();
-
-        let store = Arc::new(store);
-        let store_for_worker = store.clone();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let worker = thread::spawn(move || {
-            // INPUT_COMPACTION_OP_THRESHOLD is 200; run well past it so
-            // the compaction path runs at least once.
-            for i in 0..250 {
-                store_for_worker
-                    .edit_input(ctx, i, "x", 0)
-                    .expect("edit_input must not error");
-            }
-            let _ = done_tx.send(());
-        });
-
-        match done_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(()) => {
-                worker.join().expect("worker thread panicked");
-                // Sanity check the doc actually has 250 chars.
-                let text = store.get_input_text(ctx).unwrap();
-                assert_eq!(text.len(), 250, "all edits should have applied");
-            }
-            Err(_) => panic!(
-                "edit_input wedged — compaction path is self-deadlocking on \
-                 input_journal_seqs / input_uncompacted shard locks"
-            ),
-        }
     }
 
     // ====================================================================
