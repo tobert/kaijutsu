@@ -1,12 +1,12 @@
-//! Error types for CRDT operations.
+//! Error types for `BlockDocument` operations.
 
 use thiserror::Error;
 
 use kaijutsu_types::BlockId;
 
-/// Errors that can occur during CRDT operations.
+/// Errors that can occur during `BlockDocument` operations.
 #[derive(Error, Debug)]
-pub enum CrdtError {
+pub enum BlockDocumentError {
     /// Block not found in document.
     #[error("block not found: {0:?}")]
     BlockNotFound(BlockId),
@@ -33,8 +33,8 @@ pub enum CrdtError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
-    /// Internal CRDT consistency error.
-    #[error("internal CRDT error: {0}")]
+    /// Internal block-document consistency error.
+    #[error("internal block-document error: {0}")]
     Internal(String),
 
     /// Schema corruption detected (missing required fields).

@@ -11,8 +11,9 @@ older doc disagree, the code wins and this document tries to say so.
 ## Contents
 
 - **[overview](README.md)** — this file: the system in one read.
-- **[foundation.md](foundation.md)** — `kaijutsu-types` + `kaijutsu-crdt` + the
-  Cap'n Proto wire schema. The shared vocabulary and the CRDT data model.
+- **[foundation.md](foundation.md)** — `kaijutsu-types` + the Cap'n Proto wire
+  schema. The shared vocabulary and, historically, the CRDT data model (see
+  "Stale docs & surprises" below).
 - **[kernel.md](kernel.md)** — `kaijutsu-kernel`: the instrument's body (VFS,
   block store, MCP broker, LLM, drift, persistence, the embedded shell).
 - **[server.md](server.md)** — `kaijutsu-server`: SSH transport, the Cap'n Proto
@@ -160,12 +161,15 @@ Two more orthogonal axes that read like overlap but aren't:
 - **`ContentType`** = how the block's text renders (Plain, Markdown, Svg, Abc,
   Image). A `ToolResult` can have `ContentType::Svg`; they vary independently.
 
-CRDT mechanics live in `kaijutsu-crdt`, built on a fork of diamond-types
-(`diamond-types-extended`). Storage is `BlockStore`: one DTE document *per
-block* for text, plus per-field Last-Write-Wins Lamport timestamps for
-metadata. The earlier single-shared-DTE-document `BlockDocument` model was
-demolished 2026-08-09 (commit `75e31b60`) — `BlockStore` is the only storage
-path now.
+Storage is `kaijutsu_kernel::blocks::BlockDocument`: a `BTreeMap<BlockId,
+BlockContent>` per context, each block's content a plain `String`, ordered by
+fractional indexing, with per-field Last-Write-Wins Lamport timestamps for
+metadata. Text ran through a per-block diamond-types-extended CRDT until
+2026-08-16; the standalone `kaijutsu-crdt` crate that housed it melted into
+`kaijutsu-kernel::blocks` the same day, once retiring the CRDT left it with no
+dependency the kernel didn't already have (see `docs/crdt-position-2026-08.md`
+for the retirement, `docs/issues.md`'s architecture-mapping entries for the
+open questions this section used to describe).
 
 ---
 
@@ -279,18 +283,19 @@ The workspace layers cleanly from leaves up:
 
 - **Leaves** (no in-repo deps): `kaijutsu-types`, `kaijutsu-cas`,
   `kaijutsu-abc`, `kaijutsu-viz`, `kaijutsu-telemetry`, `kaijutsu-agent-tools`.
-- **`kaijutsu-crdt`** depends only on `-types` (+ `diamond-types-extended`).
 - **`kaijutsu-index`** depends only on `-types` (ONNX + HNSW + SQLite).
 - **`kaijutsu-hyoushigi`** depends on `-types` + `-cas`.
-- **`kaijutsu-kernel`** sits on `-types`, `-crdt`, `-cas`, `-index`,
-  `-hyoushigi`, `-abc`, `-telemetry`, plus the external `kaish-kernel`.
-- **`kaijutsu-server`** depends on `-kernel`, `-crdt`, `-types`, `-index`,
+- **`kaijutsu-kernel`** sits on `-types`, `-cas`, `-index`,
+  `-hyoushigi`, `-abc`, `-telemetry`, plus the external `kaish-kernel`. It
+  owns the block/document model directly (`src/blocks/`) — the standalone
+  `kaijutsu-crdt` crate melted into it 2026-08-16.
+- **`kaijutsu-server`** depends on `-kernel`, `-types`, `-index`,
   `-telemetry`.
-- **`kaijutsu-client`** depends on `-crdt`, `-types`, `-telemetry`.
-- **`kaijutsu-app`** depends on `-client`, `-crdt`, `-types`, `-abc`, `-viz`,
+- **`kaijutsu-client`** depends on `-types`, `-telemetry`.
+- **`kaijutsu-app`** depends on `-client`, `-types`, `-abc`, `-viz`,
   `-telemetry`.
 - **`kaijutsu-mcp`** is the terminal consumer: it depends on `-kernel`, `-server`,
-  `-client`, `-crdt`, `-types`, `-agent-tools`, `-telemetry`.
+  `-client`, `-types`, `-agent-tools`, `-telemetry`.
 
 ---
 

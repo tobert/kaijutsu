@@ -1,8 +1,8 @@
 //! Block/document model — one context's blocks, their content, order keys,
 //! and tombstones.
 //!
-//! `BlockStore` is the storage model: each block owns its content as a plain
-//! `String`. Metadata lives in `BlockHeader` (plain data).
+//! `BlockDocument` is the storage model: each block owns its content as a
+//! plain `String`. Metadata lives in `BlockHeader` (plain data).
 //!
 //! Text used to run through diamond-types-extended, a character-level CRDT —
 //! retired 2026-08-16 because no block is ever concurrently edited (the
@@ -33,23 +33,23 @@ pub(crate) mod content;
 mod error;
 pub mod selection;
 
-pub use block_store::{BlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit};
+pub use block_store::{BlockDocument, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit};
 pub use content::BlockContent;
-pub use error::CrdtError;
+pub use error::BlockDocumentError;
 pub use selection::{
     IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
 };
 
-/// Result type for block-store operations.
-pub type Result<T> = std::result::Result<T, CrdtError>;
+/// Result type for block-document operations.
+pub type Result<T> = std::result::Result<T, BlockDocumentError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kaijutsu_types::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
 
-    fn test_store() -> BlockStore {
-        BlockStore::new(ContextId::new(), PrincipalId::new())
+    fn test_store() -> BlockDocument {
+        BlockDocument::new(ContextId::new(), PrincipalId::new())
     }
 
     #[test]

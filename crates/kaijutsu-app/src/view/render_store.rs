@@ -3,9 +3,10 @@
 //!
 //! `sync_main_cell_to_conversation` (`view/sync.rs`) rebuilds this from
 //! `ContextMirror::blocks()` on every sync — never wire-fed, never persisted.
-//! It used to be `kaijutsu_kernel::blocks::BlockStore` (formerly the
-//! standalone CRDT crate), which carries a Lamport clock, fractional-index
-//! ordering, and DAG-reference validation for
+//! It used to be `kaijutsu_kernel::blocks::BlockDocument` (formerly the
+//! standalone CRDT crate, and named `BlockStore` until 2026-08-16), which
+//! carries a Lamport clock, fractional-index ordering, and DAG-reference
+//! validation for
 //! multi-writer merge. None of that applies here: this store has exactly one
 //! writer (the sync system), and it is thrown away and rebuilt on every
 //! version bump. `RenderBlockStore` keeps the twelve methods the app calls —
@@ -213,7 +214,7 @@ impl RenderBlockStore {
     }
 
     /// Reposition an existing block. `after: None` moves it to the front —
-    /// matching `kaijutsu_kernel::blocks::BlockStore::move_block`'s
+    /// matching `kaijutsu_kernel::blocks::BlockDocument::move_block`'s
     /// legacy move-to-front convention for a `None` target, which
     /// `view/render.rs`'s `reorder_repairs_children_after_order_only_change`
     /// exercises directly.

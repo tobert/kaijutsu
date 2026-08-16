@@ -1,7 +1,7 @@
 # Fork filters — interval selection, presets, seams
 
 Status: design locked 2026-06-12 (Amy + Fable). **IMPLEMENTED 2026-06-12
-(slices 1–4):** splice module, interval algebra (`kaijutsu-crdt::selection`),
+(slices 1–4):** splice module, interval algebra (`kaijutsu_kernel::blocks::selection`),
 `preset_args` + factory presets, `parse_range`, recall+compose at fork
 (`resolve_fork_selection`), hydration-policy travel, and the CLI surface
 (`--include`/`--exclude` ranges; `--shallow`/`--depth`/`max_blocks` retired →
@@ -53,7 +53,7 @@ kept = (base ∩ ∪includes) \ ∪excludes
 - Resolved **at fork instant** — positions are one-shot addresses, never
   stored, which is what makes positional addressing safe in a multi-writer
   CRDT log.
-- Implementation home: `ForkBlockFilter` (kaijutsu-crdt) grows interval
+- Implementation home: `ForkBlockFilter` (kaijutsu_kernel::blocks) grows interval
   support; `select_hydration_window` (kernel mailbox) becomes a consumer of
   the same algebra — its keep-set IS the `window` preset's base, one
   definition, single source.

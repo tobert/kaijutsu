@@ -1,15 +1,19 @@
 //! Block store — collection of blocks.
 //!
 //! A collection of `BlockContent` instances, each owning its content as a
-//! plain `String`. Metadata lives in `BlockHeader` (plain data). (Superseded
-//! the single-shared-Document `BlockDocument` model, removed 2026-08-09; text
-//! itself was a per-block diamond-types-extended CRDT until 2026-08-16 — see
-//! `docs/crdt-position-2026-08.md`.)
+//! plain `String`. Metadata lives in `BlockHeader` (plain data). `BlockDocument`
+//! superseded a *different*, single-shared-Document architecture that used
+//! the same name (a single DTE `Document` with every block addressed as a
+//! path within it), removed 2026-08-09; text itself was a per-block
+//! diamond-types-extended CRDT until 2026-08-16 — see
+//! `docs/crdt-position-2026-08.md`. Renamed from `BlockStore` 2026-08-16 to
+//! stop colliding with the kernel's own `BlockStore` (documents map,
+//! persistence, journaling, flows) — two different types sharing one name.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::content::{BlockContent, base62_encode_padded, order_key_successor, order_midpoint};
-use super::error::CrdtError;
+use super::error::BlockDocumentError;
 use super::selection::IntervalSet;
 use super::Result;
 use kaijutsu_types::{
@@ -71,7 +75,7 @@ impl ForkBlockFilter {
 /// Uses a Lamport clock (not wall-clock) for LWW conflict resolution on
 /// mutable header fields (status, collapsed). The clock advances on every
 /// local mutation and on merge (`max(local, remote) + 1`).
-pub struct BlockStore {
+pub struct BlockDocument {
     /// Context this store belongs to.
     context_id: ContextId,
 
@@ -109,7 +113,7 @@ pub struct BlockStore {
     next_tick: i64,
 }
 
-impl BlockStore {
+impl BlockDocument {
     /// Create a new empty store.
     pub fn new(context_id: ContextId, principal_id: PrincipalId) -> Self {
         Self {
@@ -597,12 +601,12 @@ impl BlockStore {
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
         if let Some(pid) = parent_id
             && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*pid));
+            return Err(BlockDocumentError::InvalidReference(*pid));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -651,18 +655,18 @@ impl BlockStore {
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let input_json = serde_json::to_string_pretty(&tool_input)
-            .map_err(|e| CrdtError::Serialization(e.to_string()))?;
+            .map_err(|e| BlockDocumentError::Serialization(e.to_string()))?;
 
         // Validate references
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
         if let Some(pid) = parent_id
             && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*pid));
+            return Err(BlockDocumentError::InvalidReference(*pid));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -717,12 +721,12 @@ impl BlockStore {
 
         // Validate tool call exists
         if !self.blocks.contains_key(tool_call_id) || self.blocks[tool_call_id].is_deleted() {
-            return Err(CrdtError::InvalidReference(*tool_call_id));
+            return Err(BlockDocumentError::InvalidReference(*tool_call_id));
         }
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -780,12 +784,12 @@ impl BlockStore {
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
         if let Some(pid) = parent_id
             && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*pid));
+            return Err(BlockDocumentError::InvalidReference(*pid));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -820,12 +824,12 @@ impl BlockStore {
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
         if let Some(pid) = parent_id
             && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*pid));
+            return Err(BlockDocumentError::InvalidReference(*pid));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -850,12 +854,12 @@ impl BlockStore {
         let id = self.new_block_id();
 
         if !self.blocks.contains_key(parent_id) || self.blocks[parent_id].is_deleted() {
-            return Err(CrdtError::InvalidReference(*parent_id));
+            return Err(BlockDocumentError::InvalidReference(*parent_id));
         }
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -887,12 +891,12 @@ impl BlockStore {
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
         if let Some(pid) = parent_id
             && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*pid));
+            return Err(BlockDocumentError::InvalidReference(*pid));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -929,12 +933,12 @@ impl BlockStore {
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
         if let Some(pid) = parent_id
             && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*pid));
+            return Err(BlockDocumentError::InvalidReference(*pid));
         }
 
         let (block_tick, order_key) = self.next_position(after);
@@ -967,7 +971,7 @@ impl BlockStore {
         self.observe_seq(snapshot.id.principal_id, snapshot.id.seq);
 
         if self.blocks.contains_key(&block_id) {
-            return Err(CrdtError::DuplicateBlock(block_id));
+            return Err(BlockDocumentError::DuplicateBlock(block_id));
         }
 
         // Keep the snapshot's own tick (via from_snapshot) — the tick is the pure
@@ -1024,7 +1028,7 @@ impl BlockStore {
         let block = self
             .blocks
             .get_mut(id)
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.mark_deleted(ts);
         self.version += 1;
         Ok(())
@@ -1046,14 +1050,14 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
 
         let len = block.content_len();
         if pos > len {
-            return Err(CrdtError::PositionOutOfBounds { pos, len });
+            return Err(BlockDocumentError::PositionOutOfBounds { pos, len });
         }
         if pos + delete > len {
-            return Err(CrdtError::PositionOutOfBounds {
+            return Err(BlockDocumentError::PositionOutOfBounds {
                 pos: pos + delete,
                 len,
             });
@@ -1070,7 +1074,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.append_text(text);
         self.version += 1;
         Ok(())
@@ -1083,7 +1087,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_status(status, ts);
         self.version += 1;
         Ok(())
@@ -1096,7 +1100,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_collapsed(collapsed, ts);
         self.version += 1;
         Ok(())
@@ -1112,7 +1116,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_output(output);
         self.version += 1;
         Ok(())
@@ -1127,7 +1131,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_stderr(stderr);
         self.version += 1;
         Ok(())
@@ -1139,7 +1143,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_tool_use_id(tool_use_id);
         self.version += 1;
         Ok(())
@@ -1153,7 +1157,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_signature(signature);
         self.version += 1;
         Ok(())
@@ -1165,7 +1169,7 @@ impl BlockStore {
         let block = self
             .blocks
             .get_mut(id)
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_content_type(content_type, ts);
         self.version += 1;
         Ok(())
@@ -1180,7 +1184,7 @@ impl BlockStore {
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_task_status(status, ts);
         self.version += 1;
         Ok(())
@@ -1195,7 +1199,7 @@ impl BlockStore {
         let block = self
             .blocks
             .get_mut(id)
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_exit_code(exit_code, ts);
         self.version += 1;
         Ok(())
@@ -1207,7 +1211,7 @@ impl BlockStore {
         let block = self
             .blocks
             .get_mut(id)
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_ephemeral(ephemeral, ts);
         self.version += 1;
         Ok(())
@@ -1219,7 +1223,7 @@ impl BlockStore {
         let block = self
             .blocks
             .get_mut(id)
-            .ok_or(CrdtError::BlockNotFound(*id))?;
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_excluded(excluded, ts);
         self.version += 1;
         Ok(())
@@ -1228,12 +1232,12 @@ impl BlockStore {
     /// Move a block to a new position.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {
-            return Err(CrdtError::BlockNotFound(*id));
+            return Err(BlockDocumentError::BlockNotFound(*id));
         }
         if let Some(after_id) = after
             && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
         {
-            return Err(CrdtError::InvalidReference(*after_id));
+            return Err(BlockDocumentError::InvalidReference(*after_id));
         }
 
         // Reorder keeps the block's original tick; only its order_key moves.
@@ -1383,7 +1387,7 @@ impl BlockStore {
 
         // Replay each text edit against the block it targets. Bounds are
         // re-checked here (not trusted from the payload) — a corrupt or
-        // out-of-order journal entry must fail loud (`CrdtError`) rather
+        // out-of-order journal entry must fail loud (`BlockDocumentError`) rather
         // than silently truncate or shift the block's text. `edit.pos ==
         // None` resolves to this block's OWN current length (an append) —
         // never the sender's, which single-writer sequential replay
@@ -1397,7 +1401,7 @@ impl BlockStore {
             let len = block.content_len();
             let pos = edit.pos.unwrap_or(len);
             if pos > len || pos + edit.delete > len {
-                return Err(CrdtError::PositionOutOfBounds {
+                return Err(BlockDocumentError::PositionOutOfBounds {
                     pos: pos + edit.delete,
                     len,
                 });
@@ -1835,8 +1839,8 @@ impl SyncPayload {
 mod tests {
     use super::*;
 
-    fn test_store() -> BlockStore {
-        BlockStore::new(ContextId::new(), PrincipalId::new())
+    fn test_store() -> BlockDocument {
+        BlockDocument::new(ContextId::new(), PrincipalId::new())
     }
 
     /// `StoreSnapshot` used to carry `block_history: Vec<SerializedOpsOwned>`
@@ -2284,7 +2288,7 @@ mod tests {
 
         // Survives a StoreSnapshot round-trip (the sync/persistence path).
         let bytes = kaijutsu_types::codec::encode(&store.snapshot()).unwrap();
-        let restored = BlockStore::from_snapshot(
+        let restored = BlockDocument::from_snapshot(
             kaijutsu_types::codec::decode(&bytes).unwrap(),
             store.principal_id(),
         )
@@ -2502,7 +2506,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.snapshot();
-        let restored = BlockStore::from_snapshot(snapshot.clone(), PrincipalId::new()).unwrap();
+        let restored = BlockDocument::from_snapshot(snapshot.clone(), PrincipalId::new()).unwrap();
 
         assert_eq!(restored.block_count(), store.block_count());
         assert_eq!(restored.full_text(), store.full_text());
@@ -2533,7 +2537,7 @@ mod tests {
 
         // Round-trip through StoreSnapshot
         let store_snapshot = store.snapshot();
-        let restored = BlockStore::from_snapshot(store_snapshot, PrincipalId::new()).unwrap();
+        let restored = BlockDocument::from_snapshot(store_snapshot, PrincipalId::new()).unwrap();
 
         let restored_snap = restored.get_block_snapshot(&tc_id).unwrap();
         assert_eq!(restored_snap.tool_use_id, Some("toolu_01ABC".to_string()));
@@ -2724,8 +2728,8 @@ mod tests {
     #[test]
     fn test_sync_round_trip() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id1 = store1
             .insert_block(
@@ -2751,8 +2755,8 @@ mod tests {
     #[test]
     fn test_incremental_sync_new_block() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id1 = store1
             .insert_block(
@@ -2804,8 +2808,8 @@ mod tests {
     fn test_new_block_sync_no_redundant_header() {
         // Create store1 with a block, sync to store2, then add a new block to store1
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id1 = store1
             .insert_block(
@@ -2877,8 +2881,8 @@ mod tests {
     #[test]
     fn test_sync_propagates_status_change() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id = store1
             .insert_block(
@@ -2919,8 +2923,8 @@ mod tests {
     #[test]
     fn test_sync_propagates_collapsed() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id = store1
             .insert_block(
@@ -2956,8 +2960,8 @@ mod tests {
     #[test]
     fn test_sync_propagates_deletion() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id1 = store1
             .insert_block(
@@ -3014,8 +3018,8 @@ mod tests {
     #[test]
     fn test_sync_preserves_order_key() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id1 = store1
             .insert_block(
@@ -3102,8 +3106,8 @@ mod tests {
     #[test]
     fn test_lamport_clock_advances_on_merge() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         // Store1 does many operations, advancing its Lamport clock
         let id = store1
@@ -3172,8 +3176,8 @@ mod tests {
         let ctx = ContextId::new();
         let agent1 = PrincipalId::new();
         let agent2 = PrincipalId::new();
-        let mut store1 = BlockStore::new(ctx, agent1);
-        let mut store2 = BlockStore::new(ctx, agent2);
+        let mut store1 = BlockDocument::new(ctx, agent1);
+        let mut store2 = BlockDocument::new(ctx, agent2);
 
         // Store1 inserts A, B
         let a = store1
@@ -3362,8 +3366,8 @@ mod tests {
     #[test]
     fn test_incremental_text_sync_after_merge() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id = store1
             .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
@@ -3443,18 +3447,18 @@ mod tests {
         assert_eq!(restored.blocks[0].signature.as_deref(), Some("sig_xyz"));
     }
 
-    /// Verify that CrdtBlockStore → snapshot → BlockStore (round-trip) preserves
+    /// Verify that BlockDocument → snapshot → BlockDocument (round-trip) preserves
     /// block ordering.
     ///
     /// This is the exact path used by the rendering pipeline:
     /// sync_main_cell_to_conversation takes a store snapshot and rebuilds the
-    /// editor's BlockStore via `from_snapshot`. If ordering diverges, blocks
+    /// editor's BlockDocument via `from_snapshot`. If ordering diverges, blocks
     /// appear out of order on screen.
     #[test]
     fn test_store_snapshot_roundtrip_ordering_consistency() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, agent);
+        let mut store = BlockDocument::new(ctx, agent);
 
         // Create a realistic conversation: user, model, tool call, tool result, model
         let b1 = store
@@ -3518,7 +3522,7 @@ mod tests {
         let store_ids: Vec<BlockId> = store_snap.blocks.iter().map(|b| b.id).collect();
 
         // Rebuild via from_snapshot — the exact rendering-path round-trip.
-        let restored = BlockStore::from_snapshot(store_snap, agent).unwrap();
+        let restored = BlockDocument::from_snapshot(store_snap, agent).unwrap();
         let restored_ids: Vec<BlockId> = restored.blocks_ordered().iter().map(|b| b.id).collect();
 
         // Ordering must match
@@ -3736,11 +3740,11 @@ mod tests {
     /// principal-major — all of `p_lo`'s blocks (ticks 1,3) then all of
     /// `p_hi`'s (ticks 0,2) → [1,3,0,2]. Any position-dependent fork op that
     /// walks `blocks.values()` instead of order_key order will pick wrong.
-    fn interleaved_principal_log() -> BlockStore {
+    fn interleaved_principal_log() -> BlockDocument {
         let ctx = ContextId::new();
         let (a, b) = (PrincipalId::new(), PrincipalId::new());
         let (p_lo, p_hi) = if a < b { (a, b) } else { (b, a) };
-        let mut store = BlockStore::new(ctx, p_lo);
+        let mut store = BlockDocument::new(ctx, p_lo);
         let new_blocks = vec![
             snap_for(ctx, p_hi, 0, 0),
             snap_for(ctx, p_lo, 0, 1),
@@ -3759,7 +3763,7 @@ mod tests {
     }
 
     /// Ticks of a store's blocks in document order.
-    fn doc_ticks(store: &BlockStore) -> Vec<i64> {
+    fn doc_ticks(store: &BlockDocument) -> Vec<i64> {
         store
             .block_ids_ordered()
             .iter()
@@ -3913,8 +3917,8 @@ mod tests {
     #[test]
     fn test_lamport_clock_advances_after_text_only_merge() {
         let ctx = ContextId::new();
-        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
-        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
 
         let id = store1
             .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
@@ -3958,7 +3962,7 @@ mod tests {
         // fork_at_version filters by created_at (millis), not by version counter.
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, agent);
+        let mut store = BlockDocument::new(ctx, agent);
 
         // Insert 3 blocks with distinct created_at timestamps.
         // We construct BlockContent directly so we can control created_at.
@@ -4086,7 +4090,7 @@ mod tests {
         // Same as above but through fork_filtered to verify both paths.
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, agent);
+        let mut store = BlockDocument::new(ctx, agent);
 
         let ts_early = 1_000_000u64;
         let ts_late = 3_000_000u64;
@@ -4177,7 +4181,7 @@ mod tests {
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
 
-        let mut store_a = BlockStore::new(ctx, agent_a);
+        let mut store_a = BlockDocument::new(ctx, agent_a);
         let block_id = store_a
             .insert_block(
                 None,
@@ -4191,7 +4195,7 @@ mod tests {
             .unwrap();
 
         // Sync to store_b so both have the same block
-        let mut store_b = BlockStore::new(ctx, agent_b);
+        let mut store_b = BlockDocument::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
@@ -4240,7 +4244,7 @@ mod tests {
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
 
-        let mut store_a = BlockStore::new(ctx, agent_a);
+        let mut store_a = BlockDocument::new(ctx, agent_a);
         let block_id = store_a
             .insert_block(
                 None,
@@ -4253,7 +4257,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut store_b = BlockStore::new(ctx, agent_b);
+        let mut store_b = BlockDocument::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
@@ -4292,7 +4296,7 @@ mod tests {
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
 
-        let mut store_a = BlockStore::new(ctx, agent_a);
+        let mut store_a = BlockDocument::new(ctx, agent_a);
         let block_id = store_a
             .insert_block(
                 None,
@@ -4305,7 +4309,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut store_b = BlockStore::new(ctx, agent_b);
+        let mut store_b = BlockDocument::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
@@ -4338,7 +4342,7 @@ mod tests {
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
 
-        let mut store_a = BlockStore::new(ctx, agent_a);
+        let mut store_a = BlockDocument::new(ctx, agent_a);
         let block_id = store_a
             .insert_block(
                 None,
@@ -4351,7 +4355,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut store_b = BlockStore::new(ctx, agent_b);
+        let mut store_b = BlockDocument::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
@@ -4386,7 +4390,7 @@ mod tests {
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
 
-        let mut store_a = BlockStore::new(ctx, agent_a);
+        let mut store_a = BlockDocument::new(ctx, agent_a);
         let block_id = store_a
             .insert_block(
                 None,
@@ -4399,7 +4403,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut store_b = BlockStore::new(ctx, agent_b);
+        let mut store_b = BlockDocument::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
@@ -4438,7 +4442,7 @@ mod tests {
     fn test_set_task_status_updates_field_and_clock() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, agent);
+        let mut store = BlockDocument::new(ctx, agent);
         let block_id = store
             .insert_block(
                 None,
@@ -4483,7 +4487,7 @@ mod tests {
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
 
-        let mut store_a = BlockStore::new(ctx, agent_a);
+        let mut store_a = BlockDocument::new(ctx, agent_a);
         let block_id = store_a
             .insert_block(
                 None,
@@ -4496,7 +4500,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut store_b = BlockStore::new(ctx, agent_b);
+        let mut store_b = BlockDocument::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashSet::new());
         store_b.merge_ops(payload).unwrap();
 
@@ -4575,7 +4579,7 @@ mod tests {
         let prin = PrincipalId::new();
 
         // Store A: 10 blocks (ticks 0..9).
-        let mut store_a = BlockStore::new(ctx, prin);
+        let mut store_a = BlockDocument::new(ctx, prin);
         let mut last: Option<BlockId> = None;
         for _ in 0..10 {
             let id = store_a
@@ -4594,7 +4598,7 @@ mod tests {
 
         // Restore into B via the real snapshot path.
         let snapshot = store_a.snapshot();
-        let mut store_b = BlockStore::from_snapshot(snapshot, prin).unwrap();
+        let mut store_b = BlockDocument::from_snapshot(snapshot, prin).unwrap();
 
         // Merge 5 more blocks (ticks 10..14, canonical keys) under a foreign
         // principal — exactly the oplog-replay restore shape.
@@ -4638,7 +4642,7 @@ mod tests {
     fn merge_ops_restores_next_tick_high_water() {
         let ctx = ContextId::new();
         let prin = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, prin);
+        let mut store = BlockDocument::new(ctx, prin);
 
         let foreign = PrincipalId::new();
         let new_blocks: Vec<BlockSnapshot> =
@@ -4682,7 +4686,7 @@ mod tests {
         let ctx = ContextId::new();
         let prin = PrincipalId::new();
         let foreign = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, prin);
+        let mut store = BlockDocument::new(ctx, prin);
 
         // A beat block lands at tick 50 via the single-snapshot insert path (the
         // materialize-barrier shape). On a fresh store next_tick starts at 0.
@@ -4735,7 +4739,7 @@ mod tests {
             let ctx = ContextId::new();
             let prin = PrincipalId::new();
             let other = PrincipalId::new(); // P != fork principal
-            let mut store = BlockStore::new(ctx, prin);
+            let mut store = BlockDocument::new(ctx, prin);
 
             // Blocks authored by P (other), ticks 0..5.
             for t in 0..5 {
@@ -4791,7 +4795,7 @@ mod tests {
     fn keyless_merge_new_blocks_append_not_prepend() {
         let ctx = ContextId::new();
         let prin = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, prin);
+        let mut store = BlockDocument::new(ctx, prin);
 
         // Existing canonical-keyed blocks.
         let mut last: Option<BlockId> = None;
@@ -4846,7 +4850,7 @@ mod tests {
         let foreign = PrincipalId::new();
 
         // Build a source store with foreign-authored blocks (one deleted).
-        let mut src = BlockStore::new(ctx, prin);
+        let mut src = BlockDocument::new(ctx, prin);
         for t in 0..3 {
             src.insert_from_snapshot(snap_for(ctx, foreign, t as u64, t), None)
                 .unwrap();
@@ -4858,7 +4862,7 @@ mod tests {
 
         // (a) from_snapshot restores the foreign lane (tombstone included → max+1).
         let snapshot = src.snapshot();
-        let restored = BlockStore::from_snapshot(snapshot, prin).unwrap();
+        let restored = BlockDocument::from_snapshot(snapshot, prin).unwrap();
         assert_eq!(
             restored.next_seq_for(foreign),
             4,
@@ -4887,7 +4891,7 @@ mod tests {
         );
 
         // (b) merge_ops seeds a fresh foreign lane.
-        let mut merged = BlockStore::new(ContextId::new(), prin);
+        let mut merged = BlockDocument::new(ContextId::new(), prin);
         let mctx = merged.context_id();
         let merge_blocks: Vec<BlockSnapshot> =
             (0..3).map(|t| snap_for(mctx, foreign, t as u64, t)).collect();
@@ -4931,7 +4935,7 @@ mod tests {
         // Build a real store and snapshot it, then strip the order_key + tick from
         // the LATER half only — a partial pre-tick migration: the head keeps its
         // canonical 'V…' keys, the tail is key-less and must still sort after it.
-        let mut src = BlockStore::new(ctx, prin);
+        let mut src = BlockDocument::new(ctx, prin);
         let mut last: Option<BlockId> = None;
         let mut ids = Vec::new();
         for i in 0..4 {
@@ -4956,7 +4960,7 @@ mod tests {
             b.tick = None;
         }
 
-        let mut restored = BlockStore::from_snapshot(snapshot, prin).unwrap();
+        let mut restored = BlockDocument::from_snapshot(snapshot, prin).unwrap();
         let restored_order = restored.block_ids_ordered();
         assert_eq!(
             restored_order, ids,
@@ -4989,7 +4993,7 @@ mod tests {
     fn reserve_block_id_claims_and_advances() {
         let ctx = ContextId::new();
         let prin = PrincipalId::new();
-        let mut store = BlockStore::new(ctx, prin);
+        let mut store = BlockDocument::new(ctx, prin);
         let player = PrincipalId::new();
 
         let first = store.reserve_block_id(player);

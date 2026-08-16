@@ -6,6 +6,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `docs/architecture/` needs a refresh pass beyond the crate-melt rename (2026-08-16)
+
+Sweeping `kaijutsu-crdt`/`CrdtBlockStore` references while melting the crate
+into `kaijutsu_kernel::blocks` (see the "block store is not a CRDT" history,
+now folded into this entry) surfaced staleness the rename sweep didn't fix:
+
+- `docs/architecture/diagrams/06-crate-deps.svg` still draws a `kaijutsu-crdt`
+  box (labeled "BlockStore (DTE)"), arrows into it from kernel/server/client/
+  app, and a caption naming `diamond-types-extended`. Regenerating it needs a
+  real diagram edit (box removal, layout reflow), not a text sweep — left
+  alone rather than hand-patched into something subtly wrong.
+- `docs/architecture/client.md`'s "Client-side mirror" section (flagged STALE
+  in place, 2026-08-16) describes `SyncManager`/`SyncedDocument`
+  (`src/sync.rs`, `src/synced_document.rs`) — neither file exists in
+  `kaijutsu-client` any more. The change-feed migration
+  (`docs/change-feed.md`, `project_change_feed.md`) replaced them with
+  `ContextMirror` (`src/context_feed.rs`) well before this task; the doc was
+  never updated for it. Same likely true of `subscriptions.rs`'s
+  `BlockEventsForwarder` description.
+- `docs/architecture/README.md` and `foundation.md` were updated for the
+  crate melt (block/document model paths, dependency layering) but not
+  independently re-verified line-by-line against current code the way the
+  2026-06-16 sweep did originally — treat them as improved, not re-certified.
+
+---
+
 ## The roster index has no kernel-now reference, so client-rendered ages mix two clocks (2026-08-16)
 
 `/run/roster/index` gives each row a `recorded_at` on the **kernel's** wall
@@ -230,23 +256,6 @@ that question first; building the kernel-wiring slice for the git-worktree
 shape before it is confirmed as the plan would be work a later decision
 could throw away.
 
-## `kaijutsu-crdt` is a block store now, not a CRDT (2026-08-16)
-
-diamond-types-extended left the crate, and the build graph, on 2026-08-16
-(`fc616aa6`, `133b5814`): block text is a plain `String`, and concurrent
-merge into a kernel document is structurally impossible (the sole-sequencer
-ruling; `pushOps`'s deletion removed `merge_ops`'s only concurrent caller).
-What is left in `kaijutsu-crdt` is a Lamport-clocked, fractional-index,
-DAG-validating block store with document/snapshot/oplog persistence — a
-real thing, just not a conflict-free replicated data type.
-
-The name now promises merge semantics the crate does not have and will not
-need again. Only `kaijutsu-kernel` and `kaijutsu-server` still depend on it
-(client, acp, mcp, and app all dropped it during the melt). Renaming the
-crate — `kaijutsu-blockstore` is the obvious candidate — is open work: pure
-churn with no behavior change across two dependents, which is exactly why
-it has stayed a name change rather than a priority.
-
 ## The well's activity glow wants a derived signal (2026-08-15)
 
 The glow is **disabled**, not broken: `RingActivity`'s decay/ripple math is live
@@ -311,7 +320,7 @@ replays"*.
 ### 1. `BlockContent::append_text` materializes the whole block per token
 
 The streaming path's O(n²) is **not** gone. `append_text` computes
-`self.text().chars().count()` on every call (`kaijutsu-crdt/src/content.rs`), so
+`self.text().chars().count()` on every call (`kaijutsu-kernel/src/blocks/content.rs`), so
 each streamed token materializes the entire block. `08793e71` removed a
 *different* one (per-op re-materialization while journaling), and the kernel's
 classification deliberately avoids adding a *third* — but the per-token cost
@@ -5478,7 +5487,7 @@ existing entry are marked *(confirms above)*.
 
 **CRDT data model:**
 - `calc_order_key` calls `block_ids_ordered()` (O(N) sort) on **every** insert
-  (`kaijutsu-crdt/src/block_store.rs:390`); the bench exposing it is `#[ignore]`d.
+  (`kaijutsu-kernel/src/blocks/block_store.rs:390`); the bench exposing it is `#[ignore]`d.
 - Tombstones aren't a first-class `BlockSnapshot` field — they ride a side
   `deleted_blocks` list re-applied by hand (`block_store.rs:1637`).
 - `StoreSnapshot` has a breaking-format note with no migration path ("delete

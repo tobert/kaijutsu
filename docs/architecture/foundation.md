@@ -1,11 +1,13 @@
-# Foundation: types, CRDT, and the wire schema
+# Foundation: types, the block/document model, and the wire schema
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-types`,
-`kaijutsu-crdt`, and `kaijutsu.capnp`. Code is truth; verified 2026-06-16.*
+`kaijutsu_kernel::blocks`, and `kaijutsu.capnp`. Code is truth; verified
+2026-06-16, block/document section updated 2026-08-16 for the CRDT retirement
+and the `kaijutsu-crdt` → `kaijutsu_kernel::blocks` melt.*
 
 These three things are the shared vocabulary every other crate builds on:
 `kaijutsu-types` defines the identities and data shapes, `kaijutsu.capnp` is how
-they travel on the wire, and `kaijutsu-crdt` is how they converge across writers.
+they travel on the wire, and `kaijutsu_kernel::blocks` holds them per context.
 
 ---
 
@@ -96,34 +98,45 @@ in [issues](../issues.md) because Cap'n Proto treats ordinals as permanent.
 
 ---
 
-## `kaijutsu-crdt` — convergence
+## `kaijutsu_kernel::blocks` — the block/document model
 
-The CRDT layer: an ordered, multi-writer-safe block log per context, built on
-`diamond-types-extended` (a fork of diamond-types). Text is a character-level
-CRDT; block order is fractional indexing; metadata is per-field LWW.
+Formerly the standalone `kaijutsu-crdt` crate; melted into the kernel
+2026-08-16 once retiring the CRDT (below) left it with no dependency the
+kernel didn't already have (`docs/crdt-position-2026-08.md`). No longer a
+CRDT: the kernel is the sole sequencer for every mutation, so nothing ever
+needs concurrent-branch reconciliation. What is described below as "the CRDT
+layer" until 2026-08-16 is now an ordered block log per context; block order
+is fractional indexing, metadata is per-field LWW, and text is a plain
+`String`.
 
-### One storage impl: `BlockStore`
+### One storage impl: `BlockDocument`
 
-`BlockStore` (`block_store.rs:76`) is the single CRDT storage path — a
-`BTreeMap<BlockId, BlockContent>` where **each block owns its own DTE
-document** for content. Manages a Lamport clock (LWW), per-principal `seq_lanes`,
+`BlockDocument` (`blocks/block_store.rs:78`) is the single per-context storage
+path — a `BTreeMap<BlockId, BlockContent>` where each block owns its content
+as a plain `String`. Manages a Lamport clock (LWW), per-principal `seq_lanes`,
 a monotonic `next_tick`, and a `version` counter. `block_ids_ordered()`
-(`block_store.rs:199`) sorts by `order_key` (tiebreak `BlockId`) — never iterate
-the `BTreeMap` for timeline order, it's principal-major. Append `order_key` is
-the *successor* of the predecessor's key (`content.rs:134`), decoupled from
-`tick` to avoid stale-counter mis-sorts. Sync via `ops_since(frontiers) →
-SyncPayload` / `merge_ops` (`block_store.rs:1193`, `:1242`); persistence via
-`StoreSnapshot` (parallel `Vec<BlockSnapshot>` + per-block DTE history, CBOR).
+(`blocks/block_store.rs:238`) sorts by `order_key` (tiebreak `BlockId`) — never
+iterate the `BTreeMap` for timeline order, it's principal-major. Append
+`order_key` is the *successor* of the predecessor's key (`blocks/content.rs`),
+decoupled from `tick` to avoid stale-counter mis-sorts. Sync via
+`ops_since(frontiers) → SyncPayload` / `merge_ops`
+(`blocks/block_store.rs:1286`, `:1327`) — retained for the client mirror's
+incremental-fetch path, not for concurrent-write merge, which cannot happen;
+persistence via `StoreSnapshot` (`Vec<BlockSnapshot>`, CBOR).
 
-The earlier `BlockDocument` — a single shared DTE document holding all blocks
-as paths, kept alongside `BlockStore` during an unfinished migration — was
-demolished 2026-08-09 (commit `75e31b60`); `crates/kaijutsu-crdt/src/document.rs`
-is gone and no `struct BlockDocument` remains anywhere in the tree.
+**Naming note:** an *earlier, different* `BlockDocument` — a single shared DTE
+document holding all blocks as paths, kept alongside this struct (then named
+`BlockStore`) during an unfinished migration — was demolished 2026-08-09
+(commit `75e31b60`) and its file (`document.rs`) deleted. `BlockStore` was
+renamed to `BlockDocument` 2026-08-16, after the old model was long gone, to
+stop colliding with the kernel's *own* `BlockStore` (the documents map,
+persistence, journaling, and flows wrapper around this one). The name is
+reused; the two things it names are unrelated.
 
-`BlockContent` (`content.rs:178`) is the per-block unit: a DTE doc scoped to one
-block's `content`, the `order_key`, an `Option<Tick>`, an `Option<TrackId>`, and
-write-once snapshot fields. DTE ops are wrapped in `catch_unwind`
-(`content.rs:628`) to turn causal-graph panics into `CrdtError::Internal`.
+`BlockContent` (`blocks/content.rs:204`) is the per-block unit: `content:
+String`, the `order_key`, an `Option<Tick>`, an `Option<TrackId>`, and
+write-once snapshot fields. No `catch_unwind`-wrapped CRDT ops remain — that
+machinery went with diamond-types-extended.
 
 ### Other documents
 
@@ -134,7 +147,7 @@ write-once snapshot fields. DTE ops are wrapped in `catch_unwind`
 ### Document kinds
 
 `DocKind` is defined in `kaijutsu-types` (`enums.rs:184`) but *implemented* here —
-a conceptual gap (the CRDT crate doesn't map kinds to backends; the kernel does).
+`kaijutsu_kernel::blocks` doesn't map kinds to backends; the kernel does.
 Variants: **Conversation** (the dialog block log), **Code** (file-tool cache, one
 doc per tracked file), **Text** (static markdown), **Config** (theme/models TOML),
 **Symlink** (content *is* the link target). Legacy string aliases map onto these;

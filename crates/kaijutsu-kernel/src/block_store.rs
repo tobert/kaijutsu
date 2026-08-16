@@ -1,6 +1,6 @@
 //! Block-based storage using `crate::blocks`.
 //!
-//! Each document wraps a `crate::blocks::block_store::BlockStore` (each
+//! Each document wraps a `crate::blocks::BlockDocument` (each
 //! block's content is a plain `String` — see `crate::blocks::content`'s
 //! module doc). The durable oplog journals a `SyncPayload` per mutation and
 //! replays it on restart; nothing multi-writer merges through it (CLAUDE.md
@@ -19,9 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use crate::blocks::{
-    BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit,
-};
+use crate::blocks::{BlockDocument, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit};
 use kaijutsu_types::codec;
 use kaijutsu_types::{BlockFilter, BlockQuery};
 use kaijutsu_types::{
@@ -58,7 +56,7 @@ pub enum BlockStoreError {
     EmptyDraft(ContextId),
 
     #[error(transparent)]
-    Crdt(#[from] crate::blocks::CrdtError),
+    Block(#[from] crate::blocks::BlockDocumentError),
 
     #[error("database error: {0}")]
     Db(String),
@@ -99,7 +97,7 @@ const COMPACTION_BYTE_THRESHOLD: u64 = 1_048_576; // 1 MiB
 /// Entry for a document in the store.
 pub struct DocumentEntry {
     /// Per-block store (each block owns its content as a plain `String`).
-    pub doc: CrdtBlockStore,
+    pub doc: BlockDocument,
     /// Document metadata.
     pub kind: DocKind,
     /// Programming language (if code).
@@ -127,7 +125,7 @@ impl DocumentEntry {
         principal_id: PrincipalId,
     ) -> Self {
         Self {
-            doc: CrdtBlockStore::new(context_id, principal_id),
+            doc: BlockDocument::new(context_id, principal_id),
             kind,
             language,
             version: AtomicU64::new(0),
@@ -150,7 +148,7 @@ impl DocumentEntry {
         uncompacted_count: u64,
         uncompacted_bytes: u64,
     ) -> BlockStoreResult<Self> {
-        let store = CrdtBlockStore::from_snapshot(snapshot, principal_id)?;
+        let store = BlockDocument::from_snapshot(snapshot, principal_id)?;
         let version = store.version();
         Ok(Self {
             doc: store,
@@ -1615,7 +1613,7 @@ impl BlockStore {
     /// Move a block to a new position.
     ///
     /// `after` is the block to land after, or `None` to land at the beginning.
-    /// Wraps the block-store primitive (`crate::blocks::BlockStore::move_block`)
+    /// Wraps the block-document primitive (`crate::blocks::BlockDocument::move_block`)
     /// with FlowBus emission (`BlockFlow::Moved`) and journaling so peers receive ops.
     pub fn move_block(
         &self,
@@ -2351,7 +2349,7 @@ impl BlockStore {
                                 snap_version = snap_row.version,
                                 "Restored document from snapshot"
                             );
-                            match CrdtBlockStore::from_snapshot(store_snapshot, principal_id) {
+                            match BlockDocument::from_snapshot(store_snapshot, principal_id) {
                                 Ok(store) => (store, snap_row.seq, snap_row.version.max(0) as u64),
                                 Err(e) => {
                                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot, skipping");
@@ -2365,7 +2363,7 @@ impl BlockStore {
                         }
                     }
                 }
-                Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0, 0),
+                Ok(None) => (BlockDocument::new(context_id, principal_id), 0, 0),
                 Err(e) => {
                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot, skipping");
                     continue;
@@ -2508,7 +2506,7 @@ impl BlockStore {
                             snap_version = snap_row.version,
                             "Hydrated document from snapshot"
                         );
-                        match CrdtBlockStore::from_snapshot(store_snapshot, principal_id) {
+                        match BlockDocument::from_snapshot(store_snapshot, principal_id) {
                             Ok(store) => (store, snap_row.seq, snap_row.version.max(0) as u64),
                             Err(e) => {
                                 tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot");
@@ -2522,7 +2520,7 @@ impl BlockStore {
                     }
                 }
             }
-            Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0, 0),
+            Ok(None) => (BlockDocument::new(context_id, principal_id), 0, 0),
             Err(e) => {
                 tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot");
                 return Ok(false);
@@ -2680,10 +2678,10 @@ impl BlockStore {
             Some(snap_row) => {
                 let store_snapshot = codec::decode::<StoreSnapshot>(&snap_row.state)
                     .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-                let store = CrdtBlockStore::from_snapshot(store_snapshot, principal_id)?;
+                let store = BlockDocument::from_snapshot(store_snapshot, principal_id)?;
                 (store, snap_row.seq)
             }
-            None => (CrdtBlockStore::new(context_id, principal_id), 0),
+            None => (BlockDocument::new(context_id, principal_id), 0),
         };
 
         // Replay must be gapless from the snapshot to the requested point.
@@ -2889,7 +2887,7 @@ impl BlockStore {
 
     /// Insert a notification block (broker-emitted tool/log event).
     ///
-    /// Wraps `CrdtBlockStore::insert_notification_block()` with FlowBus
+    /// Wraps `BlockDocument::insert_notification_block()` with FlowBus
     /// emission and journaling. `parent_id` is typically
     /// `None` (root-level notification tied to the context) but may point at
     /// a specific block when the notification is about that block.
@@ -2941,7 +2939,7 @@ impl BlockStore {
 
     /// Insert a resource block (MCP resource read-through — Phase 3, D-43).
     ///
-    /// Wraps `CrdtBlockStore::insert_resource_block()` with FlowBus emission
+    /// Wraps `BlockDocument::insert_resource_block()` with FlowBus emission
     /// and journaling. `parent_id` is `None` for the initial
     /// read (root block) and `Some(root)` for subscription-update children
     /// emitted by the broker on `ResourceUpdated` flush.
@@ -2993,7 +2991,7 @@ impl BlockStore {
 
     /// Insert an error block attached to a parent.
     ///
-    /// Wraps `CrdtBlockStore::insert_error_block()` with FlowBus emission
+    /// Wraps `BlockDocument::insert_error_block()` with FlowBus emission
     /// and journaling.
     pub fn insert_error_block_as(
         &self,
@@ -3078,7 +3076,7 @@ pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
 /// Snapshots for specific block IDs, in the order asked for; unknown IDs are
 /// skipped. Takes the document so a caller holding one guard can answer a query
 /// and read the version without releasing it.
-fn snapshots_by_ids(doc: &CrdtBlockStore, ids: &[BlockId]) -> Vec<BlockSnapshot> {
+fn snapshots_by_ids(doc: &BlockDocument, ids: &[BlockId]) -> Vec<BlockSnapshot> {
     let mut result = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(snap) = doc.get_block_snapshot(id) {
@@ -3092,7 +3090,7 @@ fn snapshots_by_ids(doc: &CrdtBlockStore, ids: &[BlockId]) -> Vec<BlockSnapshot>
 ///
 /// If `filter.parent_id` is set, only descendants (up to `max_depth`) are
 /// considered. Otherwise iterates all blocks in order, applying the predicate.
-fn snapshots_by_filter(doc: &CrdtBlockStore, filter: &BlockFilter) -> Vec<BlockSnapshot> {
+fn snapshots_by_filter(doc: &BlockDocument, filter: &BlockFilter) -> Vec<BlockSnapshot> {
     // If parent_id is set, compute descendant set via BFS
     let descendant_ids = filter
         .parent_id
@@ -3287,7 +3285,7 @@ fn validate_diff(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
 }
 
 fn compute_descendants(
-    doc: &CrdtBlockStore,
+    doc: &BlockDocument,
     root_id: &BlockId,
     max_depth: u32,
 ) -> HashSet<BlockId> {
@@ -4085,7 +4083,7 @@ mod tests {
     //
     // These tests verify SyncPayload-based sync:
     // - Server sends incremental SyncPayload for block insertions
-    // - Client (CrdtBlockStore) can merge these payloads after initial snapshot sync
+    // - Client (BlockDocument) can merge these payloads after initial snapshot sync
 
     use crate::flows::{BlockFlow, FlowBus, SharedBlockFlowBus};
     use std::sync::Arc;
@@ -4158,7 +4156,7 @@ mod tests {
 
         // Client syncs from snapshot
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new()).unwrap();
+        let mut client = BlockDocument::from_snapshot(snapshot, PrincipalId::new()).unwrap();
         assert_eq!(client.block_count(), 0);
 
         // Server inserts a block
@@ -4240,7 +4238,7 @@ mod tests {
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
         let bytes = codec::encode(&snapshot).unwrap();
         let restored: StoreSnapshot = codec::decode(&bytes).unwrap();
-        let reloaded = CrdtBlockStore::from_snapshot(restored, test_agent()).unwrap();
+        let reloaded = BlockDocument::from_snapshot(restored, test_agent()).unwrap();
 
         let rblocks = reloaded.blocks_ordered();
         let rticks: Vec<i64> = rblocks.iter().map(|b| b.tick.unwrap().get()).collect();
@@ -4261,7 +4259,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new()).unwrap();
+        let mut client = BlockDocument::from_snapshot(snapshot, PrincipalId::new()).unwrap();
 
         let block_id = store
             .insert_tool_call(
@@ -4302,7 +4300,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new()).unwrap();
+        let mut client = BlockDocument::from_snapshot(snapshot, PrincipalId::new()).unwrap();
 
         for i in 0..5 {
             let _ = store
@@ -4395,7 +4393,7 @@ mod tests {
 
         // Replay the REAL journaled oplog (insert + 4 appends) into a fresh
         // store, the same primitive `load_from_db` uses.
-        let mut client = CrdtBlockStore::new(ctx, PrincipalId::new());
+        let mut client = BlockDocument::new(ctx, PrincipalId::new());
         let oplog = db.lock().load_oplog_since(ctx, 0).unwrap();
         assert_eq!(oplog.len(), 5, "insert + 4 appends should each journal one entry");
         for (_seq, payload_bytes) in &oplog {

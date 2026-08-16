@@ -45,27 +45,19 @@ supports agent/file/in-memory keys, and does TOFU host-key checking via
 
 ---
 
-## Client-side CRDT mirror
+## Client-side mirror — STALE, see `docs/change-feed.md`
 
-### `SyncManager` (`src/sync.rs:99`)
-
-A pure state machine tracking `frontier: Option<HashMap<BlockId, Frontier>>` +
-`context_id`. `frontier = None` (or a context change) means a full sync is needed.
-`apply_initial_state` (`:267`) replaces the store from a CBOR `StoreSnapshot`;
-`apply_block_inserted` (`:329`) tries incremental merge, falls back to full
-snapshot, buffers on double failure; `apply_text_ops` (`:424`) is incremental-only
-and resets the frontier on deserialize error. A `pending_ops` buffer (bounded at
-200; overflow → reset) holds ops that can't yet apply.
-
-### `SyncedDocument` (`src/synced_document.rs:40`)
-
-Bundles a `CrdtBlockStore` + `SyncManager` + a `pending_events` map. The map
-solves the **cross-topic FlowBus ordering problem**: non-insert events (status,
-text ops, metadata) that arrive before their `BlockInserted` are buffered per
-block (≤64 blocks, ≤128 events each); on insert the block syncs first, then
-`replay_pending` drains the buffer. `apply_event` (`:211`) is the single consumer
-API; `SyncReset` resets the frontier and signals `NeedsResync` (the consumer then
-calls `get_context_sync` and feeds `apply_sync_state`).
+Everything below this heading describes `SyncManager`/`SyncedDocument`
+(`src/sync.rs`, `src/synced_document.rs`), a client-side CRDT mirror keyed on
+a `CrdtBlockStore`. **That code is gone** — neither file exists in
+`kaijutsu-client` any more, replaced by the change-feed architecture
+(`docs/change-feed.md`, `project_change_feed.md`): a `ContextMirror`
+(`src/context_feed.rs`) fed by `ActorHandle::subscribe_context` +
+`get_blocks_versioned`, held per context by `document_store.rs`'s
+multi-context store. This section is left unrewritten — a full
+architecture-doc pass for the change-feed migration is separate,
+larger work than the `kaijutsu-crdt` → `kaijutsu_kernel::blocks` crate melt
+that prompted this flag (see `docs/issues.md`).
 
 ### Compose input
 
@@ -96,11 +88,14 @@ loop → `spawn_local(run_rpc_call(...))` → `KernelHandle` method → capnp
 `request.send()` → SSH rpc channel → server → reply via oneshot. Per-call timeout
 30 s; disconnect-class errors trigger the `Closing` transition.
 
-**Inbound:** server emits an event → SSH events channel → capnp callback (in the
-`LocalSet`) → `BlockEventsForwarder` → `broadcast` (cap 256) → consumer
-(`subscribe_events`) → `SyncedDocument::apply_event` (buffer-if-unknown, else
-merge, then `replay_pending`) → `CrdtBlockStore` mutated → consumer reads
-`blocks()`.
+**Inbound (STALE — pre-change-feed):** server emits an event → SSH events
+channel → capnp callback (in the `LocalSet`) → `BlockEventsForwarder` →
+`broadcast` (cap 256) → consumer (`subscribe_events`) →
+`SyncedDocument::apply_event` (buffer-if-unknown, else merge, then
+`replay_pending`) → `CrdtBlockStore` mutated → consumer reads `blocks()`. See
+the flag at "Client-side mirror" above — this path no longer exists; the
+current inbound path is the per-context change feed
+(`docs/change-feed.md`).
 
 **Handshake** (`connect_handshake`, `:1852`): SSH dial+auth (5 s) → `bind_kernel`
 (5 s) → `join_context` if set (5 s) → `attach_peer` if remembered (best-effort,

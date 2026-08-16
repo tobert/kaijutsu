@@ -28,7 +28,7 @@ out-of-band-change notification companion described in "Hydration" below.
    (+ its own LWW clock `task_status_at`) rides directly on `BlockHeader`/
    `BlockSnapshot` as a `Copy` field, mirroring `content_type`/
    `content_type_at` field-for-field (same per-field-clock mechanism in
-   `kaijutsu-crdt/src/content.rs`: `set_task_status`, `merge_header`'s
+   `kaijutsu-kernel/src/blocks/content.rs`: `set_task_status`, `merge_header`'s
    `field_wins` tiebreak). No new payload struct, no new mutation plumbing
    to invent — the exact machinery `content_type` already proved out.
 
@@ -46,7 +46,7 @@ out-of-band-change notification companion described in "Hydration" below.
    `TaskStatus`'s own tie-break order (`Cancelled > Done > InProgress >
    Open`, pinned by `test_task_status_lww_tiebreak_order` in
    `kaijutsu-types` and exercised end-to-end by
-   `test_per_field_lww_tiebreaker_task_status` in `kaijutsu-crdt`) makes
+   `test_per_field_lww_tiebreaker_task_status` in `kaijutsu-kernel`) makes
    both terminal states dominate the non-terminal ones, and treats a
    same-timestamp cancel as the more deliberate of two concurrent terminal
    writes.
@@ -94,7 +94,7 @@ out-of-band-change notification companion described in "Hydration" below.
      so it follows the `svg_block`/`abc_block`/`diff_block` precedent
      (tool-created rich content stays `Role::Tool`) rather than the
      broker-event one.
-   - No `task_reparent`/reorder verb: `kaijutsu_crdt::BlockStore` has no
+   - No `task_reparent`/reorder verb: `kaijutsu_kernel::blocks::BlockDocument` has no
      cheap "move to a different parent" primitive today (`move_block` only
      reorders siblings under the SAME parent) — building one just for this
      slice would be exactly the "bespoke mechanism" decision 3 above

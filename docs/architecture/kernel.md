@@ -76,9 +76,10 @@ state (`BlockStore` documents, registries) that a live file swap would
 desynchronize. To restore a backup: stop the kernel, replace `kernel.db`
 (removing any `-wal`/`-shm` siblings alongside it), then start the kernel.
 
-### CRDT documents — `BlockStore` (`src/block_store.rs:180`)
+### Block documents — `BlockStore` (`src/block_store.rs:180`)
 
-Kernel-level wrapper around `kaijutsu_crdt`: a `DashMap<ContextId,
+Kernel-level wrapper around `crate::blocks::BlockDocument` (formerly the
+standalone `kaijutsu-crdt` crate, melted in 2026-08-16): a `DashMap<ContextId,
 DocumentEntry>`, threaded with the `DbHandle` for journaling.
 `create_document`/`fork_document`/`fork_document_filtered` (`:387`/`:535`/`:669`),
 `insert_block`/`insert_tool_call`/`insert_tool_result`, `set_excluded` (`:1474`),

@@ -208,7 +208,7 @@ dirs on text blocks).
 its `BlockId` (`{ctx}_{principal}_{seq}`, `crates/kaijutsu-types/src/block.rs:67` —
 stable and unique, but *principal-major*) and its timeline position (a derived view
 that shifts on every insert/exclude). Timeline order comes from
-`block_ids_ordered()` (`crates/kaijutsu-crdt/src/block_store.rs:199`) and must never
+`block_ids_ordered()` (`crates/kaijutsu-kernel/src/blocks/block_store.rs:238`) and must never
 be confused with `BlockId` iteration order — a standing gotcha. So the block-key dir
 is canonical and **the ordered view is `blocks/index` row order** — no `by-time/NNNN`
 farm whose ordinals would be unstable under multi-writer.
@@ -531,7 +531,7 @@ Track V (`/v/ctx` + `/v/session`):
 - `crates/kaijutsu-kernel/src/runtime/context_engine.rs:31` — `SessionContextMap` (the live acting-context source `context` renders; KV is retired, see `docs/shared-state.md`)
 - `crates/kaijutsu-app/src/connection/actor_plugin.rs:301,319` — the app's *durable* per-client restore (via the typed per-client store `set_last_context`/`get_client_view`, **not** `/v/session`)
 - `crates/kaijutsu-types/src/block.rs:67,134` — `BlockId::to_key()`; `BlockHeader` (gains `content_len`)
-- `crates/kaijutsu-crdt/src/block_store.rs:199` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
+- `crates/kaijutsu-kernel/src/blocks/block_store.rs:238` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
 - `crates/kaijutsu-kernel/src/block_store.rs:182,153,2020` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write, restored on remote `merge_ops`)
 - `crates/kaijutsu-kernel/src/kernel_db.rs:1823,284` — `list_all_contexts()` (context roster → `index`); `contexts.label` UNIQUE (the `label` column)
 - `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write` (keys on `ctx.context_id`; unchanged)
