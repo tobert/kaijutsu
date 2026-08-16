@@ -123,7 +123,8 @@ async-trait = "0.1"
 dashmap = "6"
 parking_lot = "0.12"
 
-# RNG — pinned to 0.8 by diamond-types-extended (jumprope)
+# RNG — 0.8 was pinned by diamond-types-extended (jumprope), which is gone.
+# Nothing forces this version now; it is free to move on its own merits.
 rand = "0.8"
 shellexpand = "3"
 
@@ -148,8 +149,7 @@ pulldown-cmark = "0.13"
 # engine with a different tokenizer. `kaijutsu-diff` writes no diff algorithm.
 imara-diff = "0.2"
 
-# CRDT + Persistence
-diamond-types-extended = "0.2"
+# Persistence
 rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Configuration
@@ -178,7 +178,4 @@ tracing-opentelemetry = "0.32"
 # Testing
 tempfile = "3"
 
-# TEMP: macOS AsRawFd fix (tobert/diamond-types-extended#3), merged but unreleased on crates.io
-[patch.crates-io]
-diamond-types-extended = { git = "https://github.com/tobert/diamond-types-extended", rev = "1304b24db229bf4cc66f1786963a184f3b0d651c" }
 

@@ -13494,8 +13494,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core 0.5.1",
 ]
-
-[[patch.unused]]
-name = "diamond-types-extended"
-version = "0.2.0"
-source = "git+https://github.com/tobert/diamond-types-extended?rev=1304b24db229bf4cc66f1786963a184f3b0d651c#1304b24db229bf4cc66f1786963a184f3b0d651c"
