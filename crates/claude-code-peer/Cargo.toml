@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Client and listener for Claude Code's per-session peer messaging socket: on-disk session registry, procStart liveness guard, canonical attribution envelope, frame codec. No kaijutsu-* dependency — publishable standalone."
+readme = "README.md"
+keywords = ["claude-code", "ipc", "unix-socket", "json-lines", "protocol"]
+categories = ["network-programming", "api-bindings", "os::unix-apis"]
 
 [lints]
 workspace = true

@@ -69,6 +69,8 @@ pub struct OutgoingUser<'a> {
 /// `message`, `priority`, then `from` when present), no spaces after
 /// separators. `content` is the one field that needs JSON string escaping —
 /// done by routing it through serde_json's string serializer alone.
+/// `priority` is fixed to `"next"`, the only value ever observed **[probed]**;
+/// the rest of the enum is unknown, so nothing here models it as one.
 pub fn user_frame_line(frame: &OutgoingUser<'_>) -> String {
     let content = serde_json::to_string(frame.content).expect("a &str always serializes");
     let mut out = format!(
