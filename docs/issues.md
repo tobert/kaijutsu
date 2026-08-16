@@ -36,6 +36,33 @@ pre-existing gap in metadata replay fidelity.
 
 ---
 
+## The dead-letter queue does not survive a restart (found 2026-08-16)
+
+`DriftRouter.dead_letter` is `Vec<StagedDrift>` held in memory
+(`crates/kaijutsu-kernel/src/drift.rs:165`) and there is **no table for it** —
+`grep dead_letter crates/kaijutsu-kernel/src/kernel_db.rs` returns nothing. A
+kernel restart discards every dead letter.
+
+**The mechanism whose whole job is "content is never silently discarded"
+silently discards content.** Its own doc comment at `:162-165` states that
+guarantee. Worse, the API invites you to come back later — `dead_letters()`
+(`:626`) is explicitly non-consuming "for clients that pair with
+`replay_dead_letter`" (`:635`), and a restart is exactly the event after which
+someone would go looking.
+
+**The fix is probably not a table.** Kaijutsu already has durable queuing and
+the answer was blocks: `ConversationMailbox` stores nothing at all
+(`llm/mailbox.rs:37-42` is a `HydrationState` plus a `seen: HashSet<BlockId>`),
+because the block log IS the queue and the mailbox is only a cursor over it.
+Landing dead letters as blocks in the lost+found context — which
+`lost_found_id`/`adopt_lost_found` (`drift.rs:425-448`) already exist to
+provide — makes them durable, inspectable through ordinary block tooling,
+replayable, and visible in the app, with no new storage and no new format.
+
+Sized as a bug rather than a design: the lost+found context is already the
+documented destination for drained dead letters, so this is moving the drain
+earlier, not inventing a destination.
+
 ## Flaky: ACP's tracing-capture test fails about 1 run in 9 (2026-08-16)
 
 `kaijutsu-acp`'s `update::tests::shrink_and_divergence_log_a_loud_warning_not_
