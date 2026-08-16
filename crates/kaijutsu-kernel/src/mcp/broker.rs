@@ -1073,7 +1073,7 @@ impl Broker {
 
     /// Drop a binding. D-44: walk any live subscriptions for this context
     /// and best-effort unsubscribe on each server. Subscription drops are
-    /// not replayed by CRDT — they are a live side effect.
+    /// not replayed from the oplog — they are a live side effect.
     pub async fn clear_binding(&self, context_id: &ContextId) {
         // Drain the subscription set for this context.
         let pending = self.subscriptions.lock().await.remove(context_id);

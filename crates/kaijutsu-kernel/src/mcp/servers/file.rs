@@ -170,7 +170,7 @@ impl McpServerLike for FileToolsServer {
                 "Find files matching a glob pattern (supports **, gitignore)"
             )?,
             tool_def::<GrepParams>(&self.instance_id, "grep",
-                "Search file content with regex, CRDT-aware (sees uncommitted edits)"
+                "Search file content with regex, document-aware (sees unflushed edits)"
             )?,
         ])
     }
@@ -390,7 +390,7 @@ impl McpServerLike for FileToolsServer {
                                 c
                             }
                             Err(CacheReadError::Backend(e)) => {
-                                output.push_str(&format!("# WARNING: skipped {} (CRDT error: {})\n", path_str, e));
+                                output.push_str(&format!("# WARNING: skipped {} (document error: {})\n", path_str, e));
                                 continue;
                             }
                             Err(CacheReadError::NotCached) => {
@@ -510,7 +510,7 @@ impl FileToolsServer {
                 self.cache.mark_dirty(&path);
                 if let Err(e) = self.cache.flush_one(&path).await {
                     // Roll all the way back: a plain `invalidate` only drops
-                    // the in-memory map entry, but the persisted CRDT shadow
+                    // the in-memory map entry, but the persisted shadow
                     // document still holds the phantom edit — the next
                     // load's "document already exists" fallback would just
                     // re-adopt that same phantom content instead of
@@ -527,7 +527,7 @@ impl FileToolsServer {
                     }
                     return ExecResult::failure(
                         1,
-                        format!("wrote to CRDT but failed to flush {}: {}", path, e),
+                        format!("wrote the document but failed to flush {}: {}", path, e),
                     );
                 }
                 ExecResult::success(format!(
@@ -620,7 +620,7 @@ impl FileToolsServer {
             }
             return ExecResult::failure(
                 1,
-                format!("edited CRDT but failed to flush {}: {}", path, e),
+                format!("edited the document but failed to flush {}: {}", path, e),
             );
         }
 

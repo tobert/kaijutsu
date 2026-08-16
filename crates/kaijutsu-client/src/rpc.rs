@@ -1017,11 +1017,11 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // Block-based CRDT sync methods
+    // Block document compaction
     // =========================================================================
 
-    /// Get document state (blocks and CRDT oplog)
-    /// Compact a document's oplog, returning new size and sync generation.
+    /// No-op today — per-block storage needs no compaction. Kept for wire
+    /// compatibility; returns new size and sync generation, both always zero.
     #[tracing::instrument(skip(self), name = "rpc_client.compact_context")]
     pub async fn compact_context(&self, context_id: ContextId) -> Result<(u64, u64), RpcError> {
         let mut request = self.kernel.compact_context_request();
@@ -1847,7 +1847,7 @@ impl KernelHandle {
         }
     }
 
-    /// Author one block over RPC — no CRDT replication required.
+    /// Author one block over RPC — no separate replication step required.
     ///
     /// The client half of migration step 3
     /// (`docs/crdt-position-2026-08.md`). See [`AuthorBlock`] for the field
@@ -2427,7 +2427,7 @@ impl KernelHandle {
     ///
     /// The input document is an ordinary draft block (`Status::Draft`,
     /// ephemeral, one per (context, principal)) read off the per-context
-    /// change feed — not a CRDT scratchpad. Returns the current content and
+    /// change feed — not a separate scratchpad. Returns the current content and
     /// version; `ops` is a legacy wire field kept for schema compatibility
     /// and carries no meaning today.
     #[tracing::instrument(skip(self), name = "rpc_client.get_input_state")]
@@ -2690,8 +2690,9 @@ impl KernelHandle {
     }
 
     /// Thin wrapper over `Vfs.write` — needed by the vfs-activity e2e test to
-    /// generate content-mutation heat (`MountTable::bump_activity`) without a
-    /// full CRDT edit path. Returns the byte count the backend reports written.
+    /// generate content-mutation heat (`MountTable::bump_activity`) without
+    /// going through the normal block-edit path. Returns the byte count the
+    /// backend reports written.
     #[tracing::instrument(skip(self, data), name = "rpc_client.vfs_write")]
     pub async fn vfs_write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, RpcError> {
         let vfs_response = self.kernel.vfs_request().send().promise.await?;
@@ -4044,7 +4045,7 @@ pub struct SubmitResult {
 pub struct InputState {
     pub content: String,
     /// Legacy wire field kept for schema compatibility with the retired
-    /// CRDT oplog; no longer populated with meaningful data.
+    /// oplog; no longer populated with meaningful data.
     pub ops: Vec<u8>,
     pub version: u64,
 }
@@ -4646,7 +4647,7 @@ mod tests {
         );
     }
 
-    /// Pins the wire-carried / CRDT-internal split documented at
+    /// Pins the wire-carried / internal-only split documented at
     /// `kaijutsu-types/src/block.rs:1578`: `order_key` is deliberately absent
     /// from `kaijutsu.capnp` — internal bookkeeping, not conversation-visible
     /// state, and `parse_block_snapshot` has no wire field to read it from.

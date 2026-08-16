@@ -1,4 +1,4 @@
-//! FlowBus pub/sub system for CRDT event broadcasting.
+//! FlowBus pub/sub system for kernel event broadcasting.
 //!
 //! The FlowBus provides a typed publish/subscribe mechanism for kernel events.
 //! Subscribers use NATS-style subject patterns to filter events of interest.
@@ -39,7 +39,7 @@ use kaijutsu_types::{BlockEventFilter, BlockFlowKind, ContextId, PrincipalId};
 // Origin Tracking
 // ============================================================================
 
-/// Origin source for CRDT operations.
+/// Origin source for block operations.
 ///
 /// Used to prevent echo loops in bidirectional sync:
 /// - Local operations should be sent to the server
@@ -1580,9 +1580,7 @@ impl HasSubject for TurnFlow {
 /// state the instant it lands — the reason the editor channel is push, not poll.
 ///
 /// Published by the kernel's `editor_keys`/`editor_save` (→ `StateChanged`) and
-/// `editor_quit` (→ `Closed`). The remote-merge producer — a *peer's* CRDT edit
-/// reconciling into an open session — wires in with `EditorCore::apply_remote_ops`
-/// (vi.md step 1b) and publishes `StateChanged` from the block `TextOps` path.
+/// `editor_quit` (→ `Closed`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EditorFlow {
     /// A session's state changed (a keystroke landed, a save moved the

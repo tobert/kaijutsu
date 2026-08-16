@@ -2421,7 +2421,7 @@ mod tests {
             .mount("/mnt/wire", crate::vfs::LocalBackend::new(dir.path()))
             .await;
 
-        // Diverge the CRDT copy from disk so there is something to show.
+        // Diverge the document copy from disk so there is something to show.
         {
             let blocks = dispatcher.block_store();
             let cache = dispatcher.kernel().file_cache(blocks);

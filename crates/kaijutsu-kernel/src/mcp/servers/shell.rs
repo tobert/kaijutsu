@@ -111,7 +111,7 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
 });
 
 // Read-only variant's kaijutsu-specific half: same return contract, plus what
-// makes it read-only (no mutation, no external commands) and the CRDT views
+// makes it read-only (no mutation, no external commands) and the document views
 // it can still read (`/v/docs`, `/v/input`) that a host-only read-only shell
 // wouldn't have.
 static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
@@ -119,7 +119,7 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
         "Run a READ-ONLY command in your current kernel context using kaish \
          (会sh). This shell cannot mutate anything: every file write/delete/\
          move and every external command is refused. Use it to inspect — \
-         read files, `grep`, `find`, walk the tree, and read the CRDT \
+         read files, `grep`, `find`, walk the tree, and read the kernel \
          document/input views under `/v/docs` and `/v/input`; `kj` is in \
          scope for read-only context introspection. Returns combined stdout \
          (stderr appended when present); a nonzero exit code is reported as \
@@ -140,7 +140,7 @@ pub struct ShellServer {
     /// The model-facing tool name (`shell` or `read_only_shell`).
     tool: &'static str,
     /// When true, materialize a read-only context kaish (no writes, no external
-    /// commands; reads — incl. CRDT views — still work).
+    /// commands; reads — incl. document views — still work).
     read_only: bool,
     broker: Weak<Broker>,
     notif_tx: broadcast::Sender<ServerNotification>,
@@ -545,7 +545,7 @@ mod tests {
     /// The kaijutsu-specific wrapper — what kaish-help can't know — must
     /// survive composition: what the tool IS here (current kernel context),
     /// `kj` in scope, and the return contract. The read-only variant also
-    /// names its mutation refusal and the CRDT views it can still read.
+    /// names its mutation refusal and the document views it can still read.
     #[test]
     fn kaijutsu_wrapper_survives_composition() {
         let text = DESCRIPTION.as_str();
@@ -563,7 +563,7 @@ mod tests {
         );
         assert!(
             ro_text.contains("/v/docs") && ro_text.contains("/v/input"),
-            "read-only CRDT views must survive: {ro_text}"
+            "read-only document views must survive: {ro_text}"
         );
         assert!(
             ro_text.contains("combined stdout") && ro_text.contains("nonzero exit"),
@@ -1099,14 +1099,14 @@ mod tests {
     }
 
     /// CHARACTERIZATION: block lifecycle, "created up front" half. The
-    /// output block's CRDT `Status` must already be `Running` the instant
+    /// output block's stored `Status` must already be `Running` the instant
     /// `shell(background: true)` returns — not flipped to `Running` by some
     /// later step. Distinct from the `"status": "running"` field in the tool
     /// response (that's the background JOB's status, a different value from
-    /// the block's own CRDT status); this pins the block directly.
+    /// the block's own status); this pins the block directly.
     ///
     /// Reaches into `d.block_store()` for the raw `Status` enum (the MCP tool
-    /// surface never exposes it) — expected to remain the shared CRDT
+    /// surface never exposes it) — expected to remain the shared
     /// primitive across the background-engine swap, unlike
     /// `background_exec`'s own types.
     #[tokio::test]
@@ -1152,14 +1152,14 @@ mod tests {
     }
 
     /// CHARACTERIZATION: block lifecycle, nonzero-exit case. A Running block
-    /// must transition to CRDT `Status::Error` (never silently `Done`, never
+    /// must transition to `Status::Error` (never silently `Done`, never
     /// stuck `Running`) when the backgrounded command exits nonzero, and the
     /// real exit code must survive into `list_background_processes`.
     /// Complements
     /// `background_exec::tests::spawn_background_nonzero_exit_marks_block_error_and_records_code`
     /// (same contract, pinned directly against the internal `spawn_background`
     /// API) with the MCP-tool-surface view expected to survive the engine
-    /// swap. Reaches into `d.block_store()` for the CRDT `Status` only.
+    /// swap. Reaches into `d.block_store()` for the stored `Status` only.
     #[tokio::test]
     async fn background_true_nonzero_exit_marks_the_block_error() {
         let (broker, d) = wired().await;

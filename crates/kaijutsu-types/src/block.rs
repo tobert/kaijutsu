@@ -415,7 +415,7 @@ pub enum ErrorCategory {
     Parse,
     /// Input validation failure (bad parameters, out-of-range).
     Validation,
-    /// Internal kernel error (CRDT corruption, panic recovery).
+    /// Internal kernel error (block-store corruption, panic recovery).
     Kernel,
 }
 
@@ -830,7 +830,7 @@ pub fn format_tool_content_envelope(block: &BlockSnapshot, body: &str) -> String
 /// Mirrors rmcp's `ResourceContents` split: exactly one of `text` or
 /// `blob_base64` is populated per read (a resource is either text or bytes).
 /// Binary bodies stay base64-encoded end-to-end to avoid encode/decode forks
-/// between the CRDT, RPC, and LLM hydration paths.
+/// between the block store, RPC, and LLM hydration paths.
 ///
 /// `parent_resource_block_id` is `None` for the initial read and `Some(parent)`
 /// for subscription-update children emitted by the broker when
@@ -1059,12 +1059,12 @@ pub enum BlockKind {
     Text,
     /// Extended thinking/reasoning — collapsible.
     Thinking,
-    /// Tool invocation — content is streamable via Text CRDT.
+    /// Tool invocation — content streams as plain text.
     /// See `tool_kind` for which engine (Shell, Mcp, Builtin).
     #[serde(rename = "tool_call")]
     #[strum(serialize = "tool_call", serialize = "toolcall")]
     ToolCall,
-    /// Tool result — content is streamable via Text CRDT.
+    /// Tool result — content streams as plain text.
     /// See `tool_kind` for which engine.
     #[serde(rename = "tool_result")]
     #[strum(serialize = "tool_result", serialize = "toolresult")]
@@ -1075,8 +1075,8 @@ pub enum BlockKind {
     #[strum(serialize = "drift")]
     Drift,
     /// File content tracked in a context.
-    /// Content is the file body (DTE Text CRDT). `file_path` on BlockSnapshot
-    /// records the logical path.
+    /// Content is the file body (a plain `String`). `file_path` on
+    /// BlockSnapshot records the logical path.
     #[serde(rename = "file")]
     #[strum(serialize = "file")]
     File,
@@ -1111,7 +1111,7 @@ pub enum BlockKind {
     Trace,
     /// A groomable task/plan item — household-agent grooming (create,
     /// update, complete, cancel, list). `content` carries the title/
-    /// description; `task_status` (a dedicated CRDT-synced field, see
+    /// description; `task_status` (a dedicated field, see
     /// [`TaskStatus`]) carries the lifecycle state. Subtasks reuse the
     /// ordinary DAG `parent_id` edge — no bespoke hierarchy. Unlike
     /// `Notification`/`Resource`/`Error`, a Task's `role` follows normal
@@ -1356,7 +1356,7 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
-/// Serializable snapshot of a block (no CRDT state).
+/// Serializable snapshot of a block (plain data; no live document behind it).
 ///
 /// All identity fields use typed IDs: `PrincipalId` for the author,
 /// `ContextId` for context references. Mechanism-specific fields are
@@ -4369,13 +4369,13 @@ mod tests {
         let payload = ErrorPayload {
             category: ErrorCategory::Kernel,
             severity: ErrorSeverity::Fatal,
-            code: Some("crdt.corruption".into()),
+            code: Some("block.corruption".into()),
             detail: None,
             span: None,
             source_kind: None,
         };
         let summary = payload.summary_line();
-        assert_eq!(summary, "kernel error (crdt.corruption)");
+        assert_eq!(summary, "kernel error (block.corruption)");
     }
 
     #[test]
@@ -5224,7 +5224,7 @@ mod tests {
     /// Current-state-at-hydration-time: `format_task_for_llm` always reflects
     /// whatever `task_status`/`content` the snapshot carries *right now* — it
     /// has no memory of a prior render. Mutating the snapshot's fields (what
-    /// a CRDT merge does before a boundary re-hydrate) changes the next
+    /// a document write does before a boundary re-hydrate) changes the next
     /// envelope produced from it. The "don't retroactively rewrite an
     /// already-hydrated message" half of the contract lives in
     /// `ConversationMailbox`'s translate-once-per-BlockId behavior (kernel

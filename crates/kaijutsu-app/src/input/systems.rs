@@ -63,13 +63,13 @@ pub fn handle_focus_compose(
         *focus = FocusArea::Compose;
         *surface = super::focus::ActiveSurface::Chat;
 
-        // Set the overlay mode and restore text from CRDT if available
+        // Set the overlay mode and restore draft text from the mirror if available
         if let Ok(mut overlay) = overlay.single_mut() {
             overlay.mode = crate::cell::InputMode::Chat;
             // Restore draft from the mirror if the overlay is empty. The
-            // draft is an ordinary block now (Lane C slice 3) — no CRDT, no
-            // pending-clear suppression: the mirror is version-ordered and
-            // has nothing stale to arrive late.
+            // draft is an ordinary block now (Lane C slice 3) — nothing
+            // concurrent to merge, so no pending-clear suppression: the
+            // mirror is version-ordered and has nothing stale to arrive late.
             if overlay.text.is_empty()
                 && let Some(ctx_id) = doc_cache.active_id()
                 && let Some(cached) = doc_cache.get(ctx_id)
@@ -196,8 +196,8 @@ pub fn handle_pop_level(
 /// kj so the user can type and hit enter — we might use that pattern
 /// elsewhere"): summon the SHELL surface with a command line already typed,
 /// cursor at the end, in Insert mode. Enter runs it; Esc-Esc abandons it.
-/// The shell surface is local-only (no CRDT input sync), so the prefill is
-/// a plain overlay write.
+/// The shell surface is local-only (no dual-write to the kernel), so the
+/// prefill is a plain overlay write.
 pub fn handle_prompt_prefill(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
@@ -962,7 +962,7 @@ pub fn handle_compose_input(
         let pos_before = overlay.cursor;
         overlay.insert(text);
 
-        // Only dual-write to CRDT for chat input. Shell input is local-only.
+        // Only dual-write to the kernel for chat input. Shell input is local-only.
         if !is_shell
             && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
         {
@@ -1007,7 +1007,7 @@ pub fn handle_compose_input(
                             })
                             .detach();
 
-                        // Clear shell overlay locally (no CRDT involvement)
+                        // Clear shell overlay locally (no kernel involvement)
                         overlay.text.clear();
                         overlay.cursor = 0;
                         overlay.selection_anchor = None;

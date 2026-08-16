@@ -78,7 +78,7 @@
 //! observe the final status, bounded so the registry doesn't grow forever
 //! (`docs/issues.md`'s "must reap exited processes rather than leaking
 //! them"). The registry itself is the durable source of truth for exit
-//! status: `mark_exited`/`mark_killed` run unconditionally, even if the CRDT
+//! status: `mark_exited`/`mark_killed` run unconditionally, even if the
 //! block write failed (e.g. the context's document was deleted mid-run) — a
 //! `list_background_processes` poll never silently loses the exit code. A
 //! watchdog task additionally guards against the supervising task itself

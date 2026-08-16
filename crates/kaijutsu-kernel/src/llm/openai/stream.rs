@@ -4,7 +4,7 @@
 //! Anthropic does (`content_block_start` / `_stop`). Instead each chunk's
 //! `delta` carries whichever of `reasoning_content` / `content` /
 //! `tool_calls` is active. This state machine reconstructs the bracketed
-//! `*Start` / `*Delta` / `*End` lifecycle kaijutsu's CRDT writer expects
+//! `*Start` / `*Delta` / `*End` lifecycle kaijutsu's block writer expects
 //! by tracking *which* block is currently open and closing it when the
 //! active field changes:
 //!

@@ -321,7 +321,7 @@ pub struct WorkspacePathRow {
     pub created_at: i64,
 }
 
-/// A document row — CRDT content layer.
+/// A document row — the document content layer.
 #[derive(Debug, Clone)]
 pub struct DocumentRow {
     pub document_id: ContextId,
@@ -503,7 +503,7 @@ CREATE TABLE IF NOT EXISTS preset_args (
 CREATE INDEX IF NOT EXISTS idx_preset_args_lookup
     ON preset_args(preset_id, verb);
 
--- ── Documents (CRDT content layer) ─────────────────────────────
+-- ── Documents (content layer) ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS documents (
     document_id  BLOB NOT NULL PRIMARY KEY,
     workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
@@ -622,7 +622,7 @@ CREATE TABLE IF NOT EXISTS doc_snapshots (
     FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
 );
 
--- `input_oplog` and `input_doc_snapshots` (the CRDT input-document tables)
+-- `input_oplog` and `input_doc_snapshots` (the old input-document tables)
 -- are abandoned, not dropped, as of 2026-08-16: the compose scratchpad moved
 -- to the draft block (Status::Draft + ephemeral), so the kernel stops
 -- reading and writing these two tables here. Neither has a `PRAGMA

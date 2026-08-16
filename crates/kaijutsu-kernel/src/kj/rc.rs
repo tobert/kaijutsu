@@ -6,7 +6,7 @@
 //! structural fields (context_type, verb, sort_key, name, extension) are
 //! derived from it via `parse_rc_path`.
 //!
-//! These commands write through the kernel's CRDT file cache (admin-only
+//! These commands write through the kernel's file-document cache (admin-only
 //! surface, so they bypass the gated `builtin.file:write` tool). Lifecycle
 //! dispatch reads the same files; see `kj/lifecycle.rs`.
 
@@ -579,7 +579,7 @@ impl KjDispatcher {
             ));
         }
 
-        // No `--content` → open an interactive editor session on the owning CRDT
+        // No `--content` → open an interactive editor session on the owning
         // block, the same `Kernel::editor_open` primitive the `vi`/`edit` builtin
         // and `kj editor open` route through, and signal the submitter's app
         // windows to pop a renderer (`open_editor`). A headless driver

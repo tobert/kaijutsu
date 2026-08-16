@@ -106,9 +106,10 @@
 //!   place without telling them.
 //! - Yank always reads the **frozen** model, never current block content.
 //!   Copying a hunk that has since changed is a correctness bug you cannot see.
-//! - Because content and content-type are separate LWW registers in the CRDT,
-//!   a block can legitimately declare itself a diff while holding text that
-//!   does not parse. Consumers must handle [`parse`] failing on
+//! - Because content and content-type are independent fields, set separately
+//!   and never validated against each other, a block can legitimately declare
+//!   itself a diff while holding text that does not parse. Consumers must
+//!   handle [`parse`] failing on
 //!   declared-`Diff` content — loudly, as a visible error state, not as an
 //!   empty viewer.
 //!

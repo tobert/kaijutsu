@@ -15,7 +15,7 @@
 //!
 //! resolved order-free (stacking repeatable flags can never change meaning by
 //! position) and one-shot (positions are never stored — what makes positional
-//! addressing safe in a multi-writer CRDT log). Output is a normalized
+//! addressing safe in a multi-writer block log). Output is a normalized
 //! [`IntervalSet`] whose runs the splicer (`kaijutsu-kernel::llm::splice`)
 //! consumes; the splicer, not this module, owns the *order-dependent* cut
 //! hygiene (turn-boundary snapping, tool-pair integrity, archive seams).

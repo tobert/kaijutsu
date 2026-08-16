@@ -37,7 +37,7 @@
 //! - **World Implementation** — [`WorldImpl`] (top-level capability).
 //! - **Kernel Implementation** — [`KernelImpl`], the main trait impl. Its
 //!   internal subsections group ~80 RPC methods: lifecycle/info, shell
-//!   execution (`execute`/`interrupt`/`complete`), VFS, tools, block CRDT
+//!   execution (`execute`/`interrupt`/`complete`), VFS, tools, block store
 //!   ops, prompt/LLM, context ops, MCP, shell execution (kaish), shell
 //!   state, blob placeholders, MCP resources, peer attachment, timeline
 //!   navigation, config, drift, LLM configuration, tool filter
@@ -1101,7 +1101,7 @@ fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<St
 ///
 /// Model configuration is SQL-native (`backends` / `backend_models` /
 /// `llm_defaults` / `casts` / `cast_slots` / `model_aliases` /
-/// `embedding_config`). There is no `models.toml`, no CRDT config doc, and no
+/// `embedding_config`). There is no `models.toml`, no kernel config document, and no
 /// host file in this path — the embedded floor lives in
 /// `kaijutsu_kernel::seed_backends` and is applied at kernel construction.
 ///
@@ -1594,7 +1594,7 @@ mod context_bootstrap_tests {
 /// persistence, default context, config backend, block tools, LLM, and MCP.
 /// The returned `SharedKernel` is shared across all connections via `Arc`.
 pub async fn create_shared_kernel(
-    // One-time CRDT config seed source on a fresh kernel (see the /etc/config
+    // One-time config seed source on a fresh kernel (see the /etc/config
     // mount below). NOT ongoing ownership: production passes None (embedded
     // defaults; the kernel never reads the user's host config). Tests point it
     // at a tempdir to inject config seeds.
@@ -1694,7 +1694,7 @@ pub async fn create_shared_kernel(
         // Seed the LLM configuration floor — backends, their known context
         // windows, the `--model` aliases, the defaults, and the embedding
         // model. Same absent-only floor pattern as the presets above, and the
-        // successor to seeding `models.toml` into the CRDT. Fail loud: a
+        // successor to seeding `models.toml` into the kernel. Fail loud: a
         // kernel with no backends hangs its first turn on "no provider
         // configured", which is a far worse diagnostic than this error.
         kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
@@ -1716,7 +1716,7 @@ pub async fn create_shared_kernel(
     // read-only `/`; the host's real /etc is never touched). The block store's
     // load_from_db has already replayed any persisted rc Config docs; seed from
     // the embedded defaults only when the rc namespace is still empty (a
-    // genuinely fresh kernel). After that the CRDT owns the content: a script
+    // genuinely fresh kernel). After that the kernel owns the content: a script
     // you `rm`'d stays gone, a repo-dropped seed does not resurrect. Per-file
     // recovery is `kj rc reset <path>`. Seeding failure is fatal — a kernel
     // without its stance scripts must not come up pretending all is well.
@@ -1726,9 +1726,9 @@ pub async fn create_shared_kernel(
     );
     if rc_fs.is_empty() {
         let n = rc_fs.seed_from_embedded().map_err(|e| {
-            capnp::Error::failed(format!("rc seed into CRDT failed: {e}"))
+            capnp::Error::failed(format!("rc seed into the kernel failed: {e}"))
         })?;
-        log::info!("seeded {n} rc script(s) into the CRDT (fresh kernel)");
+        log::info!("seeded {n} rc script(s) (fresh kernel)");
     }
     kernel.mount(paths::RC_ROOT, rc_fs).await;
 
@@ -1736,7 +1736,7 @@ pub async fn create_shared_kernel(
     // kernel-owned too (slice 2, docs/config-ownership.md): the SAME backend
     // type as rc, one rule, no host file. Seed the embedded defaults only when
     // the config namespace is still empty (a genuinely fresh kernel); after that
-    // the CRDT owns the content. Per-file recovery is `kj config reset`. Seeding
+    // the kernel owns the content. Per-file recovery is `kj config reset`. Seeding
     // failure is fatal — a kernel without a system prompt is useless.
     let config_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
@@ -1749,7 +1749,7 @@ pub async fn create_shared_kernel(
         // else the embedded default. Production passes None → embedded only (the
         // hard-reset cutover: the kernel never reads the user's host config).
         // Model config is NOT here — it is SQL-native (`kj backend`).
-        // After this, the CRDT is the sole owner — no host read/flush/reload.
+        // After this, the kernel is the sole owner — no host read/flush/reload.
         let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::config_seed_files()
             .into_iter()
             .map(|(canonical, embedded)| {
@@ -1760,8 +1760,8 @@ pub async fn create_shared_kernel(
             .collect();
         let n = config_fs
             .seed_entries(seed)
-            .map_err(|e| capnp::Error::failed(format!("config seed into CRDT failed: {e}")))?;
-        log::info!("seeded {n} config file(s) into the CRDT (fresh kernel)");
+            .map_err(|e| capnp::Error::failed(format!("config seed into the kernel failed: {e}")))?;
+        log::info!("seeded {n} config file(s) (fresh kernel)");
     }
     kernel.mount(paths::CONFIG_ROOT, config_fs).await;
 
@@ -1771,7 +1771,7 @@ pub async fn create_shared_kernel(
     // root; per-client overrides at /etc/client/<client-id>/… are written lazily
     // and never seeded (there is no client id at build time). Seed only on a
     // fresh (empty) namespace — new even on an already-seeded kernel, so a
-    // restart brings the shared defaults up once, then the CRDT owns them.
+    // restart brings the shared defaults up once, then the kernel owns them.
     let client_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
         paths::CLIENT_ROOT,
@@ -1782,9 +1782,9 @@ pub async fn create_shared_kernel(
             .map(|(canonical, embedded)| (canonical, embedded.to_string()))
             .collect();
         let n = client_fs.seed_entries(seed).map_err(|e| {
-            capnp::Error::failed(format!("client config seed into CRDT failed: {e}"))
+            capnp::Error::failed(format!("client config seed into the kernel failed: {e}"))
         })?;
-        log::info!("seeded {n} client config default(s) into the CRDT (fresh kernel)");
+        log::info!("seeded {n} client config default(s) (fresh kernel)");
     }
     kernel.mount(paths::CLIENT_ROOT, client_fs).await;
 
@@ -1793,7 +1793,7 @@ pub async fn create_shared_kernel(
     // rc/config/client, one more mount. Seeded from the embedded profiles
     // (`assets/defaults/midi/devices/*.md`, `kaijutsu_kernel::midi_seed`) only
     // when the namespace is still empty (a genuinely fresh kernel); after that
-    // the CRDT owns the content. `kj midi list`/`show` read it.
+    // the kernel owns the content. `kj midi list`/`show` read it.
     let midi_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
         documents.clone(),
         paths::MIDI_ROOT,
@@ -1801,8 +1801,8 @@ pub async fn create_shared_kernel(
     if midi_fs.is_empty() {
         let n = midi_fs
             .seed_entries(kaijutsu_kernel::midi_seed::seed_files())
-            .map_err(|e| capnp::Error::failed(format!("midi seed into CRDT failed: {e}")))?;
-        log::info!("seeded {n} midi device profile(s) into the CRDT (fresh kernel)");
+            .map_err(|e| capnp::Error::failed(format!("midi seed into the kernel failed: {e}")))?;
+        log::info!("seeded {n} midi device profile(s) (fresh kernel)");
     }
     kernel.mount(paths::MIDI_ROOT, midi_fs).await;
 
@@ -3060,7 +3060,7 @@ impl kernel::Server for KernelImpl {
     }
 
     // =========================================================================
-    // Block-based CRDT operations
+    // Block-based operations
     // =========================================================================
 
     fn subscribe_blocks(
@@ -3122,7 +3122,7 @@ impl kernel::Server for KernelImpl {
     /// Subscribe to one context's change feed (docs/change-feed.md).
     ///
     /// The replacement for `subscribe_blocks`, which forwards thirteen methods
-    /// and two flavors of raw CRDT operations. Here the client receives
+    /// and two flavors of raw block operations. Here the client receives
     /// classified domain facts in ordered batches with the version they bring
     /// it to, and never links the text engine.
     fn subscribe_context(
@@ -5062,7 +5062,7 @@ impl kernel::Server for KernelImpl {
     }
 
     // =========================================================================
-    // Config Methods (Phase 2: Config as CRDT)
+    // Config Methods
     // =========================================================================
 
     fn get_config(
@@ -5859,8 +5859,8 @@ impl kernel::Server for KernelImpl {
             Ok(draft) => {
                 let mut r = results.get();
                 r.set_content(draft.as_ref().map(|d| d.content.as_str()).unwrap_or(""));
-                // `ops` is always empty: the draft is a block, not a CRDT
-                // document, so there is no input oplog to project into it.
+                // `ops` is always empty: the draft is a block, and block text
+                // is a plain String — there is no oplog to project into it.
                 // The field stays on the wire until a later commit removes it
                 // from the schema.
                 r.set_ops(&[]);
@@ -6901,8 +6901,9 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    /// Author one block on behalf of a client that is NOT a CRDT replica —
-    /// migration step 3 of `docs/crdt-position-2026-08.md`.
+    /// Author one block on behalf of a client that never sequences blocks
+    /// itself — the kernel is the sole sequencer. Migration step 3 of
+    /// `docs/crdt-position-2026-08.md`.
     ///
     /// The reservation half of Amy's reserve-then-flow model: short, holds
     /// nothing, returns an id. A ToolCall authored here sits at whatever
@@ -9003,7 +9004,7 @@ pub(crate) fn set_block_snapshot(
     }
 }
 
-/// Convert a CRDT ErrorCategory to Cap'n Proto.
+/// Convert a `kaijutsu_types` ErrorCategory to Cap'n Proto.
 fn error_category_to_capnp(
     cat: kaijutsu_types::ErrorCategory,
 ) -> crate::kaijutsu_capnp::ErrorCategory {
@@ -9020,7 +9021,7 @@ fn error_category_to_capnp(
     }
 }
 
-/// Convert a CRDT ErrorSeverity to Cap'n Proto.
+/// Convert a `kaijutsu_types` ErrorSeverity to Cap'n Proto.
 fn error_severity_to_capnp(
     sev: kaijutsu_types::ErrorSeverity,
 ) -> crate::kaijutsu_capnp::ErrorSeverity {
@@ -9083,7 +9084,7 @@ fn block_kind_from_capnp(kind: crate::kaijutsu_capnp::BlockKind) -> BlockKind {
     }
 }
 
-/// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
+/// Convert a `kaijutsu_types` ToolKind to Cap'n Proto ToolKind.
 fn tool_kind_to_capnp(tk: kaijutsu_types::ToolKind) -> crate::kaijutsu_capnp::ToolKind {
     match tk {
         kaijutsu_types::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
@@ -9092,7 +9093,7 @@ fn tool_kind_to_capnp(tk: kaijutsu_types::ToolKind) -> crate::kaijutsu_capnp::To
     }
 }
 
-/// Convert a CRDT DriftKind to Cap'n Proto DriftKind.
+/// Convert a `kaijutsu_types` DriftKind to Cap'n Proto DriftKind.
 fn drift_kind_to_capnp(dk: kaijutsu_types::DriftKind) -> crate::kaijutsu_capnp::DriftKind {
     match dk {
         kaijutsu_types::DriftKind::Push => crate::kaijutsu_capnp::DriftKind::Push,
@@ -9360,7 +9361,7 @@ fn set_editor_state(
 //
 // (The per-token text-op coalescing this bridge used to do —
 // `onBlockTextOpsBatch` — was deleted in the 2026-08-15 wire flag day along
-// with the raw-CRDT-ops event it batched; classified text changes ride the
+// with the raw-ops event it batched; classified text changes ride the
 // `ContextObserver` change feed instead, which batches natively —
 // docs/change-feed.md.)
 
@@ -9935,7 +9936,7 @@ const VFS_ACTIVITY_DEFAULT_INTERVAL_MS: u32 = 1000;
 /// diff/commit that lets a dropped entry return on a later tick.
 const VFS_ACTIVITY_DIGEST_MAX_ENTRIES: usize = 256;
 
-/// Convert a CRDT Status to Cap'n Proto Status.
+/// Convert a `kaijutsu_types` Status to Cap'n Proto Status.
 ///
 /// Shared with the change feed's `statusChanged` arm, so the two cannot drift:
 /// one exhaustive mapping, and a new status is a compile error in both places.

@@ -208,7 +208,7 @@ pub struct ThemeData {
     pub block_border_user: String,
     pub block_border_assistant: String,
     /// Focus ring for the keyboard-focused conversation block (j/k). A
-    /// serde default, not a required field: themes stored in the CRDT
+    /// serde default, not a required field: themes stored by the kernel
     /// before this knob existed must keep parsing, or the app silently
     /// reverts to compiled-in defaults.
     #[serde(default = "default_block_border_focus")]
@@ -225,7 +225,7 @@ pub struct ThemeData {
     /// The 3D scene lane (`[scene]` table): identity hues, the brightness tier
     /// ladder, live-signal gains, and the camera post chain. `serde(default)`
     /// on purpose — themes written before this section existed must keep
-    /// parsing (the live CRDT theme.toml predates it). See `docs/color.md`.
+    /// parsing (the live kernel theme.toml predates it). See `docs/color.md`.
     #[serde(default)]
     pub scene: SceneData,
 }
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn theme_without_scene_section_still_parses() {
-        // The live CRDT theme.toml predates `[scene]` — it MUST keep parsing,
+        // The live kernel theme.toml predates `[scene]` — it MUST keep parsing,
         // yielding the compiled scene defaults.
         let stripped = DEFAULT_THEME_TOML
             .split("\n[scene.hues]")

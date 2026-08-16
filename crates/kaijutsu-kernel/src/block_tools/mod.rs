@@ -1,7 +1,8 @@
 //! Block tools for kernel-owned editing.
 //!
 //! This module provides the tool interface for blocks, bridging the
-//! model-friendly line-based editing with the CRDT's character-based operations.
+//! model-friendly line-based editing with the block store's character-based
+//! operations.
 //!
 //! # Tools
 //!
@@ -35,10 +36,10 @@
 //! │         Translation Layer               │
 //! │   (line ↔ byte offsets, CAS)            │
 //! └────────────────────┬────────────────────┘
-//!                      │ CRDT operations
+//!                      │ Char operations
 //!                      ▼
 //! ┌─────────────────────────────────────────┐
-//! │         BlockStore (CRDT)               │
+//! │              BlockStore                 │
 //! └─────────────────────────────────────────┘
 //! ```
 
@@ -49,7 +50,7 @@ pub mod translate;
 pub use error::{EditError, Result};
 
 // Re-export translation utilities. The `*_char_*` twins are the ones to feed
-// `edit_text`/`edit_text_as` (the CRDT text layer is char-indexed); the byte
+// `edit_text`/`edit_text_as` (block text is char-indexed); the byte
 // variants are for byte-oriented consumers (string slicing, replace_range).
 pub use translate::{
     byte_to_char_offset, content_with_line_numbers, extract_lines_with_numbers, line_count,

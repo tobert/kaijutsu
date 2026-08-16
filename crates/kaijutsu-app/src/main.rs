@@ -1,7 +1,7 @@
 //! Kaijutsu App - Cell-based collaborative workspace
 //!
 //! A fresh implementation with cells as the universal primitive.
-//! CRDT sync via diamond-types, Vello text rendering.
+//! Vello text rendering.
 //!
 //! ## UI Architecture
 //!

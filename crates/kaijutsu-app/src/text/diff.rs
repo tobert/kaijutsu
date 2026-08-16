@@ -25,9 +25,9 @@
 //!   whole diff — and it cuts on whole-hunk boundaries, so a preview never
 //!   reads as a complete-but-smaller patch.
 //! - **A declared diff that does not parse is a visible error**, never an
-//!   empty cell and never a crash. Content and content-type are separate LWW
-//!   registers in the CRDT, so "declares itself a diff, holds something else"
-//!   is a legitimate state, not a bug to assume away.
+//!   empty cell and never a crash. Content and content-type are separate
+//!   fields on the block, set independently, so "declares itself a diff,
+//!   holds something else" is a legitimate state, not a bug to assume away.
 
 use kaijutsu_diff::{
     DiffModel, DiffStat, FileChange, LineKind,

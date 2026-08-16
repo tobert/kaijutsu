@@ -1,6 +1,6 @@
 //! `ConfigDocFs` — a kernel-owned VFS backend for config/rc content.
 //!
-//! This is the backend that lets the CRDT be the **sole owner** of the
+//! This is the backend that lets the kernel be the **sole owner** of the
 //! `/etc/rc` tree (and, later, the config TOMLs): file ops map straight onto
 //! `BlockStore` documents, with **no host-disk backing, no write-through flush,
 //! and no mtime-vs-disk reload**. That deletes — by construction, for this
@@ -313,7 +313,7 @@ impl ConfigDocFs {
     }
 
     /// True when this backend owns no documents yet — the "fresh install" gate.
-    /// Replaces the old host-dir-empty check: seeding is keyed on the CRDT
+    /// Replaces the old host-dir-empty check: seeding is keyed on the document
     /// namespace being empty, not on a host directory.
     pub fn is_empty(&self) -> bool {
         self.blocks
@@ -323,9 +323,9 @@ impl ConfigDocFs {
     }
 
     /// Seed every embedded rc default ([`crate::seed_scripts::seed_files`]) into
-    /// the CRDT, skipping any path already present. Returns the count newly
-    /// written. This replaces `ensure_rc_seed_files` (embedded → host disk): the
-    /// embedded tree is the seed, the CRDT is the owner thereafter.
+    /// kernel documents, skipping any path already present. Returns the count
+    /// newly written. This replaces `ensure_rc_seed_files` (embedded → host
+    /// disk): the embedded tree is the seed, the kernel is the owner thereafter.
     ///
     /// Per the crash-over-corruption stance a write failure aborts loudly — a
     /// half-seeded rc tree is corruption, and the caller decides whether a fork
@@ -334,7 +334,7 @@ impl ConfigDocFs {
         self.seed_entries(crate::seed_scripts::seed_files())
     }
 
-    /// Seed `(canonical path, body)` entries into the CRDT, skipping any path
+    /// Seed `(canonical path, body)` entries into kernel documents, skipping any path
     /// already present or not under this backend's root. Returns the count
     /// newly written. This is the shared absent-only, fail-loud seed core —
     /// [`seed_from_embedded`] (rc, from the embedded tree) and the config
@@ -467,7 +467,7 @@ impl VfsOps for ConfigDocFs {
         let rows = self
             .blocks
             .documents_under_path(&canonical)
-            .map_err(|e| VfsError::other(format!("crdt: {e}")))?;
+            .map_err(|e| VfsError::other(format!("block store: {e}")))?;
         if rows.is_empty() && canonical != self.root {
             return Err(VfsError::not_found(canonical));
         }
@@ -554,7 +554,7 @@ impl VfsOps for ConfigDocFs {
         }
         // Splice `data` at byte `offset` into the current content. Config/rc
         // content is text; a write that would produce non-UTF-8 is rejected
-        // (fail loud) rather than silently corrupting the CRDT text.
+        // (fail loud) rather than silently corrupting the document text.
         let mut buf = self
             .content_of(&canonical)
             .map(String::into_bytes)
@@ -620,7 +620,7 @@ impl VfsOps for ConfigDocFs {
         let ctx = config_context_id(&canonical);
         self.blocks
             .delete_document(ctx)
-            .map_err(|e| VfsError::other(format!("crdt: {e}")))?;
+            .map_err(|e| VfsError::other(format!("block store: {e}")))?;
         self.forget(&canonical);
         Ok(())
     }
@@ -660,7 +660,7 @@ impl VfsOps for ConfigDocFs {
         let ctx = config_context_id(&from_c);
         self.blocks
             .delete_document(ctx)
-            .map_err(|e| VfsError::other(format!("crdt: {e}")))?;
+            .map_err(|e| VfsError::other(format!("block store: {e}")))?;
         self.forget(&from_c);
         Ok(())
     }
@@ -719,7 +719,7 @@ impl VfsOps for ConfigDocFs {
 
     async fn link(&self, _oldpath: &Path, newpath: &Path) -> VfsResult<FileAttr> {
         Err(VfsError::other(format!(
-            "hard links unsupported in CRDT config backend: {}",
+            "hard links unsupported in the config document backend: {}",
             self.canonical(newpath)
         )))
     }
@@ -1009,7 +1009,7 @@ mod tests {
         );
         assert!(!fs.is_empty(), "seeded backend is no longer empty");
 
-        // A known seed round-trips through the CRDT (read via the VFS, not disk).
+        // A known seed round-trips through the document (read via the VFS, not disk).
         let stance = fs
             .read_all(p("coder/create/S00-stance.kai"))
             .await

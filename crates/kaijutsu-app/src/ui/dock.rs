@@ -1679,10 +1679,9 @@ mod tests {
     // State-derivation proofs — these exercise the REAL join/recovery code
     // path (docs/change-feed.md): `ContextMirror::apply_snapshot` for a
     // hydrate, `ContextMirror::receive` for a steady-state delivery. No
-    // `ServerEvent::BlockStatusChanged`, and — post-migration — no CRDT of
-    // any kind, is ever constructed; the count is derived fresh from
-    // `mirror.blocks()` every time, proving it cannot drift from an
-    // accumulator that was never built.
+    // `ServerEvent::BlockStatusChanged` is ever constructed; the count is
+    // derived fresh from `mirror.blocks()` every time, proving it cannot
+    // drift from an accumulator that was never built.
     // ------------------------------------------------------------------
 
     fn mirror_delivery(
@@ -1731,7 +1730,7 @@ mod tests {
         // Defect 2 (deletion half): the failed block is deleted server-side
         // and the change feed delivers that fact directly — no
         // `BlockStatusChanged` fabricated, and (unlike the pre-migration
-        // CRDT resync this test used to drive) no full resnapshot needed
+        // resync this test used to drive) no full resnapshot needed
         // either: an ordinary `BlockDeleted` delivery must drop it from the
         // count on its own.
         let ctx = kaijutsu_types::ContextId::new();

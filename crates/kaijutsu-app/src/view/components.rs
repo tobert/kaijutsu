@@ -1,7 +1,7 @@
 //! Cell components for Bevy ECS.
 //!
 //! Cells are the fundamental content primitive in Kaijutsu. Each cell contains
-//! structured content blocks (text, thinking, tool use/results) managed by CRDTs.
+//! structured content blocks (text, thinking, tool use/results) managed by the block store.
 
 use bevy::prelude::*;
 
@@ -76,7 +76,7 @@ impl BlockCursor {
 /// The `store` field is a `RenderBlockStore` (`view::render_store`) — the
 /// local render buffer for this cell's blocks. Synced content arrives via
 /// `DocumentCache` (a `ContextMirror` per context, docs/change-feed.md —
-/// plain `BlockSnapshot`s, no CRDT) and is materialized into this editor's
+/// plain `BlockSnapshot`s) and is materialized into this editor's
 /// store via `insert_from_snapshot`
 /// (`view::sync::sync_main_cell_to_conversation`).
 ///
@@ -702,8 +702,8 @@ impl LayoutGeneration {
 // ============================================================================
 
 /// Transient error queue for context-free failures (e.g., create_context
-/// failure, kernel attach failure). These can't be CRDT-synced because
-/// there's no context to sync them into.
+/// failure, kernel attach failure). These can't be synced to the kernel
+/// because there's no context to sync them into.
 ///
 /// The dock HUD renders these as toasts that auto-dismiss.
 #[derive(Resource, Default)]

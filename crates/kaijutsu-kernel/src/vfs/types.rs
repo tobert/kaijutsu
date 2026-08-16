@@ -57,7 +57,7 @@ pub struct FileAttr {
     /// it to re-verify on `WRITE` (TOCTOU guard). Values are NOT comparable
     /// across backends or paths. `0` means "unknown / never observed a write".
     ///
-    /// Monotonicity is backend-dependent: CRDT and memory backends source it
+    /// Monotonicity is backend-dependent: document and memory backends source it
     /// from a per-backend monotonic counter and are **strictly** advancing on
     /// every content mutation. Host-backed files (`LocalBackend`) derive it from
     /// mtime-nanos, so it advances with normal external edits but can *step
@@ -195,7 +195,7 @@ pub struct SnapshotNode {
     pub child_count: u32,
     /// gitignore CLASSIFICATION — metadata, never a filter (see
     /// `docs/scenes/vfs.md`: "gitignored wastes get weather"). Real for
-    /// LocalBackend-backed subtrees; always `false` for virtual/CRDT
+    /// LocalBackend-backed subtrees; always `false` for virtual/document
     /// backends (no gitignore semantics there). See
     /// [`MountTable::snapshot`](super::mount::MountTable::snapshot) doc for
     /// the exact folding rule and its known precision gap.

@@ -1,6 +1,6 @@
 //! `kj diff` — unified diffs of the things the kernel already holds.
 //!
-//! Not a git front-end. The first-class sources are kaijutsu's own: the CRDT
+//! Not a git front-end. The first-class sources are kaijutsu's own: the kernel
 //! document that owns a file's text, the bytes actually on the backing store,
 //! and any point in a document's journalled history. Git arrives later as
 //! *another source* feeding the same pipeline (`docs/diff.md`).
@@ -98,7 +98,7 @@ pub(crate) struct DiffArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DiffSource {
     /// The bytes on the backing store behind a VFS path — what a cold reader
-    /// sees, ignoring any CRDT edits that have not been flushed.
+    /// sees, ignoring any document edits that have not been flushed.
     Disk(String),
     /// The live kernel document that owns a path's text (ownership-aware: config
     /// documents answer through the mount table, never the file-doc cache).
@@ -226,7 +226,7 @@ impl KjDispatcher {
     ///
     /// Deliberately a raw VFS read, bypassing the file-doc cache: this side
     /// exists to answer "what would a cold reader see?". Note that for a
-    /// config-owned path there *is* no host file — the CRDT is the backend —
+    /// config-owned path there *is* no host file — the kernel is the backend —
     /// so disk and document agree by construction and the diff is empty. That
     /// is the honest answer, not a missing feature.
     async fn read_disk(&self, path: &str) -> Result<Option<String>, String> {
@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_crdt_edit_shows_up_as_a_typed_diff_block_against_disk() {
+    async fn a_document_edit_shows_up_as_a_typed_diff_block_against_disk() {
         let (dispatcher, dir) = dispatcher_with_mount().await;
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("write");
 
@@ -495,7 +495,7 @@ mod tests {
         let (ctx, block) = cache.get_or_load("/mnt/diff/a.txt").await.expect("load");
         blocks
             .edit_text(ctx, &block, 4, "TWO\n", 4)
-            .expect("edit the CRDT copy");
+            .expect("edit the document copy");
         cache.mark_dirty("/mnt/diff/a.txt");
 
         let result = dispatcher
@@ -585,7 +585,7 @@ mod tests {
         cache
             .create_or_replace("/mnt/diff/new.txt", "fresh\n")
             .await
-            .expect("create in the CRDT");
+            .expect("create the document");
 
         let result = dispatcher
             .dispatch_diff(&argv(&["/mnt/diff/new.txt"]), &test_caller())
@@ -665,7 +665,7 @@ mod tests {
             .dispatch_diff(&argv(&[path]), &test_caller())
             .await;
         assert!(result.is_ok(), "kj diff on an rc script failed: {result:?}");
-        // There is no host file behind a config path — the CRDT *is* the
+        // There is no host file behind a config path — the kernel *is* the
         // backend — so both sides read the same document and agree. Honest
         // answer, not a missing feature.
         assert!(

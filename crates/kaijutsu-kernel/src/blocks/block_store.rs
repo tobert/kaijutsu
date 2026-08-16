@@ -2,13 +2,9 @@
 //!
 //! A collection of `BlockContent` instances, each owning its content as a
 //! plain `String`. Metadata lives in `BlockHeader` (plain data). `BlockDocument`
-//! superseded a *different*, single-shared-Document architecture that used
-//! the same name (a single DTE `Document` with every block addressed as a
-//! path within it), removed 2026-08-09; text itself was a per-block
-//! diamond-types-extended CRDT until 2026-08-16 — see
-//! `docs/crdt-position-2026-08.md`. Renamed from `BlockStore` 2026-08-16 to
-//! stop colliding with the kernel's own `BlockStore` (documents map,
-//! persistence, journaling, flows) — two different types sharing one name.
+//! Renamed from `BlockStore` 2026-08-16 to stop colliding with the kernel's
+//! own `BlockStore` (documents map, persistence, journaling, flows) — two
+//! different types sharing one name.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -69,8 +65,8 @@ impl ForkBlockFilter {
 /// Collection of blocks.
 ///
 /// Each block owns its content as a plain `String` (see `super::content` for
-/// why no per-block CRDT is needed). Metadata lives in `BlockHeader` (plain
-/// data). Ordering uses fractional indexing.
+/// why block text is never a text CRDT). Metadata lives in `BlockHeader`
+/// (plain data). Ordering uses fractional indexing.
 ///
 /// Uses a Lamport clock (not wall-clock) for LWW conflict resolution on
 /// mutable header fields (status, collapsed). The clock advances on every
@@ -932,7 +928,7 @@ impl BlockDocument {
 
         // Keep the snapshot's own tick (via from_snapshot) — the tick is the pure
         // *semantic* coordinate, never a row id. The `order_key`, by contrast, is
-        // the successor of the predecessor's key on an append (design §2): CRDT
+        // the successor of the predecessor's key on an append (design §2): key
         // order tracks insertion order at the sole sequencer, so within-beat order
         // = insertion order and a stale upstream tick cannot mis-sort. Ties at the
         // tick coordinate remain allowed (shared-coordinate doctrine); a snapshot
@@ -1265,11 +1261,10 @@ impl BlockDocument {
     /// reconstruct current state after a restart. That is a strictly
     /// sequential replay against a document nobody else is mutating
     /// concurrently — never two independently-edited replicas reconciling a
-    /// genuine divergence, which is the scenario diamond-types existed to
-    /// handle and which retiring it made structurally impossible. A
+    /// genuine divergence, which is structurally impossible here. A
     /// `block_ops` entry is therefore replayed as the literal edit it
-    /// records (`BlockContent::edit_text`), not merged against a
-    /// CRDT-tracked causal history.
+    /// records (`BlockContent::edit_text`), not merged against a tracked
+    /// causal history.
     pub fn merge_ops(&mut self, payload: SyncPayload) -> Result<()> {
         // Restore the tick high-water across the merge: a freshly-stamped tick
         // after this merge must exceed every merged tick (design §2.3). Mirrors

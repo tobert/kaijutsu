@@ -3,11 +3,9 @@
 //!
 //! `sync_main_cell_to_conversation` (`view/sync.rs`) rebuilds this from
 //! `ContextMirror::blocks()` on every sync — never wire-fed, never persisted.
-//! It used to be `kaijutsu_kernel::blocks::BlockDocument` (formerly the
-//! standalone CRDT crate, and named `BlockStore` until 2026-08-16), which
-//! carries a Lamport clock, fractional-index ordering, and DAG-reference
-//! validation for
-//! multi-writer merge. None of that applies here: this store has exactly one
+//! It used to be `kaijutsu_kernel::blocks::BlockDocument`, which carries a
+//! Lamport clock, fractional-index ordering, and DAG-reference validation for
+//! multi-writer ordering. None of that applies here: this store has exactly one
 //! writer (the sync system), and it is thrown away and rebuilt on every
 //! version bump — during live streaming, nearly every frame (`ContextMirror::
 //! apply` advances the version per event). [`RenderBlockStore::rebuild`] is

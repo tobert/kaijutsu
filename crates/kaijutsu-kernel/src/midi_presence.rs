@@ -12,8 +12,8 @@
 //!
 //! ## Ephemeral by construction
 //!
-//! Presence lives in a `RwLock<BTreeMap<…>>` and nowhere else — no CRDT, no
-//! host file, no disk. A kernel restart therefore *forgets*, which is the
+//! Presence lives in a `RwLock<BTreeMap<…>>` and nowhere else — no document,
+//! no host file, no disk. A kernel restart therefore *forgets*, which is the
 //! correct answer: a kernel with no sinks connected knows nothing about what
 //! is plugged in anywhere. Stale presence that lies is worse than no
 //! presence, so the absence of an entry reads as **unknown** — never as

@@ -242,7 +242,7 @@ fn session_start_renames_label_once_and_listener_stays_live() {
     });
 }
 
-/// **Slice 0 of the CRDT-position migration** (docs/crdt-position-2026-08.md,
+/// **Slice 0 of the storage-position migration** (docs/crdt-position-2026-08.md,
 /// "Build notes"): the acceptance test that has to exist *before* the MCP is
 /// moved off client-side replication.
 ///

@@ -22,7 +22,7 @@
 //!
 //! Unlike Anthropic's bracketed content blocks, OpenAI-style SSE does
 //! not delimit blocks — the [`super::stream`] state machine synthesizes
-//! the `*Start` / `*End` brackets kaijutsu's CRDT writer expects from
+//! the `*Start` / `*End` brackets kaijutsu's block writer expects from
 //! *which* delta field is populated.
 
 use serde::{Deserialize, Serialize};

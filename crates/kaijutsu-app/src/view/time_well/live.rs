@@ -199,11 +199,12 @@ fn command_arg_head(block: &BlockSnapshot) -> Option<String> {
 /// Map an inserted block to a tail line, or `None` for blocks that carry no
 /// glanceable signal (thinking, structural kinds).
 ///
-/// Model text usually inserts **empty** and streams in via `BlockTextOps`
-/// (CRDT deltas this module doesn't decode), so an empty model insert becomes
-/// a "⋯ composing" **placeholder** tagged with its block id — the block's
-/// `Done`/`Error` flip resolves it in place ([`ContextTails::resolve`]), so
-/// the tail narrates the turn without holding a CRDT replica (Gemini review,
+/// Model text usually inserts **empty** and streams in via
+/// `ContextChange::TextAppended` (plain text suffixes this module doesn't
+/// track), so an empty model insert becomes a "⋯ composing" **placeholder**
+/// tagged with its block id — the block's `Done`/`Error` flip resolves it
+/// in place ([`ContextTails::resolve`]), so the tail narrates the turn
+/// without holding its own copy of the streamed text (Gemini review,
 /// 2026-07-04). Everything else catches blocks that arrive whole — user
 /// prompts, tool calls, results, errors, notifications, and materialized
 /// score cells (tagged with their track).

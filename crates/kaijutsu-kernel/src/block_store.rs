@@ -556,7 +556,7 @@ impl BlockStore {
         self.documents.get(&context_id)
     }
 
-    /// Current CRDT version for a context, or `DocumentNotFound` if the
+    /// Current document version for a context, or `DocumentNotFound` if the
     /// context is not resident. Prefer this over `get(..).map(|e| e.version())`
     /// when a missing document should be an error rather than silently
     /// collapsing to 0 — RPC acknowledgements, for example.
@@ -624,7 +624,7 @@ impl BlockStore {
     /// Fork a document, creating a copy with a new document ID.
     ///
     /// All blocks and their content are copied to the new document.
-    /// The new document gets a fresh CRDT oplog.
+    /// The new document gets a fresh oplog.
     ///
     /// # Arguments
     ///
@@ -2231,7 +2231,7 @@ impl BlockStore {
     /// Recompute and cache `context_id`'s live status from its current block
     /// statuses. Called from `journal_op` — the one chokepoint every
     /// mutating block op (insert, status change, edit, merge...) funnels
-    /// through — so the cache can never silently drift from the CRDT state
+    /// through — so the cache can never silently drift from the stored state
     /// no matter which of the ~20 mutator functions was the actual caller.
     fn recompute_live_status(&self, context_id: ContextId, statuses: &[Status]) {
         self.live_status
@@ -3248,9 +3248,9 @@ fn validate_svg(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
 /// The *producers* already refuse bad input — `diff_block` pre-validates and
 /// `kj diff` only ever emits `format()` output — so this arm exists for the
 /// block typed `Diff` by some other route: a hand-rolled `block_create` +
-/// content-type set, a client, or a concurrent LWW type flip (content and
-/// content_type are separate registers, so "declared a diff, holds something
-/// else" is a legitimate CRDT state, not a bug to be assumed away). Such a
+/// content-type set, or a client (content and content_type are separate
+/// fields, set independently, so "declared a diff, holds something else" is a
+/// reachable state, not a bug to be assumed away). Such a
 /// block used to land with nothing visible saying so.
 ///
 /// One error at most: [`kaijutsu_diff::parse`] refuses at the first construct
@@ -3593,7 +3593,7 @@ mod tests {
     #[test]
     fn test_move_block_reorders_and_emits_flow() {
         // Move primitive at the kernel block-store layer (M2-B1):
-        // CRDT layer already implements `move_block`; verify the wrapper
+        // `BlockDocument` already implements `move_block`; verify the wrapper
         // updates ordering, bumps the version, and journals an op.
         let store = BlockStore::new(test_agent());
         let ctx = ContextId::new();
@@ -4218,7 +4218,7 @@ mod tests {
 
     /// e2e: a coder turn gets monotonic per-context timeline ticks that survive a
     /// persistence (snapshot → reload) roundtrip — the recovery path the kernel
-    /// runs on restart. Exercises CRDT tick assignment → BlockSnapshot → CBOR
+    /// runs on restart. Exercises tick assignment → BlockSnapshot → CBOR
     /// StoreSnapshot → from_snapshot (+ normalize).
     #[test]
     fn test_coder_turn_ticks_survive_persistence_roundtrip() {
@@ -4693,7 +4693,7 @@ mod tests {
                 .append_text(ctx, &block_id, " — appended")
                 .expect("append text");
 
-            // SIGKILL simulation: leak both the in-memory CRDT state and the
+            // SIGKILL simulation: leak both the in-memory store state and the
             // SQLite connection so neither is cleanly closed or checkpointed.
             // Whatever was committed must survive in the on-disk files alone.
             std::mem::forget(store);

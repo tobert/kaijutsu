@@ -194,7 +194,7 @@ pub async fn reconcile_with_toml(
             // Already running: never touch the connection (module doc,
             // "Reload semantics"). Refresh the policy so a call_timeout_ms
             // edit takes effect, and so a restart re-derives the SAME
-            // override from the CRDT instead of reverting to
+            // override from the config document instead of reverting to
             // `Broker.policies`'s in-memory default (component 3's
             // restart-persistence fix).
             let policy = policy_for(kernel, cfg);
@@ -244,7 +244,7 @@ pub async fn reconcile_with_toml(
 }
 
 /// The real entry point: read `/etc/config/mcp.toml` through the VFS (the
-/// CRDT is the sole owner — no host file), then reconcile.
+/// kernel is the sole owner — no host file), then reconcile.
 ///
 /// A read or whole-file parse failure falls back to the **embedded
 /// default**, loudly — same shape as `initialize_kernel_models`'s handling
@@ -259,7 +259,7 @@ pub async fn reconcile_external_mcp_servers(kernel: &Arc<Kernel>) -> ExternalMcp
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => {
             tracing::error!(
-                "read {mcp_path} from CRDT failed: {e}; reconciling external MCP servers \
+                "read {mcp_path} failed: {e}; reconciling external MCP servers \
                  against the embedded default instead"
             );
             crate::config_seed::DEFAULT_MCP_CONFIG.to_string()

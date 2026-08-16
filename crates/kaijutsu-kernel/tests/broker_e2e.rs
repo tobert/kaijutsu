@@ -955,18 +955,18 @@ async fn late_registration_visible_next_turn() {
 ///   register(MCP instance)
 ///     └─► broker.emit_for_bindings
 ///           └─► SharedBlockStore::insert_notification_block_as
-///                 └─► BlockKind::Notification row in the CRDT
+///                 └─► BlockKind::Notification row in the block store
 ///                       └─► store.query_blocks(ctx, kind=Notification)
 ///                             └─► hydrate_from_blocks
 ///                                   └─► `<notification …>` in a user message
 ///
 /// Unit tests at each layer cover the layer in isolation; this one locks
 /// the composition so that a filter change in the hydrator, a mis-wired
-/// binding in the broker, or a schema miss in the CRDT cannot silently
+/// binding in the broker, or a schema miss in the block store cannot silently
 /// break the LLM-visible story (D-34) while every unit test still passes.
 ///
 /// Effective because it uses only production APIs — no mock hydrator, no
-/// mock broker, no backdoor into CRDT internals. If this test passes, the
+/// mock broker, no backdoor into store internals. If this test passes, the
 /// kernel's side of the Phase 2 story is real; only the app rendering
 /// remains to verify (M5).
 #[tokio::test]
@@ -1027,7 +1027,7 @@ async fn server_notification_reaches_llm_hydrator() {
     let payload = hydrator_blocks[0]
         .notification
         .as_ref()
-        .expect("notification payload must survive CRDT storage");
+        .expect("notification payload must survive block storage");
     assert_eq!(payload.kind, NotificationKind::ToolAdded);
     assert_eq!(payload.instance, "test.hydrator");
     assert_eq!(payload.tools, vec!["fail".to_string()]);

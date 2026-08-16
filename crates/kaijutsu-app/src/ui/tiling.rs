@@ -51,7 +51,7 @@ pub enum WritingDirection {
 #[derive(Debug, Clone, PartialEq, Reflect)]
 pub enum PaneContent {
     // ── Views ──────────────────────────────────────────────────────────
-    /// A CRDT conversation view bound to a document.
+    /// A conversation view bound to a document.
     Conversation { document_id: String },
     /// A text file editor.
     #[allow(dead_code)] // Phase 4: tab containers for stacking views

@@ -9,7 +9,7 @@
 //! `execute_and_poll_shell`.
 //!
 //! The motivating bug: `shell` returned an empty `stdout` even though
-//! the server produced output, because the completion poll read a local CRDT
+//! the server produced output, because the completion poll read a local
 //! mirror the instant it saw `Done` — before the background sync listener had
 //! applied the preceding text ops. `execute_and_poll_shell` now reads
 //! completion straight from the server instead of trusting any local mirror

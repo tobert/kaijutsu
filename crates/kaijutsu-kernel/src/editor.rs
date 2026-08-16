@@ -2,7 +2,7 @@
 //! `kj rc edit` default).
 //!
 //! Two parts:
-//! - [`resolve_editor_target`] maps a VFS path to the CRDT `(context, block)`
+//! - [`resolve_editor_target`] maps a VFS path to the `(context, block)`
 //!   that *owns* its text, so an editor binds to the source of truth — never a
 //!   copy (see "Bind to the owner" below).
 //! - [`EditorSessions`] is the registry of open editors. Each session is a pure
@@ -17,13 +17,13 @@
 //!
 //! - **config-owned** paths (`/etc/rc/*`, `/etc/config/*`) are sole-owned
 //!   single-block [`DocKind::File`] documents
-//!   ([`ConfigDocFs`](crate::runtime::ConfigDocFs)). The CRDT *is* the owner —
+//!   ([`ConfigDocFs`](crate::runtime::ConfigDocFs)). The kernel *is* the owner —
 //!   there is no host file. We resolve straight to that document's block.
 //! - **ordinary files** resolve through
 //!   [`FileDocumentCache::get_or_load`](crate::file_tools::FileDocumentCache),
 //!   which mints/loads a working-copy file-doc.
 //!
-//! Running a config path through `get_or_load` would create a *second* CRDT doc
+//! Running a config path through `get_or_load` would create a *second* document
 //! (a `FileDocumentCache` copy) shadowing the ConfigDocFs original —
 //! reintroducing the dual-ownership write-through bug class the kernel-owned-config
 //! work (`docs/config-ownership.md`) deleted by construction. So the branch
@@ -44,7 +44,7 @@ use crate::file_tools::FileDocumentCache;
 /// risk #1.
 pub const APP_PEER_NICK: &str = "kaijutsu-app";
 
-/// The CRDT location an editor binds to: the context + block that own a path's
+/// The location an editor binds to: the context + block that own a path's
 /// text. Edits go to `block_store.edit_text(context_id, block_id, …)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorTarget {
@@ -379,7 +379,7 @@ impl EditorSessions {
                         &op.insert,
                         op.delete,
                     )
-                    .map_err(|e| format!("editor keys: CRDT mirror failed: {e}"))?;
+                    .map_err(|e| format!("editor keys: block mirror failed: {e}"))?;
             }
             (session.core.take_close(), session.core.take_commands())
         };
@@ -563,7 +563,7 @@ impl EditorSessions {
                     &op.insert,
                     op.delete,
                 )
-                .map_err(|e| format!("editor :r: CRDT mirror failed: {e}"))?;
+                .map_err(|e| format!("editor :r: block mirror failed: {e}"))?;
         }
         let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
@@ -584,7 +584,7 @@ impl EditorSessions {
     }
 
     /// `ZZ` — checkpoint the current buffer as saved, returning the now-clean
-    /// state. For config/rc blocks the CRDT is already the persistent owner;
+    /// state. For config/rc blocks the kernel is already the persistent owner;
     /// file-doc disk flush is TBD (see `docs/vi.md` tech-debt sweep).
     pub fn save(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
@@ -597,7 +597,7 @@ impl EditorSessions {
     }
 
     /// `ZQ` — discard changes since the last checkpoint by writing the saved
-    /// text back onto the block (an inverse forward edit — the CRDT has no
+    /// text back onto the block (an inverse forward edit — the block log has no
     /// history erasure), then drop the session.
     ///
     /// **Entanglement guard: detach, don't retract.** The rollback runs only

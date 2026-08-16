@@ -11,7 +11,7 @@
 //! ctx.backend.read() / write() / etc.
 //!     ↓
 //! KaijutsuBackend
-//!     ├── File ops → BlockStore (CRDT)
+//!     ├── File ops → BlockStore
 //!     └── Tool calls → ToolRegistry (ExecutionEngines)
 //! ```
 //!
@@ -549,7 +549,7 @@ impl KernelBackend for KaijutsuBackend {
 
     async fn set_mtime(&self, path: &Path, _mtime: std::time::SystemTime) -> BackendResult<()> {
         // The kaijutsu:// document namespace is purely virtual — context/block/
-        // doc rows derive their timing from CRDT ticks, not a settable mtime.
+        // doc rows derive their timing from block ticks, not a settable mtime.
         // Per the KernelBackend contract a virtual mount rejects rather than
         // silently succeeding, so `touch` never quietly no-ops here.
         Err(BackendError::InvalidOperation(format!(
@@ -771,7 +771,7 @@ fn apply_read_range(content: &str, range: ReadRange) -> String {
     content.to_string()
 }
 
-/// Project a WIRE byte offset onto the char index the CRDT text layer
+/// Project a WIRE byte offset onto the char index the block text layer
 /// consumes. `PatchOp::Insert`/`Delete`/`Replace` offsets are BYTES by the
 /// kaish-types contract ("Insert content at byte offset", "Delete bytes …"),
 /// and this function is the single seam where that byte domain meets the
@@ -779,7 +779,7 @@ fn apply_read_range(content: &str, range: ReadRange) -> String {
 /// `chars().count()` and splices at char positions).
 ///
 /// A mid-char or out-of-range byte offset fails LOUD here, before any splice
-/// — the old path spliced the CRDT at a bogus char position and then panicked
+/// — the old path spliced block text at a bogus char position and then panicked
 /// in the byte mirror's `replace_range`, leaving the durable block corrupted
 /// behind the crash.
 fn wire_byte_to_char(content: &str, byte: usize, what: &str) -> BackendResult<usize> {
@@ -798,8 +798,8 @@ fn wire_byte_to_char(content: &str, byte: usize, what: &str) -> BackendResult<us
 ///
 /// Two coordinate domains, deliberately: the wire offsets and the local
 /// `result` mirror ops (`insert_str`/`replace_range`) are BYTES per the
-/// PatchOp contract; the `blocks.edit_text` calls are CHARS (the CRDT text
-/// layer is char-indexed). Every CRDT call site converts through
+/// PatchOp contract; the `blocks.edit_text` calls are CHARS (block text is
+/// char-indexed). Every `edit_text` call site converts through
 /// [`wire_byte_to_char`] / `byte_to_char_offset` — never feed a byte offset
 /// to `edit_text` directly (the multibyte-corruption bug class).
 fn apply_patch_op(
@@ -965,9 +965,9 @@ fn apply_patch_op(
 /// translate.rs is 0-indexed, and this **clamps** a beyond-EOF line to
 /// end-of-content where translate.rs errors. Swapping would silently change
 /// the kaish patch surface. Outputs are BYTE offsets, consumed by the local
-/// byte-domain mirror ops; the CRDT call sites in `apply_patch_op` project
-/// them through `byte_to_char_offset` (the shared conversion) before any
-/// `edit_text` — that projection is the one source of truth for byte→char.
+/// byte-domain mirror ops; the `edit_text` call sites in `apply_patch_op`
+/// project them through `byte_to_char_offset` (the shared conversion) first
+/// — that projection is the one source of truth for byte→char.
 fn line_to_byte_offset(content: &str, line: usize) -> usize {
     if line <= 1 {
         return 0;
@@ -1155,17 +1155,17 @@ mod tests {
 
     // ── apply_patch_op × multibyte content (byte-vs-char offset regression) ──
     //
-    // `blocks.edit_text` is CHAR-indexed (the CRDT layer bounds-checks against
+    // `blocks.edit_text` is CHAR-indexed (it bounds-checks against
     // `chars().count()` and splices at char positions). PatchOp's wire
     // contract is BYTES for Insert/Delete/Replace (kaish-types doc: "Insert
     // content at byte offset", "Delete bytes") and 1-indexed lines for the
-    // *Line ops — so the byte→char projection must happen at the CRDT seam.
-    // Nastiest failure: the byte MIRROR string ops were correct while the
-    // CRDT splice was wrong, so the returned content and the durable block
-    // silently diverged.
+    // *Line ops — so the byte→char projection must happen at the `edit_text`
+    // seam. Nastiest failure: the byte MIRROR string ops were correct while
+    // the block splice was wrong, so the returned content and the durable
+    // block silently diverged.
 
     /// A store + document + one block with the given content; returns the
-    /// pieces `apply_patch_op` needs. CRDT-side content is read back through
+    /// pieces `apply_patch_op` needs. Stored content is read back through
     /// `block_content`.
     fn patch_fixture(content: &str) -> (SharedBlockStore, ContextId, BlockId) {
         let blocks = shared_block_store(PrincipalId::system());
@@ -1203,8 +1203,8 @@ mod tests {
 
         // 1-indexed: line 2 = before "second". Line 1 is 10 chars / 16 bytes;
         // whole content is 16 chars — the buggy byte offset (16) passed the
-        // char bounds check and appended at the END of the CRDT text while the
-        // byte mirror spliced correctly: silent CRDT/mirror divergence.
+        // char bounds check and appended at the END of the block text while the
+        // byte mirror spliced correctly: silent block/mirror divergence.
         let result = apply_patch_op(
             &blocks,
             ctx_id,
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(
             block_content(&blocks, ctx_id, &block_id),
             result,
-            "CRDT content must match the returned mirror"
+            "stored content must match the returned mirror"
         );
     }
 
@@ -1245,7 +1245,7 @@ mod tests {
         let (blocks, ctx_id, block_id) = patch_fixture(content);
 
         // Buggy byte range 15..19 passed the char bounds check (len 19) but
-        // deleted chars 15..19 — "tail" — in the CRDT while the mirror
+        // deleted chars 15..19 — "tail" — in the block while the mirror
         // replaced "old\n": divergence.
         let result = apply_patch_op(
             &blocks,
@@ -1265,7 +1265,7 @@ mod tests {
 
     /// Pins the byte-offset ruling for the positional ops: PatchOp::Replace's
     /// wire `offset`/`len` are BYTES (kaish-types contract; the CAS check
-    /// byte-slices), converted to chars only at the CRDT seam.
+    /// byte-slices), converted to chars only at the `edit_text` seam.
     #[test]
     fn patch_byte_replace_with_multibyte_before() {
         let content = "改善X";
@@ -1325,7 +1325,7 @@ mod tests {
     }
 
     /// A wire byte offset that lands MID-CHAR is a loud error, not a panic —
-    /// the old path spliced the CRDT at a bogus char position and then
+    /// the old path spliced block text at a bogus char position and then
     /// panicked in the byte mirror's `replace_range`, leaving the block
     /// corrupted behind the crash.
     #[test]

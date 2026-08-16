@@ -21,7 +21,7 @@ pub enum TimelineViewMode {
 
 /// Timeline position within conversation history.
 ///
-/// The timeline represents the conversation's evolution through CRDT operations.
+/// The timeline represents the conversation's evolution through the block log.
 /// Position 0.0 is the beginning (empty document), 1.0 is the current state.
 #[derive(Resource, Reflect)]
 #[reflect(Resource)]

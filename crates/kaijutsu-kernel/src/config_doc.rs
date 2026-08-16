@@ -1,6 +1,6 @@
-//! Shared CRDT config-document model.
+//! Shared config-document model.
 //!
-//! One backend, [`ConfigDocFs`], owns all config-class content as CRDT
+//! One backend, [`ConfigDocFs`], owns all config-class content as kernel
 //! documents — `/etc/rc`, `/etc/config`, `/etc/client`, and `/etc/midi` are
 //! each one mounted instance of it. (An earlier design split rc and config
 //! across two backends, `ConfigDocBackend` and `ConfigDocFs`; the former was
@@ -50,7 +50,7 @@ pub fn read_content(blocks: &SharedBlockStore, ctx: ContextId) -> Option<String>
         .map(|b| b.content.clone())
 }
 
-/// Char length of a config doc's single block (CRDT text edits are char-, not
+/// Char length of a config doc's single block (text edits are char-, not
 /// byte-, indexed, so this is the correct end offset for a full replace).
 /// `0` when the document is absent or blockless.
 pub fn content_char_len(blocks: &SharedBlockStore, ctx: ContextId) -> usize {

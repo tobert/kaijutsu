@@ -91,7 +91,7 @@ pub struct Kernel {
     /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
     /// on `InstancePolicy`.
     timeouts: kaijutsu_types::TimeoutPolicy,
-    /// Shared CRDT file-document cache. Both the MCP `builtin.file` tools and
+    /// Shared file-document cache. Both the MCP `builtin.file` tools and
     /// the kaish `MountBackend` resolve through this one instance so a single
     /// real file maps to a single kernel document regardless of surface. Set
     /// explicitly by the server at startup; lazily initialized from a block
@@ -345,7 +345,7 @@ impl Kernel {
     }
 
     /// Kernel-wide timeout policy. Read-only today; future revisions will
-    /// load this from the config CRDT and expose RPC mutation via the kj CLI.
+    /// load this from config and expose RPC mutation via the kj CLI.
     pub fn timeouts(&self) -> &kaijutsu_types::TimeoutPolicy {
         &self.timeouts
     }
@@ -357,8 +357,7 @@ impl Kernel {
     /// misleading to future maintainers).
     ///
     /// Used today by `KjDispatcher::test_dispatcher_with_timeouts`; once the
-    /// config CRDT lands, the load path will use the same construction
-    /// shape.
+    /// config load lands, it will use the same construction shape.
     pub fn with_timeouts(mut self, policy: kaijutsu_types::TimeoutPolicy) -> Self {
         self.timeouts = policy;
         self
@@ -1134,7 +1133,7 @@ impl Kernel {
         self.vfs.snapshot(path, depth, max_entries).await
     }
 
-    /// Install the shared CRDT file-document cache. Called once by the server
+    /// Install the shared file-document cache. Called once by the server
     /// at startup with the same instance handed to the MCP `builtin.file`
     /// tools, so the kaish `MountBackend` and the tools share one cache.
     /// Returns whether it was set (false if already initialized).
@@ -1145,7 +1144,7 @@ impl Kernel {
         self.file_cache.set(cache).is_ok()
     }
 
-    /// Get the shared CRDT file-document cache, lazily building one from
+    /// Get the shared file-document cache, lazily building one from
     /// `blocks` + the kernel VFS if the server never installed one (tests,
     /// embedded callers). The lazy instance is backed by the same block store
     /// and mount table, so it stays coherent with any other instance over the
@@ -1239,7 +1238,7 @@ impl Kernel {
         // dialect-level failure: it reports on the `:` status line and keeps
         // the session open — same channel as an unknown command or a bad `:s`
         // regex. Hard errors out of here stay reserved for session and
-        // infrastructure failures (no such session, a CRDT mirror failure);
+        // infrastructure failures (no such session, a block mirror failure);
         // the app's session-lost detection keys on exactly that distinction.
         if let Some(io) = io {
             let state = match self.fetch_editor_io(io, io_opener, blocks).await {

@@ -82,7 +82,7 @@ enum ContextCommand {
     /// Render the system prompt this context actually gets: the exact
     /// `base → rc sections → <situation>` assembly the LLM turn path
     /// builds (`crate::llm::build_system_prompt`), so prompt/stance tuning
-    /// can be verified against live CRDT state instead of inferred from rc
+    /// can be verified against live kernel state instead of inferred from rc
     /// scripts (default: current).
     Prompt { context: Option<String> },
     /// Print the current context.
@@ -919,7 +919,7 @@ impl KjDispatcher {
                 .await
             {
                 Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
-                    tracing::warn!("system.md in the CRDT is not UTF-8: {e}; using embedded default");
+                    tracing::warn!("system.md is not UTF-8: {e}; using embedded default");
                     crate::DEFAULT_SYSTEM_PROMPT.to_string()
                 }),
                 Err(e) => {

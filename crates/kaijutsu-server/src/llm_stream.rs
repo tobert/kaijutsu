@@ -305,7 +305,7 @@ pub(crate) async fn spawn_llm_for_prompt(
             .await
         {
             Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
-                log::warn!("system.md in the CRDT is not UTF-8: {e}; using embedded default");
+                log::warn!("system.md is not UTF-8: {e}; using embedded default");
                 kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string()
             }),
             Err(e) => {
@@ -1492,7 +1492,7 @@ async fn process_llm_stream(
         let mut current_block_id: Option<kaijutsu_types::BlockId> = None;
         // Collect tool calls for this iteration
         let mut tool_calls: Vec<(String, String, serde_json::Value, TypesToolKind)> = vec![]; // (id, name, input, tool_kind)
-        // Track tool_use_id → BlockId mapping for CRDT
+        // Track tool_use_id → BlockId mapping
         let mut tool_call_blocks: std::collections::HashMap<
             String,
             Option<kaijutsu_types::BlockId>,
@@ -1506,7 +1506,7 @@ async fn process_llm_stream(
         // `signature_delta` against its own block's text; a later turn echoes
         // them back unmodified and in order. Reset per agentic-loop iteration so
         // it holds *this* turn's reasoning. This is the same per-block shape the
-        // hydrator reconstructs from CRDT history, so live and rehydrated turns
+        // hydrator reconstructs from block history, so live and rehydrated turns
         // serialize identically.
         let mut assistant_reasoning: Vec<(String, Option<String>)> = Vec::new();
 
@@ -1750,7 +1750,7 @@ async fn process_llm_stream(
                     // `item/tool/call`) cannot continue its live turn until
                     // this callback receives a result.  It must arrive at a
                     // content boundary; still close a malformed open block
-                    // defensively so the CRDT never leaves it Running.
+                    // defensively so it never stays stuck Running.
                     if let Some(block_id) = current_block_id.take() {
                         log::warn!(
                             "inline tool {} arrived with an open content block; closing it defensively",
@@ -2079,7 +2079,7 @@ async fn process_llm_stream(
             break;
         }
 
-        // Execute tools concurrently — CRDT handles concurrent block inserts
+        // Execute tools concurrently — the kernel sequences concurrent block inserts
         log::info!("Executing {} tool calls concurrently", tool_calls.len());
 
         // Build assistant tool uses (for conversation history)
@@ -2185,7 +2185,7 @@ async fn process_llm_stream(
                     )
                     .await;
 
-                    // Step 5: Write result content via CRDT text ops
+                    // Step 5: Write result content via a block edit
                     if let Some(ref rb_id) = result_block_id {
                         if !result_content.is_empty()
                             && let Err(e) = documents.edit_text_as(

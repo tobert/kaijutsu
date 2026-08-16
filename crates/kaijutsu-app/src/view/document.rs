@@ -12,7 +12,7 @@ use std::ops::{Deref, DerefMut};
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
 
-/// The cached per-context document (CRDT doc + compose input + bookkeeping).
+/// The cached per-context document (document text + compose input + bookkeeping).
 /// Lives in the client now; re-exported under the historical name.
 pub use kaijutsu_client::DocumentEntry as CachedDocument;
 

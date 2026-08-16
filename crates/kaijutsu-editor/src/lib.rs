@@ -7,7 +7,7 @@
 //!
 //! - [`EditorCore::apply_keys`] feeds a key sequence and returns the
 //!   `(char_offset, insert, delete)` [`EditOp`]s those keystrokes produced —
-//!   char-indexed to match the CRDT's text addressing.
+//!   char-indexed to match the kernel's block text addressing.
 //! - state accessors ([`EditorCore::text`], [`cursor`](EditorCore::cursor),
 //!   [`mode`](EditorCore::mode)) are what a renderer draws and a test asserts.
 //!
@@ -29,7 +29,7 @@ use modalkit::keybindings::{BindingMachine, InputBindings};
 
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// One contiguous text edit, char-indexed (the CRDT's addressing): at `offset`,
+/// One contiguous text edit, char-indexed (the kernel's block addressing): at `offset`,
 /// remove `delete` chars and insert `insert`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditOp {

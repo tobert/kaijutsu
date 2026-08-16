@@ -138,7 +138,7 @@ fn write_new_file_to_readonly_mount_fails_clean_and_creates_nothing() {
         );
 
         // Nothing was created: a REAL host process (bypassing the VFS
-        // entirely) confirms it, independent of whatever the VFS/CRDT layer
+        // entirely) confirms it, independent of whatever the VFS layer
         // might otherwise believe.
         let stat = run_real(&kernel, &format!("test -e {probe} && echo EXISTS || echo ABSENT")).await;
         assert!(

@@ -77,11 +77,11 @@ pub const ROSTER_RUN_ROOT: &str = "/run/roster";
 /// (`/v/cas/<shard>/<hash>`).
 pub const CAS_ROOT: &str = "/v/cas";
 
-/// Root of the CRDT conversation-document view mount (kaish / file-tool read
+/// Root of the conversation-document view mount (kaish / file-tool read
 /// surface over conversation documents).
 pub const DOCS_ROOT: &str = "/v/docs";
 
-/// Root of the CRDT input-document view mount.
+/// Root of the input-document view mount.
 pub const INPUT_ROOT: &str = "/v/input";
 
 /// Root of the client-shares namespace (`docs/slash-r.md`) — the reverse of

@@ -4,7 +4,7 @@
 //! Why this exists: `FileDocumentCache` keys every kernel document by
 //! `file_context_id(path)` — a UUIDv5 of the path *string* (see `cache.rs`).
 //! If two callers address the same real file with different strings
-//! (`foo.rs`, `./foo.rs`, `/abs/foo.rs`), they get three different CRDT
+//! (`foo.rs`, `./foo.rs`, `/abs/foo.rs`), they get three different kernel
 //! documents and the surfaces silently diverge. Both the MCP file tools and
 //! the kaish file builtins must therefore canonicalize to one absolute path
 //! *before* the cache sees it.

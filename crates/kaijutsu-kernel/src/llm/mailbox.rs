@@ -865,7 +865,7 @@ mod tests {
     /// `ConversationMailbox` (mirrors what happens mid-conversation, one
     /// turn at a time via `catch_up`), a LATER mutation of that SAME
     /// block's `task_status`/`content` — exactly what `set_task_status`/
-    /// `replace_content` do in the CRDT store — must NOT change the
+    /// `replace_content` do in the block store — must NOT change the
     /// already-produced snapshot. `catch_up` is keyed by `BlockId` in its
     /// `seen` set and only ever translates a given id once; re-feeding the
     /// same id (now mutated) is a no-op. That's what keeps a task update
@@ -881,9 +881,9 @@ mod tests {
         let before = mb.snapshot();
         assert_eq!(before.len(), 1);
 
-        // Mutate the SAME BlockId's fields — exactly what a CRDT merge does
-        // after `set_task_status`/content edit lands (LWW-resolved in place,
-        // same id). This is the "task edited mid-conversation" scenario.
+        // Mutate the SAME BlockId's fields — exactly what the store does after
+        // `set_task_status`/a content edit lands (in place, same id). This is
+        // the "task edited mid-conversation" scenario.
         block.task_status = kaijutsu_types::TaskStatus::Done;
         block.content = "Buy oat milk".to_string();
 

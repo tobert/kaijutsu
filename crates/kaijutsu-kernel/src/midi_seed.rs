@@ -27,7 +27,7 @@
 //!
 //! Identical to rc/config: [`seed_files`] feeds
 //! [`crate::runtime::config_doc_fs::ConfigDocFs::seed_entries`], which
-//! writes only paths absent from the CRDT (a live edit or a deleted profile
+//! writes only paths the kernel does not already hold (a live edit or a deleted profile
 //! is never resurrected by a later boot). There is no bulk reseed for a
 //! single device yet (nothing needs `kj midi reset` today — profiles are
 //! read-only in slice 1); the embedded default remains available via

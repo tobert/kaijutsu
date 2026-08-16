@@ -22,7 +22,7 @@
 //! Context (ContextId) ← conversation/workspace within a kernel
 //!     └── parent_id forms fork/thread lineage
 //!     └── drifts to/from sibling contexts
-//!     └── owns BlockStore (CRDT)
+//!     └── owns BlockStore
 //! ```
 //!
 //! # Key Types

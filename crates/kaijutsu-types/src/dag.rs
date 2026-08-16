@@ -1,6 +1,6 @@
 //! Ephemeral index over a list of block snapshots.
 //!
-//! `ConversationDAG` holds no CRDT state and no link to a store — a caller builds it
+//! `ConversationDAG` holds no block-store state and no link to a store — a caller builds it
 //! fresh from a `Vec<BlockSnapshot>` each time it needs tree traversal, then discards it.
 //!
 //! Traversal methods cap depth at `MAX_DAG_DEPTH` (512) — a cyclic parent chain would

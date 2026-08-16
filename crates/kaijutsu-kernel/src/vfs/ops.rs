@@ -101,7 +101,7 @@ pub trait VfsOps: Send + Sync {
     /// Returns true if this filesystem is read-only.
     fn read_only(&self) -> bool;
 
-    /// Whether this backend owns its paths as single-block CRDT *config
+    /// Whether this backend owns its paths as single-block *config
     /// documents* (the rc/config trees). The editor binds such a path straight
     /// to its owning block; routing it through a file-doc cache would mint a
     /// shadow copy and revive the dual-ownership write-through bug class
@@ -182,7 +182,7 @@ pub trait VfsOps: Send + Sync {
     /// ingest, and eventually share sync all sit on this).
     ///
     /// The default implementation loops this backend's own [`Self::read`] at
-    /// [`STREAM_CHUNK_SIZE`] — correct and free for local/memory/CRDT
+    /// [`STREAM_CHUNK_SIZE`] — correct and free for local/memory/document
     /// backends, where `read` is stateless and cheap to call repeatedly. A
     /// backend whose `read` is expensive per call (a network protocol with
     /// its own OPEN/READ/CLOSE framing, e.g. the future `ShareFs`) MUST

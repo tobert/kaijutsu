@@ -851,7 +851,7 @@ impl KjDispatcher {
     /// provided on Replace; line indices are 0-indexed and half-open.
     ///
     /// Offsets are CHAR units throughout (`line_to_char_offset` /
-    /// `line_range_to_char_range`): `edit_text_as` feeds the CRDT text layer,
+    /// `line_range_to_char_range`): `edit_text_as` feeds the block text layer,
     /// which bounds-checks against `chars().count()` and splices at char
     /// positions — byte offsets from multibyte content splice at the wrong
     /// place or trip that check spuriously (the June file-tools bug class).
@@ -1013,7 +1013,7 @@ impl KjDispatcher {
                 ));
             }
         };
-        // `version` here is the document-level CRDT version, matching the
+        // `version` here is the document-level version, matching the
         // MCP block_history semantics. Single-block oplog isn't surfaced
         // by the BlockStore today; if we add it, swap this for the
         // block-specific version.
@@ -2334,7 +2334,7 @@ mod tests {
 
     // ── block edit × multibyte content (byte-vs-char offset regression) ──
     //
-    // The CRDT text layer is CHAR-indexed (`BlockStore::edit_text`
+    // Block text is CHAR-indexed (`BlockStore::edit_text`
     // validates against `chars().count()` and splices at char positions;
     // `TextContent::edit_text` likewise). Feeding it BYTE offsets computed
     // from content with multibyte UTF-8 (改善, →, ✅ — our docs are full of

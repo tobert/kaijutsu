@@ -11,8 +11,8 @@
 //! weigh each block event as a heartbeat — token streaming loudest, because it
 //! means a model is writing right now. That worked, and it cost the whole
 //! event stream: the app received every token of every context in order to
-//! choose a brightness. It was also the last consumer of the raw CRDT wire
-//! events (docs/change-feed.md), which is how it came up.
+//! choose a brightness. It was also the last consumer of the raw
+//! storage-engine wire events (docs/change-feed.md), which is how it came up.
 //!
 //! Amy's call: *"we should temporarily disable that activity glow in the app
 //! pending a redesign. we'll be doing embeddings for a lot of that content

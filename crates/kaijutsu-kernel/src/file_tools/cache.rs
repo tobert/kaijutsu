@@ -579,7 +579,7 @@ impl FileDocumentCache {
         Ok(())
     }
 
-    /// Get the SharedBlockStore (for engines that need direct CRDT access).
+    /// Get the SharedBlockStore (for engines that need direct store access).
     pub fn block_store(&self) -> &SharedBlockStore {
         &self.block_store
     }
@@ -805,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_or_replace_handles_doc_in_store_but_not_cache() {
-        // Regression: the CRDT store persists file docs across restarts while
+        // Regression: the block store persists file docs across restarts while
         // this cache starts cold. A cache miss with the doc still in the store
         // must replace its content, not fail create_document with
         // "document already exists". `invalidate` reproduces the cold cache.
@@ -915,7 +915,7 @@ mod tests {
     }
 
     /// Regression: `try_read_content` on a binary file (not UTF-8 representable
-    /// in the CRDT substrate) must return `NotCached`, not `Backend`. Callers
+    /// as document text) must return `NotCached`, not `Backend`. Callers
     /// such as grep fall through to a raw VFS read for binary files and must
     /// not be blocked by a spurious backend error.
     #[tokio::test]
@@ -932,7 +932,7 @@ mod tests {
         let err = cache
             .try_read_content("/tmp/binary.bin")
             .await
-            .expect_err("binary file must not decode as CRDT text");
+            .expect_err("binary file must not decode as document text");
         assert!(
             matches!(err, CacheReadError::NotCached),
             "binary file must be NotCached, not Backend: {:?}", err
@@ -968,7 +968,7 @@ mod tests {
     ///
     /// Setup: write a file through the cache (clean entry with a known
     /// generation), then bump the disk generation past `loaded_generation` with
-    /// an external write so the entry is seen as stale, then delete the CRDT
+    /// an external write so the entry is seen as stale, then delete the kernel
     /// document so `block_snapshots` inside `reload_block_from_disk` returns an
     /// error.
     #[tokio::test]

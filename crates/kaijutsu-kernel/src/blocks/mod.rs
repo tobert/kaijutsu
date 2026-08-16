@@ -4,22 +4,24 @@
 //! `BlockDocument` is the storage model: each block owns its content as a
 //! plain `String`. Metadata lives in `BlockHeader` (plain data).
 //!
-//! Text used to run through diamond-types-extended, a character-level CRDT —
-//! retired 2026-08-16 because no block is ever concurrently edited (the
-//! kernel is the sole sequencer for every mutation; see CLAUDE.md "Durable
-//! state and the wire") and the CRDT never earned its keep past what it
-//! materialized down to anyway. See `docs/crdt-position-2026-08.md`.
+//! Block text is never a text CRDT. The kernel is the sole sequencer for
+//! every mutation (CLAUDE.md "Durable state and the wire"), so no block is
+//! ever concurrently edited and concurrent merge is structurally impossible.
+//! Reintroducing a text CRDT here is a design conversation, not a patch —
+//! streaming is 100% append and `push_str` is amortized O(1), while the
+//! per-block merge metadata measured about 4x the text it represented. See
+//! `docs/crdt-position-2026-08.md`.
 //!
 //! This module used to be a standalone crate. It moved in-tree 2026-08-16:
-//! once the CRDT was gone, the crate held no dependency the kernel didn't
-//! already have, and its exported abstractions (blocks, forks, selection)
+//! the crate held no dependency the kernel didn't already have, and its
+//! exported abstractions (blocks, forks, selection)
 //! are meaningful only over the wire the kernel serves — not at a
 //! `Cargo.toml` boundary. See CLAUDE.md "Durable state and the wire" and
 //! `docs/crdt-position-2026-08.md`.
 //!
 //! # Block Types
 //!
-//! All block types support Text CRDT for their primary content, enabling streaming:
+//! Every block type takes streamed appends into its primary content:
 //!
 //! - **Text**: Main response text
 //! - **Thinking**: Extended reasoning, collapsible
@@ -72,8 +74,8 @@ mod tests {
         store.append_text(&block_id, " How are you?").unwrap();
         assert_eq!(store.full_text(), "Hello, world! How are you?");
 
-        store.edit_text(&block_id, 7, "CRDT", 5).unwrap();
-        assert_eq!(store.full_text(), "Hello, CRDT! How are you?");
+        store.edit_text(&block_id, 7, "text", 5).unwrap();
+        assert_eq!(store.full_text(), "Hello, text! How are you?");
     }
 
     #[test]

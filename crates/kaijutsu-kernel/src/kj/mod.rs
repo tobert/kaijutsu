@@ -1010,7 +1010,7 @@ pub(crate) mod test_helpers {
                 .with_temp_cleanup(root),
         );
         let rc_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc_fs.seed_from_embedded().expect("seed rc into CRDT");
+        rc_fs.seed_from_embedded().expect("seed rc into the kernel");
         kernel.mount(RC_ROOT, rc_fs).await;
         // Config files live on the same kernel-owned backend type at /etc/config
         // (slice 2) — seed it too so `kj config` tests exercise the real path.
@@ -1018,7 +1018,7 @@ pub(crate) mod test_helpers {
             crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
         config_fs
             .seed_entries(crate::config_seed::config_seed_files())
-            .expect("seed config into CRDT");
+            .expect("seed config into the kernel");
         kernel.mount(CONFIG_ROOT, config_fs).await;
         // Per-client config lives on the same backend type at /etc/client
         // (mirrors production's `create_shared_kernel` mount trio) — seed and
@@ -1027,7 +1027,7 @@ pub(crate) mod test_helpers {
             crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CLIENT_ROOT);
         client_fs
             .seed_entries(crate::config_seed::client_seed_files())
-            .expect("seed client config into CRDT");
+            .expect("seed client config into the kernel");
         kernel.mount(CLIENT_ROOT, client_fs).await;
         // MIDI device profiles live on the same backend type at /etc/midi
         // (docs/midi-next.md "Storage and identity") — seed and mount it too
@@ -1036,7 +1036,7 @@ pub(crate) mod test_helpers {
             crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), MIDI_ROOT);
         midi_fs
             .seed_entries(crate::midi_seed::seed_files())
-            .expect("seed midi devices into CRDT");
+            .expect("seed midi devices into the kernel");
         kernel.mount(MIDI_ROOT, midi_fs).await;
         // The ephemeral, sink-fed presence view over the same kernel's store
         // (docs/midi-next.md "Presence is sink-fed") — mounted here too so

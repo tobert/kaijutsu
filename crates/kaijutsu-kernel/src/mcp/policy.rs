@@ -10,7 +10,7 @@
 //! [`InstancePolicy::for_kernel`], which sources `call_timeout` from the
 //! kernel's `TimeoutPolicy::mcp_call_timeout_default`. Keeping them
 //! decoupled means a kernel with a non-default `TimeoutPolicy` (e.g.,
-//! loaded from config CRDT) registers builtin servers with the *kernel's*
+//! loaded from config) registers builtin servers with the *kernel's*
 //! timeout rather than the `Default` constant — closing the silent-link
 //! footgun called out in plan `lovely-hopping-pearl.md`.
 //!

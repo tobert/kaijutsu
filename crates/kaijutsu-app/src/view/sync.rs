@@ -2,7 +2,7 @@
 //!
 //! docs/change-feed.md is normative here. The block document is a
 //! `ContextMirror` (crates/kaijutsu-client/src/context_feed.rs) fed by a
-//! per-context change feed, not a CRDT fed by `ServerEvent::BlockTextOps`.
+//! per-context change feed; the old `ServerEvent::BlockTextOps` wire is gone.
 //! `handle_block_events` still owns `ContextJoined`; `drain_context_feeds`
 //! is the steady-state and recovery driver, replacing the old
 //! `check_cache_staleness` poll. The compose draft (Lane C slice 3) rides
@@ -44,7 +44,7 @@ fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
 /// Handle context-join bookkeeping (`RpcResultMessage::ContextJoined`).
 ///
 /// The block document itself is no longer hydrated here. A `ContextJoined`
-/// carries no CRDT state to apply any more — `drain_context_hydrations`
+/// carries no document state to apply any more — `drain_context_hydrations`
 /// (below) installs the mirror once the background subscribe+`getBlocks`
 /// finishes, on its own channel (a live `mpsc::Receiver<FeedEvent>` can't
 /// ride `RpcResultMessage`: `MessageReader` hands out shared references, and
@@ -276,7 +276,7 @@ pub fn sync_main_cell_to_conversation(
     // `CellEditor.store` is a `RenderBlockStore` (`view::render_store`) —
     // the local render buffer every other view system already reads
     // (block_border.rs, render.rs, diff_view, timeline, …). The change-feed
-    // mirror holds plain `BlockSnapshot`s, not a CRDT, so
+    // mirror holds plain `BlockSnapshot`s, so
     // `RenderBlockStore::rebuild` materializes them into a fresh store via
     // `insert_from_snapshot`, carrying `collapsed` forward per id across the
     // rebuild (see that method's doc — this runs nearly every frame during
@@ -446,7 +446,7 @@ pub fn handle_server_context_switch(
     }
 }
 
-// `check_cache_staleness` (the old poll-driven CRDT re-fetch) is gone —
+// `check_cache_staleness` (the old poll-driven re-fetch) is gone —
 // `drain_context_feeds`, above, replaces it. Each followed context now gets
 // its own precise recovery signal straight from its change feed instead of a
 // coarse generation bump checked once a frame.

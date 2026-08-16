@@ -4,7 +4,7 @@
 //! `llm_defaults` / `casts` / `cast_slots` / `model_aliases` /
 //! `embedding_config` in `kernel_db.rs` are the source of truth. There is no
 //! TOML anywhere in this path (`models.toml` was demolished, along with the
-//! CRDT doc that carried it). These types are what a row *becomes* once read,
+//! config document that carried it). These types are what a row *becomes* once read,
 //! and what the registry is built from.
 //!
 //! Two things the old `ProviderConfig` conflated and this does not:

@@ -131,7 +131,7 @@ impl KjDispatcher {
 
     /// Like [`Self::materialize_context_kaish`] but the materialized shell is
     /// **read-only**: filesystem mutations and external commands are refused by
-    /// construction, while reads — real files and the CRDT `/v/docs` /
+    /// construction, while reads — real files and the `/v/docs` /
     /// `/v/input` views — still work. Backs the toolie's `read_only_shell`.
     /// Unprivileged (the read-only role is never the rc control plane).
     pub async fn materialize_context_kaish_read_only(

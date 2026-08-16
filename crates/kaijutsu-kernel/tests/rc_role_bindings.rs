@@ -253,7 +253,7 @@ async fn mcp_role_holds_rc_and_config_governance() {
     // adds the rc + config governance caps via S15-governance.kai, so it can
     // iterate on the kernel's own kernel-owned config-as-code.
     //
-    // NB: the broad loadout itself (S10 → lib via a CRDT symlink) is NOT asserted
+    // NB: the broad loadout itself (S10 → lib via a document symlink) is NOT asserted
     // here — this harness mounts /etc/rc as a host `LocalBackend`, which doesn't
     // follow the `ConfigDocFs` symlink the shared binding is composed through.
     // S15 is a plain script, so it runs and grants regardless; the symlink

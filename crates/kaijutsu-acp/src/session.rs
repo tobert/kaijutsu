@@ -655,9 +655,9 @@ mod tests {
     /// `kaijutsu_client::ContextMirror` — never a `SyncedDocument`, never a
     /// diamond-types op byte. This drives exactly that path — subscribe,
     /// snapshot, deliver — and checks the ACP `SessionUpdate` it produces,
-    /// with no CRDT type in scope anywhere in the test.
+    /// with no text-engine type in scope anywhere in the test.
     #[test]
-    fn a_text_change_reaches_acp_rendering_with_no_crdt_involved() {
+    fn a_text_change_reaches_acp_rendering_with_no_text_engine_involved() {
         let c = ctx();
         let snap = BlockSnapshotBuilder::new(BlockId::new(c, PrincipalId::new(), 1), BlockKind::Text)
             .role(Role::Model)
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(text.text, "hello from the feed");
 
         // The mirror itself now holds the kernel's text — reached purely by
-        // applying typed `ContextChange`s, never by decoding a CRDT op.
+        // applying typed `ContextChange`s, never by decoding a storage-engine op.
         assert_eq!(mirror.block(&id).unwrap().content, "hello from the feed");
         assert_eq!(
             mirror.version(),

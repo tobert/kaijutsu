@@ -9,7 +9,7 @@
 //! store itself is plain Rust so its logic is unit-testable without a world.
 //!
 //! **Migration note (docs/change-feed.md).** The block document used to be a
-//! diamond-types CRDT (`SyncedDocument`), fed by `ServerEvent::BlockTextOps`
+//! diamond-types-backed document (`SyncedDocument`), fed by `ServerEvent::BlockTextOps`
 //! and friends. It is now a plain projection (`ContextMirror`) fed by a
 //! per-context change feed (`ActorHandle::subscribe_context` +
 //! `get_blocks_versioned`). The store's job shrank to match: it no longer
@@ -42,7 +42,7 @@ use crate::{ContextMirror, FeedEvent, MirrorError};
 #[allow(dead_code)]
 pub struct DocumentEntry {
     /// The context's projected block state, maintained from the change feed
-    /// (docs/change-feed.md). No CRDT lives here.
+    /// (docs/change-feed.md). No text engine lives here.
     pub mirror: ContextMirror,
     /// The context's live change feed. `None` between a `Terminated` signal
     /// and the app re-subscribing — draining is a no-op while it's `None`,
@@ -442,10 +442,10 @@ mod tests {
 
     /// The point of the whole migration, proven at the store's own seam: a
     /// delivery arrives on a plain channel carrying `ContextChange` — never
-    /// CRDT bytes, never a `ServerEvent::BlockTextOps` — and reaches the
-    /// document's block state via `DocumentStore::drain_feeds` alone.
+    /// storage-engine bytes, never a `ServerEvent::BlockTextOps` — and reaches
+    /// the document's block state via `DocumentStore::drain_feeds` alone.
     #[test]
-    fn draining_the_feed_applies_a_text_delivery_with_no_crdt_involved() {
+    fn draining_the_feed_applies_a_text_delivery_with_no_text_engine_involved() {
         let mut store = DocumentStore::default();
         let c = ctx();
         let b = block(c, 1, "");
@@ -529,7 +529,7 @@ mod tests {
 
     /// The Lane C slice 3 seam: a draft is an ordinary block in the mirror
     /// now, so `draft_text` finds it purely by `(Status::Draft, principal)` —
-    /// no CRDT, no separate fetch, other principals' drafts and non-draft
+    /// no text engine, no separate fetch, other principals' drafts and non-draft
     /// blocks all ignored.
     #[test]
     fn draft_text_finds_the_calling_principals_draft_block_only() {

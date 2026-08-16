@@ -1,6 +1,6 @@
 //! Kaijutsu MCP server binary.
 //!
-//! Exposes the CRDT kernel to MCP clients (Claude Code, opencode).
+//! Exposes the kaijutsu kernel to MCP clients (Claude Code, opencode).
 //!
 //! ## Subcommands
 //!
@@ -31,10 +31,10 @@ use kaijutsu_mcp::hook_listener::{
     send_hook_event, sweep_stale_sockets,
 };
 
-/// MCP server exposing kaijutsu CRDT kernel.
+/// MCP server exposing the kaijutsu kernel.
 #[derive(Parser, Debug)]
 #[command(name = "kaijutsu-mcp")]
-#[command(about = "MCP server for kaijutsu CRDT kernel")]
+#[command(about = "MCP server for the kaijutsu kernel")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

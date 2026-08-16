@@ -77,7 +77,7 @@ impl ApplicationWindowId for KaijutsuWindowId {}
 /// Content identifier for buffers.
 ///
 /// Only command-bar buffers exist as distinct ContentIds; the compose buffer
-/// itself lives in the DTE CRDT, not modalkit's store.
+/// itself lives in the block store, not modalkit's store.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum KaijutsuContentId {
     /// Command bar buffer (: commands).

@@ -212,8 +212,8 @@ fn analyze_document_reads_the_server_with_the_event_listener_dead() {
         // Baseline version, straight from the server, before the mutations
         // this process's dead event listener will never see. Read via both
         // RPCs the projected `get_context_version` is meant to agree with.
-        // `get_context_sync` (the CRDT-oplog RPC this cross-check used to read
-        // against) was deleted in the 2026-08-15 wire flag day
+        // `get_context_sync` (the storage-engine-oplog RPC this cross-check used
+        // to read against) was deleted in the 2026-08-15 wire flag day
         // (docs/change-feed.md); `get_blocks_versioned` reads the same
         // single-guard version, without an oplog decode anywhere.
         let (_, before_sync_version) = remote

@@ -18,7 +18,7 @@ pub const RING_SLOTS: usize = 10;
 
 /// Metadata for a context within a kernel.
 ///
-/// Used for listing, display, and constellation rendering. The actual CRDT
+/// Used for listing, display, and constellation rendering. The actual
 /// document lives in the kernel; this is the lightweight summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {

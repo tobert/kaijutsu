@@ -30,28 +30,28 @@ use crate::vfs::{FileType, MountTable, SetAttr, VfsError, VfsOps};
 
 use super::kaish_backend::KaijutsuBackend;
 
-/// Routes file *content* operations through the shared CRDT
+/// Routes file *content* operations through the shared
 /// `FileDocumentCache` and directory/metadata/tool operations through
 /// kaijutsu's `MountTable`.
 ///
-/// This is what makes kaish "shell scripting on the same CRDT substrate":
+/// This is what makes kaish "shell scripting on the same documents":
 /// a `cat`/`read`/`write`/`edit` from the shell hits the same kernel document
 /// the MCP `builtin.file` tools use, keyed by the canonical absolute path.
-/// Binary files (not representable as CRDT text) fall through to the raw
+/// Binary files (not representable as document text) fall through to the raw
 /// `MountTable`; that fallthrough is a deliberate type distinction, not a
 /// silent error-swallow.
 pub struct MountBackend {
     /// Kaijutsu kernel's VFS mount table — directory/metadata ops and the
     /// binary-file fallback path.
     mount_table: Arc<MountTable>,
-    /// Shared CRDT file-document cache — the source of truth for text file
+    /// Shared file-document cache — the source of truth for text file
     /// content across both the kaish and MCP surfaces.
     file_cache: Arc<FileDocumentCache>,
     /// document backend for document tool dispatch.
     docs_tools: Arc<KaijutsuBackend>,
     /// When true, every mutating op is refused structurally with
-    /// `PermissionDenied` *before* it can reach the shared mount table or CRDT
-    /// cache — the read-only invariant for the toolie's `read_only_shell`.
+    /// `PermissionDenied` *before* it can reach the shared mount table or the
+    /// document cache — the read-only invariant for the toolie's `read_only_shell`.
     /// Reads (real files and kernel documents) still pass through. This gates the
     /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` and
     /// `/v/input` mounts are gated separately by wrapping them in
@@ -262,7 +262,7 @@ impl KernelBackend for MountBackend {
     // =========================================================================
 
     async fn read(&self, path: &Path, range: Option<ReadRange>) -> BackendResult<Vec<u8>> {
-        // CRDT-back only writable mounts. Reading a read-only/OS path shouldn't
+        // Document-back only writable mounts. Reading a read-only/OS path shouldn't
         // mint a kernel document — pass it straight through the VFS.
         if self.mount_table.is_writable(path).await {
             let key = self.cache_key(path)?;
@@ -273,7 +273,7 @@ impl KernelBackend for MountBackend {
                     // on a binary or absent file still works as expected.
                 }
                 Err(CacheReadError::Backend(e)) => {
-                    // A real CRDT/store error: refuse to serve stale disk bytes
+                    // A real store error: refuse to serve stale disk bytes
                     // in its place — that would be silent data corruption.
                     return Err(BackendError::Io(e));
                 }
@@ -300,7 +300,7 @@ impl KernelBackend for MountBackend {
 
         let key = self.cache_key(path)?;
 
-        // Binary content can't live in the CRDT text substrate: write raw and
+        // Binary content can't live in a document's text: write raw and
         // drop any cached text doc so a later read reloads fresh.
         let text = match std::str::from_utf8(content) {
             Ok(t) => t,
@@ -361,7 +361,7 @@ impl KernelBackend for MountBackend {
                 return Ok(());
             }
         };
-        // Append onto current CRDT content.
+        // Append onto current document content.
         // NotCached = new file or binary; treat as empty (correct for append-to-new).
         // Backend = real store error; refuse — unwrap_or_default() here would
         // silently wipe the file by appending `suffix` onto "" and overwriting.
@@ -611,7 +611,7 @@ impl KernelBackend for MountBackend {
             .map_err(vfs_to_backend)?;
         // We deliberately don't touch `file_cache` here. The cache keys
         // freshness on `generation`, not mtime, and a pure mtime `setattr` is
-        // display-only on the CRDT/memory backends — it does NOT advance
+        // display-only on the document/memory backends — it does NOT advance
         // generation, so it correctly does NOT trip a reload (a `touch` must not
         // discard cached content). A real content change is what bumps
         // generation and trips the staleness check. Invalidating here would risk
@@ -708,7 +708,7 @@ impl KernelBackend for MountBackend {
         // VFS cwd into a real host cwd before spawning an external command —
         // a `None` here disables external exec for that call. Structural
         // resolution via the mount table's sync path (longest-prefix owner +
-        // `real_root`); virtual cwds (/v/*, CRDT mounts) correctly yield None.
+        // `real_root`); virtual cwds (/v/*, document mounts) correctly yield None.
         self.mount_table.resolve_real_path_sync(path)
     }
 }
@@ -876,7 +876,7 @@ mod tests {
     /// a read from the MCP surface address one kernel document. We exercise both
     /// directions over a single shared `FileDocumentCache`.
     #[tokio::test]
-    async fn kaish_and_mcp_share_one_crdt_document() {
+    async fn kaish_and_mcp_share_one_kernel_document() {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-xsurface").await);
         let sid = kaijutsu_types::SessionId::new();
@@ -930,7 +930,7 @@ mod tests {
         );
     }
 
-    /// Read-only / OS mounts pass through the VFS and never touch the CRDT
+    /// Read-only / OS mounts pass through the VFS and never touch the document
     /// cache: reads work, writes are rejected cleanly, and a rejected write
     /// must NOT leave a phantom edit that a later read would serve.
     #[tokio::test]
@@ -1142,7 +1142,7 @@ mod tests {
     /// Regression: a Backend error during `read` must return `Err`, NOT fall
     /// through to serve stale on-disk bytes. The old code used a blanket `if
     /// let Ok(text) = read_content(...)` which silently served disk content when
-    /// the CRDT store was broken — silent data corruption.
+    /// the block store was broken — silent data corruption.
     ///
     /// This test MUST FAIL on code that uses `if let Ok(text) = read_content`
     /// (or any pattern that falls through on ALL errors, not just NotCached).
@@ -1168,7 +1168,7 @@ mod tests {
 
         // Write the file through the backend so it's in the document cache AND on disk.
         backend
-            .write(Path::new("/tmp/stale.txt"), b"crdt-content", WriteMode::Overwrite)
+            .write(Path::new("/tmp/stale.txt"), b"doc-content", WriteMode::Overwrite)
             .await
             .unwrap();
 
@@ -1184,7 +1184,7 @@ mod tests {
             .delete_document(ctx_id)
             .expect("setup: delete_document must succeed");
 
-        // On old code: Backend error → falls through → serves "crdt-content"
+        // On old code: Backend error → falls through → serves "doc-content"
         // from disk (stale, wrong). On new code: must return Err.
         let result = backend.read(Path::new("/tmp/stale.txt"), None).await;
         assert!(

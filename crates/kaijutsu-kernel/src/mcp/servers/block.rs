@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::block_store::SharedBlockStore;
 // The `*_char_*` twins, NOT the byte variants: `apply_op` feeds
-// `edit_text_as`, and the CRDT text layer is char-indexed (byte offsets
+// `edit_text_as`, and block text is char-indexed (byte offsets
 // corrupt multibyte content — the June file-tools bug class).
 use crate::block_tools::translate::{
     content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
@@ -86,7 +86,7 @@ pub enum EditOp {
 pub struct BlockSpliceParams {
     /// Block ID to edit.
     pub block_id: String,
-    /// CHARACTER offset (not bytes — the CRDT text layer is char-indexed;
+    /// CHARACTER offset (not bytes — block text is char-indexed;
     /// the tool description has always said "character-based" but this
     /// schema doc used to say "byte", steering callers into computing byte
     /// offsets that corrupt multibyte content).
@@ -1777,8 +1777,8 @@ mod tests {
 
     // ── block_edit × multibyte content (byte-vs-char offset regression) ──
     //
-    // Same disease as the kj `block edit` fix (kj/block.rs): the CRDT text
-    // layer is CHAR-indexed (`BlockStore::edit_text` bounds-checks against
+    // Same disease as the kj `block edit` fix (kj/block.rs): block text
+    // is CHAR-indexed (`BlockStore::edit_text` bounds-checks against
     // `chars().count()` and splices at char positions), so byte offsets from
     // the translate helpers corrupt any block with multibyte UTF-8 before the
     // edit site — silent wrong-splice or spurious PositionOutOfBounds.

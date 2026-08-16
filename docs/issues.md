@@ -836,7 +836,7 @@ keep correct by hand.
 
 `kaijutsu-configgit` (the git write seam above) is tested and unwired — see
 `docs/config-ownership.md`, "Lane B — the git-worktree seam". `/etc/config`,
-`/etc/client`, and `/etc/midi` are still `ConfigCrdtFs` mounts backed by
+`/etc/client`, and `/etc/midi` are still `ConfigDocFs` mounts backed by
 `kernel.db`; nothing reads or writes `<data_dir>/config`. What shipped
 2026-08-15/16 (`988122f9`) was only the write *gate* — the file tools can now
 reach the kernel-owned mounts directly — not a storage migration.
@@ -4057,7 +4057,7 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
   resolution — verified not-a-bypass (twice: `LocalBackend::resolve`
   canonicalizes *and* re-clamps with `canonical.starts_with(canonical_root)`,
   `vfs/backends/local.rs:102-113`, so an escaping symlink is rejected
-  `path_escapes_root`; and gated paths are a separate `ConfigCrdtFs` mount
+  `path_escapes_root`; and gated paths are a separate `ConfigDocFs` mount
   reached by VFS prefix, not OS-symlink-reachable) but the gate belongs below
   resolution.
 - **Slice 4 — adapter limits.** Rate-limiting + traversal-depth/size caps to
@@ -4629,7 +4629,7 @@ key-value store demolished 2026-07-04.*
   long since exercised live** (`kj rc edit` is the daily surface). Remaining: the
   deferred scratch mount.
 - **rc cutover follow-ups (from slice 1):**
-  - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_crdt_rc`
+  - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_rc`
 
     (DB-backed block store sharing the in-memory `KernelDb` handle) hangs the
     `kj::fork` tests — a latent lock-ordering / re-entrant-`parking_lot` issue.
@@ -4638,7 +4638,7 @@ key-value store demolished 2026-07-04.*
     works there, so it's likely test-harness-specific — but worth a look (could flag
     a real reentrancy risk). Until fixed, the global rc test tree is still host-disk
     (`ensure_rc_seed_files` + LocalBackend), inconsistent with production.
-  - **Teach `FileDocumentCache` to pass through kernel-owned mounts.** `ConfigCrdtFs`
+  - **Teach `FileDocumentCache` to pass through kernel-owned mounts.** `ConfigDocFs`
     carries an in-memory advancing mtime purely so the cache (used by agent
     `builtin.file:read /etc/rc/…`) reloads after a `kj rc` write. Cleaner: the cache
     skips mirroring `real_path()==None` mounts entirely (read straight through),
@@ -5143,7 +5143,7 @@ key-value store demolished 2026-07-04.*
   `default_model`/aliases and `DEFAULT_MODEL` have always read the valid
   `claude-haiku-4-5-20251001` since the TOML config was introduced. But
   `/etc/config/models.toml` is kernel-owned and seeded absent-only
-  (`config_seed.rs`, `config_crdt_fs.rs:349-378`) — a kernel whose
+  (`config_seed.rs`, `config_doc_fs.rs:349-378`) — a kernel whose
   config predates whatever earlier fix corrected this would still be
   serving the stale value, since a context's model is baked in at creation
   time from the live registry (`rpc.rs` `create_context_inner`) and restarts
@@ -5833,7 +5833,7 @@ substrate deserves a systematic pass rather than per-claim firefighting. The tri
 this round: SFTP rides `Arc<MountTable>` directly (`sftp.rs:115`, from
 `kernel.vfs()`), while the `FileDocumentCache` write-through lives one layer up in
 `MountBackend` (`runtime/mount_backend.rs:43-49`), which SFTP never traverses. Not
-the "silent divergence" the review claimed (kernel-owned mounts still hit `ConfigCrdtFs`
+the "silent divergence" the review claimed (kernel-owned mounts still hit `ConfigDocFs`
 in-table; the generation/mtime staleness reload exists precisely to catch
 bypassing writers — that's how host `vim` stays coherent) — but the two-layer split
 is real and under-tested.
@@ -5841,7 +5841,7 @@ is real and under-tested.
 Scope a deliberate audit covering three axes:
 
 - **Cache coherency.** Enumerate every `FileDocumentCache` consumer and every path
-  that *bypasses* it (SFTP via `MountTable`, app renderer, `ConfigCrdtFs` execution
+  that *bypasses* it (SFTP via `MountTable`, app renderer, `ConfigDocFs` execution
   reads, kaish/MCP file tools via `MountBackend`). For each: does the generation/
   mtime staleness reload actually fire? Map the **dirty-cache-wins** windows (an
   in-flight cached edit shadows an external/SFTP write until flush) and the

@@ -1,8 +1,8 @@
-//! MCP server exposing kaijutsu CRDT kernel.
+//! MCP server exposing the kaijutsu kernel.
 //!
 //! Provides tools for document and block manipulation via Model Context Protocol,
 //! enabling agents like Claude Code and opencode to collaborate
-//! on shared CRDT state.
+//! on shared kernel state.
 //!
 //! ## Backends
 //!
@@ -635,7 +635,7 @@ impl Default for McpServerState {
     }
 }
 
-/// MCP server exposing kaijutsu CRDT kernel.
+/// MCP server exposing the kaijutsu kernel.
 #[derive(Clone)]
 pub struct KaijutsuMcp {
     backend: Backend,
@@ -934,8 +934,8 @@ impl KaijutsuMcp {
     /// Blocks (document order) plus the document's version. Local reads both
     /// off the in-process `BlockStore` directly. Remote pairs the existing
     /// `context_blocks` (`get_all_blocks`) with the projected `get_context_version`
-    /// RPC — no CRDT bytes cross the wire for this call at all, so there is
-    /// nothing here to decode. This used to fetch `get_context_sync` and
+    /// RPC — no storage-engine bytes cross the wire for this call at all, so
+    /// there is nothing here to decode. This used to fetch `get_context_sync` and
     /// throw away a `SyncedDocument` built purely to read its block list;
     /// `getContextVersion` exists so a caller that only wants the semantic
     /// facts (blocks, version) never needs the oplog in the first place.
@@ -1835,7 +1835,7 @@ impl KaijutsuMcp {
     }
 
     // ========================================================================
-    // Input Document Tools (CRDT compose scratchpad)
+    // Input Document Tools (compose scratchpad)
     // ========================================================================
 
     #[tool(
@@ -2313,7 +2313,7 @@ impl ServerHandler for KaijutsuMcp {
         // when rmcp learns a newer version. See docs/issues.md "rmcp
         // protocol-version fallback".
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
-        .with_instructions("Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with kernel-owned consistency.")
+        .with_instructions("Kaijutsu kernel MCP server. Provides tools for collaborative document and block editing with kernel-owned consistency.")
     }
 
     // ========================================================================

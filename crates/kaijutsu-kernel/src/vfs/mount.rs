@@ -574,7 +574,7 @@ impl MountTable {
     /// folded closest-directory-wins (see [`Self::ignore_stack_matches`] for
     /// the precision gap vs. git's exact semantics). Only `.gitignore` files
     /// at-or-below the snapshot root are considered — an ancestor
-    /// `.gitignore` above the root path is not consulted. Virtual/CRDT
+    /// `.gitignore` above the root path is not consulted. Virtual/document
     /// backends always report `ignored=false`. Both gaps are tracked in
     /// `docs/issues.md`.
     pub async fn snapshot(
@@ -653,7 +653,7 @@ impl MountTable {
     /// `KernelBackend::resolve_real_path` is a sync trait method, so it can't
     /// ride the async [`Self::real_path`]. Longest-prefix owner (same rule as
     /// [`Self::owner_of`]) → the owner's structural [`VfsOps::real_root`] +
-    /// the relative remainder. `None` for virtual mounts (CRDT/memory) and
+    /// the relative remainder. `None` for virtual mounts (document/memory) and
     /// unmounted paths — the caller treats that as "no host cwd, skip external
     /// exec". Purely structural: no existence check, no symlink resolution
     /// (the spawned child's own syscalls resolve those).
@@ -1431,7 +1431,7 @@ mod tests {
 
     /// The subprocess seam: sync resolution maps Local-backed mounts to real
     /// host paths (longest-prefix wins), and virtual mounts yield `None` so
-    /// external exec is skipped for CRDT/memory cwds.
+    /// external exec is skipped for document/memory cwds.
     #[tokio::test]
     async fn resolve_real_path_sync_maps_local_and_skips_virtual() {
         use crate::vfs::backends::LocalBackend;

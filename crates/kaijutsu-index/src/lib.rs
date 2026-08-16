@@ -8,7 +8,7 @@
 //! ```text
 //! kaijutsu-types  (leaf)
 //!        │
-//! kaijutsu-index  (this crate — no kernel/crdt dep)
+//! kaijutsu-index  (this crate — no kernel dep)
 //!        │
 //! kaijutsu-server (implements BlockSource/StatusReceiver traits)
 //! ```

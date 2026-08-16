@@ -11,24 +11,24 @@
 //! This module is purely additive: it does not touch mount wiring, delete any
 //! document, or add a git dependency. It builds the export model
 //! ([`ConfigTreeEntry`]) and proves — via the round-trip test below — that
-//! walking the CRDT out to disk and back loses nothing.
+//! walking the documents out to disk and back loses nothing.
 //!
 //! [`ConfigDocFs`]: crate::runtime::config_doc_fs::ConfigDocFs
 //!
 //! # What does NOT round-trip
 //!
-//! The CRDT doc model is strictly narrower than a real filesystem. Anything
+//! The document model is strictly narrower than a real filesystem. Anything
 //! below is invisible to [`export_config_tree`] by construction — not a bug
 //! in this module, but a gap this module makes visible for the eventual flip:
 //!
 //! - **File permissions / modes.** `ConfigDocFs::getattr` reports a fixed
 //!   `0o644` for every file and `0o755` for every directory (see `getattr` in
 //!   `runtime/config_doc_fs.rs`) — there is no per-document mode bit stored
-//!   anywhere. A materialized tree cannot recover a mode the CRDT never held.
+//!   anywhere. A materialized tree cannot recover a mode no document ever held.
 //! - **Empty directories.** Directories are virtual, synthesized from
 //!   descendant document paths (`is_dir`/`readdir` in `config_doc_fs.rs`).
 //!   A directory with zero documents under it does not exist as far as the
-//!   CRDT is concerned, so it materializes to nothing and a git worktree
+//!   kernel is concerned, so it materializes to nothing and a git worktree
 //!   (which also cannot track an empty directory) loses no *additional*
 //!   information here — but a real POSIX directory could have held one.
 //! - **Duplicate-path collisions.** Impossible by construction: `ContextId`
@@ -93,7 +93,7 @@ fn root_subdir(root: &str) -> &'static str {
         CLIENT_ROOT => "client",
         MIDI_ROOT => "midi",
         other => unreachable!(
-            "config_export only knows the four CRDT config mount roots; got {other}"
+            "config_export only knows the four config mount roots; got {other}"
         ),
     }
 }
@@ -127,11 +127,11 @@ pub enum ConfigTreeKind {
 /// Errors from exporting, materializing, or importing a config tree.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigExportError {
-    #[error("crdt: {0}")]
+    #[error("block store: {0}")]
     BlockStore(#[from] BlockStoreError),
 
-    /// A document is registered (its `documents` row exists) but its CRDT
-    /// doc carries zero blocks — the halted-replay case
+    /// A document is registered (its `documents` row exists) but the
+    /// document carries zero blocks — the halted-replay case
     /// `config_doc::first_block_id` names. This is data loss waiting to
     /// happen silently; the export refuses to proceed past it rather than
     /// emit a truncated tree.
@@ -161,7 +161,7 @@ pub enum ConfigExportError {
     NonUtf8Path { root: &'static str, path: PathBuf },
 
     /// An imported symlink's target resolves outside its mount root. Refused
-    /// loudly rather than materialized into the CRDT (which would let it
+    /// loudly rather than materialized into a document (which would let it
     /// escape the mount's cross-mount permission gate — the same escape
     /// `ConfigDocFs::resolve_target` refuses at read time).
     #[error(
@@ -194,7 +194,7 @@ fn sort_entries(entries: &mut [ConfigTreeEntry]) {
     });
 }
 
-/// Enumerate every File/Symlink document under all four CRDT config mount
+/// Enumerate every File/Symlink document under all four config mount
 /// roots. Deterministically ordered (root, then lexical `rel_path`) so two
 /// exports of the same store are byte-identical — the comparison strategy
 /// the whole migration rests on.

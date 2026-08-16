@@ -20,7 +20,7 @@
 //!
 //! Model configuration is **not** here. It is SQL-native — `kj backend`,
 //! `kj cast`, `kj alias` over `kernel_db` tables — and `models.toml` was
-//! demolished along with its CRDT doc. The write-time provider-type check
+//! demolished along with its config document. The write-time provider-type check
 //! this module used to carry moved with it: the closed set now lives in
 //! `BackendKind`, enforced by `kj backend set` and a SQL CHECK.
 
@@ -44,7 +44,7 @@ pub(crate) struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
-    /// List the config files the CRDT currently holds.
+    /// List the config files the kernel currently holds.
     #[command(alias = "ls")]
     List {
         /// Emit a JSON array of names instead of a labelled view

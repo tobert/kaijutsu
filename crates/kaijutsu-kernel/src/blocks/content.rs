@@ -1,12 +1,10 @@
 //! Per-block content with metadata.
 //!
 //! Each block owns its content as a plain `String`, plus a `BlockHeader` for
-//! metadata (kind, role, status, parent_id, etc.). Text used to be a
-//! per-block diamond-types-extended `Document` (a character-level CRDT); the
-//! kernel is the sole sequencer for every mutation (CLAUDE.md "Durable state
-//! and the wire"), so no block ever needed concurrent-branch reconciliation,
-//! and the CRDT was retired in favor of the plain `String` it always
-//! materialized down to. See `docs/crdt-position-2026-08.md`.
+//! metadata (kind, role, status, parent_id, etc.). The kernel is the sole
+//! sequencer for every mutation (CLAUDE.md "Durable state and the wire"), so
+//! no block ever needs concurrent-branch reconciliation. See
+//! `docs/crdt-position-2026-08.md`.
 
 use kaijutsu_types::{
     BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus, Tick,
@@ -189,7 +187,7 @@ pub(crate) fn order_key_successor(pred: &str, suffix: &str) -> String {
 
 /// A single block's content and metadata.
 ///
-/// `text` holds the block's content directly — no per-block CRDT, because no
+/// `text` holds the block's content directly — never a text CRDT, because no
 /// block is ever concurrently edited (the kernel is the sole sequencer for
 /// every mutation; see CLAUDE.md "Durable state and the wire"). The
 /// BlockHeader holds identity, kind, role, status, etc. (plain data). The
@@ -263,8 +261,8 @@ pub struct BlockContent {
 impl BlockContent {
     /// Create a new block with empty content.
     ///
-    /// `_principal_id` is unused now that content has no per-replica CRDT
-    /// agent — kept as a parameter so every call site across the kernel
+    /// `_principal_id` is unused: content has no per-replica agent
+    /// — kept as a parameter so every call site across the kernel
     /// (which threads authorship through it) does not need to change.
     pub fn new(header: BlockHeader, _principal_id: PrincipalId, order_key: String) -> Self {
         Self {
@@ -811,7 +809,7 @@ mod snapshot_threading_tests {
     /// T16(c) (design §8 Phase 5) — a track-bearing snapshot survives the central
     /// CBOR codec round-trip. The pre-track frozen fixture and unknown-key
     /// tolerance live in `kaijutsu_types::codec` tests (the codec's home crate);
-    /// this is the crdt-side companion asserting `Some(track)` round-trips.
+    /// this is the block-store-side companion asserting `Some(track)` round-trips.
     #[test]
     fn block_snapshot_cbor_track_round_trip() {
         let snap = BlockSnapshotBuilder::new(block_id(), BlockKind::Text)

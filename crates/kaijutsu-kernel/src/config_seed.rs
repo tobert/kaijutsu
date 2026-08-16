@@ -3,7 +3,7 @@
 //! The config TOMLs (`theme.toml`, `mcp.toml`) and the system prompt
 //! (`system.md`) are **kernel-owned**, exactly like `/etc/rc`: a fresh
 //! kernel seeds them from these compiled-in defaults into a [`ConfigDocFs`]
-//! mounted at [`CONFIG_VFS_ROOT`], and the CRDT is the sole owner thereafter
+//! mounted at [`CONFIG_VFS_ROOT`], and the kernel is the sole owner thereafter
 //! (no host file, no write-through). See `docs/config-ownership.md`.
 //!
 //! These consts used to live on `ConfigDocBackend`; that disk-coupled backend
@@ -19,7 +19,7 @@ pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.tom
 // SQL-native — `backends` / `backend_models` / `casts` / `cast_slots` /
 // `model_aliases` / `llm_defaults` / `embedding_config` in `kernel_db.rs` —
 // and the embedded floor lives in `crate::seed_backends`, not in an asset.
-// The `/etc/config/models.toml` CRDT doc and its loader were demolished; do
+// The `/etc/config/models.toml` document and its loader were demolished; do
 // not reintroduce a TOML in this path.
 
 /// Embedded default MCP server configuration (TOML).
@@ -122,7 +122,7 @@ mod tests {
         let files = config_seed_files();
         assert!(
             files.iter().all(|(p, _)| !p.ends_with("models.toml")),
-            "models.toml must not be a CRDT config doc: {files:?}"
+            "models.toml must not be a config document: {files:?}"
         );
         assert!(config_seed_body("/etc/config/models.toml").is_none());
     }

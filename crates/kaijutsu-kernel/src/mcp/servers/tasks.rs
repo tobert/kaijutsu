@@ -8,7 +8,7 @@
 //! without also getting `block.rs`'s generic block-editing tools (`block_edit`,
 //! `block_splice`, …) — the same reasoning `builtin.shell` /
 //! `builtin.shell_readonly` split on. A `BlockKind::Task` block IS an ordinary
-//! block underneath (CRDT-synced, DAG-parented) — this server is just the
+//! block underneath (kernel-sequenced, DAG-parented) — this server is just the
 //! curated verb set over it, delegating storage to the same `SharedBlockStore`
 //! `block.rs` uses.
 //!
@@ -443,7 +443,7 @@ impl BuiltinTasksServer {
     }
 
     /// Full-replace a task's content (title/description) — deletes the
-    /// current text and inserts the new text in one CRDT edit.
+    /// current text and inserts the new text in one edit.
     fn replace_content(
         &self,
         context_id: ContextId,

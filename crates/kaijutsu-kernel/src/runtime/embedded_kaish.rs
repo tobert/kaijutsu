@@ -252,7 +252,7 @@ impl EmbeddedKaish {
 
     /// Shared builder for [`Self::with_identity`] /
     /// [`Self::with_identity_read_only`]. When `read_only` is set, the
-    /// `MountBackend` refuses every mutation, the `/v/*` CRDT mounts are wrapped
+    /// `MountBackend` refuses every mutation, the `/v/*` document mounts are wrapped
     /// read-only, and external command execution is disabled — three structural
     /// levers, mirroring kaibo's read-only sandbox recipe (`sandbox.rs`) adapted
     /// to kaijutsu's *shared*, kernel-owned mount table.
@@ -283,10 +283,10 @@ impl EmbeddedKaish {
             session_id,
             principal_id,
         ));
-        // The shared CRDT file cache: same instance the MCP file tools use
+        // The shared file cache: same instance the MCP file tools use
         // (installed at server startup), or lazily built from this block store
         // in embedded/test paths. Routing MountBackend through it is the whole
-        // point of kaish — shell scripting on the same CRDT substrate.
+        // point of kaish — shell scripting on the same documents.
         let file_cache = kernel.file_cache(&blocks);
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
@@ -298,8 +298,8 @@ impl EmbeddedKaish {
         let mount_table = kernel.vfs().clone();
 
         // Read-only mode refuses every mutation at the MountBackend boundary
-        // (real files + the CRDT FileDocumentCache), regardless of whether the
-        // shared mount is writable. The `/v/*` CRDT mounts bypass MountBackend,
+        // (real files + the FileDocumentCache), regardless of whether the
+        // shared mount is writable. The `/v/*` document mounts bypass MountBackend,
         // so they're wrapped separately below.
         let mount_backend: Arc<dyn KernelBackend> = if read_only {
             Arc::new(MountBackend::new_read_only(
@@ -761,7 +761,7 @@ mod tests {
     }
 
     /// The kaish surface for init.d-style rc composition: an agent shell does
-    /// `ln -s` over the `/etc/rc` CRDT mount, and `cat` through the link returns
+    /// `ln -s` over the `/etc/rc` document mount, and `cat` through the link returns
     /// the *target's* content. This proves the path is wired end-to-end —
     /// kaish `ln`/`cat` builtins → MountBackend → MountTable → ConfigDocFs —
     /// with no rc-specific shell code. (KaijutsuBackend's `/docs/` block scheme

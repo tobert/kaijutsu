@@ -1,4 +1,4 @@
-//! Git write seam for Lane B of the CRDT melt — rc/config documents becoming
+//! Git write seam for Lane B — rc/config documents becoming
 //! plain files in a kernel-owned git worktree (`docs/config-ownership.md`,
 //! "Lane B — the git-worktree seam, shipped and deliberately unwired").
 //!
@@ -29,7 +29,7 @@
 //!
 //! ## What this crate does not do
 //!
-//! No CRDT types, no kernel `ContextId`/`BlockStore`, no `ConfigDocFs`
+//! No kernel `ContextId`/`BlockStore`, no `ConfigDocFs`
 //! wiring, no migration of existing documents. It does not stage changes
 //! through an on-disk git index — `commit_all` rewalks the live worktree
 //! directory on every call and always commits its full current state, which

@@ -1,9 +1,9 @@
 //! `ReadOnlyFs` — a structural read-only wrapper around any kaish
 //! [`Filesystem`].
 //!
-//! The toolie's `read_only_shell` reaches the real filesystem and the CRDT
+//! The toolie's `read_only_shell` reaches the real filesystem and the shared
 //! `FileDocumentCache` through a read-only [`MountBackend`](super::mount_backend),
-//! but the CRDT *document views* `/v/docs` and `/v/input` are mounted directly
+//! but the *document views* `/v/docs` and `/v/input` are mounted directly
 //! onto the kaish VFS — they never route through `MountBackend`, so a read-only
 //! `MountBackend` alone would still let the toolie mutate the input doc and
 //! document views.
@@ -13,7 +13,7 @@
 //! `PermissionDenied` *before* it reaches the inner fs. The toolie can read a
 //! live kernel document view but cannot author it — the differentiator from
 //! kaibo, whose read-only sandbox has only host files + ephemeral scratch and
-//! no CRDT surface at all.
+//! no kernel-document surface at all.
 
 use std::io;
 use std::path::{Path, PathBuf};

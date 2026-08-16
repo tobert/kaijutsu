@@ -1,7 +1,7 @@
 //! Translation layer between line-based operations and byte offsets.
 //!
 //! This module bridges the model-friendly line-based interface with
-//! the CRDT's character-based operations.
+//! the block store's character-based operations.
 
 use super::error::{EditError, Result};
 
@@ -91,7 +91,7 @@ pub fn line_range_to_byte_range(
 }
 
 /// Convert a byte offset that lies on a char boundary into a CHAR offset —
-/// the unit the CRDT text layer actually consumes (`BlockStore::edit_text`
+/// the unit the block text layer actually consumes (`BlockStore::edit_text`
 /// bounds-checks against `chars().count()` and `TextContent::edit_text`
 /// splices at char positions). Same conversion as `byte_to_char` in
 /// `mcp/servers/file.rs` (the June file-tools corruption fix — the prior art
@@ -105,7 +105,7 @@ pub fn byte_to_char_offset(content: &str, byte: usize) -> usize {
 /// [`line_to_byte_offset`]'s CHAR twin: the offset to hand to
 /// `edit_text`/`edit_text_as`. Identical line/bounds semantics — it reuses
 /// the byte walk, then projects the (boundary) offset into char units. Use
-/// THIS for CRDT text edits; the byte variant is for byte-oriented consumers
+/// THIS for block text edits; the byte variant is for byte-oriented consumers
 /// (string slicing, `replace_range`).
 pub fn line_to_char_offset(content: &str, line: u32) -> Result<usize> {
     line_to_byte_offset(content, line).map(|b| byte_to_char_offset(content, b))

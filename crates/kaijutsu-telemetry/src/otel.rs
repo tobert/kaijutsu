@@ -243,7 +243,7 @@ pub(crate) fn context_root_span_impl(trace_id: &[u8; 16], name: &'static str) ->
 /// | `tool.*`     | 100% | Tool dispatch                            |
 /// | `drift.*`    | 100% | Cross-context operations                 |
 /// | `rpc.*`      | 10%  | High volume Cap'n Proto calls            |
-/// | `sync.*`     |  1%  | Very high volume CRDT ops                |
+/// | `sync.*`     |  1%  | Very high volume sync ops                |
 /// | errors       | 100% | Always capture failures                  |
 /// | other        | 10%  | Default for unclassified spans           |
 #[derive(Debug, Clone)]
@@ -322,7 +322,7 @@ fn sampling_rate(name: &str) -> f64 {
     } else if name.starts_with("rpc") {
         0.1 // 10% — rpc, rpc.request, rpc_client.* (high-volume Cap'n Proto)
     } else if name.starts_with("sync") {
-        0.01 // 1% — very high-volume CRDT ops
+        0.01 // 1% — very high-volume sync ops
     } else {
         0.1 // 10% default
     }
