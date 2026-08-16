@@ -13,6 +13,10 @@ line_gain = 40.0
 pixel_gain = 3.0
 
 # Exponential easing rate (per second) for smooth wheel scrolling; higher =
-# snappier glide. 45 tuned live with Amy (MX Master 3): a lone detent lands
-# in ~3 frames; 20 felt floaty/laggy, 60+ reads as a hard teleport.
-smooth_speed = 45.0
+# snappier glide. Applied as t = 1 - exp(-smooth_speed * dt), which is
+# frame-rate independent (see view::scroll::ease_t) — unlike the old
+# (dt * speed).min(1.0) form, splitting one frame into several doesn't change
+# the net motion. 83.18 = -60 * ln(0.25): it reproduces the t=0.75-at-60Hz
+# feel that 45.0 gave under the old (frame-rate-dependent) form, which is
+# where the original tuning-with-Amy (MX Master 3) session happened.
+smooth_speed = 83.18

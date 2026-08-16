@@ -2971,9 +2971,13 @@ lands, and give it a PRIMARY variant then.
 ## Input: block-step scroll lane — Shift+wheel jumps block-to-block (seeded 2026-07-18, scroll-feel work)
 
 The *continuous* scroll lane got made crisp (follow-mode deadzone fixed;
-high-res `Pixel` stream row-quantized via `quantize_step` +
-`PIXEL_QUANTUM_PX`; `ScrollConfig` two-gain per-client config). The
-*contextual* lane is the deferred half: **Shift+wheel steps by whole
+`ScrollConfig` two-gain per-client config). **Update 2026-08-16 (scroll-relief
+slice 0):** the row-quantization mentioned above (`quantize_step` +
+`PIXEL_QUANTUM_PX`, 20px logical quanta on the high-res `Pixel` lane) turned
+out to *be* a dead zone, not a crispness win — up to ~6.7 logical px of
+trackpad travel produced zero motion, then a 20px jump. Removed; `Pixel`
+events now pass the gained delta straight through. The *contextual* lane is
+still the deferred half: **Shift+wheel steps by whole
 blocks**, snapping a block top to the viewport — Amy's "zip / stop / skim /
 narrow-in" pattern wants to move by *meaning*, not pixels. Cheap: reuse the
 existing block-nav + `scroll_to_rect_visible` (`input/systems.rs:562`) and

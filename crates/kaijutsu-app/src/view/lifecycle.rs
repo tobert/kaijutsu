@@ -485,7 +485,10 @@ pub fn spawn_block_cells(
     let order_changed = container.resort_to_document_order(&current_blocks);
 
     if had_additions || had_removals || had_band_despawns || order_changed {
-        info!(
+        // debug!, not info!: this fires on most scroll frames (band
+        // membership churns as the viewport moves), and info-level here
+        // drowned the log during scroll-feel work.
+        debug!(
             "spawn_block_cells: additions={} removals={} band_despawns={} order_changed={} container_now={}",
             had_additions,
             had_removals,
