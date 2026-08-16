@@ -279,15 +279,13 @@ pub fn sync_main_cell_to_conversation(
         return;
     }
 
-    // `CellEditor.store` is a `kaijutsu_crdt::BlockStore` — the local render
-    // buffer every other view system already reads (block_border.rs,
-    // render.rs, diff_view, timeline, …), unchanged by this migration. The
-    // change-feed mirror holds plain `BlockSnapshot`s, not a CRDT, so this
-    // materializes them via `insert_from_snapshot` (the same "remote sync /
-    // restore" primitive the kernel and MCP use to load snapshots into a
-    // fresh store) instead of `BlockStore::from_snapshot`'s CRDT-snapshot
-    // round trip. `ContextMirror::blocks()` is already document order, so a
-    // plain left-to-right insert reproduces it.
+    // `CellEditor.store` is a `RenderBlockStore` (`view::render_store`) —
+    // the local render buffer every other view system already reads
+    // (block_border.rs, render.rs, diff_view, timeline, …). The change-feed
+    // mirror holds plain `BlockSnapshot`s, not a CRDT, so this materializes
+    // them via `insert_from_snapshot` into a fresh store.
+    // `ContextMirror::blocks()` is already document order, so a plain
+    // left-to-right insert reproduces it.
     //
     // The local principal's own compose draft (Lane C slice 3: an ordinary
     // `Status::Draft` block riding this same mirror) is skipped here — it
@@ -296,7 +294,7 @@ pub fn sync_main_cell_to_conversation(
     // alone deliberately: watching a neighbor type is a feature, not a bug
     // (see `block_border.rs`'s `Status::Draft` handling).
     let principal_id = editor.store.principal_id();
-    let mut store = kaijutsu_crdt::BlockStore::new(ctx_id, principal_id);
+    let mut store = crate::view::render_store::RenderBlockStore::new(ctx_id, principal_id);
     let mut after = None;
     let mut ok = true;
     for block in cached.mirror.blocks() {

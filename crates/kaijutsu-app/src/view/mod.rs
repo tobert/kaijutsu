@@ -35,6 +35,7 @@ pub mod lifecycle;
 pub mod overlay;
 pub mod patch_bay;
 pub mod render;
+pub mod render_store;
 pub mod role_divider;
 pub mod room;
 pub mod scene_geometry;

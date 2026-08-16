@@ -3,7 +3,7 @@
 #![allow(dead_code)] // Phase 3 infrastructure - not all used yet
 
 use bevy::prelude::*;
-use kaijutsu_crdt::BlockId;
+use kaijutsu_types::BlockId;
 
 // ============================================================================
 // TIMELINE STATE

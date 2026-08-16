@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use bevy::prelude::*;
 use kaijutsu_audio::{BeatRef, LocalBeat, RefDisposition, Slew, RENDER_FLUSH_MIME};
 use kaijutsu_client::ServerEvent;
-use kaijutsu_crdt::BlockId;
+use kaijutsu_types::BlockId;
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role, Status};
 
 use crate::connection::actor_plugin::ServerEventMessage;
@@ -585,7 +585,7 @@ pub fn sync_selected_card_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::BlockId;
+    use kaijutsu_types::BlockId;
     use kaijutsu_types::{PrincipalId, ToolKind, TrackId};
 
     fn ctx(n: u8) -> ContextId {

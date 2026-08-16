@@ -458,7 +458,7 @@ pub fn handle_navigate_blocks(
     // not it currently has an entity (the band respawns it as the scroll
     // catches up).
     use crate::view::geometry::RowKey;
-    let block_rows: Vec<(kaijutsu_crdt::BlockId, f32, f32)> = geom
+    let block_rows: Vec<(kaijutsu_types::BlockId, f32, f32)> = geom
         .rows()
         .iter()
         .filter_map(|row| match row.key {
@@ -653,7 +653,7 @@ pub fn handle_collapse_toggle(
         let thinking_blocks: Vec<_> = editor
             .blocks()
             .iter()
-            .filter(|b| matches!(b.kind, kaijutsu_crdt::BlockKind::Thinking))
+            .filter(|b| matches!(b.kind, kaijutsu_types::BlockKind::Thinking))
             .map(|b| b.id)
             .collect();
 
@@ -666,7 +666,7 @@ pub fn handle_collapse_toggle(
         let collapsed = editor
             .blocks()
             .iter()
-            .find(|b| matches!(b.kind, kaijutsu_crdt::BlockKind::Thinking))
+            .find(|b| matches!(b.kind, kaijutsu_types::BlockKind::Thinking))
             .map(|b| b.collapsed)
             .unwrap_or(false);
         info!(

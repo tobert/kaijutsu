@@ -235,7 +235,7 @@ pub enum RpcResultMessage {
     /// Cherry-pick completed.
     CherryPicked {
         success: bool,
-        new_block_id: Option<kaijutsu_crdt::BlockId>,
+        new_block_id: Option<kaijutsu_types::BlockId>,
         error: Option<String>,
     },
     /// Drift contexts list received (from periodic polling).

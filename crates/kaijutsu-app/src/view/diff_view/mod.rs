@@ -26,7 +26,7 @@
 
 use bevy::prelude::*;
 
-use kaijutsu_crdt::BlockId;
+use kaijutsu_types::BlockId;
 use kaijutsu_diff::{DiffCore, DiffIntent, limits::MAX_RENDER_BYTES};
 use kaijutsu_types::ContentType;
 
@@ -447,8 +447,8 @@ mod tests {
     use kaijutsu_diff::fixtures;
 
     fn block_id() -> BlockId {
-        use kaijutsu_crdt::PrincipalId;
-        BlockId::new(kaijutsu_crdt::ContextId::new(), PrincipalId::new(), 1)
+        use kaijutsu_types::PrincipalId;
+        BlockId::new(kaijutsu_types::ContextId::new(), PrincipalId::new(), 1)
     }
 
     fn session(content: &str, ct: ContentType) -> DiffViewSession {

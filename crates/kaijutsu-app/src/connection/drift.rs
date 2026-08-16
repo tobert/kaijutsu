@@ -7,7 +7,7 @@
 use bevy::prelude::*;
 
 use kaijutsu_client::{ContextInfo, StagedDriftInfo};
-use kaijutsu_crdt::BlockKind;
+use kaijutsu_types::BlockKind;
 use kaijutsu_types::ContextId;
 
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};

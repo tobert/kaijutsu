@@ -8,7 +8,7 @@ use std::thread;
 
 use bevy::prelude::*;
 use kaijutsu_client::{ActorHandle, SshConfig};
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use kaijutsu_types::KernelId;
 use tokio::sync::mpsc;
 

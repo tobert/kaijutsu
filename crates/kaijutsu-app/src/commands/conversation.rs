@@ -22,7 +22,7 @@ use crate::input::{Action, ActionFired};
 use crate::view::time_well::card::assign_placement;
 
 /// Ring-0 seat ids in seat order, from the same drift poll the well reads.
-fn active_ring(drift: &crate::connection::drift::DriftState) -> Vec<kaijutsu_crdt::ContextId> {
+fn active_ring(drift: &crate::connection::drift::DriftState) -> Vec<kaijutsu_types::ContextId> {
     // The well filters archived contexts before placement (sync.rs does the
     // same) — archived ids never hold a seat.
     let live: Vec<_> = drift

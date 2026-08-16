@@ -272,7 +272,7 @@ fn compute_border_style(
     has_result: bool,
     font_size: f32,
 ) -> Option<BlockBorderStyle> {
-    use kaijutsu_crdt::Status;
+    use kaijutsu_types::Status;
 
     // Padding scales with font size: block_border_padding is a multiplier.
     // This defines the clearance between the border stroke and text content.
@@ -577,7 +577,7 @@ fn apply_focus_style(
 mod tests {
     use super::*;
     use crate::view::components::LayoutGeneration;
-    use kaijutsu_crdt::{ContentType, Status};
+    use kaijutsu_types::{ContentType, Status};
 
     /// Minimal world for `determine_block_border_style`: a MainCell whose
     /// editor holds `n` plain user text blocks (borderless under the

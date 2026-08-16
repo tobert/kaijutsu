@@ -2183,8 +2183,8 @@ fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) 
             continue;
         }
         match b.status {
-            kaijutsu_crdt::Status::Running => running += 1,
-            kaijutsu_crdt::Status::Error => failed += 1,
+            kaijutsu_types::Status::Running => running += 1,
+            kaijutsu_types::Status::Error => failed += 1,
             _ => {}
         }
     }

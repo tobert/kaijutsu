@@ -129,7 +129,7 @@ pub fn event_bearing(ev: &ServerEvent) -> Option<(Bearing, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::BlockId;
+    use kaijutsu_types::BlockId;
     use kaijutsu_types::{ContextId, PrincipalId, Status};
 
     fn ctx(n: u8) -> ContextId {

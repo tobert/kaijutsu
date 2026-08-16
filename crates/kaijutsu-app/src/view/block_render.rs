@@ -1319,18 +1319,18 @@ pub fn sync_role_group_headers(
         }
 
         let color = match border.role {
-            kaijutsu_crdt::Role::User => theme.block_user,
-            kaijutsu_crdt::Role::Model => theme.block_assistant,
-            kaijutsu_crdt::Role::System => theme.fg_dim,
-            kaijutsu_crdt::Role::Tool | kaijutsu_crdt::Role::Asset => theme.block_tool_call,
+            kaijutsu_types::Role::User => theme.block_user,
+            kaijutsu_types::Role::Model => theme.block_assistant,
+            kaijutsu_types::Role::System => theme.fg_dim,
+            kaijutsu_types::Role::Tool | kaijutsu_types::Role::Asset => theme.block_tool_call,
         };
 
         let label = match border.role {
-            kaijutsu_crdt::Role::User => "USER",
-            kaijutsu_crdt::Role::Model => "ASSISTANT",
-            kaijutsu_crdt::Role::System => "SYSTEM",
-            kaijutsu_crdt::Role::Tool => "TOOL",
-            kaijutsu_crdt::Role::Asset => "ASSET",
+            kaijutsu_types::Role::User => "USER",
+            kaijutsu_types::Role::Model => "ASSISTANT",
+            kaijutsu_types::Role::System => "SYSTEM",
+            kaijutsu_types::Role::Tool => "TOOL",
+            kaijutsu_types::Role::Asset => "ASSET",
         };
 
         let height = size.y.max(crate::view::lifecycle::ROLE_HEADER_HEIGHT);
@@ -1931,8 +1931,8 @@ mod tests {
     }
 
     /// Test-only `BlockId` — the value is never inspected, only carried.
-    fn test_block_id() -> kaijutsu_crdt::BlockId {
-        kaijutsu_crdt::BlockId::new(kaijutsu_crdt::ContextId::new(), kaijutsu_crdt::PrincipalId::new(), 0)
+    fn test_block_id() -> kaijutsu_types::BlockId {
+        kaijutsu_types::BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::new(), 0)
     }
 
     // -- repaint_block_scenes_on_theme_change -------------------------------
@@ -2031,7 +2031,7 @@ mod tests {
     #[test]
     fn role_group_border_surface_gets_renderable_texture() {
         assert_surface_gets_renderable_texture(RoleGroupBorder {
-            role: kaijutsu_crdt::Role::User,
+            role: kaijutsu_types::Role::User,
             block_id: test_block_id(),
         });
     }

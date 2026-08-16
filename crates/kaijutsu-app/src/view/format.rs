@@ -4,7 +4,7 @@
 //! display strings. No ECS, no systems, just data transforms.
 
 use crate::ui::theme::Theme;
-use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role, Status};
+use kaijutsu_types::{BlockKind, BlockSnapshot, DriftKind, Role, Status};
 use kaijutsu_types::{ContextId, OutputData, OutputEntryType, OutputNode};
 
 /// Map a block to its semantic text color based on BlockKind and Role.

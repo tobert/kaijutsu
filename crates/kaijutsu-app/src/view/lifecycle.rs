@@ -539,7 +539,7 @@ pub fn sync_role_headers(
     // Live headers by the block id they precede. Also collect entries whose
     // geometry row vanished (role run dissolved) — those despawn regardless
     // of band.
-    let header_keys: std::collections::HashSet<kaijutsu_crdt::BlockId> = geom
+    let header_keys: std::collections::HashSet<kaijutsu_types::BlockId> = geom
         .rows()
         .iter()
         .filter_map(|row| match row.key {
@@ -548,7 +548,7 @@ pub fn sync_role_headers(
         })
         .collect();
 
-    let mut live: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+    let mut live: std::collections::HashMap<kaijutsu_types::BlockId, Entity> =
         std::collections::HashMap::new();
     let mut dead: Vec<Entity> = Vec::new();
     for &ent in &container.role_headers {
@@ -620,7 +620,7 @@ mod tests {
     use super::*;
     use crate::cell::ConversationContainer;
     use crate::ui::tiling::PaneFocus;
-    use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+    use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 
     /// A block cell's height is authoritative: `block_render` computes it
     /// and `view::render`'s virtualization spends it. The conversation
@@ -847,9 +847,9 @@ mod tests {
         for i in 0..n {
             let ent = app.world_mut().spawn_empty().id();
             container.add(
-                kaijutsu_crdt::BlockId::new(
-                    kaijutsu_crdt::ContextId::new(),
-                    kaijutsu_crdt::PrincipalId::new(),
+                kaijutsu_types::BlockId::new(
+                    kaijutsu_types::ContextId::new(),
+                    kaijutsu_types::PrincipalId::new(),
                     i as u64,
                 ),
                 ent,

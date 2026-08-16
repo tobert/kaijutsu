@@ -88,7 +88,7 @@ pub fn process_cherry_pick_requests(
         let target = request.target_context.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
-                let target_ctx_id = match kaijutsu_crdt::ContextId::parse(&target) {
+                let target_ctx_id = match kaijutsu_types::ContextId::parse(&target) {
                     Ok(id) => id,
                     Err(e) => {
                         let _ = tx.send(RpcResultMessage::CherryPicked {

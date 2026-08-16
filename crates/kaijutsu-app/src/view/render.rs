@@ -97,7 +97,7 @@ pub fn sync_block_cell_buffers(
         // effect and the measured height converges to the actual content.
         const DEBOUNCE_CHARS: usize = 200;
         const DEBOUNCE_MIN_SIZE: usize = 10_000;
-        if block.status == kaijutsu_crdt::Status::Running
+        if block.status == kaijutsu_types::Status::Running
             && text.len() > DEBOUNCE_MIN_SIZE
             && block_cell.last_text_len > 0
         {
@@ -111,8 +111,8 @@ pub fn sync_block_cell_buffers(
 
         // Rainbow effect for user text
         let rainbow = theme.font_rainbow
-            && block.kind == kaijutsu_crdt::BlockKind::Text
-            && block.role == kaijutsu_crdt::Role::User;
+            && block.kind == kaijutsu_types::BlockKind::Text
+            && block.role == kaijutsu_types::Role::User;
         if block_cell.last_rainbow != rainbow {
             commands
                 .entity(entity)
@@ -127,16 +127,16 @@ pub fn sync_block_cell_buffers(
         }
 
         // Rich content rendering for Text blocks from Model or Tool roles (markdown, sparklines, SVG)
-        let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text
+        let is_rich_candidate = block.kind == kaijutsu_types::BlockKind::Text
             && matches!(
                 block.role,
-                kaijutsu_crdt::Role::Model | kaijutsu_crdt::Role::Tool
+                kaijutsu_types::Role::Model | kaijutsu_types::Role::Tool
             );
         // ToolResult blocks with an explicit content_type (e.g. text/markdown from `kj help`)
         let is_typed_result =
-            block.kind == kaijutsu_crdt::BlockKind::ToolResult && block.content_type != kaijutsu_crdt::ContentType::Plain;
+            block.kind == kaijutsu_types::BlockKind::ToolResult && block.content_type != kaijutsu_types::ContentType::Plain;
         // Rich content for ToolResult blocks with structured OutputData
-        let is_output_candidate = block.kind == kaijutsu_crdt::BlockKind::ToolResult
+        let is_output_candidate = block.kind == kaijutsu_types::BlockKind::ToolResult
             && block.output.is_some()
             && !block.is_error;
 
@@ -147,7 +147,7 @@ pub fn sync_block_cell_buffers(
                 doc_version,
                 block.content_type,
                 Some(&svg_fontdb),
-                block.status == kaijutsu_crdt::Status::Running,
+                block.status == kaijutsu_types::Status::Running,
             )
         {
             // For sparklines and SVGs: clear text so Parley doesn't re-measure
@@ -173,7 +173,7 @@ pub fn sync_block_cell_buffers(
                 doc_version,
                 block.content_type,
                 Some(&svg_fontdb),
-                block.status == kaijutsu_crdt::Status::Running,
+                block.status == kaijutsu_types::Status::Running,
             )
         {
             commands.entity(entity).insert(rich);
@@ -387,8 +387,8 @@ pub fn update_block_cell_nodes(
 fn ordered_entities_from_rows(
     rows: &[GeomRow],
     container: &BlockCellContainer,
-    header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
-    mut on_missing_block: impl FnMut(&kaijutsu_crdt::BlockId),
+    header_map: &std::collections::HashMap<kaijutsu_types::BlockId, Entity>,
+    mut on_missing_block: impl FnMut(&kaijutsu_types::BlockId),
 ) -> Vec<Entity> {
     let mut ordered = Vec::with_capacity(rows.len());
 
@@ -420,10 +420,10 @@ fn ordered_entities_from_rows(
 pub fn compute_ordered_children(
     rows: &[GeomRow],
     container: &BlockCellContainer,
-    header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
+    header_map: &std::collections::HashMap<kaijutsu_types::BlockId, Entity>,
     top_spacer: Entity,
     bottom_spacer: Entity,
-    on_missing_block: impl FnMut(&kaijutsu_crdt::BlockId),
+    on_missing_block: impl FnMut(&kaijutsu_types::BlockId),
 ) -> Vec<Entity> {
     let mut ordered_children = Vec::with_capacity(rows.len() + 2);
     ordered_children.push(top_spacer);
@@ -527,7 +527,7 @@ pub fn reorder_conversation_children(
     };
     *last_gen = layout_gen.0;
 
-    let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+    let mut header_map: std::collections::HashMap<kaijutsu_types::BlockId, Entity> =
         std::collections::HashMap::new();
     for &header_ent in &container.role_headers {
         if let Ok(header) = role_headers.get(header_ent) {
@@ -661,7 +661,7 @@ pub fn readback_block_heights(
         return;
     };
 
-    let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+    let mut header_map: std::collections::HashMap<kaijutsu_types::BlockId, Entity> =
         std::collections::HashMap::new();
     for &header_ent in &container.role_headers {
         if let Ok(header) = role_header_query.get(header_ent) {
@@ -904,7 +904,7 @@ pub fn virtualize_conversation(
         return;
     };
 
-    let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+    let mut header_map: std::collections::HashMap<kaijutsu_types::BlockId, Entity> =
         std::collections::HashMap::new();
     for &header_ent in &container.role_headers {
         if let Ok(header) = role_header_query.get(header_ent) {
@@ -977,7 +977,7 @@ pub fn virtualize_conversation(
 mod tests {
     use super::*;
     use crate::cell::SpacerEdge;
-    use kaijutsu_crdt::{BlockId, BlockKind, ContextId, PrincipalId, Role};
+    use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, Role};
 
     fn test_block_id(seq: u64) -> BlockId {
         BlockId::new(ContextId::new(), PrincipalId::new(), seq)
@@ -1212,7 +1212,7 @@ mod tests {
     // (component hooks), not a plugin, so `add_child`/`replace_children`
     // work without DefaultPlugins.
 
-    use kaijutsu_crdt::{ContentType, Status};
+    use kaijutsu_types::{ContentType, Status};
 
     fn build_test_app() -> App {
         let mut app = App::new();

@@ -24,7 +24,7 @@
 use bevy::prelude::*;
 use std::collections::HashMap;
 
-use kaijutsu_crdt::{BlockId, BlockKind, Role};
+use kaijutsu_types::{BlockId, BlockKind, Role};
 
 /// Identity of a geometry row: a block, or the role header shown before it.
 ///
@@ -526,7 +526,7 @@ pub fn plan_header_band(
 
 /// Build a [`RowSeed`] from a block snapshot — the only place block content
 /// is read for geometry, and it runs once per new row.
-fn row_seed(snapshot: kaijutsu_crdt::BlockSnapshot) -> RowSeed {
+fn row_seed(snapshot: kaijutsu_types::BlockSnapshot) -> RowSeed {
     RowSeed {
         text_len: snapshot.content.len(),
         newline_count: snapshot.content.matches('\n').count(),
@@ -615,7 +615,7 @@ pub fn sync_conversation_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::{ContextId, PrincipalId};
+    use kaijutsu_types::{ContextId, PrincipalId};
 
     fn bid(seq: u64) -> BlockId {
         // Fixed context/principal so ids are stable within a test.

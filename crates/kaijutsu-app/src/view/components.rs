@@ -5,18 +5,20 @@
 
 use bevy::prelude::*;
 
-// Re-export CRDT types for convenience
-pub use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, DriftKind, Role, Status};
+// Re-export vocabulary types for convenience
+pub use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, DriftKind, Role, Status};
 pub use kaijutsu_types::{ContextId, PrincipalId};
 
-/// Session-scoped agent identity for CRDT operations.
+use crate::view::render_store::RenderBlockStore;
+
+/// Session-scoped agent identity.
 ///
 /// Created once at startup, reused for the `CellEditor` render buffer's
-/// local `BlockStore`, and — since Lane C slice 3 — for finding this
+/// local `RenderBlockStore`, and — since Lane C slice 3 — for finding this
 /// principal's own compose draft among the ordinary blocks in a context's
 /// `ContextMirror` (`DocumentEntry::draft_text`). Without this, each frame
-/// or context switch would generate a fresh PrincipalId, fragmenting CRDT
-/// authorship and wasting DTE agent slots.
+/// or context switch would generate a fresh PrincipalId, fragmenting block
+/// authorship.
 #[derive(Resource)]
 pub struct SessionPrincipal(pub PrincipalId);
 
@@ -71,20 +73,20 @@ impl BlockCursor {
 
 /// Text editor state for a cell.
 ///
-/// The `store` field (BlockStore) is the local editor buffer — one DTE instance
-/// per block, matching the server's native format.
-/// Synced content arrives via `DocumentCache` (a `ContextMirror` per context,
-/// docs/change-feed.md — plain `BlockSnapshot`s, no CRDT) and is materialized
-/// into this editor's BlockStore via `insert_from_snapshot`
+/// The `store` field is a `RenderBlockStore` (`view::render_store`) — the
+/// local render buffer for this cell's blocks. Synced content arrives via
+/// `DocumentCache` (a `ContextMirror` per context, docs/change-feed.md —
+/// plain `BlockSnapshot`s, no CRDT) and is materialized into this editor's
+/// store via `insert_from_snapshot`
 /// (`view::sync::sync_main_cell_to_conversation`).
 ///
-/// Note: Not reflectable due to BlockStore lacking Default.
+/// Note: Not reflectable due to `RenderBlockStore` lacking Default.
 /// Use query filters to find CellEditor entities instead of BRP inspection.
 #[derive(Component)]
 #[allow(dead_code)]
 pub struct CellEditor {
-    /// Block store - local editor buffer (per-block DTE).
-    pub store: kaijutsu_crdt::BlockStore,
+    /// Block store - local render buffer.
+    pub store: RenderBlockStore,
 
     /// Cursor position within the document.
     pub cursor: BlockCursor,
@@ -100,7 +102,7 @@ impl CellEditor {
     /// Create a new editor with a random agent ID.
     pub fn new() -> Self {
         Self {
-            store: kaijutsu_crdt::BlockStore::new(ContextId::new(), PrincipalId::new()),
+            store: RenderBlockStore::new(ContextId::new(), PrincipalId::new()),
             cursor: BlockCursor::default(),
         }
     }
@@ -774,7 +776,7 @@ pub struct BlockCell {
     pub last_text_len: usize,
     /// Last known block status for border dirty detection.
     /// Status changes (Running→Done) affect border kind/animation.
-    pub last_status: kaijutsu_crdt::Status,
+    pub last_status: kaijutsu_types::Status,
     /// Last known rainbow effect state for change detection.
     pub last_rainbow: bool,
 }
@@ -785,7 +787,7 @@ impl BlockCell {
             block_id,
             last_render_version: None,
             last_text_len: 0,
-            last_status: kaijutsu_crdt::Status::Running,
+            last_status: kaijutsu_types::Status::Running,
             last_rainbow: false,
         }
     }
@@ -896,7 +898,7 @@ pub struct BlockCellLayout {
 #[derive(Component, Debug, Clone)]
 pub struct RoleGroupBorder {
     /// The role this header represents.
-    pub role: kaijutsu_crdt::Role,
+    pub role: kaijutsu_types::Role,
     /// The block ID this header precedes (for layout positioning).
     pub block_id: BlockId,
 }
