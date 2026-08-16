@@ -6,6 +6,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Error stub polish: dedupe summary-vs-detail, cap wrapped height (2026-08-16)
+
+First light of the collapsed error stub (`view/format.rs` error arm) showed
+two refinements: (a) stream errors carry a `detail` that starts with the same
+text as the summary (`block.content`), so the stub renders the message twice —
+skip leading detail lines identical(-ish) to the summary; (b) the stub cap
+counts *source* lines, so one long line still wraps to ~5 screen lines — add
+a char budget alongside the line budget. Shot:
+`~/archive/kaijutsu-shots/2026-08-16-error-stub-first-light.png`.
+
 ## vi input editor stopped repainting after a small in-place edit (found 2026-08-16, live on moltar)
 
 Amy was editing a typo ("rost" → "rest") in the compose-block vi input.
