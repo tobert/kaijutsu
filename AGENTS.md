@@ -19,6 +19,13 @@ one owner, no host file, no write-through; embedded defaults under
 <path>` restores one to its embedded default. Change the shipped default by editing
 `assets/defaults/rc/` (the in-repo seed). See `docs/config-crdt-ownership.md`.
 
+**Config is different from rc, as of 2026-08-15: just write the file.**
+`/etc/config`, `/etc/client` and `/etc/midi` are ordinary write surfaces for
+the file tools and the editor — there is no `kj config set`/`edit` and no
+`config-write` capability on them. `kj config` keeps only what has no file-tool
+equivalent: `list`, `show`, and `reset` (restore the embedded default). `/etc/rc`
+stays gated by `rc-write` because rc is executable rather than data.
+
 *Migration in flight:* rc/config are stored as CRDT documents today and are being
 melted toward plain files. **Single kernel ownership is the invariant that
 survives the change** — whatever the storage, config must never have two
