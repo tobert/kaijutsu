@@ -147,6 +147,27 @@ async fn handle_conn(mut stream: tokio::net::UnixStream, tx: mpsc::UnboundedSend
                         // unknown vocabulary is the frame parser's business.
                         continue;
                     };
+                    // Fail closed on the framing version. `parse_line` is
+                    // deliberately lenient about `msgV` and hands the check
+                    // to whoever acts on the frame (see `frame::parse_line`'s
+                    // docs) — the inbox is that actor. Delivering a frame
+                    // whose `msgV` we have never seen (or that omits it) is
+                    // how a protocol bump turns into silent misparse, so it
+                    // is dropped here and loudly, not passed up for a caller
+                    // to guess about. `msgV` and the descriptor's
+                    // `peerProtocol` are the two version fields this crate
+                    // checks; both fail closed (see the crate docs).
+                    if user.msg_v != Some(crate::SUPPORTED_MSG_V) {
+                        tracing::warn!(
+                            target: "claude-code-peer",
+                            msg_v = ?user.msg_v,
+                            supported = crate::SUPPORTED_MSG_V,
+                            "dropping inbound user frame with unsupported msgV \
+                             (fail-closed); re-probe the protocol before \
+                             trusting this sender"
+                        );
+                        continue;
+                    }
                     let message = ReceivedMessage {
                         msg_v: user.msg_v,
                         msg_id: user.msg_id,
@@ -279,5 +300,53 @@ mod tests {
             .unwrap()
             .expect("inbox open");
         assert_eq!(msg.envelope.unwrap().body(), "still alive");
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_msg_v_is_dropped_not_delivered() {
+        // The fail-closed half of the two-version-field promise: the inbox
+        // must refuse framing versions it has never seen (and a missing
+        // msgV), while a supported frame on the same connection still
+        // arrives. Delivering the unknown version is the silent-misparse
+        // this check exists to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inbox = Inbox::bind(&tmp.path().join("inboxes"), "peer.sock").expect("bind");
+        let path = inbox.path().to_string_lossy().into_owned();
+
+        let future_frame = format!(
+            "{{\"msgV\":2,\"msg_id\":\"{}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"from the future\"}},\"priority\":\"next\"}}",
+            uuid::Uuid::new_v4()
+        );
+        let versionless_frame = format!(
+            "{{\"msg_id\":\"{}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"no version\"}},\"priority\":\"next\"}}",
+            uuid::Uuid::new_v4()
+        );
+        let prepared = crate::client::prepare("kaijutsu", "supported frame", None).unwrap();
+        tokio::task::spawn_blocking(move || {
+            crate::client::deliver(
+                &path,
+                &[future_frame, versionless_frame, prepared.user_frame.clone()],
+            )
+        })
+        .await
+        .unwrap()
+        .expect("deliver");
+
+        // Exactly one message survives the filter — the supported one.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), inbox.recv())
+            .await
+            .unwrap()
+            .expect("inbox open");
+        assert_eq!(msg.msg_v, Some(crate::SUPPORTED_MSG_V));
+        assert_eq!(msg.envelope.unwrap().body(), "supported frame");
+
+        // And nothing else is coming: the unsupported frames were dropped,
+        // not queued behind it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), inbox.recv())
+                .await
+                .is_err(),
+            "no further message may arrive — unsupported msgV frames are dropped"
+        );
     }
 }

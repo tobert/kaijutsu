@@ -169,10 +169,11 @@ struct WireFrame {
 ///
 /// Fail-closed on the parts that matter: a line that is not JSON, a frame
 /// with no `type`, or a `user` frame missing its `content` all error. A
-/// `user` frame whose `msgV` disagrees with [`SUPPORTED_MSG_V`] parses —
-/// and the caller is expected to refuse it — because silently accepting a
-/// framing version we have never seen is how a protocol bump turns into
-/// corruption.
+/// `user` frame whose `msgV` disagrees with [`SUPPORTED_MSG_V`] still parses
+/// — the version check belongs to whoever acts on the frame, and this crate's
+/// own actor ([`crate::server::Inbox`]) refuses it there, dropping the frame
+/// loudly — because silently accepting a framing version we have never seen
+/// is how a protocol bump turns into corruption.
 pub fn parse_line(line: &str) -> Result<Incoming, Error> {
     let wire: WireFrame = serde_json::from_str(line)
         .map_err(|e| Error::Frame(format!("line is not JSON: {e}")))?;

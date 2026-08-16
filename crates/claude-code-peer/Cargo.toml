@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 # `time` beyond the workspace set: the inbox's tests bound their waits. In
 # full-workspace builds tokio/time is already unified in transitively.
 tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
