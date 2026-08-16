@@ -2,7 +2,7 @@
 //!
 //! DAG-native block model with parent/child relationships, role tracking, and
 //! status management. This module provides the *target* types that replace
-//! string-based identifiers in the current `kaijutsu-crdt::block`.
+//! string-based identifiers in the current `kaijutsu_kernel::blocks::block_store`.
 //!
 //! ## Design: BlockKind + ToolKind + DriftKind
 //!
@@ -349,7 +349,7 @@ pub enum ContentType {
 impl ContentType {
     /// LWW merge tiebreak authority for `ContentType`.
     ///
-    /// `BlockHeader::merge_header` (kaijutsu-crdt `content.rs`) resolves a
+    /// `BlockHeader::merge_header` (`kaijutsu_kernel::blocks::content`) resolves a
     /// concurrent `content_type` write at equal Lamport timestamps by keeping
     /// whichever value is greater under `Ord` — and `Ord` for `ContentType` is
     /// defined entirely in terms of this rank (see the manual `impl Ord`
@@ -3107,7 +3107,7 @@ mod tests {
 
     /// `Ord` must agree with `richness()` in both directions, not just the
     /// ascending-list spot check above — this is what `field_wins` in
-    /// `kaijutsu-crdt` actually calls on a merge tie.
+    /// `kaijutsu_kernel::blocks::content` actually calls on a merge tie.
     #[test]
     fn content_type_ord_matches_richness_both_directions() {
         let all = [

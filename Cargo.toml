@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/kaijutsu-types",
     "crates/kaijutsu-editor",
-    "crates/kaijutsu-crdt",
     "crates/kaijutsu-diff",
     "crates/kaijutsu-kernel",
     "crates/kaijutsu-client",
@@ -51,7 +50,6 @@ kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
 kaijutsu-viz = { path = "crates/kaijutsu-viz" }
 kaijutsu-types = { path = "crates/kaijutsu-types" }
 kaijutsu-editor = { path = "crates/kaijutsu-editor" }
-kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
 kaijutsu-diff = { path = "crates/kaijutsu-diff" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }

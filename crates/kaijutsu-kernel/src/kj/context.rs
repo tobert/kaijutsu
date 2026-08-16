@@ -2429,11 +2429,11 @@ mod tests {
                 ctx,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "seed".to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap();
@@ -2484,11 +2484,11 @@ mod tests {
                 ctx,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "seed".to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap();
@@ -2521,18 +2521,18 @@ mod tests {
                 ctx,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "seed".to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap();
         let c = caller_with_context(ctx);
 
         // Parseable BlockId, but never inserted into this context.
-        let phantom = kaijutsu_crdt::BlockId::new(ctx, PrincipalId::new(), 9999).to_key();
+        let phantom = kaijutsu_types::BlockId::new(ctx, PrincipalId::new(), 9999).to_key();
         let r = d
             .dispatch(
                 &[s("context"), s("hydrate"), s("--window"), s("4"), s("--mark"), s(&phantom)],
@@ -3106,11 +3106,11 @@ mod tests {
                 target,
                 None,
                 None,
-                kaijutsu_crdt::Role::Tool,
-                kaijutsu_crdt::BlockKind::ToolResult,
+                kaijutsu_types::Role::Tool,
+                kaijutsu_types::BlockKind::ToolResult,
                 String::new(),
-                kaijutsu_crdt::Status::Running,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Running,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap();
@@ -4304,11 +4304,11 @@ mod tests {
                 ctx,
                 None,
                 None,
-                kaijutsu_crdt::Role::System,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Text,
                 "You are a terse test stance.".to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Markdown,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Markdown,
                 Some(principal),
             )
             .unwrap();
@@ -4371,11 +4371,11 @@ mod tests {
                     ctx,
                     None,
                     None,
-                    kaijutsu_crdt::Role::System,
-                    kaijutsu_crdt::BlockKind::Text,
+                    kaijutsu_types::Role::System,
+                    kaijutsu_types::BlockKind::Text,
                     marker.to_string(),
-                    kaijutsu_crdt::Status::Done,
-                    kaijutsu_crdt::ContentType::Markdown,
+                    kaijutsu_types::Status::Done,
+                    kaijutsu_types::ContentType::Markdown,
                     Some(principal),
                 )
                 .unwrap();

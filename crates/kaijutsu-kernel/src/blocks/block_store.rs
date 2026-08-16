@@ -8,11 +8,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::content::{BlockContent, base62_encode_padded, order_key_successor, order_midpoint};
-use crate::selection::IntervalSet;
-use crate::{
-    BlockHeader, BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, DriftKind,
-    MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, TaskStatus, Tick, ToolKind,
+use super::content::{BlockContent, base62_encode_padded, order_key_successor, order_midpoint};
+use super::error::CrdtError;
+use super::selection::IntervalSet;
+use super::Result;
+use kaijutsu_types::{
+    BlockHeader, BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, ContextId,
+    DriftKind, MAX_DAG_DEPTH, PrincipalId, Role, Status, TaskStatus, Tick, ToolKind,
 };
 
 /// Filter criteria for selective block inclusion during fork.
@@ -29,7 +31,7 @@ pub struct ForkBlockFilter {
     pub exclude_block_ids: HashSet<String>,
     /// Positional keep-set over the order_key-sorted, non-deleted,
     /// before-`before_timestamp` snapshot at the fork instant — the interval
-    /// selection (`kept = (base ∩ ∪inc) \ ∪exc`, see `crate::selection` and
+    /// selection (`kept = (base ∩ ∪inc) \ ∪exc`, see `super::selection` and
     /// `docs/fork-filters.md`). `None` keeps every position; the predicate
     /// excludes above still apply on top. Positions are resolved upstream
     /// (preset + CLI ranges + include-invariant check), so applying it here is
@@ -62,7 +64,7 @@ impl ForkBlockFilter {
 
 /// Collection of blocks.
 ///
-/// Each block owns its content as a plain `String` (see `crate::content` for
+/// Each block owns its content as a plain `String` (see `super::content` for
 /// why no per-block CRDT is needed). Metadata lives in `BlockHeader` (plain
 /// data). Ordering uses fractional indexing.
 ///
@@ -394,10 +396,10 @@ impl BlockStore {
         let bytes = self.principal_id.as_bytes();
         // Use bytes 10-13 (random portion of UUIDv7, not the timestamp prefix)
         // to maximize entropy and minimize suffix collisions between agents.
-        let c1 = crate::content::BASE62[(bytes[10] as usize) % 62] as char;
-        let c2 = crate::content::BASE62[(bytes[11] as usize) % 62] as char;
-        let c3 = crate::content::BASE62[(bytes[12] as usize) % 62] as char;
-        let c4 = crate::content::BASE62[(bytes[13] as usize) % 62] as char;
+        let c1 = super::content::BASE62[(bytes[10] as usize) % 62] as char;
+        let c2 = super::content::BASE62[(bytes[11] as usize) % 62] as char;
+        let c3 = super::content::BASE62[(bytes[12] as usize) % 62] as char;
+        let c4 = super::content::BASE62[(bytes[13] as usize) % 62] as char;
         format!("{c1}{c2}{c3}{c4}")
     }
 
@@ -1683,7 +1685,7 @@ impl BlockStore {
         for id in &snapshot.deleted_blocks {
             store.observe_seq(id.principal_id, id.seq);
             if !store.blocks.contains_key(id) {
-                let snap = crate::BlockSnapshotBuilder::new(*id, crate::BlockKind::Text)
+                let snap = BlockSnapshotBuilder::new(*id, BlockKind::Text)
                     .build();
                 let mut block = BlockContent::from_snapshot(&snap, principal_id, "Z".to_string());
                 block.mark_deleted(0);
@@ -1860,7 +1862,7 @@ mod tests {
     fn old_shape_store_snapshot_with_block_history_still_decodes() {
         let ctx = ContextId::new();
         let id = BlockId::new(ctx, PrincipalId::new(), 0);
-        let snap = crate::BlockSnapshotBuilder::new(id, BlockKind::Text)
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
             .content("hello")
             .build();
         let old = OldStoreSnapshotMimic {
@@ -1882,7 +1884,7 @@ mod tests {
 
     /// Measure the block-insert hot path at coder scale (append-only, the way a
     /// coding session grows). Run with:
-    ///   cargo test -p kaijutsu-crdt bench_append_hot_path -- --ignored --nocapture
+    ///   cargo test -p kaijutsu-kernel bench_append_hot_path -- --ignored --nocapture
     /// This is the budget a hyoushigi `Tick` (an O(1) counter bump) would be added
     /// against — and it exposes the pre-existing O(N log N) `calc_order_key` cost.
     #[test]
@@ -2080,10 +2082,10 @@ mod tests {
             )
             .unwrap();
 
-        crate::content::reset_text_call_count();
+        crate::blocks::content::reset_text_call_count();
         let statuses = store.statuses_ordered();
         assert_eq!(
-            crate::content::text_call_count(),
+            crate::blocks::content::text_call_count(),
             0,
             "statuses_ordered() must never call BlockContent::text()"
         );
@@ -2092,10 +2094,10 @@ mod tests {
         // Positive control: prove the counter actually observes text()
         // materialization, so the zero above is meaningful and not just an
         // inert counter.
-        crate::content::reset_text_call_count();
+        crate::blocks::content::reset_text_call_count();
         let snaps = store.blocks_ordered();
         assert_eq!(
-            crate::content::text_call_count(),
+            crate::blocks::content::text_call_count(),
             snaps.len(),
             "blocks_ordered() calls text() exactly once per live block"
         );
@@ -2614,7 +2616,7 @@ mod tests {
         let mut store = test_store();
         let (ctx, prin) = (store.context_id(), store.principal_id());
         let ticked = |seq: u64, tick: i64| {
-            crate::BlockSnapshotBuilder::new(BlockId::new(ctx, prin, seq), BlockKind::Text)
+            BlockSnapshotBuilder::new(BlockId::new(ctx, prin, seq), BlockKind::Text)
                 .tick(Tick::new(tick))
                 .content(format!("beat-{tick}"))
                 .build()
@@ -2648,7 +2650,7 @@ mod tests {
         let mut store = test_store();
         let (ctx, prin) = (store.context_id(), store.principal_id());
         let ticked = |seq: u64| {
-            crate::BlockSnapshotBuilder::new(BlockId::new(ctx, prin, seq), BlockKind::Text)
+            BlockSnapshotBuilder::new(BlockId::new(ctx, prin, seq), BlockKind::Text)
                 .tick(Tick::new(7))
                 .content(format!("note-{seq}"))
                 .build()
@@ -4557,7 +4559,7 @@ mod tests {
         tick: i64,
     ) -> BlockSnapshot {
         let key = format!("V{}AAAA", base62_encode_padded(tick, 11));
-        crate::BlockSnapshotBuilder::new(BlockId::new(ctx, principal, seq), BlockKind::Text)
+        BlockSnapshotBuilder::new(BlockId::new(ctx, principal, seq), BlockKind::Text)
             .tick(Tick::new(tick))
             .order_key(key)
             .content(format!("beat-{tick}"))
@@ -4810,7 +4812,7 @@ mod tests {
 
         // Merge a new block WITHOUT a canonical order_key.
         let foreign = PrincipalId::new();
-        let keyless = crate::BlockSnapshotBuilder::new(
+        let keyless = BlockSnapshotBuilder::new(
             BlockId::new(ctx, foreign, 0),
             BlockKind::Text,
         )

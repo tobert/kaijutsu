@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::BlockId;
+use kaijutsu_types::BlockId;
 
 /// Errors that can occur during CRDT operations.
 #[derive(Error, Debug)]

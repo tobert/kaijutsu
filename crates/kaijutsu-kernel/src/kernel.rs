@@ -1070,7 +1070,7 @@ impl Kernel {
         context_id: kaijutsu_types::ContextId,
         payload: Vec<u8>,
         played_by: kaijutsu_types::PrincipalId,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<kaijutsu_crdt::BlockId, String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<kaijutsu_types::BlockId, String>>> {
         let tx = self.beat_ingress.get()?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let request = crate::hyoushigi::BeatRequest::CommitCapture {
@@ -1445,7 +1445,7 @@ impl Kernel {
     pub fn editor_reconcile_block(
         &self,
         context_id: kaijutsu_types::ContextId,
-        block_id: kaijutsu_crdt::BlockId,
+        block_id: kaijutsu_types::BlockId,
         blocks: &crate::block_store::SharedBlockStore,
     ) {
         let changed = self
@@ -1942,7 +1942,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
@@ -1989,7 +1989,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::{BlockId, ContextId, PrincipalId};
+        use kaijutsu_types::{BlockId, ContextId, PrincipalId};
         use std::path::Path;
 
         fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {
@@ -2057,7 +2057,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
@@ -2105,7 +2105,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::{ContextId, PrincipalId};
+        use kaijutsu_types::{ContextId, PrincipalId};
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
@@ -2162,7 +2162,7 @@ mod tests {
         use crate::kj::test_helpers::{
             install_rc_script_file, register_context, test_dispatcher_crdt_rc,
         };
-        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_types::PrincipalId;
         use kaijutsu_types::SessionId;
 
         let d = Arc::new(test_dispatcher_crdt_rc().await);
@@ -2210,7 +2210,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
@@ -2256,7 +2256,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;

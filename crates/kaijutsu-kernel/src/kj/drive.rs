@@ -150,10 +150,10 @@ impl KjDispatcher {
                     target,
                     None,
                     Some(&tail),
-                    kaijutsu_crdt::Role::User,
-                    kaijutsu_crdt::BlockKind::Text,
+                    kaijutsu_types::Role::User,
+                    kaijutsu_types::BlockKind::Text,
                     prompt.to_string(),
-                    kaijutsu_crdt::Status::Done,
+                    kaijutsu_types::Status::Done,
                     ContentType::Plain,
                     Some(caller.principal_id),
                 ) {
@@ -224,11 +224,11 @@ mod tests {
                 ctx,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "seed".to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap();
@@ -407,8 +407,8 @@ mod tests {
         assert_eq!(blocks.len(), before + 1, "one seed block appended");
         let seed = blocks.last().unwrap();
         assert_eq!(seed.content, "go", "seed block carries the prompt");
-        assert_eq!(seed.role, kaijutsu_crdt::Role::User, "seed is the user turn");
-        assert_eq!(seed.kind, kaijutsu_crdt::BlockKind::Text);
+        assert_eq!(seed.role, kaijutsu_types::Role::User, "seed is the user turn");
+        assert_eq!(seed.kind, kaijutsu_types::BlockKind::Text);
         assert_eq!(
             seed.id.principal_id, c.principal_id,
             "seed authored by the driving caller"

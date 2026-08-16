@@ -898,7 +898,7 @@ mod tests {
         use crate::file_tools::FileDocumentCache;
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
-        use kaijutsu_crdt::{BlockId, ContextId};
+        use kaijutsu_types::{BlockId, ContextId};
         use std::sync::Arc;
 
         fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {

@@ -18,7 +18,7 @@ use crate::block_tools::translate::{
     content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
     line_to_char_offset, validate_expected_text,
 };
-use kaijutsu_crdt::{BlockId, BlockKind, ContentType, Role, Status};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status};
 use kaijutsu_types::ContextId;
 use kaijutsu_cas::ContentStore;
 use crate::execution::{ExecContext, ExecResult};

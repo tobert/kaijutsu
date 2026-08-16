@@ -1,6 +1,5 @@
-//! Block-based document model for Kaijutsu.
-//!
-//! # Architecture
+//! Block/document model — one context's blocks, their content, order keys,
+//! and tombstones.
 //!
 //! `BlockStore` is the storage model: each block owns its content as a plain
 //! `String`. Metadata lives in `BlockHeader` (plain data).
@@ -11,11 +10,12 @@
 //! state and the wire") and the CRDT never earned its keep past what it
 //! materialized down to anyway. See `docs/crdt-position-2026-08.md`.
 //!
-//! The legacy `BlockDocument` model (a single shared DTE Document with all
-//! blocks addressed as paths within it) was removed 2026-08-09, before this
-//! retirement — see `docs/crdt-position-2026-08.md` for the position review
-//! that found it dead weight, with its only outside consumer down to a
-//! single test.
+//! This module used to be a standalone crate. It moved in-tree 2026-08-16:
+//! once the CRDT was gone, the crate held no dependency the kernel didn't
+//! already have, and its exported abstractions (blocks, forks, selection)
+//! are meaningful only over the wire the kernel serves — not at a
+//! `Cargo.toml` boundary. See CLAUDE.md "Durable state and the wire" and
+//! `docs/crdt-position-2026-08.md`.
 //!
 //! # Block Types
 //!
@@ -33,31 +33,20 @@ pub(crate) mod content;
 mod error;
 pub mod selection;
 
-// Re-export types from kaijutsu-types
-pub use kaijutsu_types::{
-    BlockFilter, BlockHeader, BlockId, BlockKind, BlockMetadata, BlockQuery, BlockSnapshot,
-    BlockSnapshotBuilder, ContentType, ContextId, ConversationDAG, DriftKind, ErrorCategory,
-    ErrorPayload, ErrorSeverity, ErrorSpan, KernelId, LogLevel, MAX_DAG_DEPTH, NotificationKind,
-    NotificationPayload, OutputData, OutputEntryType, OutputNode, PrefixError, PrefixResolvable,
-    PrincipalId, ResourcePayload, Role, SessionId, Span, Status, TaskStatus, Tick, TickDelta,
-    ToolKind, resolve_context_prefix,
-};
-
-// New architecture
 pub use block_store::{BlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit};
+pub use content::BlockContent;
+pub use error::CrdtError;
 pub use selection::{
     IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
 };
-pub use content::BlockContent;
 
-pub use error::CrdtError;
-
-/// Result type for CRDT operations.
+/// Result type for block-store operations.
 pub type Result<T> = std::result::Result<T, CrdtError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaijutsu_types::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
 
     fn test_store() -> BlockStore {
         BlockStore::new(ContextId::new(), PrincipalId::new())

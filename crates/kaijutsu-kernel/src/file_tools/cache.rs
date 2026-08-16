@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 use parking_lot::RwLock;
 
 use crate::block_store::SharedBlockStore;

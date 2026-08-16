@@ -20,7 +20,7 @@ use common::{connect_client, run_local, start_server, start_server_with_mock_llm
 use kaijutsu_client::{
     ContextMirror, FeedEvent, KernelHandle, RpcClient, context_feed_channel,
 };
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, Status};
 
 /// Every block in the context, in document order.

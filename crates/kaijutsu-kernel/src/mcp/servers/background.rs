@@ -192,7 +192,7 @@ impl McpServerLike for BackgroundServer {
                 let entry = registry.get_for_context(id, ctx.context_id).ok_or_else(|| {
                     McpError::Protocol(format!("no background process {} in this context", p.id))
                 })?;
-                let block_id = kaijutsu_crdt::BlockId::from_key(&entry.block_id).ok_or_else(|| {
+                let block_id = kaijutsu_types::BlockId::from_key(&entry.block_id).ok_or_else(|| {
                     McpError::Protocol(format!(
                         "background process {} has a malformed block id: {}",
                         p.id, entry.block_id
@@ -321,7 +321,7 @@ mod tests {
     use crate::mcp::binding::{Capability, ContextToolBinding};
     use crate::mcp::servers::ShellServer;
     use crate::mcp::{InstancePolicy, KernelCallParams};
-    use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+    use kaijutsu_types::{BlockKind, ContentType, Role, Status};
     use kaijutsu_types::{DocKind, PrincipalId, SessionId};
 
     async fn wired() -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
@@ -498,7 +498,7 @@ mod tests {
             .background_processes()
             .get_for_context(BackgroundId::parse(&bg_id).unwrap(), ctx_id)
             .expect("entry");
-        let block_id = kaijutsu_crdt::BlockId::from_key(&entry.block_id).unwrap();
+        let block_id = kaijutsu_types::BlockId::from_key(&entry.block_id).unwrap();
         let real = d
             .block_store()
             .get_block_snapshot(ctx_id, &block_id)

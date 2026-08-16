@@ -120,7 +120,7 @@ Named constructors: `text()`, `thinking()`, `tool_call()`, `tool_result()`,
 
 ## Per-Crate Migration Status
 
-### kaijutsu-crdt — done
+### kaijutsu-kernel::blocks (formerly a standalone CRDT crate) — done
 
 - [x] Depends on kaijutsu-types, re-exports all block/ID/enum types
 - [x] `block.rs` is a thin re-export module

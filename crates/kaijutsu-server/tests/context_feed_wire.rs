@@ -23,7 +23,7 @@ use common::{connect_client, run_local, start_server};
 use kaijutsu_client::{
     ContextChange, ContextMirror, FeedEvent, KernelHandle, context_feed_channel,
 };
-use kaijutsu_crdt::{ContextId, PrincipalId, Role};
+use kaijutsu_types::{ContextId, PrincipalId, Role};
 use kaijutsu_types::{BlockId, BlockQuery};
 use tokio::sync::mpsc::Receiver;
 

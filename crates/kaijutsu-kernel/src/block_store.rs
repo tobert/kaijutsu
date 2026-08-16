@@ -1,10 +1,10 @@
-//! Block-based storage using kaijutsu-crdt.
+//! Block-based storage using `crate::blocks`.
 //!
-//! Each document wraps a `kaijutsu_crdt::block_store::BlockStore` (each block's
-//! content is a plain `String` — see `kaijutsu_crdt::content`'s module doc).
-//! The durable oplog journals a `SyncPayload` per mutation and replays it on
-//! restart; nothing multi-writer merges through it (CLAUDE.md "Durable state
-//! and the wire" — the kernel is the sole sequencer).
+//! Each document wraps a `crate::blocks::block_store::BlockStore` (each
+//! block's content is a plain `String` — see `crate::blocks::content`'s
+//! module doc). The durable oplog journals a `SyncPayload` per mutation and
+//! replays it on restart; nothing multi-writer merges through it (CLAUDE.md
+//! "Durable state and the wire" — the kernel is the sole sequencer).
 //!
 //! # Concurrency Model
 //!
@@ -19,15 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use kaijutsu_crdt::block_store::{
+use crate::blocks::{
     BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit,
-};
-use kaijutsu_crdt::{
-    BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, TaskStatus, ToolKind,
 };
 use kaijutsu_types::codec;
 use kaijutsu_types::{BlockFilter, BlockQuery};
-use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
+use kaijutsu_types::{
+    BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, DocKind, PrincipalId, Role, Status,
+    TaskStatus, Tick, ToolKind, WorkspaceId,
+};
 
 use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
 use crate::kernel_db::{DocumentRow, KernelDb, KernelDbError};
@@ -58,7 +58,7 @@ pub enum BlockStoreError {
     EmptyDraft(ContextId),
 
     #[error(transparent)]
-    Crdt(#[from] kaijutsu_crdt::CrdtError),
+    Crdt(#[from] crate::blocks::CrdtError),
 
     #[error("database error: {0}")]
     Db(String),
@@ -1615,8 +1615,8 @@ impl BlockStore {
     /// Move a block to a new position.
     ///
     /// `after` is the block to land after, or `None` to land at the beginning.
-    /// Wraps the CRDT primitive (kaijutsu-crdt move_block) with FlowBus
-    /// emission (`BlockFlow::Moved`) and journaling so peers receive ops.
+    /// Wraps the block-store primitive (`crate::blocks::BlockStore::move_block`)
+    /// with FlowBus emission (`BlockFlow::Moved`) and journaling so peers receive ops.
     pub fn move_block(
         &self,
         context_id: ContextId,
@@ -2099,7 +2099,7 @@ impl BlockStore {
         // Measuring the before-length here would materialize the whole block a
         // SECOND time per streamed token. Not a second time in place of none:
         // `BlockContent::append_text` already materializes it once to find the
-        // end (kaijutsu-crdt/src/content.rs), which is a real per-token O(n)
+        // end (`blocks/content.rs`), which is a real per-token O(n)
         // this classification neither causes nor cures — it is filed in
         // docs/issues.md and belongs in the text engine. What this avoids is
         // doubling it. `append_emits_exact_suffix` pins the by-construction
@@ -2753,7 +2753,7 @@ impl BlockStore {
         content: impl Into<String>,
         source_context: ContextId,
         source_model: Option<String>,
-        drift_kind: kaijutsu_crdt::DriftKind,
+        drift_kind: kaijutsu_types::DriftKind,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
@@ -3576,7 +3576,7 @@ mod tests {
 
         // Insert blocks carrying ticks; max_tick reports the high-water.
         for t in [0i64, 3, 1] {
-            let snap = kaijutsu_crdt::BlockSnapshotBuilder::new(
+            let snap = kaijutsu_types::BlockSnapshotBuilder::new(
                 BlockId::new(ctx, player, store.reserve_block_id(ctx, player).unwrap().seq),
                 BlockKind::Text,
             )

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
-use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use kaijutsu_types::DocKind;
 
 use crate::block_store::SharedBlockStore;
@@ -249,7 +249,7 @@ impl ConfigCrdtFs {
 
     fn insert_block(
         &self,
-        ctx: kaijutsu_crdt::ContextId,
+        ctx: kaijutsu_types::ContextId,
         text: &str,
     ) -> Result<(), String> {
         self.blocks
@@ -747,7 +747,7 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store_with_db;
     use crate::kernel_db::KernelDb;
-    use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_types::PrincipalId;
     use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
     use std::sync::Arc;
 

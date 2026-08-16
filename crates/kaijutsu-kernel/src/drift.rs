@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use kaijutsu_crdt::{
+use kaijutsu_types::{
     BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix,
 };
 use kaijutsu_types::{ContextState, PrincipalId};
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn test_build_distillation_prompt_basic() {
-        use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::BlockId;
         use kaijutsu_types::PrincipalId;
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn test_build_distillation_prompt_with_directed_focus() {
-        use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::BlockId;
         use kaijutsu_types::PrincipalId;
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
@@ -1187,7 +1187,7 @@ mod tests {
 
     #[test]
     fn test_build_distillation_prompt_truncates_long_blocks() {
-        use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::BlockId;
         use kaijutsu_types::{PrincipalId, ToolKind};
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_build_distillation_prompt_skips_empty() {
-        use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::BlockId;
         use kaijutsu_types::PrincipalId;
         let ctx = ContextId::new();
         let agent = PrincipalId::new();

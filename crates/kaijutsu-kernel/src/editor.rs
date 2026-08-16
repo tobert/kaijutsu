@@ -29,7 +29,7 @@
 //! work (`docs/config-crdt-ownership.md`) deleted by construction. So the branch
 //! is the whole point. See `docs/vi.md` ("Path resolution").
 
-use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::{PrincipalId, SessionId};
 #[cfg(test)]
 use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
@@ -719,7 +719,7 @@ mod tests {
     use crate::kernel_db::KernelDb;
     use crate::runtime::config_crdt_fs::ConfigCrdtFs;
     use crate::vfs::VfsOps as _;
-    use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_types::PrincipalId;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -862,7 +862,7 @@ mod session_tests {
     use crate::kernel_db::KernelDb;
     use crate::runtime::config_crdt_fs::ConfigCrdtFs;
     use crate::vfs::{MountTable, VfsOps as _};
-    use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_types::PrincipalId;
     use std::path::Path;
     use std::sync::Arc;
 

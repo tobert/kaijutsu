@@ -30,7 +30,6 @@ include_dir = { workspace = true }
 clap = { workspace = true }
 
 # Block store
-kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-editor.workspace = true
 kaijutsu-cas.workspace = true

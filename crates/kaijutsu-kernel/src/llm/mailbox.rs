@@ -85,7 +85,7 @@ fn hydration_keep_set(
     // is a canonical (sorted, disjoint, merged) keep-set; `plan_splice` owns the
     // order-dependent cut hygiene (snapping, tool-pairs, archived-gap seams).
     let marker_idx = marker.and_then(|m| blocks.iter().position(|b| b.id == m));
-    kaijutsu_crdt::window_base(blocks.len(), marker_idx, window).into_runs()
+    crate::blocks::window_base(blocks.len(), marker_idx, window).into_runs()
 }
 
 impl ConversationMailbox {
@@ -316,7 +316,7 @@ mod tests {
 
     // ── hydration_keep_set: the order-free `window` runs ──────────────────
     //
-    // These pin the keep-set *producer* — now `kaijutsu_crdt::window_base`, the
+    // These pin the keep-set *producer* — now `crate::blocks::window_base`, the
     // shape shared with the fork side. It returns a canonical (merged) set, so
     // an overlapping prefix/tail collapses here rather than in the splicer; the
     // wire result is identical either way. Cut hygiene — snapping, tool-pairs,

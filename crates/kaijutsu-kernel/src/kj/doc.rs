@@ -16,7 +16,7 @@
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
-use kaijutsu_crdt::{BlockId, BlockKind as CrdtBlockKind, ConversationDAG};
+use kaijutsu_types::{BlockId, BlockKind as CrdtBlockKind, ConversationDAG};
 use kaijutsu_types::{ContentType, ContextId, DocKind};
 use serde::Serialize;
 
@@ -472,7 +472,7 @@ impl PreservingRecord for KjResult {
 //
 // Inlined rather than imported so kj doesn't depend on kaijutsu-mcp.
 // When we factor out a shared tree-format helper (likely into
-// kaijutsu-crdt where ConversationDAG lives), both consumers swap to it.
+// kaijutsu-types where ConversationDAG lives), both consumers swap to it.
 
 fn format_dag_node(
     dag: &ConversationDAG,

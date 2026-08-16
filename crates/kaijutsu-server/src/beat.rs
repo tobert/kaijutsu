@@ -34,7 +34,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use kaijutsu_crdt::BlockId;
+use kaijutsu_types::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::{BlockFlow, TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::hyoushigi::{
@@ -4096,8 +4096,8 @@ mod tests {
         ctx: ContextId,
         player: PrincipalId,
         abc: &str,
-    ) -> kaijutsu_crdt::BlockId {
-        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+    ) -> kaijutsu_types::BlockId {
+        use kaijutsu_types::{BlockKind, ContentType, Role, Status};
         documents
             .insert_block_as(
                 ctx,
@@ -4120,7 +4120,7 @@ mod tests {
     /// The output block id is carried explicitly (§7) — no blind last-block read.
     #[tokio::test]
     async fn completed_turn_schedules_one_phrase_ahead() {
-        use kaijutsu_crdt::Role;
+        use kaijutsu_types::Role;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
@@ -4276,7 +4276,7 @@ mod tests {
                 .block_snapshots(score)
                 .unwrap()
                 .iter()
-                .filter(|b| b.role == kaijutsu_crdt::Role::Asset)
+                .filter(|b| b.role == kaijutsu_types::Role::Asset)
                 .count()
         }
 
@@ -4301,7 +4301,7 @@ mod tests {
     ///   - a real player Model block → scheduled.
     #[tokio::test]
     async fn materialized_abc_is_not_rescheduled_on_turn_completed() {
-        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+        use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 
         let phrase = BeatPolicy {
             period: Duration::from_secs(1),
@@ -4332,13 +4332,13 @@ mod tests {
         //   the `b.track.is_some()` guard we hand `on_turn_completed` a track-bearing
         //   block placed in the producer's own doc directly (the case the guard defends).
         {
-            use kaijutsu_crdt::BlockSnapshotBuilder;
+            use kaijutsu_types::BlockSnapshotBuilder;
             let (kernel, documents) = fresh_kernel_and_docs().await;
             let ctx = ContextId::new();
             documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
             let player = PrincipalId::new();
             let seq = documents.reserve_block_id(ctx, player).unwrap().seq;
-            let track_bearing = kaijutsu_crdt::BlockId::new(ctx, player, seq);
+            let track_bearing = kaijutsu_types::BlockId::new(ctx, player, seq);
             let snap = BlockSnapshotBuilder::new(track_bearing, BlockKind::Text)
                 .role(Role::Model)
                 .content("X:1\nK:C\nCDEF|\n")
@@ -4454,7 +4454,7 @@ mod tests {
     /// block at the offending output block so the player reads its own rejection.
     #[tokio::test]
     async fn schedule_failure_surfaces_error_block() {
-        use kaijutsu_crdt::BlockKind;
+        use kaijutsu_types::BlockKind;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
@@ -4520,7 +4520,7 @@ mod tests {
     /// timeline must NOT re-seed (seed lands inside `or_insert_with`, virgin-only).
     #[tokio::test]
     async fn arm_seeds_playhead_from_max_committed_tick() {
-        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder};
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
@@ -4822,7 +4822,7 @@ mod tests {
     /// re-emitted (no duplicate score, no DuplicateBlock).
     #[tokio::test]
     async fn attach_rehydrates_committed_from_persisted_score() {
-        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder, Role};
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, Role};
 
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
         let track = TrackId::new("bass").unwrap();
@@ -4939,7 +4939,7 @@ mod tests {
     /// carry; the clock is on the track now).
     #[tokio::test]
     async fn committed_max_tick_wins_over_stale_persisted_track_playhead() {
-        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder};
 
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
 
@@ -5079,7 +5079,7 @@ mod tests {
         ctx: ContextId,
         count: u64,
     ) -> Vec<u64> {
-        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder};
         let mut seqs = Vec::new();
         for i in 0..count {
             let seq = documents.reserve_block_id(ctx, PrincipalId::beat()).unwrap().seq;
@@ -5109,7 +5109,7 @@ mod tests {
     /// holds through the real materialize barrier, not just at the store level.
     #[tokio::test]
     async fn track_lane_seq_seeds_from_block_log_no_duplicate_after_rearm() {
-        use kaijutsu_crdt::BlockKind;
+        use kaijutsu_types::BlockKind;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
@@ -5196,7 +5196,7 @@ mod tests {
     /// exactly two Error blocks across the run; advancing further adds none.
     #[tokio::test]
     async fn resolve_failure_surfaces_error_block() {
-        use kaijutsu_crdt::BlockKind;
+        use kaijutsu_types::BlockKind;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
@@ -5252,7 +5252,7 @@ mod tests {
     /// claim (the rest is the existing invariants).
     #[tokio::test]
     async fn two_producers_failures_route_to_their_own_conversations() {
-        use kaijutsu_crdt::BlockKind;
+        use kaijutsu_types::BlockKind;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let a = ContextId::new();
@@ -5353,7 +5353,7 @@ mod tests {
     /// skips it AND emits exactly one Error block (deduped — the skip happens once).
     #[tokio::test]
     async fn poison_cell_skip_surfaces_error_block() {
-        use kaijutsu_crdt::BlockKind;
+        use kaijutsu_types::BlockKind;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
@@ -5458,12 +5458,12 @@ mod tests {
     /// the musician's lane as `track`.
     #[tokio::test]
     async fn on_turn_completed_skips_materialized_blocks() {
-        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+        use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 
         // — Case A: a track-bearing block (what materialization stamps) is refused.
         //   Materialized blocks live in the score context now, so we place the guard's
         //   target — a track-bearing block — directly in the producer's own doc.
-        use kaijutsu_crdt::BlockSnapshotBuilder;
+        use kaijutsu_types::BlockSnapshotBuilder;
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
@@ -5473,7 +5473,7 @@ mod tests {
         let score = sched.score_context(&TrackId::solo());
         let player_a = PrincipalId::new();
         let seq_a = documents.reserve_block_id(ctx, player_a).unwrap().seq;
-        let track_bearing = kaijutsu_crdt::BlockId::new(ctx, player_a, seq_a);
+        let track_bearing = kaijutsu_types::BlockId::new(ctx, player_a, seq_a);
         let snap_a = BlockSnapshotBuilder::new(track_bearing, BlockKind::Text)
             .role(Role::Model)
             .content("X:1\nK:C\nCDEF|\n")
@@ -5812,7 +5812,7 @@ mod tests {
     /// restart "thin attaches first, thick attaches later" wedge gemini flagged).
     #[tokio::test]
     async fn thick_context_attach_bumps_a_lagging_track_playhead() {
-        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder};
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let thin = ContextId::new();
         documents.create_document(thin, DocumentKind::Conversation, None).unwrap();

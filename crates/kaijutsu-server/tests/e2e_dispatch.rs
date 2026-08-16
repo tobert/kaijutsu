@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use kaijutsu_crdt::{ContextId, PrincipalId};
+use kaijutsu_types::{ContextId, PrincipalId};
 use kaijutsu_kernel::{Kernel, LocalBackend, shared_block_store};
 use kaish_kernel::ExecuteOptions;
 use kaijutsu_server::EmbeddedKaish;

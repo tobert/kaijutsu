@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Status};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, Status};
 use kaijutsu_types::{BlockEventFilter, BlockFlowKind, ContextId, PrincipalId};
 
 // ============================================================================
@@ -1663,7 +1663,7 @@ pub fn shared_editor_flow_bus(capacity: usize) -> SharedEditorFlowBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::Role;
+    use kaijutsu_types::Role;
     use kaijutsu_types::PrincipalId;
 
     // ====================================================================

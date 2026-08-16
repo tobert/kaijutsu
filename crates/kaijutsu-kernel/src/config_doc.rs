@@ -14,7 +14,7 @@
 //!
 //! [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
 
-use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::DocKind;
 
 use crate::block_store::SharedBlockStore;

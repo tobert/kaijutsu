@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock as TokioRwLock;
 
-use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::llm::stream::{
@@ -44,7 +44,7 @@ use crate::rpc::{ConversationCache, SharedKernelState};
 fn insert_pre_stream_error_block(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    after_block_id: &kaijutsu_crdt::BlockId,
+    after_block_id: &kaijutsu_types::BlockId,
     detail: &str,
 ) {
     let payload = kaijutsu_types::ErrorPayload {
@@ -98,7 +98,7 @@ const CONTEXT_WARNING_THRESHOLD: f64 = 0.9;
 fn warn_if_near_context_window(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    after_block_id: &kaijutsu_crdt::BlockId,
+    after_block_id: &kaijutsu_types::BlockId,
     messages: &[LlmMessage],
     provider_name: &str,
     model_name: &str,
@@ -140,11 +140,11 @@ fn warn_if_near_context_window(
         context_id,
         None,
         Some(after_block_id),
-        kaijutsu_crdt::Role::System,
-        kaijutsu_crdt::BlockKind::Trace,
+        kaijutsu_types::Role::System,
+        kaijutsu_types::BlockKind::Trace,
         detail,
-        kaijutsu_crdt::Status::Done,
-        kaijutsu_crdt::ContentType::Plain,
+        kaijutsu_types::Status::Done,
+        kaijutsu_types::ContentType::Plain,
         Some(PrincipalId::system()),
     ) {
         log::warn!("Failed to insert context-size warning Trace block: {e}");
@@ -169,13 +169,13 @@ fn warn_if_near_context_window(
 fn hydrate_messages(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    after_block_id: &kaijutsu_crdt::BlockId,
+    after_block_id: &kaijutsu_types::BlockId,
     mailbox: &mut kaijutsu_kernel::ConversationMailbox,
     // The hydration window policy `(marker, window)`, or `None` to hydrate the
     // whole history (the default; every non-musician context). When set, the
     // turn hydrates only `[0, marker] ∪ last-window` — the cost guard for
     // endless musician logs (design: docs/chameleon.md).
-    policy: Option<(kaijutsu_crdt::BlockId, u32)>,
+    policy: Option<(kaijutsu_types::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     let read = documents.block_snapshots(context_id);
     handle_hydration_outcome(documents, context_id, after_block_id, read, mailbox, policy)
@@ -190,10 +190,10 @@ fn hydrate_messages(
 fn handle_hydration_outcome(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    after_block_id: &kaijutsu_crdt::BlockId,
-    read: kaijutsu_kernel::BlockStoreResult<Vec<kaijutsu_crdt::BlockSnapshot>>,
+    after_block_id: &kaijutsu_types::BlockId,
+    read: kaijutsu_kernel::BlockStoreResult<Vec<kaijutsu_types::BlockSnapshot>>,
     mailbox: &mut kaijutsu_kernel::ConversationMailbox,
-    policy: Option<(kaijutsu_crdt::BlockId, u32)>,
+    policy: Option<(kaijutsu_types::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     match read {
         Ok(blocks) => {
@@ -273,7 +273,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     kernel: &SharedKernelState,
     context_id: ContextId,
     model: Option<&str>,
-    after_block_id: &kaijutsu_crdt::BlockId,
+    after_block_id: &kaijutsu_types::BlockId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     user_principal_id: PrincipalId,
     // Who asked for this turn. Rides onto the `TurnFlow` outcome the stream
@@ -329,11 +329,11 @@ pub(crate) async fn spawn_llm_for_prompt(
                     context_id,
                     None,
                     Some(after_block_id),
-                    kaijutsu_crdt::Role::System,
-                    kaijutsu_crdt::BlockKind::Text,
+                    kaijutsu_types::Role::System,
+                    kaijutsu_types::BlockKind::Text,
                     "Context is in staging mode. Use `kj stage commit` to go live.",
-                    kaijutsu_crdt::Status::Done,
-                    kaijutsu_crdt::ContentType::Plain,
+                    kaijutsu_types::Status::Done,
+                    kaijutsu_types::ContentType::Plain,
                     Some(PrincipalId::system()),
                 )
                 .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
@@ -989,7 +989,7 @@ async fn dispatch_and_map_tool_result(
 async fn dispatch_inline_tool_result(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    last_block_id: &mut kaijutsu_crdt::BlockId,
+    last_block_id: &mut kaijutsu_types::BlockId,
     kernel: &Arc<Kernel>,
     tool_name: &str,
     input: serde_json::Value,
@@ -1153,7 +1153,7 @@ async fn process_llm_stream(
     kernel: Arc<Kernel>,
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     tools: Vec<ToolDefinition>,
-    after_block_id: kaijutsu_crdt::BlockId,
+    after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
     // The context's resolved cast-seat tunables (`resolve_context_model`),
@@ -1308,7 +1308,7 @@ async fn process_llm_stream(
     // crystallizes that exact block (design §7). `None` until the model emits
     // text (a tool-only turn, an interrupt before any text, or a hard error all
     // leave it `None`); a `None` Completed schedules nothing downstream.
-    let mut output_block_id: Option<kaijutsu_crdt::BlockId> = None;
+    let mut output_block_id: Option<kaijutsu_types::BlockId> = None;
     // How this turn ends, as the structured reason the tail publishes on
     // `TurnFlow::Completed`. Every `break` out of the agentic loop sets it
     // first — a cancel, an iteration cap, and a token-ceiling truncation are
@@ -1489,13 +1489,13 @@ async fn process_llm_stream(
         };
 
         // Process stream events
-        let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
+        let mut current_block_id: Option<kaijutsu_types::BlockId> = None;
         // Collect tool calls for this iteration
         let mut tool_calls: Vec<(String, String, serde_json::Value, TypesToolKind)> = vec![]; // (id, name, input, tool_kind)
         // Track tool_use_id → BlockId mapping for CRDT
         let mut tool_call_blocks: std::collections::HashMap<
             String,
-            Option<kaijutsu_crdt::BlockId>,
+            Option<kaijutsu_types::BlockId>,
         > = std::collections::HashMap::new();
         // Collect text output for conversation history
         let mut assistant_text = String::new();
@@ -2811,7 +2811,7 @@ mod publish_tests {
         // missing document is what we are exercising.
         let ctx = ContextId::new();
         let player = PrincipalId::new();
-        let after = kaijutsu_crdt::BlockId::new(ctx, player, 0);
+        let after = kaijutsu_types::BlockId::new(ctx, player, 0);
 
         let provider = Arc::new(Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n")));
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
@@ -3260,7 +3260,7 @@ mod usage_tests {
 
         let player = PrincipalId::new();
 
-        let mut last: Option<kaijutsu_crdt::BlockId> = None;
+        let mut last: Option<kaijutsu_types::BlockId> = None;
         for i in 0..pre_seed_blocks {
             let id = documents
                 .insert_block_as(

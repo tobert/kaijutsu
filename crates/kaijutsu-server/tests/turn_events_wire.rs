@@ -25,7 +25,7 @@ use common::{connect_client, run_local, start_server_with_mock_llm};
 use kaijutsu_client::{
     KernelHandle, ServerEvent, TurnCompletedStopReason, TurnOrigin, turn_events_channel,
 };
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use kaijutsu_types::{BlockKind, BlockQuery, Role};
 
 /// Drain the turn push channel until a terminal event for `context` arrives.

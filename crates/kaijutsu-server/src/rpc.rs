@@ -77,7 +77,7 @@ use crate::interrupt::ContextInterruptState;
 use crate::kaijutsu_capnp::*;
 use crate::llm_stream::spawn_llm_for_prompt;
 
-use kaijutsu_crdt::{BlockKind, ContentType, Role, Status, TaskStatus};
+use kaijutsu_types::{BlockKind, ContentType, Role, Status, TaskStatus};
 // `derive_context_live_status` moved to kaijutsu-kernel (single source of
 // truth shared with `BlockStore::live_status`'s incremental cache); only
 // `live_status_tests` below still exercises it directly, so the import is
@@ -8209,7 +8209,7 @@ async fn execute_shell_command(
     user_initiated: bool,
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
-) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
+) -> Result<kaijutsu_types::BlockId, capnp::Error> {
     // Materialize a single-use context shell seeded from L1 (durable env + cwd).
     // No caching: transient scope evaporates when this instance drops, so the
     // context's durable state only ever changes through `kj context set`.
@@ -8529,7 +8529,7 @@ struct ExecutedKj {
     exit_code: i32,
     stdout: String,
     stderr: String,
-    command_block_id: kaijutsu_crdt::BlockId,
+    command_block_id: kaijutsu_types::BlockId,
     latch: Option<ExecutedKjLatch>,
 }
 
@@ -8658,12 +8658,12 @@ mod kj_rpc_tests {
 /// Parse a BlockId from a Cap'n Proto BlockId reader (binary format).
 fn parse_block_id_from_reader(
     reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
-) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
+) -> Result<kaijutsu_types::BlockId, capnp::Error> {
     let context_id = ContextId::try_from_slice(reader.get_context_id()?)
         .ok_or_else(|| capnp::Error::failed("invalid context_id in BlockId".into()))?;
     let principal_id = PrincipalId::try_from_slice(reader.get_principal_id()?)
         .ok_or_else(|| capnp::Error::failed("invalid principal_id in BlockId".into()))?;
-    Ok(kaijutsu_crdt::BlockId {
+    Ok(kaijutsu_types::BlockId {
         context_id,
         principal_id,
         seq: reader.get_seq(),
@@ -8673,7 +8673,7 @@ fn parse_block_id_from_reader(
 /// Set BlockId fields on a Cap'n Proto builder (binary format).
 pub(crate) fn set_block_id_builder(
     builder: &mut crate::kaijutsu_capnp::block_id::Builder,
-    block_id: &kaijutsu_crdt::BlockId,
+    block_id: &kaijutsu_types::BlockId,
 ) {
     builder.set_context_id(block_id.context_id.as_bytes());
     builder.set_principal_id(block_id.principal_id.as_bytes());
@@ -8707,7 +8707,7 @@ fn turn_origin_to_capnp(origin: TurnOrigin) -> crate::kaijutsu_capnp::TurnOrigin
 /// Set BlockSnapshot fields on a Cap'n Proto builder.
 pub(crate) fn set_block_snapshot(
     builder: &mut crate::kaijutsu_capnp::block_snapshot::Builder,
-    block: &kaijutsu_crdt::BlockSnapshot,
+    block: &kaijutsu_types::BlockSnapshot,
 ) {
     // Set ID
     {
@@ -8726,11 +8726,11 @@ pub(crate) fn set_block_snapshot(
 
     // Set role
     builder.set_role(match block.role {
-        kaijutsu_crdt::Role::User => crate::kaijutsu_capnp::Role::User,
-        kaijutsu_crdt::Role::Model => crate::kaijutsu_capnp::Role::Model,
-        kaijutsu_crdt::Role::System => crate::kaijutsu_capnp::Role::System,
-        kaijutsu_crdt::Role::Tool => crate::kaijutsu_capnp::Role::Tool,
-        kaijutsu_crdt::Role::Asset => crate::kaijutsu_capnp::Role::Asset,
+        kaijutsu_types::Role::User => crate::kaijutsu_capnp::Role::User,
+        kaijutsu_types::Role::Model => crate::kaijutsu_capnp::Role::Model,
+        kaijutsu_types::Role::System => crate::kaijutsu_capnp::Role::System,
+        kaijutsu_types::Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+        kaijutsu_types::Role::Asset => crate::kaijutsu_capnp::Role::Asset,
     });
 
     // Set status
@@ -8738,17 +8738,17 @@ pub(crate) fn set_block_snapshot(
 
     // Set kind
     builder.set_kind(match block.kind {
-        kaijutsu_crdt::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
-        kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
-        kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-        kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
-        kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
-        kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
-        kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
-        kaijutsu_crdt::BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
-        kaijutsu_crdt::BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
-        kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
-        kaijutsu_crdt::BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
+        kaijutsu_types::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+        kaijutsu_types::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+        kaijutsu_types::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+        kaijutsu_types::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+        kaijutsu_types::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+        kaijutsu_types::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+        kaijutsu_types::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+        kaijutsu_types::BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
+        kaijutsu_types::BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
+        kaijutsu_types::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+        kaijutsu_types::BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
     });
 
     // Set basic fields (no author — derived from id.principal_id)
@@ -8863,23 +8863,23 @@ pub(crate) fn set_block_snapshot(
         if let Some(sk) = payload.source_kind {
             ep.set_has_source_kind(true);
             ep.set_source_kind(match sk {
-                kaijutsu_crdt::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
-                kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
-                kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-                kaijutsu_crdt::BlockKind::ToolResult => {
+                kaijutsu_types::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                kaijutsu_types::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                kaijutsu_types::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                kaijutsu_types::BlockKind::ToolResult => {
                     crate::kaijutsu_capnp::BlockKind::ToolResult
                 }
-                kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
-                kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
-                kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
-                kaijutsu_crdt::BlockKind::Notification => {
+                kaijutsu_types::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+                kaijutsu_types::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+                kaijutsu_types::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+                kaijutsu_types::BlockKind::Notification => {
                     crate::kaijutsu_capnp::BlockKind::Notification
                 }
-                kaijutsu_crdt::BlockKind::Resource => {
+                kaijutsu_types::BlockKind::Resource => {
                     crate::kaijutsu_capnp::BlockKind::Resource
                 }
-                kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
-                kaijutsu_crdt::BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
+                kaijutsu_types::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+                kaijutsu_types::BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
             });
         }
     }
@@ -8890,28 +8890,28 @@ pub(crate) fn set_block_snapshot(
         let mut np = builder.reborrow().init_notification_payload();
         np.set_instance(&payload.instance);
         np.set_kind(match payload.kind {
-            kaijutsu_crdt::NotificationKind::ToolAdded => {
+            kaijutsu_types::NotificationKind::ToolAdded => {
                 crate::kaijutsu_capnp::NotificationKind::ToolAdded
             }
-            kaijutsu_crdt::NotificationKind::ToolRemoved => {
+            kaijutsu_types::NotificationKind::ToolRemoved => {
                 crate::kaijutsu_capnp::NotificationKind::ToolRemoved
             }
-            kaijutsu_crdt::NotificationKind::Log => crate::kaijutsu_capnp::NotificationKind::Log,
-            kaijutsu_crdt::NotificationKind::PromptsChanged => {
+            kaijutsu_types::NotificationKind::Log => crate::kaijutsu_capnp::NotificationKind::Log,
+            kaijutsu_types::NotificationKind::PromptsChanged => {
                 crate::kaijutsu_capnp::NotificationKind::PromptsChanged
             }
-            kaijutsu_crdt::NotificationKind::Coalesced => {
+            kaijutsu_types::NotificationKind::Coalesced => {
                 crate::kaijutsu_capnp::NotificationKind::Coalesced
             }
         });
         if let Some(level) = payload.level {
             np.set_has_level(true);
             np.set_level(match level {
-                kaijutsu_crdt::LogLevel::Trace => crate::kaijutsu_capnp::LogLevel::Trace,
-                kaijutsu_crdt::LogLevel::Debug => crate::kaijutsu_capnp::LogLevel::Debug,
-                kaijutsu_crdt::LogLevel::Info => crate::kaijutsu_capnp::LogLevel::Info,
-                kaijutsu_crdt::LogLevel::Warn => crate::kaijutsu_capnp::LogLevel::Warn,
-                kaijutsu_crdt::LogLevel::Error => crate::kaijutsu_capnp::LogLevel::Error,
+                kaijutsu_types::LogLevel::Trace => crate::kaijutsu_capnp::LogLevel::Trace,
+                kaijutsu_types::LogLevel::Debug => crate::kaijutsu_capnp::LogLevel::Debug,
+                kaijutsu_types::LogLevel::Info => crate::kaijutsu_capnp::LogLevel::Info,
+                kaijutsu_types::LogLevel::Warn => crate::kaijutsu_capnp::LogLevel::Warn,
+                kaijutsu_types::LogLevel::Error => crate::kaijutsu_capnp::LogLevel::Error,
             });
         }
         if !payload.tools.is_empty() {
@@ -8963,29 +8963,29 @@ pub(crate) fn set_block_snapshot(
 
 /// Convert a CRDT ErrorCategory to Cap'n Proto.
 fn error_category_to_capnp(
-    cat: kaijutsu_crdt::ErrorCategory,
+    cat: kaijutsu_types::ErrorCategory,
 ) -> crate::kaijutsu_capnp::ErrorCategory {
     match cat {
-        kaijutsu_crdt::ErrorCategory::Tool => crate::kaijutsu_capnp::ErrorCategory::Tool,
-        kaijutsu_crdt::ErrorCategory::Stream => crate::kaijutsu_capnp::ErrorCategory::Stream,
-        kaijutsu_crdt::ErrorCategory::Rpc => crate::kaijutsu_capnp::ErrorCategory::Rpc,
-        kaijutsu_crdt::ErrorCategory::Render => crate::kaijutsu_capnp::ErrorCategory::Render,
-        kaijutsu_crdt::ErrorCategory::Parse => crate::kaijutsu_capnp::ErrorCategory::Parse,
-        kaijutsu_crdt::ErrorCategory::Validation => {
+        kaijutsu_types::ErrorCategory::Tool => crate::kaijutsu_capnp::ErrorCategory::Tool,
+        kaijutsu_types::ErrorCategory::Stream => crate::kaijutsu_capnp::ErrorCategory::Stream,
+        kaijutsu_types::ErrorCategory::Rpc => crate::kaijutsu_capnp::ErrorCategory::Rpc,
+        kaijutsu_types::ErrorCategory::Render => crate::kaijutsu_capnp::ErrorCategory::Render,
+        kaijutsu_types::ErrorCategory::Parse => crate::kaijutsu_capnp::ErrorCategory::Parse,
+        kaijutsu_types::ErrorCategory::Validation => {
             crate::kaijutsu_capnp::ErrorCategory::Validation
         }
-        kaijutsu_crdt::ErrorCategory::Kernel => crate::kaijutsu_capnp::ErrorCategory::Kernel,
+        kaijutsu_types::ErrorCategory::Kernel => crate::kaijutsu_capnp::ErrorCategory::Kernel,
     }
 }
 
 /// Convert a CRDT ErrorSeverity to Cap'n Proto.
 fn error_severity_to_capnp(
-    sev: kaijutsu_crdt::ErrorSeverity,
+    sev: kaijutsu_types::ErrorSeverity,
 ) -> crate::kaijutsu_capnp::ErrorSeverity {
     match sev {
-        kaijutsu_crdt::ErrorSeverity::Warning => crate::kaijutsu_capnp::ErrorSeverity::Warning,
-        kaijutsu_crdt::ErrorSeverity::Error => crate::kaijutsu_capnp::ErrorSeverity::Error,
-        kaijutsu_crdt::ErrorSeverity::Fatal => crate::kaijutsu_capnp::ErrorSeverity::Fatal,
+        kaijutsu_types::ErrorSeverity::Warning => crate::kaijutsu_capnp::ErrorSeverity::Warning,
+        kaijutsu_types::ErrorSeverity::Error => crate::kaijutsu_capnp::ErrorSeverity::Error,
+        kaijutsu_types::ErrorSeverity::Fatal => crate::kaijutsu_capnp::ErrorSeverity::Fatal,
     }
 }
 
@@ -9017,11 +9017,11 @@ fn status_from_capnp(status: crate::kaijutsu_capnp::Status) -> Status {
     }
 }
 
-fn tool_kind_from_capnp(tk: crate::kaijutsu_capnp::ToolKind) -> kaijutsu_crdt::ToolKind {
+fn tool_kind_from_capnp(tk: crate::kaijutsu_capnp::ToolKind) -> kaijutsu_types::ToolKind {
     match tk {
-        crate::kaijutsu_capnp::ToolKind::Shell => kaijutsu_crdt::ToolKind::Shell,
-        crate::kaijutsu_capnp::ToolKind::Mcp => kaijutsu_crdt::ToolKind::Mcp,
-        crate::kaijutsu_capnp::ToolKind::Builtin => kaijutsu_crdt::ToolKind::Builtin,
+        crate::kaijutsu_capnp::ToolKind::Shell => kaijutsu_types::ToolKind::Shell,
+        crate::kaijutsu_capnp::ToolKind::Mcp => kaijutsu_types::ToolKind::Mcp,
+        crate::kaijutsu_capnp::ToolKind::Builtin => kaijutsu_types::ToolKind::Builtin,
     }
 }
 
@@ -9042,23 +9042,23 @@ fn block_kind_from_capnp(kind: crate::kaijutsu_capnp::BlockKind) -> BlockKind {
 }
 
 /// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
-fn tool_kind_to_capnp(tk: kaijutsu_crdt::ToolKind) -> crate::kaijutsu_capnp::ToolKind {
+fn tool_kind_to_capnp(tk: kaijutsu_types::ToolKind) -> crate::kaijutsu_capnp::ToolKind {
     match tk {
-        kaijutsu_crdt::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
-        kaijutsu_crdt::ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
-        kaijutsu_crdt::ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
+        kaijutsu_types::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
+        kaijutsu_types::ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
+        kaijutsu_types::ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
     }
 }
 
 /// Convert a CRDT DriftKind to Cap'n Proto DriftKind.
-fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::DriftKind {
+fn drift_kind_to_capnp(dk: kaijutsu_types::DriftKind) -> crate::kaijutsu_capnp::DriftKind {
     match dk {
-        kaijutsu_crdt::DriftKind::Push => crate::kaijutsu_capnp::DriftKind::Push,
-        kaijutsu_crdt::DriftKind::Pull => crate::kaijutsu_capnp::DriftKind::Pull,
-        kaijutsu_crdt::DriftKind::Merge => crate::kaijutsu_capnp::DriftKind::Merge,
-        kaijutsu_crdt::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
-        kaijutsu_crdt::DriftKind::Notification => crate::kaijutsu_capnp::DriftKind::Notification,
-        kaijutsu_crdt::DriftKind::Fork => crate::kaijutsu_capnp::DriftKind::Fork,
+        kaijutsu_types::DriftKind::Push => crate::kaijutsu_capnp::DriftKind::Push,
+        kaijutsu_types::DriftKind::Pull => crate::kaijutsu_capnp::DriftKind::Pull,
+        kaijutsu_types::DriftKind::Merge => crate::kaijutsu_capnp::DriftKind::Merge,
+        kaijutsu_types::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
+        kaijutsu_types::DriftKind::Notification => crate::kaijutsu_capnp::DriftKind::Notification,
+        kaijutsu_types::DriftKind::Fork => crate::kaijutsu_capnp::DriftKind::Fork,
     }
 }
 
@@ -9894,13 +9894,13 @@ const VFS_ACTIVITY_DIGEST_MAX_ENTRIES: usize = 256;
 ///
 /// Shared with the change feed's `statusChanged` arm, so the two cannot drift:
 /// one exhaustive mapping, and a new status is a compile error in both places.
-pub(crate) fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
+pub(crate) fn status_to_capnp(status: kaijutsu_types::Status) -> crate::kaijutsu_capnp::Status {
     match status {
-        kaijutsu_crdt::Status::Pending => crate::kaijutsu_capnp::Status::Pending,
-        kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,
-        kaijutsu_crdt::Status::Done => crate::kaijutsu_capnp::Status::Done,
-        kaijutsu_crdt::Status::Error => crate::kaijutsu_capnp::Status::Error,
-        kaijutsu_crdt::Status::Draft => crate::kaijutsu_capnp::Status::Draft,
+        kaijutsu_types::Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+        kaijutsu_types::Status::Running => crate::kaijutsu_capnp::Status::Running,
+        kaijutsu_types::Status::Done => crate::kaijutsu_capnp::Status::Done,
+        kaijutsu_types::Status::Error => crate::kaijutsu_capnp::Status::Error,
+        kaijutsu_types::Status::Draft => crate::kaijutsu_capnp::Status::Draft,
     }
 }
 
@@ -10716,7 +10716,7 @@ mod live_status_tests {
     //! reads off `listContexts`. Locks in the running-wins / error-only-if-tail /
     //! non-sticky semantics.
     use super::derive_context_live_status;
-    use kaijutsu_crdt::Status;
+    use kaijutsu_types::Status;
 
     #[test]
     fn empty_is_idle() {

@@ -335,7 +335,7 @@ fn test_join_nonexistent_context_fails() {
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // Joining a random context that was never created should fail
-        let random_id = kaijutsu_crdt::ContextId::new();
+        let random_id = kaijutsu_types::ContextId::new();
         let result = kernel.join_context(random_id, "test-instance").await;
         assert!(
             result.is_err(),
@@ -1277,12 +1277,12 @@ fn test_get_context_version_matches_get_blocks_versioned() {
 
         // A block-mutating op must bump the version, and both RPCs must
         // observe the same post-mutation value.
-        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("context-version-author");
+        let principal = kaijutsu_types::PrincipalId::for_agent_session("context-version-author");
         kernel
             .author_block(&kaijutsu_client::AuthorBlock::text(
                 context_id,
                 principal,
-                kaijutsu_crdt::Role::User,
+                kaijutsu_types::Role::User,
                 "context-version probe block",
             ))
             .await
@@ -1336,12 +1336,12 @@ fn test_get_blocks_returns_the_version_it_read_at() {
             "getBlocks must report the same counter getContextVersion does"
         );
 
-        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("get-blocks-version-author");
+        let principal = kaijutsu_types::PrincipalId::for_agent_session("get-blocks-version-author");
         kernel
             .author_block(&kaijutsu_client::AuthorBlock::text(
                 context_id,
                 principal,
-                kaijutsu_crdt::Role::User,
+                kaijutsu_types::Role::User,
                 "a block that moves the version",
             ))
             .await

@@ -1106,7 +1106,7 @@ mod tests {
         // the now-gone context_id.
         let ctx_id = {
             use uuid::Uuid;
-            use kaijutsu_crdt::ContextId;
+            use kaijutsu_types::ContextId;
             let uuid = Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
                 b"kaijutsu:file:/tmp/nowipe.txt",
@@ -1175,7 +1175,7 @@ mod tests {
         // Destroy the CRDT document to force a Backend error on next read.
         let ctx_id = {
             use uuid::Uuid;
-            use kaijutsu_crdt::ContextId;
+            use kaijutsu_types::ContextId;
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"kaijutsu:file:/tmp/stale.txt");
             ContextId::from_bytes(*uuid.as_bytes())
         };

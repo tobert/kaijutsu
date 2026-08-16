@@ -117,7 +117,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kaijutsu_crdt::{BlockId, Status};
+use kaijutsu_types::{BlockId, Status};
 use kaijutsu_types::{ContextId, PrincipalId};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -836,7 +836,7 @@ async fn drain_to_block(
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use kaijutsu_crdt::{BlockKind, ContentType, Role};
+    use kaijutsu_types::{BlockKind, ContentType, Role};
     use kaijutsu_types::DocKind;
     use std::time::Duration as StdDuration;
 

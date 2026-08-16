@@ -20,7 +20,7 @@ mod common;
 
 use common::{connect_client, run_local, start_server};
 use kaijutsu_client::{KernelHandle, PermissionAskAnswer, permission_events_channel};
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 
 /// Join a fresh context and install a `pre_call` `Ask` hook on `whoami`.
 /// Returns the context id (not otherwise needed by these tests, but handy

@@ -9,7 +9,7 @@
 //! `Drift` cap) is preserved against the matched variant.
 
 use clap::{Parser, Subcommand};
-use kaijutsu_crdt::DriftKind;
+use kaijutsu_types::DriftKind;
 use kaijutsu_types::{ContentType, ContextId, EdgeKind};
 
 use super::format::format_drift_queue;
@@ -1384,7 +1384,7 @@ mod tests {
                     dst,
                     "victim".into(),
                     None,
-                    kaijutsu_crdt::DriftKind::Push,
+                    kaijutsu_types::DriftKind::Push,
                     PrincipalId::new(),
                 )
                 .unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
                     dst,
                     "victim".into(),
                     None,
-                    kaijutsu_crdt::DriftKind::Push,
+                    kaijutsu_types::DriftKind::Push,
                     PrincipalId::new(),
                 )
                 .unwrap();
@@ -1799,11 +1799,11 @@ mod tests {
                 source,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "material to distill",
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
             )
             .unwrap();
 
@@ -1829,7 +1829,7 @@ mod tests {
         let blocks = d.block_store().block_snapshots(dest).unwrap();
         let drift_block = blocks
             .iter()
-            .find(|b| b.kind == kaijutsu_crdt::BlockKind::Drift);
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift);
         assert!(
             drift_block.is_some(),
             "drift pull must insert a Drift block into the caller's context: {blocks:?}"
@@ -1906,11 +1906,11 @@ mod tests {
                 child,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "child material to distill",
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
             )
             .unwrap();
 
@@ -1934,7 +1934,7 @@ mod tests {
         let blocks = d.block_store().block_snapshots(parent).unwrap();
         let drift_block = blocks
             .iter()
-            .find(|b| b.kind == kaijutsu_crdt::BlockKind::Drift);
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift);
         assert!(
             drift_block.is_some(),
             "drift merge must insert a Drift block into the parent context: {blocks:?}"

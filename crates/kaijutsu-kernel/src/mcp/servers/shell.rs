@@ -288,11 +288,11 @@ impl ShellServer {
                 ctx.context_id,
                 None,
                 None,
-                kaijutsu_crdt::Role::Tool,
-                kaijutsu_crdt::BlockKind::ToolResult,
+                kaijutsu_types::Role::Tool,
+                kaijutsu_types::BlockKind::ToolResult,
                 String::new(),
-                kaijutsu_crdt::Status::Running,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Running,
+                kaijutsu_types::ContentType::Plain,
                 Some(ctx.principal_id),
             )
             .map_err(|e| McpError::Protocol(format!("failed to create background output block: {e}")))?;
@@ -1055,7 +1055,7 @@ mod tests {
             other => panic!("expected text, got {other:?}"),
         }
 
-        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
         let start = std::time::Instant::now();
         loop {
             let snap = d
@@ -1140,14 +1140,14 @@ mod tests {
             .expect("background start should succeed");
         let structured = result.structured.unwrap();
         let block_key = structured["block_id"].as_str().unwrap().to_string();
-        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
         let bg_id = crate::background_exec::BackgroundId::parse(structured["background_id"].as_str().unwrap())
             .expect("valid background id");
 
         let snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
         assert_eq!(
             snap.status,
-            kaijutsu_crdt::Status::Running,
+            kaijutsu_types::Status::Running,
             "the output block must be Running immediately after shell(background: true) returns"
         );
 
@@ -1190,7 +1190,7 @@ mod tests {
             .expect("background start should succeed");
         let bg_id = result.structured.as_ref().unwrap()["background_id"].as_str().unwrap().to_string();
         let block_key = result.structured.unwrap()["block_id"].as_str().unwrap().to_string();
-        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
 
         let registry = d.kernel().background_processes();
         let parsed_id = crate::background_exec::BackgroundId::parse(&bg_id).unwrap();
@@ -1207,7 +1207,7 @@ mod tests {
         let block_snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
         assert_eq!(
             block_snap.status,
-            kaijutsu_crdt::Status::Error,
+            kaijutsu_types::Status::Error,
             "a nonzero-exit background process must leave the block Error, not Done"
         );
         assert_eq!(block_snap.exit_code, Some(5));
@@ -1310,12 +1310,12 @@ mod tests {
             .await
             .expect("background start should succeed");
         let block_key = result.structured.unwrap()["block_id"].as_str().unwrap().to_string();
-        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
 
         let start = std::time::Instant::now();
         let content = loop {
             let snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
-            if snap.status != kaijutsu_crdt::Status::Running {
+            if snap.status != kaijutsu_types::Status::Running {
                 break snap.content;
             }
             assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for `env` to finish");

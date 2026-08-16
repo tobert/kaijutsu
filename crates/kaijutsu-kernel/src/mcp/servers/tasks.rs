@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::block_store::SharedBlockStore;
 use crate::execution::ExecResult;
-use kaijutsu_crdt::{BlockId, BlockKind, ContentType, Role, Status, TaskStatus};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status, TaskStatus};
 use kaijutsu_types::{BlockSnapshot, ContextId};
 
 use super::super::context::CallContext;

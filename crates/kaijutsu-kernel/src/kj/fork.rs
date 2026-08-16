@@ -91,7 +91,7 @@ struct ForkSelection {
     /// `None` only on the plain full-copy fast path (base `full`, nothing
     /// narrowing) — which keeps the history-preserving `fork_document` copy
     /// instead of the snapshot-rebuilding filtered copy.
-    selection: Option<kaijutsu_crdt::IntervalSet>,
+    selection: Option<crate::blocks::IntervalSet>,
     /// CLI `--exclude <block-key>` exact-form drops, validated present in the
     /// source. Composed as a predicate exclusion on top of the positional
     /// selection (the orchestrator-repair path).
@@ -106,13 +106,13 @@ struct ForkSelection {
 fn parse_range_specs(
     specs: &[String],
     len: usize,
-) -> Result<kaijutsu_crdt::IntervalSet, (String, kaijutsu_crdt::RangeError)> {
+) -> Result<crate::blocks::IntervalSet, (String, crate::blocks::RangeError)> {
     let mut ranges = Vec::with_capacity(specs.len());
     for s in specs {
-        let r = kaijutsu_crdt::parse_range(s, len).map_err(|e| (s.clone(), e))?;
+        let r = crate::blocks::parse_range(s, len).map_err(|e| (s.clone(), e))?;
         ranges.push(r);
     }
-    Ok(kaijutsu_crdt::IntervalSet::from_ranges(ranges))
+    Ok(crate::blocks::IntervalSet::from_ranges(ranges))
 }
 
 /// Render canonical runs as `lo:hi, …` for an error message naming the
@@ -182,7 +182,7 @@ impl KjDispatcher {
         cli_excludes: &[String],
         before_timestamp: u64,
     ) -> Result<ForkSelection, String> {
-        use kaijutsu_crdt::{IntervalSet, RangeError, SelectionError};
+        use crate::blocks::{IntervalSet, RangeError, SelectionError};
 
         // The fork-instant ordered snapshot — the universe positions address
         // (order_key / BlockId order, the same `fork_filtered` rebuilds). MUST be
@@ -257,11 +257,11 @@ impl KjDispatcher {
                          carrying the whole log"
                     );
                 }
-                kaijutsu_crdt::window_base(len, marker_idx, window as usize)
+                crate::blocks::window_base(len, marker_idx, window as usize)
             }
             other => {
                 // Forward-looking: a user patch may store a literal range as base.
-                let r = kaijutsu_crdt::parse_range(other, len)
+                let r = crate::blocks::parse_range(other, len)
                     .map_err(|e| format!("preset base '{other}': {e}"))?;
                 IntervalSet::from_ranges([r])
             }
@@ -286,7 +286,7 @@ impl KjDispatcher {
         let mut cli_exc_ranges: Vec<std::ops::Range<usize>> = Vec::new();
         let mut exclude_block_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for spec in cli_excludes {
-            match kaijutsu_crdt::parse_range(spec, len) {
+            match crate::blocks::parse_range(spec, len) {
                 Ok(r) => cli_exc_ranges.push(r),
                 Err(RangeError::NotARange(_)) => {
                     let id = kaijutsu_types::BlockId::from_key(spec).ok_or_else(|| {
@@ -305,7 +305,7 @@ impl KjDispatcher {
         // ── Compose: kept = (effective_base ∩ ∪cli_inc) \ ∪exc ──────────────
         // The include invariant names the culprit: the preset's shape (when one
         // was recalled) or an exclude. No silent winner.
-        let kept = kaijutsu_crdt::resolve_keep_set(&effective_base, cli_inc_opt.as_ref(), &excludes)
+        let kept = crate::blocks::resolve_keep_set(&effective_base, cli_inc_opt.as_ref(), &excludes)
             .map_err(|SelectionError::IncludeViolation { missing }| {
                 let culprit = match preset_label {
                     Some(label) => format!("preset '{label}' or an exclude"),
@@ -484,7 +484,7 @@ impl KjDispatcher {
         // filtered copy (snapshot-rebuilt with the positional keep-set +
         // block-key drops).
         let copy = if selection.filtered {
-            let filter = kaijutsu_crdt::ForkBlockFilter {
+            let filter = crate::blocks::ForkBlockFilter {
                 selection: selection.selection.clone(),
                 exclude_block_ids: selection.exclude_block_ids.clone(),
                 ..Default::default()
@@ -839,7 +839,7 @@ impl KjDispatcher {
                 &summary,
                 source_id,
                 source_model,
-                kaijutsu_crdt::DriftKind::Distill,
+                kaijutsu_types::DriftKind::Distill,
                 Some(caller.principal_id),
             ) {
                 return KjResult::Err(format!("kj fork --compact: failed to insert summary: {e}"));
@@ -1436,11 +1436,11 @@ impl KjDispatcher {
                 new_id,
                 None,
                 after.as_ref(),
-                kaijutsu_crdt::Role::System,
-                kaijutsu_crdt::BlockKind::Error,
+                kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Error,
                 summary,
-                kaijutsu_crdt::Status::Error,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Error,
+                kaijutsu_types::ContentType::Plain,
                 Some(caller.principal_id),
             ) {
                 tracing::warn!(
@@ -1462,7 +1462,7 @@ impl KjDispatcher {
         // verified against all three fork call sites, they always match).
         owner: PrincipalId,
     ) -> Result<(), String> {
-        use kaijutsu_crdt::DriftKind;
+        use kaijutsu_types::DriftKind;
 
         let after = self.block_store().last_block_id(target_id);
         self.block_store()
@@ -1500,7 +1500,7 @@ impl KjDispatcher {
         // to the context owner, not the store's own identity.
         owner: PrincipalId,
     ) -> Result<(), String> {
-        use kaijutsu_crdt::DriftKind;
+        use kaijutsu_types::DriftKind;
 
         let source_short = source_id.short();
         let source_display = source_label.unwrap_or(&source_short);
@@ -1742,17 +1742,17 @@ mod tests {
         ctx: kaijutsu_types::ContextId,
         principal: PrincipalId,
         body: &str,
-    ) -> kaijutsu_crdt::BlockId {
+    ) -> kaijutsu_types::BlockId {
         d.block_store()
             .insert_block_as(
                 ctx,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 body.to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap()
@@ -1817,7 +1817,7 @@ mod tests {
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
         insert_text(&d, source, principal, "real");
-        let phantom = kaijutsu_crdt::BlockId::new(source, PrincipalId::new(), 9999).to_key();
+        let phantom = kaijutsu_types::BlockId::new(source, PrincipalId::new(), 9999).to_key();
 
         let c = caller_with_context(source);
         let result = d
@@ -2106,7 +2106,7 @@ mod tests {
     fn child_policy(
         d: &crate::KjDispatcher,
         ctx: kaijutsu_types::ContextId,
-    ) -> Option<(kaijutsu_crdt::BlockId, u32)> {
+    ) -> Option<(kaijutsu_types::BlockId, u32)> {
         d.kernel_db().lock().get_hydration_policy(ctx).unwrap()
     }
 
@@ -2194,7 +2194,7 @@ mod tests {
         // seq)-preserving remap (see the 3d comment above `child_marker`).
         let source_last = d.block_store().block_snapshots(source).unwrap()[4].id;
         let expected_marker =
-            kaijutsu_crdt::BlockId::new(child, source_last.principal_id, source_last.seq);
+            kaijutsu_types::BlockId::new(child, source_last.principal_id, source_last.seq);
         let (marker, window) = child_policy(&d, child)
             .expect("beat-attached child without a carried policy must get the backstop default");
         assert_eq!(
@@ -3069,11 +3069,11 @@ mod tests {
                 source,
                 None,
                 None,
-                kaijutsu_crdt::Role::User,
-                kaijutsu_crdt::BlockKind::Text,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
                 "hello world".to_string(),
-                kaijutsu_crdt::Status::Done,
-                kaijutsu_crdt::ContentType::Plain,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
                 Some(principal),
             )
             .unwrap();

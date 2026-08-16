@@ -395,7 +395,7 @@ mod tests {
     use crate::kernel_db::KernelDb;
     use crate::runtime::config_crdt_fs::ConfigCrdtFs;
     use crate::vfs::VfsOps as _;
-    use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_types::PrincipalId;
     use std::path::Path as StdPath;
     use std::sync::Arc;
 

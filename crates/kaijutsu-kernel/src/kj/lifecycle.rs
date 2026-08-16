@@ -1187,7 +1187,7 @@ mod tests {
     ) -> (
         std::sync::Arc<KjDispatcher>,
         ContextId,
-        Option<(kaijutsu_crdt::BlockId, u32)>,
+        Option<(kaijutsu_types::BlockId, u32)>,
     ) {
         // Arc + set_self_arc so the .kai script can reach the `kj` builtin
         // (the script runs `kj context hydrate`); see `rc_kai_can_call_kj`.

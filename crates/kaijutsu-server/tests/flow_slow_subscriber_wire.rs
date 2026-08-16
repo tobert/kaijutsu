@@ -155,7 +155,7 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
             .join_context(context_id, "flow-slow-subscriber-burst")
             .await
             .expect("join_context");
-        let principal = kaijutsu_crdt::PrincipalId::for_agent_session("flow-slow-subscriber-burst");
+        let principal = kaijutsu_types::PrincipalId::for_agent_session("flow-slow-subscriber-burst");
         // Materialize the owned `AuthorBlock`s first so they outlive the
         // futures borrowing them across the batched `join_all` below —
         // building each `AuthorBlock` inline inside the future expression
@@ -165,7 +165,7 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
                 kaijutsu_client::AuthorBlock::text(
                     context_id,
                     principal,
-                    kaijutsu_crdt::Role::User,
+                    kaijutsu_types::Role::User,
                     format!("burst block {i}"),
                 )
             })

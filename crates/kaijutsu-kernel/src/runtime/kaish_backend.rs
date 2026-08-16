@@ -31,7 +31,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use kaijutsu_crdt::BlockId;
+use kaijutsu_types::BlockId;
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::ExecResult;

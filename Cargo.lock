@@ -6299,18 +6299,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kaijutsu-crdt"
-version = "0.1.0"
-dependencies = [
- "kaijutsu-types",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "kaijutsu-diff"
 version = "0.1.0"
 dependencies = [
@@ -6400,7 +6388,6 @@ dependencies = [
  "kaijutsu-abc",
  "kaijutsu-audio",
  "kaijutsu-cas",
- "kaijutsu-crdt",
  "kaijutsu-diff",
  "kaijutsu-editor",
  "kaijutsu-hyoushigi",
@@ -6481,7 +6468,6 @@ dependencies = [
  "kaijutsu-audio",
  "kaijutsu-cas",
  "kaijutsu-client",
- "kaijutsu-crdt",
  "kaijutsu-hyoushigi",
  "kaijutsu-index",
  "kaijutsu-kernel",

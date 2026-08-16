@@ -17,7 +17,7 @@ use tokio::task::{JoinHandle, LocalSet};
 use kaijutsu_client::{
     ActorHandle, CallError, ConnectionStatus, KeySource, ServerEvent, SshConfig, spawn_actor,
 };
-use kaijutsu_crdt::ContextId;
+use kaijutsu_types::ContextId;
 use kaijutsu_types::BlockQuery;
 use kaijutsu_server::{SshServer, SshServerConfig};
 

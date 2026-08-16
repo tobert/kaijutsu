@@ -8,8 +8,9 @@
 //! and the CRDT was retired in favor of the plain `String` it always
 //! materialized down to. See `docs/crdt-position-2026-08.md`.
 
-use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus};
-use kaijutsu_types::Tick;
+use kaijutsu_types::{
+    BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus, Tick,
+};
 
 // Test-only instrumentation for `BlockContent::text()` — see
 // `block_store::tests::statuses_ordered_does_not_materialize_block_text` for
@@ -248,9 +249,9 @@ pub struct BlockContent {
     /// `ThinkingEnd` via [`set_signature`](Self::set_signature). See
     /// [`kaijutsu_types::BlockSnapshot::signature`].
     signature: Option<String>,
-    source_context: Option<crate::ContextId>,
+    source_context: Option<kaijutsu_types::ContextId>,
     source_model: Option<String>,
-    drift_kind: Option<crate::DriftKind>,
+    drift_kind: Option<kaijutsu_types::DriftKind>,
     file_path: Option<String>,
 
     /// Whether this block is collapsed (only meaningful for Thinking blocks).
@@ -520,7 +521,7 @@ impl BlockContent {
         self.signature = signature;
     }
 
-    pub fn source_context(&self) -> Option<crate::ContextId> {
+    pub fn source_context(&self) -> Option<kaijutsu_types::ContextId> {
         self.source_context
     }
 
@@ -528,7 +529,7 @@ impl BlockContent {
         self.source_model.as_deref()
     }
 
-    pub fn drift_kind(&self) -> Option<crate::DriftKind> {
+    pub fn drift_kind(&self) -> Option<kaijutsu_types::DriftKind> {
         self.drift_kind
     }
 

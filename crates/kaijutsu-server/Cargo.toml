@@ -9,7 +9,6 @@ workspace = true
 
 [dependencies]
 kaijutsu-kernel.workspace = true
-kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-index = { path = "../kaijutsu-index" }
 kaijutsu-telemetry.workspace = true

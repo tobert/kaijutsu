@@ -13,6 +13,7 @@
 
 pub mod background_exec;
 pub mod block_store;
+pub mod blocks;
 pub mod block_tools;
 pub mod cc_inbox;
 pub mod image;
