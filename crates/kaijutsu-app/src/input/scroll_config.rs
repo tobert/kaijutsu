@@ -44,30 +44,17 @@ pub struct ScrollConfig {
 impl Default for ScrollConfig {
     fn default() -> Self {
         // Must match assets/defaults/scroll.toml (the embedded seed).
-        Self { line_gain: 40.0, pixel_gain: 3.0, smooth_speed: 45.0 }
+        //
+        // smooth_speed = 83.18, not the old 45.0: `view::scroll::ease_t`
+        // switched from a frame-rate-*dependent* linear ease
+        // (`(dt * speed).min(1.0)`) to the frame-rate-*independent*
+        // exponential form `1 - exp(-speed * dt)`. The two forms don't share
+        // a scale, so the constant had to be re-derived to preserve the feel
+        // rather than carried over: the old form at 60Hz (the tuning
+        // reference) gave t = 0.75, and `1 - exp(-speed/60) = 0.75` solves to
+        // `speed = -60 * ln(0.25) ~= 83.18`.
+        Self { line_gain: 40.0, pixel_gain: 3.0, smooth_speed: 83.18 }
     }
-}
-
-/// Quantum for the high-res `Pixel` scroll lane, in LOGICAL px — one text row.
-/// Sub-quantum motion accumulates and only scrolls once a full row is crossed,
-/// which is what makes terminal scrolling feel crisp instead of mushy. A module
-/// constant, not a `ScrollConfig` field, on purpose: it's an internal feel unit,
-/// not a per-client knob (the two gains stay the only config surface).
-pub const PIXEL_QUANTUM_PX: f32 = 20.0;
-
-/// Accumulate `desired` logical-px scroll into `accum` and return the whole-
-/// quantum amount to emit now, leaving the sub-quantum remainder in `accum`
-/// (sign-preserving, so reversing direction unwinds cleanly). `quantum <= 0.0`
-/// disables quantization (pass-through). This is what turns the mushy high-res
-/// pixel stream into crisp row-sized steps.
-pub fn quantize_step(accum: &mut f32, desired: f32, quantum: f32) -> f32 {
-    if quantum <= 0.0 {
-        return desired;
-    }
-    *accum += desired;
-    let steps = (*accum / quantum).trunc(); // toward zero → remainder keeps sign
-    *accum -= steps * quantum;
-    steps * quantum
 }
 
 /// Raw winit wheel event → logical-px scroll delta (before the sign flip
@@ -166,8 +153,8 @@ mod tests {
         assert_eq!(
             *app.world().resource::<ScrollConfig>(),
             // smooth_speed absent from the TOML → serde fills it from the
-            // struct default (45.0), which is the point: partial files merge.
-            ScrollConfig { line_gain: 20.0, pixel_gain: 1.5, smooth_speed: 45.0 },
+            // struct default (83.18), which is the point: partial files merge.
+            ScrollConfig { line_gain: 20.0, pixel_gain: 1.5, smooth_speed: 83.18 },
         );
     }
 
@@ -191,60 +178,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn quantize_step_sub_quantum_accumulates_and_emits_nothing() {
-        let mut a = 0.0_f32;
-        assert_eq!(quantize_step(&mut a, 12.0, 20.0), 0.0);
-        assert_eq!(a, 12.0);
-    }
-
-    #[test]
-    fn quantize_step_crossing_one_quantum_emits_exactly_one() {
-        let mut a = 0.0_f32;
-        assert_eq!(quantize_step(&mut a, 12.0, 20.0), 0.0);
-        assert_eq!(a, 12.0);
-        // 12 + 12 = 24 -> 1 whole quantum (20), remainder 4.
-        assert_eq!(quantize_step(&mut a, 12.0, 20.0), 20.0);
-        assert_eq!(a, 4.0);
-    }
-
-    #[test]
-    fn quantize_step_big_flick_emits_multiple_quanta_at_once() {
-        let mut a = 0.0_f32;
-        // 105 / 20 = 5.25 -> 5 whole quanta (100), remainder 5.
-        assert_eq!(quantize_step(&mut a, 105.0, 20.0), 100.0);
-        assert_eq!(a, 5.0);
-    }
-
-    #[test]
-    fn quantize_step_negative_direction_is_sign_preserving() {
-        let mut a = 0.0_f32;
-        // -25 / 20 = -1.25 -> trunc toward zero = -1 quantum (-20), remainder -5.
-        assert_eq!(quantize_step(&mut a, -25.0, 20.0), -20.0);
-        assert_eq!(a, -5.0);
-    }
-
-    #[test]
-    fn quantize_step_reversal_unwinds_the_remainder_before_emitting_again() {
-        // Bank 15 (under one quantum, nothing emitted yet)...
-        let mut a = 15.0_f32;
-        // ...then reverse hard: 15 + (-30) = -15. |-15| < quantum(20), so this
-        // reversal only unwinds the banked remainder — it does NOT cross a
-        // quantum boundary, so nothing emits yet. (trunc(-15/20) = trunc(-0.75)
-        // = -0.0, which is numerically 0.0 — IEEE 754 zero-sign quirk.)
-        assert_eq!(quantize_step(&mut a, -30.0, 20.0), 0.0);
-        assert_eq!(a, -15.0);
-        // The remainder stays within (-quantum, quantum) and keeps the new
-        // (negative) sign — one more small negative nudge now crosses.
-        assert_eq!(quantize_step(&mut a, -6.0, 20.0), -20.0);
-        assert_eq!(a, -1.0);
-    }
-
-    #[test]
-    fn quantize_step_zero_quantum_is_pass_through() {
-        let mut a = 0.0_f32;
-        assert_eq!(quantize_step(&mut a, 7.3, 0.0), 7.3);
-        // Pass-through never touches accum.
-        assert_eq!(a, 0.0);
-    }
 }

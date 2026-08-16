@@ -546,15 +546,6 @@ pub struct ConversationScrollState {
     /// When true, target_offset auto-updates to max_offset each frame.
     /// Set to false when user manually scrolls up.
     pub following: bool,
-    /// Set to true when user explicitly scrolls this frame.
-    /// Prevents handle_block_events from re-enabling following mode.
-    /// Cleared each frame by smooth_scroll.
-    #[reflect(ignore)]
-    pub user_scrolled_this_frame: bool,
-    /// Last LayoutGeneration value when we checked for auto-scroll.
-    /// Used to detect content changes for scroll auto-follow.
-    #[reflect(ignore)]
-    pub last_content_gen: u64,
     /// Set when new block entities are spawned this frame.
     /// Consumed by readback_block_heights (PostUpdate) to compute the scroll anchor.
     pub new_blocks_added: bool,
@@ -573,8 +564,6 @@ impl Default for ConversationScrollState {
             content_height: 0.0,
             visible_height: 600.0, // Will be updated by layout system
             following: true,       // Start in follow mode
-            user_scrolled_this_frame: false,
-            last_content_gen: 0,
             new_blocks_added: false,
             pending_scroll_anchor: None,
         }
@@ -582,12 +571,26 @@ impl Default for ConversationScrollState {
 }
 
 impl ConversationScrollState {
-    /// Check if scroll position is at (or near) the bottom.
-    /// Used to determine if we should enter/stay in follow mode.
-    pub fn is_at_bottom(&self) -> bool {
-        // Within 50px of max scroll counts as "at bottom"
-        const THRESHOLD: f32 = 50.0;
-        self.target_offset >= self.max_offset() - THRESHOLD
+    /// True once `target_offset` has actually reached the TRUE bottom
+    /// (within ~1px). Used everywhere a scroll re-latches follow mode
+    /// (`scroll_by`, `input::systems::scroll_to_rect_visible`) to decide
+    /// whether a downward scroll may opt back in: sticky-follow semantics
+    /// (2026-08-16, scroll-relief slice 0) require actually reaching the
+    /// tail, not merely coming close to it — the invariant has to hold at
+    /// every re-latch site.
+    ///
+    /// This used to coexist with a looser `is_at_bottom()` (a 50px "near the
+    /// bottom" band), and one re-latch site was still built on that looser
+    /// method — the exact backdoor the invariant above warns about (found by
+    /// kaibo/qwen review, 2026-08-16: `scroll_to_rect_visible` block
+    /// navigation landing 40px from the true bottom was re-latching follow).
+    /// `is_at_bottom()` is gone now: once every re-latch site used
+    /// `reached_bottom()`, it had no callers left, and keeping a second,
+    /// looser "at bottom" predicate around is exactly what let the bug
+    /// happen twice.
+    pub(crate) fn reached_bottom(&self) -> bool {
+        const EPS: f32 = 1.0;
+        self.target_offset >= self.max_offset() - EPS
     }
 
     /// Maximum scroll offset (can't scroll past content)
@@ -609,11 +612,17 @@ impl ConversationScrollState {
     /// Moves only the TARGET — `smooth_scroll` eases the visible `offset`
     /// toward it over subsequent frames, so wheel input glides instead of
     /// teleporting.
+    ///
+    /// Follow mode is sticky (2026-08-16, scroll-relief slice 0): once the
+    /// user scrolls away from the tail, `following` stays OFF until they
+    /// explicitly return — a downward scroll back to the true bottom here,
+    /// or an explicit `ScrollToEnd`/`start_following` action. New content
+    /// arriving must never re-latch it by itself; `handle_block_events`
+    /// (`view/sync.rs`) used to re-enable follow from a 50px "near the
+    /// bottom" band whenever layout advanced, which was the yank bug: scroll
+    /// up <50px to read, pause a frame, and the next streamed block silently
+    /// snapped the view back to the bottom.
     pub fn scroll_by(&mut self, delta: f32) {
-        // Mark that user explicitly scrolled this frame
-        // This prevents handle_block_events from re-enabling following
-        self.user_scrolled_this_frame = true;
-
         // If scrolling up, disable follow mode
         if delta < 0.0 {
             self.following = false;
@@ -622,16 +631,18 @@ impl ConversationScrollState {
         self.target_offset += delta;
         self.clamp_target();
 
-        // If scrolling DOWN and we land at the bottom, re-enable follow mode.
-        // The `delta > 0.0` guard is load-bearing: without it, a small upward
-        // scroll that stays within the 50px `is_at_bottom()` band re-enables
-        // follow on the very same call that just disabled it (line above),
-        // and next frame `smooth_scroll` snaps back to the bottom. That ate
-        // small high-res wheel steps near the bottom until ~50px accumulated
-        // in one frame — "8 swipes before it responds; a flick zips" (MX
-        // Master 3, 2026-07-18). Only a downward scroll should re-follow.
-        if delta > 0.0 && self.is_at_bottom() {
+        // If scrolling DOWN and target lands at the TRUE bottom (within
+        // ~1px — `reached_bottom`, not the 50px `is_at_bottom()` band),
+        // re-enable follow mode. The `delta > 0.0` guard is load-bearing:
+        // without it, a small upward scroll that stays within a "near the
+        // bottom" band would re-enable follow on the very same call that
+        // just disabled it (above), and the next frame would snap back to
+        // the bottom. Only a downward scroll that actually reaches bottom
+        // should re-follow — "8 swipes before it responds; a flick zips"
+        // (MX Master 3, 2026-07-18) is the regression a looser band caused.
+        if delta > 0.0 && self.reached_bottom() {
             self.following = true;
+            self.clear_stale_scroll_anchor();
         }
     }
 
@@ -639,11 +650,30 @@ impl ConversationScrollState {
     pub fn scroll_to_end(&mut self) {
         self.target_offset = self.max_offset();
         self.following = true;
+        self.clear_stale_scroll_anchor();
     }
 
     /// Enable follow mode (will smoothly scroll to and track bottom).
     pub fn start_following(&mut self) {
         self.following = true;
+        self.clear_stale_scroll_anchor();
+    }
+
+    /// Drop a leftover `pending_scroll_anchor` when explicitly (re-)engaging
+    /// follow (found by kaibo/qwen review, 2026-08-16). `readback_block_heights`
+    /// (`view/render.rs`) unconditionally sets the anchor whenever new blocks
+    /// are added, but `smooth_scroll` only ever drains it while `following`
+    /// is true — so blocks streaming in while the user is scrolled away
+    /// leave a stale anchor sitting here (repeatedly overwritten, never
+    /// consumed). Without this, the *next* time the user explicitly returns
+    /// to the bottom, `smooth_scroll` would consume that stale anchor and
+    /// land them at `anchor.min(max)` — partway through the conversation,
+    /// not the bottom they just asked for (they'd have to press it twice).
+    /// Every site that flips `following` on from an explicit user action
+    /// calls this; the streaming-while-following case is unaffected because
+    /// `smooth_scroll` drains a fresh anchor the same frame it's set.
+    fn clear_stale_scroll_anchor(&mut self) {
+        self.pending_scroll_anchor = None;
     }
 }
 
@@ -975,31 +1005,29 @@ mod tests {
             content_height,
             visible_height,
             following: false,
-            user_scrolled_this_frame: false,
-            last_content_gen: 0,
             new_blocks_added: false,
             pending_scroll_anchor: None,
         }
     }
 
     #[test]
-    fn test_is_at_bottom_at_max() {
+    fn test_reached_bottom_at_max() {
         let state = scroll_state(1000.0, 400.0, 600.0);
-        assert!(state.is_at_bottom());
+        assert!(state.reached_bottom());
     }
 
     #[test]
-    fn test_is_at_bottom_within_threshold() {
-        // 50px threshold: max_offset=600, target=551 → 600-551=49 < 50
-        let state = scroll_state(1000.0, 400.0, 551.0);
-        assert!(state.is_at_bottom());
+    fn test_reached_bottom_within_the_1px_threshold() {
+        // max_offset=600, target=599.5 → 600-599.5=0.5 < 1.0
+        let state = scroll_state(1000.0, 400.0, 599.5);
+        assert!(state.reached_bottom());
     }
 
     #[test]
-    fn test_is_at_bottom_outside_threshold() {
-        // max_offset=600, target=549 → 600-549=51 > 50
-        let state = scroll_state(1000.0, 400.0, 549.0);
-        assert!(!state.is_at_bottom());
+    fn test_reached_bottom_outside_the_1px_threshold() {
+        // max_offset=600, target=598.9 → 600-598.9=1.1 > 1.0
+        let state = scroll_state(1000.0, 400.0, 598.9);
+        assert!(!state.reached_bottom());
     }
 
     #[test]
@@ -1044,12 +1072,22 @@ mod tests {
         assert_eq!(state.target_offset, 600.0, "clamped to max");
     }
 
+    /// Sticky-follow regression (2026-08-16, scroll-relief slice 0): landing
+    /// merely *inside* the 50px `is_at_bottom()` band must NOT re-enable
+    /// follow — only actually reaching the true bottom (within ~1px) should.
+    /// Before this fix `scroll_by` re-latched off `is_at_bottom()`, so a
+    /// downward nudge that only closed *part* of the gap could silently
+    /// re-arm follow well before the user was really back at the tail.
     #[test]
-    fn test_scroll_by_sets_user_scrolled_flag() {
-        let mut state = scroll_state(1000.0, 400.0, 300.0);
-        assert!(!state.user_scrolled_this_frame);
-        state.scroll_by(10.0);
-        assert!(state.user_scrolled_this_frame);
+    fn test_scroll_by_positive_within_band_but_not_at_bottom_stays_off() {
+        let mut state = scroll_state(1000.0, 400.0, 500.0); // max=600, 100px up
+        state.following = false;
+        state.scroll_by(60.0); // target=560: inside the old 50px band, not at bottom
+        assert!(
+            !state.following,
+            "reaching only 40px from the bottom must not re-latch follow"
+        );
+        assert_eq!(state.target_offset, 560.0);
     }
 
     #[test]
@@ -1066,6 +1104,43 @@ mod tests {
         state.scroll_to_end();
         assert_eq!(state.target_offset, 600.0);
         assert!(state.following);
+    }
+
+    /// Stale-anchor regression (found by kaibo/qwen review, 2026-08-16):
+    /// `readback_block_heights` (`view/render.rs`) sets `pending_scroll_anchor`
+    /// whenever new blocks are added, regardless of `following` — but
+    /// `smooth_scroll` only ever drains it while following. Blocks streaming
+    /// in while the user is scrolled away leave a stale anchor sitting here.
+    /// Without clearing it, the next explicit "go to bottom" would have
+    /// `smooth_scroll` consume that stale anchor and land the user
+    /// mid-conversation instead of at the true bottom.
+    #[test]
+    fn test_scroll_to_end_clears_a_stale_pending_scroll_anchor() {
+        let mut state = scroll_state(1000.0, 400.0, 0.0);
+        state.pending_scroll_anchor = Some(123.0); // stale: set while not following
+        state.scroll_to_end();
+        assert_eq!(
+            state.pending_scroll_anchor, None,
+            "an explicit return to bottom must not honor a leftover anchor"
+        );
+    }
+
+    #[test]
+    fn test_start_following_clears_a_stale_pending_scroll_anchor() {
+        let mut state = scroll_state(1000.0, 400.0, 300.0);
+        state.pending_scroll_anchor = Some(456.0);
+        state.start_following();
+        assert_eq!(state.pending_scroll_anchor, None);
+    }
+
+    #[test]
+    fn test_scroll_by_relatch_clears_a_stale_pending_scroll_anchor() {
+        let mut state = scroll_state(1000.0, 400.0, 590.0); // max=600, near bottom
+        state.pending_scroll_anchor = Some(789.0);
+        state.following = false;
+        state.scroll_by(100.0); // clamps to max_offset -> re-latches follow
+        assert!(state.following);
+        assert_eq!(state.pending_scroll_anchor, None);
     }
 
     // ------------------------------------------------------------------

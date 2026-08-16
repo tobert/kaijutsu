@@ -13,8 +13,7 @@
 use bevy::prelude::*;
 
 use crate::cell::{
-    CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration, MainCell,
-    ViewingConversation,
+    CellEditor, ConversationScrollState, EditorEntities, MainCell, ViewingConversation,
 };
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
@@ -51,22 +50,25 @@ fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
 /// ride `RpcResultMessage`: `MessageReader` hands out shared references, and
 /// a receiver can't be moved out of one — see `ContextHydrationChannel`).
 /// This function only reacts to the join *event* — set active, satisfy a
-/// pending switch — plus the scroll-follow bookkeeping that used to
-/// piggyback on the streamed-block loop this function no longer has
-/// (streamed block/text changes ride the per-context change feed now; see
-/// `drain_context_feeds`). Compose-input hydration is gone too (Lane C
-/// slice 3): the draft is an ordinary block, so it arrives on the same
-/// change feed as everything else — no separate fetch needed.
+/// pending switch. It used to also re-enable scroll-follow whenever the view
+/// was near the bottom and layout advanced (streamed block/text changes ride
+/// the per-context change feed now; see `drain_context_feeds`) — that was
+/// the sticky-follow yank bug (docs/issues.md, scroll-relief slice 0):
+/// scrolling up within the 50px `is_at_bottom()` band, pausing one frame, and
+/// the next streamed block silently snapped the view back to the bottom.
+/// Follow is sticky now — once the user scrolls away from the tail it stays
+/// off until they explicitly return (`ScrollToEnd`/`start_following`, or
+/// scrolling target back to true bottom, `ConversationScrollState::scroll_by`)
+/// — so new content arriving is no longer a re-latch trigger. Compose-input
+/// hydration is gone too (Lane C slice 3): the draft is an ordinary block,
+/// so it arrives on the same change feed as everything else — no separate
+/// fetch needed.
 pub fn handle_block_events(
     mut result_events: MessageReader<RpcResultMessage>,
-    mut scroll_state: ResMut<ConversationScrollState>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
-    layout_gen: Res<LayoutGeneration>,
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
 ) {
-    let was_at_bottom = scroll_state.is_at_bottom();
-
     for result in result_events.read() {
         match result {
             RpcResultMessage::ContextJoined { membership } => {
@@ -87,14 +89,6 @@ pub fn handle_block_events(
             }
             _ => {}
         }
-    }
-
-    if was_at_bottom
-        && layout_gen.0 > scroll_state.last_content_gen
-        && !scroll_state.user_scrolled_this_frame
-    {
-        scroll_state.start_following();
-        scroll_state.last_content_gen = layout_gen.0;
     }
 }
 
@@ -416,6 +410,14 @@ pub fn handle_context_switch(
         }
 
         // Restore the incoming context's saved scroll (default: top).
+        //
+        // `following` is deliberately flattened to false here, even for a
+        // context that was at the bottom when last viewed: a context switch
+        // is a jump to a fixed remembered offset, not a live "go to bottom"
+        // request, so it should never auto-engage follow. If the restored
+        // context happens to be at the bottom and the user wants live
+        // tracking again, `scroll_by`/`ScrollToEnd`/a submit re-engages it
+        // through the normal explicit paths.
         if doc_cache.contains(ctx_id) {
             let offset = scroll_offsets.0.get(&ctx_id).copied().unwrap_or(0.0);
             scroll_state.offset = offset;

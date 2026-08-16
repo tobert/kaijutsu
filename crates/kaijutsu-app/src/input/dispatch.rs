@@ -25,7 +25,7 @@ use super::binding::{InputSource, Modifiers};
 use super::context::{ActiveInputContexts, InputContext, KeyboardGrab};
 use super::events::{ActionFired, AnalogInput, GrabbedKey, LiteralPrefix};
 use super::map::InputMap;
-use super::scroll_config::{quantize_step, wheel_delta_px, ScrollConfig};
+use super::scroll_config::{wheel_delta_px, ScrollConfig};
 
 /// Bundles the two scroll-gain inputs into a single `SystemParam` — `Res` +
 /// `Query` were pushed as separate params on `dispatch_input` and tipped it
@@ -35,9 +35,6 @@ use super::scroll_config::{quantize_step, wheel_delta_px, ScrollConfig};
 pub(crate) struct ScrollInput<'w, 's> {
     config: Res<'w, ScrollConfig>,
     windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    /// Sub-quantum remainder for the `Pixel`-unit quantizer (see
-    /// [`quantize_step`]); `Line` events bypass this entirely.
-    accum: Local<'s, f32>,
 }
 
 impl ScrollInput<'_, '_> {
@@ -67,7 +64,7 @@ pub fn dispatch_input(
     input_map: Res<InputMap>,
     active_contexts: Res<ActiveInputContexts>,
     grab: Res<KeyboardGrab>,
-    mut scroll: ScrollInput,
+    scroll: ScrollInput,
     mut prefix: ResMut<super::prefix::PrefixState>,
     mut action_writer: MessageWriter<ActionFired>,
     mut grab_writer: MessageWriter<GrabbedKey>,
@@ -91,13 +88,13 @@ pub fn dispatch_input(
     // LOGICAL px, so `wheel_delta_px` converts before applying the gain.
     let scale = scroll.scale_factor();
     for event in mouse_wheel.read() {
-        let desired = wheel_delta_px(event.unit, event.y, scale, &scroll.config);
-        let delta = match event.unit {
-            bevy::input::mouse::MouseScrollUnit::Pixel => {
-                quantize_step(&mut scroll.accum, desired, super::scroll_config::PIXEL_QUANTUM_PX)
-            }
-            bevy::input::mouse::MouseScrollUnit::Line => desired,
-        };
+        // Pass the gained delta straight through for both units — no
+        // quantization. Pixel-unit events used to be row-quantized (20px
+        // logical quanta, `quantize_step`/`PIXEL_QUANTUM_PX`, now removed)
+        // to make terminal-style scrolling feel "crisp"; in practice that
+        // quantum was bigger than a lot of trackpad wheel travel, so it read
+        // as a dead zone (nothing happens, then a 20px jump).
+        let delta = wheel_delta_px(event.unit, event.y, scale, &scroll.config);
         if delta.abs() > 0.001 {
             action_writer.write(ActionFired::new(
                 Action::ScrollDelta(-delta),

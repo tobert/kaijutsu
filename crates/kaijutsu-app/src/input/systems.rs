@@ -668,7 +668,13 @@ fn scroll_to_rect_visible(scroll_state: &mut ConversationScrollState, y_offset: 
         let target = block_bottom - scroll_state.visible_height + MARGIN;
         scroll_state.target_offset = target.min(scroll_state.max_offset());
         scroll_state.offset = scroll_state.target_offset;
-        scroll_state.following = scroll_state.is_at_bottom();
+        // `reached_bottom()`, not `is_at_bottom()`: sticky-follow semantics
+        // (scroll-relief slice 0) require every re-latch site to use the
+        // same ~1px "true bottom" threshold as `scroll_by`, or this looser
+        // 50px band becomes a backdoor around it — block navigation that
+        // lands 40px from bottom would otherwise re-arm follow and the next
+        // streamed block yanks the view back down.
+        scroll_state.following = scroll_state.reached_bottom();
     }
 }
 
@@ -1212,7 +1218,8 @@ pub fn cleanup_stale_focused_markers(
 
 #[cfg(test)]
 mod tests {
-    use super::{NavigationDirection, find_latest_error_block, next_focus_index};
+    use super::{NavigationDirection, find_latest_error_block, next_focus_index, scroll_to_rect_visible};
+    use crate::cell::ConversationScrollState;
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
 
     fn block(seq: u64, kind: BlockKind, status: Status, excluded: bool) -> kaijutsu_types::BlockSnapshot {
@@ -1221,6 +1228,56 @@ mod tests {
             .status(status)
             .excluded(excluded)
             .build()
+    }
+
+    fn scroll_state(content_height: f32, visible_height: f32, offset: f32) -> ConversationScrollState {
+        ConversationScrollState {
+            offset,
+            target_offset: offset,
+            content_height,
+            visible_height,
+            following: false,
+            new_blocks_added: false,
+            pending_scroll_anchor: None,
+        }
+    }
+
+    /// Sticky-follow regression (found by kaibo/qwen review, 2026-08-16):
+    /// `scroll_to_rect_visible` (j/k block navigation revealing an
+    /// off-screen block) used to re-latch follow off `is_at_bottom()`'s 50px
+    /// band — the same band `scroll_by` was fixed to stop using. A reveal
+    /// landing 40px from the true bottom must NOT re-arm follow; only
+    /// landing at the true bottom (~1px, `reached_bottom`) may.
+    #[test]
+    fn scroll_to_rect_visible_does_not_relatch_follow_from_the_50px_band() {
+        // content=1000, visible=400 -> max_offset=600. A block whose bottom
+        // sits at 640 pulls the view down to target=640-400+20(margin)=260...
+        // simpler: pick a block bottom that lands the clamped target at
+        // max_offset - 40 (40px shy of the true bottom, inside the old
+        // 50px band but outside reached_bottom's ~1px one).
+        let mut state = scroll_state(1000.0, 400.0, 0.0);
+        // view_bottom = 0 + 400 = 400; MARGIN = 20, so block_bottom must
+        // exceed 380 to trigger the "reveal from below" branch. Choose a
+        // block bottom of 940: target = 940 - 400 + 20 = 560, clamped to
+        // max_offset (600) unchanged since 560 < 600. 600 - 560 = 40px shy.
+        scroll_to_rect_visible(&mut state, /* y_offset */ 900.0, /* height */ 40.0);
+        assert_eq!(state.target_offset, 560.0, "landed 40px shy of true bottom");
+        assert!(
+            !state.following,
+            "landing merely inside the 50px band must not re-latch follow"
+        );
+    }
+
+    /// The companion positive case: a reveal that lands AT the true bottom
+    /// (clamped to max_offset) does re-latch follow, same as `scroll_by`.
+    #[test]
+    fn scroll_to_rect_visible_relatches_follow_at_the_true_bottom() {
+        let mut state = scroll_state(1000.0, 400.0, 0.0);
+        // block_bottom = 1000 (the very end of the content) -> target =
+        // 1000 - 400 + 20 = 620, clamped to max_offset = 600 (true bottom).
+        scroll_to_rect_visible(&mut state, /* y_offset */ 960.0, /* height */ 40.0);
+        assert_eq!(state.target_offset, 600.0, "clamped to the true bottom");
+        assert!(state.following, "landing at the true bottom re-latches follow");
     }
 
     /// The end-clamp rules j/k depend on: no wraparound at either edge,
