@@ -4,8 +4,9 @@
 # Cap'n Proto interface for kernel-based collaborative spaces
 
 # ============================================================================
-# Distributed Tracing (W3C Trace Context)
+# Core identity and primitives
 # ============================================================================
+# Distributed tracing, who is talking, and the block address every other type is keyed by.
 
 # W3C Trace Context for distributed tracing across SSH boundary.
 # See: https://www.w3.org/TR/trace-context/
@@ -14,21 +15,11 @@ struct TraceContext {
   tracestate @1 :Text;    # vendor-specific key=value pairs (optional, may be empty)
 }
 
-# ============================================================================
-# Identity
-# ============================================================================
-
 struct Identity {
   username @0 :Text;
   displayName @1 :Text;
   principalId @2 :Data;   # 16-byte PrincipalId (UUIDv7)
 }
-
-# ============================================================================
-# Block-Based CRDT Types (DAG Architecture)
-# ============================================================================
-# Blocks are the fundamental primitive. Everything is blocks.
-# BlockSnapshot is the unit of replication and display.
 
 # Block identifier — globally unique across all contexts and agents.
 # Uses typed UUIDs (binary, 16 bytes each) instead of strings.
@@ -37,6 +28,11 @@ struct BlockId {
   principalId @1 :Data;     # 16-byte PrincipalId (UUIDv7)
   seq @2 :UInt64;
 }
+
+# ============================================================================
+# Block vocabulary
+# ============================================================================
+# What a block is, how it is queried, and how it is filtered — the shared nouns everything below spells with.
 
 # Role in conversation (User/Model terminology for collaborative peer model)
 enum Role {
@@ -107,90 +103,6 @@ enum DriftKind {
 enum InputMode {
   chat @0;
   shell @1;
-}
-
-# ============================================================================
-# Block Payloads (kind-specific structured fields on BlockSnapshot)
-# ============================================================================
-
-# What system produced the error.
-enum ErrorCategory {
-  tool @0;
-  stream @1;
-  rpc @2;
-  render @3;
-  parse @4;
-  validation @5;
-  kernel @6;
-}
-
-# How severe the error is.
-enum ErrorSeverity {
-  warning @0;
-  error @1;
-  fatal @2;
-}
-
-# Structured error payload for Error blocks.
-struct ErrorPayload {
-  category @0 :ErrorCategory;
-  severity @1 :ErrorSeverity;
-  code @2 :Text;              # Stable machine-readable ID (empty = None)
-  detail @3 :Text;            # Full diagnostic text (empty = None)
-  hasSpan @4 :Bool;
-  spanLine @5 :UInt32;
-  spanColumn @6 :UInt32;
-  spanLength @7 :UInt32;
-  hasSourceKind @8 :Bool;
-  sourceKind @9 :BlockKind;
-}
-
-# What a notification is about.
-enum NotificationKind {
-  toolAdded @0;
-  toolRemoved @1;
-  log @2;
-  promptsChanged @3;
-  coalesced @4;
-}
-
-# Severity for Log notifications. Kept in sync with kaijutsu-types::LogLevel.
-enum LogLevel {
-  trace @0;
-  debug @1;
-  info @2;
-  warn @3;
-  error @4;
-}
-
-# Structured notification payload for Notification blocks.
-struct NotificationPayload {
-  instance @0 :Text;            # MCP instance id (never empty)
-  kind @1 :NotificationKind;
-  hasLevel @2 :Bool;            # True iff `level` applies (Log events)
-  level @3 :LogLevel;
-  tools @4 :List(Text);         # ToolAdded/Removed — names in the batch (1+); empty otherwise
-  hasCount @5 :Bool;            # True iff `count` applies (Coalesced)
-  count @6 :UInt32;
-  detail @7 :Text;              # Expandable body — empty = None
-}
-
-# Structured resource payload for Resource blocks.
-# Exactly one of `text`/`blobBase64` is populated per read, signaled by the
-# corresponding `has*` flag. Binary bodies stay base64-encoded end-to-end.
-struct ResourcePayload {
-  instance @0 :Text;                  # MCP instance id (never empty)
-  uri @1 :Text;
-  mimeType @2 :Text;                  # empty unless hasMimeType
-  hasMimeType @3 :Bool;
-  size @4 :UInt64;                    # 0 unless hasSize
-  hasSize @5 :Bool;
-  text @6 :Text;                      # empty unless hasText
-  hasText @7 :Bool;
-  blobBase64 @8 :Text;                # empty unless hasBlob
-  hasBlob @9 :Bool;
-  hasParentResourceBlockId @10 :Bool;
-  parentResourceBlockId @11 :BlockId;
 }
 
 # Flat block snapshot — all fields present, some unused depending on kind.
@@ -282,9 +194,63 @@ struct BlockSnapshot {
   taskStatus @41 :Text;
 }
 
-# ============================================================================
-# Block Events & Subscriptions
-# ============================================================================
+# Scalar block metadata carried by onBlockMetadataChanged.
+#
+# These fields are set (typically once) after a block is inserted — e.g. the
+# real exit code and stderr written when a shell command finishes. They are
+# NOT DTE-tracked (unlike content), so they ride this event and are applied
+# directly to the client's store replica, independent of the text frontier.
+struct BlockMetadata {
+  exitCode @0 :Int32;
+  hasExitCode @1 :Bool;       # True if exitCode is set
+  isError @2 :Bool;
+  contentType @3 :Text;       # MIME type; empty falls back to heuristic
+  ephemeral @4 :Bool;
+  toolUseId @5 :Text;         # LLM-assigned tool invocation id ("" if unset)
+  stderr @6 :Text;            # Standard error stream
+  hasStderr @7 :Bool;         # True if stderr is set (distinguishes "" from unset)
+  # Task lifecycle status (BlockKind::Task only); "" falls back to "open",
+  # same "empty = default" convention as contentType.
+  taskStatus @8 :Text;
+}
+
+# Query for fetching blocks — union of all/byIds/byFilter
+struct BlockQuery {
+  union {
+    all @0 :Void;
+    byIds @1 :List(BlockId);
+    byFilter @2 :BlockFilter;
+  }
+}
+
+# Filter criteria for block queries
+struct BlockFilter {
+  kinds @0 :List(BlockKind);
+  hasKinds @1 :Bool;
+  roles @2 :List(Role);
+  hasRoles @3 :Bool;
+  statuses @4 :List(Status);
+  hasStatuses @5 :Bool;
+  # Retired 2026-08-02 with the dead `compacted` block flag it filtered on.
+  # Cap'n Proto ordinals must stay sequential, so the slot is kept — unread,
+  # unwritten — rather than reused.
+  unusedExcludeCompacted @6 :Bool;
+  limit @7 :UInt32;
+  maxDepth @8 :UInt32;
+  parentId @9 :BlockId;
+  hasParentId @10 :Bool;
+}
+
+# Server-side filter for block event subscriptions.
+# Empty lists = unconstrained. All constraints are AND'd.
+struct BlockEventFilter {
+  contextIds @0 :List(Data);         # 16-byte ContextId UUIDs
+  hasContextIds @1 :Bool;            # Needed because empty list ≠ unconstrained
+  eventTypes @2 :List(BlockFlowKind);
+  hasEventTypes @3 :Bool;
+  blockKinds @4 :List(BlockKind);
+  hasBlockKinds @5 :Bool;
+}
 
 # Discriminant for BlockFlow event variants (for subscription filtering).
 enum BlockFlowKind {
@@ -314,233 +280,89 @@ enum BlockFlowKind {
   textReplaced @12;
 }
 
-# Server-side filter for block event subscriptions.
-# Empty lists = unconstrained. All constraints are AND'd.
-struct BlockEventFilter {
-  contextIds @0 :List(Data);         # 16-byte ContextId UUIDs
-  hasContextIds @1 :Bool;            # Needed because empty list ≠ unconstrained
-  eventTypes @2 :List(BlockFlowKind);
-  hasEventTypes @3 :Bool;
-  blockKinds @4 :List(BlockKind);
-  hasBlockKinds @5 :Bool;
+# ============================================================================
+# Errors and notifications
+# ============================================================================
+# Structured payloads for Error, Notification, and Resource blocks (BlockSnapshot's kind-specific fields).
+
+# What system produced the error.
+enum ErrorCategory {
+  tool @0;
+  stream @1;
+  rpc @2;
+  render @3;
+  parse @4;
+  validation @5;
+  kernel @6;
 }
 
-# Scalar block metadata carried by onBlockMetadataChanged.
-#
-# These fields are set (typically once) after a block is inserted — e.g. the
-# real exit code and stderr written when a shell command finishes. They are
-# NOT DTE-tracked (unlike content), so they ride this event and are applied
-# directly to the client's store replica, independent of the text frontier.
-struct BlockMetadata {
-  exitCode @0 :Int32;
-  hasExitCode @1 :Bool;       # True if exitCode is set
-  isError @2 :Bool;
-  contentType @3 :Text;       # MIME type; empty falls back to heuristic
-  ephemeral @4 :Bool;
-  toolUseId @5 :Text;         # LLM-assigned tool invocation id ("" if unset)
-  stderr @6 :Text;            # Standard error stream
-  hasStderr @7 :Bool;         # True if stderr is set (distinguishes "" from unset)
-  # Task lifecycle status (BlockKind::Task only); "" falls back to "open",
-  # same "empty = default" convention as contentType.
-  taskStatus @8 :Text;
+# How severe the error is.
+enum ErrorSeverity {
+  warning @0;
+  error @1;
+  fatal @2;
 }
 
-# A render directive crossing the seam to an off-box sink (docs/midi.md
-# "Render is a wire cue"; docs/pcm.md "How it converges"). Mirrors
-# kaijutsu_audio::RenderCue: mime-keyed symbolic content (or a CAS hash the
-# sink resolves), scheduled at receipt + lead. Generalizes the slice-3
-# play-now audio directive — audio samples, clip records, MIDI, and ABC all
-# ride this one struct and the sink dispatches on `mime`.
-struct RenderCue {
-  mime @0 :Text;          # dispatch key: audio/wav, audio/midi, text/vnd.abc, …
-  leadNanos @1 :UInt64;   # relative schedule lead; sink fires at receipt+lead. 0 = now.
-  union {
-    inline @2 :Data;      # inline symbolic content / tiny sample bytes
-    casHash @3 :Text;     # hex ContentHash — resolved from CAS at the sink
-  }
-  # Sender wallclock (ns since UNIX_EPOCH) at emission — mirrors BeatRef.epochNs
-  # below (phase-align Slice 2). 0 = unstamped (an old peer, or a synthetic cue
-  # with no meaningful emission instant, e.g. a RENDER_FLUSH directive). A sink
-  # back-dates `leadNanos` by however old the cue reads on receipt, so per-cue
-  # transfer latency can't walk the render out of phase with the click
-  # (`docs/midi.md`).
-  epochNs @4 :UInt64;
-  # The beat coordinate this cue is placed at (1 tick == 1 beat — see
-  # publishBeatSync's own doc comment), stamped by the kernel for a
-  # track-committed cell (phase-align Slice 2). Unset for directive cues with
-  # no track/beat association (transport flush, kj play's play-now, the
-  # PREPARE_MIME cache-warm directive) — those always dispatch immediately
-  # regardless of a sink's clock mode.
-  onsetBeat @5 :Float64;
-  hasOnsetBeat @6 :Bool;  # True if onsetBeat is set (distinguishes 0.0 from unset)
+# Structured error payload for Error blocks.
+struct ErrorPayload {
+  category @0 :ErrorCategory;
+  severity @1 :ErrorSeverity;
+  code @2 :Text;              # Stable machine-readable ID (empty = None)
+  detail @3 :Text;            # Full diagnostic text (empty = None)
+  hasSpan @4 :Bool;
+  spanLine @5 :UInt32;
+  spanColumn @6 :UInt32;
+  spanLength @7 :UInt32;
+  hasSourceKind @8 :Bool;
+  sourceKind @9 :BlockKind;
 }
 
-# A low-rate beat reference for a sink's continuous local timebase (docs/midi.md
-# "The relative-lead timebase, analyzed"). Mirrors kaijutsu_audio::BeatRef: the
-# fractional beat coordinate at emission plus the tempo, PLUS the sender's
-# wallclock at emission (epochNs) — mirroring reportClockEstimate's epochNs
-# (the reverse-direction ClockEstimate path this mirrors forward). The sink
-# back-dates each reference to its own emission instant (BeatRef::backdated_at)
-# rather than folding every buffered reference at one receipt-time now — a
-# delivery flood (refs queued behind a turn's streamed output) would otherwise
-# walk the phasor several beats. epochNs == 0 means unstamped (an old peer) —
-# the sink falls back to receipt time, the old behavior. The phasor still never
-# hard-resyncs: a fresh reference nudges it, it doesn't snap.
-struct BeatRef {
-  beat @0 :Float64;       # fractional beat coordinate at emission; integers are onsets
-  tempoBps @1 :Float64;   # tempo in beats per second (120 BPM == 2.0)
-  epochNs @2 :UInt64;     # sender wallclock (ns since UNIX_EPOCH) at emission; 0 = unstamped
+# What a notification is about.
+enum NotificationKind {
+  toolAdded @0;
+  toolRemoved @1;
+  log @2;
+  promptsChanged @3;
+  coalesced @4;
 }
 
-# One MIDI port as a reporting sink sees it (docs/midi-next.md "Presence is
-# sink-fed"). Backend-neutral by construction: `name` is the port's display
-# name — what profile match strings match on — and `address` is the backend's
-# own handle for it ("client:port" under ALSA, a unique id under CoreMIDI),
-# opaque to the kernel and carried for logs/disambiguation only. No ALSA
-# client numbers ever reach a profile.
-struct MidiPortFact {
-  name @0 :Text;
-  address @1 :Text;
+# Severity for Log notifications. Kept in sync with kaijutsu-types::LogLevel.
+enum LogLevel {
+  trace @0;
+  debug @1;
+  info @2;
+  warn @3;
+  error @4;
 }
 
-# Callback for receiving block updates from server
-#
-# # Delivery contract (2026-08-05 backpressure rework)
-#
-# Every method carries `subSeq`: a per-SUBSCRIPTION monotonic counter starting
-# at 1, incremented once per callback the server issues on this subscription.
-# The kernel's FlowBus is lossless per subscriber — a subscriber that cannot
-# keep up is terminated, not silently truncated — so a gap in `subSeq` can
-# only mean one of:
-#
-#   * you were terminated for falling behind (`onSubscriptionTerminated`
-#     arrives, and the connection is dropped right after), or
-#   * you resubscribed / reconnected and the counter restarted at 1.
-#
-# It can NEVER mean "the server quietly lost an event". A client that sees a
-# gap without a termination has found a kernel bug and should say so loudly.
-#
-# `subSeq` is 0 on a peer that predates the rework; treat 0 as "not reporting".
-# Methods on the musical-time lane (`onRenderCue`, `onBeatSync`) count on their
-# OWN sequence, because a missed beat is missed on purpose (docs/midi.md) and
-# must not look like a hole in the block stream.
-interface BlockEvents {
-  onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data, subSeq :UInt64);
-  onBlockDeleted @1 (contextId :Data, blockId :BlockId, subSeq :UInt64);
-  onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool, subSeq :UInt64);
-  onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool, subSeq :UInt64);
-  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, subSeq :UInt64);
-
-  # @5 retired (2026-08-16): was onInputTextOps, streaming CRDT text ops for
-  # the compose scratchpad. Zero production callers — the input document was
-  # replaced by the draft block (Status::Draft + ephemeral), which rides the
-  # ordinary block event stream instead. Stub, not a hole — see @79-@83.
-
-  # @6 retired (2026-08-16): was onInputCleared, the companion clear event
-  # for the same input document. Same replacement, same reason. Stub, not a
-  # hole — see @79-@83.
-
-  # Session control events (server → client)
-  onContextSwitched @5 (contextId :Data, subSeq :UInt64);
-
-  # Block excluded flag changed (staging curation)
-  onBlockExcludedChanged @6 (contextId :Data, blockId :BlockId, excluded :Bool, subSeq :UInt64);
-
-  # Scalar metadata changed (exit code, stderr, content type, …). Applied
-  # directly to the client store — frontier-independent, so it survives a
-  # reconnect even when text ops are gated behind a full resync.
-  onBlockMetadataChanged @7 (contextId :Data, blockId :BlockId, metadata :BlockMetadata, subSeq :UInt64);
-
-  # Structured output data changed (output is not DTE-tracked, so it rides
-  # its own event rather than the block text op stream).
-  onBlockOutputChanged @8 (contextId :Data, blockId :BlockId, output :OutputData, subSeq :UInt64);
-
-  # Render a cue (docs/pcm.md, docs/midi.md "Render is a wire cue"). A kernel
-  # directive (from `kj play`, later the track render seam), not a block change
-  # — carried on this channel because it already fans out to every attached
-  # client. `contextId` is the originating context (reserved for future
-  # per-listener routing); the standalone slice forwards unconditionally.
-  #
-  # Musical-time lane: `subSeq` counts separately from the block stream and a
-  # gap is legitimate — a stalled sink misses cues rather than replaying stale
-  # ones.
-  onRenderCue @9 (contextId :Data, cue :RenderCue, subSeq :UInt64);
-
-  # A beat reference for the sink's continuous timebase (docs/midi.md "The
-  # relative-lead timebase, analyzed"). Emitted at a low rate while a track's
-  # clock rolls; the sink's phasor extrapolates the beats between and slews
-  # toward each reference. Like onRenderCue, a directive that fans out to every
-  # attached client, on the musical-time lane. `contextId` is the track's score
-  # context (the same key onRenderCue uses), so a sink can associate a beat
-  # with its track.
-  onBeatSync @10 (contextId :Data, beatRef :BeatRef, subSeq :UInt64);
-
-  # A bounded MIDI request/reply at one sink (docs/midi-next.md "SysEx: the
-  # exchange pattern"). The FIRST round-trip member of this otherwise
-  # fire-and-forget set: onRenderCue/onBeatSync push, this one *calls*. Cap'n
-  # Proto is bidirectional and promise-returning, so the kernel asks a
-  # specific sink a question and awaits its answer over the connection that
-  # sink already holds.
-  #
-  # Unlike every method above, this is NOT a fan-out: the kernel picks the ONE
-  # connection whose sink reported the device present (the presence store's
-  # SinkAttribution) and calls it there. Sending a device dialogue to every
-  # attached client would mean several ears answering for gear only one of
-  # them has.
-  #
-  # - `portOrDevice` — a device profile name (`keystep-pro`, resolved through
-  #   the sink's own routing table, exactly as a device-addressed control cue
-  #   is) or a backend port address (`"24:0"`) when the caller already knows
-  #   the port. The kernel sends the device name; it never learns ALSA
-  #   numbers.
-  # - `payload` — complete MIDI bytes to send (a whole F0…F7 SysEx today).
-  # - `replyMatch` — leading bytes the reply must start with (`F0 7E` for a
-  #   universal Identity Reply); traffic that doesn't match is ignored, so a
-  #   chatty device can't answer the wrong question.
-  # - `timeoutMs` — the sink's own bound on the wait. The kernel enforces a
-  #   slightly larger overall deadline so a wedged sink can't hang the caller.
-  #
-  # Errors are LOUD: unplugged, unroutable, no reply before the timeout, or a
-  # sink with no exchange client all come back as a failed call, never as an
-  # empty reply and never as a hang.
-  exchange @11 (portOrDevice :Text, payload :Data, replyMatch :Data, timeoutMs :UInt32)
-      -> (reply :Data);
-
-  # THE LAG KICK. This subscription is over: the client could not drain its
-  # per-subscriber queue fast enough, so the kernel terminated it rather than
-  # let it keep a hole-punched view of the log (Amy, 2026-08-05: "I'd rather be
-  # disconnected"). Sent best-effort with a short deadline, immediately before
-  # the server tears the RPC connection down — so a client that never
-  # implements this method still recovers, via the ordinary reconnect path,
-  # just without knowing why.
-  #
-  # The contract for the client: this is NOT a resumable gap. Reconnect,
-  # re-subscribe, and re-fetch a snapshot (`Kernel.getBlocks` for the block
-  # feed); do not try to patch forward from the last `subSeq`, because the
-  # events between are gone by construction.
-  #
-  # - `reason` — why the subscription ended.
-  # - `topic` — the FlowBus topic whose event could not be enqueued.
-  # - `delivered` — how many events this subscription successfully received;
-  #   equals the last `subSeq` the client should have seen.
-  # - `capacity` — the queue depth that was exceeded, for the operator.
-  onSubscriptionTerminated @12 (reason :SubscriptionEndReason, topic :Text,
-                                delivered :UInt64, capacity :UInt64);
+# Structured notification payload for Notification blocks.
+struct NotificationPayload {
+  instance @0 :Text;            # MCP instance id (never empty)
+  kind @1 :NotificationKind;
+  hasLevel @2 :Bool;            # True iff `level` applies (Log events)
+  level @3 :LogLevel;
+  tools @4 :List(Text);         # ToolAdded/Removed — names in the batch (1+); empty otherwise
+  hasCount @5 :Bool;            # True iff `count` applies (Coalesced)
+  count @6 :UInt32;
+  detail @7 :Text;              # Expandable body — empty = None
 }
 
-# Why a push subscription ended. Additive: an unknown enumerant decodes as the
-# default, which is the honest "we don't know" answer.
-enum SubscriptionEndReason {
-  # The subscriber's bounded queue filled — it could not keep up.
-  slowSubscriber @0;
-  # The server is going away (shutdown, kernel restart).
-  serverShutdown @1;
-  # Replaced by a newer subscription from the same client instance.
-  superseded @2;
-  # The server cannot produce a correct stream and is ending it rather than
-  # sending one it knows is wrong (docs/change-feed.md). Nothing is wrong with
-  # the client; recovery is the same refetch as any other ending.
-  internalFault @3;
+# Structured resource payload for Resource blocks.
+# Exactly one of `text`/`blobBase64` is populated per read, signaled by the
+# corresponding `has*` flag. Binary bodies stay base64-encoded end-to-end.
+struct ResourcePayload {
+  instance @0 :Text;                  # MCP instance id (never empty)
+  uri @1 :Text;
+  mimeType @2 :Text;                  # empty unless hasMimeType
+  hasMimeType @3 :Bool;
+  size @4 :UInt64;                    # 0 unless hasSize
+  hasSize @5 :Bool;
+  text @6 :Text;                      # empty unless hasText
+  hasText @7 :Bool;
+  blobBase64 @8 :Text;                # empty unless hasBlob
+  hasBlob @9 :Bool;
+  hasParentResourceBlockId @10 :Bool;
+  parentResourceBlockId @11 :BlockId;
 }
 
 # ============================================================================
@@ -648,6 +470,10 @@ struct ContextEvent {
 
 # The client's end of the feed.
 interface ContextObserver {
+  # Next free ordinal: 2. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   # One delivery carries an ordered batch of changes and the version they
   # bring the client to: applying `events` in order makes the client's state
   # exactly the context at `version`.
@@ -673,6 +499,167 @@ interface ContextObserver {
   onTerminated @1 (reason :SubscriptionEndReason, deliveredVersion :UInt64);
 }
 
+# Snapshot of a context version for timeline navigation
+struct VersionSnapshot {
+  version @0 :UInt64;         # Context version number
+  timestamp @1 :UInt64;       # Unix millis when this version was created
+  blockCount @2 :UInt32;      # Number of blocks at this version
+  changeKind @3 :ChangeKind;
+  changedBlockId @4 :BlockId; # The block that changed (if applicable)
+}
+
+# What changed at a given version
+enum ChangeKind {
+  blockAdded @0;
+  blockDeleted @1;
+  edit @2;
+  statusChange @3;
+}
+
+# Why a push subscription ended. Additive: an unknown enumerant decodes as the
+# default, which is the honest "we don't know" answer.
+enum SubscriptionEndReason {
+  # The subscriber's bounded queue filled — it could not keep up.
+  slowSubscriber @0;
+  # The server is going away (shutdown, kernel restart).
+  serverShutdown @1;
+  # Replaced by a newer subscription from the same client instance.
+  superseded @2;
+  # The server cannot produce a correct stream and is ending it rather than
+  # sending one it knows is wrong (docs/change-feed.md). Nothing is wrong with
+  # the client; recovery is the same refetch as any other ending.
+  internalFault @3;
+}
+
+# ============================================================================
+# Block events
+# ============================================================================
+# The BlockEvents push channel — superseded by the change feed above, still live until every client migrates.
+
+# Callback for receiving block updates from server
+#
+# # Delivery contract (2026-08-05 backpressure rework)
+#
+# Every method carries `subSeq`: a per-SUBSCRIPTION monotonic counter starting
+# at 1, incremented once per callback the server issues on this subscription.
+# The kernel's FlowBus is lossless per subscriber — a subscriber that cannot
+# keep up is terminated, not silently truncated — so a gap in `subSeq` can
+# only mean one of:
+#
+#   * you were terminated for falling behind (`onSubscriptionTerminated`
+#     arrives, and the connection is dropped right after), or
+#   * you resubscribed / reconnected and the counter restarted at 1.
+#
+# It can NEVER mean "the server quietly lost an event". A client that sees a
+# gap without a termination has found a kernel bug and should say so loudly.
+#
+# `subSeq` is 0 on a peer that predates the rework; treat 0 as "not reporting".
+# Methods on the musical-time lane (`onRenderCue`, `onBeatSync`) count on their
+# OWN sequence, because a missed beat is missed on purpose (docs/midi.md) and
+# must not look like a hole in the block stream.
+interface BlockEvents {
+  # Next free ordinal: 13. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
+  onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data, subSeq :UInt64);
+  onBlockDeleted @1 (contextId :Data, blockId :BlockId, subSeq :UInt64);
+  onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool, subSeq :UInt64);
+  onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool, subSeq :UInt64);
+  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, subSeq :UInt64);
+
+  # Session control events (server → client)
+  onContextSwitched @5 (contextId :Data, subSeq :UInt64);
+
+  # Block excluded flag changed (staging curation)
+  onBlockExcludedChanged @6 (contextId :Data, blockId :BlockId, excluded :Bool, subSeq :UInt64);
+
+  # Scalar metadata changed (exit code, stderr, content type, …). Applied
+  # directly to the client store — frontier-independent, so it survives a
+  # reconnect even when text ops are gated behind a full resync.
+  onBlockMetadataChanged @7 (contextId :Data, blockId :BlockId, metadata :BlockMetadata, subSeq :UInt64);
+
+  # Structured output data changed (output is not DTE-tracked, so it rides
+  # its own event rather than the block text op stream).
+  onBlockOutputChanged @8 (contextId :Data, blockId :BlockId, output :OutputData, subSeq :UInt64);
+
+  # Render a cue (docs/pcm.md, docs/midi.md "Render is a wire cue"). A kernel
+  # directive (from `kj play`, later the track render seam), not a block change
+  # — carried on this channel because it already fans out to every attached
+  # client. `contextId` is the originating context (reserved for future
+  # per-listener routing); the standalone slice forwards unconditionally.
+  #
+  # Musical-time lane: `subSeq` counts separately from the block stream and a
+  # gap is legitimate — a stalled sink misses cues rather than replaying stale
+  # ones.
+  onRenderCue @9 (contextId :Data, cue :RenderCue, subSeq :UInt64);
+
+  # A beat reference for the sink's continuous timebase (docs/midi.md "The
+  # relative-lead timebase, analyzed"). Emitted at a low rate while a track's
+  # clock rolls; the sink's phasor extrapolates the beats between and slews
+  # toward each reference. Like onRenderCue, a directive that fans out to every
+  # attached client, on the musical-time lane. `contextId` is the track's score
+  # context (the same key onRenderCue uses), so a sink can associate a beat
+  # with its track.
+  onBeatSync @10 (contextId :Data, beatRef :BeatRef, subSeq :UInt64);
+
+  # A bounded MIDI request/reply at one sink (docs/midi-next.md "SysEx: the
+  # exchange pattern"). The FIRST round-trip member of this otherwise
+  # fire-and-forget set: onRenderCue/onBeatSync push, this one *calls*. Cap'n
+  # Proto is bidirectional and promise-returning, so the kernel asks a
+  # specific sink a question and awaits its answer over the connection that
+  # sink already holds.
+  #
+  # Unlike every method above, this is NOT a fan-out: the kernel picks the ONE
+  # connection whose sink reported the device present (the presence store's
+  # SinkAttribution) and calls it there. Sending a device dialogue to every
+  # attached client would mean several ears answering for gear only one of
+  # them has.
+  #
+  # - `portOrDevice` — a device profile name (`keystep-pro`, resolved through
+  #   the sink's own routing table, exactly as a device-addressed control cue
+  #   is) or a backend port address (`"24:0"`) when the caller already knows
+  #   the port. The kernel sends the device name; it never learns ALSA
+  #   numbers.
+  # - `payload` — complete MIDI bytes to send (a whole F0…F7 SysEx today).
+  # - `replyMatch` — leading bytes the reply must start with (`F0 7E` for a
+  #   universal Identity Reply); traffic that doesn't match is ignored, so a
+  #   chatty device can't answer the wrong question.
+  # - `timeoutMs` — the sink's own bound on the wait. The kernel enforces a
+  #   slightly larger overall deadline so a wedged sink can't hang the caller.
+  #
+  # Errors are LOUD: unplugged, unroutable, no reply before the timeout, or a
+  # sink with no exchange client all come back as a failed call, never as an
+  # empty reply and never as a hang.
+  exchange @11 (portOrDevice :Text, payload :Data, replyMatch :Data, timeoutMs :UInt32)
+      -> (reply :Data);
+
+  # THE LAG KICK. This subscription is over: the client could not drain its
+  # per-subscriber queue fast enough, so the kernel terminated it rather than
+  # let it keep a hole-punched view of the log (Amy, 2026-08-05: "I'd rather be
+  # disconnected"). Sent best-effort with a short deadline, immediately before
+  # the server tears the RPC connection down — so a client that never
+  # implements this method still recovers, via the ordinary reconnect path,
+  # just without knowing why.
+  #
+  # The contract for the client: this is NOT a resumable gap. Reconnect,
+  # re-subscribe, and re-fetch a snapshot (`Kernel.getBlocks` for the block
+  # feed); do not try to patch forward from the last `subSeq`, because the
+  # events between are gone by construction.
+  #
+  # - `reason` — why the subscription ended.
+  # - `topic` — the FlowBus topic whose event could not be enqueued.
+  # - `delivered` — how many events this subscription successfully received;
+  #   equals the last `subSeq` the client should have seen.
+  # - `capacity` — the queue depth that was exceeded, for the operator.
+  onSubscriptionTerminated @12 (reason :SubscriptionEndReason, topic :Text,
+                                delivered :UInt64, capacity :UInt64);
+}
+
+# ============================================================================
+# Editor
+# ============================================================================
+# Renderer-facing state for the in-app vi editor (docs/vi.md).
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).
 # Carries everything a renderer draws; see docs/vi.md.
@@ -690,6 +677,10 @@ struct EditorState {
 # The push channel exists so a peer's CRDT merge into an open block reaches
 # every renderer the instant it lands — collaborative editing, not poll lag.
 interface EditorEvents {
+  # Next free ordinal: 2. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   onEditorState @0 (state :EditorState);
   onEditorClosed @1 (sessionId :UInt64);
 }
@@ -730,6 +721,10 @@ enum TurnOrigin {
 # `subscribeEditor` — the event names its context rather than the subscription
 # filtering to one, so a client watching several contexts needs one channel.
 interface TurnEvents {
+  # Next free ordinal: 2. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   # A turn reached an ending the driver arrived at on purpose. `outputBlockId`
   # is the model's last text block; `hasOutputBlock` is false (and the id
   # meaningless) when the turn produced no text at all.
@@ -743,64 +738,9 @@ interface TurnEvents {
 }
 
 # ============================================================================
-# Block Queries & Timeline
+# Contexts
 # ============================================================================
-
-# Query for fetching blocks — union of all/byIds/byFilter
-struct BlockQuery {
-  union {
-    all @0 :Void;
-    byIds @1 :List(BlockId);
-    byFilter @2 :BlockFilter;
-  }
-}
-
-# Filter criteria for block queries
-struct BlockFilter {
-  kinds @0 :List(BlockKind);
-  hasKinds @1 :Bool;
-  roles @2 :List(Role);
-  hasRoles @3 :Bool;
-  statuses @4 :List(Status);
-  hasStatuses @5 :Bool;
-  # Retired 2026-08-02 with the dead `compacted` block flag it filtered on.
-  # Cap'n Proto ordinals must stay sequential, so the slot is kept — unread,
-  # unwritten — rather than reused.
-  unusedExcludeCompacted @6 :Bool;
-  limit @7 :UInt32;
-  maxDepth @8 :UInt32;
-  parentId @9 :BlockId;
-  hasParentId @10 :Bool;
-}
-
-# What changed at a given version
-enum ChangeKind {
-  blockAdded @0;
-  blockDeleted @1;
-  edit @2;
-  statusChange @3;
-}
-
-# Snapshot of a context version for timeline navigation
-struct VersionSnapshot {
-  version @0 :UInt64;         # Context version number
-  timestamp @1 :UInt64;       # Unix millis when this version was created
-  blockCount @2 :UInt32;      # Number of blocks at this version
-  changeKind @3 :ChangeKind;
-  changedBlockId @4 :BlockId; # The block that changed (if applicable)
-}
-
-# ============================================================================
-# Context & Kernel Types
-# ============================================================================
-
-struct KernelInfo {
-  id @0 :Data;                    # 16-byte KernelId (UUIDv7)
-  name @1 :Text;
-  userCount @2 :UInt32;
-  agentCount @3 :UInt32;
-  contexts @4 :List(ContextHandleInfo);
-}
+# A context's identity and metadata, plus staged and dead-lettered cross-context drift.
 
 # A context within a kernel
 struct Context {
@@ -917,62 +857,6 @@ struct ContextCluster {
   label @2 :Text;             # Kernel-synthesized cluster label (e.g. top shared keyword); empty if none
 }
 
-# Live state of one track (a clock domain: named cadence + score + attached
-# contexts — docs/tracks.md). Answered from the beat scheduler's IN-MEMORY
-# truth: the persisted `tracks` row's playhead lags (written only on transport
-# transitions), so the wire never reads the row. Used by listTracks.
-struct TrackInfo {
-  id @0 :Text;                    # TrackId — the human name ([a-z0-9_-], never empty)
-  scoreContextId @1 :Data;        # 16-byte ContextId of the track's score context
-  playing @2 :Bool;               # transport: whether the clock is rolling
-  playheadTick @3 :Int64;         # musical time (event-counted; freezes on pause)
-  periodUs @4 :UInt64;            # beat period (the tempo knob), microseconds
-  beatsPerPhrase @5 :UInt64;
-  beatCount @6 :UInt64;           # beats elapsed while playing (resets on kernel restart)
-  lastEpochNs @7 :UInt64;         # wall clock (ns) of the most recent beat; 0 = never fired
-  clockKind @8 :Text;             # clock driver: "system" today, "modeled" at M3
-  attached @9 :List(Data);        # 16-byte ContextIds currently bound to this track
-}
-
-struct KernelConfig {
-  name @0 :Text;
-  mounts @1 :List(MountSpec);
-  consentMode @2 :ConsentMode;
-}
-
-# Kernel-wide timeout policy. Mirrors `kaijutsu_types::TimeoutPolicy`.
-# Wire form is millis (UInt64); Rust side uses `Duration`.
-struct TimeoutPolicy {
-  kaishRequestTimeoutMs @0 :UInt64;
-  rcScriptTimeoutMs @1 :UInt64;
-  hookBodyTimeoutMs @2 :UInt64;
-  initScriptTimeoutMs @3 :UInt64;
-  llmRequestTimeoutMs @4 :UInt64;
-  llmIdleTimeoutMs @5 :UInt64;
-  mcpConnectTimeoutMs @6 :UInt64;
-  mcpCallTimeoutDefaultMs @7 :UInt64;
-}
-
-struct MountSpec {
-  path @0 :Text;           # e.g. "/mnt/kaijutsu"
-  source @1 :Text;         # e.g. "~/src/kaijutsu" or "kernel://other"
-  writable @2 :Bool;
-}
-
-enum ConsentMode {
-  collaborative @0;
-  autonomous @1;
-}
-
-struct MountInfo {
-  path @0 :Text;
-  readOnly @1 :Bool;
-}
-
-# ============================================================================
-# Drift Types (Multi-Context Communication)
-# ============================================================================
-
 # Information about a staged drift (pending content transfer)
 struct StagedDriftInfo {
   id @0 :UInt64;
@@ -999,170 +883,137 @@ struct DeadLetter {
 }
 
 # ============================================================================
-# LLM Types
+# Music and time
 # ============================================================================
+# Wire types for the render-cue / beat-sync musical timebase (docs/midi.md) and live track state.
 
-struct LlmRequest {
-  content @0 :Text;       # The prompt text
-  model @1 :Text;         # Optional model name, uses server default if empty
-  contextId @2 :Data;     # 16-byte ContextId — target context for response blocks
-}
-
-struct Completion {
-  text @0 :Text;
-  displayText @1 :Text;
-  kind @2 :CompletionKind;
-}
-
-enum CompletionKind {
-  command @0;
-  path @1;
-  variable @2;
-  keyword @3;
-}
-
-# Information about a single LLM provider
-struct LlmProviderInfo {
-  name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
-  defaultModel @1 :Text;      # Default model for this provider
-  available @2 :Bool;         # Whether the provider is available (has API key)
-  models @3 :List(Text);      # All available model IDs (from aliases + default)
-}
-
-# Current LLM configuration for a kernel
-struct LlmConfigInfo {
-  defaultProvider @0 :Text;   # Name of the default provider
-  defaultModel @1 :Text;      # Name of the default model
-  providers @2 :List(LlmProviderInfo);
-}
-
-# ============================================================================
-# Tool Types
-# ============================================================================
-
-struct ToolInfo {
-  name @0 :Text;
-  description @1 :Text;
-}
-
-struct ToolCall {
-  tool @0 :Text;         # Tool name (e.g., "cell.edit")
-  params @1 :Text;       # JSON parameters
-  requestId @2 :Text;    # For correlation
-}
-
-struct ToolResult {
-  requestId @0 :Text;
-  success @1 :Bool;
-  output @2 :Text;       # JSON result
-  error @3 :Text;        # Error if !success
-}
-
-struct ToolSchema {
-  name @0 :Text;
-  description @1 :Text;
-  inputSchema @2 :Text;  # JSON Schema for params
-  category @3 :Text;
-}
-
-# Tool filter mode — controls which tools are available
-struct ToolFilterConfig {
+# A render directive crossing the seam to an off-box sink (docs/midi.md
+# "Render is a wire cue"; docs/pcm.md "How it converges"). Mirrors
+# kaijutsu_audio::RenderCue: mime-keyed symbolic content (or a CAS hash the
+# sink resolves), scheduled at receipt + lead. Generalizes the slice-3
+# play-now audio directive — audio samples, clip records, MIDI, and ABC all
+# ride this one struct and the sink dispatches on `mime`.
+struct RenderCue {
+  mime @0 :Text;          # dispatch key: audio/wav, audio/midi, text/vnd.abc, …
+  leadNanos @1 :UInt64;   # relative schedule lead; sink fires at receipt+lead. 0 = now.
   union {
-    all @0 :Void;                 # All tools available
-    allowList @1 :List(Text);     # Only these tools available
-    denyList @2 :List(Text);      # All except these tools available
+    inline @2 :Data;      # inline symbolic content / tiny sample bytes
+    casHash @3 :Text;     # hex ContentHash — resolved from CAS at the sink
   }
+  # Sender wallclock (ns since UNIX_EPOCH) at emission — mirrors BeatRef.epochNs
+  # below (phase-align Slice 2). 0 = unstamped (an old peer, or a synthetic cue
+  # with no meaningful emission instant, e.g. a RENDER_FLUSH directive). A sink
+  # back-dates `leadNanos` by however old the cue reads on receipt, so per-cue
+  # transfer latency can't walk the render out of phase with the click
+  # (`docs/midi.md`).
+  epochNs @4 :UInt64;
+  # The beat coordinate this cue is placed at (1 tick == 1 beat — see
+  # publishBeatSync's own doc comment), stamped by the kernel for a
+  # track-committed cell (phase-align Slice 2). Unset for directive cues with
+  # no track/beat association (transport flush, kj play's play-now, the
+  # PREPARE_MIME cache-warm directive) — those always dispatch immediately
+  # regardless of a sink's clock mode.
+  onsetBeat @5 :Float64;
+  hasOnsetBeat @6 :Bool;  # True if onsetBeat is set (distinguishes 0.0 from unset)
 }
 
-# ============================================================================
-# OutputData Types (Structured Output from kaish commands)
-# ============================================================================
-
-enum EntryType {
-  text @0;
-  file @1;
-  directory @2;
-  executable @3;
-  symlink @4;
+# A low-rate beat reference for a sink's continuous local timebase (docs/midi.md
+# "The relative-lead timebase, analyzed"). Mirrors kaijutsu_audio::BeatRef: the
+# fractional beat coordinate at emission plus the tempo, PLUS the sender's
+# wallclock at emission (epochNs) — mirroring reportClockEstimate's epochNs
+# (the reverse-direction ClockEstimate path this mirrors forward). The sink
+# back-dates each reference to its own emission instant (BeatRef::backdated_at)
+# rather than folding every buffered reference at one receipt-time now — a
+# delivery flood (refs queued behind a turn's streamed output) would otherwise
+# walk the phasor several beats. epochNs == 0 means unstamped (an old peer) —
+# the sink falls back to receipt time, the old behavior. The phasor still never
+# hard-resyncs: a fresh reference nudges it, it doesn't snap.
+struct BeatRef {
+  beat @0 :Float64;       # fractional beat coordinate at emission; integers are onsets
+  tempoBps @1 :Float64;   # tempo in beats per second (120 BPM == 2.0)
+  epochNs @2 :UInt64;     # sender wallclock (ns since UNIX_EPOCH) at emission; 0 = unstamped
 }
 
-struct OutputNode {
+# One MIDI port as a reporting sink sees it (docs/midi-next.md "Presence is
+# sink-fed"). Backend-neutral by construction: `name` is the port's display
+# name — what profile match strings match on — and `address` is the backend's
+# own handle for it ("client:port" under ALSA, a unique id under CoreMIDI),
+# opaque to the kernel and carried for logs/disambiguation only. No ALSA
+# client numbers ever reach a profile.
+struct MidiPortFact {
   name @0 :Text;
-  entryType @1 :EntryType;
-  text @2 :Text;             # content when hasText=true; None vs Some("") distinction
-  hasText @3 :Bool;
-  cells @4 :List(Text);
-  children @5 :List(OutputNode);
+  address @1 :Text;
 }
 
-struct OutputData {
-  headers @0 :List(Text);
-  hasHeaders @1 :Bool;       # None vs Some([]) distinction
-  root @2 :List(OutputNode);
-  richJson @3 :Text;   # kj / builtin structured payload (JSON-encoded); empty = none. See OutputData::rich_json.
+# Live state of one track (a clock domain: named cadence + score + attached
+# contexts — docs/tracks.md). Answered from the beat scheduler's IN-MEMORY
+# truth: the persisted `tracks` row's playhead lags (written only on transport
+# transitions), so the wire never reads the row. Used by listTracks.
+struct TrackInfo {
+  id @0 :Text;                    # TrackId — the human name ([a-z0-9_-], never empty)
+  scoreContextId @1 :Data;        # 16-byte ContextId of the track's score context
+  playing @2 :Bool;               # transport: whether the clock is rolling
+  playheadTick @3 :Int64;         # musical time (event-counted; freezes on pause)
+  periodUs @4 :UInt64;            # beat period (the tempo knob), microseconds
+  beatsPerPhrase @5 :UInt64;
+  beatCount @6 :UInt64;           # beats elapsed while playing (resets on kernel restart)
+  lastEpochNs @7 :UInt64;         # wall clock (ns) of the most recent beat; 0 = never fired
+  clockKind @8 :Text;             # clock driver: "system" today, "modeled" at M3
+  attached @9 :List(Data);        # 16-byte ContextIds currently bound to this track
 }
 
 # ============================================================================
-# Shell Types
+# Kernel configuration
 # ============================================================================
+# Kernel identity, mount/consent policy, and timeout defaults.
 
-struct HistoryEntry {
-  id @0 :UInt64;
-  code @1 :Text;
-  timestamp @2 :UInt64;
+struct KernelInfo {
+  id @0 :Data;                    # 16-byte KernelId (UUIDv7)
+  name @1 :Text;
+  userCount @2 :UInt32;
+  agentCount @3 :UInt32;
+  contexts @4 :List(ContextHandleInfo);
 }
 
-# Result from shell command execution (matches kaish ExecResult)
-struct ShellExecResult {
-  code @0 :Int64;           # Exit code (0 = success)
-  ok @1 :Bool;              # Convenience: code == 0
-  stdout @2 :Data;          # Raw bytes (may be binary — images, serialized blobs, etc.)
-  stderr @3 :Text;          # Always text (diagnostics, warnings)
-  data @4 :ShellValue;      # Parsed result value (structured)
-  outputData @5 :OutputData; # Structured output for tables/trees
-}
-
-# Shell variable value (mirrors kaish ast::Value)
-struct ShellValue {
-  union {
-    null @0 :Void;
-    bool @1 :Bool;
-    int @2 :Int64;
-    float @3 :Float64;
-    string @4 :Text;
-    json @5 :Text;       # serde_json::Value serialized
-    blob @6 :Text;       # LEGACY: kaish dropped Value::Blob in 0.9; never produced now
-    bytes @7 :Data;      # inline binary (kaish Value::Bytes) — raw bytes on wire
-  }
-}
-
-# Shell variable name + value pair
-struct ShellVar {
+struct KernelConfig {
   name @0 :Text;
-  value @1 :ShellValue;
+  mounts @1 :List(MountSpec);
+  consentMode @2 :ConsentMode;
 }
 
-struct KernelOutputEvent {
-  execId @0 :UInt64;
-  event @1 :OutputEvent;
-}
-
-struct OutputEvent {
-  union {
-    stdout @0 :Text;
-    stderr @1 :Text;
-    exitCode @2 :Int32;
-    structured @3 :OutputData;  # Structured output
-  }
-}
-
-interface KernelOutput {
-  onOutput @0 (event :KernelOutputEvent);
+# Kernel-wide timeout policy. Mirrors `kaijutsu_types::TimeoutPolicy`.
+# Wire form is millis (UInt64); Rust side uses `Duration`.
+struct TimeoutPolicy {
+  kaishRequestTimeoutMs @0 :UInt64;
+  rcScriptTimeoutMs @1 :UInt64;
+  hookBodyTimeoutMs @2 :UInt64;
+  initScriptTimeoutMs @3 :UInt64;
+  llmRequestTimeoutMs @4 :UInt64;
+  llmIdleTimeoutMs @5 :UInt64;
+  mcpConnectTimeoutMs @6 :UInt64;
+  mcpCallTimeoutDefaultMs @7 :UInt64;
 }
 
 # ============================================================================
-# VFS Types
+# VFS and mounts
 # ============================================================================
+# The virtual filesystem's wire types and its RPC interface.
+
+struct MountSpec {
+  path @0 :Text;           # e.g. "/mnt/kaijutsu"
+  source @1 :Text;         # e.g. "~/src/kaijutsu" or "kernel://other"
+  writable @2 :Bool;
+}
+
+enum ConsentMode {
+  collaborative @0;
+  autonomous @1;
+}
+
+struct MountInfo {
+  path @0 :Text;
+  readOnly @1 :Bool;
+}
 
 enum FileType {
   file @0;
@@ -1225,10 +1076,6 @@ struct SnapshotNode {
                                # no, rendered as a seam rather than failing the walk
 }
 
-# ============================================================================
-# VFS Activity Digest (Lane K, FSN slice-1, docs/scenes/vfs.md)
-# ============================================================================
-
 struct VfsActivityEntry {
   # path is normalized MountTable form: absolute, /-rooted, no trailing slash —
   # the SAME namespace and format as Vfs.snapshot paths and the app's listing keys.
@@ -1242,13 +1089,228 @@ struct VfsActivityEntry {
 # digest self-heals on the next tick (see kaijutsu-kernel's vfs/activity.rs
 # for the full lossy-safe reasoning).
 interface VfsActivityEvents {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   # Lossy-safe: totals are absolute state snapshots, never deltas.
   onActivityDigest @0 (entries :List(VfsActivityEntry), globalTotal :UInt64);
 }
 
+interface Vfs {
+  # Next free ordinal: 17. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
+  # Reading
+  getattr @0 (path :Text) -> (attr :FileAttr);
+  readdir @1 (path :Text) -> (entries :List(DirEntry));
+  read @2 (path :Text, offset :UInt64, size :UInt32) -> (data :Data);
+  readlink @3 (path :Text) -> (target :Text);
+
+  # Writing
+  write @4 (path :Text, offset :UInt64, data :Data) -> (written :UInt32);
+  create @5 (path :Text, mode :UInt32) -> (attr :FileAttr);
+  mkdir @6 (path :Text, mode :UInt32) -> (attr :FileAttr);
+  unlink @7 (path :Text);
+  rmdir @8 (path :Text);
+  rename @9 (from :Text, to :Text);
+  truncate @10 (path :Text, size :UInt64);
+  setattr @11 (path :Text, attr :SetAttr) -> (newAttr :FileAttr);
+  symlink @12 (path :Text, target :Text) -> (attr :FileAttr);
+
+  # Metadata
+  readOnly @13 () -> (readOnly :Bool);
+  statfs @14 () -> (stat :StatFs);
+
+  # Path resolution
+  realPath @15 (path :Text) -> (realPath :Text);
+
+  # FSN world stage-0/1 plumbing (docs/scenes/vfs.md). Recursive listing walk
+  # with generation stamps, VFS-mediated (never touches the host filesystem
+  # directly) so nested mounts and virtual backends compose correctly.
+  # `depth` (0 = just `root`, no children walked) and `maxEntries` (total
+  # node count in the reply tree, root included) are both caller-supplied but
+  # server-clamped to a hard ceiling regardless of what's asked — walking `/`
+  # with no cap must be structurally impossible. `generation` mirrors
+  # `root.generation` (a quick staleness check without descending the tree);
+  # `truncated` is true iff ANY node in the reply has `truncatedHere` set (a
+  # cheap "is this reply complete" check without walking the whole tree). A
+  # backend error mid-walk fails the whole call rather than returning a
+  # partial tree that would look indistinguishable from an intentional cut.
+  snapshot @16 (path :Text, depth :UInt32, maxEntries :UInt32)
+      -> (root :SnapshotNode, generation :UInt64, truncated :Bool);
+}
+
 # ============================================================================
-# Peer Types
+# LLM
 # ============================================================================
+# Per-kernel multi-provider LLM request/response and configuration types.
+
+struct LlmRequest {
+  content @0 :Text;       # The prompt text
+  model @1 :Text;         # Optional model name, uses server default if empty
+  contextId @2 :Data;     # 16-byte ContextId — target context for response blocks
+}
+
+struct Completion {
+  text @0 :Text;
+  displayText @1 :Text;
+  kind @2 :CompletionKind;
+}
+
+enum CompletionKind {
+  command @0;
+  path @1;
+  variable @2;
+  keyword @3;
+}
+
+# Information about a single LLM provider
+struct LlmProviderInfo {
+  name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
+  defaultModel @1 :Text;      # Default model for this provider
+  available @2 :Bool;         # Whether the provider is available (has API key)
+  models @3 :List(Text);      # All available model IDs (from aliases + default)
+}
+
+# Current LLM configuration for a kernel
+struct LlmConfigInfo {
+  defaultProvider @0 :Text;   # Name of the default provider
+  defaultModel @1 :Text;      # Name of the default model
+  providers @2 :List(LlmProviderInfo);
+}
+
+# ============================================================================
+# Tools
+# ============================================================================
+# Generic tool-call vocabulary — not MCP-specific; see the MCP section below for that protocol's own types.
+
+struct ToolInfo {
+  name @0 :Text;
+  description @1 :Text;
+}
+
+struct ToolCall {
+  tool @0 :Text;         # Tool name (e.g., "cell.edit")
+  params @1 :Text;       # JSON parameters
+  requestId @2 :Text;    # For correlation
+}
+
+struct ToolResult {
+  requestId @0 :Text;
+  success @1 :Bool;
+  output @2 :Text;       # JSON result
+  error @3 :Text;        # Error if !success
+}
+
+struct ToolSchema {
+  name @0 :Text;
+  description @1 :Text;
+  inputSchema @2 :Text;  # JSON Schema for params
+  category @3 :Text;
+}
+
+# Tool filter mode — controls which tools are available
+struct ToolFilterConfig {
+  union {
+    all @0 :Void;                 # All tools available
+    allowList @1 :List(Text);     # Only these tools available
+    denyList @2 :List(Text);      # All except these tools available
+  }
+}
+
+# ============================================================================
+# Shell and output
+# ============================================================================
+# kaish structured output types and the KernelOutput push channel.
+
+enum EntryType {
+  text @0;
+  file @1;
+  directory @2;
+  executable @3;
+  symlink @4;
+}
+
+struct OutputNode {
+  name @0 :Text;
+  entryType @1 :EntryType;
+  text @2 :Text;             # content when hasText=true; None vs Some("") distinction
+  hasText @3 :Bool;
+  cells @4 :List(Text);
+  children @5 :List(OutputNode);
+}
+
+struct OutputData {
+  headers @0 :List(Text);
+  hasHeaders @1 :Bool;       # None vs Some([]) distinction
+  root @2 :List(OutputNode);
+  richJson @3 :Text;   # kj / builtin structured payload (JSON-encoded); empty = none. See OutputData::rich_json.
+}
+
+struct HistoryEntry {
+  id @0 :UInt64;
+  code @1 :Text;
+  timestamp @2 :UInt64;
+}
+
+# Result from shell command execution (matches kaish ExecResult)
+struct ShellExecResult {
+  code @0 :Int64;           # Exit code (0 = success)
+  ok @1 :Bool;              # Convenience: code == 0
+  stdout @2 :Data;          # Raw bytes (may be binary — images, serialized blobs, etc.)
+  stderr @3 :Text;          # Always text (diagnostics, warnings)
+  data @4 :ShellValue;      # Parsed result value (structured)
+  outputData @5 :OutputData; # Structured output for tables/trees
+}
+
+# Shell variable value (mirrors kaish ast::Value)
+struct ShellValue {
+  union {
+    null @0 :Void;
+    bool @1 :Bool;
+    int @2 :Int64;
+    float @3 :Float64;
+    string @4 :Text;
+    json @5 :Text;       # serde_json::Value serialized
+    blob @6 :Text;       # LEGACY: kaish dropped Value::Blob in 0.9; never produced now
+    bytes @7 :Data;      # inline binary (kaish Value::Bytes) — raw bytes on wire
+  }
+}
+
+# Shell variable name + value pair
+struct ShellVar {
+  name @0 :Text;
+  value @1 :ShellValue;
+}
+
+struct KernelOutputEvent {
+  execId @0 :UInt64;
+  event @1 :OutputEvent;
+}
+
+struct OutputEvent {
+  union {
+    stdout @0 :Text;
+    stderr @1 :Text;
+    exitCode @2 :Int32;
+    structured @3 :OutputData;  # Structured output
+  }
+}
+
+interface KernelOutput {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
+  onOutput @0 (event :KernelOutputEvent);
+}
+
+# ============================================================================
+# Peers
+# ============================================================================
+# Named RPC participants the kernel can dispatch invocations to (the app, MCP servers, future clients).
 
 # Configuration for attaching a peer.
 struct PeerConfig {
@@ -1267,6 +1329,10 @@ struct PeerInfo {
 # Registered via attachPeer; the kernel calls back to dispatch work.
 # Same pattern as MCP sampling: server holds callback to client.
 interface PeerCommands {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   invoke @0 (action :Text, params :Data) -> (result :Data);
 }
 
@@ -1319,6 +1385,10 @@ struct McpResourceContents {
 
 # Callback interface for receiving MCP resource events from the server
 interface ResourceEvents {
+  # Next free ordinal: 2. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   # Called when a resource's content is updated
   onResourceUpdated @0 (server :Text, uri :Text, contents :McpResourceContents, hasContents :Bool);
   # Called when a server's resource list changes (resources added or removed)
@@ -1368,6 +1438,10 @@ struct McpProgress {
 }
 
 interface ProgressEvents {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   onProgress @0 (progress :McpProgress);
 }
 
@@ -1387,6 +1461,10 @@ struct McpElicitationResponse {
 }
 
 interface ElicitationEvents {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   onRequest @0 (request :McpElicitationRequest) -> (response :McpElicitationResponse);
 }
 
@@ -1434,6 +1512,10 @@ struct PermissionAskResponse {
 }
 
 interface PermissionEvents {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   onAsk @0 (request :PermissionAskRequest) -> (response :PermissionAskResponse);
 }
 
@@ -1454,14 +1536,35 @@ struct McpLogMessage {
 }
 
 interface LoggingEvents {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   onLog @0 (log :McpLogMessage);
 }
 
 # ============================================================================
-# Server Interfaces
+# kj
 # ============================================================================
+# Wire shape for the ACP-facing kj command catalog.
+
+struct KjCommand {
+  name @0 :Text;
+  description @1 :Text;
+  inputHint @2 :Text;
+  argvPrefix @3 :List(Text);
+}
+
+# ============================================================================
+# The kernel interface
+# ============================================================================
+# World and Kernel — the RPC surface everything above exists to serve; last because it is built from the vocabulary above it.
 
 interface World {
+  # Next free ordinal: 3. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   # Identity
   whoami @0 () -> (identity :Identity);
 
@@ -1471,9 +1574,14 @@ interface World {
 }
 
 interface Kernel {
+  # Next free ordinal: 101. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
   # ==========================================================================
   # Kernel info & liveness
   # ==========================================================================
+
   getInfo @0 (trace :TraceContext) -> (info :KernelInfo);
 
   # Cheap liveness probe used by the client's reconnection FSM.
@@ -1487,48 +1595,86 @@ interface Kernel {
   # ==========================================================================
   # kaish execution
   # ==========================================================================
+
   execute @2 (code :Text, trace :TraceContext) -> (execId :UInt64);
+
   interrupt @3 (execId :UInt64, trace :TraceContext);
+
   complete @4 (partial :Text, cursor :UInt32, trace :TraceContext) -> (completions :List(Completion));
+
   subscribeOutput @5 (callback :KernelOutput);
+
   getCommandHistory @6 (limit :UInt32, trace :TraceContext) -> (entries :List(HistoryEntry));
 
   # ==========================================================================
   # Shell (kaish REPL with block output)
   # ==========================================================================
+
   # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
   shellExecute @7 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
   getCwd @8 () -> (path :Text);
+
   setCwd @9 (path :Text) -> (success :Bool, error :Text);
+
   getLastResult @10 () -> (result :ShellExecResult);
 
   # Shell variable introspection (kaish scope)
   getShellVar @11 (name :Text) -> (value :ShellValue, found :Bool);
+
   setShellVar @12 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
+
   listShellVars @13 () -> (vars :List(ShellVar));
+
+  # Addressed forms of the durable context cwd operations. Unlike getCwd /
+  # setCwd these never consult or mutate the connection's ambient joined
+  # context, so one client can safely manage several sessions.
+  getContextCwd @97 (contextId :Data, trace :TraceContext) -> (path :Text, found :Bool);
+
+  setContextCwd @98 (contextId :Data, path :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # ==========================================================================
   # VFS & mounts
   # ==========================================================================
+
   vfs @14 () -> (vfs :Vfs);
+
   listMounts @15 () -> (mounts :List(MountInfo));
+
   mount @16 (path :Text, source :Text, writable :Bool);
+
   unmount @17 (path :Text) -> (success :Bool);
+
+  # ── VFS activity digest stream (Lane K, FSN slice-1, docs/scenes/vfs.md) ──
+  # Push channel: server ticks a per-connection timer and streams
+  # `onActivityDigest` callbacks reporting which directories have gotten hot
+  # since this subscriber's last delivered digest. `intervalMs` is the
+  # requested tick period; 0 requests the server default (1000ms), and the
+  # server floors any request below 500ms. A quiet tick (nothing changed
+  # anywhere since last delivery) sends nothing at all. Connection-scoped,
+  # same lifecycle as subscribeEditor — no cross-connection dedupe, the
+  # bridge simply dies with the connection.
+  subscribeVfsActivity @89 (callback :VfsActivityEvents, intervalMs :UInt32);
 
   # ==========================================================================
   # Tool execution
   # ==========================================================================
+
   executeTool @18 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
+
   getToolSchemas @19 (trace :TraceContext) -> (schemas :List(ToolSchema));
 
   # ==========================================================================
   # LLM operations & configuration (per-kernel multi-provider)
   # ==========================================================================
+
   prompt @20 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
+
   getLlmConfig @21 (trace :TraceContext) -> (config :LlmConfigInfo);
+
   setDefaultProvider @22 (provider :Text) -> (success :Bool, error :Text);
+
   setDefaultModel @23 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # Configure LLM provider/model for a specific context (per-context model assignment).
@@ -1538,8 +1684,11 @@ interface Kernel {
   # ==========================================================================
   # Context management & lifecycle (ContextId = 16-byte UUIDv7 as Data)
   # ==========================================================================
+
   listContexts @25 (trace :TraceContext) -> (contexts :List(ContextHandleInfo));
+
   createContext @26 (label :Text, contextType :Text) -> (id :Data);
+
   joinContext @27 (contextId :Data, instance :Text, trace :TraceContext) -> (contextId :Data);
 
   # Get this kernel's context ID and label
@@ -1571,288 +1720,37 @@ interface Kernel {
   # List all presets for this kernel
   listPresets @33 (trace :TraceContext) -> (presets :List(PresetInfo));
 
-  # ==========================================================================
-  # Blocks: queries & CRDT sync
-  # ==========================================================================
-  # @34 retired (2026-08-15 flag day, docs/crdt-position-2026-08.md): was
-  # getContextState, already a tombstone handler returning "removed: use
-  # getBlocks @35 + getContextVersion @110" before this — this just formalizes
-  # the ordinal as unusable at the schema level too. Cap'n Proto requires
-  # interface method ordinals to be sequential with no holes (see @79-@83
-  # below), so it stays a stub, not a hole.
+  # ── Label resolution (DB-driven — deliberately NOT `listContexts`) ──
 
-  # Fetch blocks by query: all, byIds, or byFilter.
-  #
-  # `version` is the context's mutation counter **at the instant the blocks
-  # were read** — both come from one guard, so no mutation can slip between
-  # them. It is what joins a snapshot to the change feed: a client subscribes,
-  # fetches here, then discards every buffered delivery at or below this
-  # version and applies the rest (docs/change-feed.md rules 21-26). Without it
-  # a client cannot tell whether a buffered append is already included, and
-  # applying one twice corrupts the text.
-  getBlocks @34 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot), version :UInt64);
+  # Resolve a label straight against KernelDb::find_context_by_label, bypassing
+  # the in-memory DriftRouter entirely. `listContexts` reads the DriftRouter,
+  # which `create_shared_kernel`'s boot-time recovery already re-registers
+  # every NON-ARCHIVED context into on every restart (KernelDb is the
+  # recovery source) — so for the common live/concluded case, `listContexts`
+  # and this call agree. The gap is narrower than "never rehydrated": an
+  # ARCHIVED context's DriftRouter entry does NOT survive a restart (recovery
+  # filters `archived_at IS NULL`), so it stays durable (KernelDb row +
+  # BlockStore document both survive) but invisible to listContexts until
+  # something re-registers it (see joinContext's registry-heal). More to the
+  # point for registerSession's upsert/attach decision: even WITHOUT any
+  # restart, a label a live context already holds needs resolving here rather
+  # than through listContexts, because the decision (attach vs. suffix vs.
+  # create) has to be made before creating anything — reusing listContexts
+  # would mean scanning + label-matching every context in the kernel on every
+  # register_session call instead of one indexed lookup. `found = false`
+  # means no context currently holds this label.
+  resolveContextLabel @92 (label :Text, trace :TraceContext) -> (found :Bool, info :ContextHandleInfo);
 
-  # Projected revision of a context's block document, with no oplog bytes:
-  # clients use it for staleness/gap detection without decoding DTE.
-  getContextVersion @35 (contextId :Data, trace :TraceContext) -> (version :UInt64);
-
-  # @37 retired (2026-08-15 flag day, docs/crdt-position-2026-08.md): was
-  # pushOps, letting a client push raw diamond-types operations into a kernel
-  # document. Zero production callers (verified independently three times) —
-  # its deletion is what makes concurrent merge into kernel documents
-  # structurally impossible: `BlockStore::merge_ops` (kernel-level,
-  # kaijutsu-kernel/src/block_store.rs) had exactly one caller, this handler,
-  # and is deleted with it. Clients neither author nor decode CRDT operations;
-  # the kernel is the sole sequencer. Stub, not a hole — see @79-@83.
-
-  # Compact a context's oplog, bumping sync generation. Server-side
-  # maintenance only (docs/change-feed.md "Deleted by this change") — a
-  # client holding materialized block state (via `ContextObserver` /
-  # `getBlocks`) is unaffected and is not notified.
-  compactContext @36 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
-
-  # ==========================================================================
-  # Blocks: subscriptions
-  # ==========================================================================
-  subscribeBlocks @37 (callback :BlockEvents);
-
-  # Subscribe to block events with server-side filtering.
-  # Like subscribeBlocks but the server applies the filter before sending,
-  # reducing bandwidth and client CPU during high-throughput streaming.
-  subscribeBlocksFiltered @38 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
-
-  # Subscribe to ONE context's change feed (docs/change-feed.md). The
-  # replacement for the two methods above, and for the raw-operation events
-  # they carry; they remain only until the in-repo clients migrate.
-  #
-  # Ordering with the snapshot matters and is the client's job: subscribe
-  # FIRST, buffer what arrives, then `getBlocks` and read the version it
-  # returns, discard every buffered delivery at or below that version, and
-  # apply the rest in order. Fetching first loses an event that lands in the
-  # gap; applying first corrupts the text; the version resolves the overlap.
-  #
-  # One subscription is one context, because the version is one context's
-  # counter. Watching several means several subscriptions. The feed ends when
-  # the observer capability is dropped — there is no unsubscribe call.
-  subscribeContext @39 (contextId :Data, observer :ContextObserver, trace :TraceContext);
-
-  # ==========================================================================
-  # Blocks: mutation & curation
-  # ==========================================================================
-  # Set the excluded flag on a block (staging curation).
-  setBlockExcluded @40 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # Move a block to a new position. When `hasAfter` is true, `after` is
-  # the block to land after; otherwise the block is parked at the
-  # beginning of the document. Mirrors the `has_parent_id` idiom used
-  # elsewhere in the schema.
-  moveBlock @41 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # ==========================================================================
-  # Turn control
-  # ==========================================================================
-  # Interrupt a running LLM stream or shell jobs for a context.
-  # immediate=false → soft interrupt (stop agentic loop after current tool turn).
-  # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
-  # Returns success=false when context has no active interrupt state (i.e. nothing running).
-  interruptContext @42 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
-
-  # ==========================================================================
-  # Input document (CRDT scratchpad per context)
-  # ==========================================================================
-  # Each context has a companion CRDT text document for compose input.
-  # Any participant can read/write it. Submit snapshots to conversation block.
-
-  # High-level edit: insert text at position, delete characters
-  editInput @43 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # Full state fetch for join/reconnect recovery
-  getInputState @44 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
-
-  # @46 retired (2026-08-15 flag day, docs/crdt-position-2026-08.md): was
-  # pushInputOps, the input-document twin of `pushOps` (raw DTE ops from a
-  # CRDT-aware client). Same zero-production-callers finding, same reasoning:
-  # clients edit via `editInput`'s high-level insert/delete, never by
-  # authoring CRDT ops themselves. Stub, not a hole — see @79-@83.
-
-  # Atomic submit: read input, create block, clear input.
-  # Mode is explicit — no prefix detection.
-  submitInput @45 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
-
-  # Clear the input document for a context (discard draft).
-  # Emits InputCleared so all clients can reset their compose state.
-  clearInput @46 (contextId :Data, trace :TraceContext) -> ();
-
-  # ==========================================================================
-  # Timeline navigation (fork-first temporal model)
-  # ==========================================================================
-  # The past is read-only, but forking is ubiquitous.
-
-  # Cherry-pick a block into another context (carries lineage)
-  cherryPickBlock @47 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
-
-  # Get context version history for timeline scrubber
-  getContextHistory @48 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
-
-  # ==========================================================================
-  # Semantic search & clustering
-  # ==========================================================================
-  # Semantic search: find contexts similar to a text query
-  searchSimilar @49 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
-
-  # Context neighbors: find contexts similar to a given context
-  getNeighbors @50 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
-
-  # Clustering: group contexts by semantic similarity
-  getClusters @51 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
-
-  # ==========================================================================
-  # Drift (cross-context communication with provenance)
-  # ==========================================================================
-  # List staged drifts pending flush
-  driftQueue @52 () -> (staged :List(StagedDriftInfo));
-
-  # Cancel a staged drift by ID
-  driftCancel @53 (stagedId :UInt64) -> (success :Bool);
-
-  # Inspect the drift router's dead-letter queue. Non-consuming — pairs with
-  # replayDeadLetter. Drifts land here when MAX_DRIFT_RETRIES is exceeded or
-  # the target context unregisters before delivery.
-  listDeadLetters @54 (trace :TraceContext) -> (items :List(DeadLetter));
-
-  # Replay a dead-letter item by id: extract from DLQ, reset retry count,
-  # push back to the staging queue for another flush attempt. Returns
-  # `replayed = false` when the id isn't present (already drained or
-  # never queued).
-  replayDeadLetter @55 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
-
-  # ==========================================================================
-  # Configuration (config as CRDT)
-  # ==========================================================================
-  # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are managed as CRDT documents.
-
-  # @56 retired (2026-08-15): was listConfigs, listing the /etc/config mount's
-  # loaded documents. Zero production callers (verified independently).
-  # Stub, not a hole — see @79-@83.
-
-  # @57 retired (2026-08-15): was reloadConfig — already repurposed as
-  # "restore to embedded default" once config became CRDT-owned (no host file
-  # left to reload from), duplicating resetConfig exactly. Zero production
-  # callers. Stub, not a hole — see @79-@83.
-
-  # @58 retired (2026-08-15): was resetConfig, resetting a config file to its
-  # embedded default. Zero production callers — `docs/crdt-melt.md` Lane B is
-  # melting config CRDT documents into plain files; a reseed tool for shipped
-  # defaults is the surviving shape, not a per-path RPC verb. Stub, not a
-  # hole — see @79-@83.
-
-  # Get config content (from CRDT)
-  getConfig @56 (path :Text) -> (content :Text, error :Text);
-
-  # ==========================================================================
-  # MCP (Model Context Protocol) management
-  # ==========================================================================
-  listMcpServers @57 () -> (servers :List(McpServerInfo));
-  callMcpTool @58 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
-
-  # MCP Resources (push-first with caching)
-  listMcpResources @59 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
-  subscribeMcpResources @60 (callback :ResourceEvents, instance :Text);
-
-  # MCP Roots (client advertises workspaces to servers)
-  setMcpRoots @61 (roots :List(McpRoot));
-
-  # MCP Prompts (poll-based with optional caching)
-  listMcpPrompts @62 (server :Text) -> (prompts :List(McpPrompt));
-  getMcpPrompt @63 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
-
-  # MCP Progress (push-based streaming)
-  subscribeMcpProgress @64 (callback :ProgressEvents);
-
-  # MCP Elicitation (server-initiated requests for user input)
-  subscribeMcpElicitations @65 (callback :ElicitationEvents, instance :Text);
-
-  # MCP Completion (request/response)
-  completeMcp @66 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
-
-  # MCP Logging
-  setMcpLogLevel @67 (server :Text, level :Text);
-  subscribeMcpLogs @68 (callback :LoggingEvents);
-
-  # MCP Cancellation
-  cancelMcpRequest @69 (server :Text, requestId :Text);
-
-  # ==========================================================================
-  # Peer registry (drift navigation transport)
-  # ==========================================================================
-  # Peers are named RPC participants (the Bevy app, MCP servers, future
-  # clients) that the kernel can dispatch invocations to. The transport is
-  # how MCP-driven agents tell the app to switch contexts, etc.
-
-  # Attach a peer to this kernel.
-  # `commands` is the callback the kernel uses to invoke this peer.
-  attachPeer @70 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
-
-  # List all attached peers on this kernel.
-  listPeers @71 () -> (peers :List(PeerInfo));
-
-  # Detach a peer from this kernel.
-  detachPeer @72 (nick :Text);
-
-  # Invoke a peer. Params and result are JSON bytes.
-  invokePeer @73 (nick :Text, action :Text, params :Data) -> (result :Data);
-
-  # ==========================================================================
-  # @79–@83 retired (KV store deleted 2026-07-04). Cap'n Proto requires
-  # interface method ordinals to be sequential with no holes, so the slots
-  # below are stubs, not real methods — do not give them behavior or reuse
-  # the names. The default `Server` trait impl already returns
-  # "unimplemented" for any stale caller. Was: kvGet/kvSet/kvDelete/kvKeys/
-  # kvWatch, the kernel key–value store. Superseded by setLastContext/
-  # getClientView below for the one real production use
-  # (docs/shared-state.md "KV retired"); full history in git.
-  # ==========================================================================
-
-  # ==========================================================================
-  # In-app editor sessions (the vi/edit builtin; see docs/vi.md)
-  # ==========================================================================
-  # A kernel-owned vi session bound to the CRDT block that owns a path's text.
-  # Session ids are global (no contextId needed); the path resolves the owner.
-  # Renderers draw `editorState`/`subscribeEditor` and forward keys to
-  # `editorKeys`. Edits mirror onto the CRDT block — rc/config permission errors
-  # surface here loudly (crash over corruption).
-  editorOpen @74 (path :Text, trace :TraceContext) -> (state :EditorState);
-  editorKeys @75 (sessionId :UInt64, keys :Text, trace :TraceContext) -> (state :EditorState);
-  editorState @76 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
-  editorSave @77 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
-  editorQuit @78 (sessionId :UInt64, trace :TraceContext) -> ();
-  # Push channel: server streams editor state changes (incl. future remote merges).
-  subscribeEditor @79 (callback :EditorEvents);
-
-  # ==========================================================================
-  # Per-client durable view state (docs/shared-state.md "Retiring KV")
-  # ==========================================================================
-  # The kernel-managed replacement for the app's one production KV use:
-  # "reopen the context this window was last looking at" on reconnect. Backed
-  # by a small normalized `client_views` KernelDb row keyed by the app's
-  # stable per-installation client id — not a stringly KV namespace.
-
-  # Record the last-viewed context for `clientId`. Idempotent re-write on the
-  # same value is harmless (the app fires this on every context switch,
-  # including the restore itself).
-  setLastContext @80 (clientId :Text, contextId :Text);
-
-  # Read back the last-viewed context for `clientId`. `found = false` when no
-  # view is on record for this client (matches `kvGet`/`getShellVar`'s
-  # value+found shape rather than an empty-string sentinel).
-  getClientView @81 (clientId :Text) -> (contextId :Text, found :Bool);
-
-  # ── Tracks (docs/tracks.md; the time well's Stage 3 wire slice) ──
-
-  # Enumerate every track's live state, straight from the beat scheduler's
-  # in-memory TrackState (see TrackInfo). Empty when no tracks exist or no
-  # scheduler is wired (embedded/test kernels).
-  listTracks @82 (trace :TraceContext) -> (tracks :List(TrackInfo));
+  # Set (or clear, on empty `originHost`) a context's advisory `originHost` —
+  # see `ContextHandleInfo.originHost`'s doc comment. Called once, right
+  # after `createContext`, by a client that knows its own hostname
+  # (`register_session` on the kaijutsu-mcp side); NOT part of `createContext`
+  # itself, so every other creation path (genesis bootstrap, fork, the app)
+  # is unaffected and keeps shipping today's two-arg call. Shared-trust
+  # model: advisory metadata, not auth — the server trusts the client's
+  # self-report, and a failed call here is non-fatal to the caller's own
+  # registration (log-and-continue, never a hard failure over a hostname).
+  setContextOriginHost @94 (contextId :Data, originHost :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # ── Time-well ring placement (docs/timewell.md) ──
 
@@ -1888,123 +1786,97 @@ interface Kernel {
   # already a no-op).
   archiveContext @86 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
 
-  # Commit a captured-MIDI batch onto the track `contextId` is attached to
-  # (docs/midi.md M2, "the ear is the sink's twin" — the structural reverse
-  # of RenderCue: the app hears, collates on its musical timer, and pushes;
-  # the kernel quantizes to the track grid and lands one data-only block in
-  # the score context). `mime` must be the MIDI_CAPTURE_MIME batch record.
-  # `casHash` "" = `payload` carries the record inline (the only form built
-  # today; a non-empty casHash is the reserved CAS arm, mirroring
-  # RenderCue's union — rejected until the client→kernel CAS write surface
-  # lands, docs/issues.md).
-  commitCapture @87 (contextId :Data, mime :Text, payload :Data, casHash :Text, trace :TraceContext) -> (blockId :BlockId);
+  # ── Per-client durable view state (docs/shared-state.md "Retiring KV") ──
+  # The kernel-managed replacement for the app's one production KV use:
+  # "reopen the context this window was last looking at" on reconnect. Backed
+  # by a small normalized `client_views` KernelDb row keyed by the app's
+  # stable per-installation client id — not a stringly KV namespace.
 
-  # One clock reference from an edge observer (docs/midi.md M3, "distribute
-  # tempo, not pulses" — the reverse of the BeatSync push, third mirror in
-  # the set): the observed master's beat coordinate + tempo, stamped with
-  # the observer's wallclock. ~2 Hz fire-and-forget; the kernel resolves the
-  # sender's track and slaves it only when that track's clock is `modeled`
-  # (`kj transport clock <track> modeled`). `source` is the observed ALSA
-  # port ("client:port"), for logs/attribution.
-  reportClockEstimate @88 (contextId :Data, beat :Float64, tempoBps :Float64, epochNs :UInt64, source :Text, trace :TraceContext) -> ();
+  # Record the last-viewed context for `clientId`. Idempotent re-write on the
+  # same value is harmless (the app fires this on every context switch,
+  # including the restore itself).
+  setLastContext @80 (clientId :Text, contextId :Text);
+
+  # Read back the last-viewed context for `clientId`. `found = false` when no
+  # view is on record for this client (matches `kvGet`/`getShellVar`'s
+  # value+found shape rather than an empty-string sentinel).
+  getClientView @81 (clientId :Text) -> (contextId :Text, found :Bool);
 
   # ==========================================================================
-  # VFS activity digest stream (Lane K, FSN slice-1, docs/scenes/vfs.md)
+  # Blocks: queries & CRDT sync
   # ==========================================================================
-  # Push channel: server ticks a per-connection timer and streams
-  # `onActivityDigest` callbacks reporting which directories have gotten hot
-  # since this subscriber's last delivered digest. `intervalMs` is the
-  # requested tick period; 0 requests the server default (1000ms), and the
-  # server floors any request below 500ms. A quiet tick (nothing changed
-  # anywhere since last delivery) sends nothing at all. Connection-scoped,
-  # same lifecycle as subscribeEditor — no cross-connection dedupe, the
-  # bridge simply dies with the connection.
-  subscribeVfsActivity @89 (callback :VfsActivityEvents, intervalMs :UInt32);
 
-  # ==========================================================================
-  # Sink-fed MIDI presence (docs/midi-next.md "Presence is sink-fed")
-  # ==========================================================================
-  # The app matches, the kernel records. A sink watches platform hotplug,
-  # matches port facts against the backend-neutral match strings in
-  # /etc/midi/devices/<name>, and reports here; the kernel writes the report
-  # into its EPHEMERAL /run/midi/<device> store as provenance-tagged facts
-  # (source: "sink"). Not context-scoped: presence is a fact about the rig,
-  # not about a conversation. `present` false is a first-class report (unplug)
-  # — stale presence that lies is worse than none, so the sink says so rather
-  # than going quiet. `backend` is the reporting sink's platform backend
-  # ("alsa", "coremidi"); `epochNs` is its wallclock at observation, and a
-  # report older than the one on file is dropped (latest timestamp wins).
-  # No facade gate, on purpose (the reportClockEstimate stance): presence is
-  # inert sensor data, and every player is inside the trust boundary.
-  # `sinkHost` is the reporting sink's own name for its machine — display and
-  # provenance only, so `kj midi list` can answer "live, but WHERE?" across a
-  # rig. It is NEVER the key anything is reaped by: presence is bound to the
-  # *connection* the report arrived on (the kernel attaches its own
-  # per-connection id and drops every record attributed to a connection when
-  # it dies), because a sink that crashes cannot send an unplug and cannot be
-  # trusted to identify itself honestly either. Empty from an older peer.
-  reportMidiPresence @90 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
-
-  # ==========================================================================
-  # Turn lifecycle stream
-  # ==========================================================================
-  # Push channel: the server bridges the kernel's `TurnFlow` outcome bus onto
-  # `TurnEvents` callbacks. Every turn announces — interactive prompts and
-  # kernel-driven autonomous turns alike — carrying the structured stop reason
-  # (`end_turn` / cancelled / `max_tokens` / `max_iterations`) that a client
-  # cannot infer from block status at all.
+  # Fetch blocks by query: all, byIds, or byFilter.
   #
-  # Kernel-wide, following `subscribeEditor`: no per-context filter parameter,
-  # because the event names its own `contextId` and a client watching several
-  # contexts should not need several subscriptions. Connection-scoped — the
-  # bridge dies with the connection, no cross-connection dedupe.
-  subscribeTurnEvents @91 (callback :TurnEvents);
+  # `version` is the context's mutation counter **at the instant the blocks
+  # were read** — both come from one guard, so no mutation can slip between
+  # them. It is what joins a snapshot to the change feed: a client subscribes,
+  # fetches here, then discards every buffered delivery at or below this
+  # version and applies the rest (docs/change-feed.md rules 21-26). Without it
+  # a client cannot tell whether a buffered append is already included, and
+  # applying one twice corrupts the text.
+  getBlocks @34 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot), version :UInt64);
+
+  # Projected revision of a context's block document, with no oplog bytes:
+  # clients use it for staleness/gap detection without decoding DTE.
+  getContextVersion @35 (contextId :Data, trace :TraceContext) -> (version :UInt64);
+
+  # Compact a context's oplog, bumping sync generation. Server-side
+  # maintenance only (docs/change-feed.md "Deleted by this change") — a
+  # client holding materialized block state (via `ContextObserver` /
+  # `getBlocks`) is unaffected and is not notified.
+  compactContext @36 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
 
   # ==========================================================================
-  # Label resolution (DB-driven — deliberately NOT `listContexts`)
+  # Blocks: subscriptions
   # ==========================================================================
-  # Resolve a label straight against KernelDb::find_context_by_label, bypassing
-  # the in-memory DriftRouter entirely. `listContexts` reads the DriftRouter,
-  # which `create_shared_kernel`'s boot-time recovery already re-registers
-  # every NON-ARCHIVED context into on every restart (KernelDb is the
-  # recovery source) — so for the common live/concluded case, `listContexts`
-  # and this call agree. The gap is narrower than "never rehydrated": an
-  # ARCHIVED context's DriftRouter entry does NOT survive a restart (recovery
-  # filters `archived_at IS NULL`), so it stays durable (KernelDb row +
-  # BlockStore document both survive) but invisible to listContexts until
-  # something re-registers it (see joinContext's registry-heal). More to the
-  # point for registerSession's upsert/attach decision: even WITHOUT any
-  # restart, a label a live context already holds needs resolving here rather
-  # than through listContexts, because the decision (attach vs. suffix vs.
-  # create) has to be made before creating anything — reusing listContexts
-  # would mean scanning + label-matching every context in the kernel on every
-  # register_session call instead of one indexed lookup. `found = false`
-  # means no context currently holds this label.
-  resolveContextLabel @92 (label :Text, trace :TraceContext) -> (found :Bool, info :ContextHandleInfo);
+
+  subscribeBlocks @37 (callback :BlockEvents);
+
+  # Subscribe to block events with server-side filtering.
+  # Like subscribeBlocks but the server applies the filter before sending,
+  # reducing bandwidth and client CPU during high-throughput streaming.
+  subscribeBlocksFiltered @38 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
+
+  # Subscribe to ONE context's change feed (docs/change-feed.md). The
+  # replacement for the two methods above, and for the raw-operation events
+  # they carry; they remain only until the in-repo clients migrate.
+  #
+  # Ordering with the snapshot matters and is the client's job: subscribe
+  # FIRST, buffer what arrives, then `getBlocks` and read the version it
+  # returns, discard every buffered delivery at or below that version, and
+  # apply the rest in order. Fetching first loses an event that lands in the
+  # gap; applying first corrupts the text; the version resolves the overlap.
+  #
+  # One subscription is one context, because the version is one context's
+  # counter. Watching several means several subscriptions. The feed ends when
+  # the observer capability is dropped — there is no unsubscribe call.
+  subscribeContext @39 (contextId :Data, observer :ContextObserver, trace :TraceContext);
 
   # ==========================================================================
-  # Permission asks (HookAction::Ask, D-57, docs/acp.md gap #2)
+  # Blocks: mutation & curation
   # ==========================================================================
-  # Kernel-wide, following `subscribeTurnEvents` rather than the per-
-  # connection `subscribeMcpElicitations` model: `HookAction::Ask` can fire
-  # from any call path, not just the connection that triggered it, so one
-  # subscription serves every context. No per-context filter parameter for
-  # the same reason `subscribeTurnEvents` has none — the request names its
-  # own `contextId`. See `PermissionEvents` above for the wire shape and
-  # `kaijutsu-kernel`'s `mcp::permission` module for the no-subscriber/
-  # timeout fail-closed policy this bridges to.
-  subscribePermissionEvents @93 (callback :PermissionEvents);
 
-  # Set (or clear, on empty `originHost`) a context's advisory `originHost` —
-  # see `ContextHandleInfo.originHost`'s doc comment. Called once, right
-  # after `createContext`, by a client that knows its own hostname
-  # (`register_session` on the kaijutsu-mcp side); NOT part of `createContext`
-  # itself, so every other creation path (genesis bootstrap, fork, the app)
-  # is unaffected and keeps shipping today's two-arg call. Shared-trust
-  # model: advisory metadata, not auth — the server trusts the client's
-  # self-report, and a failed call here is non-fatal to the caller's own
-  # registration (log-and-continue, never a hard failure over a hostname).
-  setContextOriginHost @94 (contextId :Data, originHost :Text, trace :TraceContext) -> (success :Bool, error :Text);
+  # Set the excluded flag on a block (staging curation).
+  setBlockExcluded @40 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Move a block to a new position. When `hasAfter` is true, `after` is
+  # the block to land after; otherwise the block is parked at the
+  # beginning of the document. Mirrors the `has_parent_id` idiom used
+  # elsewhere in the schema.
+  moveBlock @41 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # ==========================================================================
+  # Blocks: timeline & lineage
+  # ==========================================================================
+
+  # The past is read-only, but forking is ubiquitous.
+
+  # Cherry-pick a block into another context (carries lineage)
+  cherryPickBlock @47 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
+
+  # Get context version history for timeline scrubber
+  getContextHistory @48 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
 
   # ── RPC authoring (docs/crdt-position-2026-08.md, migration step 3) ───────
   #
@@ -2076,11 +1948,241 @@ interface Kernel {
     trace :TraceContext
   ) -> (success :Bool, error :Text);
 
-  # Addressed forms of the durable context cwd operations. Unlike getCwd /
-  # setCwd these never consult or mutate the connection's ambient joined
-  # context, so one client can safely manage several sessions.
-  getContextCwd @97 (contextId :Data, trace :TraceContext) -> (path :Text, found :Bool);
-  setContextCwd @98 (contextId :Data, path :Text, trace :TraceContext) -> (success :Bool, error :Text);
+  # ==========================================================================
+  # Turn control
+  # ==========================================================================
+
+  # Interrupt a running LLM stream or shell jobs for a context.
+  # immediate=false → soft interrupt (stop agentic loop after current tool turn).
+  # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
+  # Returns success=false when context has no active interrupt state (i.e. nothing running).
+  interruptContext @42 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
+
+  # Push channel: the server bridges the kernel's `TurnFlow` outcome bus onto
+  # `TurnEvents` callbacks. Every turn announces — interactive prompts and
+  # kernel-driven autonomous turns alike — carrying the structured stop reason
+  # (`end_turn` / cancelled / `max_tokens` / `max_iterations`) that a client
+  # cannot infer from block status at all.
+  #
+  # Kernel-wide, following `subscribeEditor`: no per-context filter parameter,
+  # because the event names its own `contextId` and a client watching several
+  # contexts should not need several subscriptions. Connection-scoped — the
+  # bridge dies with the connection, no cross-connection dedupe.
+  subscribeTurnEvents @91 (callback :TurnEvents);
+
+  # ==========================================================================
+  # Input document (CRDT scratchpad per context)
+  # ==========================================================================
+
+  # Each context has a companion CRDT text document for compose input.
+  # Any participant can read/write it. Submit snapshots to conversation block.
+
+  # High-level edit: insert text at position, delete characters
+  editInput @43 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Full state fetch for join/reconnect recovery
+  getInputState @44 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
+
+  # Atomic submit: read input, create block, clear input.
+  # Mode is explicit — no prefix detection.
+  submitInput @45 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
+
+  # Clear the input document for a context (discard draft).
+  # Emits InputCleared so all clients can reset their compose state.
+  clearInput @46 (contextId :Data, trace :TraceContext) -> ();
+
+  # ==========================================================================
+  # Semantic search & clustering
+  # ==========================================================================
+
+  # Semantic search: find contexts similar to a text query
+  searchSimilar @49 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+
+  # Context neighbors: find contexts similar to a given context
+  getNeighbors @50 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+
+  # Clustering: group contexts by semantic similarity
+  getClusters @51 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
+
+  # ==========================================================================
+  # Drift (cross-context communication with provenance)
+  # ==========================================================================
+
+  # List staged drifts pending flush
+  driftQueue @52 () -> (staged :List(StagedDriftInfo));
+
+  # Cancel a staged drift by ID
+  driftCancel @53 (stagedId :UInt64) -> (success :Bool);
+
+  # Inspect the drift router's dead-letter queue. Non-consuming — pairs with
+  # replayDeadLetter. Drifts land here when MAX_DRIFT_RETRIES is exceeded or
+  # the target context unregisters before delivery.
+  listDeadLetters @54 (trace :TraceContext) -> (items :List(DeadLetter));
+
+  # Replay a dead-letter item by id: extract from DLQ, reset retry count,
+  # push back to the staging queue for another flush attempt. Returns
+  # `replayed = false` when the id isn't present (already drained or
+  # never queued).
+  replayDeadLetter @55 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
+
+  # ==========================================================================
+  # Configuration (config as CRDT)
+  # ==========================================================================
+
+  # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are managed as CRDT documents.
+
+  # Get config content (from CRDT)
+  getConfig @56 (path :Text) -> (content :Text, error :Text);
+
+  # ==========================================================================
+  # MCP (Model Context Protocol) management
+  # ==========================================================================
+
+  listMcpServers @57 () -> (servers :List(McpServerInfo));
+
+  callMcpTool @58 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
+
+  # MCP Resources (push-first with caching)
+  listMcpResources @59 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
+
+  subscribeMcpResources @60 (callback :ResourceEvents, instance :Text);
+
+  # MCP Roots (client advertises workspaces to servers)
+  setMcpRoots @61 (roots :List(McpRoot));
+
+  # MCP Prompts (poll-based with optional caching)
+  listMcpPrompts @62 (server :Text) -> (prompts :List(McpPrompt));
+
+  getMcpPrompt @63 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
+
+  # MCP Progress (push-based streaming)
+  subscribeMcpProgress @64 (callback :ProgressEvents);
+
+  # MCP Elicitation (server-initiated requests for user input)
+  subscribeMcpElicitations @65 (callback :ElicitationEvents, instance :Text);
+
+  # MCP Completion (request/response)
+  completeMcp @66 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
+
+  # MCP Logging
+  setMcpLogLevel @67 (server :Text, level :Text);
+
+  subscribeMcpLogs @68 (callback :LoggingEvents);
+
+  # MCP Cancellation
+  cancelMcpRequest @69 (server :Text, requestId :Text);
+
+  # ==========================================================================
+  # Peer registry (drift navigation transport)
+  # ==========================================================================
+
+  # Peers are named RPC participants (the Bevy app, MCP servers, future
+  # clients) that the kernel can dispatch invocations to. The transport is
+  # how MCP-driven agents tell the app to switch contexts, etc.
+
+  # Attach a peer to this kernel.
+  # `commands` is the callback the kernel uses to invoke this peer.
+  attachPeer @70 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
+
+  # List all attached peers on this kernel.
+  listPeers @71 () -> (peers :List(PeerInfo));
+
+  # Detach a peer from this kernel.
+  detachPeer @72 (nick :Text);
+
+  # Invoke a peer. Params and result are JSON bytes.
+  invokePeer @73 (nick :Text, action :Text, params :Data) -> (result :Data);
+
+  # ==========================================================================
+  # In-app editor sessions (the vi/edit builtin; see docs/vi.md)
+  # ==========================================================================
+
+  # A kernel-owned vi session bound to the CRDT block that owns a path's text.
+  # Session ids are global (no contextId needed); the path resolves the owner.
+  # Renderers draw `editorState`/`subscribeEditor` and forward keys to
+  # `editorKeys`. Edits mirror onto the CRDT block — rc/config permission errors
+  # surface here loudly (crash over corruption).
+
+  editorOpen @74 (path :Text, trace :TraceContext) -> (state :EditorState);
+  editorKeys @75 (sessionId :UInt64, keys :Text, trace :TraceContext) -> (state :EditorState);
+  editorState @76 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
+  editorSave @77 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
+  editorQuit @78 (sessionId :UInt64, trace :TraceContext) -> ();
+
+  # Push channel: server streams editor state changes (incl. future remote merges).
+  subscribeEditor @79 (callback :EditorEvents);
+
+  # ==========================================================================
+  # Transport and time (tracks, MIDI capture/presence, clock estimates)
+  # ==========================================================================
+
+  # ── Tracks (docs/tracks.md; the time well's Stage 3 wire slice) ──
+
+  # Enumerate every track's live state, straight from the beat scheduler's
+  # in-memory TrackState (see TrackInfo). Empty when no tracks exist or no
+  # scheduler is wired (embedded/test kernels).
+  listTracks @82 (trace :TraceContext) -> (tracks :List(TrackInfo));
+
+  # Commit a captured-MIDI batch onto the track `contextId` is attached to
+  # (docs/midi.md M2, "the ear is the sink's twin" — the structural reverse
+  # of RenderCue: the app hears, collates on its musical timer, and pushes;
+  # the kernel quantizes to the track grid and lands one data-only block in
+  # the score context). `mime` must be the MIDI_CAPTURE_MIME batch record.
+  # `casHash` "" = `payload` carries the record inline (the only form built
+  # today; a non-empty casHash is the reserved CAS arm, mirroring
+  # RenderCue's union — rejected until the client→kernel CAS write surface
+  # lands, docs/issues.md).
+  commitCapture @87 (contextId :Data, mime :Text, payload :Data, casHash :Text, trace :TraceContext) -> (blockId :BlockId);
+
+  # One clock reference from an edge observer (docs/midi.md M3, "distribute
+  # tempo, not pulses" — the reverse of the BeatSync push, third mirror in
+  # the set): the observed master's beat coordinate + tempo, stamped with
+  # the observer's wallclock. ~2 Hz fire-and-forget; the kernel resolves the
+  # sender's track and slaves it only when that track's clock is `modeled`
+  # (`kj transport clock <track> modeled`). `source` is the observed ALSA
+  # port ("client:port"), for logs/attribution.
+  reportClockEstimate @88 (contextId :Data, beat :Float64, tempoBps :Float64, epochNs :UInt64, source :Text, trace :TraceContext) -> ();
+
+  # ── Sink-fed MIDI presence (docs/midi-next.md "Presence is sink-fed") ──
+
+  # The app matches, the kernel records. A sink watches platform hotplug,
+  # matches port facts against the backend-neutral match strings in
+  # /etc/midi/devices/<name>, and reports here; the kernel writes the report
+  # into its EPHEMERAL /run/midi/<device> store as provenance-tagged facts
+  # (source: "sink"). Not context-scoped: presence is a fact about the rig,
+  # not about a conversation. `present` false is a first-class report (unplug)
+  # — stale presence that lies is worse than none, so the sink says so rather
+  # than going quiet. `backend` is the reporting sink's platform backend
+  # ("alsa", "coremidi"); `epochNs` is its wallclock at observation, and a
+  # report older than the one on file is dropped (latest timestamp wins).
+  # No facade gate, on purpose (the reportClockEstimate stance): presence is
+  # inert sensor data, and every player is inside the trust boundary.
+  # `sinkHost` is the reporting sink's own name for its machine — display and
+  # provenance only, so `kj midi list` can answer "live, but WHERE?" across a
+  # rig. It is NEVER the key anything is reaped by: presence is bound to the
+  # *connection* the report arrived on (the kernel attaches its own
+  # per-connection id and drops every record attributed to a connection when
+  # it dies), because a sink that crashes cannot send an unplug and cannot be
+  # trusted to identify itself honestly either. Empty from an older peer.
+  reportMidiPresence @90 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
+
+  # ==========================================================================
+  # Permission asks (HookAction::Ask, D-57, docs/acp.md gap #2)
+  # ==========================================================================
+
+  # Kernel-wide, following `subscribeTurnEvents` rather than the per-
+  # connection `subscribeMcpElicitations` model: `HookAction::Ask` can fire
+  # from any call path, not just the connection that triggered it, so one
+  # subscription serves every context. No per-context filter parameter for
+  # the same reason `subscribeTurnEvents` has none — the request names its
+  # own `contextId`. See `PermissionEvents` above for the wire shape and
+  # `kaijutsu-kernel`'s `mcp::permission` module for the no-subscriber/
+  # timeout fail-closed policy this bridges to.
+  subscribePermissionEvents @93 (callback :PermissionEvents);
+
+  # ==========================================================================
+  # kj (context-addressed command execution)
+  # ==========================================================================
 
   # Run one context-addressed kj invocation through the materialized kaish
   # builtin. argv excludes the leading "kj". Keeping argv structured prevents
@@ -2102,56 +2204,4 @@ interface Kernel {
   # by name; clients append parsed user arguments. The server owns curation so
   # every frontend observes the same loadout-aware surface.
   getKjCommandCatalog @100 (contextId :Data, trace :TraceContext) -> (commands :List(KjCommand));
-}
-
-struct KjCommand {
-  name @0 :Text;
-  description @1 :Text;
-  inputHint @2 :Text;
-  argvPrefix @3 :List(Text);
-}
-
-# ============================================================================
-# VFS Interface
-# ============================================================================
-
-interface Vfs {
-  # Reading
-  getattr @0 (path :Text) -> (attr :FileAttr);
-  readdir @1 (path :Text) -> (entries :List(DirEntry));
-  read @2 (path :Text, offset :UInt64, size :UInt32) -> (data :Data);
-  readlink @3 (path :Text) -> (target :Text);
-
-  # Writing
-  write @4 (path :Text, offset :UInt64, data :Data) -> (written :UInt32);
-  create @5 (path :Text, mode :UInt32) -> (attr :FileAttr);
-  mkdir @6 (path :Text, mode :UInt32) -> (attr :FileAttr);
-  unlink @7 (path :Text);
-  rmdir @8 (path :Text);
-  rename @9 (from :Text, to :Text);
-  truncate @10 (path :Text, size :UInt64);
-  setattr @11 (path :Text, attr :SetAttr) -> (newAttr :FileAttr);
-  symlink @12 (path :Text, target :Text) -> (attr :FileAttr);
-
-  # Metadata
-  readOnly @13 () -> (readOnly :Bool);
-  statfs @14 () -> (stat :StatFs);
-
-  # Path resolution
-  realPath @15 (path :Text) -> (realPath :Text);
-
-  # FSN world stage-0/1 plumbing (docs/scenes/vfs.md). Recursive listing walk
-  # with generation stamps, VFS-mediated (never touches the host filesystem
-  # directly) so nested mounts and virtual backends compose correctly.
-  # `depth` (0 = just `root`, no children walked) and `maxEntries` (total
-  # node count in the reply tree, root included) are both caller-supplied but
-  # server-clamped to a hard ceiling regardless of what's asked — walking `/`
-  # with no cap must be structurally impossible. `generation` mirrors
-  # `root.generation` (a quick staleness check without descending the tree);
-  # `truncated` is true iff ANY node in the reply has `truncatedHere` set (a
-  # cheap "is this reply complete" check without walking the whole tree). A
-  # backend error mid-walk fails the whole call rather than returning a
-  # partial tree that would look indistinguishable from an intentional cut.
-  snapshot @16 (path :Text, depth :UInt32, maxEntries :UInt32)
-      -> (root :SnapshotNode, generation :UInt64, truncated :Bool);
 }
