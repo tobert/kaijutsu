@@ -2886,6 +2886,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -6189,7 +6190,6 @@ dependencies = [
  "kaijutsu-audio",
  "kaijutsu-cas",
  "kaijutsu-client",
- "kaijutsu-crdt",
  "kaijutsu-diff",
  "kaijutsu-kernel",
  "kaijutsu-telemetry",
