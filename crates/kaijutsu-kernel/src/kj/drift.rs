@@ -798,77 +798,138 @@ impl KjDispatcher {
 
     /// The lost+found context id, creating the context if this kernel has none.
     ///
-    /// Order matters and is the point of this helper: the `documents` row (via
-    /// the block store) and the `contexts` row land BEFORE the router claims
-    /// the handle, so the "a registered handle implies a KernelDb row"
-    /// invariant holds even when the DB write fails. A failure rolls the
-    /// document back and returns `Err` — the caller keeps its dead letters
-    /// queued rather than writing them into a context that isn't there.
+    /// Lookup order is router cache → well-known registry → mint
+    /// (docs/drifting-dead-letters.md, slice 1). The registry step is what
+    /// keeps a cold start from minting a duplicate: a fresh `DriftRouter` has
+    /// no cache, and without consulting `WellKnownRole::LostFound` first this
+    /// would mint a second lost+found every time it ran before cold-start
+    /// recovery (`rpc.rs`) got around to adopting the persisted one.
+    ///
+    /// Order matters on the mint path and is the point of this helper: the
+    /// `documents` row (via the block store), the `contexts` row, and the
+    /// registry row all land BEFORE the router claims the handle, so the "a
+    /// registered handle implies a KernelDb row" invariant holds even when a
+    /// DB write fails. A failure rolls the document back and returns `Err` —
+    /// the caller keeps its dead letters queued rather than writing them into
+    /// a context that isn't there.
     fn ensure_lost_found_context(&self) -> Result<ContextId, String> {
+        // 1. Router cache — cheap, and correct once this process has resolved
+        //    lost+found at least once.
         if let Some(id) = self.drift_router().read().lost_found_id() {
             return Ok(id);
         }
 
+        // 2. Well-known registry — a persisted assignment from this kernel's
+        //    history (this process's own earlier mint, a prior process, or a
+        //    rotation). A hit means the row already exists; adopt it into the
+        //    router rather than minting a duplicate.
+        {
+            let registry_hit = self
+                .kernel_db()
+                .lock()
+                .well_known_context(crate::kernel_db::WellKnownRole::LostFound);
+            match registry_hit {
+                Ok(Some(id)) => {
+                    self.drift_router().write().adopt_lost_found(id);
+                    return Ok(id);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "well-known registry lookup for lost+found failed, minting instead: {e}"
+                    );
+                }
+            }
+        }
+
+        // 3. Mint.
         let id = ContextId::new();
         let system = kaijutsu_types::PrincipalId::system();
 
-        // 1. The document — this is what writes the `documents` row.
+        // 3a. The document — this is what writes the `documents` row.
         self.block_store()
             .create_document(id, crate::DocumentKind::Conversation, None)
             .map_err(|e| format!("failed to create lost+found document: {e}"))?;
 
-        // 2. The context row, so cold start rehydrates and re-adopts it and the
-        //    dead letters survive a restart.
-        let persist = {
+        // 3b. The context row (+ registry row), so cold start rehydrates and
+        //     re-adopts it and the dead letters survive a restart.
+        let persist: Result<String, String> = {
             let db = self.kernel_db().lock();
             let now = kaijutsu_types::now_millis() as i64;
-            db.get_or_create_default_workspace(system)
-                .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
-                .and_then(|ws| {
-                    let row = crate::kernel_db::ContextRow {
-                        context_id: id,
-                        label: Some("lost+found".to_string()),
-                        provider: None,
-                        model: None,
-                        system_prompt: None,
-                        consent_mode: kaijutsu_types::ConsentMode::Collaborative,
-                        context_state: kaijutsu_types::ContextState::Live,
-                        context_type: "default".to_string(),
-                        created_at: now,
-                        created_by: system,
-                        forked_from: None,
-                        fork_kind: None,
-                        archived_at: None,
-                        workspace_id: Some(ws),
-                        preset_id: None,
-                        concluded_at: None,
-                        last_activity_at: None,
-                        promoted_at: None,
-                        demoted_at: None,
-                        paused_at: None,
-                        cast_id: None,
-                        origin_host: None,
+            // A rotation leaves the incumbent registered under "lost+found"
+            // (rotate_lost_found only vacates the registry role, it does not
+            // rename or unregister the outgoing context) — so a fresh mint
+            // must never collide with it. Disambiguate instead of renaming
+            // the incumbent.
+            match db.find_context_by_label("lost+found") {
+                Err(e) => Err(format!("failed to check lost+found label: {e}")),
+                Ok(existing) => {
+                    let label = match existing {
+                        Some(_) => format!("lost+found-{}", id.short()),
+                        None => "lost+found".to_string(),
                     };
-                    db.insert_context_with_document(&row, ws)
-                        .map_err(|e| format!("failed to persist lost+found context row: {e}"))
-                })
-        };
-        if let Err(e) = persist {
-            // Roll the document back so a retry starts clean instead of
-            // leaving an orphan `documents` row behind per attempt.
-            if let Err(cleanup) = self.block_store().delete_document(id) {
-                tracing::error!(
-                    context = %id.short(),
-                    "lost+found rollback failed, orphan document row left behind: {cleanup}"
-                );
+                    db.get_or_create_default_workspace(system)
+                        .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
+                        .and_then(|ws| {
+                            let row = crate::kernel_db::ContextRow {
+                                context_id: id,
+                                label: Some(label.clone()),
+                                provider: None,
+                                model: None,
+                                system_prompt: None,
+                                consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                                context_state: kaijutsu_types::ContextState::Live,
+                                context_type: "default".to_string(),
+                                created_at: now,
+                                created_by: system,
+                                forked_from: None,
+                                fork_kind: None,
+                                archived_at: None,
+                                workspace_id: Some(ws),
+                                preset_id: None,
+                                concluded_at: None,
+                                last_activity_at: None,
+                                promoted_at: None,
+                                demoted_at: None,
+                                paused_at: None,
+                                cast_id: None,
+                                origin_host: None,
+                            };
+                            db.insert_context_with_document(&row, ws)
+                                .map_err(|e| format!("failed to persist lost+found context row: {e}"))
+                        })
+                        .and_then(|_| {
+                            db.set_well_known_context(
+                                crate::kernel_db::WellKnownRole::LostFound,
+                                id,
+                            )
+                            .map_err(|e| {
+                                format!("failed to register lost+found in well-known registry: {e}")
+                            })
+                        })
+                        .map(|_| label)
+                }
             }
-            return Err(e);
-        }
+        };
+        let label = match persist {
+            Ok(label) => label,
+            Err(e) => {
+                // Roll the document back so a retry starts clean instead of
+                // leaving an orphan `documents` row behind per attempt.
+                if let Err(cleanup) = self.block_store().delete_document(id) {
+                    tracing::error!(
+                        context = %id.short(),
+                        "lost+found rollback failed, orphan document row left behind: {cleanup}"
+                    );
+                }
+                return Err(e);
+            }
+        };
 
-        // 3. Only now is a handle legitimate.
+        // 3c. Only now is a handle legitimate.
         self.drift_router()
             .write()
-            .claim_lost_found(id)
+            .claim_lost_found(id, &label)
             .map_err(|e| format!("failed to claim lost+found: {e}"))
     }
 

@@ -202,6 +202,27 @@ pub enum PromoteOutcome {
     },
 }
 
+/// A kernel role that exactly one context fills at a time. Identity for these
+/// contexts is this role, NOT their label — which is what makes rotation an
+/// UPDATE instead of a rename. See `well_known_contexts` in `SCHEMA` and
+/// `docs/drifting-dead-letters.md` (slice 1).
+///
+/// Only `LostFound` exists so far. The drift-queue role is slice 3's job —
+/// speculative variants are not wanted ahead of that need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WellKnownRole {
+    /// The lost+found dead-letter sink.
+    LostFound,
+}
+
+impl WellKnownRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LostFound => "lost_found",
+        }
+    }
+}
+
 /// A persisted hook entry. Flat shape so the rusqlite row readers map
 /// directly; the broker reconstructs the live `HookEntry` (including
 /// resolving `action_builtin_name` against `BuiltinHookRegistry`) at
@@ -548,6 +569,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_structural_unique
     ON context_edges(source_id, target_id) WHERE kind = 'structural';
 CREATE INDEX IF NOT EXISTS idx_edges_source ON context_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON context_edges(target_id);
+
+-- ── Well-Known Context Registry ─────────────────────────────────
+-- A fixed set of kernel roles (see `WellKnownRole`), each mapped to at most
+-- one context at a time. This is identity, not a label: lost+found is the
+-- context that holds the `lost_found` role, never the context named
+-- "lost+found" — which is what makes rotation an UPDATE (`set_well_known_
+-- context`) instead of a rename. See docs/drifting-dead-letters.md (slice 1).
+--
+-- ON DELETE CASCADE is deliberate: if the holding context is destroyed the
+-- role simply becomes vacant, and the next dead letter mints a fresh holder.
+-- That is better than a dangling pointer a reader would have to notice and
+-- work around.
+CREATE TABLE IF NOT EXISTS well_known_contexts (
+    role        TEXT NOT NULL PRIMARY KEY,
+    context_id  BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    assigned_at INTEGER NOT NULL
+);
 
 -- ── Op-Log Persistence ──────────────────────────────────────────
 -- Append-only journal: each mutation writes one row with the delta.
@@ -1581,6 +1619,7 @@ impl KernelDb {
         Self::migrate_context_model_rollover(conn)?;
         Self::migrate_preset_cast_narrowing(conn)?;
         Self::migrate_backends_kind_check(conn)?;
+        Self::migrate_well_known_lost_found(conn)?;
         Ok(())
     }
 
@@ -1781,6 +1820,28 @@ impl KernelDb {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// One-time adoption of the pre-registry lost+found scheme
+    /// (docs/drifting-dead-letters.md, slice 1): a database that predates
+    /// `well_known_contexts` identified lost+found purely by the magic label
+    /// `'lost+found'`. This backfills the registry row from whatever context
+    /// currently holds that label, so `WellKnownRole::LostFound` lookups work
+    /// on an upgraded database without anyone having to notice or act.
+    ///
+    /// `INSERT OR IGNORE` makes this idempotent across every `open()` — once
+    /// a row exists for the role (whether from this backfill or a later
+    /// rotation), the label stops being meaningful and this is a no-op
+    /// forever after, even if the label is later reused or moved.
+    fn migrate_well_known_lost_found(conn: &Connection) -> KernelDbResult<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO well_known_contexts (role, context_id, assigned_at)
+             SELECT 'lost_found', context_id, ?1
+               FROM contexts WHERE label = 'lost+found'
+               ORDER BY created_at LIMIT 1",
+            params![now_millis()],
+        )?;
         Ok(())
     }
 
@@ -5069,6 +5130,50 @@ impl KernelDb {
         } else {
             Ok(None)
         }
+    }
+
+    // ========================================================================
+    // Well-Known Context Registry (docs/drifting-dead-letters.md, slice 1)
+    // ========================================================================
+
+    /// The context currently filling `role`, or `None` if the role is vacant
+    /// (never assigned, or its holder was destroyed and cascaded away).
+    pub fn well_known_context(&self, role: WellKnownRole) -> KernelDbResult<Option<ContextId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT context_id FROM well_known_contexts WHERE role = ?1")?;
+        let mut rows = stmt.query(params![role.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(read_context_id(row, 0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Assign `id` to `role` — the rotation primitive. Upserts: a role that
+    /// is already held is reassigned to `id` rather than erroring, so this is
+    /// also how a rotation happens (the incumbent is untouched by this call —
+    /// it keeps its row and its blocks as an ordinary context, it just stops
+    /// being pointed at by the registry).
+    pub fn set_well_known_context(&self, role: WellKnownRole, id: ContextId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO well_known_contexts (role, context_id, assigned_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(role) DO UPDATE SET
+                 context_id = excluded.context_id,
+                 assigned_at = excluded.assigned_at",
+            params![role.as_str(), blob_param(id.as_bytes()), now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Vacate `role`. Not currently called by slice 1 (rotation reassigns
+    /// rather than clears), but a role the registry can hand out must also be
+    /// one it can take back — e.g. if a holder is deliberately retired with
+    /// no successor yet chosen.
+    pub fn clear_well_known_context(&self, role: WellKnownRole) -> KernelDbResult<()> {
+        self.conn
+            .execute("DELETE FROM well_known_contexts WHERE role = ?1", params![role.as_str()])?;
+        Ok(())
     }
 
     // ========================================================================
@@ -11012,5 +11117,91 @@ mod tests {
                 params![blob_param(PrincipalId::new().as_bytes())],
             )
             .unwrap();
+    }
+
+    // ── 31. Well-known context registry (docs/drifting-dead-letters.md, slice 1) ──
+
+    /// Basic set → get → clear roundtrip.
+    #[test]
+    fn well_known_context_set_get_clear_roundtrip() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("lost+found"));
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert_eq!(db.well_known_context(WellKnownRole::LostFound).unwrap(), None);
+
+        db.set_well_known_context(WellKnownRole::LostFound, row.context_id).unwrap();
+        assert_eq!(
+            db.well_known_context(WellKnownRole::LostFound).unwrap(),
+            Some(row.context_id)
+        );
+
+        db.clear_well_known_context(WellKnownRole::LostFound).unwrap();
+        assert_eq!(db.well_known_context(WellKnownRole::LostFound).unwrap(), None);
+    }
+
+    /// This is the rotation primitive: assigning a role that is already held
+    /// UPDATEs rather than erroring, and the second id wins.
+    #[test]
+    fn set_well_known_context_twice_rotates_rather_than_conflicts() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let incumbent = make_context_row(Some("lost+found"));
+        insert_context_with_doc(&db, &incumbent, ws_id);
+        let successor = make_context_row(Some("lost+found-2"));
+        insert_context_with_doc(&db, &successor, ws_id);
+
+        db.set_well_known_context(WellKnownRole::LostFound, incumbent.context_id).unwrap();
+        assert_eq!(
+            db.well_known_context(WellKnownRole::LostFound).unwrap(),
+            Some(incumbent.context_id)
+        );
+
+        // Re-assigning must not error, and the new id must win.
+        db.set_well_known_context(WellKnownRole::LostFound, successor.context_id).unwrap();
+        assert_eq!(
+            db.well_known_context(WellKnownRole::LostFound).unwrap(),
+            Some(successor.context_id)
+        );
+
+        // The incumbent's own row is untouched — rotation reassigns the
+        // registry pointer, it does not delete or rename anything.
+        let incumbent_row = db.find_context_by_label("lost+found").unwrap().unwrap();
+        assert_eq!(incumbent_row.context_id, incumbent.context_id);
+    }
+
+    /// The backfill migration (`migrate_well_known_lost_found`) adopts a
+    /// pre-existing `label = 'lost+found'` row into the registry, and running
+    /// it again (as every `open()`/`in_memory()` does) is a no-op.
+    #[test]
+    fn migrate_well_known_lost_found_backfills_and_is_idempotent() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let legacy = make_context_row(Some("lost+found"));
+        insert_context_with_doc(&db, &legacy, ws_id);
+
+        // Pre-migration: nothing in the registry yet (in_memory() already ran
+        // the migration once before this row existed).
+        assert_eq!(db.well_known_context(WellKnownRole::LostFound).unwrap(), None);
+
+        KernelDb::migrate_well_known_lost_found(&db.conn).unwrap();
+        assert_eq!(
+            db.well_known_context(WellKnownRole::LostFound).unwrap(),
+            Some(legacy.context_id)
+        );
+
+        // A second run (idempotent — INSERT OR IGNORE) must not disturb the
+        // mapping, even if a rotation happened in between.
+        let rotated = make_context_row(Some("lost+found-2"));
+        insert_context_with_doc(&db, &rotated, ws_id);
+        db.set_well_known_context(WellKnownRole::LostFound, rotated.context_id).unwrap();
+
+        KernelDb::migrate_well_known_lost_found(&db.conn).unwrap();
+        assert_eq!(
+            db.well_known_context(WellKnownRole::LostFound).unwrap(),
+            Some(rotated.context_id),
+            "re-running the backfill must not clobber a later rotation"
+        );
     }
 }

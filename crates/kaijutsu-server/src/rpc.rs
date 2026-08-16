@@ -86,7 +86,7 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, TaskStatus};
 use kaijutsu_kernel::block_store::derive_context_live_status;
 use kaijutsu_kernel::kernel_db::{
     context_used_pct, ContextRow, ContextShellRow, ContextUsageRow, DemoteOutcome, KernelDb,
-    KernelDbError, PromoteOutcome,
+    KernelDbError, PromoteOutcome, WellKnownRole,
 };
 use kaijutsu_kernel::{
     // FlowBus
@@ -1993,18 +1993,53 @@ pub async fn create_shared_kernel(
             if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
                 let _ = drift.configure_llm(row.context_id, provider, model);
             }
-            // Re-claim the persisted lost+found sink so a later dead letter
-            // reuses it instead of minting a duplicate (which would also
-            // conflict on the reserved label).
-            if row.label.as_deref() == Some("lost+found") {
-                drift.adopt_lost_found(row.context_id);
-            }
             log::info!(
                 "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
                 row.context_id.short(),
                 row.label,
                 row.provider,
             );
+        }
+    }
+
+    // Re-adopt the persisted lost+found sink (docs/drifting-dead-letters.md,
+    // slice 1) so a later dead letter reuses it instead of minting a
+    // duplicate. One registry lookup replaces scanning recovered rows for
+    // the old magic label. `all_contexts` above came from
+    // `list_active_contexts()`, so an ARCHIVED lost+found (e.g. the outgoing
+    // half of a rotation) was never registered into the router — if the
+    // registry still names it, that's a real anomaly, not something to
+    // silently proceed past: warn loudly (the kernel can still start; drift
+    // flush will just fail until this is resolved) rather than adopt a
+    // handle that points at nothing.
+    //
+    // Bound to a `let` before the `match` on purpose: a scrutinee expression's
+    // temporaries live for the whole match body, so matching directly on
+    // `kernel_db_arc.lock()....` would hold the KernelDb mutex across the
+    // `drift().write()` below. Every other path in this subsystem takes the
+    // DB lock and releases it before touching the router (see
+    // `KjDispatcher::ensure_lost_found_context`), so that would be the one
+    // site establishing a db→drift hold — a lock-order inversion waiting for
+    // a second thread. Cold start is single-threaded today, which is exactly
+    // why it would go unnoticed until it didn't.
+    let lost_found = kernel_db_arc.lock().well_known_context(WellKnownRole::LostFound);
+    match lost_found {
+        Ok(Some(id)) => {
+            let mut drift = kernel_arc.drift().write();
+            if drift.get(id).is_some() {
+                drift.adopt_lost_found(id);
+            } else {
+                log::warn!(
+                    "well-known lost+found context {} is registered in KernelDb but was not \
+                     recovered into DriftRouter (likely archived) — dead letters will fail to \
+                     flush until this is resolved",
+                    id.short()
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log::warn!("failed to read well-known lost+found from KernelDb: {}", e);
         }
     }
 
