@@ -34,13 +34,59 @@ when nonzero) via `[patch.crates-io]`; one file each, removable when
 upstream lands. Given the catch-up loop is "the most important interaction
 in the whole app", (b) is a plausible day-lane.
 
-What to do meanwhile: **our pipeline is already fraction-ready** (no
-quantum, sub-pixel offsets, gain math handles fractional lines), so it
-lights up with zero app work when the events arrive. Do NOT re-add
-smoothing hacks to fake sub-detent motion. Wheel event trace lives at
-`debug!` in `input/dispatch.rs` for feel-tuning — it also answers, in 30
-seconds, whether any given compositor streams sub-detent continuous axis
-to old clients (KWin observed: it does not).
+**Experiment log (2026-08-16 evening), lane PARKED by Amy's call** ("fix
+kaijutsu-app for what already works for other apps right now; experiment
+later with the HID++ device"):
+- Carried forks BUILT and PROTOCOL-VERIFIED live: sctk branch
+  `tobert/axis-value120-0.19` (value120 field/arm/merge, seat bind 1..=8,
+  bind receipt log) + winit branch `tobert/wayland-axis-value120-0.30`
+  (prefer value120/120 as fractional LineDelta), both in
+  `~/src/research/{client-toolkit,winit}`. App logged
+  `bound wl_seat@11 at version 8` — every layer above the kernel driver
+  confirmed working. `[patch.crates-io]` since removed from Cargo.toml
+  (path deps must not be committed); re-wire via tobert/* GitHub forks +
+  git refs when the lane resumes.
+- Root probe: kernel `REL_WHEEL_HI_RES` emits ONLY ±120 — the mouse (MX
+  Master 4, WPID B042, Bolt receiver 046d:c548) never had hi-res mode
+  enabled. `modinfo hid_logitech_dj` lacks c548; the Bolt receiver runs
+  on hid-generic, so hidpp never manages the mouse.
+- solaar `hires-smooth-resolution true` tried: generic driver mismaps —
+  each sub-detent counted as a WHOLE detent (y=-17 events, ~8-17x speed),
+  broke wezterm/CC, event storm × ~26ms frames pegged a core. REVERTED.
+- Next when resumed: `~/src/research/bolt-dj-bind-test.sh` (root) —
+  runtime `new_id` rebind test of the one-line kernel fix (add c548 to
+  hid-logitech-dj); if dj claims it, hidpp manages the mouse and hi-res
+  works properly (fractions for v8 clients, whole detents preserved for
+  legacy). Probe scripts + tmp.log parked in `~/src/research/`.
+  Possibly upstreamable to the kernel — MX Master 4 is new; others will
+  hit this.
+
+Meanwhile: pipeline stays fraction-ready; do NOT re-add smoothing hacks to
+fake sub-detent motion. Wheel trace at `debug!` in `input/dispatch.rs`.
+
+## Scroll feel polish notes (2026-08-16, post slice-0)
+
+Current state Amy accepted ("seems ok rn"): whole-detent input, line_gain
+60 (3 lines/notch), smooth_speed 83.18, unfocused-mode Continuous gate.
+Polish backlog:
+- `smooth_speed` never re-tuned after the detent-size change — live-tune
+  over BRP (`ScrollConfig`) in a sitting; crisper (100-130) may suit
+  3-line steps better than the carried-over 83.18.
+- `pixel_gain` 3.0 is 3x finger speed; browsers do 1:1. Retune to ~1.0
+  the day a Pixel-unit device (touchpad/touchscreen — moltar's monitor
+  has touch, unplugged) is actually in hand. Touch will also need fling
+  physics — the momentum do-not-build fence gets revisited then, not
+  before.
+- Unfocused baseline is still 2Hz `reactive_low_power(500ms)` when
+  nothing is active; fine for power, but if unfocused reading feels
+  laggy on first wheel touch, consider reactive(100ms) unfocused while
+  the conversation screen is showing.
+- Flick event bursts each pay a full ~26ms frame on a 205k-px document
+  (heats a core) — that cost is the surface renderer's to kill
+  (docs/conversation-surface.md), not a scroll-tuning knob.
+- App window came back 960x600@scale1 after restarts (was ~1920@2x that
+  morning) — window geometry restore may be broken or KWin-side; check
+  whether kaijutsu should remember size/position itself.
 
 ## Catch-up seam: mark and jump to the read/unread boundary (2026-08-16)
 
