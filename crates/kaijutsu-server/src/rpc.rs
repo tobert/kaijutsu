@@ -5875,10 +5875,14 @@ impl kernel::Server for KernelImpl {
         );
 
         let kernel = self.kernel.clone();
+        // A draft belongs to the principal who is typing it, and `editInput` can
+        // only ever reach the caller's own — the id is taken from the
+        // authenticated connection, never from the request.
+        let principal_id = self.connection.borrow().principal.id;
         Promise::from_future(
             async move {
                 // Shared facade gate — both live compose typing (app) and the
-                // MCP write_input/edit_input handlers reach the input doc through
+                // MCP write_input/edit_input handlers reach the draft through
                 // this RPC, so the allow-set is enforced here for everyone.
                 kernel
                     .kernel
@@ -5887,11 +5891,17 @@ impl kernel::Server for KernelImpl {
                     .await
                     .map_err(|e| capnp::Error::failed(format!("edit_input denied: {e}")))?;
 
-                match kernel.documents.edit_input(context_id, pos, &insert, delete) {
-                    Ok(_ops) => {
-                        // edit_input emits InputDocFlow::TextOps via FlowBus; the
-                        // version is implicit from the DTE document, return 0 as ack.
-                        results.get().set_ack_version(0);
+                match kernel
+                    .documents
+                    .edit_draft(context_id, principal_id, pos, &insert, delete)
+                {
+                    Ok(_block_id) => {
+                        // The draft is a block, so the meaningful revision is the
+                        // context's — the same number `getBlocks` and the change
+                        // feed speak. Best-effort: a failure to read it back must
+                        // not fail an edit that already landed.
+                        let version = kernel.documents.version(context_id).unwrap_or(0);
+                        results.get().set_ack_version(version);
                         Ok(())
                     }
                     Err(e) => Err(capnp::Error::failed(format!("edit_input failed: {}", e))),
@@ -5917,13 +5927,17 @@ impl kernel::Server for KernelImpl {
         log::debug!("get_input_state: context={}", context_id);
 
         let documents = &self.kernel.documents;
+        let principal_id = self.connection.borrow().principal.id;
 
-        match documents.get_input_state(context_id) {
-            Ok((content, ops, version)) => {
+        match documents.draft_block(context_id, principal_id) {
+            Ok(draft) => {
                 let mut r = results.get();
-                r.set_content(&content);
-                r.set_ops(&ops);
-                r.set_version(version);
+                r.set_content(draft.as_ref().map(|d| d.content.as_str()).unwrap_or(""));
+                // `ops` is a corpse: the draft is a block, so there is no input
+                // oplog to project. It stays on the wire only until slice 4
+                // deletes this method along with the rest of the input surface.
+                r.set_ops(&[]);
+                r.set_version(documents.version(context_id).unwrap_or(0));
                 Promise::ok(())
             }
             Err(e) => Promise::err(capnp::Error::failed(format!(
@@ -5967,21 +5981,23 @@ impl kernel::Server for KernelImpl {
 
                 let documents = kernel.documents.clone();
 
-                // Read text first, validate, THEN clear — avoids clearing compose
-                // on whitespace-only input (InputCleared would fire with no block created).
-                let text = documents
-                    .get_input_text(context_id)
-                    .map_err(|e| capnp::Error::failed(format!("get_input_text: {}", e)))?;
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return Err(capnp::Error::failed("input is empty".into()));
-                }
-                // Input has content — now clear it
-                documents
-                    .clear_input(context_id)
-                    .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
-
                 if is_shell {
+                    // Shell mode cannot promote the draft: a shell command is a
+                    // `ToolCall` block carrying JSON arguments, not the user's
+                    // `Text`. So the draft is consumed rather than transitioned —
+                    // and the ORDER is the correctness property. Read without
+                    // clearing, author the command block, and only then discard
+                    // what it was built from. Anything that fails in between
+                    // leaves the typed text exactly where the player left it.
+                    let draft = documents
+                        .draft_block(context_id, user_principal_id)
+                        .map_err(|e| capnp::Error::failed(format!("read draft: {}", e)))?
+                        .ok_or_else(|| capnp::Error::failed("input is empty".into()))?;
+                    let text = draft.content.trim().to_string();
+                    if text.is_empty() {
+                        return Err(capnp::Error::failed("input is empty".into()));
+                    }
+
                     let command_block_id = execute_shell_command(
                         &text,
                         context_id,
@@ -5992,18 +6008,21 @@ impl kernel::Server for KernelImpl {
                     )
                     .await?;
 
+                    // The command exists durably; the draft has done its job.
+                    documents
+                        .clear_draft(context_id, user_principal_id)
+                        .map_err(|e| capnp::Error::failed(format!("clear draft: {}", e)))?;
+
                     let mut block_id_builder = results.get().init_command_block_id();
                     set_block_id_builder(&mut block_id_builder, &command_block_id);
                 } else {
-                    // Chat prompt — create user message block and invoke LLM
-
-                    // Document must exist — join_context is the sole creator
-                    if documents.get(context_id).is_none() {
-                        return Err(capnp::Error::failed(format!(
-                            "context {} not found — call join_context first",
-                            context_id
-                        )));
-                    }
+                    // Chat prompt — the draft IS the user message. Submitting is
+                    // a status transition on the block they typed into, so the
+                    // text is never in flight between two homes. Refuses an empty
+                    // draft without clearing it.
+                    let (user_block_id, _text) = documents
+                        .submit_draft(context_id, user_principal_id)
+                        .map_err(|e| capnp::Error::failed(format!("submit: {}", e)))?;
 
                     // Build ToolContext from connection state; cwd is durable
                     // context-scoped state (L1).
@@ -6024,23 +6043,11 @@ impl kernel::Server for KernelImpl {
                         ),
                     };
 
-                    // Create user message block at the end of the document
-                    let last_block = documents.last_block_id(context_id);
-                    let user_block_id = documents
-                        .insert_block_as(
-                            context_id,
-                            None,
-                            last_block.as_ref(),
-                            Role::User,
-                            BlockKind::Text,
-                            &text,
-                            Status::Done,
-                            ContentType::Plain,
-                            Some(user_principal_id),
-                        )
-                        .map_err(|e| {
-                            capnp::Error::failed(format!("failed to insert user block: {}", e))
-                        })?;
+                    // No user block is created here: `submit_draft` already
+                    // promoted the one the player typed into. This is where the
+                    // old data-loss window lived — the draft was cleared above
+                    // and re-authored here, so a failure between the two lost
+                    // the message.
 
                     // Spawn LLM streaming in background. An interactive chat
                     // prompt via submit_input: it announces like every other
@@ -6084,8 +6091,13 @@ impl kernel::Server for KernelImpl {
 
         log::info!("clear_input: context={}", context_id);
 
-        match self.kernel.documents.clear_input(context_id) {
-            Ok(_text) => Promise::ok(()),
+        // Only ever the caller's own draft — the principal comes from the
+        // authenticated connection, so one player cannot discard another's
+        // half-typed message.
+        let principal_id = self.connection.borrow().principal.id;
+
+        match self.kernel.documents.clear_draft(context_id, principal_id) {
+            Ok(_discarded) => Promise::ok(()),
             Err(e) => Promise::err(capnp::Error::failed(format!("clear_input failed: {}", e))),
         }
     }
