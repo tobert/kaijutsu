@@ -8627,11 +8627,18 @@ async fn execute_kj_command(
             return Ok(ExecutedKj { exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None });
         }
     };
-    let latch = result.latch_request().map(|latch| ExecutedKjLatch {
-        command: latch.command.clone(),
-        target: latch.paths.join(" "),
-        message: latch.hint.clone(),
-    });
+    // kj's confirmation gate rides kaish's opaque `baggage` channel as of
+    // kaish 0.14 (which deleted the typed `ExecResult.latch`). Same three
+    // fields on the wire — `hasLatch`/`latchCommand`/`latchTarget`/
+    // `latchMessage` are unchanged.
+    let latch =
+        kaijutsu_kernel::runtime::kj_builtin::latch_from_result(&result).map(|latch| {
+            ExecutedKjLatch {
+                command: latch.command,
+                target: latch.target,
+                message: latch.hint,
+            }
+        });
     let stdout = result.text_out().into_owned();
     let stderr = result.err.clone();
     documents.edit_text_as(context_id, &output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))

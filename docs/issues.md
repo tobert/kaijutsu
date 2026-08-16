@@ -305,14 +305,16 @@ eventually rely on the lie.
 **Default grants stay per-rc, as today** — each `context_type`'s rc decides.
 Not an unconditional grant in every bucket.
 
-**Sequencing: do this with the kaish 0.14 bump, not after it.** The bump
-deletes the entire latch/nonce confirmation surface (6 call sites, 5 files —
-measured, see the 0.14 entry), which is the same mechanism write approvals
-would otherwise extend. Amy: *"maybe we do the `kaish_ro` thing at the same
-time (and end up with one unified read-only-ish shell with path boundaries
-for all agents)."* Rebuilding confirmation on the new API and defining the
-read/write split in one pass means designing the boundary once instead of
-porting the old shape and immediately reshaping it.
+**Sequencing: this is now the same slice as the confirmation gate.** The plan
+was to do it *with* the kaish 0.14 bump; the bump shipped 2026-08-16 on its own
+(deliberately — a bump that also redesigns a gate is two changes), leaving the
+`kj` gate alive as a bare `--confirm` flag and kaish's own shell-side latch
+gone. See *The `kj` confirmation gate needs a real design*. Amy: *"maybe we do
+the `kaish_ro` thing at the same time (and end up with one unified
+read-only-ish shell with path boundaries for all agents)."* Rebuilding
+confirmation on `plan_program` and defining the read/write split in one pass
+means designing the boundary once instead of porting the old shape and
+immediately reshaping it.
 
 ---
 
@@ -1270,12 +1272,14 @@ Three things the manual sweep taught, worth not re-learning:
   contexts. Use last-activity age, and treat "attached" as a separate question
   the roster cannot currently answer per-context (its `bound` rows are keyed by
   principal).
-- **The archive latch scopes its nonce to the RESOLVED LABEL**, so confirming
-  with the id you just listed fails with `nonce scope mismatch: unauthorized
-  path '<id>' (authorized: ["<label>"])`. Unlabeled contexts scope to the short
+- **The archive latch scoped its nonce to the RESOLVED LABEL**, so confirming
+  with the id you just listed failed with `nonce scope mismatch: unauthorized
+  path '<id>' (authorized: ["<label>"])`. Unlabeled contexts scoped to the short
   id. This is the gate research pass's finding #3 observed live — see "Gate
   slice 1a" below, which already says `authorized_label` must become the raw
-  typed reference.
+  typed reference. *No longer reproducible as written* (kaish 0.14 deleted the
+  nonce store 2026-08-16 and `--confirm` is a bare flag), but the property it
+  exposed is exactly what the replacement gate must get right.
 - **kaish loop counters do not persist across iterations here**, so a batch
   guard written as `if test "$i" -ge 10` never trips and a "batch of 10" runs
   the whole list. Nothing was lost (the per-item skip checks are independent
@@ -1369,133 +1373,84 @@ has **no test** — undertested in a crate whose whole premise is tested
 guarantees. `rules::list_rules` doesn't exist yet and `kj approve rules` needs
 it. Both are first work on resume.
 
-## kaish 0.14 bump — a confirmation-subsystem replacement, and it unpins `kaish-help` (2026-08-13)
+## The `kj` confirmation gate needs a real design — the kaish latch it rode is gone (2026-08-16)
 
-> **Read the approvals ruling first.** Amy already decided the shape on
-> 2026-08-12 — see *Drive gates* below, "kaish latches are going away —
-> approvals become ours, bespoke". That entry correctly called this a
-> **removal** (not a `LatchRequest` change), enumerated the latched verbs, and
-> set the steer: kaish's command-visibility tools are the substrate, not a
-> reimplementation of latches. It also carries a property to KEEP — the nonce
-> is scoped to the **label, not the id**, so confirming names what it
-> authorizes and an id-keyed batch fails loudly on scope mismatch.
->
-> This entry disagreed with that one for two days and a 2026-08-14 session
-> corrected *this* one without finding *that* one. Two entries in one file
-> disagreeing is the real defect; they are cross-linked now. One addition from
-> the re-probe: the filed verb list omits `kj doc delete` (`kj/doc.rs:434`),
-> so there are **six** producer sites, not five.
+**The kaish 0.14 bump SHIPPED 2026-08-16** (`kaish-kernel`/`-glob`/`-types`/
+`-help` all `"0.14"` from crates.io, lock at 0.14.1). It closed the
+`kaish-help` git-rev TODO — the overlay-opt-in `Selector::without_overlay`
+shipped in 0.14.0, so there is no git source in `Cargo.lock` any more — and it
+picked up `${var:0:N}` becoming a loud error (0.14.1) instead of a silently
+wrong path. What it did NOT do is design the replacement gate; that is this
+entry.
 
-We pin **kaish 0.13** (`Cargo.toml`). **0.14 removes the latch surface**
-(`latch_request()`, `LatchRequest`, `.nonce`) — flagged by the kaish lead as
-the translation-site port predicted during the cut, now concrete.
+**What the bump did to the gate, and why.** kaish 0.14 deleted its confirmation
+latch outright: `kaish_kernel::nonce`, `NonceStore`, `ExecContext::verify_nonce`
+/ `latch_result`, `ExecResult.latch`, `JobStatus::Latched`. kaijutsu had built
+its own confirmation subsystem on those primitives — six producers
+(`kj/context.rs` archive/remove/retag, `kj/workspace.rs`, `kj/doc.rs`,
+`kj/preset.rs`) returning `KjResult::Latch`.
 
-**Scope — CORRECTED 2026-08-14, and the earlier correction was itself wrong.**
+Two facts settled how to port it:
 
-The first pass here read: "one production call site
-(`shell.rs:467`), five test fixtures — a small port, not a six-site sweep."
-That is accurate *for the symbol it counted* (`latch_request()`) and wrong for
-the work. It missed that **kaijutsu built its own confirmation subsystem on
-kaish's `nonce` primitives**, which 0.14 deletes outright (not renames):
-`kaish_kernel::nonce`, `NonceStore`, `ExecContext::verify_nonce`,
-`ExecContext::latch_result`, `ExecResult.latch`, `JobStatus::Latched`.
+1. **kaish's own latch was never on in kaijutsu.** `KaishConfig::named()`
+   defaults `latch_enabled: false` and we never called `with_latch`, so `rm` and
+   truncating overwrites in a kaijutsu shell already ran unconfirmed on 0.13.
+   0.14 removing that gate changed nothing here — the shell-side gap this entry
+   worries about predates the bump.
+2. **The kj-side gate was ours, so it survived.** It is now a **bare
+   `--confirm` flag** — the same trade kaish itself made for `kaish-trash
+   empty`. A destructive `kj` verb still refuses at exit 2 and prints what it
+   would destroy; what went away with the nonce store is the *binding* between a
+   confirmation and the exact command and target that prompted it.
 
-Verified in-tree 2026-08-14:
-- `kernel.rs:107` — `nonce_stores: DashMap<ContextId, kaish_kernel::nonce::NonceStore>`
-- `kernel.rs:1435-1448` — per-context mint/lookup accessor
-- `runtime/kj_builtin.rs:596-597` (`--confirm` extract), `:649`
-  (`ctx.verify_nonce`), `:744` (`ctx.latch_result`)
-- `kj/mod.rs:127-138,149,157` — `KjResult::Latch` + `is_latch()`
-- **six producers**: `kj/context.rs:1672,1908,2020` (archive/remove/retag),
-  `kj/workspace.rs:322`, `kj/doc.rs:434`, `kj/preset.rs:303`
-- `mcp/servers/shell.rs:467,495` — the MCP envelope's `"latch"` key
+The gate rides `ExecResult::baggage` now (`runtime::kj_builtin::latch_result` /
+`latch_from_result`, keys `kj.latch.{command,target,hint}`) — kaish's opaque
+carry-don't-interpret channel, which propagates up a statement exactly the way
+`.data` does. **No wire change:** `hasLatch`/`latchCommand`/`latchTarget`/
+`latchMessage` in `kaijutsu.capnp`, `KjLatch` in `kaijutsu-client`, and the
+`kaijutsu-acp` "requires explicit confirmation" error all still work.
 
-So this is a subsystem replacement, not a port. **The lesson filed in
-`signoff.md` about this entry — "say what a number means for the work" —
-recursed: a correction praised for good framing was framed against the wrong
-symbol.** A count is only as good as the question it answers; check that the
-symbol you counted is the one the work is about.
+**What is still open, and it is the whole point of this entry:**
 
-**kaish removed the gate on purpose.** `~/src/kaish/docs/EMBEDDING.md:793-812`:
-no kernel-held decision, no nonce, no interception hook. The embedder calls
-`plan_program(source)`, judges, and executes or doesn't. So the replacement is
-**ours to own end-to-end** — and it should be ONE path shared with the
-permission-Ask seam (`HookAction::Ask`, `mcp/permission.rs`,
-`subscribePermissionEvents @103`) rather than a second bespoke confirmation.
-Six `kj` verbs and the `shell` tool gate want the same thing.
+- **A confirmation you can trust.** A bare flag cannot tell "I read the prompt
+  for *this* target" from "I always pass `--confirm`", and a batch loop that
+  appends it unconditionally has no gate at all. The 2026-08-12 approvals ruling
+  stands: the replacement is ours end-to-end, built on `plan_program(source)`,
+  and should be ONE path shared with the permission-Ask seam (`HookAction::Ask`,
+  `mcp/permission.rs`, `subscribePermissionEvents @103`) rather than a second
+  bespoke confirmation. Property to KEEP from the old latch: scope to the
+  **label the caller typed, not the resolved id**, so confirming names what it
+  authorizes.
+- **The `shell` / `shell_write` split** — same design pass, per the sequencing
+  note above under the read-only-shell entry. That entry said to do the split
+  *with* the bump; it was done *after*, deliberately, so the bump stayed a bump.
+- **Plan-API constraints to design against:** no execute-a-Plan API and no
+  per-command interception hook — you re-submit the original source text, so a
+  gate is **all-or-nothing per statement**. `presented_keys` / `--confirm`
+  redaction in the plan surface is vestigial: nothing in 0.14 mints or redeems a
+  confirm key.
+- **Five `.is_latch()` assertions** (`kj/workspace.rs`, `kj/doc.rs`,
+  `kj/context.rs` ×2, `kj/preset.rs`) assert the *dispatcher* still returns
+  `KjResult::Latch`. They pass today and will have to be rewritten to assert
+  gate behavior when the real gate lands — budget them into that slice.
 
-**Free win in the same bump:** 0.14 adds
-`KernelConfig::with_job_manager(Arc<JobManager>)` — that is blocker #1 of the
-three listed under *Background exec → kaish's job system*. The other two
-(mid-run output forwarding, PDEATHSIG) are unchecked.
+**Free win taken by the bump, still unused:** 0.14 adds
+`KernelConfig::with_job_manager(Arc<JobManager>)` — blocker #1 of the three under
+*Background exec → kaish's job system*. The other two (mid-run output
+forwarding, PDEATHSIG) are unchecked.
 
-**Plan-API constraints worth knowing before designing against it:** there is no
-execute-a-Plan API and no per-command interception hook (grepped for
-specifically) — you re-submit the original source text, so a gate is
-**all-or-nothing per statement**. And `presented_keys` / `--confirm` redaction
-in the plan surface is vestigial: nothing in 0.14 mints or redeems a confirm
-key (only `kaish-trash empty` keeps a bare no-nonce `--confirm` flag).
-
-**It also closes an open TODO.** `kaish-help` is pinned to a git rev (not
-crates.io) because published 0.13 forces an "Overlay mode" paragraph into every
-composed recipe and kaijutsu never enables overlay mode — we would be telling
-our models to run `kaish-vfs commit` for a mode that is off. That rev shipped
-in **0.14.0**, so the TODO's own stated exit condition is met: flip
-`kaish-help` to `"0.14"` in the same bump (`docs/composable-help.md` step 4).
-The two are coupled — the help unpin is the reward for doing the latch port.
-
-**`${var:0:N}` is NOT fixed by pinning crates.io `"0.14"` — MEASURED
-2026-08-14, correcting this entry's original claim.** The fix is real but lives
-in the **12 unreleased commits past the `v0.14.0` tag** (`d129cb5`). Built the
-tag in a throwaway worktree and probed it directly:
-
-| probe | published `v0.14.0` | HEAD `d129cb5` |
-|---|---|---|
-| `echo "${d:0:4}/file"` | **`/file`, exit 0, no diagnostic** | loud parse error naming `${d[0:4]}` |
-| `echo "[${d:0:4}]"` | `[]`, exit 0 | loud parse error |
-| `echo "[${d[0:4]}]"` | `cannot subscript a string` | `[/hom]` ✓ |
-
-So on the published tag the trap is **live** (silent wrong path — the data-
-corruption shape, not the missing-value shape) **and the documented replacement
-syntax does not work on strings at all**. Pinning `"0.14"` from crates.io buys
-nothing here.
-
-**RESOLVED — Amy 2026-08-14: "the string range stuff will be in kaish 0.14.1."**
-So: **no git-rev pin.** Do the bump against `"0.14"` (the confirmation-subsystem
-replacement is the long pole and is independent of slice syntax), then flip the
-pin to `"0.14.1"` when it is cut. The `${var:0:N}` trap stays live in the
-interim, which is exactly the status quo on 0.13 — no regression, and a rev pin
-would have re-created the very problem this bump retires by unpinning
-`kaish-help`.
-
-**Probes 4–6 showed no tag-vs-HEAD delta**, so these are unaffected by the pin
-choice: `||` after a `$()` assignment still never fires (also absent from the
-unreleased changelog — nobody upstream is tracking it).
-
-**The leading-zero trap is BROADER than filed, not narrower.** A first probe
-(`x=007; case $x in 007)`) matched, which looked like evidence the loss was
-`for`-only — it is not, and the probe was under-designed: it normalizes BOTH
-sides, so a match cannot distinguish "neither normalized" from "both
-normalized". The decisive forms:
+**The leading-zero trap survives 0.14 and is ruled INTENDED upstream** — plan
+around it permanently, quote the literal whenever a leading zero is data:
 
 ```sh
 case "03" in 03) …      # NO-MATCH — the PATTERN normalizes
 x=007; echo "[$x]"      # [7]    — bare-numeric ASSIGNMENT normalizes too
-for i in 007; …         # [7]
 ```
 
-Assignment was not previously recorded anywhere. So any rc script doing
-`hour=08` — not just `case`/`for` — silently holds a different value than it
-reads. Ruled INTENDED upstream, so plan around it permanently: **quote the
-literal** (`x="007"`) whenever a leading zero is data. Worth knowing *why* it got
-prioritized: our report said the expansion yielded empty, but the receiving
-lane's re-probe found the word vanishes from the AST entirely — so inside
-quotes it produced a **wrong path, not a missing one** (`"${d:0:4}/file"` →
-`/file`, meaning `rm "${d:0:4}/file"` silently targeted the wrong thing). A
-report describes what was visible; a probe finds the shape. Separately, the
-bare-numeric leading-zero normalization is **ruled intended** (coerce to number,
-quote for a string) and becomes a docs task, not a fix — though the `1e2`
-inconsistency is real and should ride the write-up.
+Assignment normalizing was not previously recorded anywhere, so any rc script
+doing `hour=08` holds a different value than it reads. `||` after a `$()`
+assignment still never fires on 0.14 either, and is absent from the upstream
+changelog — nobody is tracking it.
 
 ### kaish 0.15 gives the gate a real heredoc surface (relayed 2026-08-16, kaish lead)
 

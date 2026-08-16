@@ -10,7 +10,7 @@
 //! kj doc list [--kind <k>] [--json]
 //! kj doc tree <id> [--max-depth N] [--expand-tools]
 //! kj doc create [--kind <k>] [--language <l>] [--id <hex>]
-//! kj doc delete <id> [--confirm <nonce>]
+//! kj doc delete <id> [--confirm]
 //! ```
 
 use std::str::FromStr;
@@ -75,15 +75,15 @@ enum DocCommand {
         id: Option<String>,
     },
     /// Delete a document and all its blocks. CASCADEs to drop the
-    /// contexts row, oplog, snapshots — irreversible. Two-step: first
-    /// invocation returns a nonce, second invocation with --confirm
-    /// performs the deletion (latch pattern shared with archive).
+    /// contexts row, oplog, snapshots — irreversible. Two-step: the first
+    /// invocation refuses and prints what would be destroyed, a second with
+    /// --confirm performs the deletion (latch pattern shared with archive).
     Delete {
         /// Document id (hex UUID)
         doc_id: String,
-        /// Latch confirmation nonce returned by the first invocation
+        /// Confirm the deletion — it is irreversible
         #[arg(long)]
-        confirm: Option<String>,
+        confirm: bool,
     },
 }
 
@@ -145,7 +145,7 @@ impl KjDispatcher {
                 id,
             } => self.doc_create(&kind, language.as_deref(), id.as_deref(), caller),
             DocCommand::Delete { doc_id, confirm } => {
-                self.doc_delete(&doc_id, confirm.as_deref(), caller)
+                self.doc_delete(&doc_id, confirm, caller)
             }
         }
     }
@@ -387,12 +387,12 @@ impl KjDispatcher {
     }
 
     /// Delete a document and CASCADE-drop its contexts row, oplog,
-    /// snapshots. Latch-gated: first call returns a nonce + summary,
-    /// second call with `--confirm <nonce>` actually deletes.
+    /// snapshots. Latch-gated: the first call refuses with a summary of what
+    /// would go, a second call with `--confirm` actually deletes.
     fn doc_delete(
         &self,
         id_str: &str,
-        confirm: Option<&str>,
+        confirm: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let ctx_id = match ContextId::parse(id_str) {
@@ -427,10 +427,10 @@ impl KjDispatcher {
         };
 
         // Without --confirm: emit a Latch so the kaish layer prints the
-        // confirmation summary and a nonce. With --confirm: caller.confirmed
-        // is set true by KjBuiltin if the nonce verifies; otherwise we'd
-        // never reach here with confirm set, so trust it.
-        if !caller.confirmed && confirm.is_none() {
+        // confirmation summary. `KjBuiltin` strips the root `--confirm` flag
+        // before dispatch and reports it as `caller.confirmed`, so the local
+        // `confirm` only fires for a direct dispatcher call (tests).
+        if !caller.confirmed && !confirm {
             return KjResult::Latch {
                 command: "kj doc delete".to_string(),
                 target: id_str.to_string(),

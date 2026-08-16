@@ -72,7 +72,7 @@ pub struct KjCaller {
     pub principal_id: PrincipalId,
     pub context_id: Option<ContextId>,
     pub session_id: SessionId,
-    /// True when the caller has verified a latch nonce (destructive op confirmed).
+    /// True when the caller passed `--confirm` (destructive op confirmed).
     pub confirmed: bool,
     /// Recursion depth from rc lifecycle dispatch. The rc runner increments
     /// this before invoking nested kj from a script, so an rc-driven
@@ -133,12 +133,15 @@ pub enum KjResult {
     /// Context switch — carries the resolved ContextId for the caller to act on.
     /// The dispatcher resolves the target; the caller (KjBuiltin) updates SharedContextId.
     Switch(ContextId, String),
-    /// Destructive op needs confirmation. KjBuiltin converts to ExecResult code 2
-    /// via kaish's latch/nonce system.
+    /// Destructive op needs confirmation. `KjBuiltin` converts this to an
+    /// `ExecResult` at code 2 and stamps the gate onto `ExecResult::baggage`
+    /// (`runtime::kj_builtin::latch_result`) — kaish owned this end-to-end
+    /// through 0.13 and deleted its latch in 0.14; the gate is kaijutsu policy
+    /// and survived, the nonce round-trip did not.
     Latch {
-        /// Nonce scope: the kj subcommand path (e.g., "kj context archive").
+        /// The kj subcommand path (e.g., "kj context archive").
         command: String,
-        /// Nonce scope: the target label/identifier.
+        /// The target label/identifier.
         target: String,
         /// Human-readable summary of what will be affected.
         message: String,
@@ -835,16 +838,23 @@ pub(crate) fn kj_command() -> clap::Command {
     use clap::CommandFactory;
     clap::Command::new("kj")
         .about("Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.")
-        // Root-level (global) flag: kj extracts `--confirm <nonce>` in
+        // Root-level (global) flag: kj extracts `--confirm` in
         // KjBuiltin::execute before dispatch, so it isn't on any subcommand's
         // clap struct. Declaring it here puts it in the reflected top-level
         // params, and kaish's binder merges root params onto every leaf so the
-        // trailing `… retag a b --confirm <nonce>` form binds the value.
+        // trailing `… retag a b --confirm` form binds.
+        //
+        // It is a BARE flag as of kaish 0.14: the nonce round-trip went away
+        // with kaish's confirmation latch (which owned the nonce store), the
+        // same trade kaish itself made for `kaish-trash empty`. The gate
+        // survives — a destructive `kj` verb still refuses without it — but the
+        // confirmation is no longer bound to the exact command and target that
+        // issued it.
         .arg(
             clap::Arg::new("confirm")
                 .long("confirm")
-                .action(clap::ArgAction::Set)
-                .help("Latch confirmation nonce"),
+                .action(clap::ArgAction::SetTrue)
+                .help("Confirm a destructive operation"),
         )
         // Root-level (global) flag: kaish 0.13 owns `--json` entirely now
         // (`GlobalFlags::apply_from_args` / `finalize_output` /

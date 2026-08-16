@@ -341,13 +341,11 @@ impl EmbeddedKaish {
             // Model-facing shells keep kaish's 8 KB agent preset; rc/hook/
             // editor-splice shells get a runaway backstop instead, so kaish's
             // `did_spill` exit-code remap never forges a failure in a script.
-            .with_output_limit(output.to_config())
-            // Latch nonces must outlive this per-execute shell: a nonce issued
-            // by one command (e.g. `kj context retag`) is confirmed by the
-            // *next* command in a fresh `EmbeddedKaish`. The store is keyed by
-            // context on the long-lived kernel, so the `--confirm` lands in the
-            // same table that issued the nonce instead of a fresh empty one.
-            .with_nonce_store(kernel.nonce_store_for(context_id));
+            // kaish 0.14 deleted the confirmation latch and its nonce store, so
+            // there is nothing to keep alive across this per-execute shell any
+            // more: `kj`'s own confirmation gate is a bare `--confirm` flag
+            // evaluated inside a single invocation (see `kj_builtin.rs`).
+            .with_output_limit(output.to_config());
         if let Some(root) = project_root {
             config = config.with_cwd(root);
         }

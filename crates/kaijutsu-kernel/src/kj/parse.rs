@@ -34,6 +34,15 @@ pub fn has_flag(argv: &[String], names: &[&str]) -> bool {
     argv.iter().any(|a| names.contains(&a.as_str()))
 }
 
+/// Remove every occurrence of a **bare** boolean flag from argv in-place.
+///
+/// Unlike [`strip_named_arg`] this consumes only the flag token itself, never
+/// the argument that follows it — so `kj context remove --confirm doomed`
+/// keeps `doomed` as a positional.
+pub fn strip_flag(argv: &mut Vec<String>, names: &[&str]) {
+    argv.retain(|a| !names.contains(&a.as_str()));
+}
+
 /// Extract all instances of a repeatable named argument.
 ///
 /// e.g., `--path /a --path /b` → `vec!["/a", "/b"]`

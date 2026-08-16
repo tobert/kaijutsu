@@ -58,21 +58,16 @@ kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 approval-ledger = { path = "crates/approval-ledger" }
 claude-code-peer = { path = "crates/claude-code-peer" }
 
-# Kaish (execution engine + client) — pinned to published 0.12.
+# Kaish (execution engine + client) — pinned to published 0.14.
 # `subprocess` compiles in host external-command execution; whether a given
 # shell may actually use it is decided per-context at materialization
 # (ExternalExec, gated on the `exec` loadout authority — deny by default).
-kaish-kernel = { version = "0.13", features = ["subprocess"] }
-kaish-glob = "0.13"
-kaish-types = "0.13"
-# TODO(amy): kaish-help pinned to an open PR branch (not crates.io) because
-# published 0.13 forces an "Overlay mode" paragraph into every composed
-# recipe and kaijutsu never enables overlay mode — shipping it would tell
-# our models to run `kaish-vfs commit` for a mode that isn't on. This rev
-# makes overlay opt-in (`Selector::without_overlay`) and adds the four
-# verified syntax gaps. Flip to a version string once Amy cuts the release
-# that carries this (docs/composable-help.md step 4).
-kaish-help = { git = "https://github.com/tobert/kaish", rev = "ee3cfb6ffe6968fb9ffd0d88dcb9479b80326d28" }
+# All four ride crates.io again: 0.14 carries the overlay-opt-in kaish-help
+# (`Selector::without_overlay`) that kept us on a git rev through 0.13.
+kaish-kernel = { version = "0.14", features = ["subprocess"] }
+kaish-glob = "0.14"
+kaish-types = "0.14"
+kaish-help = "0.14"
 
 # Cap'n Proto
 capnp = "0.25"

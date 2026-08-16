@@ -593,9 +593,11 @@ impl Tool for KjBuiltin {
             }
         }
 
-        // Extract --confirm <nonce> before dispatch
-        let confirm_nonce = crate::kj::parse::extract_named_arg(&argv, &["--confirm"]);
-        crate::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
+        // Extract the bare --confirm flag before dispatch. kaish 0.14 deleted
+        // the confirmation latch and with it the nonce store this used to
+        // round-trip through, so presence of the flag IS the confirmation.
+        let confirmed = crate::kj::parse::has_flag(&argv, &["--confirm"]);
+        crate::kj::parse::strip_flag(&mut argv, &["--confirm"]);
 
         // Stdin → --content for `kj rc add`/`edit`. Lets shell pipelines
         // author multi-line .md / .kai scripts without the
@@ -632,24 +634,14 @@ impl Tool for KjBuiltin {
             Err(e) => return ExecResult::failure(1, format!("kj: {e}")),
         };
 
-        let mut caller = KjCaller {
+        let caller = KjCaller {
             principal_id: self.principal_id,
             context_id: self.current_context_id(),
             session_id: self.session_id,
-            confirmed: false,
+            confirmed,
             rc_depth,
             privileged: self.privileged,
         };
-
-        // If --confirm provided, verify nonce BEFORE dispatching
-        if let Some(nonce) = &confirm_nonce {
-            let cmd_scope = build_command_scope(&argv);
-            let target_scope = build_target_scope(&argv);
-            match ctx.verify_nonce(nonce, &cmd_scope, &[&target_scope]) {
-                Ok(()) => caller.confirmed = true,
-                Err(e) => return ExecResult::failure(1, format!("kj: {e}")),
-            }
-        }
 
         // Server-crate commands intercepted here because they require
         // dependencies that kaijutsu-kernel does not have.
@@ -754,19 +746,16 @@ impl Tool for KjBuiltin {
                 target,
                 message,
             } => {
-                let original_argv = argv.join(" ");
-                ctx.latch_result(&command, &[&target], &message, |nonce| {
-                    format!("kj {} --confirm {}", original_argv, nonce)
-                })
+                let hint = format!("kj {} --confirm", argv.join(" "));
+                latch_result(&command, &target, &message, hint)
             }
         };
 
         // `--json` formatting is entirely kaish's concern now (kaish 0.13):
         // `finalize_output`/`apply_output_format` render this `ExecResult`
-        // after `execute()` returns, reading `.data`/`.output`/`.latch`
-        // exactly as set above — a `Switch` has already switched and a
-        // `Latch` has already latched by this point, so returning `exec`
-        // as-is preserves those side effects. kj no longer builds its own
+        // after `execute()` returns, reading `.data`/`.output` exactly as set
+        // above — a `Switch` has already switched by this point, so returning
+        // `exec` as-is preserves that side effect. kj no longer builds its own
         // envelope (see `schema()`'s `owns_output` note and the kaish 0.13
         // `--json` migration in docs/issues.md).
         exec
@@ -854,49 +843,79 @@ fn is_gated_verb(argv: &[String]) -> bool {
     }
 }
 
-/// Build a command scope string from argv for nonce validation.
-///
-/// e.g., `["context", "archive", "old-ctx"]` → `"kj context archive"`
-fn build_command_scope(argv: &[String]) -> String {
-    let mut parts: Vec<&str> = argv
-        .iter()
-        .map(|s| s.as_str())
-        .take_while(|s| !s.starts_with('-'))
-        .take(2) // At most: subcommand + verb
-        .collect();
-    // Canonicalize the verb alias so a nonce issued for the canonical scope
-    // (e.g. "kj context remove" — the form printed in the "To confirm, run:"
-    // message) verifies whether the user confirmed with the canonical verb or
-    // its alias ("kj context rm … --confirm"). Latched destructive commands
-    // are the only ones that reach here; today only `rm` aliases a latched
-    // verb (context/preset/workspace remove), but mapping is centralized so a
-    // future alias (`del`, etc.) is a one-line add.
-    if let Some(verb) = parts.get_mut(1) {
-        *verb = canonical_latched_verb(verb);
-    }
-    format!("kj {}", parts.join(" "))
+// ── kj's confirmation gate, carried on kaish baggage ──────────────────────
+//
+// kaish 0.13 gave an embedder a typed control-plane field for this
+// (`ExecResult.latch` / `ExecContext::latch_result`); 0.14 deleted the latch
+// outright. kj's OWN gate — the one that holds `kj context remove`,
+// `kj context archive`, `kj context retag`, `kj doc delete`, `kj preset
+// remove` and `kj workspace remove` at exit 2 until `--confirm` — is
+// kaijutsu policy, not kaish's, so it survives the removal. What it lost is
+// the substrate: it now rides `ExecResult::baggage`, the opaque key-value
+// channel kaish carries and does not interpret (kaish-types
+// `ExecResult::baggage`), which propagates up a statement exactly the way
+// `.data` does. Producer and consumers are all kaijutsu, so the keys below
+// are the whole protocol.
+
+/// Baggage key: the canonical command that latched (e.g. `kj context remove`).
+pub const LATCH_COMMAND_KEY: &str = "kj.latch.command";
+/// Baggage key: what the command would have acted on.
+pub const LATCH_TARGET_KEY: &str = "kj.latch.target";
+/// Baggage key: the exact re-run that confirms it.
+pub const LATCH_HINT_KEY: &str = "kj.latch.hint";
+
+/// A `kj` confirmation gate, read back off a finished `ExecResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KjLatchInfo {
+    /// The canonical command that latched.
+    pub command: String,
+    /// What it would have acted on.
+    pub target: String,
+    /// The exact re-run that confirms it.
+    pub hint: String,
 }
 
-/// Map a verb alias to the canonical form used by latched-command nonce
-/// scopes. Identity for anything that isn't a known destructive alias.
-fn canonical_latched_verb(verb: &str) -> &str {
-    match verb {
-        "rm" => "remove",
-        other => other,
-    }
+/// Build the standard exit-2 "confirmation required" result and stamp the
+/// gate onto the result's baggage so a programmatic caller reads it
+/// structurally instead of scraping the prose.
+pub fn latch_result(command: &str, target: &str, reason: &str, hint: String) -> ExecResult {
+    let authorized = if target.is_empty() {
+        String::new()
+    } else {
+        format!("\nTarget: {target}")
+    };
+    let mut result = ExecResult::failure(
+        2,
+        format!("{command}: confirmation required ({reason}){authorized}\nTo confirm, run: {hint}"),
+    );
+    result
+        .baggage
+        .insert(LATCH_COMMAND_KEY.to_string(), command.to_string());
+    result
+        .baggage
+        .insert(LATCH_TARGET_KEY.to_string(), target.to_string());
+    result.baggage.insert(LATCH_HINT_KEY.to_string(), hint);
+    result
 }
 
-/// Extract the target (context label/ref) from argv for nonce validation.
-///
-/// Heuristic: first positional arg after the subcommand verb.
-/// e.g., `["context", "archive", "old-ctx"]` → `"old-ctx"`
-fn build_target_scope(argv: &[String]) -> String {
-    // Skip subcommand and verb, take the first non-flag arg
-    argv.iter()
-        .skip(2) // Skip e.g. "context" "archive"
-        .find(|s| !s.starts_with('-'))
-        .cloned()
-        .unwrap_or_default()
+/// Read a `kj` confirmation gate back off an `ExecResult`, or `None` when the
+/// command did not latch. The command key is what marks a latch; the other two
+/// are informational and default to empty rather than suppressing the gate.
+pub fn latch_from_result(result: &ExecResult) -> Option<KjLatchInfo> {
+    let command = result.baggage.get(LATCH_COMMAND_KEY)?.clone();
+    Some(KjLatchInfo {
+        command,
+        target: result
+            .baggage
+            .get(LATCH_TARGET_KEY)
+            .cloned()
+            .unwrap_or_default(),
+        hint: result
+            .baggage
+            .get(LATCH_HINT_KEY)
+            .cloned()
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -1346,25 +1365,42 @@ mod tests {
         );
     }
 
-    /// A latch nonce issued for the canonical scope (`kj context remove`,
-    /// the form printed in the confirm prompt) must verify whether the user
-    /// confirms via the canonical verb or the `rm` alias. Regression: the
-    /// confirm path echoed the raw alias (`kj context rm`) and rejected the
-    /// nonce with "scope mismatch".
-    #[test]
-    fn latch_scope_canonicalizes_rm_alias() {
-        let s = |v: &str| v.to_string();
-        let canonical = build_command_scope(&[s("context"), s("remove"), s("victim")]);
-        let aliased = build_command_scope(&[s("context"), s("rm"), s("victim")]);
-        assert_eq!(canonical, "kj context remove");
+    /// The `rm` alias reaches the same confirmation gate as the canonical
+    /// `remove` verb, and `--confirm` releases it through the alias too. This
+    /// used to be a nonce-scope canonicalization test (a nonce issued for
+    /// "kj context remove" had to validate against a confirm spelled
+    /// "kj context rm"); kaish 0.14 deleted the nonce store, so the property
+    /// worth holding is now the plain one: neither spelling can delete
+    /// unconfirmed, and either spelling can confirm.
+    #[tokio::test]
+    async fn rm_alias_reaches_the_same_confirmation_gate() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("alias-home"), None, principal);
+        let _doomed = register_context(&dispatcher, Some("doomed"), Some(home), principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+
+        let held = kaish
+            .execute_with_options("kj context rm doomed", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (alias, unconfirmed)");
         assert_eq!(
-            aliased, canonical,
-            "rm alias must map to the canonical scope"
+            held.code, 2,
+            "the `rm` alias must latch exactly like `remove`: out={} err={}",
+            held.text_out(),
+            held.err
         );
-        // Non-aliased verbs are untouched.
-        assert_eq!(
-            build_command_scope(&[s("context"), s("archive"), s("x")]),
-            "kj context archive"
+
+        let done = kaish
+            .execute_with_options("kj context rm doomed --confirm", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (alias, confirmed)");
+        assert!(
+            done.ok(),
+            "`--confirm` must release the gate through the alias, got code {} / err {:?}",
+            done.code,
+            done.err
         );
     }
 
@@ -1941,22 +1977,23 @@ mod tests {
         );
     }
 
-    /// Latch regression: a confirmation nonce issued by one `EmbeddedKaish`
-    /// must still validate when the *next* shell confirms it. kaish is
-    /// materialized fresh per MCP `execute`, so the nonce store can't live on
-    /// the shell — it lives per-context on the kernel. Before the fix, the
-    /// `--confirm` landed in a brand-new empty store and the kernel reported
-    /// "invalid nonce", exactly the `kj context retag … --confirm <nonce>`
-    /// failure observed in the app.
+    /// The confirmation gate round-trips across a *fresh* `EmbeddedKaish` for
+    /// the same context — the real path a follow-up MCP `execute` takes, since
+    /// kaish is materialized per call. Under kaish 0.13 this was a nonce
+    /// durability regression (the store had to live per-context on the kernel
+    /// or `--confirm` hit a brand-new empty table and reported "invalid
+    /// nonce"). kaish 0.14 deleted the nonce store, so the gate is now a bare
+    /// flag with no cross-call state to lose — this holds the observable
+    /// behavior that regression was about: unconfirmed refuses, confirmed runs.
     #[tokio::test]
-    async fn latch_nonce_survives_fresh_shell_for_same_context() {
+    async fn confirmation_gate_round_trips_across_a_fresh_shell() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
 
         let principal = PrincipalId::new();
         let ctx = register_context(&dispatcher, Some("alpha"), None, principal);
 
-        // Shell #1: issue the latch nonce (no --confirm yet → exit 2).
+        // Shell #1: the gate holds (no --confirm yet → exit 2).
         let kaish_a = embedded_with_kj(dispatcher.clone(), ctx).await;
         let issue = kaish_a
             .execute_with_options("kj context retag beta alpha", ExecuteOptions::default())
@@ -1966,32 +2003,22 @@ mod tests {
             issue.code, 2,
             "retag without --confirm should latch (exit 2): {issue:?}"
         );
+        assert!(
+            issue.err.contains("--confirm"),
+            "the refusal must name the flag that releases it: {}",
+            issue.err
+        );
 
-        // Pull the nonce out of the confirmation hint kaish emitted, e.g.
-        // "...To confirm, run: kj context retag beta alpha --confirm 1a2b3c4d".
-        let hint = &issue.err;
-        let nonce = hint
-            .split("--confirm ")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .unwrap_or_else(|| panic!("no --confirm nonce in latch message: {hint}"));
-
-        // Shell #2: a *fresh* materialization for the same context — the real
-        // path a follow-up MCP `execute` takes. The nonce must still validate.
+        // Shell #2: a *fresh* materialization for the same context.
         let kaish_b = embedded_with_kj(dispatcher.clone(), ctx).await;
         let confirm = kaish_b
             .execute_with_options(
-                &format!("kj context retag beta alpha --confirm {nonce}"),
+                "kj context retag beta alpha --confirm",
                 ExecuteOptions::default(),
             )
             .await
             .expect("kaish exec (confirm)");
 
-        assert!(
-            !confirm.err.contains("invalid nonce"),
-            "nonce was lost between fresh shells: {}",
-            confirm.err
-        );
         assert!(
             confirm.ok(),
             "confirm in a fresh shell should succeed, got code {} / err {:?}",
@@ -2277,18 +2304,15 @@ mod tests {
         }
     }
 
-    /// A latched `kj … --json` result must carry the confirmation nonce in
-    /// kaish's OWN `--json` latch envelope — `{"error", "code", "latch":
-    /// {nonce, hint, ...}}`, `apply_output_format`'s `latch_envelope` (kaish
-    /// 0.13) — not buried in prose, AND keep the typed request on the outer
-    /// `ExecResult.latch` so the MCP shell layer surfaces it too. kj no
-    /// longer builds this itself (the retired `render_json_envelope`); this
-    /// drives a real latched command end-to-end through the kaish bridge to
-    /// prove kaish's own formatter picks the `.latch` field up ahead of
-    /// `.data`/`.out` — `apply_output_format` special-cases `result.latch`
-    /// before its has-output/no-output branches, so a latch always wins.
-    /// Resolves the on-hold docs/issues.md "latch nonce on stderr" entry
-    /// against kaish's shape now, rather than kj's retired one.
+    /// A latched `kj … --json` result must still surface the gate. kaish 0.13
+    /// had its own `latch_envelope` in `apply_output_format`; 0.14 deleted the
+    /// latch, so under `--json` a refusal renders as kaish's ordinary error
+    /// envelope (`{"error", "code": 2}`) and the structured gate rides
+    /// `ExecResult::baggage` — which is what the MCP shell layer and the RPC
+    /// `execute_kj` path read. This drives a real latched command end-to-end
+    /// through the kaish bridge to prove the baggage survives kaish's `--json`
+    /// formatting. Resolves the on-hold docs/issues.md "latch nonce on stderr"
+    /// entry.
     #[tokio::test]
     async fn json_flag_surfaces_and_preserves_latch() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -2312,18 +2336,15 @@ mod tests {
             res.err
         );
 
-        // The nonce rides kaish's structured latch envelope body, not just prose.
+        // kaish's own error envelope carries the refusal prose under --json.
         let body: serde_json::Value = serde_json::from_str(&res.text_out())
             .unwrap_or_else(|e| panic!("--json latch output not JSON ({e}): {}", res.text_out()));
-        let nonce = body["latch"]["nonce"]
-            .as_str()
-            .unwrap_or_else(|| panic!("latch.nonce missing from kaish's envelope: {body}"));
-        assert!(!nonce.is_empty(), "nonce must be nonempty: {body}");
+        assert_eq!(body["code"], serde_json::json!(2), "envelope: {body}");
         assert!(
-            body["latch"]["hint"]
+            body["error"]
                 .as_str()
-                .is_some_and(|h| h.contains("--confirm") && h.contains("doomed")),
-            "latch.hint must be the ready-to-run confirmation: {body}"
+                .is_some_and(|e| e.contains("--confirm") && e.contains("doomed")),
+            "the error must be the ready-to-run confirmation: {body}"
         );
         // Not the retired kj-owned {ok,message} shape.
         assert!(
@@ -2331,20 +2352,25 @@ mod tests {
             "must not resemble the retired envelope: {body}"
         );
 
-        // The control-plane field survives so the MCP shell layer
+        // The structured gate survives so the MCP shell layer
         // (`shell_result_to_kernel`) still reads it from the returned result.
-        assert_eq!(
-            res.latch_request().map(|l| l.nonce),
-            Some(nonce.to_string()),
-            "ExecResult.latch must survive kaish's --json formatting"
+        let latch = latch_from_result(&res)
+            .expect("the kj latch baggage must survive kaish's --json formatting");
+        assert_eq!(latch.command, "kj context remove");
+        assert_eq!(latch.target, "doomed");
+        assert!(
+            latch.hint.contains("--confirm") && latch.hint.contains("doomed"),
+            "hint is the ready-to-run confirmation: {}",
+            latch.hint
         );
     }
 
-    /// End-to-end proof that a *real* latched kj command stamps `ExecResult.latch`
-    /// through the full kaish bridge — not just the synthetic constructions the
-    /// envelope tests use. `kj context remove <child>` without `--confirm` must
-    /// come back exit 2 with a typed request whose hint re-runs the exact command
-    /// with `--confirm`. This is what feeds the `--json`/MCP-shell surfacing.
+    /// End-to-end proof that a *real* latched kj command stamps its gate onto
+    /// `ExecResult::baggage` through the full kaish bridge — not just the
+    /// synthetic constructions the envelope tests use. `kj context remove
+    /// <child>` without `--confirm` must come back exit 2 with a hint that
+    /// re-runs the exact command with `--confirm`. This is what feeds the
+    /// `--json`/MCP-shell/RPC surfacing.
     #[tokio::test]
     async fn kj_latch_stamps_exec_result_through_the_bridge() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -2365,10 +2391,10 @@ mod tests {
             res.text_out(),
             res.err
         );
-        let latch = res
-            .latch_request()
-            .expect("a latched kj result must carry ExecResult.latch through the bridge");
-        assert!(!latch.nonce.is_empty(), "latch carries a nonce");
+        let latch = latch_from_result(&res)
+            .expect("a latched kj result must carry its gate on baggage through the bridge");
+        assert_eq!(latch.command, "kj context remove");
+        assert_eq!(latch.target, "doomed");
         assert!(
             latch.hint.contains("--confirm") && latch.hint.contains("doomed"),
             "hint is the ready-to-run confirmation naming the target: {}",

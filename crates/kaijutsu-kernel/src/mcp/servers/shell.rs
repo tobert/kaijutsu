@@ -458,13 +458,21 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
         .data
         .as_ref()
         .map(kaish_kernel::interpreter::value_to_json);
-    // A confirmation latch (exit 2, e.g. `kj context remove` or `rm` under
-    // `set -o latch`) rides its typed request on the control-plane `.latch`
-    // field (kaish 0.11), distinct from the data-plane `.data`. Surface it so a
-    // batch loop reads `structured.latch.nonce`/`.hint` and re-runs with
-    // `--confirm=<nonce>`, instead of scraping the confirmation prose out of the
-    // body. `null` when the command didn't latch.
-    let latch = result.latch_request();
+    // A `kj` confirmation gate (exit 2, e.g. `kj context remove`) rides
+    // kaish's opaque `baggage` channel, distinct from the data-plane `.data`.
+    // Surface it so a batch loop reads `structured.latch.hint` and re-runs
+    // with `--confirm`, instead of scraping the confirmation prose out of the
+    // body. `null` when the command didn't latch. kaish's own latch — the one
+    // that used to hold `rm` here on a typed `.latch` field — is gone as of
+    // 0.14, and was never enabled in kaijutsu anyway (`KaishConfig::named`
+    // defaults `latch_enabled` off, and we never called `with_latch`).
+    let latch = crate::runtime::kj_builtin::latch_from_result(&result).map(|l| {
+        serde_json::json!({
+            "command": l.command,
+            "target": l.target,
+            "hint": l.hint,
+        })
+    });
 
     let mut body = stdout.clone();
     let mut push_line = |s: &str| {
@@ -761,41 +769,29 @@ mod tests {
 
     #[test]
     fn conversion_surfaces_latch_request_structurally() {
-        // A latched destructive op (exit 2) carries a typed `LatchRequest` on the
-        // control-plane `.latch` field (kaish 0.11). The MCP shell envelope must
-        // surface it so a batch loop reads the nonce structurally instead of
-        // scraping the confirmation prose out of the body. Resolves the on-hold
-        // docs/issues.md "latch nonce on stderr" entry.
-        let mut r = kaish_kernel::interpreter::ExecResult::failure(
-            2,
-            "kj context remove: confirmation required\n\
-             To confirm, run: kj context remove doomed --confirm abc123",
+        // A latched destructive op (exit 2) carries its gate on kaish's opaque
+        // `baggage` channel (kaish 0.14 deleted the typed `.latch` field). The
+        // MCP shell envelope must surface it so a batch loop reads the gate
+        // structurally instead of scraping the confirmation prose out of the
+        // body. Resolves the on-hold docs/issues.md "latch nonce on stderr"
+        // entry.
+        let r = crate::runtime::kj_builtin::latch_result(
+            "kj context remove",
+            "doomed",
+            "removing a context is destructive",
+            "kj context remove doomed --confirm".to_string(),
         );
-        r.latch = Some(Box::new(kaish_kernel::interpreter::LatchRequest {
-            nonce: "abc123".to_string(),
-            command: "kj context remove".to_string(),
-            paths: vec!["doomed".to_string()],
-            hint: "kj context remove doomed --confirm abc123".to_string(),
-            tool: "kj".to_string(),
-            argv: vec![
-                "context".to_string(),
-                "remove".to_string(),
-                "doomed".to_string(),
-            ],
-            ttl: 60,
-            job_id: None,
-        }));
         let structured = shell_result_to_kernel(r)
             .structured
             .expect("structured envelope");
-        assert_eq!(structured["latch"]["nonce"], serde_json::json!("abc123"));
         assert_eq!(
             structured["latch"]["command"],
             serde_json::json!("kj context remove")
         );
+        assert_eq!(structured["latch"]["target"], serde_json::json!("doomed"));
         assert_eq!(
             structured["latch"]["hint"],
-            serde_json::json!("kj context remove doomed --confirm abc123"),
+            serde_json::json!("kj context remove doomed --confirm"),
             "the ready-to-run confirmation command must ride the structured envelope"
         );
 
