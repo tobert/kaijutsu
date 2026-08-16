@@ -597,15 +597,14 @@ impl Tool for KjBuiltin {
         let confirm_nonce = crate::kj::parse::extract_named_arg(&argv, &["--confirm"]);
         crate::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
 
-        // Stdin → --content for `kj rc add`/`edit` and `kj config set`/`edit`.
-        // Lets shell pipelines author multi-line .md / .kai scripts and load a
-        // staged TOML file without the `--content "$(cat …)"` dance:
+        // Stdin → --content for `kj rc add`/`edit`. Lets shell pipelines
+        // author multi-line .md / .kai scripts without the
+        // `--content "$(cat …)"` dance:
         //   cat prompt.md | kj rc add /etc/rc/coder/create/S00-stance.md
-        //   cat theme.toml | kj config set /etc/config/theme.toml
         // Only kicks in when --content was not given explicitly. `kj config
-        // set`/`edit` joined `rc add`/`edit` here 2026-06-30 (config
-        // papercuts, Fix 3) — the help text already promised piped stdin;
-        // this is what makes that promise true. If more kj subcommands grow
+        // set`/`edit` were here too until config stopped having write verbs;
+        // a config body now goes to `builtin.file:write` like any other file.
+        // If more kj subcommands grow
         // stdin appetite, promote this to the dispatcher signature.
         if wants_stdin_content(&argv) && !crate::kj::parse::has_flag(&argv, &["--content"]) {
             // kaish 0.13 split stdin reads into a `Result` so a read error
@@ -786,20 +785,18 @@ fn rc_depth_from_scope(scope: &kaish_kernel::interpreter::Scope) -> Result<u8, S
 
 /// Whether this `kj` invocation should have piped stdin promoted to
 /// `--content` when the flag was omitted. `argv` here is post-normalization
-/// (`--confirm`/`--json` already stripped). Two write surfaces want this:
-/// `kj rc add`/`edit` (scripts) and, since 2026-06-30 (config papercuts,
-/// Fix 3), `kj config set`/`edit` (`cat new.toml | kj config set
-/// /etc/config/theme.toml`).
+/// (`--confirm`/`--json` already stripped).
+///
+/// Only `kj rc add`/`edit` want this now. `kj config set`/`edit` were on this
+/// list until config stopped having write verbs at all — pipe a body into
+/// `builtin.file:write` instead, the same way you would for any other file.
 fn wants_stdin_content(argv: &[String]) -> bool {
     matches!(
         (
             argv.first().map(String::as_str),
             argv.get(1).map(String::as_str)
         ),
-        (Some("rc"), Some("add"))
-            | (Some("rc"), Some("edit"))
-            | (Some("config"), Some("set"))
-            | (Some("config"), Some("edit"))
+        (Some("rc"), Some("add")) | (Some("rc"), Some("edit"))
     )
 }
 
@@ -1817,73 +1814,6 @@ mod tests {
         );
     }
 
-    /// Piped stdin populates `--content` for `kj config set` when the flag is
-    /// omitted — Fix 3 (2026-06-30 config papercuts): `--help` already
-    /// promised "stdin is piped here when omitted", but before this,
-    /// `cat new.toml | kj config set /etc/config/theme.toml` failed with
-    /// "missing content" despite the promise. This is the same injection
-    /// `rc add`/`edit` already had (`pipe_stdin_provides_rc_add_content`
-    /// above), widened to `config set`/`edit` in `wants_stdin_content`.
-    #[tokio::test]
-    async fn pipe_stdin_provides_config_set_content() {
-        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
-        dispatcher.set_self_arc();
-
-        let principal = PrincipalId::new();
-        let ctx = register_context(&dispatcher, Some("cfgstdinhost"), None, principal);
-        let kaish = embedded_with_kj(dispatcher, ctx).await;
-
-        let script = r#"
-            echo 'marker-101010' | kj config set theme.toml
-            kj config show theme.toml
-        "#;
-        let res = kaish
-            .execute_with_options(script, ExecuteOptions::default())
-            .await
-            .expect("kaish exec");
-        assert!(res.ok(), "pipe-into-config-set exit != 0: {res:?}");
-
-        let stdout = res.text_out();
-        assert!(
-            stdout.contains("marker-101010"),
-            "stdin content didn't reach config set: {stdout}"
-        );
-        assert!(
-            !stdout.contains("missing content"),
-            "config set still reported missing content despite piped stdin: {stdout}"
-        );
-    }
-
-    /// Piped stdin ALSO populates `--content` for `kj config edit` (the
-    /// interactive-when-omitted verb from the stretch goal) when the flag is
-    /// omitted — same treatment as `set`, since `edit`'s content-given branch
-    /// is the same validate-then-write path.
-    #[tokio::test]
-    async fn pipe_stdin_provides_config_edit_content() {
-        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
-        dispatcher.set_self_arc();
-
-        let principal = PrincipalId::new();
-        let ctx = register_context(&dispatcher, Some("cfgstdinhost2"), None, principal);
-        let kaish = embedded_with_kj(dispatcher, ctx).await;
-
-        let script = r#"
-            echo 'marker-202020' | kj config edit theme.toml
-            kj config show theme.toml
-        "#;
-        let res = kaish
-            .execute_with_options(script, ExecuteOptions::default())
-            .await
-            .expect("kaish exec");
-        assert!(res.ok(), "pipe-into-config-edit exit != 0: {res:?}");
-
-        let stdout = res.text_out();
-        assert!(
-            stdout.contains("marker-202020"),
-            "stdin content didn't reach config edit: {stdout}"
-        );
-    }
-
     /// Regression: a literal `"--json"` string passed as a *value* (here,
     /// `--content`'s body) must survive argv reconstruction untouched — it is
     /// not the global `--json` presentation flag just because it matches the
@@ -1900,12 +1830,13 @@ mod tests {
         let ctx = register_context(&dispatcher, Some("jsonliteralhost"), None, principal);
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
-        let script = r#"kj config set theme.toml --content "--json""#;
+        let path = "/etc/rc/jsonliteral/create/S00-x.kai";
+        let script = r#"kj rc add /etc/rc/jsonliteral/create/S00-x.kai --content "--json""#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
             .await
             .expect("kaish exec");
-        assert!(res.ok(), "set with literal --json content failed: {res:?}");
+        assert!(res.ok(), "add with literal --json content failed: {res:?}");
         // No --json flag was passed, so the result renders as kj's normal
         // human text, not a JSON envelope.
         assert!(
@@ -1917,14 +1848,17 @@ mod tests {
         );
 
         let show = kaish
-            .execute_with_options("kj config show theme.toml --raw", ExecuteOptions::default())
+            .execute_with_options(
+                &format!("kj rc show {path} --json"),
+                ExecuteOptions::default(),
+            )
             .await
             .expect("kaish exec");
-        assert!(show.ok(), "show --raw failed: {show:?}");
-        assert_eq!(
-            show.text_out(),
-            "--json",
-            "the literal content value must survive byte-for-byte"
+        assert!(show.ok(), "show --json failed: {show:?}");
+        assert!(
+            show.text_out().contains("--json"),
+            "the literal content value must survive byte-for-byte: {}",
+            show.text_out()
         );
     }
 
@@ -1946,29 +1880,33 @@ mod tests {
         let ctx = register_context(&dispatcher, Some("jsonbothhost"), None, principal);
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
-        let script = r#"kj config set theme.toml --content "--json" --json"#;
+        let script =
+            r#"kj rc add /etc/rc/jsonboth/create/S00-x.kai --content "--json" --json"#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
             .await
             .expect("kaish exec");
-        assert!(res.ok(), "set with literal + real --json failed: {res:?}");
+        assert!(res.ok(), "add with literal + real --json failed: {res:?}");
         let rendered: serde_json::Value = serde_json::from_str(&res.text_out())
             .unwrap_or_else(|e| panic!("--json flag should render valid JSON ({e}): {}", res.text_out()));
         assert!(
             rendered
                 .as_str()
-                .is_some_and(|s| s.contains("set config") && s.contains("theme.toml")),
+                .is_some_and(|s| s.contains("S00-x.kai")),
             "text-only success under --json wraps the message as a JSON string: {rendered}"
         );
 
         let show = kaish
-            .execute_with_options("kj config show theme.toml --raw", ExecuteOptions::default())
+            .execute_with_options(
+                "kj rc show /etc/rc/jsonboth/create/S00-x.kai --json",
+                ExecuteOptions::default(),
+            )
             .await
             .expect("kaish exec");
-        assert_eq!(
-            show.text_out(),
-            "--json",
-            "the literal content value must survive alongside a real --json flag"
+        assert!(
+            show.text_out().contains("--json"),
+            "the literal content value must survive alongside a real --json flag: {}",
+            show.text_out()
         );
     }
 

@@ -36,8 +36,10 @@ enum RcCommand {
     Add {
         /// Canonical path: /etc/rc/<type>/<verb>/SXX-name.{kai,md}
         path: String,
-        /// Script body (stdin is piped here for `kj rc add` when omitted)
-        #[arg(long)]
+        /// Script body (stdin is piped here for `kj rc add` when omitted).
+        /// Free text: a body may legitimately begin with `-`, so this must
+        /// accept a hyphen-prefixed value without clap reading it as a flag.
+        #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
     },
     /// List installed scripts, optionally filtered. Each entry is marked
@@ -79,8 +81,9 @@ enum RcCommand {
     Edit {
         /// Canonical rc path to edit
         path: String,
-        /// Replacement body (omit to open the editor instead)
-        #[arg(long)]
+        /// Replacement body (omit to open the editor instead). Same
+        /// hyphen-tolerant shape as `add`'s `--content`.
+        #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
     },
     /// Restore one script to its embedded seed (targeted recovery from a

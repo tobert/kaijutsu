@@ -83,12 +83,36 @@ pub(crate) fn rc_write_denied(path: &str) -> crate::execution::ExecResult {
     )
 }
 
-/// Flat deny for writes under `/etc` *outside* the rc tree via the
-/// `file:write`/`edit` tools. The rc tree (`/etc/rc`) is handled separately
-/// with the `rc-write` capability; everything else under `/etc` maps to the
-/// host's read-only root mount and is not a kaijutsu write surface. Returns
-/// `Some(failure)` if the path is under `/etc`, else `None`.
+/// Deny writes under `/etc` that are not one of kaijutsu's own config mounts.
+///
+/// `/etc` is shared ground: the four kaijutsu mounts (`rc/`, `config/`,
+/// `client/`, `midi/`) sit alongside the host's read-only root, where
+/// `/etc/passwd` lives. This is the line between them.
+///
+/// **Config, client and MIDI profiles are ordinary write surfaces** — an agent
+/// edits them with the same `file:write`/`edit` tools it uses for any other
+/// file, with no capability of their own. Config is not a special category
+/// owed its own machinery (Amy, 2026-08-15); the gate it used to have lived
+/// only in `kj config set/edit`, which reached the VFS directly and is being
+/// retired in favour of just editing the files.
+///
+/// `/etc/rc` is **not** handled here: rc is executable rather than data, and
+/// its `rc-write` capability is applied by the caller *before* this check.
+///
+/// Returns `Some(failure)` for a denied path, else `None`.
 pub(crate) fn deny_etc_write(canonical_path: &str) -> Option<crate::execution::ExecResult> {
+    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT};
+
+    let under_config_mount = [CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT].iter().any(|root| {
+        // Exact root, or a real child of it — never a sibling that merely
+        // shares the prefix (`/etc/configuration` is the host's, not ours).
+        canonical_path == *root
+            || canonical_path.starts_with(&format!("{root}/"))
+    });
+    if under_config_mount {
+        return None;
+    }
+
     if canonical_path == "/etc" || canonical_path.starts_with("/etc/") {
         return Some(crate::execution::ExecResult::failure(
             1,
@@ -141,16 +165,42 @@ mod tests {
     }
 
     #[test]
-    fn deny_etc_write_blocks_etc_but_passes_others() {
-        // The rc tree is handled by is_rc_path + rc-write capability, not here;
-        // deny_etc_write is the flat deny for the rest of /etc (host root).
+    fn deny_etc_write_blocks_the_host_root_but_passes_others() {
+        // `/etc` itself and anything that is not one of kaijutsu's own config
+        // mounts is the host's read-only root — never a write surface.
         assert!(deny_etc_write("/etc").is_some());
         assert!(deny_etc_write("/etc/passwd").is_some());
+        assert!(deny_etc_write("/etc/shadow").is_some());
         // Everything outside /etc is allowed through (workspace guard applies).
         assert!(deny_etc_write("/src/kaijutsu/foo.rs").is_none());
         assert!(deny_etc_write("/tmp/scratch").is_none());
         // Not fooled by a prefix that merely starts with the letters "etc".
         assert!(deny_etc_write("/etcetera/x").is_none());
+    }
+
+    /// Config is editable with the ordinary file tools, like any other file.
+    ///
+    /// This is the shared-trust stance applied literally (Amy, 2026-08-15: *"if
+    /// the agent can see the files and edit them, that's fine, we don't need to
+    /// complicate it just because it's config"*). These three mounts used to be
+    /// unreachable here, so `kj config set` was the only way in — which is what
+    /// made deleting that verb a brick rather than a simplification.
+    ///
+    /// `/etc/rc` is deliberately NOT in this list: rc is executable, and its
+    /// `rc-write` gate is applied by the caller before this check.
+    #[test]
+    fn config_mounts_are_ordinary_write_surfaces() {
+        assert!(deny_etc_write("/etc/config/theme.toml").is_none());
+        assert!(deny_etc_write("/etc/config/system.md").is_none());
+        assert!(deny_etc_write("/etc/client/metronome.toml").is_none());
+        assert!(deny_etc_write("/etc/midi/devices/minibrute.md").is_none());
+        // The mount roots themselves, too.
+        assert!(deny_etc_write("/etc/config").is_none());
+        assert!(deny_etc_write("/etc/client").is_none());
+        assert!(deny_etc_write("/etc/midi").is_none());
+        // But a near-miss sibling under /etc is still the host's.
+        assert!(deny_etc_write("/etc/configuration/x").is_some());
+        assert!(deny_etc_write("/etc/midifoo").is_some());
     }
 
     #[test]

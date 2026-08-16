@@ -91,6 +91,18 @@ from it (Amy, 2026-08-15: *"clients should rely on stuff in kaish anyways most o
 the time"*). `authorBlock` stays — authoring a whole block is a submission, not
 an edit.
 
+**And the line that decides where a new surface goes** (Amy, 2026-08-15): *"kj is
+good enough for all admin-like stuff. normal ops over RPC is probably still
+advisable for chatty paths."* Administration — config, rc, reset, reload,
+anything an operator does occasionally and deliberately — is a `kj` verb, and
+does **not** earn a wire method. Chatty paths that run at interaction rate —
+compose keystrokes, the change feed, block queries — stay on RPC, because
+routing them through a shell dispatch per event is a cost with no benefit. Three
+config RPCs were deleted under this rule and had zero callers; `getConfig`
+survived it, because a client fetching its theme at bootstrap step 0 has no
+context to run `kj` in, and reading over the wire is what the rule above already
+sanctions.
+
 *Migration in flight.* Block text is stored in a CRDT (diamond-types-extended,
 the `kaijutsu-crdt` crate) and some clients still consume raw sync payloads. That
 is being retired: DTE stays only where it earns its keep, as a **private text

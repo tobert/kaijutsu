@@ -1,16 +1,22 @@
-//! `kj config` — read and edit the CRDT-owned config files.
+//! `kj config` — read config files, and restore one to its shipped default.
 //!
-//! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at
-//! `/etc/config` on the same CRDT-native backend as `/etc/rc` (slice 2,
-//! `docs/config-crdt-ownership.md`): the kernel is the sole owner — no host
-//! file, no write-through. `show`/`list` read the live CRDT; `set` writes it
-//! (requiring `--content` or piped stdin); `edit` does the same but opens an
-//! interactive vi session (the `kj rc edit` analog) when no body is given;
-//! `reset` restores one file to its embedded default.
+//! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at `/etc/config`
+//! (`docs/config-crdt-ownership.md`), with per-client overrides at
+//! `/etc/client`.
 //!
-//! Writes go straight through the VFS to the CRDT backend (the admin-only
-//! surface, bypassing the gated `builtin.file:write` tool), so the `config-write`
-//! capability is enforced here — the only place it gates the `kj` surface.
+//! **There is no write verb here, deliberately.** Config is a file: write it
+//! with the ordinary file tools, or open it with `kj editor <path>` / the `vi`
+//! builtin. `set` and `edit` existed only because `/etc/config` used to be
+//! unreachable from `builtin.file:write` — once that flat deny was narrowed to
+//! the host's own `/etc`, they were a second way to do one thing, with a
+//! capability guarding one of the two doors. Both are gone, and with them the
+//! `config-write` gate on this surface: it would have denied `reset` to a
+//! caller who could achieve the identical result by writing the file.
+//! `rc-write` still guards `/etc/rc`, which is executable rather than data.
+//!
+//! What survives is what has no file-tool equivalent: `list`, `show`, and
+//! `reset` — restoring a file to the default embedded in the binary, which is
+//! the reseed tool Amy asked to keep.
 //!
 //! Model configuration is **not** here. It is SQL-native — `kj backend`,
 //! `kj cast`, `kj alias` over `kernel_db` tables — and `models.toml` was
@@ -27,7 +33,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "CRDT-owned config: kernel-global at /etc/config (system.md, theme.toml, mcp.toml) + per-client at /etc/client (metronome.toml). Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
+    about = "Read config: kernel-global at /etc/config (system.md, theme.toml, mcp.toml) + per-client at /etc/client (metronome.toml). To CHANGE a config file, just write it with the file tools or open it with `kj editor` — there is no set/edit verb. Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -54,36 +60,17 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
         /// Emit exactly the stored content — no path/length header, no code
-        /// fence. Round-trips byte-identical through `kj config set`.
+        /// fence. Round-trips byte-identical through `builtin.file:write`.
         #[arg(long, conflicts_with = "json")]
         raw: bool,
     },
-    /// Replace a config file's content (direct CRDT write). Requires a body
-    /// (`--content` or piped stdin) — use `edit` with no body to open an
-    /// interactive session instead.
-    Set {
-        /// Config file name (e.g. theme.toml) or full /etc/config path
-        path: String,
-        /// Replacement body (stdin is piped here when omitted). Free text —
-        /// TOML/markdown bodies legitimately start with `-`, so this must
-        /// accept a hyphen-prefixed value without clap mistaking it for
-        /// another flag.
-        #[arg(long, allow_hyphen_values = true)]
-        content: Option<String>,
-    },
-    /// Edit a config file. With `--content` (or piped stdin) it replaces the
-    /// body just like `set`; with no body it opens an interactive vi editor
-    /// session on the file (docs/vi.md) — the `kj rc edit` analog `kj config`
-    /// lacked.
-    #[command(alias = "update")]
-    Edit {
-        /// Config file name (e.g. theme.toml) or full /etc/config path
-        path: String,
-        /// Replacement body (omit to open the editor instead). Same
-        /// hyphen-tolerant shape as `set`'s `--content`.
-        #[arg(long, allow_hyphen_values = true)]
-        content: Option<String>,
-    },
+    // `set` and `edit` are deliberately absent. Config is a file: write it with
+    // the ordinary file tools, or open it with `kj editor <path>` / the `vi`
+    // builtin, exactly as you would any other file. Config is not a special
+    // category owed its own write verbs (Amy, 2026-08-15). `show --raw` still
+    // round-trips byte-identical, now into `builtin.file:write` rather than
+    // into a verb that existed only because `/etc/config` used to be
+    // unreachable from the file tools.
     /// Restore a config file to its embedded default. Errors if the path ships
     /// no built-in seed — there is nothing to reset it to.
     Reset {
@@ -136,7 +123,7 @@ fn config_canonical(path: &str) -> Result<String, String> {
 }
 
 impl KjDispatcher {
-    pub(crate) async fn dispatch_config(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_config(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<ConfigArgs>();
         }
@@ -153,38 +140,23 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj config: {e}"));
             }
         };
-        // Writes go through the admin-only VFS path (not builtin.file:write), so
-        // this is the only place `config-write` gates the kj surface. Reads stay
-        // ungated.
-        if matches!(
-            parsed.command,
-            ConfigCommand::Set { .. } | ConfigCommand::Edit { .. } | ConfigCommand::Reset { .. }
-        ) && let Err(denied) =
-            self.require_cap(caller, crate::mcp::Capability::ConfigWrite, "config")
-        {
-            return denied;
-        }
-        // A direct config write touches the ConfigCrdtFs block, not the
-        // FileDocumentCache shadow that backs kaish `cat`/file tools — capture
-        // the canonical path so we can drop the stale shadow after a success.
-        // (The `edit`-opens-editor branch is covered too: invalidation is a
-        // harmless reload there, and the editor self-invalidates on its writes
-        // — mirrors `kj rc edit`.)
+        // No capability gate. Config is ungated for the same reason it has no
+        // write verbs: it is a file, and the file tools that can already write
+        // it enforce nothing of their own. A gate here would have been theatre
+        // — it would deny `kj config reset` to a caller who could achieve the
+        // identical result with `builtin.file:write`. `rc-write` still guards
+        // `/etc/rc`, which is executable rather than data.
+        //
+        // A `reset` touches the ConfigCrdtFs block, not the FileDocumentCache
+        // shadow that backs kaish `cat`/file tools — capture the canonical path
+        // so we can drop the stale shadow after a success.
         let write_path = match &parsed.command {
-            ConfigCommand::Set { path, .. }
-            | ConfigCommand::Edit { path, .. }
-            | ConfigCommand::Reset { path } => config_canonical(path).ok(),
+            ConfigCommand::Reset { path } => config_canonical(path).ok(),
             _ => None,
         };
         let result = match parsed.command {
             ConfigCommand::List { json } => self.config_list(json).await,
             ConfigCommand::Show { path, json, raw } => self.config_show(&path, json, raw).await,
-            ConfigCommand::Set { path, content } => {
-                self.config_set(&path, content.as_deref()).await
-            }
-            ConfigCommand::Edit { path, content } => {
-                self.config_edit(&path, content.as_deref(), caller).await
-            }
             ConfigCommand::Reset { path } => self.config_reset(&path).await,
         };
         if let Some(canonical) = write_path
@@ -334,77 +306,6 @@ impl KjDispatcher {
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
     }
 
-    async fn config_set(&self, path: &str, content: Option<&str>) -> KjResult {
-        let canonical = match config_canonical(path) {
-            Ok(c) => c,
-            Err(e) => return KjResult::Err(format!("kj config set: {e}")),
-        };
-        let content = match content {
-            Some(c) => c,
-            None => {
-                return KjResult::Err(
-                    "kj config set: missing content\n\
-                     usage: kj config set <path> --content <body> (or pipe it: cat <file> | kj config set <path>)"
-                        .to_string(),
-                );
-            }
-        };
-        if let Err(e) = self.write_config_content(&canonical, content).await {
-            return KjResult::Err(format!("kj config set: {e}"));
-        }
-        KjResult::ok(format!(
-            "set config '{canonical}' ({} bytes)",
-            content.len()
-        ))
-    }
-
-    /// `kj config edit`: with a body (`--content` or piped stdin) it's the same
-    /// write `set` does; with none it opens an interactive vi
-    /// editor session on the owning CRDT block — the same
-    /// `Kernel::editor_open_signaled` primitive `kj rc edit` uses (docs/vi.md
-    /// step 4). Config has no symlink-composition concept (`config_canonical`
-    /// enforces a flat namespace), so there's no analog to rc's composed-link
-    /// guard here.
-    async fn config_edit(&self, path: &str, content: Option<&str>, caller: &KjCaller) -> KjResult {
-        let canonical = match config_canonical(path) {
-            Ok(c) => c,
-            Err(e) => return KjResult::Err(format!("kj config edit: {e}")),
-        };
-
-        let Some(content) = content else {
-            let opener = caller
-                .context_id
-                .map(|context_id| crate::editor::EditorOpener {
-                    principal: caller.principal_id,
-                    context_id,
-                    session_id: caller.session_id,
-                });
-            return match self
-                .kernel()
-                .editor_open_signaled(&canonical, self.block_store(), opener)
-                .await
-            {
-                Ok((id, st)) => KjResult::ok_with_data(
-                    format!(
-                        "opened editor session {id} on {canonical} \
-                         — drive it with `kj editor keys {id} …`",
-                        id = id.as_u64(),
-                    ),
-                    st.to_json(id),
-                ),
-                Err(e) => KjResult::Err(format!("kj config edit: {e}")),
-            };
-        };
-
-        if let Err(e) = self.write_config_content(&canonical, content).await {
-            return KjResult::Err(format!("kj config edit: {e}"));
-        }
-        KjResult::ok(format!(
-            "set config '{canonical}' ({} bytes)",
-            content.len()
-        ))
-    }
-
     async fn config_reset(&self, path: &str) -> KjResult {
         let canonical = match config_canonical(path) {
             Ok(c) => c,
@@ -518,21 +419,10 @@ mod tests {
     async fn list_also_surfaces_client_namespace() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
-        // A per-client override: config_set writes through config_canonical,
-        // which recognizes the CLIENT_ROOT/<client-id>/<file> shape.
-        let set = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("/etc/client/abc-123/metronome.toml"),
-                    s("--content"),
-                    s("enabled = false"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(matches!(set, KjResult::Ok { .. }), "set failed: {set:?}");
+        // A per-client override, written the way anything writes config now.
+        d.write_config_content("/etc/client/abc-123/metronome.toml", "enabled = false")
+            .await
+            .expect("client override is writable");
 
         let result = d.dispatch(&[s("config"), s("list")], &c).await;
         match result {
@@ -560,24 +450,14 @@ mod tests {
         }
     }
 
-    /// `kj config set` then `show` reflects the new content via the live CRDT.
+    /// A write then `show` reflects the new content via the live backend.
     #[tokio::test]
-    async fn set_then_show_reflects_new_content() {
+    async fn a_write_then_show_reflects_new_content() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
-        let set = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("theme.toml"),
-                    s("--content"),
-                    s("bg = \"#000000\""),
-                ],
-                &c,
-            )
-            .await;
-        assert!(matches!(set, KjResult::Ok { .. }), "set failed: {set:?}");
+        d.write_config_content("/etc/config/theme.toml", "bg = \"#000000\"")
+            .await
+            .expect("theme is writable");
 
         let show = d
             .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
@@ -591,26 +471,16 @@ mod tests {
     }
 
     /// `kj config show --raw` emits exactly the stored content — no
-    /// path/length header, no code fence — so piping it into `kj config set`
-    /// round-trips byte-identical instead of storing the decoration.
+    /// path/length header, no code fence — so it round-trips byte-identical
+    /// back through a write instead of storing the decoration.
     #[tokio::test]
-    async fn show_raw_round_trips_byte_identical_through_set() {
+    async fn show_raw_round_trips_byte_identical() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let body = "bg = \"#123456\"\nfg = \"#abcdef\"\n";
-        let set = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("theme.toml"),
-                    s("--content"),
-                    s(body),
-                ],
-                &c,
-            )
-            .await;
-        assert!(matches!(set, KjResult::Ok { .. }), "set failed: {set:?}");
+        d.write_config_content("/etc/config/theme.toml", body)
+            .await
+            .expect("theme is writable");
 
         let raw = d
             .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--raw")], &c)
@@ -621,23 +491,10 @@ mod tests {
         };
         assert_eq!(raw_message, body, "raw output must be exactly the content");
 
-        // Round-trip: set it right back using the raw output as the body.
-        let set_again = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("theme.toml"),
-                    s("--content"),
-                    raw_message,
-                ],
-                &c,
-            )
-            .await;
-        assert!(
-            matches!(set_again, KjResult::Ok { .. }),
-            "round-trip set failed: {set_again:?}"
-        );
+        // Round-trip: write it right back using the raw output as the body.
+        d.write_config_content("/etc/config/theme.toml", &raw_message)
+            .await
+            .expect("round-trip write");
 
         let show = d
             .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
@@ -655,17 +512,21 @@ mod tests {
     async fn reset_restores_embedded_default() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
-        d.dispatch(
-            &[
-                s("config"),
-                s("set"),
-                s("theme.toml"),
-                s("--content"),
-                s("# clobbered"),
-            ],
-            &c,
-        )
-        .await;
+        d.write_config_content("/etc/config/theme.toml", "# clobbered")
+            .await
+            .expect("clobber the theme");
+        // Prove the clobber landed — otherwise `reset` would be "restoring" a
+        // file that was already the default and this test would pass on air.
+        let clobbered = d
+            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--raw")], &c)
+            .await;
+        match clobbered {
+            KjResult::Ok { ref message, .. } => {
+                assert_eq!(message, "# clobbered", "the clobber must actually land")
+            }
+            ref other => panic!("expected Ok, got {other:?}"),
+        }
+
         let reset = d
             .dispatch(&[s("config"), s("reset"), s("theme.toml")], &c)
             .await;
@@ -689,34 +550,6 @@ mod tests {
         }
     }
 
-    /// `kj config set` is denied for a context without `config-write` — the gate
-    /// is real, not advisory.
-    #[tokio::test]
-    async fn set_denied_without_config_write() {
-        let d = test_dispatcher_crdt_rc().await;
-        // A non-privileged caller whose context has no binding → no config-write.
-        let c = caller_with_context(kaijutsu_crdt::ContextId::new());
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("theme.toml"),
-                    s("--content"),
-                    s("bg = \"#fff\""),
-                ],
-                &c,
-            )
-            .await;
-        match result {
-            KjResult::Err(msg) => assert!(
-                msg.contains("config-write"),
-                "denial should name the missing cap: {msg}"
-            ),
-            other => panic!("expected denial, got {other:?}"),
-        }
-    }
-
     /// `kj config reset` on an unknown file errors instead of silently no-oping.
     #[tokio::test]
     async fn reset_unknown_file_errors() {
@@ -732,47 +565,38 @@ mod tests {
     }
 
     // ── Fix 2 (2026-06-30 config papercuts): `kj config set` validates
-    /// `kj config edit <path>` with no `--content` opens an interactive editor
-    /// session on the owning block (mirrors
-    /// `rc_edit_without_content_opens_an_editor_session` in `kj/rc.rs`).
+    /// A config file is written with the ordinary file tools, and `show` sees
+    /// it immediately — the claim that made `kj config set` deletable.
+    ///
+    /// `deny_etc_write` used to refuse every path under `/etc`, so this write
+    /// was impossible and the verb was the only door. The assertion is that
+    /// the door is now the same one every other file uses.
     #[tokio::test]
-    async fn config_edit_without_content_opens_an_editor_session() {
+    async fn a_file_tool_write_reaches_config_and_show_sees_it() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
-        let result = d
-            .dispatch(&[s("config"), s("edit"), s("theme.toml")], &c)
-            .await;
-        match result {
-            KjResult::Ok {
-                message,
-                data: Some(v),
-                ..
-            } => {
-                assert!(message.contains("opened editor session"), "msg: {message}");
-                assert!(
-                    v["session"].as_u64().is_some(),
-                    "data carries a numeric session id: {v}"
-                );
-            }
-            other => panic!("expected ok-with-data session, got {other:?}"),
-        }
-    }
+        let body = "bg = \"#0d0d0d\"\n";
 
-    /// `kj config edit` is gated by `config-write` exactly like `set` — it's
-    /// still a write surface, even in its interactive-open branch.
-    #[tokio::test]
-    async fn config_edit_denied_without_config_write() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = caller_with_context(kaijutsu_crdt::ContextId::new());
-        let result = d
-            .dispatch(&[s("config"), s("edit"), s("theme.toml")], &c)
+        // The path guard is what stood in the way; assert it lets config through.
+        assert!(
+            crate::file_tools::path::deny_etc_write("/etc/config/theme.toml").is_none(),
+            "config must be an ordinary write surface for the file tools"
+        );
+
+        // Write it the way a file tool does — straight through the VFS.
+        d.write_config_content("/etc/config/theme.toml", body)
+            .await
+            .expect("config is writable through the VFS");
+
+        let show = d
+            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--raw")], &c)
             .await;
-        match result {
-            KjResult::Err(msg) => assert!(
-                msg.contains("config-write"),
-                "denial should name the missing cap: {msg}"
+        match show {
+            KjResult::Ok { message, .. } => assert_eq!(
+                message, body,
+                "show --raw returns exactly what was written"
             ),
-            other => panic!("expected denial, got {other:?}"),
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 }
