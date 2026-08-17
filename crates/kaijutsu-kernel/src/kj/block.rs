@@ -259,7 +259,9 @@ impl KjDispatcher {
                 status,
                 json,
             } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), json, caller),
-            BlockCommand::Inspect { block_id, json } => self.block_inspect(&block_id, json),
+            BlockCommand::Inspect { block_id, json } => {
+                self.block_inspect(&block_id, json, caller)
+            }
             BlockCommand::Count {
                 context,
                 kind,
@@ -269,7 +271,7 @@ impl KjDispatcher {
                 block_id,
                 no_line_numbers,
                 range,
-            } => self.block_read(&block_id, !no_line_numbers, range.as_deref()),
+            } => self.block_read(&block_id, !no_line_numbers, range.as_deref(), caller),
             BlockCommand::Cat {
                 block_id,
                 latest,
@@ -289,12 +291,12 @@ impl KjDispatcher {
             BlockCommand::Status {
                 block_id,
                 new_status,
-            } => self.block_status(&block_id, &new_status),
-            BlockCommand::History { block_id } => self.block_history(&block_id),
+            } => self.block_status(&block_id, &new_status, caller),
+            BlockCommand::History { block_id } => self.block_history(&block_id, caller),
             BlockCommand::Diff {
                 block_id,
                 original,
-            } => self.block_diff(&block_id, original.as_deref()),
+            } => self.block_diff(&block_id, original.as_deref(), caller),
             BlockCommand::Create {
                 role,
                 kind,
@@ -311,6 +313,78 @@ impl KjDispatcher {
                 after.as_deref(),
                 caller,
             ),
+        }
+    }
+
+    /// Resolve a block id argument for every id-taking block verb. Accepts
+    /// both forms a caller might reasonably have in hand:
+    ///
+    /// - the full `context_hex_principal_hex_seq` key (`BlockId::to_key()`)
+    ///   — what `--json`/the for-loop `data` payload emit, and what every
+    ///   verb accepted before this existed;
+    /// - the short `<principal8>#<seq>` form (`short_key()`) — what the
+    ///   plain-text `kj block list` table prints. Resolved against the
+    ///   caller's current context, since that's what `block list` itself
+    ///   defaults to and none of these verbs take an explicit `--context`.
+    ///
+    /// "A tool's output should be accepted as that tool family's input"
+    /// (Amy, `docs/issues.md` 2026-08-16) — this closes the
+    /// read-your-own-listing gap for every id-taking verb, not just `read`.
+    ///
+    /// Short-form resolution is unambiguous barring an entropy-tail
+    /// collision between two principals in the same context (astronomically
+    /// unlikely — `PrincipalId::short()` is 8 hex chars of UUIDv7 random
+    /// tail). If it ever happens, this errors loudly with every full-id
+    /// candidate rather than silently picking one (CLAUDE.md: "Silent
+    /// fallbacks are often a mistake").
+    fn resolve_block_id(
+        &self,
+        id_str: &str,
+        caller: &KjCaller,
+    ) -> Result<kaijutsu_types::BlockId, String> {
+        if let Some(id) = kaijutsu_types::BlockId::from_key(id_str) {
+            return Ok(id);
+        }
+
+        let Some((prefix, seq_str)) = id_str.split_once('#') else {
+            return Err(format!(
+                "malformed id '{id_str}' (expected context_hex_principal_hex_seq, \
+                 or the short <principal8>#<seq> form `kj block list` prints)"
+            ));
+        };
+        let Ok(seq) = seq_str.parse::<u64>() else {
+            return Err(format!(
+                "malformed id '{id_str}': '{seq_str}' is not a valid sequence number"
+            ));
+        };
+        let ctx_id = caller.context_id.ok_or_else(|| {
+            "no active context joined — short block ids resolve against it".to_string()
+        })?;
+        let snapshots = self
+            .blocks
+            .block_snapshots(ctx_id)
+            .map_err(|e| format!("resolving short id '{id_str}': {e}"))?;
+        let matches: Vec<kaijutsu_types::BlockId> = snapshots
+            .iter()
+            .filter(|b| b.id.seq == seq && b.id.principal_id.matches_short(prefix))
+            .map(|b| b.id)
+            .collect();
+        match matches.len() {
+            0 => Err(format!(
+                "no block matches '{id_str}' in context {} (short ids resolve against the \
+                 caller's current context — pass the full id from `--json`/the for-loop \
+                 payload to target a different one)",
+                ctx_id.short()
+            )),
+            1 => Ok(matches[0]),
+            _ => Err(format!(
+                "ambiguous short id '{id_str}': matches {} — use the full id",
+                matches
+                    .iter()
+                    .map(|id| id.to_key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
     }
 
@@ -396,18 +470,16 @@ impl KjDispatcher {
         KjResult::ok_with_data(out, id_array)
     }
 
-    fn block_inspect(&self, id_str: &str, json: bool) -> KjResult {
+    fn block_inspect(&self, id_str: &str, json: bool, caller: &KjCaller) -> KjResult {
         // Round-trip with the keys `block list` emits: `BlockId::to_key()`
-        // uses `_` (legacy `:` still accepted by from_key). Without this,
-        // `for b in $(kj block list); do kj block inspect $b; done` would
-        // reject every iteration as malformed.
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block inspect: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+        // uses `_` (legacy `:` still accepted by from_key), and now also the
+        // short `<principal8>#<seq>` form the plain-text table prints — see
+        // `resolve_block_id`. Without this, `for b in $(kj block list); do
+        // kj block inspect $b; done` would reject every iteration as
+        // malformed.
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block inspect: {e}")),
         };
         let ctx_id = block_id.context_id;
 
@@ -496,14 +568,16 @@ impl KjDispatcher {
     /// Read a block's content. Closes the MCP `block_read` parity gap
     /// (line numbers + range filtering) — kj inspect only shows metadata,
     /// this returns the body.
-    fn block_read(&self, id_str: &str, line_numbers: bool, range: Option<&str>) -> KjResult {
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block read: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+    fn block_read(
+        &self,
+        id_str: &str,
+        line_numbers: bool,
+        range: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block read: {e}")),
         };
         let ctx_id = block_id.context_id;
 
@@ -623,13 +697,9 @@ impl KjDispatcher {
     ) -> KjResult {
         let (ctx_id, snap) = match (block_id_arg, latest_mime) {
             (Some(id_str), None) => {
-                let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-                    Some(id) => id,
-                    None => {
-                        return KjResult::Err(format!(
-                            "kj block cat: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                        ));
-                    }
+                let block_id = match self.resolve_block_id(id_str, caller) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
                 };
                 let ctx_id = block_id.context_id;
                 let snapshots = match self.blocks.block_snapshots(ctx_id) {
@@ -771,13 +841,9 @@ impl KjDispatcher {
     /// Append text to an existing block. Mirrors MCP `block_append`. Returns
     /// the new content length so callers can confirm the write took.
     fn block_append(&self, id_str: &str, text: &str, caller: &KjCaller) -> KjResult {
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block append: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block append: {e}")),
         };
         let ctx_id = block_id.context_id;
 
@@ -814,14 +880,10 @@ impl KjDispatcher {
     /// Set a block's status. Mirrors MCP `block_status`. Parses the status
     /// string via `Status::from_str`, which already accepts the lenient set
     /// of synonyms (active→running, completed→done, etc.).
-    fn block_status(&self, id_str: &str, new_status: &str) -> KjResult {
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block status: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+    fn block_status(&self, id_str: &str, new_status: &str, caller: &KjCaller) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block status: {e}")),
         };
         let ctx_id = block_id.context_id;
         let status = match Status::from_str(new_status) {
@@ -856,13 +918,9 @@ impl KjDispatcher {
     /// positions — byte offsets from multibyte content splice at the wrong
     /// place or trip that check spuriously (the June file-tools bug class).
     fn block_edit(&self, id_str: &str, op: EditOp, caller: &KjCaller) -> KjResult {
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block edit: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block edit: {e}")),
         };
         let ctx_id = block_id.context_id;
 
@@ -989,14 +1047,10 @@ impl KjDispatcher {
     }
 
     /// Version / creation info for a block. Mirrors MCP `block_history`.
-    fn block_history(&self, id_str: &str) -> KjResult {
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block history: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+    fn block_history(&self, id_str: &str, caller: &KjCaller) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block history: {e}")),
         };
         let ctx_id = block_id.context_id;
 
@@ -1051,14 +1105,10 @@ impl KjDispatcher {
 
     /// Unified line-by-line diff against an original. Mirrors MCP
     /// `block_diff`. Without --original, prints current content.
-    fn block_diff(&self, id_str: &str, original: Option<&str>) -> KjResult {
-        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
-            Some(id) => id,
-            None => {
-                return KjResult::Err(format!(
-                    "kj block diff: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
-                ));
-            }
+    fn block_diff(&self, id_str: &str, original: Option<&str>, caller: &KjCaller) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block diff: {e}")),
         };
         let ctx_id = block_id.context_id;
 
@@ -1286,7 +1336,7 @@ fn parse_kind(s: &str) -> Option<BlockKind> {
 /// Compact block handle for `kj block list`: `principal.short()#seq`. The list
 /// is scoped to one context, so the block-distinguishing part is enough — and it
 /// uses the entropy-tail `short()`, never the shared UUIDv7 timestamp front.
-fn short_key(id: &kaijutsu_types::BlockId) -> String {
+pub(crate) fn short_key(id: &kaijutsu_types::BlockId) -> String {
     format!("{}#{}", id.principal_id.short(), id.seq)
 }
 
@@ -1429,6 +1479,25 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("malformed"));
+    }
+
+    #[tokio::test]
+    async fn block_inspect_accepts_short_id_from_list() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "x");
+        let c = caller_with_context(ctx);
+
+        let short = super::short_key(&bid);
+        let result = d
+            .dispatch(&[s("block"), s("inspect"), s(&short)], &c)
+            .await;
+        assert!(
+            result.is_ok(),
+            "short id '{short}' rejected: {}",
+            result.message()
+        );
     }
 
     /// `kj block list` must populate `KjResult::Ok::data` with a JSON array
@@ -1639,6 +1708,105 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("malformed"));
+    }
+
+    /// The addressing-asymmetry fix: `kj block list`'s plain-text table
+    /// prints `<principal8>#<seq>` (`short_key`), not the full id `read`
+    /// used to require. This must round-trip — the whole point of the fix
+    /// (docs/issues.md "`kj block read` rejects the block id that `kj block
+    /// list` prints").
+    #[tokio::test]
+    async fn block_read_accepts_short_id_from_list() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "x\ny\nz");
+        let c = caller_with_context(ctx);
+
+        let short = super::short_key(&bid);
+        let result = d.dispatch(&[s("block"), s("read"), s(&short)], &c).await;
+        assert!(
+            result.is_ok(),
+            "short id '{short}' rejected: {}",
+            result.message()
+        );
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["total_lines"], 3);
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// Short-id resolution scopes to the caller's current context and
+    /// disambiguates by (principal-short, seq). If two principals in the
+    /// same context ever collide on the 8-hex entropy tail, that must be
+    /// reported loudly with every candidate — never silently picked
+    /// (CLAUDE.md: "Silent fallbacks are often a mistake").
+    #[tokio::test]
+    async fn block_read_short_id_ambiguous_errors_with_both_candidates() {
+        let d = test_dispatcher().await;
+        // Construct two principals that share the entropy-tail `short()`
+        // (last 4 bytes) but differ elsewhere, so they're distinct full ids.
+        let mut bytes_a = [0u8; 16];
+        let mut bytes_b = [0u8; 16];
+        bytes_a[0] = 0x11;
+        bytes_b[0] = 0x22;
+        let principal_a = PrincipalId::from_bytes(bytes_a);
+        let principal_b = PrincipalId::from_bytes(bytes_b);
+        assert_eq!(
+            principal_a.short(),
+            principal_b.short(),
+            "test setup requires a genuine short() collision"
+        );
+        assert_ne!(principal_a, principal_b);
+
+        let ctx = register_context_with_doc(&d, Some("c"), principal_a);
+        let c = caller_with_context(ctx);
+
+        let id_a = d
+            .block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                "a",
+                Status::Done,
+                ContentType::Plain,
+                Some(principal_a),
+            )
+            .expect("insert a");
+        let id_b = d
+            .block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                "b",
+                Status::Done,
+                ContentType::Plain,
+                Some(principal_b),
+            )
+            .expect("insert b");
+        assert_eq!(
+            id_a.seq, id_b.seq,
+            "test setup requires colliding seq too, or the short keys differ"
+        );
+
+        let short = format!("{}#{}", principal_a.short(), id_a.seq);
+        let result = d.dispatch(&[s("block"), s("read"), s(&short)], &c).await;
+        assert!(!result.is_ok(), "expected ambiguity to be rejected");
+        assert!(
+            result.message().contains("ambiguous"),
+            "expected 'ambiguous', got: {}",
+            result.message()
+        );
+        assert!(result.message().contains(&id_a.to_key()));
+        assert!(result.message().contains(&id_b.to_key()));
     }
 
     // ── New: block cat ─────────────────────────────────────────────────
@@ -2144,6 +2312,36 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "status failed: {}", result.message());
+
+        let after = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(after.status, Status::Running);
+    }
+
+    /// Mutating verbs get the same short-id acceptance as reads — the fix
+    /// is on the shared `resolve_block_id` path, not read-only.
+    #[tokio::test]
+    async fn block_status_accepts_short_id_from_list() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "x");
+
+        let short = super::short_key(&bid);
+        let result = d
+            .dispatch(&[s("block"), s("status"), s(&short), s("running")], &c)
+            .await;
+        assert!(
+            result.is_ok(),
+            "short id '{short}' rejected: {}",
+            result.message()
+        );
 
         let after = d
             .block_store()
