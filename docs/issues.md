@@ -3440,11 +3440,21 @@ than left to rot (that survey now lives in `docs/wishlist-gemini-cli.md`).
   `hooks_admin_is_subject_to_hooks` (`hooks_builtin.rs:1229`). There is no
   `kj hook` CLI. The only documented recovery is hand-editing kernel SQLite,
   which violates our own standing rule against touching that DB directly.
-  Two doc comments disagree about this; `bindings_builtin.rs:22-25` ("hooks are
-  in-memory", "restart to recover") is **stale and wrong** — `broker.rs:1465` is
-  right. Fix the comment (one line), then decide the real question: a hard-coded
-  carve-out so admin instances can always self-repair, **or** a `kj hook` path
-  that bypasses broker hook evaluation.
+  **RULED by Amy 2026-08-17: a `kj hook` surface**, which does not route
+  through broker hook evaluation at all — so no carve-out is punched in the
+  hook mechanism, and the gap this bullet describes stops existing rather
+  than being excepted. Design + slices: `docs/gate-and-shell-split.md`
+  (Slice 1). It also closes a second gap: there is no `kj hook` CLI today.
+
+  **Two corrections to this bullet's own text, found 2026-08-17.** The
+  claim that `bindings_builtin.rs`'s doc comment is "stale and wrong" is
+  itself stale — the comment was corrected on 2026-08-12 and at HEAD
+  (`mcp/servers/bindings_builtin.rs:22-33`) says exactly the right thing,
+  including that it *used to* claim the opposite. There is nothing to fix
+  there. And the citations have drifted: hydrate logic is around
+  `broker.rs:313-392`, not `:275,283` or `:1465`. **Re-grep every line
+  citation in this file rather than trusting it** — several lanes edit this
+  tree daily and a stale citation reads exactly like a live one.
 - **`bevy_brp` and `invoke_peer` do NOT overlap** — settled, don't re-litigate.
   `peers.rs` is a named-peer action registry (`switch_context`, `active_context`)
   for drift navigation; BRP is entity introspection/screenshots. Orthogonal. The
