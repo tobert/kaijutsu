@@ -6,6 +6,60 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Flaky: `test_ordering_stress_100_bisections` put a Middle block first, once (2026-08-17)
+
+`blocks::block_store::tests::test_ordering_stress_100_bisections` failed once
+in a `cargo test --workspace` run:
+
+```
+assertion `left == right` failed
+  left: "Middle-5"
+ right: "First"
+```
+
+The test inserts `First`, then `Last` after it, then 100 `Middle-{i}` blocks
+each anchored immediately after `First`, and asserts
+`blocks_ordered()[0].content == "First"`. A `Middle` sorting ahead of the
+anchor it was inserted after is an **ordering inversion**, not a timing
+artifact.
+
+**Characterized, and the cause is NOT known — stated as unknown rather than
+guessed.** Measured after the failure: 8/8 passes in isolation, 10/10 passes
+running the full `-p kaijutsu-kernel --lib` suite (the contended case). So it
+is rarer than 1 in 10 even under load, and does not reproduce on demand.
+
+**It is not today's replay fix.** That commit (`89d90ccc`) touched `merge_ops`,
+`SyncPayload`, and tests only — it never touched `insert_block`, order-key
+generation, or `blocks_ordered()`, which is this test's entire code path.
+Verified against the diff rather than assumed.
+
+**Where to look, in order.** The test holds no shared state (fresh
+`BlockDocument`, fresh `ContextId`, no temp files), so the nondeterminism has
+to live in order-key generation or its tie-break:
+
+1. **Does order-key precision exhaust after ~100 bisections at one anchor?**
+   That is what the test's name suggests it was written to catch. If keys
+   collide, the tie-break decides — and `BlockId` ordering is principal-major
+   and UUIDv7 time-derived, which would make the outcome depend on wall-clock
+   and thus be nondeterministic. That is the leading hypothesis and it is
+   testable directly: assert on generated keys, not on the sorted result.
+2. **But note the observation that does not fit it:** the misplaced block was
+   `Middle-5` — the sixth of a hundred, not one of the last. Precision
+   exhaustion should misplace *late* inserts. Either the hypothesis is wrong
+   or bisection is not descending the way it looks. **Do not stop at
+   hypothesis 1 without explaining `Middle-5`.**
+
+**Why it matters more than one flaky test** — the same reason recorded for the
+ACP flake fixed today: a suite that fails rarely for an unexplained reason
+trains everyone to re-run and move on, which is exactly how a real failure
+gets waved through. Block ordering is load-bearing (it is what
+`block_ids_ordered()` exists for), so an inversion here is not cosmetic.
+
+Fix the test to assert on the generated keys rather than the sorted output, so
+a failure names the mechanism instead of the symptom.
+
+---
+
 ## Serialized-struct changes need a restart, not a migration framework (2026-08-16)
 
 Filed after 343 documents went dark, then **right-sized on Amy's pushback**:
