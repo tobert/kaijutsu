@@ -15,6 +15,7 @@ use kaijutsu_client::{
 use kaijutsu_client::rpc::{KjCommandInfo, KjExecutionResult};
 use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::BlockQuery;
+use kaijutsu_types::paths::client_config_path;
 use tokio::sync::mpsc;
 
 /// Per-process subscription identity.
@@ -28,14 +29,15 @@ fn acp_peer_instance() -> &'static str {
     INSTANCE.get_or_init(|| format!("kaijutsu-acp-{}", uuid::Uuid::new_v4()))
 }
 
-/// Turn an ACP implementation name into the stable address shown in the
-/// kernel's peer registry. ACP names are programmatic identifiers, but they
-/// are supplied by another process, so keep the useful identifier characters
-/// and collapse everything else rather than putting arbitrary display text in
-/// a peer address.
-pub fn peer_nick_for_client(name: &str) -> String {
-    let slug = name
-        .trim()
+/// Collapse an ACP implementation name into a path-safe slug: lowercase
+/// alphanumerics plus `-`/`_`/`.` survive, everything else (spaces, CJK,
+/// punctuation) collapses to `-`, and runs of `-` merge. Shared core for
+/// [`peer_nick_for_client`] (peer-registry nick) and [`client_config_id`]
+/// (`/etc/client` cascade key) — ACP names are programmatic identifiers
+/// supplied by another process, so keep the useful identifier characters
+/// rather than putting arbitrary display text into either address.
+fn slugify(name: &str) -> String {
+    name.trim()
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
@@ -48,8 +50,40 @@ pub fn peer_nick_for_client(name: &str) -> String {
         .split('-')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join("-");
+        .join("-")
+}
+
+/// Turn an ACP implementation name into the stable address shown in the
+/// kernel's peer registry.
+pub fn peer_nick_for_client(name: &str) -> String {
+    let slug = slugify(name);
     if slug.is_empty() { "acp/client".to_string() } else { format!("acp/{slug}") }
+}
+
+/// Turn an ACP implementation name into the client-id key used by the
+/// `/etc/client/<id>/…` config cascade (docs/config-ownership.md — the
+/// metronome/patchbay consumer pattern). **Not** `peer_nick_for_client`'s
+/// `acp/<slug>` — a client-id is one path segment
+/// (`kaijutsu-kernel/src/kj/config.rs`'s `config_canonical` rejects more than
+/// `<client-id>/<file>` under `/etc/client`), so a `/` here would silently
+/// misroute every read. `acp-<slug>` keeps the same slug core, in a
+/// disjoint namespace from the peer nick.
+pub fn client_config_id(name: &str) -> String {
+    let slug = slugify(name);
+    if slug.is_empty() { "acp-client".to_string() } else { format!("acp-{slug}") }
+}
+
+/// Pull the named cast out of a `/etc/client/<id>/cast.toml`-shaped
+/// document (`{ cast = "<label>" }`). Pure and RPC-free so it is
+/// unit-testable without a live kernel connection. Malformed TOML, a
+/// missing `cast` key, a non-string value, or an all-whitespace string all
+/// read the same as "this layer names no cast" — the caller falls through
+/// to the next cascade layer (or the registry's row-stamped default) rather
+/// than erroring session creation over an operator's config typo.
+fn parse_cast_config(toml_text: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(toml_text).ok()?;
+    let cast = value.get("cast")?.as_str()?.trim();
+    (!cast.is_empty()).then(|| cast.to_string())
 }
 
 /// A live connection to a kaijutsu kernel.
@@ -227,6 +261,48 @@ impl KernelBridge {
             .execute_kj(context_id, argv)
             .await
             .context("execute addressed kj command")
+    }
+
+    /// Look up this client's preferred cast label from the `/etc/client`
+    /// cascade (docs/config-ownership.md): `/etc/client/<client_id>/cast.toml`
+    /// (this client's override), then the shared `/etc/client/cast.toml`.
+    /// Mirrors the two-layer read the app's metronome/scroll bootstrap does
+    /// (`kaijutsu-app/src/connection/actor_plugin.rs`'s
+    /// `fetch_layered_config`) rather than inventing a second cascade
+    /// mechanism.
+    ///
+    /// `None` is the ordinary case — nobody has configured a cast preference
+    /// for this client, so the caller should leave the context on the
+    /// registry's row-stamped default. A layer that errors (as opposed to
+    /// simply not existing) is logged, not propagated: declining an optional
+    /// preset preference is a safe degrade, never a reason to fail
+    /// `session/new`.
+    pub async fn resolve_client_cast(&self, client_id: &str) -> Option<String> {
+        let mut saw_error = false;
+        for path in [
+            client_config_path(Some(client_id), "cast.toml"),
+            client_config_path(None, "cast.toml"),
+        ] {
+            match self.actor.get_config(path.clone()).await {
+                Ok(text) => {
+                    if let Some(cast) = parse_cast_config(&text) {
+                        return Some(cast);
+                    }
+                    // Present but empty / no `cast` key: fall through.
+                }
+                Err(e) => {
+                    saw_error = true;
+                    tracing::debug!(path = %path, error = %e, "client cast config unavailable");
+                }
+            }
+        }
+        if saw_error {
+            tracing::debug!(
+                client = client_id,
+                "no client cast preference resolved on either cascade layer"
+            );
+        }
+        None
     }
 
     /// Resolve-or-create a context for a label, then join it.
@@ -508,6 +584,57 @@ mod tests {
     #[test]
     fn empty_client_name_has_a_safe_fallback() {
         assert_eq!(peer_nick_for_client(" \t/ "), "acp/client");
+    }
+
+    #[test]
+    fn client_config_id_shares_the_slug_but_not_the_peer_nicks_slash() {
+        // A `/etc/client/<id>/…` id is ONE path segment — a literal
+        // `acp/toad` (the peer nick) would misroute into a THIRD segment
+        // that `config_canonical` rejects. `acp-toad` keeps the same slug,
+        // disjoint namespace.
+        assert_eq!(client_config_id("toad"), "acp-toad");
+        assert_eq!(client_config_id("Zed Industries"), "acp-zed-industries");
+        assert!(!client_config_id("toad").contains('/'));
+    }
+
+    #[test]
+    fn empty_client_config_id_has_a_safe_fallback() {
+        assert_eq!(client_config_id(" \t/ "), "acp-client");
+    }
+
+    #[test]
+    fn cast_config_reads_the_happy_path() {
+        assert_eq!(parse_cast_config("cast = \"house\""), Some("house".to_string()));
+    }
+
+    #[test]
+    fn cast_config_ignores_surrounding_whitespace() {
+        assert_eq!(parse_cast_config("cast = \"  house  \""), Some("house".to_string()));
+    }
+
+    #[test]
+    fn cast_config_is_none_when_the_cast_key_is_absent() {
+        assert_eq!(parse_cast_config("enabled = true"), None);
+    }
+
+    #[test]
+    fn cast_config_is_none_for_an_empty_document() {
+        assert_eq!(parse_cast_config(""), None);
+    }
+
+    #[test]
+    fn cast_config_is_none_for_a_blank_cast_value() {
+        assert_eq!(parse_cast_config("cast = \"   \""), None);
+    }
+
+    #[test]
+    fn cast_config_is_none_for_a_non_string_cast_value() {
+        assert_eq!(parse_cast_config("cast = 4"), None);
+    }
+
+    #[test]
+    fn cast_config_is_none_for_malformed_toml() {
+        assert_eq!(parse_cast_config("this is not { toml"), None);
     }
 
     #[test]

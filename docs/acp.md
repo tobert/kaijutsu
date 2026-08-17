@@ -154,13 +154,40 @@ UI for these updates.
 
 ### Client identity and parity
 
-`initialize.clientInfo` currently disappears. Retain it and derive the same
-kind of stable client identity used by the native Claude Code and Codex
-integrations where their semantics overlap. An ACP connection should attach
-to the peer registry with a nick such as `acp/toad`, and client identity
-should feed the existing `/etc/client` cascade and eventual preset/cast
-selection. Identity is ergonomic routing and presence, not a security
-boundary.
+**Shipped, in two steps.** `initialize.clientInfo` is retained
+(`AcpBridge::client_info`, `crates/kaijutsu-acp/src/lib.rs`'s
+`handle_initialize`) and an ACP connection attaches to the peer registry as
+`acp/<name>` (`bridge::peer_nick_for_client`, `90bdc53a`, 2026-08-15) — the
+same `initialize` handler spawns `KernelBridge::attach_client_peer` the
+moment `clientInfo` arrives, replayed on reconnect like every other actor
+peer.
+
+Client identity now also feeds the `/etc/client` cascade for cast selection
+(2026-08-17): `bridge::client_config_id` derives a **separate** slug —
+`acp-<name>`, not the peer nick's `acp/<name>` — because a `/etc/client/<id>`
+path segment can't itself contain `/`. On `session/new`, for a genuinely
+fresh context only (never on `session/load`/`resume`, which must not stomp a
+cast already in effect), `KernelBridge::resolve_client_cast` reads
+`/etc/client/<client_id>/cast.toml` then the shared `/etc/client/cast.toml`
+(`{ cast = "<label>" }`); if either layer names a cast, `apply_client_cast_preset`
+(`lib.rs`) runs the same `kj context set --cast <label>` a human would type,
+via the existing `execute_kj` addressed-command path — no new RPC. Absence on
+both layers (the default — nobody has written a `cast.toml` yet) leaves the
+context on the LLM registry's row-stamped default, unchanged from before.
+Identity is ergonomic routing and presence, not a security boundary.
+
+Not done: nothing writes `/etc/client/<id>/cast.toml` for an operator yet —
+it is a plain file (docs/config-ownership.md's "just write the file" rule),
+so today that means `kj editor` or the file tools, by hand, per client.
+Client-identity-driven **presets** (system prompt + consent mode alongside
+the cast) are also not built — `kj context set` has no `--preset` flag, only
+`--cast`; a preset applies today only at fork/apply time
+(`crates/kaijutsu-kernel/src/kj/preset.rs`). And there is still no
+handler-level test harness for `handle_new_session` itself (a fake
+`KernelBridge` seam, tracked in docs/issues.md's ACP-delete-follow-ups entry)
+— `apply_client_cast_preset`'s wiring is covered indirectly by unit tests on
+its pure pieces (`client_config_id`, `parse_cast_config` in `bridge.rs`), not
+by an end-to-end `session/new` test.
 
 ### Rich prompt content
 
@@ -196,9 +223,13 @@ a Toad flight before the next one needs to start.
    idempotent for client retries; a successful request unbinds the session
    registry entry and stops its event pump, while context data remains
    recoverable in kj.
-3. **Client identity and presence.** Retain `clientInfo`, attach `acp/<name>`
-   as a peer, and feed the client-config/preset machinery with parity to the
-   native Claude Code and Codex integrations where appropriate.
+3. **Client identity and presence — shipped.** `clientInfo` is retained,
+   `acp/<name>` attaches as a peer, and `session/new` on a fresh context now
+   feeds the `/etc/client` cascade for cast selection (see "Client identity
+   and parity" above). Not done: a full preset (system prompt + consent, not
+   just cast), and the seed data itself — nobody has written a
+   `/etc/client/<id>/cast.toml` for toad/Zed/Happy yet, that's an operator
+   action.
 4. **Commands and usage — commands shipped, usage remains.** The curated
    kj-backed catalog and slash invocation path are built. Next project the
    kernel's context-window usage without fabricating cumulative cost.

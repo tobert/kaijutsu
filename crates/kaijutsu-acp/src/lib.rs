@@ -273,10 +273,82 @@ async fn handle_new_session(
         }
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
+    if !opened.resumed {
+        apply_client_cast_preset(&bridge, opened.context_id).await;
+    }
     let session_id = rank::session_id_of(opened.context_id);
     match start_session(&bridge, &session_id, opened.context_id, opened.label, &cx, false).await {
         Ok(()) => responder.respond(NewSessionResponse::new(session_id)),
         Err(e) => responder.respond_with_error(e),
+    }
+}
+
+/// Client-identity presets on connect (docs/issues.md, "ACP adapter
+/// follow-ups", "Client-identity presets on connect").
+///
+/// Every ACP context otherwise gets the LLM registry's row-stamped default
+/// cast (today `deepseek-v4-flash`) regardless of which frontend connected.
+/// If the client's `initialize.clientInfo` named an operator-configured cast
+/// (`/etc/client/<id>/cast.toml` or the shared `/etc/client/cast.toml` —
+/// `KernelBridge::resolve_client_cast`), assign it to the FRESH context via
+/// the same `kj context set --cast <label>` path a human would type. Only
+/// called for a genuinely new context (`!opened.resumed`): reattaching to a
+/// live or resumed context must never stomp a cast the user (or an earlier
+/// preset) already set.
+///
+/// Best-effort throughout — an absent/unconfigured cast is the ordinary
+/// case (`resolve_client_cast` returns `None`, nothing runs); a configured
+/// but invalid label is a config error, logged loud, and the session still
+/// proceeds on the row-stamped default rather than failing `session/new`
+/// over an optional preference.
+async fn apply_client_cast_preset(bridge: &Arc<AcpBridge>, context_id: kaijutsu_types::ContextId) {
+    let Some(info) = bridge.client_info() else {
+        return;
+    };
+    let client_id = bridge::client_config_id(&info.name);
+    let Some(cast) = bridge.kernel.resolve_client_cast(&client_id).await else {
+        return;
+    };
+    match bridge
+        .kernel
+        .execute_kj(
+            context_id,
+            vec![
+                "context".to_string(),
+                "set".to_string(),
+                "--cast".to_string(),
+                cast.clone(),
+            ],
+        )
+        .await
+    {
+        Ok(result) if result.exit_code == 0 => {
+            tracing::info!(
+                context = %context_id.short(),
+                client = %client_id,
+                cast = %cast,
+                "applied client-identity cast preset"
+            );
+        }
+        Ok(result) => {
+            tracing::warn!(
+                context = %context_id.short(),
+                client = %client_id,
+                cast = %cast,
+                exit_code = result.exit_code,
+                stderr = %result.stderr,
+                "configured client cast preset failed to apply; context stays on the row-stamped default"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                context = %context_id.short(),
+                client = %client_id,
+                cast = %cast,
+                error = %e,
+                "failed to apply client cast preset"
+            );
+        }
     }
 }
 
