@@ -126,15 +126,25 @@ fn deny_blocks_the_call() {
     });
 }
 
-/// D-57's fail-closed default: no `PermissionEvents` subscriber attached
-/// at all denies the call rather than silently letting it through — same
-/// assertion `kaijutsu-kernel`'s `permission_ask_no_subscriber_denies`
-/// makes headless, reproduced here over the real wire so a regression that
-/// only shows up in the server-side bridge (e.g. the registry never gets
-/// wired onto the broker at bootstrap) cannot hide behind the headless
-/// test's fake `PermissionAsker`.
+/// D-57's fail-closed default: no `PermissionEvents` subscriber attached at
+/// all still refuses the call rather than silently letting it through —
+/// reproduced here over the real wire so a regression that only shows up in
+/// the server-side bridge (e.g. the registry never gets wired onto the broker
+/// at bootstrap) cannot hide behind the headless test's fake
+/// `PermissionAsker`.
+///
+/// **What this asserts changed on 2026-08-17, and the change is the point.**
+/// It used to assert a `Denied`-shaped error, because the kernel collapsed
+/// "a human said no" and "there was no human to ask" into one
+/// `McpError::Denied`. Amy ruled those must be distinguishable: a fault
+/// silently becoming a policy decision is its own failure family. So the
+/// honest answer here is `GateUnavailable` — nobody rendered a verdict.
+///
+/// The fail-closed property is unchanged and is asserted separately below;
+/// distinguishable is not the same as permissive. The headless counterpart is
+/// `permission_ask_no_subscriber_is_gate_unavailable`.
 #[test]
-fn no_subscriber_denies_over_the_wire() {
+fn no_subscriber_is_gate_unavailable_over_the_wire() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
@@ -147,9 +157,14 @@ fn no_subscriber_denies_over_the_wire() {
             .call_mcp_tool("whoami", &serde_json::json!({}))
             .await
             .expect_err("whoami must fail closed with nobody to ask");
+        let msg = err.to_string().to_lowercase();
         assert!(
-            err.to_string().to_lowercase().contains("den"),
-            "expected a Denied-shaped error, got: {err}"
+            msg.contains("nothing to answer"),
+            "expected a GateUnavailable-shaped error naming the missing answerer, got: {err}"
+        );
+        assert!(
+            !msg.contains("denied by hook"),
+            "an absent subscriber is not a denial — a fault must not read as a verdict: {err}"
         );
     });
 }

@@ -28,7 +28,9 @@ use super::context::CallContext;
 use super::error::{HookId, McpError, McpResult, PolicyError};
 use super::hook_table::{AskSpec, HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
-use super::permission::{PermissionAskRequest, PermissionAsker, PermissionOutcome};
+use super::permission::{
+    PermissionAskOutcome, PermissionAskRequest, PermissionAsker, PermissionOutcome,
+};
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
@@ -1425,11 +1427,19 @@ impl Broker {
                         emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                         Err(McpError::Denied { by_hook: hook_id })
                     }
+                    PhaseOutcome::GateUnavailable { hook_id, reason } => {
+                        emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                        Err(McpError::GateUnavailable { by_hook: hook_id, reason })
+                    }
                 };
             }
             PhaseOutcome::Deny { hook_id, reason } => {
                 emit_deny_attribution(McpHookPhase::PreCall, &hook_id, &reason);
                 return Err(McpError::Denied { by_hook: hook_id });
+            }
+            PhaseOutcome::GateUnavailable { hook_id, reason } => {
+                emit_gate_unavailable_attribution(McpHookPhase::PreCall, &hook_id, &reason);
+                return Err(McpError::GateUnavailable { by_hook: hook_id, reason });
             }
         }
 
@@ -1492,6 +1502,10 @@ impl Broker {
                         emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                         Err(McpError::Denied { by_hook: hook_id })
                     }
+                    PhaseOutcome::GateUnavailable { hook_id, reason } => {
+                        emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                        Err(McpError::GateUnavailable { by_hook: hook_id, reason })
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -1508,7 +1522,9 @@ impl Broker {
     /// Run `OnError` and return either a short-circuited success (converting
     /// the error) or the original error. `Deny` on the error path still
     /// returns `McpError::Denied { by_hook }` — a denial overrides the
-    /// original error in the attribution channel.
+    /// original error in the attribution channel. An `Ask` that never
+    /// reached a verdict overrides it with `McpError::GateUnavailable`
+    /// instead, same override, honest reason.
     async fn run_on_error_then_err(
         &self,
         params: &KernelCallParams,
@@ -1527,6 +1543,10 @@ impl Broker {
             Ok(PhaseOutcome::Deny { hook_id, reason }) => {
                 emit_deny_attribution(McpHookPhase::OnError, &hook_id, &reason);
                 Err(McpError::Denied { by_hook: hook_id })
+            }
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                emit_gate_unavailable_attribution(McpHookPhase::OnError, &hook_id, &reason);
+                Err(McpError::GateUnavailable { by_hook: hook_id, reason })
             }
             Err(eval_err) => {
                 tracing::warn!(
@@ -1656,11 +1676,20 @@ impl Broker {
                     });
                 }
                 HookAction::Ask(spec) => {
-                    if let Some(reason) = self.run_permission_ask(&entry.id, &spec, params, ctx).await {
-                        return Ok(PhaseOutcome::Deny {
-                            hook_id: entry.id,
-                            reason,
-                        });
+                    match self.run_permission_ask(&entry.id, &spec, params, ctx).await {
+                        PermissionAskOutcome::Proceed => {}
+                        PermissionAskOutcome::Denied(reason) => {
+                            return Ok(PhaseOutcome::Deny {
+                                hook_id: entry.id,
+                                reason,
+                            });
+                        }
+                        PermissionAskOutcome::Unavailable(reason) => {
+                            return Ok(PhaseOutcome::GateUnavailable {
+                                hook_id: entry.id,
+                                reason,
+                            });
+                        }
                     }
                 }
                 HookAction::Invoke(body) => match body {
@@ -1698,20 +1727,27 @@ impl Broker {
         Ok(PhaseOutcome::Continue)
     }
 
-    /// Run one `HookAction::Ask` round trip (D-57). Returns `None` when the
-    /// call should proceed (an attached subscriber answered "allow");
-    /// `Some(reason)` when it should be denied — either a real "no" from a
-    /// subscriber, or one of the two fail-closed defaults:
+    /// Run one `HookAction::Ask` round trip (D-57). Returns
+    /// `PermissionAskOutcome::Proceed` when the call should proceed (an
+    /// attached subscriber answered "allow"); `Denied(reason)` when a
+    /// subscriber actually answered "no" — a real verdict; and
+    /// `Unavailable(reason)` for either of the two fail-closed defaults
+    /// below, which still refuse the call but are NOT a verdict (Amy's
+    /// ruling, 2026-08-17, `docs/gate-and-shell-split.md`: "gate
+    /// unavailable" and "denied" must be distinguishable to a model — see
+    /// `McpError::GateUnavailable`):
     ///
     /// - **No subscriber attached** (`self.permission_asker` unset, or the
     ///   bridge itself reports `PermissionOutcome::NoSubscriber` because its
-    ///   registry is empty) — nothing to ask, so the safe default is Deny.
-    ///   An `Ask` hook with nobody to ask is a misconfiguration, not a
-    ///   quiet no-op (`CLAUDE.md`: "Silent fallbacks are often a mistake").
+    ///   registry is empty) — nothing to ask, so the safe default is to
+    ///   refuse. An `Ask` hook with nobody to ask is a misconfiguration, not
+    ///   a quiet no-op (`CLAUDE.md`: "Silent fallbacks are often a
+    ///   mistake") — and not a considered "no" either.
     /// - **Timeout** — a subscriber was attached but didn't answer within
     ///   `permission_ask_timeout` (default 30s, "generous" — see
-    ///   `super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`). Same Deny
-    ///   default; a turn must not hang forever on an unanswered prompt.
+    ///   `super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`). Same
+    ///   fail-closed refusal; a turn must not hang forever on an unanswered
+    ///   prompt.
     ///
     /// Both fail-closed paths log at `warn!` (not the plain `debug!` other
     /// hook denials use) — a stuck Ask usually means the current session
@@ -1723,7 +1759,7 @@ impl Broker {
         spec: &AskSpec,
         params: &KernelCallParams,
         ctx: &CallContext,
-    ) -> Option<String> {
+    ) -> PermissionAskOutcome {
         let description = spec
             .description
             .clone()
@@ -1746,9 +1782,9 @@ impl Broker {
                 instance = %params.instance,
                 tool = %params.tool,
                 context_id = %ctx.context_id,
-                "permission ask fired with no PermissionEvents subscriber attached; denying (fail-closed)",
+                "permission ask fired with no PermissionEvents subscriber attached; refusing (fail-closed, gate unavailable)",
             );
-            return Some(
+            return PermissionAskOutcome::Unavailable(
                 "permission ask: no PermissionEvents subscriber attached (fail-closed)".into(),
             );
         };
@@ -1765,9 +1801,9 @@ impl Broker {
                     context_id = %ctx.context_id,
                     request_id = %request_id,
                     timeout_secs = timeout.as_secs_f64(),
-                    "permission ask timed out waiting for a response; denying (fail-closed)",
+                    "permission ask timed out waiting for a response; refusing (fail-closed, gate unavailable)",
                 );
-                Some(format!(
+                PermissionAskOutcome::Unavailable(format!(
                     "permission ask: timed out after {:.1}s waiting for a response (fail-closed)",
                     timeout.as_secs_f64()
                 ))
@@ -1780,9 +1816,9 @@ impl Broker {
                     tool = %params.tool,
                     context_id = %ctx.context_id,
                     request_id = %request_id,
-                    "permission ask bridge reports no subscriber; denying (fail-closed)",
+                    "permission ask bridge reports no subscriber; refusing (fail-closed, gate unavailable)",
                 );
-                Some(
+                PermissionAskOutcome::Unavailable(
                     "permission ask: no PermissionEvents subscriber attached (fail-closed)".into(),
                 )
             }
@@ -1794,9 +1830,9 @@ impl Broker {
                     tool = %params.tool,
                     context_id = %ctx.context_id,
                     request_id = %request_id,
-                    "permission ask bridge reports its own timeout; denying (fail-closed)",
+                    "permission ask bridge reports its own timeout; refusing (fail-closed, gate unavailable)",
                 );
-                Some(
+                PermissionAskOutcome::Unavailable(
                     "permission ask: subscriber did not answer in time (fail-closed)".into(),
                 )
             }
@@ -1813,9 +1849,9 @@ impl Broker {
                     "permission ask answered",
                 );
                 if answer.allow {
-                    None
+                    PermissionAskOutcome::Proceed
                 } else {
-                    Some(format!(
+                    PermissionAskOutcome::Denied(format!(
                         "permission ask: denied by subscriber{}",
                         answer
                             .remember
@@ -2189,6 +2225,10 @@ impl Broker {
                 emit_deny_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
                 return;
             }
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                emit_gate_unavailable_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     context_id = %ctx,
@@ -2316,9 +2356,17 @@ enum PhaseOutcome {
         hook_id: HookId,
         result: KernelToolResult,
     },
-    /// A `Deny` hook matched. `reason` is tracing-only; the LLM-visible
-    /// error is `McpError::Denied { by_hook }` (D-28 channel discipline).
+    /// A `Deny` hook matched, or an `Ask` hook's subscriber answered "no".
+    /// `reason` is tracing-only; the LLM-visible error is
+    /// `McpError::Denied { by_hook }` (D-28 channel discipline).
     Deny { hook_id: HookId, reason: String },
+    /// An `Ask` hook fired but never reached a verdict — no subscriber
+    /// attached, or nobody answered in time. Distinct from `Deny` so the
+    /// LLM-visible error is `McpError::GateUnavailable`, not
+    /// `McpError::Denied` (Amy, 2026-08-17: "gate unavailable" and "denied"
+    /// must be distinguishable to a model — `docs/gate-and-shell-split.md`).
+    /// `reason` is tracing-only, same discipline as `Deny`.
+    GateUnavailable { hook_id: HookId, reason: String },
 }
 
 /// Per-phase payload for hook evaluation. Carries the data a phase observes
@@ -2390,6 +2438,10 @@ fn error_to_hook_json(e: &McpError) -> String {
         McpError::Denied { by_hook } => (
             "Denied",
             serde_json::json!({"by_hook": by_hook.to_string()}),
+        ),
+        McpError::GateUnavailable { by_hook, reason } => (
+            "GateUnavailable",
+            serde_json::json!({"by_hook": by_hook.to_string(), "reason": reason}),
         ),
         McpError::CapabilityDenied { instance, tool } => (
             "CapabilityDenied",
@@ -2539,6 +2591,20 @@ fn emit_deny_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
         phase = ?phase,
         reason = %reason,
         "hook.deny",
+    );
+}
+
+/// Tracing attribution for a `GateUnavailable` result — an `Ask` hook that
+/// never reached a verdict. Kept as its own event name (`hook.gate_unavailable`,
+/// not `hook.deny`) so a trace consumer can tell a broken control apart from
+/// an actual "no" without parsing `reason` prose (Amy, 2026-08-17,
+/// `docs/gate-and-shell-split.md`).
+fn emit_gate_unavailable_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
+    tracing::info!(
+        hook_id = %format!("hook:{hook_id}"),
+        phase = ?phase,
+        reason = %reason,
+        "hook.gate_unavailable",
     );
 }
 
@@ -2790,6 +2856,14 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
+                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                        emit_gate_unavailable_attribution(
+                            McpHookPhase::OnNotification,
+                            &hook_id,
+                            &reason,
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             context_id = %ctx_id,
@@ -2854,6 +2928,14 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     }
                     Ok(PhaseOutcome::Deny { hook_id, reason }) => {
                         emit_deny_attribution(
+                            McpHookPhase::OnNotification,
+                            &hook_id,
+                            &reason,
+                        );
+                        continue;
+                    }
+                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                        emit_gate_unavailable_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
                             &reason,
@@ -7183,10 +7265,17 @@ mod tests {
     }
 
     /// D-57 fail-closed default #1: no `PermissionEvents` subscriber
-    /// attached at all (`set_permission_asker` never called) denies the
-    /// call rather than silently letting it through.
+    /// attached at all (`set_permission_asker` never called) refuses the
+    /// call rather than silently letting it through — but as
+    /// `McpError::GateUnavailable`, not `McpError::Denied`. Nobody rendered
+    /// a verdict; the gate itself was missing (Amy's ruling, 2026-08-17,
+    /// `docs/gate-and-shell-split.md`). Renamed from
+    /// `permission_ask_no_subscriber_denies` and the assertion changed from
+    /// `Denied` to `GateUnavailable` — this is the honest reclassification
+    /// Slice 2 exists to make, not a weakened check: the call still fails
+    /// closed, only the *kind* of failure is now distinguishable.
     #[tokio::test]
-    async fn permission_ask_no_subscriber_denies() {
+    async fn permission_ask_no_subscriber_is_gate_unavailable() {
         let broker = Arc::new(Broker::new());
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -7206,17 +7295,19 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            McpError::Denied { by_hook } => assert_eq!(by_hook.0, "ask-no-sub"),
-            other => panic!("expected Denied, got {other:?}"),
+            McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-no-sub"),
+            other => panic!("expected GateUnavailable, got {other:?}"),
         }
     }
 
     /// D-57 fail-closed default #1, variant: a bridge IS attached but its
     /// own registry is empty, so it reports `NoSubscriber` explicitly
     /// rather than the kernel inferring it from an absent bridge. Same
-    /// Deny outcome either way.
+    /// fail-closed refusal either way, and same reclassification as above:
+    /// `GateUnavailable`, not `Denied` — nothing rendered a verdict here
+    /// either. Renamed from `permission_ask_bridge_reports_no_subscriber_denies`.
     #[tokio::test]
-    async fn permission_ask_bridge_reports_no_subscriber_denies() {
+    async fn permission_ask_bridge_reports_no_subscriber_is_gate_unavailable() {
         let broker = Arc::new(Broker::new());
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -7238,16 +7329,22 @@ mod tests {
             .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "ask-empty-registry"));
+        assert!(matches!(
+            err,
+            McpError::GateUnavailable { ref by_hook, .. } if by_hook.0 == "ask-empty-registry"
+        ));
     }
 
     /// D-57 fail-closed default #2: a subscriber is attached but doesn't
     /// answer within the timeout — must not hang the turn forever, and
-    /// must resolve to the same Deny default as no-subscriber. The test
-    /// shrinks the timeout (`set_permission_ask_timeout_for_test`) so this
-    /// doesn't block the suite for the real 30s production default.
+    /// must resolve to the same fail-closed refusal as no-subscriber. The
+    /// test shrinks the timeout (`set_permission_ask_timeout_for_test`) so
+    /// this doesn't block the suite for the real 30s production default.
+    /// Reclassified like the two tests above: a timeout is a broken
+    /// control, not a verdict, so the error is `GateUnavailable`, not
+    /// `Denied`. Renamed from `permission_ask_timeout_denies`.
     #[tokio::test]
-    async fn permission_ask_timeout_denies() {
+    async fn permission_ask_timeout_is_gate_unavailable() {
         let broker = Arc::new(Broker::new());
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -7263,7 +7360,7 @@ mod tests {
             .push(ask_entry("ask-timeout", None));
 
         // Asker "answers allow" but only after 200ms — the 20ms test
-        // timeout must win, and the call must still be denied (a slow
+        // timeout must win, and the call must still be refused (a slow
         // subscriber is not a substitute for a real one within budget).
         let asker = ScriptedAsker::with_delay(
             PermissionOutcome::Answered(PermissionAnswer {
@@ -7288,8 +7385,8 @@ mod tests {
             "must resolve at the 20ms timeout, not wait for the 200ms answer",
         );
         match err {
-            McpError::Denied { by_hook } => assert_eq!(by_hook.0, "ask-timeout"),
-            other => panic!("expected Denied, got {other:?}"),
+            McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-timeout"),
+            other => panic!("expected GateUnavailable, got {other:?}"),
         }
     }
 

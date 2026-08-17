@@ -26,13 +26,23 @@
 //! ask is not "nudge absent," it's a broken control: the operator declared
 //! "a human must decide this" and no human is reachable. Silent fallbacks
 //! are a mistake (`CLAUDE.md` user directives) — the fallback here is
-//! **Deny, loud log, always** (fail closed but observable), for both a
-//! missing subscriber and a subscriber that doesn't answer within the
-//! timeout. This differs from `HookAction::Deny`'s tracing-only reason
-//! channel: a no-subscriber/timeout Ask denial is logged at `warn!` (not
+//! **refuse the call, loud log, always** (fail closed but observable), for
+//! both a missing subscriber and a subscriber that doesn't answer within
+//! the timeout. This differs from `HookAction::Deny`'s tracing-only reason
+//! channel: a no-subscriber/timeout Ask refusal is logged at `warn!` (not
 //! plain `debug!`) because it usually means an rc script or hook config is
 //! misconfigured for the current session (Ask declared, nothing attached to
 //! answer it), which the operator needs to notice.
+//!
+//! **This refusal is not the same LLM-visible error as a real "no."** Amy's
+//! ruling, 2026-08-17 (`docs/gate-and-shell-split.md`, "'Gate unavailable'
+//! and 'denied' must be distinguishable to a model"): a subscriber
+//! answering "no" is a verdict (`McpError::Denied`); no subscriber
+//! attached, or nobody answering in time, is a broken control
+//! (`McpError::GateUnavailable`) — both refuse the call, but only one of
+//! them is a decision a model should learn from. See
+//! [`PermissionAskOutcome`] below, which is how `Broker::run_permission_ask`
+//! keeps the two apart before they reach `McpError`.
 
 use std::time::Duration;
 
@@ -104,6 +114,34 @@ pub enum PermissionOutcome {
     /// A subscriber was attached but the round trip did not complete
     /// within the caller's timeout (or the bridge's own internal one).
     TimedOut,
+}
+
+/// What `Broker::run_permission_ask` decided, distinguishing a real verdict
+/// from a broken control (Amy's ruling, 2026-08-17,
+/// `docs/gate-and-shell-split.md` "'Gate unavailable' and 'denied' must be
+/// distinguishable to a model"). [`PermissionOutcome`] above is the bridge's
+/// own three-way report of what happened on the wire; `run_permission_ask`
+/// folds that in with the two ask-level fail-closed defaults that never
+/// even reach the bridge (no [`PermissionAsker`] attached at all, or the
+/// round trip's own `tokio::time::timeout` elapses) into the two buckets
+/// that matter to a caller deciding what to do next: a real verdict versus
+/// a gate that never rendered one. `McpError` mirrors this split exactly —
+/// `Denied` / `GateUnavailable`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionAskOutcome {
+    /// A subscriber answered "allow". The call proceeds.
+    Proceed,
+    /// A subscriber answered "no" — a real verdict. `reason` is
+    /// tracing/hook-visible prose, not shown to the model directly (D-28
+    /// channel discipline still applies at the `McpError` boundary).
+    Denied(String),
+    /// Nothing could answer: no `PermissionAsker` was attached, the
+    /// bridge's own subscriber registry was empty, or nobody answered
+    /// inside the timeout (either the ask-level `tokio::time::timeout` or
+    /// the bridge's own internal one). All of these read the same to a
+    /// caller — "the gate could not do its job" — so they collapse to one
+    /// variant here; `reason` keeps the specific flavor for tracing.
+    Unavailable(String),
 }
 
 /// Bridge to the server's `PermissionEvents` subscriber registry. Kept as a

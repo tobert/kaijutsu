@@ -76,8 +76,28 @@ pub enum McpError {
     #[error("call cancelled")]
     Cancelled,
 
+    /// A denial with a verdict behind it — a `Deny` hook matched, or an
+    /// `Ask` hook's subscriber answered "no". Distinct from
+    /// [`McpError::GateUnavailable`] below on purpose (Amy's ruling,
+    /// 2026-08-17, `docs/gate-and-shell-split.md` "'Gate unavailable' and
+    /// 'denied' must be distinguishable to a model"): this variant means a
+    /// human or a rule actually decided.
     #[error("denied by hook {by_hook}")]
     Denied { by_hook: HookId },
+
+    /// An `Ask` hook fired but never reached a verdict: no
+    /// `PermissionAsker` subscriber was attached, or nobody answered inside
+    /// the timeout. Still fails closed — the call is refused exactly like
+    /// `Denied` — but the reason is honest: this is a broken control, not a
+    /// "no" (CLAUDE.md: "silent fallbacks are often a mistake"; there is no
+    /// adversary inside the trust boundary to hide gate state from, per
+    /// `docs/instrument-design.md` "Many hands, one trust boundary", so
+    /// nothing is lost by saying so). A model reading this can retry,
+    /// escalate through a different channel, or ask a human directly,
+    /// instead of learning the wrong lesson ("that action is refused")
+    /// from a control that was simply absent.
+    #[error("gate for {by_hook} had nothing to answer it: {reason}")]
+    GateUnavailable { by_hook: HookId, reason: String },
 
     #[error("tool `{tool}` on instance {instance} is not in this context's capability allow-set")]
     CapabilityDenied { instance: InstanceId, tool: String },

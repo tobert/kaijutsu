@@ -45,7 +45,11 @@
 //! see `super::permission` for the request/response/trait shape and
 //! `Broker::evaluate_phase` for the fail-closed no-subscriber/timeout
 //! policy. Like `Kaish`, `ListTools` rejects `Ask` at `hook_add` (D-56):
-//! a list-filter can't block-wait per tool.
+//! a list-filter can't block-wait per tool. A subscriber's real "no"
+//! terminates as `McpError::Denied`; no subscriber attached or nobody
+//! answering in time terminates as `McpError::GateUnavailable` instead — a
+//! broken control, not a verdict (Amy, 2026-08-17,
+//! `docs/gate-and-shell-split.md`). Both still fail closed.
 
 use std::sync::Arc;
 
@@ -134,9 +138,13 @@ pub struct AskSpec {
 /// converts denials uniformly to `McpError::Denied { by_hook }` at the
 /// LLM boundary (D-28); the reason string is tracing-only.
 ///
-/// `Ask` also terminates as `McpError::Denied` when the answer is "no" (or
-/// the fail-closed default fires) — same D-28 channel, different verdict
-/// source. See `super::permission` (D-57).
+/// `Ask` terminates as `McpError::Denied` when a subscriber actually
+/// answers "no" — a real verdict, same D-28 channel as `Deny`. When the
+/// fail-closed default fires instead (no subscriber attached, or nobody
+/// answered in time), it terminates as `McpError::GateUnavailable` —
+/// distinct on purpose (Amy, 2026-08-17, `docs/gate-and-shell-split.md`):
+/// both refuse the call, but only one of them is a decision. See
+/// `super::permission` (D-57).
 #[derive(Clone, Debug)]
 pub enum HookAction {
     Invoke(HookBody),
