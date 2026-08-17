@@ -745,7 +745,7 @@ app-scoped UI slice — it is a wire-schema change and wants its own review.
 
 ---
 
-## Slice 2 ("widen the origin") needs `kj/drift.rs`, so it wasn't done (found 2026-08-17)
+## Drift peer origins are stageable but not deliverable, and the wire can't name one (2026-08-17)
 
 `set_stderr`, `set_signature`, `set_tool_use_id`, and `set_output`
 (`crates/kaijutsu-kernel/src/block_store.rs`) mutate `BlockContent` fields
@@ -770,33 +770,37 @@ updating them means editing `kj/drift.rs` and possibly `block_store.rs` — both
 another lane's territory this session, and the wiring is not obviously
 separable from slice 4 ("the cc inbox melts into the drift queue," which
 already owns target/delivery resolution for a peer origin).
+Replaces two entries that shipped the same day: slice 2's "needs `kj/drift.rs`"
+blocker, and the drain-acks-early residual. **Both are fixed** — slice 2 widened
+`StagedDrift.origin` to `Context | Peer`, and `drain_dead_letter` is now
+two-phase with `ack_dead_letter` marking the record `Done` only after the
+lost+found write lands (`drain_dead_letter_then_crash_before_ack_recovers_on_restart`
+pins it). What remains is the boundary those two left behind, recorded at its
+real size.
 
-Not attempted as a half-measure (an unused `DriftOrigin` enum nothing calls)
-because that would be dead code masquerading as progress. Whoever picks this
-up needs write access to `kj/drift.rs`; it is a natural pairing with slice 4,
-since both need the same "peer origin has no `ContextId`" handling in the
-delivery path.
+**A peer-origin item can be staged and is durable, but cannot be delivered.**
+`insert_drift_block_as` needs a real `ContextId` for provenance and a peer has
+none. Fabricating one would smear one sender's identity onto another — the
+mistake `hook_listener.rs` already had to walk back — so a peer-origin item is
+treated as an ordinary delivery failure: requeued, eventually dead-lettered,
+never lost. `ContextEdgeRow` has a hard SQL FK to `contexts` (verified), and
+since these items never reach the success branch no fake edge is attempted.
 
-## Drift drain acks before the lost+found write, so a narrow crash window remains (2026-08-17)
+**The wire cannot represent a non-context origin.** `sourceCtx @1 :Data` on the
+staged-drift and dead-letter rows means "16-byte ContextId" and nothing else, so
+`origin_ctx_bytes` (`kaijutsu-server/src/rpc.rs`) reports a peer origin as
+*absent* — zero-length `Data`, which is how capnp spells absence — and logs
+loudly rather than inventing an id. The client decodes that field with
+`parse_context_id`, which rejects an empty slice.
 
-The restart-loses-dead-letters bug itself **SHIPPED FIXED 2026-08-17** (slice 3,
-`docs/drifting-dead-letters.md`): the queue is blocks in a well-known
-drift-queue context, `staging`/`dead_letter` are a cursor over it, and cold
-start attaches + rehydrates in `kaijutsu-server/src/rpc.rs` next to the
-lost+found re-adoption. That part is done; this entry is only the residual.
+**Currently unreachable, and that is the only reason it is safe.** Nothing in
+production constructs a `DriftOrigin::Peer`; only tests do. So:
 
-`drain_dead_letter()` marks each drained item's durable record consumed
-immediately — **not** after the caller's subsequent write into lost+found
-succeeds, because there is no ack path back into the router for that. A crash
-in the narrow synchronous window between the drain and that write could still
-lose the item.
+> The first lane to add a real peer-origin producer — the cc inbox, slice 4 —
+> must give the wire an honest origin representation **in the same change**.
+> Appending origin fields to those two structs is ordinal-safe.
 
-Accepted deliberately rather than silently: this trades an *unbounded-time*
-loss window (the original bug — content lost across ANY restart before a human
-happened to run `kj drift flush`) for a millisecond one during an active
-flush. Closing it needs an ack path, which means touching `kj/drift.rs`. See
-`persist_item`'s and `drain_dead_letter`'s doc comments in `drift.rs` for the
-full reasoning.
+Do not let a peer origin reach those projections before then.
 
 ## A context's version is unobservable from `kj` (2026-08-15)
 
