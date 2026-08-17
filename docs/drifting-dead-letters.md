@@ -5,6 +5,17 @@ instead of three. Written 2026-08-16 from a conversation with Amy; the code
 citations are from that day and should be re-checked before trusting a line
 number.
 
+**Status (2026-08-17):** slice 1 shipped (`e30a8deb`) and verified against
+HEAD. Slice 3's mechanism shipped in `drift.rs`/`kernel_db.rs` — durable
+staging/dead-letter blocks, rehydrate, `ensure_drift_queue_context` — with a
+real-restart test suite (`drift::tests::persistence::*`); it is **not yet
+wired into a running kernel** (no production code calls
+`attach_persistence`/`rehydrate_from_block_log` yet — see `docs/issues.md`
+for the exact three-call wiring gap and why it wasn't closed this session).
+Slice 2 was not attempted: widening `StagedDrift.source_ctx`'s type cannot be
+contained inside `drift.rs` (see `docs/issues.md`); it needs `kj/drift.rs`
+edits and pairs naturally with slice 4.
+
 ## The finding that started it
 
 The Claude Code inbox needed somewhere to put an inbound message. Looking for
@@ -107,6 +118,11 @@ real source is what should drive it.
 Exit: drift still routes exactly as before, and an inbound peer message can be
 staged without inventing a source context for it.
 
+**Not started (2026-08-17).** `kj/drift.rs`'s `drift_flush` reads
+`source_ctx` directly (edge insertion, `insert_drift_block_as`, two log
+lines) — widening the field's type is not containable in `drift.rs` alone.
+See `docs/issues.md`.
+
 ### 3. The queue becomes blocks in a well-known context
 
 Staged and dead-lettered items stop being `Vec`s and become blocks in the
@@ -125,7 +141,23 @@ drift router."*
 Exit: a kernel restart mid-flight loses neither staged nor dead-lettered
 content, proven by a test that restarts against a real database.
 
-### 4. The cc inbox melts into the drift queue
+**Mechanism shipped 2026-08-17**, exit criterion met at the `DriftRouter`
+level: `attach_persistence`, `rehydrate_from_block_log`,
+`ensure_drift_queue_context` in `drift.rs`, `WellKnownRole::DriftQueue` in
+`kernel_db.rs`, restart-against-a-real-database tests in
+`drift::tests::persistence`. **Not yet wired into a running kernel** — see
+`docs/issues.md` for the three-call wiring gap (belongs in
+`kaijutsu-server/src/rpc.rs`, next to the existing lost+found re-adoption
+code, outside this session's territory). Answers the "one context or two?"
+open question below: **one** — a single new `drift-queue` well-known context
+(distinct from lost+found) holds both staged and dead-lettered records,
+distinguished by a `QueueSlot` tag on each block's content rather than by
+which context they live in. Lost+found is unchanged: it stays the
+human-facing destination `kj drift flush` writes formatted, delivered dead
+letters into. The drift-queue context is closer to internal bookkeeping (its
+blocks are `BlockKind::Trace`, model-hidden) than to something a human reads
+directly — "what failed" is still answerable via `dead_letters()`/`kj drift`
+without needing a second context to query against.
 
 The Claude Code inbox stops being a delivery path and becomes a **source**. Its
 transport stays where it belongs — socket, frame codec, descriptor registry,
@@ -177,9 +209,9 @@ going on"* — slice 3 delivers that without app work, because it is a context.
   its own? Automatic rotation needs its cutoff to come from the context's own
   economics rather than a global constant — the same caution the 3-hour archive
   rule carries.
-- Whether staged items and dead letters live in one well-known context or two.
-  One context makes the app view simpler; two make "what failed" a query
-  instead of a filter.
+- ~~Whether staged items and dead letters live in one well-known context or
+  two.~~ **Resolved 2026-08-17: one** (the `drift-queue` role, `QueueSlot`
+  tag per record) — see slice 3's status note above.
 - Whether a triage agent eventually attaches to lost+found. It costs nothing
   structural once the queue is blocks — it reads blocks and calls `kj drift` —
   so this is a product decision, not an architectural one.

@@ -31,12 +31,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 
 use kaijutsu_types::{
-    BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix,
+    BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, DriftKind, PrefixError, Role,
+    Status, resolve_context_prefix,
 };
 use kaijutsu_types::{ContextState, PrincipalId};
+
+use crate::block_store::SharedBlockStore;
+use crate::kernel_db::{ContextRow, KernelDb, WellKnownRole};
 
 /// Shared, thread-safe DriftRouter reference.
 pub type SharedDriftRouter = Arc<RwLock<DriftRouter>>;
@@ -94,7 +99,11 @@ impl ContextHandle {
 // ============================================================================
 
 /// A drift operation staged in the queue, pending flush.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` back the durable mirror slice 3 writes into the
+/// drift-queue context (see [`DriftRouter::attach_persistence`]) — this is
+/// the wire format for that block's content, not a network-facing type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedDrift {
     /// Unique ID for this staged operation.
     pub id: u64,
@@ -142,6 +151,56 @@ pub struct StagedDrift {
 const MAX_DRIFT_RETRIES: u32 = 5;
 
 // ============================================================================
+// Durable backing for the queues (slice 3, docs/drifting-dead-letters.md)
+// ============================================================================
+//
+// `staging` and `dead_letter` above are the in-memory queue, same as before
+// slice 3 — that does not change, and every caller that never attaches
+// persistence sees identical behavior to pre-slice-3 `DriftRouter`. What
+// slice 3 adds is a durable *mirror*: every item that enters one of those
+// Vecs is also written as a block into the drift-queue well-known context,
+// and every item that leaves is marked consumed there. `rehydrate_from_block_log`
+// is the read side — the `ConversationMailbox` shape this doc calls for: the
+// block log is the queue, the Vec is a materialized cursor over it, rebuilt on
+// cold start rather than trusted to survive a restart on its own.
+
+/// Which durable sub-queue a persisted drift-queue block represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum QueueSlot {
+    Staging,
+    DeadLetter,
+}
+
+/// The wire format written into a drift-queue block's content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDrift {
+    slot: QueueSlot,
+    drift: StagedDrift,
+}
+
+/// A block store + the drift-queue context id to write into. Attached once,
+/// after construction — `DriftRouter::new()` has no block store in scope (the
+/// kernel does not own a `BlockStore`; it is assembled by the frontend and
+/// handed in later). Absent, the router behaves exactly as it did before
+/// slice 3: in-memory only.
+struct DriftPersistence {
+    blocks: SharedBlockStore,
+    queue_ctx: ContextId,
+}
+
+impl std::fmt::Debug for DriftPersistence {
+    // `BlockStore` has no `Debug` impl (it holds live document state), so this
+    // is hand-written rather than derived — needed for `DriftRouter`'s own
+    // `#[derive(Debug)]` to keep compiling with an `Option<DriftPersistence>`
+    // field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriftPersistence")
+            .field("queue_ctx", &self.queue_ctx.short())
+            .finish_non_exhaustive()
+    }
+}
+
+// ============================================================================
 // DriftRouter — central coordinator
 // ============================================================================
 
@@ -169,6 +228,17 @@ pub struct DriftRouter {
     label_to_id: HashMap<String, ContextId>,
     /// ContextId for the lazy "lost+found" context, created on first dead letter.
     lost_found_id: Option<ContextId>,
+    /// ContextId for the durable drift-queue context (slice 3), claimed the
+    /// same way `lost_found_id` is — see [`Self::claim_drift_queue`] /
+    /// [`Self::adopt_drift_queue`].
+    drift_queue_id: Option<ContextId>,
+    /// Durable backing for `staging`/`dead_letter`, if attached (slice 3). See
+    /// [`Self::attach_persistence`].
+    persistence: Option<DriftPersistence>,
+    /// `StagedDrift::id` → the `BlockId` currently holding its durable mirror
+    /// in the drift-queue context. Only populated while `persistence` is
+    /// attached; empty and unused otherwise.
+    persisted_blocks: HashMap<u64, BlockId>,
 }
 
 impl Default for DriftRouter {
@@ -186,6 +256,9 @@ impl DriftRouter {
             dead_letter: Vec::new(),
             next_staged_id: 1,
             label_to_id: HashMap::new(),
+            drift_queue_id: None,
+            persistence: None,
+            persisted_blocks: HashMap::new(),
             lost_found_id: None,
         }
     }
@@ -292,6 +365,12 @@ impl DriftRouter {
                 count = dead.len(),
                 "moving staged drifts to dead letter for unregistered context"
             );
+            for item in &dead {
+                // Consume the staging record, write a fresh dead-letter one —
+                // same append-only-history reasoning as the `requeue` path.
+                self.mark_consumed(item.id);
+                self.persist_item(QueueSlot::DeadLetter, item);
+            }
             self.dead_letter.extend(dead);
         }
     }
@@ -462,6 +541,211 @@ impl DriftRouter {
         self.lost_found_id.take()
     }
 
+    /// The drift-queue context id, if one has been claimed (slice 3).
+    pub fn drift_queue_id(&self) -> Option<ContextId> {
+        self.drift_queue_id
+    }
+
+    /// Claim an already-registered context as the drift-queue sink — the
+    /// slice-3 counterpart to [`Self::adopt_lost_found`], same cold-start
+    /// shape: `drift_queue_id` resets to `None` across a restart, and the
+    /// caller re-claims it from `WellKnownRole::DriftQueue` rather than
+    /// re-deriving it from a label.
+    pub fn adopt_drift_queue(&mut self, id: ContextId) {
+        match self.drift_queue_id {
+            Some(existing) if existing == id => {}
+            Some(existing) => tracing::warn!(
+                existing = %existing.short(),
+                candidate = %id.short(),
+                "adopt_drift_queue ignored: a different drift-queue is already claimed"
+            ),
+            None => self.drift_queue_id = Some(id),
+        }
+    }
+
+    /// Claim `id` — a context whose `KernelDb` row the caller has **already
+    /// persisted** — as the drift-queue sink, registering it under `label`.
+    /// See [`Self::claim_lost_found`]'s doc for why row-then-claim matters;
+    /// the same reasoning applies here. Unlike lost+found, this role has no
+    /// rotation story yet, so `label` is not the caller's concern to
+    /// disambiguate — a fixed `"drift-queue"` is fine.
+    pub fn claim_drift_queue(
+        &mut self,
+        id: ContextId,
+        label: &str,
+    ) -> Result<ContextId, DriftError> {
+        if let Some(existing) = self.drift_queue_id {
+            if existing != id {
+                tracing::warn!(
+                    existing = %existing.short(),
+                    candidate = %id.short(),
+                    "claim_drift_queue lost a race: the candidate's persisted row is now unused"
+                );
+            }
+            return Ok(existing);
+        }
+        self.register(id, Some(label), None, PrincipalId::system())?;
+        self.drift_queue_id = Some(id);
+        tracing::info!(context = %id.short(), label, "created drift-queue context");
+        Ok(id)
+    }
+
+    /// Attach durable backing (slice 3, docs/drifting-dead-letters.md): every
+    /// future `stage`/dead-letter transition also writes or marks a block in
+    /// `queue_ctx`, and prior content can be recovered via
+    /// [`Self::rehydrate_from_block_log`]. `DriftRouter::new()` cannot do
+    /// this at construction — the kernel does not own a `BlockStore` (it is
+    /// assembled by the frontend and handed in later, see `kernel.rs`'s
+    /// `register_builtin_mcp_servers`) — so this is attached after the fact
+    /// by whoever resolves both. Every existing caller that never attaches
+    /// this is completely unaffected: `persistence` stays `None` and every
+    /// method below degrades to its pre-slice-3, in-memory-only behavior.
+    pub fn attach_persistence(&mut self, blocks: SharedBlockStore, queue_ctx: ContextId) {
+        self.persistence = Some(DriftPersistence { blocks, queue_ctx });
+    }
+
+    /// Whether a durable backing is attached. Diagnostic/test convenience —
+    /// no caller needs to branch on this to use the router correctly.
+    pub fn has_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Write `item` into the drift-queue context as a `slot` record, and
+    /// track the resulting block id so a later transition can mark it
+    /// consumed. A no-op if no persistence is attached. If persistence IS
+    /// attached but the write fails, this logs loudly rather than silently
+    /// continuing (CLAUDE.md: "silent fallbacks are often a mistake") — the
+    /// in-memory `staging`/`dead_letter` Vecs stay authoritative for this
+    /// process regardless, so a write failure here degrades durability
+    /// (this item will not survive a restart), not this process's
+    /// correctness.
+    fn persist_item(&mut self, slot: QueueSlot, item: &StagedDrift) {
+        let Some(p) = &self.persistence else {
+            return;
+        };
+        let payload = PersistedDrift {
+            slot,
+            drift: item.clone(),
+        };
+        let content = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    drift_id = item.id,
+                    "failed to serialize drift-queue record, item will NOT survive a restart: {e}"
+                );
+                return;
+            }
+        };
+        let after = p.blocks.last_block_id(p.queue_ctx);
+        match p.blocks.insert_block(
+            p.queue_ctx,
+            None,
+            after.as_ref(),
+            Role::System,
+            BlockKind::Trace,
+            content,
+            Status::Pending,
+            ContentType::Plain,
+        ) {
+            Ok(block_id) => {
+                self.persisted_blocks.insert(item.id, block_id);
+            }
+            Err(e) => {
+                tracing::error!(
+                    drift_id = item.id,
+                    "failed to persist drift-queue block, item will NOT survive a restart: {e}"
+                );
+            }
+        }
+    }
+
+    /// Mark `staged_id`'s durable record consumed — delivered, cancelled, or
+    /// superseded by a fresh record for the same item (a retry or a
+    /// dead-letter/replay transition writes a new record rather than
+    /// mutating the old one in place, so the old one is consumed here). A
+    /// no-op if no persistence is attached, or if `staged_id` has no durable
+    /// record (never staged with persistence attached, or already consumed).
+    fn mark_consumed(&mut self, staged_id: u64) {
+        let Some(p) = &self.persistence else {
+            return;
+        };
+        if let Some(block_id) = self.persisted_blocks.remove(&staged_id)
+            && let Err(e) = p.blocks.set_status(p.queue_ctx, &block_id, Status::Done)
+        {
+            tracing::error!(
+                drift_id = staged_id,
+                "failed to mark drift-queue block consumed: {e}"
+            );
+        }
+    }
+
+    /// Rebuild `staging`/`dead_letter` from the durable drift-queue context —
+    /// the read side of [`Self::attach_persistence`], and the reason this
+    /// design pays off: the block log is the queue, `staging`/`dead_letter`
+    /// are a materialized cursor over it (the `ConversationMailbox` shape,
+    /// `docs/drifting-dead-letters.md`'s "three things that are one thing").
+    /// Call once, right after attaching, before this router serves any
+    /// traffic — it REPLACES `staging`/`dead_letter`/`persisted_blocks`
+    /// wholesale rather than merging, which is correct for a fresh router
+    /// (the cold-start case this exists for) and wrong for any other.
+    ///
+    /// Only `Status::Pending` drift-queue blocks are live, unconsumed
+    /// records — `Status::Done` ones are already-delivered/cancelled history,
+    /// left in place for audit but not requeued. `next_staged_id` is
+    /// advanced past every recovered id so a `stage` call right after
+    /// rehydrate cannot mint a colliding id. Nothing is truly in-flight the
+    /// moment a process starts, so recovered items always come back with
+    /// `in_flight`/`cancelled` cleared even if the persisted record predates
+    /// that (a crash mid-flush cannot leave a phantom in-flight item behind).
+    pub fn rehydrate_from_block_log(&mut self) -> Result<(), DriftError> {
+        let Some(p) = &self.persistence else {
+            return Ok(());
+        };
+        let snapshots = p.blocks.block_snapshots(p.queue_ctx).map_err(|e| {
+            DriftError::DocumentError(format!(
+                "drift-queue rehydrate: failed to read block log: {e}"
+            ))
+        })?;
+
+        self.staging.clear();
+        self.dead_letter.clear();
+        self.persisted_blocks.clear();
+
+        for block in &snapshots {
+            if block.status != Status::Pending {
+                continue;
+            }
+            let payload: PersistedDrift = match serde_json::from_str(&block.content) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    tracing::error!(
+                        block_id = ?block.id,
+                        "drift-queue block is Pending but not a valid record, skipping (stays \
+                         in the log for inspection, will not be requeued): {e}"
+                    );
+                    continue;
+                }
+            };
+            self.next_staged_id = self.next_staged_id.max(payload.drift.id + 1);
+            self.persisted_blocks.insert(payload.drift.id, block.id);
+            let mut item = payload.drift;
+            item.in_flight = false;
+            item.cancelled = false;
+            match payload.slot {
+                QueueSlot::Staging => self.staging.push(item),
+                QueueSlot::DeadLetter => self.dead_letter.push(item),
+            }
+        }
+
+        tracing::info!(
+            staged = self.staging.len(),
+            dead_letters = self.dead_letter.len(),
+            "rehydrated drift queue from block log"
+        );
+        Ok(())
+    }
+
     /// Stage a drift operation for later flush.
     ///
     /// Returns the staged drift ID.
@@ -486,7 +770,7 @@ impl DriftRouter {
         let id = self.next_staged_id;
         self.next_staged_id += 1;
 
-        self.staging.push(StagedDrift {
+        let item = StagedDrift {
             id,
             source_ctx,
             target_ctx,
@@ -498,7 +782,12 @@ impl DriftRouter {
             retry_count: 0,
             in_flight: false,
             cancelled: false,
-        });
+        };
+        // Durable mirror before the in-memory push reports success — see
+        // `persist_item`'s doc for what "success" means when persistence
+        // isn't attached or its write fails.
+        self.persist_item(QueueSlot::Staging, &item);
+        self.staging.push(item);
 
         Ok(id)
     }
@@ -519,6 +808,7 @@ impl DriftRouter {
             self.staging[pos].cancelled = true;
         } else {
             self.staging.remove(pos);
+            self.mark_consumed(staged_id);
         }
         true
     }
@@ -571,6 +861,7 @@ impl DriftRouter {
     /// linger in `staging` forever, permanently marked in-flight.
     pub fn complete(&mut self, staged_id: u64) {
         self.staging.retain(|s| s.id != staged_id);
+        self.mark_consumed(staged_id);
     }
 
     /// Re-queue staged drifts that failed to deliver.
@@ -604,6 +895,7 @@ impl DriftRouter {
                     drift_id = item.id,
                     "dropping cancelled in-flight drift instead of requeuing"
                 );
+                self.mark_consumed(item.id);
                 continue;
             }
 
@@ -619,8 +911,17 @@ impl DriftRouter {
                     "staged drift exceeded {} retries, moving to dead letter queue",
                     MAX_DRIFT_RETRIES,
                 );
+                // Consume the staging record and write a fresh dead-letter
+                // one rather than mutate in place — blocks are append-only
+                // history here, not a mutable cell.
+                self.mark_consumed(item.id);
+                self.persist_item(QueueSlot::DeadLetter, &item);
                 self.dead_letter.push(item);
             } else {
+                // Re-persist with the incremented retry_count so a restart
+                // recovers an accurate count, not just "it was staged."
+                self.mark_consumed(item.id);
+                self.persist_item(QueueSlot::Staging, &item);
                 self.staging.push(item);
             }
         }
@@ -631,7 +932,22 @@ impl DriftRouter {
     /// Called by the flush engine to write dead letter content to the
     /// "lost+found" context in the block store.
     pub fn drain_dead_letter(&mut self) -> Vec<StagedDrift> {
-        std::mem::take(&mut self.dead_letter)
+        let items = std::mem::take(&mut self.dead_letter);
+        // Mark every drained item consumed now, not after the caller's write
+        // into lost+found succeeds — there is no ack path back into this
+        // router for that (the flush engine's write is synchronous and
+        // immediate, with `restore_dead_letters` as its own failure path
+        // right below), so this is a narrow, deliberate trade: a crash in
+        // the few synchronous instructions between this call and that write
+        // could still lose the item, versus the actual bug this closes
+        // (content sitting in-memory-only for however long until a human
+        // runs `kj drift flush`, guaranteed lost on ANY restart before that).
+        // Tracked as a known residual gap, not silently accepted —
+        // docs/issues.md.
+        for item in &items {
+            self.mark_consumed(item.id);
+        }
+        items
     }
 
     /// Read-only snapshot of the dead-letter queue (M2-B4).
@@ -651,6 +967,9 @@ impl DriftRouter {
         let pos = self.dead_letter.iter().position(|d| d.id == id)?;
         let mut item = self.dead_letter.remove(pos);
         item.retry_count = 0;
+        // Consume the dead-letter record, write a fresh staging one.
+        self.mark_consumed(item.id);
+        self.persist_item(QueueSlot::Staging, &item);
         self.staging.push(item.clone());
         Some(item)
     }
@@ -663,6 +982,14 @@ impl DriftRouter {
     /// The flush engine hands those items back here instead, and they get
     /// another attempt on the next flush.
     pub fn restore_dead_letters(&mut self, items: Vec<StagedDrift>) {
+        // `drain_dead_letter` already marked these consumed on the assumption
+        // the caller's write would succeed; it didn't, so re-persist each one
+        // durably before putting it back — otherwise a restart between now
+        // and the next successful flush would lose exactly the content this
+        // whole path exists to protect.
+        for item in &items {
+            self.persist_item(QueueSlot::DeadLetter, item);
+        }
         self.dead_letter.extend(items);
     }
 
@@ -704,6 +1031,120 @@ impl DriftRouter {
         tracing::info!(context = %id.short(), label, "created lost+found context");
         Ok(id)
     }
+}
+
+/// Resolve (creating if necessary) the durable drift-queue context that
+/// backs [`DriftRouter::attach_persistence`] — the slice-3 counterpart to
+/// `KjDispatcher::ensure_lost_found_context` (`kj/drift.rs`), which this
+/// mirrors: router cache → well-known registry → mint. It lives here rather
+/// than there because `WellKnownRole::DriftQueue` and the persistence it
+/// backs are this router's concern, and because `kj/drift.rs` is a
+/// different lane's file this slice does not touch.
+///
+/// Unlike lost+found there is no rotation story for this role yet, so there
+/// is no reserved-label disambiguation to do on mint — `"drift-queue"` is
+/// fine.
+///
+/// This resolves and attaches the context; it does NOT rehydrate. Call
+/// [`DriftRouter::rehydrate_from_block_log`] afterward if the caller wants
+/// prior durable content folded back into `staging`/`dead_letter` — kept
+/// separate because rehydrate has cold-start-only timing requirements
+/// (replaces state wholesale) that resolving the context does not.
+pub fn ensure_drift_queue_context(
+    router: &SharedDriftRouter,
+    blocks: &SharedBlockStore,
+    kernel_db: &Mutex<KernelDb>,
+) -> Result<ContextId, DriftError> {
+    // 1. Router cache.
+    if let Some(id) = router.read().drift_queue_id() {
+        return Ok(id);
+    }
+
+    // 2. Well-known registry — a persisted assignment from this kernel's
+    //    history. A hit means the row already exists; adopt it rather than
+    //    minting a duplicate.
+    {
+        let registry_hit = kernel_db.lock().well_known_context(WellKnownRole::DriftQueue);
+        match registry_hit {
+            Ok(Some(id)) => {
+                router.write().adopt_drift_queue(id);
+                return Ok(id);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "well-known registry lookup for drift-queue failed, minting instead: {e}"
+                );
+            }
+        }
+    }
+
+    // 3. Mint: document row, then context + well-known row, then the router
+    //    claim — row before register, same invariant `claim_lost_found`
+    //    documents.
+    let id = ContextId::new();
+    let system = PrincipalId::system();
+
+    blocks
+        .create_document(id, crate::DocumentKind::Conversation, None)
+        .map_err(|e| {
+            DriftError::DocumentError(format!("failed to create drift-queue document: {e}"))
+        })?;
+
+    let persist: Result<(), String> = {
+        let db = kernel_db.lock();
+        let now = kaijutsu_types::now_millis() as i64;
+        db.get_or_create_default_workspace(system)
+            .map_err(|e| format!("failed to resolve workspace for drift-queue: {e}"))
+            .and_then(|ws| {
+                let row = ContextRow {
+                    context_id: id,
+                    label: Some("drift-queue".to_string()),
+                    provider: None,
+                    model: None,
+                    system_prompt: None,
+                    consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                    context_state: ContextState::Live,
+                    context_type: "default".to_string(),
+                    created_at: now,
+                    created_by: system,
+                    forked_from: None,
+                    fork_kind: None,
+                    archived_at: None,
+                    workspace_id: Some(ws),
+                    preset_id: None,
+                    concluded_at: None,
+                    last_activity_at: None,
+                    promoted_at: None,
+                    demoted_at: None,
+                    paused_at: None,
+                    cast_id: None,
+                    origin_host: None,
+                };
+                db.insert_context_with_document(&row, ws)
+                    .map_err(|e| format!("failed to persist drift-queue context row: {e}"))
+            })
+            .and_then(|_| {
+                db.set_well_known_context(WellKnownRole::DriftQueue, id)
+                    .map_err(|e| {
+                        format!("failed to register drift-queue in well-known registry: {e}")
+                    })
+            })
+    };
+
+    if let Err(e) = persist {
+        // Roll the document back so a retry starts clean instead of leaving
+        // an orphan `documents` row behind per attempt.
+        if let Err(cleanup) = blocks.delete_document(id) {
+            tracing::error!(
+                context = %id.short(),
+                "drift-queue rollback failed, orphan document row left behind: {cleanup}"
+            );
+        }
+        return Err(DriftError::DocumentError(e));
+    }
+
+    router.write().claim_drift_queue(id, "drift-queue")
 }
 
 // ============================================================================
@@ -1753,5 +2194,521 @@ mod tests {
     fn test_cancel_unknown_id_returns_false() {
         let mut router = DriftRouter::new();
         assert!(!router.cancel(999_999));
+    }
+
+    // ========================================================================
+    // Slice 3 — durable drift queue (docs/drifting-dead-letters.md)
+    //
+    // The whole point: `DriftRouter.dead_letter`/`staging` used to be
+    // in-memory-only `Vec`s (docs/issues.md, "The dead-letter queue does not
+    // survive a restart") — content the kernel accepted and promised to
+    // deliver, gone the moment the process exits. These tests drive a real,
+    // file-backed `KernelDb` + `BlockStore` — not an in-memory stand-in — and
+    // simulate a restart the same way `block_store.rs`'s own
+    // `test_durability_across_kill` does: write, `mem::forget` everything
+    // (no clean close — a real SIGKILL doesn't get one either), then open a
+    // FRESH `KernelDb`/`BlockStore`/`DriftRouter` against the SAME on-disk
+    // file and assert the content comes back. A test that instead kept the
+    // same `DriftRouter` alive across the "restart" would prove nothing — the
+    // in-memory Vec would still be right there regardless of durability.
+    // ========================================================================
+    mod persistence {
+        use super::*;
+        use crate::block_store::{DbHandle, shared_block_store_with_db};
+
+        /// Open a fresh file-backed `KernelDb` + `BlockStore` pair rooted at
+        /// `path`. Returns the `DbHandle` too so a caller can reopen the same
+        /// file later to simulate a restart.
+        fn open_store(path: &std::path::Path) -> (DbHandle, SharedBlockStore) {
+            let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(path).expect("open db")));
+            let creator = PrincipalId::system();
+            let ws = db
+                .lock()
+                .get_or_create_default_workspace(creator)
+                .expect("workspace");
+            let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+            (db, blocks)
+        }
+
+        /// Mint a drift-queue document directly (bypassing
+        /// `ensure_drift_queue_context`'s router-cache/registry dance — that
+        /// resolution order has its own tests below) and attach it to a
+        /// fresh router, alongside two ordinary registered contexts to stage
+        /// between.
+        fn attached_router(
+            blocks: &SharedBlockStore,
+        ) -> (DriftRouter, ContextId, ContextId, ContextId) {
+            let queue_ctx = ContextId::new();
+            blocks
+                .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                .expect("create drift-queue document");
+            let mut router = DriftRouter::new();
+            router.attach_persistence(blocks.clone(), queue_ctx);
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            router
+                .register(src, Some("src"), None, PrincipalId::system())
+                .unwrap();
+            router
+                .register(tgt, Some("tgt"), None, PrincipalId::system())
+                .unwrap();
+            (router, queue_ctx, src, tgt)
+        }
+
+        #[test]
+        fn stage_writes_a_durable_pending_block() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+
+            router
+                .stage(
+                    src,
+                    tgt,
+                    "durable content".into(),
+                    None,
+                    DriftKind::Push,
+                    PrincipalId::new(),
+                )
+                .unwrap();
+
+            let snaps = blocks.block_snapshots(queue_ctx).unwrap();
+            assert_eq!(
+                snaps.len(),
+                1,
+                "stage must write exactly one drift-queue block"
+            );
+            assert_eq!(snaps[0].status, Status::Pending);
+            assert!(snaps[0].content.contains("durable content"));
+        }
+
+        #[test]
+        fn complete_marks_the_block_done_so_it_is_not_resurrected() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+
+            let id = router
+                .stage(src, tgt, "delivered".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            router.complete(id);
+
+            let snaps = blocks.block_snapshots(queue_ctx).unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(
+                snaps[0].status,
+                Status::Done,
+                "a completed item's durable record must be marked consumed"
+            );
+
+            router.rehydrate_from_block_log().unwrap();
+            assert!(
+                router.queue().is_empty(),
+                "a Done record must not be resurrected by rehydrate"
+            );
+        }
+
+        #[test]
+        fn cancel_marks_the_block_done_so_it_is_not_resurrected() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+
+            let id = router
+                .stage(src, tgt, "cancel me".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            assert!(router.cancel(id));
+
+            let snaps = blocks.block_snapshots(queue_ctx).unwrap();
+            assert_eq!(snaps[0].status, Status::Done);
+
+            router.rehydrate_from_block_log().unwrap();
+            assert!(router.queue().is_empty());
+        }
+
+        #[test]
+        fn restart_recovers_a_staged_item_never_flushed() {
+            // THE test slice 3 exists for: a restart between `stage` and any
+            // flush must not lose the content.
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+            let queue_ctx = ContextId::new();
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            let creator = PrincipalId::system();
+
+            let staged_id = {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+                blocks
+                    .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+
+                let mut router = DriftRouter::new();
+                router.attach_persistence(blocks.clone(), queue_ctx);
+                router.register(src, Some("src"), None, creator).unwrap();
+                router.register(tgt, Some("tgt"), None, creator).unwrap();
+                let id = router
+                    .stage(
+                        src,
+                        tgt,
+                        "survive the restart".into(),
+                        None,
+                        DriftKind::Push,
+                        PrincipalId::new(),
+                    )
+                    .unwrap();
+
+                // Simulate an unclean kill: leak the router, the block store,
+                // and the DB connection. Nothing is cleanly closed or
+                // checkpointed — whatever is committed must survive on disk
+                // alone, exactly as `test_durability_across_kill` verifies
+                // for `BlockStore` itself.
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+                id
+            };
+
+            // "Restart": a fresh connection to the SAME on-disk file, a fresh
+            // BlockStore that loads from it, and a fresh DriftRouter with
+            // nothing in memory.
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+            let blocks2 = shared_block_store_with_db(db2, ws2, creator);
+            blocks2.load_from_db().expect("load_from_db");
+
+            let mut router2 = DriftRouter::new();
+            router2.attach_persistence(blocks2, queue_ctx);
+            router2.register(src, Some("src"), None, creator).unwrap();
+            router2.register(tgt, Some("tgt"), None, creator).unwrap();
+            router2.rehydrate_from_block_log().unwrap();
+
+            assert_eq!(
+                router2.queue().len(),
+                1,
+                "a staged item never flushed before the restart must survive it"
+            );
+            assert_eq!(router2.queue()[0].id, staged_id);
+            assert_eq!(router2.queue()[0].content, "survive the restart");
+        }
+
+        #[test]
+        fn restart_recovers_a_dead_lettered_item() {
+            // The other half of the same bug: `docs/issues.md`'s exact
+            // words were "the mechanism whose whole job is 'content is never
+            // silently discarded' silently discards content." This drives an
+            // item past MAX_DRIFT_RETRIES into `dead_letter`, "restarts," and
+            // checks it is still there — not lost, not duplicated.
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+            let queue_ctx = ContextId::new();
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            let creator = PrincipalId::system();
+
+            {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+                blocks
+                    .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+
+                let mut router = DriftRouter::new();
+                router.attach_persistence(blocks.clone(), queue_ctx);
+                router.register(src, Some("src"), None, creator).unwrap();
+                router.register(tgt, Some("tgt"), None, creator).unwrap();
+                router
+                    .stage(src, tgt, "persistent failure".into(), None, DriftKind::Push, PrincipalId::new())
+                    .unwrap();
+
+                for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                    let drained = router.drain(None);
+                    router.requeue(drained);
+                }
+                assert_eq!(router.dead_letters().len(), 1, "must be dead-lettered before the restart");
+
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+            }
+
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+            let blocks2 = shared_block_store_with_db(db2, ws2, creator);
+            blocks2.load_from_db().expect("load_from_db");
+
+            let mut router2 = DriftRouter::new();
+            router2.attach_persistence(blocks2, queue_ctx);
+            router2.register(src, Some("src"), None, creator).unwrap();
+            router2.register(tgt, Some("tgt"), None, creator).unwrap();
+            router2.rehydrate_from_block_log().unwrap();
+
+            assert!(router2.queue().is_empty(), "must not resurrect as staging");
+            let dl = router2.dead_letters();
+            assert_eq!(dl.len(), 1, "the dead letter must survive the restart, not just once but exactly once");
+            assert_eq!(dl[0].content, "persistent failure");
+        }
+
+        #[test]
+        fn drain_dead_letter_then_restart_does_not_resurrect_the_drained_item() {
+            // `drain_dead_letter` marks the durable record consumed on the
+            // assumption the caller's write into lost+found will succeed
+            // (see its doc for the accepted trade-off). This pins the happy
+            // path: once drained, a restart must not bring the item back a
+            // second time — that would duplicate content already delivered.
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+
+            router
+                .stage(src, tgt, "dies then flushes".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                let drained = router.drain(None);
+                router.requeue(drained);
+            }
+            let drained_dead = router.drain_dead_letter();
+            assert_eq!(drained_dead.len(), 1);
+
+            let snaps = blocks.block_snapshots(queue_ctx).unwrap();
+            assert!(
+                snaps.iter().all(|s| s.status == Status::Done),
+                "drain_dead_letter must mark every drained record consumed"
+            );
+
+            router.rehydrate_from_block_log().unwrap();
+            assert!(router.queue().is_empty());
+            assert!(router.dead_letters().is_empty());
+        }
+
+        #[test]
+        fn restore_dead_letters_survives_a_restart() {
+            // The failure path `drain_dead_letter`'s doc trade-off leans on:
+            // when the caller's write fails and hands the item back via
+            // `restore_dead_letters`, it must be durable again — a restart
+            // right after must not lose it just because it was drained once.
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+            let queue_ctx = ContextId::new();
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            let creator = PrincipalId::system();
+
+            {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+                blocks
+                    .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+
+                let mut router = DriftRouter::new();
+                router.attach_persistence(blocks.clone(), queue_ctx);
+                router.register(src, Some("src"), None, creator).unwrap();
+                router.register(tgt, Some("tgt"), None, creator).unwrap();
+                router
+                    .stage(src, tgt, "write failed, restored".into(), None, DriftKind::Push, PrincipalId::new())
+                    .unwrap();
+                for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                    let drained = router.drain(None);
+                    router.requeue(drained);
+                }
+                let drained_dead = router.drain_dead_letter();
+                // Simulate the flush engine's write into lost+found failing.
+                router.restore_dead_letters(drained_dead);
+                assert_eq!(router.dead_letters().len(), 1);
+
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+            }
+
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+            let blocks2 = shared_block_store_with_db(db2, ws2, creator);
+            blocks2.load_from_db().expect("load_from_db");
+
+            let mut router2 = DriftRouter::new();
+            router2.attach_persistence(blocks2, queue_ctx);
+            router2.register(src, Some("src"), None, creator).unwrap();
+            router2.register(tgt, Some("tgt"), None, creator).unwrap();
+            router2.rehydrate_from_block_log().unwrap();
+
+            let dl = router2.dead_letters();
+            assert_eq!(dl.len(), 1, "a restored-after-failed-write dead letter must survive a restart");
+            assert_eq!(dl[0].content, "write failed, restored");
+        }
+
+        #[test]
+        fn replay_dead_letter_survives_a_restart_as_staging() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+            let queue_ctx = ContextId::new();
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            let creator = PrincipalId::system();
+
+            let replayed_id = {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+                blocks
+                    .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+
+                let mut router = DriftRouter::new();
+                router.attach_persistence(blocks.clone(), queue_ctx);
+                router.register(src, Some("src"), None, creator).unwrap();
+                router.register(tgt, Some("tgt"), None, creator).unwrap();
+                let id = router
+                    .stage(src, tgt, "replay me".into(), None, DriftKind::Push, PrincipalId::new())
+                    .unwrap();
+                for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                    let drained = router.drain(None);
+                    router.requeue(drained);
+                }
+                let replayed = router.replay_dead_letter(id).expect("replay");
+                assert_eq!(replayed.retry_count, 0);
+
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+                id
+            };
+
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+            let blocks2 = shared_block_store_with_db(db2, ws2, creator);
+            blocks2.load_from_db().expect("load_from_db");
+
+            let mut router2 = DriftRouter::new();
+            router2.attach_persistence(blocks2, queue_ctx);
+            router2.register(src, Some("src"), None, creator).unwrap();
+            router2.register(tgt, Some("tgt"), None, creator).unwrap();
+            router2.rehydrate_from_block_log().unwrap();
+
+            assert!(router2.dead_letters().is_empty());
+            assert_eq!(router2.queue().len(), 1, "a replayed item must survive as staging, not dead-letter");
+            assert_eq!(router2.queue()[0].id, replayed_id);
+            assert_eq!(router2.queue()[0].retry_count, 0);
+        }
+
+        #[test]
+        fn unregister_sweep_persists_the_dead_letter_before_a_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+            let queue_ctx = ContextId::new();
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            let creator = PrincipalId::system();
+
+            {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+                blocks
+                    .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+
+                let mut router = DriftRouter::new();
+                router.attach_persistence(blocks.clone(), queue_ctx);
+                router.register(src, Some("src"), None, creator).unwrap();
+                router.register(tgt, Some("tgt"), None, creator).unwrap();
+                router
+                    .stage(src, tgt, "orphaned by unregister".into(), None, DriftKind::Push, PrincipalId::new())
+                    .unwrap();
+                router.unregister(tgt);
+                assert_eq!(router.dead_letters().len(), 1);
+
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+            }
+
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+            let blocks2 = shared_block_store_with_db(db2, ws2, creator);
+            blocks2.load_from_db().expect("load_from_db");
+
+            let mut router2 = DriftRouter::new();
+            router2.attach_persistence(blocks2, queue_ctx);
+            router2.register(src, Some("src"), None, creator).unwrap();
+            router2.rehydrate_from_block_log().unwrap();
+
+            let dl = router2.dead_letters();
+            assert_eq!(dl.len(), 1, "unregister's dead-letter sweep must survive a restart");
+            assert_eq!(dl[0].content, "orphaned by unregister");
+        }
+
+        #[test]
+        fn without_attach_persistence_behavior_is_unchanged() {
+            // Non-vacuity guard for the whole module: every test above
+            // depends on `attach_persistence` actually doing something. This
+            // proves the DEFAULT (nothing attached) path — every existing
+            // caller of `DriftRouter` today — is untouched by any of it.
+            let mut router = DriftRouter::new();
+            assert!(!router.has_persistence());
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+            router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+            let id = router
+                .stage(src, tgt, "no persistence attached".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            router.complete(id);
+            // rehydrate on an unattached router is a documented no-op, not
+            // an error.
+            router.rehydrate_from_block_log().unwrap();
+            assert!(router.queue().is_empty());
+        }
+
+        #[test]
+        fn ensure_drift_queue_context_mints_once_and_is_recoverable_after_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+
+            let minted_id = {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db
+                    .lock()
+                    .get_or_create_default_workspace(PrincipalId::system())
+                    .unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, PrincipalId::system());
+                let router = shared_drift_router();
+
+                let id1 = ensure_drift_queue_context(&router, &blocks, &db).unwrap();
+                // Idempotent within the same process: second call hits the
+                // router cache and returns the same id without minting again.
+                let id2 = ensure_drift_queue_context(&router, &blocks, &db).unwrap();
+                assert_eq!(id1, id2);
+                assert!(router.read().get(id1).is_some(), "must be a real registered handle");
+
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+                id1
+            };
+
+            // "Restart": a fresh router has no cache, but the well-known
+            // registry row survived — `ensure_drift_queue_context` must
+            // adopt it rather than minting a second one.
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2
+                .lock()
+                .get_or_create_default_workspace(PrincipalId::system())
+                .unwrap();
+            let blocks2 = shared_block_store_with_db(db2.clone(), ws2, PrincipalId::system());
+            blocks2.load_from_db().expect("load_from_db");
+            let router2 = shared_drift_router();
+
+            let recovered = ensure_drift_queue_context(&router2, &blocks2, &db2).unwrap();
+            assert_eq!(
+                recovered, minted_id,
+                "a restart must recover the same drift-queue context, never mint a duplicate"
+            );
+        }
     }
 }

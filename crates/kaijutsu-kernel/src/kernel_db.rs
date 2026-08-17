@@ -205,20 +205,23 @@ pub enum PromoteOutcome {
 /// A kernel role that exactly one context fills at a time. Identity for these
 /// contexts is this role, NOT their label — which is what makes rotation an
 /// UPDATE instead of a rename. See `well_known_contexts` in `SCHEMA` and
-/// `docs/drifting-dead-letters.md` (slice 1).
-///
-/// Only `LostFound` exists so far. The drift-queue role is slice 3's job —
-/// speculative variants are not wanted ahead of that need.
+/// `docs/drifting-dead-letters.md` (slices 1 and 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WellKnownRole {
     /// The lost+found dead-letter sink.
     LostFound,
+    /// The durable drift queue (slice 3): staged and dead-lettered
+    /// `StagedDrift` items are persisted as blocks here so a kernel restart
+    /// cannot discard them. See `DriftRouter::attach_persistence` in
+    /// `drift.rs`.
+    DriftQueue,
 }
 
 impl WellKnownRole {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::LostFound => "lost_found",
+            Self::DriftQueue => "drift_queue",
         }
     }
 }
