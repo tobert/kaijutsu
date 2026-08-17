@@ -672,7 +672,7 @@ fn handle_prompt(
             }
         }
         let text = prompt_text(&req.prompt);
-        match run_turn(&bridge.kernel, &session, &text).await {
+        match run_turn(&bridge.kernel, &session, &req.session_id, &prompt_cx, &text).await {
             Ok(TurnOutcome::Stopped(stop)) => responder.respond(PromptResponse::new(stop)),
             // A broken turn is an error, not a turn that ended quietly. ACP's
             // StopReason has no "failed", and reporting `end_turn` for a

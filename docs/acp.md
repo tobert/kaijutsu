@@ -48,7 +48,8 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the context mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `session/update` commands | curated, loadout-aware kj catalog; exact single-text `/name input` prompts execute addressed kj | built |
-| `session/update` usage / mode / config | context usage, casts/presets/config | planned |
+| `session/update` `UsageUpdate` | context-window occupancy (`used`/`size`) at each turn boundary | built — see "Context window usage" below |
+| `session/update` mode / config | casts/presets/config | planned |
 | `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
 
 ## Direction: ordinary ACP clients should just work
@@ -148,9 +149,10 @@ Keep the three ACP affordances distinct:
 - **available commands** are one-shot kj actions.
 
 Do not advertise modes or configuration until their set methods and update
-notifications are truthful. `usage_update` should project context-window and
-cost information already known by the kernel; Toad and Happy both have useful
-UI for these updates.
+notifications are truthful. The usage gauge (`UsageUpdate`, hunk 4, "Context
+window usage" below) is built and projects context-window occupancy; modes
+and configuration options remain unimplemented. Toad and Happy both have
+useful UI for these updates.
 
 ### Client identity and parity
 
@@ -230,9 +232,19 @@ a Toad flight before the next one needs to start.
    just cast), and the seed data itself — nobody has written a
    `/etc/client/<id>/cast.toml` for toad/Zed/Happy yet, that's an operator
    action.
-4. **Commands and usage — commands shipped, usage remains.** The curated
-   kj-backed catalog and slash invocation path are built. Next project the
-   kernel's context-window usage without fabricating cumulative cost.
+4. **Commands and usage — shipped.** The curated kj-backed catalog and slash
+   invocation path are built. The usage gauge is also built, but complete
+   only as far as honesty permits: `UsageUpdate.used`/`.size` project the
+   kernel's real context-window occupancy at each turn boundary, and are
+   silent — never a fabricated number — when the model's context window is
+   unconfigured. `UsageUpdate.cost` is deliberately left unset in every
+   emission: ACP v1 has no stable shape for *cumulative* token/dollar cost
+   (the one that exists, `PromptResponse.usage`, sits behind the
+   `unstable_end_turn_token_usage` Cargo feature, off in this build per the
+   "Version stance" below), and the kernel keeps no running counter to fill
+   it with even if it were on — `ContextUsageRow` is a last-completed-call
+   snapshot, not a cumulative total. See "Context window usage" below for
+   the full writeup.
 5. **Client-declared MCP servers.** Call the already-built external MCP
    substrate for `mcpServers` on new/load/resume; define lifecycle, reconnect,
    duplicate-name, and teardown semantics before advertising transports.
@@ -564,6 +576,101 @@ block-ordered reads already avoid).
 `doc.apply_event(&event)`, leaving deleted blocks in the live mirror until a
 resync. The arm now applies the deletion before rebuilding a Task plan; Task
 and non-Task cases are both pinned by tests.
+
+## Context window usage
+
+`SessionUpdate::UsageUpdate` (ACP v1, `agent-client-protocol-schema` 1.5.0 —
+pinned via `agent-client-protocol = "2.0.0"` in `Cargo.lock`) wired to the
+kernel's per-context usage gauge, 2026-08-17.
+`crates/kaijutsu-acp/src/update.rs`'s `UpdateMapper::build_usage`/
+`baseline_usage`, `crates/kaijutsu-acp/src/session.rs`'s
+`fetch_usage_info`/`emit_usage_update`/`catch_up`.
+
+**The one constraint that shaped everything here: never fabricate a number.**
+The kernel already went to real trouble to keep `context_used_pct` honest —
+`kernel_db.rs`'s `context_used_pct` resolves the denominator to `None` rather
+than a guessed default when a model's context window is unconfigured, and
+treats `Some(0)` the same as unknown (it would divide into `NaN`/`+Inf`,
+neither of which the wire's `-1.0` sentinel convention catches). This hunk's
+whole job was to project that gauge into ACP without undoing that care.
+
+**What ACP v1's usage shape actually is, read from the real crate (not the
+spec prose):** `SessionUpdate` has a stable variant,
+`UsageUpdate { used: u64, size: u64, cost: Option<Cost> }`
+(`agent-client-protocol-schema-1.5.0/src/v1/client.rs:302`) — no `#[cfg]`
+gate, unlike `PlanUpdate`/`PlanRemoved`. `used`/`size` are **occupancy**:
+tokens currently in context, and the window size — exactly what the kernel's
+`context_used_pct` denominator/numerator already are, just not
+pre-divided into a percentage. Separately, `PromptResponse` (the
+`session/prompt` *response*, not a `session/update`) carries an
+optional `usage: Option<Usage>` whose fields are explicitly **cumulative**
+("Sum of all token types across session", "Total input tokens across all
+turns" — `agent.rs:3275,3368-3373`) — but that field is gated behind the
+`unstable_end_turn_token_usage` Cargo feature, off in this crate per the
+"Version stance" section (stable v1 only). So ACP draws the same line this
+codebase already draws: occupancy is one honest, stable-v1 concept;
+cumulative cost is a different, unstable-and-unbuilt one.
+
+**Neither `used`/`size` is `Option`, so "unknown" has no wire
+representation inside `UsageUpdate` itself — the only honest move is to send
+no notification at all.** `UpdateMapper::build_usage` returns `None` (not a
+value) when `ContextInfo::context_window` is `None` or `Some(0)`, and the
+caller sends nothing in that case. This is the same shape decision the kernel
+made for `contextUsedPct`'s `-1.0` sentinel, ported to a wire type that
+doesn't offer a sentinel slot to reuse: absence of a notification takes the
+place absence-as-a-value fills elsewhere.
+
+**Cumulative cost genuinely is not implemented, and that is the correct
+outcome, not a shortfall.** `UsageUpdate.cost: Option<Cost>` (a dollar amount
++ currency code) is left unset in every emission. The kernel's
+`ContextUsageRow` is a last-completed-call *snapshot* — "last-write-wins…
+rather than a running total" per its own doc comment — so there is no
+cumulative dollar figure anywhere to report even informally. Setting `cost`
+to anything would be exactly the fabrication this hunk exists to refuse; the
+field staying `None` is the honest answer to "does this bridge track spend,"
+which is no.
+
+**Emission cadence: turn boundaries, not every delta.** A usage figure only
+changes when a completed LLM call lands — projecting it on every text/thought
+chunk would be a firehose of duplicate values `build_usage`'s own dedup
+would just be swallowing anyway. Three call sites, all sharing
+`fetch_usage_info` (a best-effort, addressed `resolveContextLabel` lookup —
+narrow, not `list_contexts()`, since the gauge only ever needs one context's
+row):
+
+- **Turn boundary** (`session::emit_usage_update`, called from both
+  `Stopped`-returning arms of `run_turn`, right after `settle_delivery`) —
+  the live per-turn signal.
+- **`session/load` replay** — one `build_usage` call after the transcript
+  replay loop, mirroring `build_plan`'s "one plan, once, at the end" posture:
+  a client reopening history should learn the current occupancy once, not a
+  value per historical turn.
+- **`session/new`/`session/resume` bootstrap** — `baseline_usage` seeds
+  `UpdateMapper`'s dedup state silently, mirroring `baseline_plan`: a client
+  that just attached should not be narrated a figure out of nowhere: it sees
+  the next real one at the first turn boundary. `session/resume` and
+  `session/new` share this path (`run_pump`'s `replay_history == false` arm),
+  same as they already share it for the plan.
+- **Resync catch-up** (`FeedEvent::Resubscribed`/`Terminated`) — refreshed
+  unconditionally alongside the plan rebuild, since a dropped-and-resumed
+  feed is exactly the kind of gap that could hide a turn's worth of usage
+  change; `build_usage`'s dedup keeps it silent when nothing moved.
+
+**Test that pins the constraint:**
+`update::tests::build_usage_emits_nothing_when_the_context_window_is_unknown`
+— an unknown window must never be papered over with a fabricated denominator
+or percentage. Sibling tests pin the rest of the honesty surface:
+`build_usage_treats_a_zero_window_as_unknown` (mirrors the kernel's own
+zero-window guard), `build_usage_reports_a_real_zero_when_the_window_is_
+known_but_nothing_ran_yet` (a known window with no completed call is a real
+zero, not the same "unknown" as a missing window — it must NOT be swallowed
+into silence), and `build_usage_never_fabricates_a_cost`.
+
+**Kernel-side: nothing needed.** `ContextInfo::context_window`/
+`context_used_tokens` (`kaijutsu-client/src/rpc.rs:413-420`, sourced from
+`ContextHandleInfo.contextWindow`/`.contextUsedTokens` on `listContexts`/
+`resolveContextLabel`) already carry exactly what this hunk needed; no
+kernel or wire change was made or required.
 
 ## Manual smoke test (live kernel)
 

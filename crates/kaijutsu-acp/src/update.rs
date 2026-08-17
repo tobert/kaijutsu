@@ -36,9 +36,9 @@ use std::hash::{Hash, Hasher};
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionId,
     SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind as AcpToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind as AcpToolKind, UsageUpdate,
 };
-use kaijutsu_client::TurnCompletedStopReason;
+use kaijutsu_client::{ContextInfo, TurnCompletedStopReason};
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshot, Role, Status, TaskStatus, ToolKind as KjToolKind,
 };
@@ -176,6 +176,11 @@ pub struct UpdateMapper {
     /// "identical re-observation is silent" contract `observe()` gives every
     /// other block kind.
     last_plan: Option<Vec<PlanEntry>>,
+    /// `(used, size)` last actually emitted (or silently baselined by
+    /// [`Self::baseline_usage`]) — the usage gauge's half of the same
+    /// "identical re-observation is silent" contract `last_plan` gives the
+    /// plan. See [`Self::build_usage`].
+    last_usage: Option<(u64, u64)>,
 }
 
 /// A block's streaming high-water mark: how many chars of its content have
@@ -224,6 +229,7 @@ impl UpdateMapper {
             armed: false,
             task_marks: HashMap::new(),
             last_plan: None,
+            last_usage: None,
         }
     }
 
@@ -336,6 +342,60 @@ impl UpdateMapper {
     /// should not be narrated at a client that just opened the session.
     pub fn baseline_plan(&mut self, blocks: &[BlockSnapshot]) {
         self.last_plan = Some(task_plan_entries(blocks));
+    }
+
+    /// Rebuild the context-window usage gauge from the kernel's current
+    /// [`ContextInfo`], or `None` when nothing should be sent: either the
+    /// window is unknown, or the figure is byte-for-byte what was last
+    /// emitted (the same "identical re-observation is silent" contract
+    /// [`Self::build_plan`] gives the plan).
+    ///
+    /// **The constraint this method exists to honor** (docs/acp.md hunk 4,
+    /// `CLAUDE.md` "never fabricate a zero"): `size` comes straight from
+    /// `ContextInfo::context_window`, which the kernel already resolves to
+    /// `None` — never a guessed denominator — when the model's context
+    /// window is unconfigured
+    /// (`kaijutsu_kernel::kernel_db::context_used_pct`'s doc comment is the
+    /// canonical statement of this). A `Some(0)` window is treated the same
+    /// as unknown, mirroring that helper's own guard against a zero
+    /// denominator (it would divide into `NaN`/`+Inf`, not "unknown"). When
+    /// the window is unknown, this returns `None` and the caller sends
+    /// nothing — ACP has no wire shape for "unknown usage", so silence is
+    /// the honest choice, not a sentinel value dressed up as one.
+    ///
+    /// `used` is the LAST completed call's fill (`ContextUsageRow` is a
+    /// snapshot, never a running total — see its doc comment), not
+    /// cumulative session usage. ACP v1's *only* cumulative-cost shape,
+    /// `PromptResponse.usage: Option<Usage>` with its
+    /// `total_tokens`/`input_tokens`/`output_tokens` fields described as
+    /// sums "across session", sits behind the `unstable_end_turn_token_usage`
+    /// Cargo feature (off in this build, and off deliberately — docs/acp.md
+    /// "Version stance": only stable v1). We do not track a cumulative
+    /// counter kernel-side, so there is nothing honest to fill it with even
+    /// if the feature were on. `UsageUpdate.cost` is left unset for the
+    /// identical reason: no cumulative dollar figure exists to report, and
+    /// inventing one would be exactly the fabrication this hunk refuses.
+    pub fn build_usage(&mut self, info: &ContextInfo) -> Option<SessionUpdate> {
+        let window = info.context_window.filter(|&w| w > 0)?;
+        let used = info.context_used_tokens.unwrap_or(0);
+        if self.last_usage == Some((used, window)) {
+            return None;
+        }
+        self.last_usage = Some((used, window));
+        Some(SessionUpdate::UsageUpdate(UsageUpdate::new(used, window)))
+    }
+
+    /// Establish the usage baseline without emitting — `session/new` and
+    /// `session/resume` bootstrap, mirroring [`Self::baseline_plan`]: a
+    /// client that just opened or resumed a session should not be narrated
+    /// a usage figure out of nowhere mid-attachment; it sees one at the next
+    /// turn boundary, from [`Self::build_usage`]. A `None`/zero window
+    /// leaves `last_usage` untouched (there is nothing honest to baseline).
+    pub fn baseline_usage(&mut self, info: &ContextInfo) {
+        if let Some(window) = info.context_window.filter(|&w| w > 0) {
+            let used = info.context_used_tokens.unwrap_or(0);
+            self.last_usage = Some((used, window));
+        }
     }
 
     /// Translate the current state of `block` into the updates not yet sent.
@@ -766,7 +826,7 @@ fn tool_title(block: &BlockSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_types::{ContextId, PrincipalId};
+    use kaijutsu_types::{ContextId, PrincipalId, Status};
 
     fn block(kind: BlockKind, role: Role, content: &str, seq: u64) -> BlockSnapshot {
         kaijutsu_types::BlockSnapshotBuilder::new(
@@ -866,6 +926,158 @@ mod tests {
             "removing a non-Task block leaves the plan identical, so the pump \
              must send nothing"
         );
+    }
+
+    /// A `ContextInfo` carrying only the two usage fields `build_usage`/
+    /// `baseline_usage` read; every other field is a harmless default —
+    /// same fixture shape as `bridge.rs`/`rank.rs`'s test-only `ContextInfo`
+    /// builders.
+    fn context_info_with_usage(window: Option<u64>, used_tokens: Option<u64>) -> ContextInfo {
+        ContextInfo {
+            id: ContextId::new(),
+            label: String::new(),
+            forked_from: None,
+            provider: String::new(),
+            model: String::new(),
+            created_at: 0,
+            trace_id: [0; 16],
+            fork_kind: None,
+            context_type: "coder".into(),
+            archived: false,
+            concluded_at: None,
+            keywords: Vec::new(),
+            top_block_preview: None,
+            live_status: Status::Pending,
+            last_activity_at: None,
+            track_id: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            context_window: window,
+            context_used_tokens: used_tokens,
+            context_used_pct: None,
+            background_running_count: 0,
+            background_oldest_running_started_at: None,
+            background_last_finished_at: None,
+            background_last_finished_status: None,
+            background_last_exit_code: None,
+            cast_label: None,
+            origin_host: None,
+        }
+    }
+
+    fn usage_update(update: &SessionUpdate) -> &UsageUpdate {
+        match update {
+            SessionUpdate::UsageUpdate(u) => u,
+            other => panic!("not a usage update: {other:?}"),
+        }
+    }
+
+    /// The test this hunk most needs: an unknown context window must never
+    /// be papered over with a fabricated denominator or percentage. ACP has
+    /// no wire shape for "unknown usage" (`UsageUpdate.size` is a required
+    /// `u64`, not `Option<u64>`), so the only honest behavior is to send
+    /// nothing at all — never a guessed `size`, never a `0` standing in for
+    /// "I don't know" (CLAUDE.md "never fabricate a zero").
+    #[test]
+    fn build_usage_emits_nothing_when_the_context_window_is_unknown() {
+        let mut m = mapper();
+        let info = context_info_with_usage(None, Some(12_345));
+        assert!(
+            m.build_usage(&info).is_none(),
+            "an unknown window must never be papered over with a fabricated \
+             denominator"
+        );
+    }
+
+    /// A `Some(0)` window is a config error, not a measurement — dividing by
+    /// it would yield `NaN`/`+Inf`, and the kernel's own
+    /// `context_used_pct` treats it as unknown for exactly that reason. This
+    /// mapper must agree, not silently ship a `size: 0` that a client would
+    /// render as a confident (and wrong) 0-token window.
+    #[test]
+    fn build_usage_treats_a_zero_window_as_unknown() {
+        let mut m = mapper();
+        let info = context_info_with_usage(Some(0), Some(10));
+        assert!(m.build_usage(&info).is_none());
+    }
+
+    /// A known window with no completed call yet is a genuine, honest zero —
+    /// not the same "unknown" as a missing window. `used` must come through
+    /// as `0`, not be swallowed into silence.
+    #[test]
+    fn build_usage_reports_a_real_zero_when_the_window_is_known_but_nothing_ran_yet() {
+        let mut m = mapper();
+        let info = context_info_with_usage(Some(8_192), None);
+        let update = m.build_usage(&info).expect("a known window must always emit");
+        let u = usage_update(&update);
+        assert_eq!(u.used, 0);
+        assert_eq!(u.size, 8_192);
+    }
+
+    /// ACP's `UsageUpdate.cost` is a cumulative dollar figure we do not
+    /// track (the kernel keeps a last-call snapshot, never a running spend
+    /// counter). Leaving it unset is the honest choice — setting it to
+    /// anything would be inventing a number, which is the one thing this
+    /// hunk exists to refuse.
+    #[test]
+    fn build_usage_never_fabricates_a_cost() {
+        let mut m = mapper();
+        let info = context_info_with_usage(Some(4_096), Some(200));
+        let update = m.build_usage(&info).unwrap();
+        assert_eq!(usage_update(&update).cost, None);
+    }
+
+    /// Same dedup contract `build_plan` gives the plan: an identical repeat
+    /// must not re-fire, so the live pump can call `build_usage` on every
+    /// turn boundary without a firehose of no-op updates.
+    #[test]
+    fn build_usage_stays_quiet_on_an_identical_repeat() {
+        let mut m = mapper();
+        let info = context_info_with_usage(Some(4_096), Some(200));
+        assert!(m.build_usage(&info).is_some(), "first observation must emit");
+        assert!(
+            m.build_usage(&info).is_none(),
+            "an unchanged usage figure must not be re-sent"
+        );
+
+        let grown = context_info_with_usage(Some(4_096), Some(512));
+        assert!(
+            m.build_usage(&grown).is_some(),
+            "a moved figure must emit again"
+        );
+    }
+
+    /// `baseline_usage` seeds state silently (`session/new`/`session/resume`
+    /// bootstrap) — a client that just attached should not be narrated a
+    /// usage figure out of nowhere. A subsequent `build_usage` call for the
+    /// SAME figure must stay quiet, exactly like `baseline_plan`.
+    #[test]
+    fn baseline_usage_seeds_state_without_emitting() {
+        let mut m = mapper();
+        let info = context_info_with_usage(Some(2_048), Some(100));
+        m.baseline_usage(&info);
+        assert!(
+            m.build_usage(&info).is_none(),
+            "baseline already covered this exact figure; build_usage must stay silent"
+        );
+
+        let moved = context_info_with_usage(Some(2_048), Some(150));
+        assert!(
+            m.build_usage(&moved).is_some(),
+            "usage that moves past the baseline must still emit"
+        );
+    }
+
+    /// An unknown window at bootstrap must leave the baseline untouched —
+    /// there is nothing honest to seed, and `build_usage` must still refuse
+    /// to emit for the same info afterward.
+    #[test]
+    fn baseline_usage_is_a_no_op_when_the_window_is_unknown() {
+        let mut m = mapper();
+        let info = context_info_with_usage(None, Some(10));
+        m.baseline_usage(&info);
+        assert!(m.build_usage(&info).is_none());
     }
 
     fn chunk_text(u: &SessionUpdate) -> String {

@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate, StopReason};
 use agent_client_protocol::{Client, ConnectionTo};
-use kaijutsu_client::{ContextChange, ContextDelivery, ContextMirror, FeedEvent, ServerEvent, TurnOrigin};
+use kaijutsu_client::{
+    ContextChange, ContextDelivery, ContextInfo, ContextMirror, FeedEvent, ServerEvent, TurnOrigin,
+};
 use kaijutsu_client::rpc::KjCommandInfo;
 use kaijutsu_types::{BlockId, ContextId};
 use parking_lot::Mutex;
@@ -140,6 +142,11 @@ pub async fn run_pump(
     // can render history. `session/new` does not — a brand-new context has
     // nothing to say, and an rc-seeded one should not narrate its own
     // bootstrap.
+    // Fetched before the mapper lock, not inside it — an RPC round trip has
+    // no business happening under a `parking_lot::Mutex`. Best-effort: `None`
+    // on any failure, and the block below already treats "no usage info"
+    // as "nothing to baseline/emit this time" (see `fetch_usage_info`).
+    let usage_info = fetch_usage_info(&bridge, &session).await;
     {
         let mut mapper = session.mapper.lock();
         let blocks = mirror.blocks();
@@ -160,6 +167,14 @@ pub async fn run_pump(
             if let Some(update) = mapper.build_plan(blocks) {
                 let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
             }
+            // Same posture for the usage gauge: one emission at the end of
+            // replay, not a value per historical turn — `build_usage` stays
+            // silent on its own if the window is unknown or unchanged.
+            if let Some(info) = &usage_info
+                && let Some(update) = mapper.build_usage(info)
+            {
+                let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+            }
         } else {
             for block in blocks {
                 mapper.mark_seen(block);
@@ -168,6 +183,13 @@ pub async fn run_pump(
             // narrated at a client that just opened `session/new`, same
             // reasoning as `mark_seen` for every other kind.
             mapper.baseline_plan(blocks);
+            // Same silent baseline for usage: `session/new` and
+            // `session/resume` both land here, and neither should narrate a
+            // usage figure the client never asked to see mid-attachment. The
+            // first real emission comes at the next turn boundary.
+            if let Some(info) = &usage_info {
+                mapper.baseline_usage(info);
+            }
         }
     }
 
@@ -202,7 +224,7 @@ pub async fn run_pump(
                     match bridge.rehydrate_context(context_id).await {
                         Ok(fresh) => {
                             mirror = fresh;
-                            catch_up(&session, &session_id, &cx, &mirror, "reconnected");
+                            catch_up(&bridge, &session, &session_id, &cx, &mirror, "reconnected").await;
                         }
                         Err(e) => tracing::error!(
                             session = %session_id,
@@ -225,7 +247,7 @@ pub async fn run_pump(
                         Ok((fresh, new_rx)) => {
                             mirror = fresh;
                             feed_rx = new_rx;
-                            catch_up(&session, &session_id, &cx, &mirror, "feed terminated");
+                            catch_up(&bridge, &session, &session_id, &cx, &mirror, "feed terminated").await;
                         }
                         Err(e) => tracing::error!(
                             session = %session_id,
@@ -329,6 +351,62 @@ fn deliver_updates(
     updates
 }
 
+/// Best-effort fetch of the context's current usage/window info, for the
+/// `session/update` usage gauge (`UpdateMapper::build_usage`/
+/// `baseline_usage`, docs/acp.md hunk 4).
+///
+/// `resolve_context_label` — the same narrow, addressed lookup
+/// `KernelBridge::open_or_create` already uses to attach by label — is
+/// reused here rather than `list_contexts()`: the usage gauge only ever
+/// needs ONE context's row, and this session already knows its label. A
+/// failure degrades to "no usage update this time", never to failing the
+/// pump or the turn — the usage gauge is an ergonomic extra, not load-bearing
+/// for the conversation itself.
+async fn fetch_usage_info(bridge: &KernelBridge, session: &Session) -> Option<ContextInfo> {
+    match bridge.actor().resolve_context_label(&session.label).await {
+        Ok(Some(info)) => Some(info),
+        Ok(None) => {
+            tracing::warn!(
+                context = %session.context_id.short(),
+                label = %session.label,
+                "context vanished while fetching usage info; skipping this usage update"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                context = %session.context_id.short(),
+                error = %e,
+                "usage info fetch failed; skipping this usage update"
+            );
+            None
+        }
+    }
+}
+
+/// Send the `session/update` usage gauge once, at a turn boundary —
+/// [`run_turn`]'s two `Stopped`-returning arms both call this right after
+/// [`settle_delivery`]. Turn boundaries are the natural cadence: unlike text
+/// or tool-call deltas, a usage figure only changes when a completed LLM
+/// call lands, and emitting on every intermediate event would be a firehose
+/// of duplicate values `build_usage`'s dedup would just be swallowing
+/// anyway. Best-effort — a fetch failure or an unknown window means no
+/// notification, never a fabricated one (see [`fetch_usage_info`] and
+/// `UpdateMapper::build_usage`).
+async fn emit_usage_update(
+    bridge: &KernelBridge,
+    session: &Arc<Session>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+) {
+    let Some(info) = fetch_usage_info(bridge, session).await else {
+        return;
+    };
+    if let Some(update) = session.mapper.lock().build_usage(&info) {
+        let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+    }
+}
+
 /// Catch the client up after a fresh mirror replaces a stale one
 /// (`FeedEvent::Resubscribed` or `Terminated`).
 ///
@@ -336,8 +414,12 @@ fn deliver_updates(
 /// live), and every block in the fresh mirror is re-observed — `observe()`
 /// emits exactly each block's unseen tail plus any tool-call create/patch not
 /// yet announced, so the client receives whatever the gap held and nothing
-/// twice.
-fn catch_up(
+/// twice. Same treatment for the usage gauge: a resync is exactly the kind
+/// of gap that could hide a turn's worth of usage change, so it refreshes
+/// unconditionally alongside the plan rebuild — `build_usage`'s own dedup
+/// keeps it silent when nothing moved.
+async fn catch_up(
+    bridge: &KernelBridge,
     session: &Arc<Session>,
     session_id: &SessionId,
     cx: &ConnectionTo<Client>,
@@ -345,6 +427,7 @@ fn catch_up(
     reason: &str,
 ) {
     let blocks = mirror.blocks();
+    let usage_info = fetch_usage_info(bridge, session).await;
     let updates: Vec<_> = {
         let mut mapper = session.mapper.lock();
         let live: HashSet<BlockId> = blocks.iter().map(|b| b.id).collect();
@@ -355,6 +438,11 @@ fn catch_up(
         // task activity stays silent.
         if let Some(plan) = mapper.build_plan(blocks) {
             updates.push(plan);
+        }
+        if let Some(info) = &usage_info
+            && let Some(usage) = mapper.build_usage(info)
+        {
+            updates.push(usage);
         }
         updates
     };
@@ -441,6 +529,8 @@ fn turn_ran_and_settled(blocks: &[kaijutsu_types::BlockSnapshot], prompt: &Block
 pub async fn run_turn(
     bridge: &KernelBridge,
     session: &Arc<Session>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
     text: &str,
 ) -> anyhow::Result<TurnOutcome> {
     let context_id = session.context_id;
@@ -466,6 +556,7 @@ pub async fn run_turn(
                              unrecoverable until the kernel catch-up story)"
                         );
                         settle_delivery(bridge, session, context_id).await;
+                        emit_usage_update(bridge, session, session_id, cx).await;
                         return Ok(TurnOutcome::Stopped(StopReason::EndTurn));
                     }
                     Ok(_) => continue, // not started or still executing; keep waiting
@@ -488,6 +579,7 @@ pub async fn run_turn(
                 ..
             }) if ctx == context_id && origin == TurnOrigin::Interactive => {
                 settle_delivery(bridge, session, context_id).await;
+                emit_usage_update(bridge, session, session_id, cx).await;
                 return Ok(TurnOutcome::Stopped(acp_stop_reason(stop_reason)));
             }
             Ok(ServerEvent::TurnFailed {
