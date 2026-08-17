@@ -476,14 +476,27 @@ collapses into a dependency swap rather than a rewrite.
   `expand_fragment` and `PlannedHeredoc` (`crates/kaish-kernel/src/lib.rs:109-110`),
   with `PlannedHeredoc` threaded through `ast/plan.rs`. `b58e492` (PR #340)
   is confirmed an ancestor of the checkout's HEAD.
-- **The checkout is NOT on `main`** — it sits on `docs/voice-guidance`, which
-  is `main` (`c72dc32`) plus two docs-only commits, and has an untracked
-  `help-plan.md`. Functionally identical for code purposes today, but a
-  `path` dep follows the working tree, so **whoever wires this must decide
-  and state which revision they mean** rather than inheriting whatever branch
-  the checkout happens to be on. Re-check it before building; it is a working
-  checkout, not a pinned mirror, and CLAUDE.md already records that trap
-  biting us once on the Bevy tree.
+- **Do NOT point at `~/src/kaish` itself.** It is a working checkout, not a
+  pinned mirror — when measured it sat on `docs/voice-guidance` (`main`
+  `c72dc32` plus two docs commits, with an untracked `help-plan.md`). A `path`
+  dep follows the working tree, so anything there can move under us. CLAUDE.md
+  already records that trap biting us once on the Bevy tree.
+
+**The target, as of 2026-08-17: `~/src/wt/kaish-integration`.** Amy had the
+kaish lead assemble a dedicated worktree of everything queued for 0.15,
+specifically so kaijutsu can link against it while GitHub is offline and `main`
+cannot be merged to:
+
+- Branch **`integration/kaijutsu-preview`**, measured at **`dd30354`**,
+  workspace version still `0.14.1`.
+- It exists to be linked against, so it will not be rebased out from under us
+  the way a shared branch might — but **re-read the rev before building** and
+  record the one you used, because a `path` dep pins nothing.
+- The kaish lead is fixing the mid-word-`#` comment bug (see `docs/issues.md`,
+  the short-block-id entry) and it is expected to arrive here. If it does, that
+  papercut can be retired early — and linking against this tree means we can
+  verify the fix end-to-end through a real embedder, which is worth something
+  back to the kaish lane.
 
 **What this costs, recorded so it gets undone.** Yesterday's kaish bump
 (`6ebb0a8b`) deliberately removed the last git source from `Cargo.lock`, and
