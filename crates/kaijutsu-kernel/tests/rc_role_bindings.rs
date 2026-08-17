@@ -151,15 +151,28 @@ async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
         "toolie must NOT allow block_create"
     );
 
-    // Facades: toolie holds none (reading the compose buffer is ungated, so
-    // a read-only role needs no facade). The shell facade is refused.
+    // Facades, as of the 2026-08-17 shell/shell_write flag day: toolie holds
+    // `facade:shell` — which is now the SAFE, `ExternalExec::Deny` tool — and
+    // is refused `facade:shell_write`, the mutating one.
+    //
+    // Both assertions inverted with the rename, and that inversion IS the
+    // slice: toolie previously held `facade:shell_readonly` and was refused
+    // `facade:shell`, because `shell` named the mutating tool. Now the
+    // unmarked name is the harmless one, so the role that should only read
+    // gets it — a model reaching for the shortest name lands somewhere safe
+    // instead of somewhere hot. (The old comment here claimed toolie "holds
+    // none", which was never true; it held the readonly facade.)
     assert!(!binding.is_admin(), "toolie must NOT be a binding admin");
     assert!(
+        fx_broker_check(&h, &ctx, "shell").await.is_ok(),
+        "toolie must hold the SAFE shell facade under the unmarked name"
+    );
+    assert!(
         matches!(
-            fx_broker_check(&h, &ctx, "shell").await,
+            fx_broker_check(&h, &ctx, "shell_write").await,
             Err(McpError::FacadeDenied { .. })
         ),
-        "toolie shell facade must be refused"
+        "toolie shell_write facade must be refused"
     );
     assert!(
         matches!(

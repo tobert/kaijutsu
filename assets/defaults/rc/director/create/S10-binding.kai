@@ -31,9 +31,17 @@ kj binding allow "operator"
 # reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
 # the VFS, so it's a dedicated authority, not implied by anything above.
 kj binding allow "exec"
-# Facades: full interaction surface (shell + edit + submit). `shell` is the
-# context-bound shell tool; `edit_input` covers write_input too.
+# Facades: full interaction surface (shell + edit + submit). `facade:shell` is
+# the safe, unmarked shell (ExternalExec::Deny, docs/gate-and-shell-split.md
+# "Slice 3" — this used to be the mutating grant before the 2026-08-17 flag
+# day; kept explicit rather than implied). `facade:shell_write` is the hot,
+# mutating twin (ExternalExec::Allow, what this grant alone used to mean) —
+# JUDGMENT CALL (Amy should confirm): granted here because director is the
+# operator's console and wants the safe tool available by default AND the hot
+# one on hand, not because "director" is inherently a write-shell role.
+# `edit_input` covers write_input too.
 kj binding allow "facade:shell"
+kj binding allow "facade:shell_write"
 kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
 # The app's MIDI ear commits capture batches against its seat (docs/midi.md

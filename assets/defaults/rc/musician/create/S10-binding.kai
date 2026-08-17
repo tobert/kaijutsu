@@ -13,6 +13,8 @@
 # palette stalls the turn). Only `drive` (the tick) is granted.
 kj binding allow "drive"
 # Deliberately NOT granted: any builtin.* tool instance (block/file/resources/
-# kernel_info/tool_search), facade:shell, facade:submit_input, and fork/drift/
-# transport/operator/admin/rc-write. A musician drives itself and emits ABC text;
-# it does not call tools, fork, merge drift, run the transport, or do lifecycle.
+# kernel_info/tool_search), facade:shell (the safe tool) or facade:shell_write
+# (the hot one — docs/gate-and-shell-split.md "Slice 3", 2026-08-17 flag day),
+# facade:submit_input, and fork/drift/transport/operator/admin/rc-write. A
+# musician drives itself and emits ABC text; it does not call tools, fork,
+# merge drift, run the transport, or do lifecycle.

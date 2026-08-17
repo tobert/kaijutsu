@@ -322,10 +322,13 @@ This is a **flag day** on the tool named `shell`: today `builtin.shell`
 | `builtin.shell_readonly` / tool `read_only_shell` — `ExternalExec::Deny` | `builtin.shell` / tool `shell` — same restriction, the name a caller now reaches for by default |
 
 Facade projections move with the tool names: `facade:shell_write` replaces
-what `facade:shell` gated before; `facade:shell` now gates the safe tool
-(today ungated by name, since `read_only_shell` didn't have its own facade
-before — Slice 3 needs to confirm this and give it one if it doesn't,
-otherwise the rename silently widens the safe shell's reach).
+what `facade:shell` gated before; `facade:shell` now gates the safe tool.
+**Confirmed at Slice 3 implementation time (2026-08-17): this paragraph's
+premise was wrong — `read_only_shell` already had its own facade before the
+flag day** (`KNOWN_FACADES`/`FACADE_PROJECTED_INSTANCES`, `mcp/binding.rs`,
+pre-existing `("builtin.shell_readonly", "shell_readonly")` entry). There was
+nothing to give it; the rename only needed to retarget the existing
+`shell`/`shell_readonly` pair onto `shell`/`shell_write`.
 
 **This fails in the right direction.** An old caller (rc script, cached
 tool-name string, a model's habit) that asks for `"shell"` after the flag
@@ -354,6 +357,40 @@ context type, whether it meant read or write.
 
 **`sandbox` stays out of both names**, per doctrine above — `shell` and
 `shell_write` say what the tool does, not what boundary it claims.
+
+**Slice 3 implementation note (2026-08-17).** Shipped: `ShellServer`
+constants/constructors swapped identity (`mcp/servers/shell.rs`),
+`KNOWN_FACADES`/`FACADE_PROJECTED_INSTANCES` retargeted (`mcp/binding.rs`),
+`toolie`'s S10-binding rewritten to `facade:shell`, `musician`'s comment
+updated, `lib`'s wildcard confirmed unaffected. Three findings that change
+the checklist above:
+
+- **`director` got BOTH facades, not a read/write decision.** Read against
+  "director is the operator's console," `director/create/S10-binding.kai` now
+  grants `facade:shell` (safe, default-visible) *and* `facade:shell_write`
+  (hot, on hand) rather than picking one — flagged in the rc script itself as
+  a judgment call for Amy to confirm, not a silent choice.
+- **`builtin.background`'s facade projection was NOT repointed.** It still
+  reads the literal string `"shell"` in `FACADE_PROJECTED_INSTANCES`, which
+  means its meaning silently flipped from "whoever held the old mutating
+  grant" to "whoever holds the new safe grant" — exactly the failure this
+  paragraph's own "silently widens the safe shell's reach" line warns about,
+  just relocated from the (already-false) `shell_readonly`-facade premise
+  above to `builtin.background`. Left open because fixing it requires
+  updating `mcp/servers/background.rs`'s ~20 hardcoded `ShellServer::INSTANCE`
+  / `Capability::Facade("shell")` test call sites, which were outside this
+  slice's assigned territory. Recommended fix: repoint the tuple to
+  `("builtin.background", "shell_write")` and update `background.rs`'s tests
+  in the same change. Until then, `cargo test -p kaijutsu-kernel` has 8 known
+  failures in `mcp::servers::background::tests` (`InstanceNotFound(InstanceId
+  ("builtin.shell"))`) — collateral of the `ShellServer::INSTANCE` identity
+  swap, not a regression in the rename's own logic.
+- **Every rc-owning `S10-binding.kai` is a document in the live kernel, not
+  just a file in this repo.** Editing `assets/defaults/rc/**` reseeds a
+  *fresh* kernel only (`docs/config-ownership.md`); a running kernel's
+  `director`/`toolie` rc scripts keep the pre-rename grant text until an
+  operator runs `kj rc reset /etc/rc/director/create/S10-binding.kai` and `kj
+  rc reset /etc/rc/toolie/create/S10-binding.kai` by hand.
 
 ## The crux: the plan API is all-or-nothing per statement, and that's real
 

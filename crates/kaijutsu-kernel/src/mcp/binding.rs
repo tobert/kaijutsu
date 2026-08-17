@@ -36,12 +36,21 @@ pub type ResolvedName = (InstanceId, String);
 /// benign and gating it traps the `write_input` handler, which reads before it
 /// writes.
 ///
-/// The `shell` facade additionally **projects** the in-kernel `builtin.shell`
-/// broker tool (see [`FACADE_PROJECTED_INSTANCES`]) so the native LLM agent —
-/// whose tool roster is built from broker tools, not facades — gets a shell.
-/// The facade bit gates all three reach paths (human box, external MCP,
-/// in-kernel tool) so shell policy stays single-axis.
-pub const KNOWN_FACADES: &[&str] = &["shell", "shell_readonly", "edit_input", "submit_input"];
+/// **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3", Amy's
+/// 2026-08-16 ruling): `shell` is the unmarked, SAFE facade
+/// (`ExternalExec::Deny`) — the name a caller reaches for by default has to be
+/// the one that cannot hurt anything. `shell_write` is the hot, mutating
+/// facade (`ExternalExec::Allow`, what `facade:shell` gated before this flag
+/// day), granted not default. `shell_readonly` retires as a facade name
+/// entirely — no dual-name transition period.
+///
+/// The `shell`/`shell_write` facades additionally **project** the in-kernel
+/// `builtin.shell`/`builtin.shell_write` broker tools (see
+/// [`FACADE_PROJECTED_INSTANCES`]) so the native LLM agent — whose tool
+/// roster is built from broker tools, not facades — gets a shell. The facade
+/// bit gates all three reach paths (human box, external MCP, in-kernel tool)
+/// so shell policy stays single-axis per flavor.
+pub const KNOWN_FACADES: &[&str] = &["shell", "shell_write", "edit_input", "submit_input"];
 
 /// The `kj` *authority* capabilities — bare-word grants that gate the
 /// escalation-relevant `kj` verbs which never reach the broker `call_tool` path
@@ -70,27 +79,37 @@ pub const KNOWN_AUTHORITIES: &[&str] =
 /// `Instance`/`Tool` grant would mean a context with `facade:shell` but no `*`
 /// (e.g. `director`) silently loses the model's shell. So the
 /// binding treats a projected instance as allowed exactly when its backing
-/// facade is allowed. One bit — `facade:shell` — governs both surfaces.
-/// `shell_readonly` is the read-only twin: it projects `builtin.shell_readonly`
-/// (the `read_only_shell` tool) for roles that must not write or shell out (the
-/// `toolie`). A read-only role grants `facade:shell_readonly` and never
-/// `facade:shell`, so it sees one shell, not both. Broad `facade:*` roles match
-/// both projections and see both tools — a harmless strict subset, accepted to
-/// keep the gate single-axis.
+/// facade is allowed.
+///
+/// **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3"):
+/// `builtin.shell` is now the SAFE tool (`ExternalExec::Deny`), projected by
+/// `facade:shell` — the unmarked name a caller reaches for by default.
+/// `builtin.shell_write` is the HOT, mutating tool (`ExternalExec::Allow`,
+/// what `builtin.shell` was before this flag day), projected by
+/// `facade:shell_write`. `shell_readonly` retires as a facade name entirely.
+/// A role grants one or the other (or both — `director`, the operator's
+/// console, holds both post-flag-day) so it sees one shell or two, never a
+/// stale mismatch. Broad `facade:*` roles match both projections and see both
+/// tools — a harmless strict subset, accepted to keep the gate single-axis.
 ///
 /// `builtin.background` (`list_background_processes` /
 /// `read_background_output` / `kill_background_process`, `mcp/servers/
-/// background.rs`) rides the SAME `facade:shell` bit — it's a sibling of
-/// `shell` (companion tools for the `background: true` jobs `shell` starts),
-/// not a new capability axis, so whoever can shell out can also manage what
-/// they backgrounded, with no separate rc grant to add. Individual
-/// operations still re-check the `exec` authority where it matters (starting
-/// or killing a host process) — see `mcp/servers/shell.rs` and
-/// `mcp/servers/background.rs`.
+/// background.rs`) rides **`"shell_write"`**, repointed with the flag day
+/// rather than left behind it.
+///
+/// It had to move. Leaving it on the string `"shell"` would have silently
+/// shifted its meaning from "whoever can shell out" to "whoever holds the new
+/// SAFE facade" — handing background visibility to safe-only roles like
+/// `toolie` that never had it, which is precisely the "widens the safe
+/// shell's reach" failure this rename exists to avoid. Background execution
+/// spawns host processes; it is the mutating path by construction, so it
+/// belongs with the mutating facade. `kill_background_process` still
+/// re-checks the `exec` authority on top, unchanged — that gate was never
+/// what made this correct.
 pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
     ("builtin.shell", "shell"),
-    ("builtin.shell_readonly", "shell_readonly"),
-    ("builtin.background", "shell"),
+    ("builtin.shell_write", "shell_write"),
+    ("builtin.background", "shell_write"),
 ];
 
 /// A single capability grant or query. The allow-set is the positive surface a
@@ -427,8 +446,11 @@ impl ContextToolBinding {
         }
         // Facade-projected builtins are candidates when their backing facade is
         // granted, so `list_visible_tools` selects the server for facade-only
-        // loadouts (director/musician hold `facade:shell` but no instance grant
-        // and no `*`). Without this they'd never reach the per-tool filter.
+        // loadouts (`director` holds `facade:shell`/`facade:shell_write` but no
+        // instance grant and no `*`; wrong at HEAD before this fix — `musician`
+        // grants NO shell facade at all, see
+        // `assets/defaults/rc/musician/create/S10-binding.kai`). Without this
+        // the projected instance would never reach the per-tool filter.
         for (inst, facade) in FACADE_PROJECTED_INSTANCES {
             let id = InstanceId::new(*inst);
             if self.facade_granted(facade) && !out.contains(&id) {
@@ -507,8 +529,10 @@ mod tests {
     fn facade_shell_projects_the_builtin_shell_tool() {
         // The whole point: granting `facade:shell` (and nothing else — no `*`,
         // no instance grant) must light up the `builtin.shell` broker tool, so
-        // facade-only loadouts (director/musician) get the model's shell. This
-        // is what keeps the RPC seam and the model tool single-axis.
+        // a facade-only loadout (`director`) gets the model's safe shell.
+        // (`musician` grants no shell facade at all — see
+        // `assets/defaults/rc/musician/create/S10-binding.kai`.) This is what
+        // keeps the RPC seam and the model tool single-axis.
         let mut b = ContextToolBinding::new();
         b.grant(Capability::Facade("shell".into()));
         assert!(
@@ -674,15 +698,33 @@ mod tests {
         assert!(b.allows(&Capability::Facade("shell".into())));
         assert!(!b.allows(&Capability::Facade("edit_input".into())));
 
-        // `builtin.shell` AND `builtin.background` join the candidates
-        // because `facade:shell` was granted above — the facade projects
-        // both the in-kernel shell tool and its background-job sibling, so
-        // both are selected by list_visible_tools (FACADE_PROJECTED_INSTANCES).
+        // `facade:shell` projects the SAFE shell and nothing else.
+        //
+        // This assertion changed with the 2026-08-17 shell/shell_write flag
+        // day and the change is the point: `builtin.background` used to ride
+        // the string `"shell"`, so it appeared here. It now rides
+        // `"shell_write"`, because background execution spawns host processes
+        // and is the mutating path by construction. A safe-facade holder
+        // (`toolie`) must NOT gain background visibility it never had — that
+        // is the "widens the safe shell's reach" failure the rename exists to
+        // avoid.
         let mut cands = b.candidate_instances();
         cands.sort();
         assert_eq!(
             cands,
-            vec![inst("block"), inst("builtin.background"), inst("builtin.shell"), inst("file")]
+            vec![inst("block"), inst("builtin.shell"), inst("file")],
+            "facade:shell must project only the safe shell — background is shell_write's"
+        );
+
+        // And the write facade is what carries background.
+        let mut w = ContextToolBinding::new();
+        w.grant(Capability::Facade("shell_write".into()));
+        let mut wcands = w.candidate_instances();
+        wcands.sort();
+        assert_eq!(
+            wcands,
+            vec![inst("builtin.background"), inst("builtin.shell_write")],
+            "facade:shell_write projects the mutating shell and its background-job sibling"
         );
     }
 

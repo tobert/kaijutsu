@@ -259,10 +259,13 @@ mod tests {
 
     /// `kj kaish primer` (composed kaish-help guidance) is wired into every
     /// context_type whose `S10-binding.kai` actually grants a shell facade
-    /// (`facade:shell` or `facade:shell_readonly`) — coder/default/mcp via the
-    /// shared `lib/create/S10-binding.kai`, director explicitly, and toolie
-    /// via `facade:shell_readonly`. `musician` is deliberately excluded: its
-    /// binding grants no shell facade at all (Chameleon's tool-free player —
+    /// (`facade:shell` or `facade:shell_write` — post-2026-08-17-flag-day
+    /// names, `docs/gate-and-shell-split.md` "Slice 3"; `shell_readonly`
+    /// retired) — coder/default/mcp via the shared `lib/create/S10-binding.kai`
+    /// (`facade:*`), director explicitly (`facade:shell` +
+    /// `facade:shell_write`), and toolie via `facade:shell`. `musician` is
+    /// deliberately excluded: its binding grants no shell facade at all
+    /// (Chameleon's tool-free player —
     /// see `docs/chameleon.md`), so seeding it a primer for a tool it can
     /// never call would be dead weight.
     #[test]

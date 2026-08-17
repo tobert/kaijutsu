@@ -409,7 +409,7 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
@@ -421,8 +421,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({
                         "command": format!("yes kaijutsu | head -c {total}"),
                         "background": true,
@@ -525,7 +525,7 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
@@ -534,8 +534,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({"command": "echo hi-bg", "background": true}),
                 },
                 &cc,
@@ -610,7 +610,7 @@ mod tests {
         .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         broker.set_binding(ctx_id, binding).await;
 
@@ -672,7 +672,7 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -680,8 +680,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({"command": "sleep 30", "background": true}),
                 },
                 &cc,
@@ -718,11 +718,11 @@ mod tests {
         d.block_store().create_document(other_ctx, DocKind::Conversation, None).unwrap();
 
         let mut owner_binding = ContextToolBinding::new();
-        owner_binding.grant(Capability::Facade("shell".into()));
+        owner_binding.grant(Capability::Facade("shell_write".into()));
         owner_binding.grant(Capability::Exec);
         broker.set_binding(owner_ctx, owner_binding).await;
         let mut other_binding = ContextToolBinding::new();
-        other_binding.grant(Capability::Facade("shell".into()));
+        other_binding.grant(Capability::Facade("shell_write".into()));
         other_binding.grant(Capability::Exec);
         broker.set_binding(other_ctx, other_binding).await;
 
@@ -732,8 +732,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({"command": "sleep 30", "background": true}),
                 },
                 &owner_cc,
@@ -823,7 +823,7 @@ mod tests {
         let owner_ctx = register_context(&d, Some("killowner"), None, principal);
         d.block_store().create_document(owner_ctx, DocKind::Conversation, None).unwrap();
         let mut owner_binding = ContextToolBinding::new();
-        owner_binding.grant(Capability::Facade("shell".into()));
+        owner_binding.grant(Capability::Facade("shell_write".into()));
         owner_binding.grant(Capability::Exec);
         broker.set_binding(owner_ctx, owner_binding).await;
         let owner_cc = CallContext::new(principal, owner_ctx, SessionId::new(), d.kernel_id());
@@ -831,8 +831,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({"command": "sleep 30", "background": true}),
                 },
                 &owner_cc,
@@ -846,7 +846,7 @@ mod tests {
         // must not kill, even setting aside cross-context isolation — test
         // against the SAME owner context using a binding without exec).
         let mut no_exec = ContextToolBinding::new();
-        no_exec.grant(Capability::Facade("shell".into()));
+        no_exec.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(owner_ctx, no_exec).await;
 
         let err = broker
@@ -860,7 +860,7 @@ mod tests {
 
         // Restore exec and clean up the still-running sleep.
         let mut with_exec = ContextToolBinding::new();
-        with_exec.grant(Capability::Facade("shell".into()));
+        with_exec.grant(Capability::Facade("shell_write".into()));
         with_exec.grant(Capability::Exec);
         broker.set_binding(owner_ctx, with_exec).await;
         broker
@@ -888,7 +888,7 @@ mod tests {
         d.block_store().create_document(ctx_id, DocKind::Conversation, None).unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -896,8 +896,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({
                         "command": "echo before-sleep; sleep 1; echo after-sleep",
                         "background": true,
@@ -997,7 +997,7 @@ mod tests {
         d.block_store().create_document(ctx_id, DocKind::Conversation, None).unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -1006,8 +1006,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({
                         "command": format!("yes x | head -c {}", cap * 3),
                         "background": true,
@@ -1086,7 +1086,7 @@ mod tests {
         d.block_store().create_document(ctx_id, DocKind::Conversation, None).unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -1102,8 +1102,8 @@ mod tests {
         let start = broker
             .call_tool(
                 KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE),
-                    tool: ShellServer::TOOL.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({
                         "command": format!(
                             "(while true; do date +%s%N > {hb_path}; sleep 0.05; done) & sleep 30"

@@ -1,27 +1,44 @@
-//! `ShellServer` — the in-kernel projection of the `shell` facade as a broker
-//! MCP tool (`builtin.shell` / `shell`).
+//! `ShellServer` — the in-kernel projection of the `shell` / `shell_write`
+//! facades as broker MCP tools (`builtin.shell` / `shell` and
+//! `builtin.shell_write` / `shell_write`).
 //!
-//! The `shell` facade was historically reachable only over the RPC seam: the
-//! human shell box and the external MCP `context_shell` (both cross
-//! `Broker::check_facade`). The in-kernel LLM agent's tool roster is built from
-//! broker tools (`list_visible_tools`), which never included facades — so a
-//! native agent in any context "had no shell" no matter what its binding said.
+//! **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3", Amy's
+//! 2026-08-16 ruling): `shell` is now the unmarked, SAFE name
+//! (`ExternalExec::Deny`) — the tool a model reaches for by accident must be
+//! the one that cannot hurt anything. `shell_write` is the hot, mutating name
+//! (`ExternalExec::Allow`, same behavior `builtin.shell`/`shell` had before
+//! the flag day), granted not default. `read_only_shell` retires as a name
+//! entirely — no dual-name transition period. A stale caller that still asks
+//! for `"shell"` after the flag day lands on the SAFE tool now, never the
+//! mutating one — wrong-but-safe, the only acceptable direction for a
+//! breaking rename.
 //!
-//! This server closes that gap. It exposes one `shell` tool that materializes
-//! the SAME per-context kaish (`KjDispatcher::materialize_context_kaish`) the
-//! RPC seam and the rc lifecycle use, so durable env/cwd stay coherent across
-//! every surface — there is one shell, reached three ways.
+//! The `shell`/`shell_write` facades were historically reachable only over the
+//! RPC seam: the human shell box and the external MCP `context_shell` (both
+//! cross `Broker::check_facade`). The in-kernel LLM agent's tool roster is
+//! built from broker tools (`list_visible_tools`), which never included
+//! facades — so a native agent in any context "had no shell" no matter what
+//! its binding said.
 //!
-//! Gating stays single-axis: `builtin.shell` is a *facade-projected* instance
-//! (see [`crate::mcp::binding::FACADE_PROJECTED_INSTANCES`]), so a context sees
-//! and can call `shell` exactly when its binding grants `facade:shell` — the
-//! same bit that gates the RPC seam. There is no second capability to keep in
-//! sync, and no rc-script change: every role that already had `facade:shell`
-//! (default/coder/mcp via `facade:*`, director explicitly) gets the tool;
-//! `toolie` holds `facade:shell_readonly` and so gets the read-only twin;
-//! `musician` holds neither and is excluded by design — its binding grants
-//! only `drive`, because a small local model plays best with an empty tool
-//! palette (see `assets/defaults/rc/musician/create/S10-binding.kai`).
+//! This server closes that gap. It exposes tools that materialize the SAME
+//! per-context kaish (`KjDispatcher::materialize_context_kaish`) the RPC seam
+//! and the rc lifecycle use, so durable env/cwd stay coherent across every
+//! surface — there is one shell (per flavor), reached three ways.
+//!
+//! Gating stays single-axis per flavor: `builtin.shell` and `builtin.
+//! shell_write` are each *facade-projected* instances (see
+//! [`crate::mcp::binding::FACADE_PROJECTED_INSTANCES`]), so a context sees and
+//! can call `shell` exactly when its binding grants `facade:shell`, and
+//! `shell_write` exactly when it grants `facade:shell_write` — the same bits
+//! that gate the RPC seam. There is no second capability to keep in sync.
+//! Default grants stay per-rc, decided per context type at the flag day:
+//! `default`/`coder`/`mcp` via `facade:*`; `director` explicitly holds both
+//! (operator's console — wants the safe tool AND the hot one available);
+//! `toolie` holds `facade:shell` only (never `facade:shell_write`), so it gets
+//! exactly the safe tool; `musician` holds neither and is excluded by design —
+//! its binding grants only `drive`, because a small local model plays best
+//! with an empty tool palette (see
+//! `assets/defaults/rc/musician/create/S10-binding.kai`).
 
 use std::sync::{Arc, LazyLock, Weak};
 
@@ -128,16 +145,18 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// In-kernel broker server backing the `shell` / `read_only_shell` tool. Holds
+/// In-kernel broker server backing the `shell` / `shell_write` tools. Holds
 /// `Weak<Broker>` (the broker owns this instance's `Arc`) and reaches the
 /// shared `KjDispatcher` through the broker, materializing a throwaway context
 /// kaish per call. One struct, two flavours selected at construction: the
-/// writable `shell` (`facade:shell`) and the read-only `read_only_shell`
-/// (`facade:shell_readonly`) the toolie gets. The constraint lives in the
-/// *tool name* so the model never wastes a turn attempting a write it can't do.
+/// hot, mutating `shell_write` (`facade:shell_write`) and the safe, unmarked
+/// `shell` (`facade:shell`) — the name a caller reaches for by default, and
+/// what `read_only_shell`/`facade:shell_readonly` used to be before the
+/// 2026-08-17 flag day. The constraint lives in the *tool name* so the model
+/// never wastes a turn attempting a write it can't do.
 pub struct ShellServer {
     instance_id: InstanceId,
-    /// The model-facing tool name (`shell` or `read_only_shell`).
+    /// The model-facing tool name (`shell`, safe, or `shell_write`, hot).
     tool: &'static str,
     /// When true, materialize a read-only context kaish (no writes, no external
     /// commands; reads — incl. document views — still work).
@@ -147,29 +166,37 @@ pub struct ShellServer {
 }
 
 impl ShellServer {
+    /// The safe, unmarked tool — `ExternalExec::Deny`. This is what
+    /// `builtin.shell_readonly`/`read_only_shell` was before the 2026-08-17
+    /// flag day (`docs/gate-and-shell-split.md`, "Slice 3"): the name a caller
+    /// reaches for by accident must be the one that cannot hurt anything.
     pub const INSTANCE: &'static str = "builtin.shell";
     pub const TOOL: &'static str = "shell";
-    pub const INSTANCE_READ_ONLY: &'static str = "builtin.shell_readonly";
-    pub const TOOL_READ_ONLY: &'static str = "read_only_shell";
+    /// The hot, mutating tool — `ExternalExec::Allow`, granted not default.
+    /// This is what `builtin.shell`/`shell` was before the flag day; a stale
+    /// caller that still asks for the bare name `"shell"` now lands on the
+    /// SAFE tool above instead, never here.
+    pub const INSTANCE_WRITE: &'static str = "builtin.shell_write";
+    pub const TOOL_WRITE: &'static str = "shell_write";
 
-    /// The writable `shell` tool (gated by `facade:shell`).
+    /// The hot `shell_write` tool (gated by `facade:shell_write`).
     pub fn new(broker: Weak<Broker>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
-            instance_id: InstanceId::new(Self::INSTANCE),
-            tool: Self::TOOL,
+            instance_id: InstanceId::new(Self::INSTANCE_WRITE),
+            tool: Self::TOOL_WRITE,
             read_only: false,
             broker,
             notif_tx,
         }
     }
 
-    /// The read-only `read_only_shell` tool (gated by `facade:shell_readonly`).
+    /// The safe, unmarked `shell` tool (gated by `facade:shell`).
     pub fn new_read_only(broker: Weak<Broker>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
-            instance_id: InstanceId::new(Self::INSTANCE_READ_ONLY),
-            tool: Self::TOOL_READ_ONLY,
+            instance_id: InstanceId::new(Self::INSTANCE),
+            tool: Self::TOOL,
             read_only: true,
             broker,
             notif_tx,
@@ -211,7 +238,7 @@ impl ShellServer {
         // generic capability-denied).
         if self.read_only {
             return Err(McpError::Protocol(
-                "read_only_shell cannot start background processes (it never spawns host subprocesses)"
+                "the safe `shell` tool cannot start background processes (it never spawns host subprocesses; use `shell_write`)"
                     .to_string(),
             ));
         }
@@ -597,14 +624,8 @@ mod tests {
         (broker, d)
     }
 
-    fn call_ro(command: &str) -> KernelCallParams {
-        KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_READ_ONLY),
-            tool: ShellServer::TOOL_READ_ONLY.to_string(),
-            arguments: serde_json::json!({ "command": command }),
-        }
-    }
-
+    /// Params targeting the SAFE, unmarked `shell` tool (`ExternalExec::Deny`)
+    /// — the name a stale/default caller reaches for after the flag day.
     fn call(command: &str) -> KernelCallParams {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE),
@@ -613,9 +634,20 @@ mod tests {
         }
     }
 
+    /// Params targeting the HOT, mutating `shell_write` tool
+    /// (`ExternalExec::Allow`) — granted not default.
+    fn call_write(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        }
+    }
+
     /// End-to-end through `broker.call_tool`: `facade:shell` alone (no `*`, no
-    /// instance grant) must let the model run a command. This is the whole
-    /// point — facade-only loadouts (director/musician) get a working shell.
+    /// instance grant) must let the model run a command through the SAFE tool.
+    /// Post-2026-08-17-flag-day, `facade:shell` is the unmarked/safe grant —
+    /// this is the tool a caller reaches for by default.
     #[tokio::test]
     async fn facade_shell_runs_a_command_through_the_broker() {
         let (broker, d) = wired().await;
@@ -636,6 +668,35 @@ mod tests {
         match result.content.first().expect("content") {
             ToolContent::Text(s) => {
                 assert!(s.contains("hello-shell"), "stdout missing, got: {s:?}")
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// The mirror on the hot side: `facade:shell_write` alone must let the
+    /// model run a command through the mutating tool, under its new name.
+    /// Director explicitly holds both facades post-flag-day (the operator's
+    /// console wants the safe tool by default and the hot one available).
+    #[tokio::test]
+    async fn facade_shell_write_runs_a_command_through_the_broker() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("shw"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let result = broker
+            .call_tool(call_write("echo hello-shell-write"), &cc, CancellationToken::new())
+            .await
+            .expect("shell_write call should succeed");
+
+        assert!(!result.is_error, "echo should not be an error");
+        match result.content.first().expect("content") {
+            ToolContent::Text(s) => {
+                assert!(s.contains("hello-shell-write"), "stdout missing, got: {s:?}")
             }
             other => panic!("expected text content, got {other:?}"),
         }
@@ -893,39 +954,16 @@ mod tests {
         );
     }
 
-    /// The toolie's loadout: `facade:shell_readonly` (and NOT `facade:shell`).
-    /// It must see exactly the `read_only_shell` tool and NOT the writable
-    /// `shell` — one shell or the other, never both, for a narrow role.
+    /// The toolie's post-flag-day loadout: `facade:shell` (and NOT
+    /// `facade:shell_write`). It must see exactly the safe `shell` tool and
+    /// NOT the hot `shell_write` — one shell or the other, never both, for a
+    /// narrow role. `read_only_shell`/`facade:shell_readonly` are retired
+    /// names as of the 2026-08-17 flag day.
     #[tokio::test]
-    async fn read_only_role_sees_only_the_read_only_shell() {
+    async fn safe_role_sees_only_the_shell_tool() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ro"), None, principal);
-
-        let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_readonly".into()));
-        broker.set_binding(ctx_id, binding).await;
-
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
-        assert!(
-            visible.iter().any(|(name, _)| name == "read_only_shell"),
-            "facade:shell_readonly must expose read_only_shell: {visible:?}"
-        );
-        assert!(
-            !visible.iter().any(|(name, _)| name == "shell"),
-            "facade:shell_readonly must NOT expose the writable shell: {visible:?}"
-        );
-    }
-
-    /// The mirror: a `facade:shell` (writable) role sees `shell` and NOT
-    /// `read_only_shell`. Together with the test above, this is the "one shell
-    /// or the other" invariant for the narrow roles.
-    #[tokio::test]
-    async fn writable_role_does_not_see_the_read_only_shell() {
-        let (broker, d) = wired().await;
-        let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("rw"), None, principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell".into()));
@@ -935,34 +973,60 @@ mod tests {
         let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
         assert!(
             visible.iter().any(|(name, _)| name == "shell"),
-            "facade:shell must expose the writable shell: {visible:?}"
+            "facade:shell must expose the safe shell tool: {visible:?}"
         );
         assert!(
-            !visible.iter().any(|(name, _)| name == "read_only_shell"),
-            "facade:shell must NOT expose read_only_shell: {visible:?}"
+            !visible.iter().any(|(name, _)| name == "shell_write"),
+            "facade:shell must NOT expose the hot shell_write tool: {visible:?}"
         );
     }
 
-    /// End-to-end through `broker.call_tool`: `facade:shell_readonly` lets the
-    /// model run a *read* command and get its output. Refusal of writes /
-    /// external commands is enforced structurally and unit-tested at the
-    /// `MountBackend` / `ReadOnlyFs` layers; here we prove the gate opens for a
-    /// read and the command actually runs in the read-only materialization.
+    /// The mirror: a `facade:shell_write` (hot) role sees `shell_write` and
+    /// NOT `shell`. Together with the test above, this is the "one shell or
+    /// the other" invariant for the narrow roles.
     #[tokio::test]
-    async fn read_only_shell_runs_a_read_command() {
+    async fn shell_write_role_does_not_see_the_safe_shell() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("rw"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
+        assert!(
+            visible.iter().any(|(name, _)| name == "shell_write"),
+            "facade:shell_write must expose the hot shell tool: {visible:?}"
+        );
+        assert!(
+            !visible.iter().any(|(name, _)| name == "shell"),
+            "facade:shell_write must NOT expose the safe shell tool: {visible:?}"
+        );
+    }
+
+    /// End-to-end through `broker.call_tool`: `facade:shell` lets the model
+    /// run a *read* command and get its output through the safe, unmarked
+    /// tool. Refusal of writes / external commands is enforced structurally
+    /// and unit-tested at the `MountBackend` / `ReadOnlyFs` layers; here we
+    /// prove the gate opens for a read and the command actually runs in the
+    /// read-only materialization.
+    #[tokio::test]
+    async fn safe_shell_runs_a_read_command() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("roexec"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_readonly".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let result = broker
-            .call_tool(call_ro("echo hello-ro"), &cc, CancellationToken::new())
+            .call_tool(call("echo hello-ro"), &cc, CancellationToken::new())
             .await
-            .expect("read_only_shell call should succeed");
+            .expect("safe shell call should succeed");
 
         assert!(!result.is_error, "echo should not be an error: {result:?}");
         match result.content.first().expect("content") {
@@ -973,10 +1037,144 @@ mod tests {
         }
     }
 
+    /// **Slice 3 spec test 1** (`docs/gate-and-shell-split.md`): a context
+    /// bound to the OLD `facade:shell` grant (a stale rc script, a cached
+    /// binding, a model's habit — nobody updated it for the flag day) must
+    /// see the mutating tool disappear and the safe one take over under the
+    /// name `shell` — capability LOSS, never a capability leak. Pins the
+    /// "wrong-but-safe, never wrong-but-dangerous" direction the rename must
+    /// fail in.
+    #[tokio::test]
+    async fn stale_facade_shell_grant_loses_write_keeps_the_name() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("stale"), None, principal);
+
+        // The stale grant: whatever an old rc script or cached binding still
+        // says, unaware anything changed.
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        // The mutating tool is gone: neither visible...
+        let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
+        assert!(
+            !visible.iter().any(|(name, _)| name == "shell_write"),
+            "a stale facade:shell grant must not expose shell_write: {visible:?}"
+        );
+        // ...nor callable.
+        let err = broker
+            .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
+            .await
+            .expect_err("a stale facade:shell grant must not reach the mutating tool");
+        assert!(
+            matches!(err, McpError::CapabilityDenied { .. }),
+            "expected CapabilityDenied, got {err:?}"
+        );
+
+        // The name "shell" still works — routed to the safe tool now.
+        let result = broker
+            .call_tool(call("echo still-works"), &cc, CancellationToken::new())
+            .await
+            .expect("the stale grant must still reach the safe tool under the name `shell`");
+        assert!(!result.is_error);
+        match result.content.first().expect("content") {
+            ToolContent::Text(s) => assert!(s.contains("still-works"), "got: {s:?}"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// **Slice 3 spec test 2**: a context newly granted `facade:shell_write`
+    /// (plus the `exec` authority — external spawning is gated on that
+    /// authority independent of which facade is granted, see
+    /// `kj/context_shell.rs::materialize_context_kaish_inner`) gets exactly
+    /// what `builtin.shell` provided before the flag day, under the new name
+    /// — proven with a real external binary (`id`), not just a kaish
+    /// builtin, so the assertion actually exercises `ExternalExec::Allow`,
+    /// not merely that a command ran.
+    ///
+    /// The `exec` grant must land on TWO brokers: `wired()`'s standalone
+    /// broker (what `call_tool` gates against) AND `d.kernel().broker()`
+    /// (what `materialize_context_kaish_inner`'s exec-authority check reads,
+    /// via `self.kernel().broker()` — a different `Arc<Broker>` than the one
+    /// `ShellServer` was registered on for the *synchronous* path; the
+    /// `background: true` path checks the server's own `self.broker`
+    /// instead, so background tests elsewhere in this file don't need this).
+    #[tokio::test]
+    async fn shell_write_grant_gets_full_external_exec_under_the_new_name() {
+        let (broker, d) = wired().await;
+        // Real host root so the shell's default cwd resolves to a real
+        // directory and `id` can actually spawn (mirrors
+        // `kj/context_shell.rs`'s `unknown_command_fails_fast_exec_granted_shell`).
+        d.kernel()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("write-exec"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding.clone()).await;
+        d.kernel().broker().set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let result = broker
+            .call_tool(call_write("id"), &cc, CancellationToken::new())
+            .await
+            .expect("shell_write call should succeed");
+        assert!(!result.is_error, "`id` should run and exit 0: {result:?}");
+        match result.content.first().expect("content") {
+            ToolContent::Text(s) => assert!(
+                s.contains("uid="),
+                "`id` must have actually spawned as a real external process, got: {s:?}"
+            ),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// **Slice 3 spec test 3 — the fail-safe pin.** A stale `"shell"` request
+    /// must NEVER reach `ExternalExec::Allow`, full stop, regardless of what
+    /// the caller intended. Same real-binary probe as the test above (`id`),
+    /// same real host mount, but through the safe tool under a bare
+    /// `facade:shell` grant — the output must NOT show a real spawn. `exec`
+    /// is granted too (which no real safe-only role would have) to prove the
+    /// refusal is structural on the tool identity, not merely a missing
+    /// authority that a different rc grant could paper over.
+    #[tokio::test]
+    async fn stale_shell_name_never_reaches_external_exec_allow() {
+        let (broker, d) = wired().await;
+        d.kernel()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("stale-exec"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let result = broker
+            .call_tool(call("id"), &cc, CancellationToken::new())
+            .await
+            .expect("the call itself succeeds structurally — the shell runs, `id` just can't spawn");
+        match result.content.first().expect("content") {
+            ToolContent::Text(s) => assert!(
+                !s.contains("uid="),
+                "a stale `shell` request must NEVER reach ExternalExec::Allow \
+                 and spawn a real process, got: {s:?}"
+            ),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
     /// `background: true` requires the `exec` authority on top of
-    /// `facade:shell` — the same gate a synchronous external command hits,
-    /// never a weaker one. A context with `facade:shell` alone (no `exec`)
-    /// must be refused, not silently degrade to a foreground run.
+    /// `facade:shell_write` — the same gate a synchronous external command
+    /// hits, never a weaker one. A context with `facade:shell_write` alone
+    /// (no `exec`) must be refused, not silently degrade to a foreground run.
     #[tokio::test]
     async fn background_true_is_denied_without_exec_authority() {
         let (broker, d) = wired().await;
@@ -987,13 +1185,13 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
             arguments: serde_json::json!({"command": "echo nope", "background": true}),
         };
         let err = broker
@@ -1006,11 +1204,11 @@ mod tests {
         );
     }
 
-    /// End-to-end: `shell(background: true)` with `facade:shell` + `exec`
-    /// returns IMMEDIATELY (a handle + block id, never the command's output),
-    /// and the command actually runs — its output shows up in the returned
-    /// block a moment later, proving the async path is really wired, not
-    /// just accepting the flag and doing nothing.
+    /// End-to-end: `shell_write(background: true)` with `facade:shell_write`
+    /// + `exec` returns IMMEDIATELY (a handle + block id, never the command's
+    /// output), and the command actually runs — its output shows up in the
+    /// returned block a moment later, proving the async path is really
+    /// wired, not just accepting the flag and doing nothing.
     #[tokio::test]
     async fn background_true_returns_immediately_and_streams_into_its_block() {
         let (broker, d) = wired().await;
@@ -1021,14 +1219,14 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
             arguments: serde_json::json!({"command": "echo streamed-bg-output", "background": true}),
         };
         let result = broker
@@ -1067,34 +1265,34 @@ mod tests {
         }
     }
 
-    /// `read_only_shell` must refuse `background: true` outright — it never
-    /// spawns host subprocesses by construction (its materialized kaish pins
-    /// `ExternalExec::Deny`), and background execution must not be a back
-    /// door around that.
+    /// The safe `shell` tool must refuse `background: true` outright — it
+    /// never spawns host subprocesses by construction (its materialized
+    /// kaish pins `ExternalExec::Deny`), and background execution must not be
+    /// a back door around that.
     #[tokio::test]
-    async fn read_only_shell_rejects_background_true() {
+    async fn safe_shell_rejects_background_true() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ro-bg"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_readonly".into()));
-        // Even granting `exec` (which no real read-only role would have)
-        // must not open the door — the refusal is structural on `read_only`,
-        // checked before the capability gate.
+        binding.grant(Capability::Facade("shell".into()));
+        // Even granting `exec` (which no real safe-shell-only role would
+        // have) must not open the door — the refusal is structural on
+        // `read_only`, checked before the capability gate.
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_READ_ONLY),
-            tool: ShellServer::TOOL_READ_ONLY.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
             arguments: serde_json::json!({"command": "echo nope", "background": true}),
         };
         let err = broker
             .call_tool(params, &cc, CancellationToken::new())
             .await
-            .expect_err("read_only_shell must refuse background execution even with exec granted");
+            .expect_err("the safe shell tool must refuse background execution even with exec granted");
         assert!(matches!(err, McpError::Protocol(_)), "expected a Protocol refusal, got {err:?}");
     }
 
@@ -1119,14 +1317,14 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
             // Long enough that it cannot have exited by the time we check.
             arguments: serde_json::json!({"command": "sleep 2", "background": true}),
         };
@@ -1170,14 +1368,14 @@ mod tests {
             .unwrap();
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
             arguments: serde_json::json!({"command": "exit 5", "background": true}),
         };
         let result = broker
@@ -1235,14 +1433,14 @@ mod tests {
         }
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
             arguments: serde_json::json!({"command": "echo nope", "background": true}),
         };
         let err = broker
@@ -1291,14 +1489,14 @@ mod tests {
         }
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
             arguments: serde_json::json!({"command": "env", "background": true}),
         };
         let result = broker

@@ -132,8 +132,11 @@ impl KjDispatcher {
     /// Like [`Self::materialize_context_kaish`] but the materialized shell is
     /// **read-only**: filesystem mutations and external commands are refused by
     /// construction, while reads — real files and the `/v/docs` /
-    /// `/v/input` views — still work. Backs the toolie's `read_only_shell`.
-    /// Unprivileged (the read-only role is never the rc control plane).
+    /// `/v/input` views — still work. Backs the toolie's (and, post-2026-08-17
+    /// flag day, the default-unmarked) `shell` tool — the old name for this
+    /// was `read_only_shell`, now retired (`docs/gate-and-shell-split.md`
+    /// "Slice 3"). Unprivileged (the read-only role is never the rc control
+    /// plane).
     pub async fn materialize_context_kaish_read_only(
         &self,
         name: &str,
@@ -387,10 +390,12 @@ mod tests {
         );
     }
 
-    /// The toolie/read-only flavor: a `read_only_shell` pins `ExternalExec::Deny`
-    /// structurally, so an unknown command can never spawn and must fall through
-    /// to the backend lookup and fail fast (127) — the same invariant, exercised
-    /// through the read-only materialization the toolie actually uses.
+    /// The toolie/read-only flavor: the safe `shell` tool (`read_only_shell`
+    /// before the 2026-08-17 flag day, `docs/gate-and-shell-split.md` "Slice
+    /// 3") pins `ExternalExec::Deny` structurally, so an unknown command can
+    /// never spawn and must fall through to the backend lookup and fail fast
+    /// (127) — the same invariant, exercised through the read-only
+    /// materialization the toolie actually uses.
     #[tokio::test]
     async fn unknown_command_fails_fast_read_only_shell() {
         let d = dispatcher_with_full_broker().await;
@@ -592,7 +597,7 @@ mod tests {
     /// context's real block snapshots (what `kj search`/synthesis consume),
     /// where the rc/hook `NoopBlockSource` is deliberately blind. Also pins the
     /// `semantic_index` install round-trip. Without this wiring the model's
-    /// `shell` / `read_only_shell` ran with degraded (empty) block search.
+    /// `shell` / `shell_write` ran with degraded (empty) block search.
     #[tokio::test]
     async fn block_source_surfaces_real_blocks_where_noop_is_blind() {
         use crate::kj::lifecycle::NoopBlockSource;
