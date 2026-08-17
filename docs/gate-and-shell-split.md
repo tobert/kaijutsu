@@ -648,29 +648,76 @@ change to request `facade:shell_write`; a context newly granted
 under the new name. This is a flag day — no dual-name transition period,
 per Amy's "explicit is better" ruling on transparent routing.
 
-**Slice 4 — the `shell_write` gate itself**, built on `plan_program`,
-shipped against 0.14.1 (pending Amy's call on the fork above): submitted
-source → `plan_program` → one `NewPlanStatement` per `PlannedStatement`,
-free/bound variables carried through from `Plan::free_variables`/
-`bound_variables` → one ledger ask per submission → `AskCoverage::verdict`
-composes across statements (deny wins, allow needs every statement, else
-escalate — already built, `rules::redeem`/`AskCoverage`) → escalation goes
-through `run_gate`'s wait-and-notify path (now sharing the
-`subscribePermissionEvents` seam per above). Any `PlannedStatement` whose
-commands include a heredoc redirect is refused outright with a message
-naming the unrenderable-on-0.14.1 reason, not silently shown. `kj approve`
-answers it exactly like a `kj cc send` ask. Tests: a plain multi-statement
-submission with one statement covered by an active deny rule refuses the
-whole call; an uncovered submission escalates and blocks on
-`gate_wait_timeout`; a heredoc-bearing statement refuses immediately with
-no wait, regardless of rule coverage; `plan_program`'s `Stmt::Empty`
-index-gap gotcha (`docs/issues.md`) has a regression test — a leading blank
-line or comment in the submission must not shift which `PlannedStatement`
-a later error message blames.
+**Slice 4 — the `shell_write` gate itself — SHIPPED 2026-08-17, against the
+real heredoc surface, no refusal path.** Amy's ruling above ("let's link
+against local kaish for now") landed before this slice was built, so the
+heredoc-refusal design this section originally called for was never
+written — **Slice 4b collapsed into Slice 4**, built once, as the ruling
+intended. Developed against kaish rev
+`cf106d62a15163d8809d46615baff8662394984c`
+(`~/src/wt/kaish-integration`, branch `integration/kaijutsu-preview`),
+already the workspace's `path` dep at build time.
 
-**Slice 4b — deferred, not scheduled.** Swap the renderer onto kaish 0.15's
-`PlannedHeredoc`/`expand_fragment` once 0.15 is released and pinned; lift
-the heredoc refusal for statements where `literal` says the body is honest.
+Shape: `crate::kj::shell_gate::build_shell_gate_spec(source)`
+(`crates/kaijutsu-kernel/src/kj/shell_gate.rs`, new) calls
+`kaish_kernel::plan_program(source)`, turns every `PlannedStatement` into a
+`GatedStatement` (`crates/kaijutsu-kernel/src/kj/gate.rs`), and
+`GateSpec`/`run_gate` — generalized from the `kj cc send`-only single
+statement shape to an ORDERED `Vec<GatedStatement>` — do the rest:
+`AskCoverage::verdict` composes across every statement (deny wins, allow
+needs every statement, else escalate — unchanged, already built), escalation
+waits on `run_gate`'s existing poll loop up to `gate_wait_timeout`, and `kj
+approve` answers a `shell_write` ask exactly like a `kj cc send` ask because
+both now build the same `GateSpec` shape (`Origin::KjVerb` vs
+`Origin::ShellGate` is the only distinguishing field a consumer sets).
+Statement digests are namespaced by `Origin` (`kj-verb:v1:…` unchanged,
+`shell-stmt:v1:…` new) so a `kj cc send` rule can never accidentally redeem
+a `shell_write` ask that happens to render the same text, or vice versa.
+
+**Heredocs are rendered, not refused**, honest about `PlannedHeredoc::literal`:
+kaish's own `Plan::rendered` already carries every heredoc body verbatim and
+unexpanded, so `honest_render` (`shell_gate.rs`) only APPENDS a note for a
+non-literal (`<<EOF`, unquoted) heredoc, naming the free variables kaish will
+substitute before the command reads it. Deliberately does NOT call
+`expand_fragment` to show a computed "final" preview — a preview computed at
+ask-time against live session state can go stale before a human answers and
+the statement actually runs (the gate cannot pause mid-execution — see "The
+crux" above), so showing one would recreate exactly the mismatch a gate
+exists to prevent. See `shell_gate.rs`'s module docs for the full reasoning.
+
+**The `plan_program`/`Stmt::Empty` index-gap landmine** (`docs/issues.md`) is
+guarded structurally, not just tested: `GatedStatement::source_index` carries
+`PlannedStatement::index` (the PUBLISHED, pre-filter position) through
+untouched, and `describe_rule_coverage` (`gate.rs`) reads it off the
+statement it belongs to rather than re-deriving a position by enumerating
+`GateSpec::statements`. Regression tests:
+`kj::shell_gate::tests::a_leading_comment_does_not_shift_which_statement_is_reported`
+and `…multiple_leading_gaps_still_report_a_nonzero_source_index`.
+
+**Scope, stated plainly (also in `shell_gate.rs`'s module docs, where a
+reader of the code is most likely to assume more than this gate delivers):**
+the gate only ever sees what `plan_program` can see — the kaish source text
+of one statement. It does NOT cover `python3 -c '<payload>'` or any
+interpreter invocation whose real behavior is inside a string argument;
+`echo <payload> | python3` or any pipeline handing a program to an
+interpreter over stdin; the `ShellParams::stdin` parameter (content piped in
+separately from `command`, never part of what's planned); write-then-run
+across two separately gated calls; or `background: true` (a direct host
+subprocess via `/bin/sh -c`, not kaish — `plan_program` cannot describe
+source that was never kaish in the first place; background execution is
+ungated today, a named gap, not a silent one). The airtight configuration
+remains `subprocess` off; this gate improves the common case.
+
+Tests (`kj::gate`, `kj::shell_gate`, `mcp::servers::shell`): a plain
+multi-statement submission with one statement covered by an active deny rule
+refuses the whole call; an uncovered submission escalates and blocks on
+`gate_wait_timeout`, proven both against `run_gate` directly and through the
+real `ShellServer` MCP wiring; a `literal: false` heredoc is rendered and
+gated normally, with an explicit assertion that the prompt never presents
+substituted text as final; the `Stmt::Empty` index-gap regression tests
+above; `kj approve` answers a `shell_write` ask like a `kj cc send` ask,
+through the real `kj approve list`/`allow` verbs, not the ledger API
+directly.
 
 **Slice 5 — retire the six `Latch` producers, and retire the word with
 them.** `kj/workspace.rs`, `kj/doc.rs`, `kj/context.rs` (×2 —

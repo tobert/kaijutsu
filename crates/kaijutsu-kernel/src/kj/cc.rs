@@ -149,16 +149,22 @@ fn gate_spec_for_send(
         .unwrap_or_default();
     let preview: String = message.chars().take(200).collect();
     crate::kj::gate::GateSpec {
+        origin: approval_ledger::types::Origin::KjVerb,
+        instance: "builtin.kj",
         tool: "cc.send",
         description: format!(
             "send a cross-session message to Claude Code session {target:?}{resolution}: {preview}"
         ),
-        rendered: "kj cc send ${TARGET} ${MESSAGE}".into(),
         authorized_label: target.to_string(),
-        vars: vec![
-            ("TARGET".into(), approval_ledger::types::VarBinding::Bound),
-            ("MESSAGE".into(), approval_ledger::types::VarBinding::Free),
-        ],
+        statements: vec![crate::kj::gate::GatedStatement {
+            rendered: "kj cc send ${TARGET} ${MESSAGE}".into(),
+            statement_kind: "kj_verb".into(),
+            vars: vec![
+                ("TARGET".into(), approval_ledger::types::VarBinding::Bound),
+                ("MESSAGE".into(), approval_ledger::types::VarBinding::Free),
+            ],
+            source_index: None,
+        }],
     }
 }
 

@@ -218,14 +218,20 @@ mod tests {
 
     fn spec() -> GateSpec {
         GateSpec {
+            origin: approval_ledger::types::Origin::KjVerb,
+            instance: "builtin.kj",
             tool: "cc.send",
             description: "test ask".into(),
-            rendered: "kj cc send ${TARGET} ${MESSAGE}".into(),
             authorized_label: "some-target".into(),
-            vars: vec![
-                ("TARGET".into(), VarBinding::Bound),
-                ("MESSAGE".into(), VarBinding::Free),
-            ],
+            statements: vec![crate::kj::gate::GatedStatement {
+                rendered: "kj cc send ${TARGET} ${MESSAGE}".into(),
+                statement_kind: "kj_verb".into(),
+                vars: vec![
+                    ("TARGET".into(), VarBinding::Bound),
+                    ("MESSAGE".into(), VarBinding::Free),
+                ],
+                source_index: None,
+            }],
         }
     }
 

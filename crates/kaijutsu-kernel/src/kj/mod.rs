@@ -46,6 +46,7 @@ pub mod roster;
 pub mod model;
 pub mod refs;
 pub mod search;
+pub mod shell_gate;
 pub mod stage;
 pub mod transport;
 pub mod vfs;

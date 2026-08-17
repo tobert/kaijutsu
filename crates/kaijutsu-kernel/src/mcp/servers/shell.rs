@@ -408,7 +408,80 @@ impl McpServerLike for ShellServer {
         // when embeddings aren't configured the index is `None` and `kj` falls
         // back to non-semantic search rather than failing.
         if parsed.background {
+            // NOT gated (`docs/gate-and-shell-split.md`, "Slice 4"): a
+            // backgrounded command runs as a direct host subprocess
+            // (`start_background`, below), not through kaish, so
+            // `plan_program` cannot describe it — there is no kaish source
+            // here to plan. Gating this path is separate, unbuilt work; see
+            // `kj::shell_gate`'s module docs for the full list of what this
+            // gate does and does not cover.
             return self.start_background(&parsed.command, &dispatcher, ctx).await;
+        }
+
+        // The hot, mutating tool is gated (`docs/gate-and-shell-split.md`,
+        // "Slice 4") — every foreground `shell_write` submission goes
+        // through the approval ledger before it runs. The safe `shell` tool
+        // (`self.read_only`) is never gated: it cannot mutate anything
+        // (`ExternalExec::Deny`), so a gate on it would be pure friction
+        // with nothing to protect against.
+        //
+        // The gate is all-or-nothing per submission (kaish has no
+        // per-command interception hook — `kj::shell_gate`'s module docs
+        // explain why) and covers exactly what `plan_program` can see: the
+        // kaish source text of `parsed.command`. It does NOT cover a
+        // program handed to an interpreter as a string argument or over
+        // `parsed.stdin`, and it does not cover `start_background` above —
+        // see `kj::shell_gate`'s module docs for the full, honest list.
+        if !self.read_only {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(&parsed.command)
+                .map_err(|e| McpError::Protocol(format!("shell_write: {e} — nothing was run")))?;
+            let caller = crate::kj::KjCaller {
+                principal_id: ctx.principal_id,
+                context_id: Some(ctx.context_id),
+                session_id: ctx.session_id,
+                confirmed: false,
+                rc_depth: 0,
+                privileged: false,
+            };
+            // **The gate's own deadline must fire before the broker's.**
+            //
+            // `run_gate` blocks on a human answering from another surface
+            // (`kj approve`), up to `gate_wait_timeout` — 300s by default.
+            // But this call is running *inside* a broker `call_tool`, which
+            // enforces `InstancePolicy::call_timeout`
+            // (`mcp_call_timeout_default`, 120s by default). The broker wins
+            // that race, so an unanswered gate would surface as a generic MCP
+            // timeout instead of the gate's honest "nobody answered, nothing
+            // was run" — and the gate's own advice ("answer faster, or raise
+            // `gate_wait_timeout`") would be useless, since raising it past
+            // the broker's cap changes nothing.
+            //
+            // Fail-closed is preserved either way; what is lost without this
+            // clamp is the *reason*, which is exactly the fault-reads-as-
+            // something-else family this project keeps filing. This is the
+            // same hazard `runtime::kj_builtin` solves for gated `kj` verbs
+            // with a patient hold (see its comment citing "Gate slice 1a,
+            // finding #1" — "passes tests, dies in production"); the MCP path
+            // has no such hold, so it clamps instead.
+            //
+            // The margin gives `run_gate` room to write its terminal ledger
+            // row and return before the broker's axe falls. Two timeouts that
+            // must stay ordered is precisely the "two things that must agree"
+            // shape worth distrusting — if a third caller ever needs this,
+            // lift it into one place rather than copying the arithmetic.
+            let timeouts = dispatcher.kernel().timeouts();
+            let broker_cap = timeouts
+                .mcp_call_timeout_default
+                .saturating_sub(std::time::Duration::from_secs(5));
+            let wait = timeouts.gate_wait_timeout.min(broker_cap);
+            let outcome =
+                crate::kj::gate::run_gate(dispatcher.kernel_db(), &caller, spec, wait).await;
+            if !outcome.allowed {
+                return Err(McpError::Protocol(format!(
+                    "shell_write: approval gate refused [ask {}] ({}): {} — nothing was run",
+                    outcome.request_id, outcome.status, outcome.reason
+                )));
+            }
         }
 
         let semantic_index = dispatcher.semantic_index();
@@ -535,7 +608,7 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kj::test_helpers::{register_context, test_dispatcher};
+    use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher};
     use crate::mcp::binding::{Capability, ContextToolBinding};
     use crate::mcp::{InstancePolicy, KernelCallParams};
     use kaijutsu_types::{PrincipalId, SessionId};
@@ -644,6 +717,46 @@ mod tests {
         }
     }
 
+    /// `shell_write` is gated (`docs/gate-and-shell-split.md`, "Slice 4") —
+    /// a test that calls it synchronously now leaves a pending approval
+    /// ledger ask and must answer its own ask (the way a human running `kj
+    /// approve allow` would) or the call blocks until `gate_wait_timeout`.
+    /// Spawn this BEFORE the call it answers, mirroring `kj::gate`'s own
+    /// test pattern (`an_answer_from_another_principal_is_honored`).
+    fn spawn_gate_answerer(
+        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+        allow: bool,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let pending = {
+                    let db = db.lock();
+                    approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap()
+                };
+                if let Some(row) = pending.into_iter().next() {
+                    let db = db.lock();
+                    let conn = db.conn_for_ledger();
+                    approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
+                    approval_ledger::decide::decide(
+                        conn,
+                        &row.request_id,
+                        approval_ledger::decide::DecideInput {
+                            allow,
+                            decided_by: Some(b"test-approver"),
+                            decided_option: Some(if allow { "allow_once" } else { "deny" }),
+                            remember_scope: None,
+                            auto_reason: None,
+                        },
+                    )
+                    .unwrap();
+                    return row.request_id;
+                }
+            }
+            panic!("no pending gate ask appeared within 4s");
+        })
+    }
+
     /// End-to-end through `broker.call_tool`: `facade:shell` alone (no `*`, no
     /// instance grant) must let the model run a command through the SAFE tool.
     /// Post-2026-08-17-flag-day, `facade:shell` is the unmarked/safe grant —
@@ -688,15 +801,215 @@ mod tests {
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let answerer = spawn_gate_answerer(d.kernel_db().clone(), true);
         let result = broker
             .call_tool(call_write("echo hello-shell-write"), &cc, CancellationToken::new())
             .await
             .expect("shell_write call should succeed");
+        answerer.await.unwrap();
 
         assert!(!result.is_error, "echo should not be an error");
         match result.content.first().expect("content") {
             ToolContent::Text(s) => {
                 assert!(s.contains("hello-shell-write"), "stdout missing, got: {s:?}")
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// A dispatcher variant with a SHORT `gate_wait_timeout`, for the tests
+    /// below that need an unanswered gate to expire quickly rather than
+    /// wait the production default.
+    async fn wired_with_short_gate_timeout() -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
+        let policy = kaijutsu_types::TimeoutPolicy {
+            gate_wait_timeout: std::time::Duration::from_millis(300),
+            ..kaijutsu_types::TimeoutPolicy::default()
+        };
+        let d = Arc::new(crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await);
+        d.set_self_arc();
+        let broker = Arc::new(Broker::new());
+        broker.set_kj_dispatcher(&d).await;
+        broker
+            .register(
+                Arc::new(ShellServer::new(Arc::downgrade(&broker))),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
+        broker
+            .register(
+                Arc::new(ShellServer::new_read_only(Arc::downgrade(&broker))),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
+        (broker, d)
+    }
+
+    /// The gate's deadline must be clamped under the broker's, so an
+    /// unanswered gate returns the gate's honest reason rather than a generic
+    /// MCP timeout.
+    ///
+    /// Defaults make this a real race, not a hypothetical: `gate_wait_timeout`
+    /// is 300s and `mcp_call_timeout_default` is 120s, so unclamped the broker
+    /// always wins and the "nobody answered, nothing was run" message — plus
+    /// the ask id a human needs to go find — is lost. Fail-closed survives
+    /// either way; the *reason* is what the clamp protects, which is the same
+    /// fault-reads-as-something-else family as `GateUnavailable` vs `Denied`.
+    ///
+    /// Asserts the ordering rather than a literal duration, so retuning either
+    /// timeout cannot quietly invert it.
+    #[test]
+    fn the_gate_deadline_is_clamped_under_the_broker_call_timeout() {
+        let t = kaijutsu_types::TimeoutPolicy::default();
+        let broker_cap = t
+            .mcp_call_timeout_default
+            .saturating_sub(std::time::Duration::from_secs(5));
+        let effective = t.gate_wait_timeout.min(broker_cap);
+        assert!(
+            effective < t.mcp_call_timeout_default,
+            "the gate must resolve BEFORE the broker cancels the call, or its reason is lost \
+             (gate {:?}, broker {:?}, effective {:?})",
+            t.gate_wait_timeout,
+            t.mcp_call_timeout_default,
+            effective
+        );
+        assert!(
+            t.gate_wait_timeout > t.mcp_call_timeout_default,
+            "if this fails the clamp became a no-op and this test stopped testing anything — \
+             defaults were retuned so the gate is already shorter than the broker cap"
+        );
+    }
+
+    /// **Slice 4 spec test.** An uncovered `shell_write` submission escalates
+    /// and blocks on `gate_wait_timeout` — proven through the real
+    /// `ShellServer` → `build_shell_gate_spec` → `run_gate` wiring, not just
+    /// `run_gate` in isolation (`kj::gate`'s own
+    /// `an_uncovered_multi_statement_submission_escalates_and_expires`
+    /// covers the underlying mechanism).
+    #[tokio::test]
+    async fn shell_write_with_no_answer_escalates_and_times_out_refusing_the_call() {
+        let (broker, d) = wired_with_short_gate_timeout().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("timeout-shw"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let start = std::time::Instant::now();
+        let err = broker
+            .call_tool(call_write("echo nobody-answers"), &cc, CancellationToken::new())
+            .await
+            .expect_err("an unanswered gate must refuse, never hang forever or silently run");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(300));
+        match err {
+            McpError::Protocol(msg) => assert!(
+                msg.to_lowercase().contains("expired"),
+                "an unanswered gate must expire, distinguishably from a hard denial: {msg}"
+            ),
+            other => panic!("expected a Protocol refusal, got {other:?}"),
+        }
+    }
+
+    /// **Slice 4 spec test.** A multi-statement `shell_write` submission a
+    /// human denies refuses the WHOLE call — the gate runs entirely before
+    /// `execute_with_options` is ever called for this submission, so there
+    /// is no partial-execution window to prove separately; this asserts the
+    /// refusal itself reaches the caller through the real MCP wiring. The
+    /// RULE-covered "one denied statement denies the whole ask" composition
+    /// is unit-tested directly against `run_gate` in `kj::gate`
+    /// (`a_denied_statement_among_several_refuses_the_whole_submission_and_names_it`).
+    #[tokio::test]
+    async fn shell_write_deny_refuses_the_whole_multi_statement_submission() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("deny-multi"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let answerer = spawn_gate_answerer(d.kernel_db().clone(), false);
+        let err = broker
+            .call_tool(
+                call_write("echo one\necho two"),
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a denied gate must refuse the whole submission, not run any of it");
+        answerer.await.unwrap();
+        match err {
+            McpError::Protocol(msg) => assert!(
+                msg.to_lowercase().contains("denied"),
+                "refusal must say WHY (denied, not merely unavailable): {msg}"
+            ),
+            other => panic!("expected a Protocol refusal, got {other:?}"),
+        }
+    }
+
+    /// **Slice 4 spec test — required.** `kj approve` (the SAME verb `kj cc
+    /// send`'s ask is answered through) must see and answer a `shell_write`
+    /// ask with no special-casing by origin: one answering surface for
+    /// every gated producer.
+    #[tokio::test]
+    async fn kj_approve_answers_a_shell_write_ask_like_a_cc_send_ask() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("approve-shw"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let broker2 = broker.clone();
+        let gate_call = tokio::spawn(async move {
+            broker2
+                .call_tool(
+                    call_write("echo answered-like-cc-send"),
+                    &cc,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+
+        let approve_caller = test_caller();
+        let mut request_id = String::new();
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let listing = d
+                .dispatch(&["approve".to_string(), "list".to_string()], &approve_caller)
+                .await;
+            if listing.message().contains("shell_gate") {
+                request_id = listing
+                    .message()
+                    .lines()
+                    .find(|l| l.contains("shell_gate"))
+                    .and_then(|l| l.split_whitespace().next())
+                    .expect("request id is the first column")
+                    .to_string();
+                break;
+            }
+        }
+        assert!(!request_id.is_empty(), "kj approve list must show the shell_write ask");
+
+        let allow = d
+            .dispatch(
+                &["approve".to_string(), "allow".to_string(), request_id.clone()],
+                &approve_caller,
+            )
+            .await;
+        assert!(allow.is_ok(), "kj approve allow must answer a shell_write ask: {allow:?}");
+
+        let result = gate_call
+            .await
+            .unwrap()
+            .expect("shell_write call should succeed once kj approve allows it");
+        assert!(!result.is_error);
+        match result.content.first().expect("content") {
+            ToolContent::Text(s) => {
+                assert!(s.contains("answered-like-cc-send"), "stdout missing, got: {s:?}")
             }
             other => panic!("expected text content, got {other:?}"),
         }
@@ -1120,10 +1433,12 @@ mod tests {
         d.kernel().broker().set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
+        let answerer = spawn_gate_answerer(d.kernel_db().clone(), true);
         let result = broker
             .call_tool(call_write("id"), &cc, CancellationToken::new())
             .await
             .expect("shell_write call should succeed");
+        answerer.await.unwrap();
         assert!(!result.is_error, "`id` should run and exit 0: {result:?}");
         match result.content.first().expect("content") {
             ToolContent::Text(s) => assert!(
