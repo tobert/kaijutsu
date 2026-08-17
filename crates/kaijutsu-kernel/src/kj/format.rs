@@ -463,7 +463,7 @@ pub fn format_drift_queue(items: &[crate::drift::StagedDrift]) -> String {
         lines.push(format!(
             "#{:<3} {} → {}  {:?}  {}{}",
             item.id,
-            item.source_ctx.short(),
+            item.origin.short(),
             item.target_ctx.short(),
             item.drift_kind,
             preview,

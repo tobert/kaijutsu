@@ -95,6 +95,79 @@ impl ContextHandle {
 }
 
 // ============================================================================
+// DriftOrigin — slice 2, docs/drifting-dead-letters.md
+// ============================================================================
+//
+// This widens `StagedDrift`'s old `source_ctx: ContextId` field so a second
+// kind of sender fits: a peer that has no kaijutsu context of its own (e.g.
+// an inbound Claude Code message, before slice 4 gives it somewhere to
+// attach). It is deliberately NOT a trait, a registry, or a plugin point —
+// the doc is explicit that one caller does not reveal an abstraction's
+// shape, and the second real source (slice 4) is what should drive any
+// further generalization. `target_ctx` stays a plain `ContextId`: only the
+// origin widens, a drift always lands *in* a real context.
+
+/// A sender that is not a kaijutsu context — the shape slice 2's exit
+/// criterion names: "a peer with a kind, a display name, and a reply
+/// address." Fields are owned strings rather than a reference to any
+/// specific transport type (e.g. `claude-code-peer`'s socket descriptor), so
+/// `drift.rs` stays free of a dependency on any one peer transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerOrigin {
+    /// What kind of peer this is (e.g. `"claude-code"`). A free-form string,
+    /// not an enum — the router does not need to know the closed set of
+    /// peer kinds that exist.
+    pub kind: String,
+    /// Human-facing name for provenance and logging.
+    pub display_name: String,
+    /// Where a reply should go, in whatever address form the peer's own
+    /// transport understands (e.g. a socket path). Opaque to the router.
+    pub reply_address: String,
+}
+
+/// Where a staged drift came from: a registered kaijutsu context (the only
+/// kind that existed before slice 2), or a [`PeerOrigin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriftOrigin {
+    /// A registered context — `DriftRouter::stage`/`unregister` can look it
+    /// up in `contexts`.
+    Context(ContextId),
+    /// An external sender with no context to look up.
+    Peer(PeerOrigin),
+}
+
+impl DriftOrigin {
+    /// The `ContextId` behind this origin, if it is one. `None` for a peer
+    /// — callers that need a real `ContextId` (edge writes, block
+    /// authorship provenance) branch on this rather than inventing one.
+    pub fn as_context(&self) -> Option<ContextId> {
+        match self {
+            DriftOrigin::Context(id) => Some(*id),
+            DriftOrigin::Peer(_) => None,
+        }
+    }
+
+    /// Short display form for logs. Mirrors `ContextId::short()` for the
+    /// `Context` case; a peer has no hex id to shorten, so this uses its
+    /// kind and display name instead.
+    pub fn short(&self) -> String {
+        match self {
+            DriftOrigin::Context(id) => id.short(),
+            DriftOrigin::Peer(p) => format!("peer:{}:{}", p.kind, p.display_name),
+        }
+    }
+}
+
+/// Every existing caller stages a bare `ContextId` — this keeps every one of
+/// them compiling unchanged (`DriftRouter::stage` takes `impl Into<DriftOrigin>`)
+/// rather than forcing a `DriftOrigin::Context(..)` wrapper at each call site.
+impl From<ContextId> for DriftOrigin {
+    fn from(id: ContextId) -> Self {
+        DriftOrigin::Context(id)
+    }
+}
+
+// ============================================================================
 // StagedDrift — queued drift operation
 // ============================================================================
 
@@ -107,8 +180,9 @@ impl ContextHandle {
 pub struct StagedDrift {
     /// Unique ID for this staged operation.
     pub id: u64,
-    /// Source context ID.
-    pub source_ctx: ContextId,
+    /// Where this drift came from — a context, or (slice 2) a peer with no
+    /// context of its own. See [`DriftOrigin`].
+    pub origin: DriftOrigin,
     /// Target context ID.
     pub target_ctx: ContextId,
     /// Content to transfer.
@@ -357,7 +431,7 @@ impl DriftRouter {
         let (dead, keep): (Vec<_>, Vec<_>) = self
             .staging
             .drain(..)
-            .partition(|s| s.source_ctx == id || s.target_ctx == id);
+            .partition(|s| s.origin.as_context() == Some(id) || s.target_ctx == id);
         self.staging = keep;
         if !dead.is_empty() {
             tracing::info!(
@@ -365,6 +439,23 @@ impl DriftRouter {
                 count = dead.len(),
                 "moving staged drifts to dead letter for unregistered context"
             );
+            // A swept item may have been mid-flight for STAGING delivery
+            // (`drain`'s in_flight) at the moment its context vanished.
+            // Dead-letter draining (`drain_dead_letter`) has its own,
+            // separate in-flight domain (Task B, docs/drifting-dead-
+            // letters.md) — carrying the staging flag over would make the
+            // item look already-checked-out there and `drain_dead_letter`
+            // would silently skip it forever, since nothing will ever call
+            // `ack_dead_letter`/`restore_dead_letters` to clear a flag that
+            // belongs to the wrong domain. Reset both flags on the move.
+            let dead: Vec<StagedDrift> = dead
+                .into_iter()
+                .map(|mut item| {
+                    item.in_flight = false;
+                    item.cancelled = false;
+                    item
+                })
+                .collect();
             for item in &dead {
                 // Consume the staging record, write a fresh dead-letter one —
                 // same append-only-history reasoning as the `requeue` path.
@@ -748,19 +839,27 @@ impl DriftRouter {
 
     /// Stage a drift operation for later flush.
     ///
+    /// `origin` accepts anything convertible to [`DriftOrigin`] — every
+    /// call site today passes a bare `ContextId`, which converts via the
+    /// blanket `From` impl, so slice 2's widening does not force any of
+    /// them to change. Context validation applies only when `origin` is a
+    /// `DriftOrigin::Context`: a peer has no entry in `contexts` to check
+    /// by construction, and that absence is the point, not an oversight.
+    ///
     /// Returns the staged drift ID.
-    #[tracing::instrument(skip(self, content, source_model), fields(drift.source = %source_ctx, drift.target = %target_ctx))]
     pub fn stage(
         &mut self,
-        source_ctx: ContextId,
+        origin: impl Into<DriftOrigin>,
         target_ctx: ContextId,
         content: String,
         source_model: Option<String>,
         drift_kind: DriftKind,
         staged_by: PrincipalId,
     ) -> Result<u64, DriftError> {
-        // Validate both contexts exist
-        if !self.contexts.contains_key(&source_ctx) {
+        let origin = origin.into();
+        if let DriftOrigin::Context(source_ctx) = &origin
+            && !self.contexts.contains_key(source_ctx)
+        {
             return Err(DriftError::UnknownContext(source_ctx.short()));
         }
         if !self.contexts.contains_key(&target_ctx) {
@@ -772,7 +871,7 @@ impl DriftRouter {
 
         let item = StagedDrift {
             id,
-            source_ctx,
+            origin,
             target_ctx,
             content,
             source_model,
@@ -844,7 +943,7 @@ impl DriftRouter {
             }
             let matches = match for_context {
                 None => true,
-                Some(ctx) => item.source_ctx == ctx || item.target_ctx == ctx,
+                Some(ctx) => item.origin.as_context() == Some(ctx) || item.target_ctx == ctx,
             };
             if matches {
                 item.in_flight = true;
@@ -905,7 +1004,7 @@ impl DriftRouter {
             if item.retry_count > MAX_DRIFT_RETRIES {
                 tracing::warn!(
                     drift_id = item.id,
-                    source = %item.source_ctx.short(),
+                    source = %item.origin.short(),
                     target = %item.target_ctx.short(),
                     retries = item.retry_count,
                     "staged drift exceeded {} retries, moving to dead letter queue",
@@ -927,33 +1026,72 @@ impl DriftRouter {
         }
     }
 
-    /// Drain all items from the dead letter queue.
+    /// Check out every not-already-checked-out item in the dead letter
+    /// queue for delivery, without marking its durable record consumed.
     ///
-    /// Called by the flush engine to write dead letter content to the
-    /// "lost+found" context in the block store.
+    /// This is a two-phase drain (docs/issues.md, "Drift drain acks before
+    /// the lost+found write") mirroring [`Self::drain`]'s shape for
+    /// staging: matched items are flagged
+    /// [`in_flight`](StagedDrift::in_flight) and a clone is returned, but
+    /// they stay physically in `dead_letter` — so a concurrent
+    /// `drain_dead_letter` cannot double-check-out the same item, and
+    /// [`dead_letters`](Self::dead_letters) still shows them (checked out,
+    /// not gone). The caller reports the outcome per item afterward:
+    /// success via [`ack_dead_letter`](Self::ack_dead_letter) (only then is
+    /// the durable record marked consumed), failure via
+    /// [`restore_dead_letters`](Self::restore_dead_letters).
+    ///
+    /// The old, single-phase version of this method marked every drained
+    /// item's durable record consumed immediately, before the caller's
+    /// write into lost+found — a crash in the synchronous window between
+    /// the two could lose the item for good, even though `dead_letter`'s
+    /// whole reason to exist is "content is never silently discarded."
+    /// With this shape, a crash at any point either leaves the durable
+    /// record `Pending` (recovered as a dead letter again on restart — at
+    /// worst re-delivered, never lost) or `Done` because
+    /// `ack_dead_letter` ran, which only happens after the write actually
+    /// succeeded. Never both-lost.
     pub fn drain_dead_letter(&mut self) -> Vec<StagedDrift> {
-        let items = std::mem::take(&mut self.dead_letter);
-        // Mark every drained item consumed now, not after the caller's write
-        // into lost+found succeeds — there is no ack path back into this
-        // router for that (the flush engine's write is synchronous and
-        // immediate, with `restore_dead_letters` as its own failure path
-        // right below), so this is a narrow, deliberate trade: a crash in
-        // the few synchronous instructions between this call and that write
-        // could still lose the item, versus the actual bug this closes
-        // (content sitting in-memory-only for however long until a human
-        // runs `kj drift flush`, guaranteed lost on ANY restart before that).
-        // Tracked as a known residual gap, not silently accepted —
-        // docs/issues.md.
-        for item in &items {
-            self.mark_consumed(item.id);
+        let mut drained = Vec::new();
+        for item in self.dead_letter.iter_mut() {
+            if item.in_flight {
+                continue;
+            }
+            item.in_flight = true;
+            drained.push(item.clone());
         }
-        items
+        drained
+    }
+
+    /// Report a [`drain_dead_letter`](Self::drain_dead_letter)ed item as
+    /// successfully written into lost+found: removes it from `dead_letter`
+    /// and marks its durable record consumed. Returns `false` if `staged_id`
+    /// is not currently in the dead-letter queue (already acked, replayed
+    /// out from under a concurrent caller, or never dead-lettered).
+    ///
+    /// This is the second phase of the two-phase drain — the caller must
+    /// not call this until the lost+found write it is acking has actually
+    /// succeeded. Calling it before that (or not at all) is exactly what
+    /// keeps the item safe: see [`drain_dead_letter`](Self::drain_dead_letter)'s
+    /// doc.
+    pub fn ack_dead_letter(&mut self, staged_id: u64) -> bool {
+        let Some(pos) = self.dead_letter.iter().position(|d| d.id == staged_id) else {
+            return false;
+        };
+        self.dead_letter.remove(pos);
+        self.mark_consumed(staged_id);
+        true
     }
 
     /// Read-only snapshot of the dead-letter queue (M2-B4).
     ///
     /// Non-consuming — pairs with `replay_dead_letter` for clients that
-    /// want to inspect failed drifts and selectively requeue.
+    /// want to inspect failed drifts and selectively requeue. Includes
+    /// items currently checked out by a [`drain_dead_letter`](Self::drain_dead_letter)
+    /// awaiting [`ack_dead_letter`](Self::ack_dead_letter)/[`restore_dead_letters`](Self::restore_dead_letters)
+    /// — same reasoning as [`queue`](Self::queue) for staging: a client
+    /// inspecting mid-flush should see the whole picture, not have the item
+    /// vanish until the flush resolves it.
     pub fn dead_letters(&self) -> &[StagedDrift] {
         &self.dead_letter
     }
@@ -982,23 +1120,36 @@ impl DriftRouter {
         Some(item)
     }
 
-    /// Put drained dead letters back on the dead-letter queue.
+    /// Report [`drain_dead_letter`](Self::drain_dead_letter)ed items whose
+    /// write into lost+found failed: clears their checked-out flag so they
+    /// are drainable again on the next flush.
     ///
-    /// [`drain_dead_letter`](Self::drain_dead_letter) takes the whole queue,
-    /// so an item whose write into lost+found fails afterwards is gone —
-    /// dropped by the one path whose entire job is *not* losing failed drifts.
-    /// The flush engine hands those items back here instead, and they get
-    /// another attempt on the next flush.
+    /// With the two-phase drain (see `drain_dead_letter`'s doc), these items
+    /// were never marked consumed in the first place — they are still
+    /// sitting in `dead_letter`, durable record `Pending`, exactly where
+    /// `drain_dead_letter` left them. So the normal case here is cheap: find
+    /// each item by id and clear `in_flight`, no re-persist needed. The
+    /// fallback branch below (item not found — e.g. some other path already
+    /// removed it) is defensive rather than expected: if it ever fires, this
+    /// re-adds and re-persists the item so a write failure never silently
+    /// drops content, but it also means something upstream violated the
+    /// "restore only what you drained" contract and is worth investigating.
     pub fn restore_dead_letters(&mut self, items: Vec<StagedDrift>) {
-        // `drain_dead_letter` already marked these consumed on the assumption
-        // the caller's write would succeed; it didn't, so re-persist each one
-        // durably before putting it back — otherwise a restart between now
-        // and the next successful flush would lose exactly the content this
-        // whole path exists to protect.
-        for item in &items {
-            self.persist_item(QueueSlot::DeadLetter, item);
+        for item in items {
+            if let Some(existing) = self.dead_letter.iter_mut().find(|d| d.id == item.id) {
+                existing.in_flight = false;
+                existing.cancelled = false;
+            } else {
+                tracing::warn!(
+                    drift_id = item.id,
+                    "restore_dead_letters: item was not checked out via drain_dead_letter \
+                     (already restored, or drained by a concurrent caller?); re-adding and \
+                     re-persisting it defensively rather than dropping it"
+                );
+                self.persist_item(QueueSlot::DeadLetter, &item);
+                self.dead_letter.push(item);
+            }
         }
-        self.dead_letter.extend(items);
     }
 
     /// Claim `id` — a context whose `KernelDb` row the caller has **already
@@ -1580,7 +1731,7 @@ mod tests {
         // Scoped drain for alpha — should only get a→b
         let drained = router.drain(Some(a));
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].source_ctx, a);
+        assert_eq!(drained[0].origin.as_context(), Some(a));
         // Both remain visible in queue() — a→b as in-flight (drain no
         // longer removes it, only flags it), c→b untouched and still
         // waiting. OLD behavior encoded here was `queue().len() == 1`
@@ -1588,10 +1739,10 @@ mod tests {
         assert_eq!(router.queue().len(), 2);
         let waiting: Vec<_> = router.queue().iter().filter(|s| !s.in_flight).collect();
         assert_eq!(waiting.len(), 1, "only c→b should still be waiting");
-        assert_eq!(waiting[0].source_ctx, c);
+        assert_eq!(waiting[0].origin.as_context(), Some(c));
         let in_flight: Vec<_> = router.queue().iter().filter(|s| s.in_flight).collect();
         assert_eq!(in_flight.len(), 1, "a→b should be in-flight, not gone");
-        assert_eq!(in_flight[0].source_ctx, a);
+        assert_eq!(in_flight[0].origin.as_context(), Some(a));
     }
 
     #[test]
@@ -1926,7 +2077,10 @@ mod tests {
     #[test]
     fn test_restore_dead_letters_requeues_unwritten() {
         // A dead letter whose write into lost+found fails goes back on the
-        // queue — the drain must not be able to lose it.
+        // queue — the drain must not be able to lose it. Exercises the real
+        // shape of the two-phase drain (Task B): items restored here must
+        // have come from `drain_dead_letter` first, same as the flush engine
+        // does in `kj/drift.rs`.
         let mut router = DriftRouter::new();
         let src = ContextId::new();
         let dst = ContextId::new();
@@ -1935,13 +2089,34 @@ mod tests {
         router
             .stage(src, dst, "undeliverable".to_string(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
-        let staged = router.drain(None);
+        for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+            let drained = router.drain(None);
+            router.requeue(drained);
+        }
+        assert_eq!(router.dead_letters().len(), 1);
 
-        router.restore_dead_letters(staged);
+        // The flush engine checks it out for a lost+found write...
+        let checked_out = router.drain_dead_letter();
+        assert_eq!(checked_out.len(), 1);
+        assert_eq!(
+            router.dead_letters().len(),
+            1,
+            "checked-out item stays visible while in flight, like queue() for staging"
+        );
+
+        // ...and the write fails.
+        router.restore_dead_letters(checked_out);
         assert_eq!(router.dead_letters().len(), 1);
         assert_eq!(router.dead_letters()[0].content, "undeliverable");
-        // And it drains like any other dead letter on the next flush.
-        assert_eq!(router.drain_dead_letter().len(), 1);
+        assert!(
+            !router.dead_letters()[0].in_flight,
+            "restore must clear the in-flight flag so it can be drained again"
+        );
+
+        // And it drains + acks like any other dead letter on the next flush.
+        let redrained = router.drain_dead_letter();
+        assert_eq!(redrained.len(), 1);
+        assert!(router.ack_dead_letter(redrained[0].id));
         assert!(router.dead_letters().is_empty());
     }
 
@@ -2078,6 +2253,160 @@ mod tests {
         // Original labels still work
         assert_eq!(router.resolve_context("alpha").unwrap(), a);
         assert_eq!(router.resolve_context("beta").unwrap(), b);
+    }
+
+    // ========================================================================
+    // DriftOrigin — slice 2, docs/drifting-dead-letters.md. `origin` accepts
+    // `impl Into<DriftOrigin>`, so every test above that stages with a bare
+    // `ContextId` already proves "drift still routes exactly as before" (the
+    // first half of slice 2's exit criterion) without changing a line. These
+    // cover the second half: a peer origin.
+    // ========================================================================
+
+    #[test]
+    fn test_stage_peer_origin_without_a_context() {
+        // The exit criterion, verbatim: "an inbound peer message can be
+        // staged without inventing a source context for it."
+        let mut router = DriftRouter::new();
+        let tgt = ContextId::new();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+
+        let origin = DriftOrigin::Peer(PeerOrigin {
+            kind: "claude-code".to_string(),
+            display_name: "cc-kaijutsu-a1b2".to_string(),
+            reply_address: "/tmp/cc-kaijutsu-a1b2.sock".to_string(),
+        });
+
+        let id = router
+            .stage(
+                origin.clone(),
+                tgt,
+                "inbound from peer".into(),
+                None,
+                DriftKind::Push,
+                PrincipalId::new(),
+            )
+            .expect("staging a peer origin must not require a source context");
+
+        assert_eq!(router.queue().len(), 1);
+        assert_eq!(router.queue()[0].id, id);
+        assert_eq!(router.queue()[0].origin, origin);
+        assert_eq!(
+            router.queue()[0].origin.as_context(),
+            None,
+            "a peer origin has no context — nothing was invented to fill it"
+        );
+    }
+
+    #[test]
+    fn test_stage_peer_origin_still_validates_the_target() {
+        // The origin widens; the target does not. A peer message aimed at a
+        // context that does not exist must still fail the same way a
+        // context-origin push would.
+        let mut router = DriftRouter::new();
+        let origin = DriftOrigin::Peer(PeerOrigin {
+            kind: "claude-code".to_string(),
+            display_name: "cc".to_string(),
+            reply_address: "sock".to_string(),
+        });
+        let result = router.stage(
+            origin,
+            ContextId::new(),
+            "nope".into(),
+            None,
+            DriftKind::Push,
+            PrincipalId::new(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unregister_unrelated_context_leaves_peer_origin_item_alone() {
+        let mut router = DriftRouter::new();
+        let tgt = ContextId::new();
+        let unrelated = ContextId::new();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        router.register(unrelated, Some("unrelated"), None, PrincipalId::system()).unwrap();
+        let origin = DriftOrigin::Peer(PeerOrigin {
+            kind: "claude-code".to_string(),
+            display_name: "cc".to_string(),
+            reply_address: "sock".to_string(),
+        });
+        router
+            .stage(origin, tgt, "content".into(), None, DriftKind::Push, PrincipalId::new())
+            .unwrap();
+
+        router.unregister(unrelated);
+        assert_eq!(router.queue().len(), 1, "a peer origin has no context to match unregister");
+    }
+
+    #[test]
+    fn test_unregister_target_dead_letters_a_peer_origin_item() {
+        // `target_ctx` is still a plain `ContextId` — tearing it down must
+        // dead-letter a peer-origin item exactly like a context-origin one.
+        let mut router = DriftRouter::new();
+        let tgt = ContextId::new();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        let origin = DriftOrigin::Peer(PeerOrigin {
+            kind: "claude-code".to_string(),
+            display_name: "cc".to_string(),
+            reply_address: "sock".to_string(),
+        });
+        router
+            .stage(origin.clone(), tgt, "content".into(), None, DriftKind::Push, PrincipalId::new())
+            .unwrap();
+
+        router.unregister(tgt);
+        assert!(router.queue().is_empty());
+        // Check via the non-consuming inspect view first — `drain_dead_letter`
+        // itself sets `in_flight`, so the flag has to be checked BEFORE
+        // draining to prove `unregister` didn't already leave it set.
+        assert!(
+            !router.dead_letters()[0].in_flight,
+            "moving domains must not carry the staging in_flight flag over"
+        );
+        let dead = router.drain_dead_letter();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].origin, origin);
+    }
+
+    #[test]
+    fn test_unregister_dead_letter_is_not_already_in_flight() {
+        // `unregister` can sweep a STAGING item that is mid-flight (checked
+        // out by a concurrent flush, per `drain`'s in_flight flag) at the
+        // exact moment its target context is torn down. The item lands in
+        // `dead_letter` — but "checked out for staging delivery" and
+        // "checked out for a dead-letter lost+found write" (Task B) are
+        // different in-flight domains. Carrying the flag over would make
+        // `drain_dead_letter` skip the item forever, since nothing will
+        // ever call `ack_dead_letter`/`restore_dead_letters` to clear a
+        // flag from the wrong domain.
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        router
+            .stage(src, tgt, "mid-flight victim".into(), None, DriftKind::Push, PrincipalId::new())
+            .unwrap();
+
+        // Check it out for staging delivery (simulating an in-progress flush).
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 1);
+        assert!(router.queue()[0].in_flight);
+
+        // Its target is torn down mid-flight.
+        router.unregister(tgt);
+
+        let dl = router.dead_letters();
+        assert_eq!(dl.len(), 1);
+        assert!(
+            !dl[0].in_flight,
+            "dead-letter in_flight must not inherit the staging domain's flag"
+        );
+
+        // And it is actually drainable, not silently stuck forever.
+        assert_eq!(router.drain_dead_letter().len(), 1);
     }
 
     // ========================================================================
@@ -2461,12 +2790,13 @@ mod tests {
         }
 
         #[test]
-        fn drain_dead_letter_then_restart_does_not_resurrect_the_drained_item() {
-            // `drain_dead_letter` marks the durable record consumed on the
-            // assumption the caller's write into lost+found will succeed
-            // (see its doc for the accepted trade-off). This pins the happy
-            // path: once drained, a restart must not bring the item back a
-            // second time — that would duplicate content already delivered.
+        fn drain_dead_letter_alone_does_not_consume_the_durable_record() {
+            // Task B (docs/issues.md, "Drift drain acks before the
+            // lost+found write..."): the two-phase drain leaves the durable
+            // record `Pending` until `ack_dead_letter` confirms the write
+            // into lost+found actually succeeded. Drain alone — no ack —
+            // must NOT consume it, or a crash in the window between the two
+            // loses the item exactly like the old single-phase version did.
             let dir = tempfile::tempdir().unwrap();
             let (_db, blocks) = open_store(&dir.path().join("t.db"));
             let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
@@ -2483,21 +2813,135 @@ mod tests {
 
             let snaps = blocks.block_snapshots(queue_ctx).unwrap();
             assert!(
+                snaps.iter().any(|s| s.status == Status::Pending),
+                "drain alone must NOT consume the durable record — only ack_dead_letter does"
+            );
+
+            // A restart right now (ack never happened) must recover it.
+            router.rehydrate_from_block_log().unwrap();
+            assert!(router.queue().is_empty());
+            assert_eq!(
+                router.dead_letters().len(),
+                1,
+                "un-acked dead letter must survive rehydrate, not vanish"
+            );
+        }
+
+        #[test]
+        fn ack_dead_letter_marks_the_block_done_so_it_is_not_resurrected() {
+            // The other half of the two-phase contract: once the caller
+            // confirms the lost+found write succeeded, ack really does
+            // consume the durable record — the queue must not grow forever.
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+
+            router
+                .stage(src, tgt, "delivered eventually".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                let drained = router.drain(None);
+                router.requeue(drained);
+            }
+            let drained_dead = router.drain_dead_letter();
+            assert_eq!(drained_dead.len(), 1);
+            assert!(router.ack_dead_letter(drained_dead[0].id));
+
+            let snaps = blocks.block_snapshots(queue_ctx).unwrap();
+            assert!(
                 snaps.iter().all(|s| s.status == Status::Done),
-                "drain_dead_letter must mark every drained record consumed"
+                "ack must mark the durable record consumed"
             );
 
             router.rehydrate_from_block_log().unwrap();
             assert!(router.queue().is_empty());
-            assert!(router.dead_letters().is_empty());
+            assert!(
+                router.dead_letters().is_empty(),
+                "an acked item must not be resurrected"
+            );
+        }
+
+        #[test]
+        fn drain_dead_letter_then_crash_before_ack_recovers_on_restart() {
+            // THE test the residual gap asks for (docs/issues.md, "Drift
+            // drain acks before the lost+found write, so a narrow crash
+            // window remains"): drain checks an item out for delivery, the
+            // process dies before the caller can ever call
+            // `ack_dead_letter` (or `restore_dead_letters` on failure) —
+            // simulating a crash squarely inside the old unsafe window —
+            // and a restart must still recover the item. Never both-lost:
+            // at worst this is a duplicate re-delivery on the next flush,
+            // never a silent loss.
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("t.db");
+            let queue_ctx = ContextId::new();
+            let src = ContextId::new();
+            let tgt = ContextId::new();
+            let creator = PrincipalId::system();
+
+            {
+                let db: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("open db")));
+                let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+                let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+                blocks
+                    .create_document(queue_ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+
+                let mut router = DriftRouter::new();
+                router.attach_persistence(blocks.clone(), queue_ctx);
+                router.register(src, Some("src"), None, creator).unwrap();
+                router.register(tgt, Some("tgt"), None, creator).unwrap();
+                router
+                    .stage(src, tgt, "crash before ack".into(), None, DriftKind::Push, PrincipalId::new())
+                    .unwrap();
+                for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                    let drained = router.drain(None);
+                    router.requeue(drained);
+                }
+                assert_eq!(router.dead_letters().len(), 1);
+
+                // The flush engine checks the item out for a lost+found
+                // write...
+                let drained_dead = router.drain_dead_letter();
+                assert_eq!(drained_dead.len(), 1);
+                // ...and the process dies right here — no ack_dead_letter,
+                // no restore_dead_letters, nothing. This is the crash the
+                // old single-phase drain_dead_letter lost.
+
+                std::mem::forget(router);
+                std::mem::forget(blocks);
+                std::mem::forget(db);
+            }
+
+            let db2: DbHandle = Arc::new(Mutex::new(KernelDb::open(&db_path).expect("reopen db")));
+            let ws2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+            let blocks2 = shared_block_store_with_db(db2, ws2, creator);
+            blocks2.load_from_db().expect("load_from_db");
+
+            let mut router2 = DriftRouter::new();
+            router2.attach_persistence(blocks2, queue_ctx);
+            router2.register(src, Some("src"), None, creator).unwrap();
+            router2.register(tgt, Some("tgt"), None, creator).unwrap();
+            router2.rehydrate_from_block_log().unwrap();
+
+            let dl = router2.dead_letters();
+            assert_eq!(
+                dl.len(),
+                1,
+                "a crash between drain_dead_letter and ack must not lose the item"
+            );
+            assert_eq!(dl[0].content, "crash before ack");
+            assert!(!dl[0].in_flight, "rehydrate must clear in_flight — nothing is truly in flight at process start");
         }
 
         #[test]
         fn restore_dead_letters_survives_a_restart() {
-            // The failure path `drain_dead_letter`'s doc trade-off leans on:
-            // when the caller's write fails and hands the item back via
-            // `restore_dead_letters`, it must be durable again — a restart
-            // right after must not lose it just because it was drained once.
+            // With the two-phase drain (Task B), `drain_dead_letter` never
+            // marks the durable record consumed in the first place — so
+            // restoring after a failed write does not need to re-persist
+            // anything, the record has been sitting `Pending` the whole
+            // time. This pins that: a restart right after a restore must
+            // still find the item, whether restore did real work or none.
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("t.db");
             let queue_ctx = ContextId::new();

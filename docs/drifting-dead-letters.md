@@ -12,9 +12,16 @@ real-restart test suite (`drift::tests::persistence::*`); it is **not yet
 wired into a running kernel** (no production code calls
 `attach_persistence`/`rehydrate_from_block_log` yet — see `docs/issues.md`
 for the exact three-call wiring gap and why it wasn't closed this session).
-Slice 2 was not attempted: widening `StagedDrift.source_ctx`'s type cannot be
-contained inside `drift.rs` (see `docs/issues.md`); it needs `kj/drift.rs`
-edits and pairs naturally with slice 4.
+Slice 3's own residual gap — `drain_dead_letter()` acking before the
+lost+found write — **shipped fixed, same day**: see slice 3's status note and
+the new "the drain ack path" subsection below.
+
+Slice 2 **shipped, same day**, once a lane with write access to both
+`drift.rs` and `kj/drift.rs` picked it up (the morning's lane correctly
+stopped short of it for lacking the second file). `StagedDrift.origin:
+DriftOrigin` now admits a `Peer` origin alongside `Context`; see slice 2's
+status note below for exactly how far delivery goes and where the honest
+boundary sits.
 
 ## The finding that started it
 
@@ -53,14 +60,15 @@ Filed separately in `docs/issues.md`; this plan is the fix.
 `DriftRouter` already is a postmaster that knows exactly one envelope shape.
 It holds a context registry, label→`ContextId` lookup with prefix matching, a
 staging queue, retry counting, dead-lettering, lost+found, and replay. Only
-three fields of `StagedDrift` are drift-specific: `source_ctx`, `source_model`,
-`drift_kind` (`drift.rs:100-110`).
+three fields of `StagedDrift` are drift-specific: `origin` (`source_ctx:
+ContextId` at the time this was written — widened to `DriftOrigin` by slice
+2, see its status note below), `source_model`, `drift_kind`.
 
-`source_ctx: ContextId` is the field a Claude Code session cannot supply, and
-it is the whole reason inbound peer messages looked like they needed a second
-router. **They do not.** A second router would need context registration and
-dead-lettering of its own, and the two would drift apart the day someone fixed
-one — the failure mode this codebase keeps re-learning.
+The old `source_ctx: ContextId` was the field a Claude Code session could not
+supply, and it was the whole reason inbound peer messages looked like they
+needed a second router. **They do not.** A second router would need context
+registration and dead-lettering of its own, and the two would drift apart the
+day someone fixed one — the failure mode this codebase keeps re-learning.
 
 The name stays. Amy, 2026-08-16: *"I still like the name since it's handling
 liminal stuff."*
@@ -118,10 +126,46 @@ real source is what should drive it.
 Exit: drift still routes exactly as before, and an inbound peer message can be
 staged without inventing a source context for it.
 
-**Not started (2026-08-17).** `kj/drift.rs`'s `drift_flush` reads
-`source_ctx` directly (edge insertion, `insert_drift_block_as`, two log
-lines) — widening the field's type is not containable in `drift.rs` alone.
-See `docs/issues.md`.
+**Shipped 2026-08-17** — the exit criterion above, exactly, and no further:
+`StagedDrift.source_ctx: ContextId` became `origin: DriftOrigin`, an enum of
+`Context(ContextId)` (everything that existed before this slice) or
+`Peer(PeerOrigin { kind, display_name, reply_address })` — the shape the
+exit criterion names, added as one field's type widening rather than a
+trait/registry/plugin point, per Amy's explicit instruction to resist that.
+`DriftRouter::stage` takes `impl Into<DriftOrigin>` with a blanket
+`From<ContextId>`, so every existing call site (`kj/drift.rs`, every test)
+kept compiling with a bare `ContextId` — "drift still routes exactly as
+before" needed no changes to prove, only new coverage
+(`drift::tests::test_stage_peer_origin_without_a_context` and siblings).
+
+**Where the honest boundary actually is**, per the morning lane's own
+finding: `kj/drift.rs`'s `drift_flush` reads the origin in the delivery loop
+and the lost+found-write loop. Both branch on `DriftOrigin::as_context()`.
+A `Context` origin flows through exactly as before. A `Peer` origin cannot
+flow through `insert_drift_block_as` (`block_store.rs`, outside this
+slice's territory) at all — that function requires a real `ContextId` for
+provenance, with no `None`/peer-shaped alternative, and fabricating one
+would be exactly the identity-smear mistake `hook_listener.rs` already had
+to walk back once (stamping `PrincipalId::system()` in place of real
+authorship). So a peer-origin item is **stageable and durable today, but
+not yet deliverable**: `drift_flush` treats it as an ordinary delivery
+failure (requeues it; it eventually dead-letters, and stays durably queued
+rather than lost either way — the same crash-safety Task B gives every
+other item). Turning a peer-origin item into an actual delivered block
+needs a `block_store.rs` (and likely `kaijutsu-types::BlockSnapshot::drift`)
+change, which is the piece that pairs with slice 4 — "the cc inbox melts
+into the drift queue" already owns target/delivery resolution for a peer
+origin, and is the natural place to design what a peer-authored block's
+provenance field actually looks like.
+
+`ContextEdgeRow.source_id`/`target_id` carry a hard SQL foreign key to
+`contexts(context_id)` (`kernel_db.rs`) — confirmed while implementing this,
+not assumed — so a peer origin categorically cannot get an edge row without
+a schema change. Since a peer-origin item never reaches `drift_flush`'s
+success branch (the block write it would need always fails first, for the
+reason above), no edge is ever attempted for one; this needed no special
+case of its own; "an edge from a non-context may simply not be an edge"
+held without extra code.
 
 ### 3. The queue becomes blocks in a well-known context
 
@@ -158,6 +202,32 @@ letters into. The drift-queue context is closer to internal bookkeeping (its
 blocks are `BlockKind::Trace`, model-hidden) than to something a human reads
 directly — "what failed" is still answerable via `dead_letters()`/`kj drift`
 without needing a second context to query against.
+
+**The drain ack path — shipped fixed 2026-08-17.** `drain_dead_letter()` used
+to mark every checked-out item's durable record consumed immediately, before
+the caller's write into lost+found ever ran — a crash in that narrow
+synchronous window could still lose the item, the exact failure class this
+whole slice exists to close (filed in `docs/issues.md`, "Drift drain acks
+before the lost+found write..."). It is now a proper two-phase drain, the
+same shape [`DriftRouter::drain`]/[`complete`]/[`requeue`] already use for
+staging: `drain_dead_letter` checks an item out (flags it
+[`in_flight`](StagedDrift::in_flight), leaves it physically in
+`dead_letter`, durable record untouched — still `Pending`) rather than
+removing it; `ack_dead_letter(id)` is the new second phase, called only
+after the caller's lost+found write actually succeeds, and only then marks
+the durable record consumed; `restore_dead_letters` (the failure path)
+just clears the checked-out flag now, since the record was never touched in
+the first place. `kj/drift.rs`'s `drift_flush` calls `ack_dead_letter`
+right after its `insert_drift_block_as` write returns `Ok`. The test named
+for exactly this crash window is
+`drift::tests::persistence::drain_dead_letter_then_crash_before_ack_recovers_on_restart`:
+drain, forget everything (no ack, no restore — simulating a kill in the old
+unsafe window), reopen the same on-disk file, rehydrate, assert the item is
+still a dead letter. A related latent bug found while building this:
+`unregister`'s sweep of staging into dead-letter could carry a
+staging-domain `in_flight` flag into the dead-letter domain, permanently
+hiding the item from `drain_dead_letter` — fixed by clearing both flags on
+the move (`drift::tests::test_unregister_dead_letter_is_not_already_in_flight`).
 
 The Claude Code inbox stops being a delivery path and becomes a **source**. Its
 transport stays where it belongs — socket, frame codec, descriptor registry,

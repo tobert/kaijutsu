@@ -641,6 +641,29 @@ impl KjDispatcher {
         let mut failed = Vec::new();
 
         for drift in staged {
+            // Slice 2 (docs/drifting-dead-letters.md): a peer-origin item
+            // has no `ContextId` by construction, and `insert_drift_block_as`
+            // (block_store.rs, outside this lane's territory) requires a
+            // real one for provenance — there is no honest value to pass.
+            // Fabricating one would be exactly the identity-smear mistake
+            // `hook_listener.rs` already had to walk back once (stamping
+            // `PrincipalId::system()` for real authorship). So a peer-origin
+            // delivery is treated as a normal delivery failure here: it
+            // requeues and eventually dead-letters like anything else that
+            // cannot be delivered, rather than losing or misattributing
+            // content. Full peer-origin delivery needs a block_store.rs (and
+            // possibly kaijutsu-types) change and pairs naturally with slice
+            // 4, per docs/issues.md.
+            let Some(source_ctx) = drift.origin.as_context() else {
+                tracing::warn!(
+                    origin = %drift.origin.short(),
+                    target = %drift.target_ctx.short(),
+                    "drift flush: peer-origin delivery is not wired yet (needs block_store.rs \
+                     — docs/issues.md), requeuing instead of fabricating a source context"
+                );
+                failed.push(drift);
+                continue;
+            };
             let after = self.block_store().last_block_id(drift.target_ctx);
             // The author is whoever STAGED this item, not whoever is running
             // flush — see `StagedDrift::staged_by`.
@@ -649,7 +672,7 @@ impl KjDispatcher {
                 None,
                 after.as_ref(),
                 drift.content.clone(),
-                drift.source_ctx,
+                source_ctx,
                 drift.source_model.clone(),
                 drift.drift_kind,
                 Some(drift.staged_by),
@@ -673,7 +696,7 @@ impl KjDispatcher {
                         let db = self.kernel_db().lock();
                         let edge = crate::kernel_db::ContextEdgeRow {
                             edge_id: uuid::Uuid::now_v7(),
-                            source_id: drift.source_ctx,
+                            source_id: source_ctx,
                             target_id: drift.target_ctx,
                             kind: EdgeKind::Drift,
                             metadata: Some(format!("{}#{}", drift.drift_kind, drift.id)),
@@ -682,7 +705,7 @@ impl KjDispatcher {
                         if let Err(e) = db.insert_edge(&edge) {
                             tracing::warn!(
                                 "drift flush: failed to insert edge {} → {}: {e}",
-                                drift.source_ctx.short(),
+                                source_ctx.short(),
                                 drift.target_ctx.short()
                             );
                         }
@@ -696,7 +719,7 @@ impl KjDispatcher {
                             None,
                             Some(super::lifecycle::DriftInfo {
                                 kind: drift.drift_kind,
-                                source_ctx: drift.source_ctx,
+                                source_ctx,
                                 target_ctx: drift.target_ctx,
                                 source_model: drift.source_model.clone(),
                             }),
@@ -706,7 +729,7 @@ impl KjDispatcher {
                     {
                         tracing::warn!(
                             "rc drift lifecycle (flush) {} → {}: {e}",
-                            drift.source_ctx.short(),
+                            source_ctx.short(),
                             drift.target_ctx.short()
                         );
                     }
@@ -714,7 +737,7 @@ impl KjDispatcher {
                 Err(e) => {
                     tracing::warn!(
                         "drift flush failed: {} → {}: {e}",
-                        drift.source_ctx.short(),
+                        source_ctx.short(),
                         drift.target_ctx.short()
                     );
                     failed.push(drift);
@@ -756,6 +779,13 @@ impl KjDispatcher {
                     ));
                 }
             };
+            // Two-phase drain (Task B, docs/issues.md "Drift drain acks
+            // before the lost+found write..."): `drain_dead_letter` checks
+            // each item out WITHOUT marking its durable record consumed.
+            // Only `ack_dead_letter`, called below after this loop's write
+            // actually succeeds, does that — so a crash anywhere in this
+            // loop leaves the durable record `Pending` (recovered as a dead
+            // letter again on restart) rather than losing the item.
             let dead = {
                 let mut router = self.drift_router().write();
                 router.drain_dead_letter()
@@ -763,10 +793,24 @@ impl KjDispatcher {
             let dead_count = dead.len();
             let mut unwritten = Vec::new();
             for item in dead {
+                // Same slice-2 boundary as the delivery loop above: this
+                // write also goes through `insert_drift_block_as`, which
+                // needs a real `ContextId`. A peer-origin dead letter stays
+                // queued (durable, since drain never marked it consumed)
+                // rather than fabricate one.
+                let Some(source_ctx) = item.origin.as_context() else {
+                    tracing::warn!(
+                        origin = %item.origin.short(),
+                        "drift flush: peer-origin dead letter can't be written to lost+found \
+                         yet (needs block_store.rs — docs/issues.md), retaining"
+                    );
+                    unwritten.push(item);
+                    continue;
+                };
                 let after = self.block_store().last_block_id(lf_id);
                 let content = format!(
                     "[DEAD LETTER] {} → {} (retries: {}, kind: {:?})\n\n{}",
-                    item.source_ctx.short(),
+                    item.origin.short(),
                     item.target_ctx.short(),
                     item.retry_count,
                     item.drift_kind,
@@ -775,18 +819,29 @@ impl KjDispatcher {
                 // A dead letter keeps its original sender. `lost+found` exists
                 // to answer "whose message died?", which the flusher's identity
                 // cannot.
-                if let Err(e) = self.block_store().insert_drift_block_as(
+                match self.block_store().insert_drift_block_as(
                     lf_id,
                     None,
                     after.as_ref(),
                     content,
-                    item.source_ctx,
+                    source_ctx,
                     item.source_model.clone(),
                     item.drift_kind,
                     Some(item.staged_by),
                 ) {
-                    tracing::error!("failed to write dead letter to lost+found, retaining: {e}");
-                    unwritten.push(item);
+                    Ok(_) => {
+                        // Only now — after the write into lost+found has
+                        // actually landed — mark the durable dead-letter
+                        // record consumed. This is the ack half of Task B's
+                        // two-phase drain.
+                        self.drift_router().write().ack_dead_letter(item.id);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to write dead letter to lost+found, retaining: {e}"
+                        );
+                        unwritten.push(item);
+                    }
                 }
             }
             dead_retained = unwritten.len();

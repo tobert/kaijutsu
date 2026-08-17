@@ -5289,7 +5289,7 @@ impl kernel::Server for KernelImpl {
                 for (i, drift_item) in queue.iter().enumerate() {
                     let mut entry = list.reborrow().get(i as u32);
                     entry.set_id(drift_item.id);
-                    entry.set_source_ctx(drift_item.source_ctx.as_bytes());
+                    entry.set_source_ctx(&origin_ctx_bytes(&drift_item.origin));
                     entry.set_target_ctx(drift_item.target_ctx.as_bytes());
                     entry.set_content(&drift_item.content);
                     entry.set_source_model(drift_item.source_model.as_deref().unwrap_or(""));
@@ -7483,7 +7483,7 @@ impl kernel::Server for KernelImpl {
             for (i, dl) in items.iter().enumerate() {
                 let mut row = out.reborrow().get(i as u32);
                 row.set_id(dl.id);
-                row.set_source_ctx(dl.source_ctx.as_bytes());
+                row.set_source_ctx(&origin_ctx_bytes(&dl.origin));
                 row.set_target_ctx(dl.target_ctx.as_bytes());
                 row.set_content(&dl.content);
                 if let Some(ref m) = dl.source_model {
@@ -9145,6 +9145,42 @@ fn tool_kind_to_capnp(tk: kaijutsu_types::ToolKind) -> crate::kaijutsu_capnp::To
         kaijutsu_types::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
         kaijutsu_types::ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
         kaijutsu_types::ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
+    }
+}
+
+/// The 16 `sourceCtx` bytes for a staged drift's origin — empty when there is
+/// no source context to report.
+///
+/// Drift slice 2 widened `StagedDrift`'s origin to admit a sender that is not
+/// a kaijutsu context (`DriftOrigin::Peer`), but the wire's `sourceCtx @1
+/// :Data` on `StagedDriftEntry`/the dead-letter row still means "16-byte
+/// ContextId" and nothing else. A peer has no ContextId, so this returns an
+/// empty slice rather than fabricating one — zero-length `Data` is how capnp
+/// spells absence, and a made-up id would smear one sender's identity onto
+/// another (the mistake `hook_listener.rs` already had to walk back).
+///
+/// **This is a known wire gap, and it is currently unreachable.** Nothing in
+/// production constructs a `DriftOrigin::Peer` yet — only tests do — so no
+/// live listing can contain one. The client decodes this field with
+/// `parse_context_id`, which will reject an empty slice, so **the first lane
+/// to add a real peer-origin producer (the cc-inbox / slice 4 work) must give
+/// the wire an honest origin representation in the same change** — appending
+/// origin fields to these two structs is ordinal-safe. Do not let a peer
+/// origin reach these projections before then. Filed in `docs/issues.md`.
+fn origin_ctx_bytes(origin: &kaijutsu_kernel::drift::DriftOrigin) -> Vec<u8> {
+    match origin.as_context() {
+        // `as_context` hands back an owned id, so the bytes are copied out
+        // rather than borrowed. These are listing RPCs, not a hot path.
+        Some(id) => id.as_bytes().to_vec(),
+        None => {
+            log::error!(
+                "staged drift with a non-context origin ({}) reached a wire projection whose \
+                 sourceCtx field can only carry a ContextId — reporting it as absent; the wire \
+                 needs a real origin representation before peer origins are produced",
+                origin.short()
+            );
+            Vec::new()
+        }
     }
 }
 
