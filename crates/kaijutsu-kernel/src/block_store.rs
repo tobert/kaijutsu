@@ -1618,14 +1618,14 @@ impl BlockStore {
             entry.touch(self.principal_id());
             let version = entry.version();
             // `order_key` lives on `BlockSnapshot`, not `BlockHeader` — a
-            // move was never carried through the journaled payload before
-            // this migration either (`ops_since` only ever sent the header
-            // for a known block). Unchanged behavior, just reproduced
-            // directly instead of via a frontier diff.
-            let header = entry.doc.get_block_header(block_id).expect(
+            // header-only payload can't carry it through oplog replay
+            // before the next compaction (docs/issues.md "Four write-once
+            // block fields don't survive oplog replay..."). Journal the
+            // full post-move snapshot instead so `merge_ops` can recover it.
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
+            (SyncPayload::from_updated_snapshot(snapshot), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::Moved {
@@ -1778,15 +1778,15 @@ impl BlockStore {
             entry.touch(self.principal_id());
             let version = entry.version();
             // `stderr` is a write-once snapshot field, not part of
-            // `BlockHeader` — pre-migration `ops_since` didn't carry it
-            // through the journaled payload either (header replay never
-            // touched it). Unchanged behavior: the value durably survives
-            // the next compaction (a full `BlockSnapshot`), not oplog
-            // replay of the window before it. See docs/issues.md.
-            let header = entry.doc.get_block_header(block_id).expect(
+            // `BlockHeader` — a header-only payload can't carry it through
+            // oplog replay before the next compaction (docs/issues.md
+            // "Four write-once block fields don't survive oplog
+            // replay..."). Journal the full post-mutation snapshot instead
+            // so `merge_ops` can recover it.
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
+            (SyncPayload::from_updated_snapshot(snapshot), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -1829,10 +1829,10 @@ impl BlockStore {
             // `signature` is a write-once snapshot field, not part of
             // `BlockHeader` — see the same note on `set_stderr` above and
             // docs/issues.md.
-            let header = entry.doc.get_block_header(block_id).expect(
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            SyncPayload::from_updated_header(header)
+            SyncPayload::from_updated_snapshot(snapshot)
         };
         self.journal_op(context_id, ops)?;
         Ok(())
@@ -1859,10 +1859,10 @@ impl BlockStore {
             let version = entry.version();
             // `output` is a snapshot field, not part of `BlockHeader` — see
             // the same note on `set_stderr` above and docs/issues.md.
-            let header = entry.doc.get_block_header(block_id).expect(
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
+            (SyncPayload::from_updated_snapshot(snapshot), version)
         };
         self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::OutputChanged {
@@ -1893,10 +1893,10 @@ impl BlockStore {
             let version = entry.version();
             // `tool_use_id` is a snapshot field, not part of `BlockHeader`
             // — see the same note on `set_stderr` above and docs/issues.md.
-            let header = entry.doc.get_block_header(block_id).expect(
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
+            (SyncPayload::from_updated_snapshot(snapshot), version)
         };
         self.journal_op(context_id, ops)?;
         let metadata = self
@@ -4331,6 +4331,227 @@ mod tests {
         for (sb, cb) in server_blocks.iter().zip(replayed_blocks.iter()) {
             assert_eq!(sb.content, cb.content);
         }
+    }
+
+    // ── Five write-once snapshot fields must survive replay ──────────────
+    //
+    // docs/issues.md "Four write-once block fields don't survive oplog
+    // replay before the next compaction" (+ `move_block`'s `order_key`,
+    // the same gap). Each of these five mutations journals a `SyncPayload`
+    // via `SyncPayload::from_updated_header` — carrying only `BlockHeader`
+    // — for a field that lives on `BlockSnapshot`, not `BlockHeader`.
+    // `replay_journal` (the real restart path: fresh document + real
+    // journaled oplog rows, no compaction snapshot in between) must
+    // reproduce the mutation, exactly like `test_insert_block_journals_
+    // replayable_payload` above proves for insert.
+
+    #[tokio::test]
+    async fn test_set_stderr_survives_oplog_replay_without_compaction() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "stdout",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store
+            .set_stderr(ctx, &block_id, Some("boom on stderr".to_string()))
+            .unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&block_id)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.stderr.as_deref(),
+            Some("boom on stderr"),
+            "stderr set before the next compaction must survive a restart replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_signature_survives_oplog_replay_without_compaction() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "reasoning...",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store
+            .set_signature(ctx, &block_id, Some("sig-continuity-token".to_string()))
+            .unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&block_id)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.signature.as_deref(),
+            Some("sig-continuity-token"),
+            "signature set before the next compaction must survive a restart replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_output_survives_oplog_replay_without_compaction() {
+        use kaijutsu_types::{OutputData, OutputNode};
+
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let output = OutputData::nodes(vec![OutputNode::text("row-one")]);
+        store.set_output(ctx, &block_id, Some(&output)).unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&block_id)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.output,
+            Some(output),
+            "output set before the next compaction must survive a restart replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_tool_use_id_survives_oplog_replay_without_compaction() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::ToolCall,
+                "{}",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store
+            .set_tool_use_id(ctx, &block_id, Some("toolu_abc123".to_string()))
+            .unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&block_id)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.tool_use_id.as_deref(),
+            Some("toolu_abc123"),
+            "tool_use_id set before the next compaction must survive a restart replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_move_block_order_key_survives_oplog_replay_without_compaction() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let first = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "first",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let second = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "second",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        // Move `second` to land before `first` (after = None means "at the
+        // beginning").
+        store.move_block(ctx, &second, None).unwrap();
+        let live_order_key = store
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == second)
+            .unwrap()
+            .order_key;
+
+        let replayed = replay_journal(&db, ctx);
+        let replayed_key = replayed
+            .get_block_snapshot(&second)
+            .expect("block should exist after replay")
+            .order_key;
+        assert_eq!(
+            replayed_key, live_order_key,
+            "order_key set by move_block before the next compaction must survive a restart replay"
+        );
+        // Sanity: the move actually reordered the live document (otherwise
+        // this test would pass trivially even with the pre-fix gap, since
+        // the order_key never changed from its insert-time value).
+        let first_order_key = store
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == first)
+            .unwrap()
+            .order_key;
+        assert!(
+            live_order_key < first_order_key,
+            "move_block should have placed `second` before `first`"
+        );
     }
 
     /// Streaming append (`append_text`) does two independent things per

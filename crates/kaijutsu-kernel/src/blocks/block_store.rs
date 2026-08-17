@@ -1249,6 +1249,7 @@ impl BlockDocument {
             new_blocks,
             updated_headers,
             deleted_blocks,
+            updated_snapshots: Vec::new(),
         }
     }
 
@@ -1320,6 +1321,31 @@ impl BlockDocument {
         for header in &payload.updated_headers {
             if let Some(block) = self.blocks.get_mut(&header.id) {
                 block.replace_header(*header);
+            }
+        }
+
+        // Apply full-snapshot updates for known blocks: `set_stderr`,
+        // `set_signature`, `set_output`, `set_tool_use_id`, and
+        // `move_block` each touch a field that lives on `BlockSnapshot` but
+        // not `BlockHeader` (stderr/signature/output/tool_use_id/
+        // order_key), so a bare header can't carry the change through
+        // replay — see docs/issues.md "Four write-once block fields don't
+        // survive oplog replay...". A full overwrite here is safe for the
+        // same reason `new_blocks`' overwrite is: replay is strictly
+        // sequential self-application of this document's own history
+        // (never a concurrent merge — CLAUDE.md "Durable state and the
+        // wire"), so each snapshot already reflects everything journaled
+        // before it, and anything journaled after (e.g. a later text edit)
+        // replays on top of it in the same order it happened live.
+        for snap in &payload.updated_snapshots {
+            if let Some(block) = self.blocks.get_mut(&snap.id) {
+                let fallback_order_key = block.order_key().to_string();
+                *block = BlockContent::from_snapshot(snap, self.principal_id, fallback_order_key);
+            } else {
+                tracing::warn!(
+                    "sync payload has an updated snapshot for unknown block {}, skipping",
+                    snap.id
+                );
             }
         }
 
@@ -1694,6 +1720,23 @@ pub struct SyncPayload {
     /// Block IDs that have been deleted (tombstoned) on the sender.
     /// Receiver should apply tombstones for these.
     pub deleted_blocks: Vec<BlockId>,
+    /// Full post-mutation snapshots for known blocks whose mutation touched
+    /// a field that lives on `BlockSnapshot` but not `BlockHeader` —
+    /// `stderr`/`signature`/`output`/`tool_use_id` (write-once metadata) and
+    /// `order_key` (`move_block`). `updated_headers` alone can't carry these
+    /// through oplog replay (`merge_ops` never reads a field the header
+    /// doesn't have) — see docs/issues.md "Four write-once block fields
+    /// don't survive oplog replay...".
+    ///
+    /// `#[serde(default)]` is LOAD-BEARING: this struct is journaled as
+    /// versioned CBOR (field-name-keyed maps, no `deny_unknown_fields`), so
+    /// an old-shape row written before this field existed must still
+    /// decode — proven by
+    /// `old_shape_sync_payload_without_updated_snapshots_still_decodes`
+    /// below. Never remove this default or a restart replaying a
+    /// pre-existing oplog will fail to decode every row.
+    #[serde(default)]
+    pub updated_snapshots: Vec<BlockSnapshot>,
 }
 
 impl SyncPayload {
@@ -1703,6 +1746,7 @@ impl SyncPayload {
             && self.new_blocks.is_empty()
             && self.updated_headers.is_empty()
             && self.deleted_blocks.is_empty()
+            && self.updated_snapshots.is_empty()
     }
 
     /// A payload carrying exactly one freshly-created block.
@@ -1712,6 +1756,7 @@ impl SyncPayload {
             new_blocks: vec![snapshot],
             updated_headers: Vec::new(),
             deleted_blocks: Vec::new(),
+            updated_snapshots: Vec::new(),
         }
     }
 
@@ -1723,6 +1768,23 @@ impl SyncPayload {
             new_blocks: Vec::new(),
             updated_headers: vec![header],
             deleted_blocks: Vec::new(),
+            updated_snapshots: Vec::new(),
+        }
+    }
+
+    /// A payload carrying exactly one known block's full post-mutation
+    /// snapshot — for a mutation (`set_stderr`, `set_signature`,
+    /// `set_output`, `set_tool_use_id`, `move_block`) that changed a field
+    /// living on `BlockSnapshot` but not `BlockHeader`, so
+    /// `from_updated_header` alone can't carry it through replay. See the
+    /// doc on `updated_snapshots`.
+    pub fn from_updated_snapshot(snapshot: BlockSnapshot) -> Self {
+        Self {
+            block_ops: Vec::new(),
+            new_blocks: Vec::new(),
+            updated_headers: Vec::new(),
+            deleted_blocks: Vec::new(),
+            updated_snapshots: vec![snapshot],
         }
     }
 
@@ -1733,6 +1795,7 @@ impl SyncPayload {
             new_blocks: Vec::new(),
             updated_headers: Vec::new(),
             deleted_blocks: Vec::new(),
+            updated_snapshots: Vec::new(),
         }
     }
 
@@ -1743,6 +1806,7 @@ impl SyncPayload {
             new_blocks: Vec::new(),
             updated_headers: Vec::new(),
             deleted_blocks: vec![id],
+            updated_snapshots: Vec::new(),
         }
     }
 }
@@ -1803,6 +1867,53 @@ mod tests {
         assert_eq!(restored.context_id, ctx);
         assert_eq!(restored.blocks.len(), 1);
         assert_eq!(restored.blocks[0].content, "hello");
+    }
+
+    /// The pre-`updated_snapshots` shape of `SyncPayload` — every journaled
+    /// oplog row written by a currently-running kernel before this field
+    /// existed. `#[serde(default)]` on `updated_snapshots` must make this
+    /// decode fine, the unknown-field-missing case rather than the
+    /// unknown-field-*present* case `old_shape_store_snapshot_with_
+    /// block_history_still_decodes` above covers. Getting this wrong is
+    /// exactly the 2026-08-16 boot flood class (343 documents unreadable,
+    /// 27-minute outage) — a struct-shape change to something journaled
+    /// must never make an old row undecodable.
+    #[derive(serde::Serialize)]
+    struct OldSyncPayloadMimic {
+        block_ops: Vec<(BlockId, TextEdit)>,
+        new_blocks: Vec<BlockSnapshot>,
+        updated_headers: Vec<BlockHeader>,
+        deleted_blocks: Vec<BlockId>,
+    }
+
+    #[test]
+    fn old_shape_sync_payload_without_updated_snapshots_still_decodes() {
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 0);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello")
+            .build();
+        let old = OldSyncPayloadMimic {
+            block_ops: Vec::new(),
+            new_blocks: vec![snap],
+            updated_headers: Vec::new(),
+            deleted_blocks: Vec::new(),
+        };
+        let bytes = kaijutsu_types::codec::encode(&old).expect("encode old-shape mimic");
+        let restored: SyncPayload =
+            kaijutsu_types::codec::decode(&bytes).expect("old-shape row must still decode");
+        assert_eq!(restored.new_blocks.len(), 1);
+        assert_eq!(restored.new_blocks[0].content, "hello");
+        assert!(
+            restored.updated_snapshots.is_empty(),
+            "a missing key must default, never fabricate data"
+        );
+
+        // And the whole point: replaying an old-shape row into a fresh
+        // document must still work end to end, not just decode.
+        let mut doc = test_store();
+        doc.merge_ops(restored).expect("replay old-shape payload");
+        assert_eq!(doc.get_block_snapshot(&id).map(|s| s.content), Some("hello".to_string()));
     }
 
     /// Measure the block-insert hot path at coder scale (append-only, the way a
@@ -3605,6 +3716,7 @@ mod tests {
                 new_blocks,
                 updated_headers: vec![],
                 deleted_blocks: vec![],
+                updated_snapshots: vec![],
             })
             .unwrap();
         store
@@ -4177,6 +4289,7 @@ mod tests {
                 new_blocks,
                 updated_headers: vec![],
                 deleted_blocks: vec![],
+                updated_snapshots: vec![],
             })
             .unwrap();
 
@@ -4218,6 +4331,7 @@ mod tests {
                 new_blocks,
                 updated_headers: vec![],
                 deleted_blocks: vec![],
+                updated_snapshots: vec![],
             })
             .unwrap();
 
@@ -4394,6 +4508,7 @@ mod tests {
                 new_blocks: vec![keyless],
                 updated_headers: vec![],
                 deleted_blocks: vec![],
+                updated_snapshots: vec![],
             })
             .unwrap();
 
@@ -4466,6 +4581,7 @@ mod tests {
                 new_blocks: merge_blocks,
                 updated_headers: vec![],
                 deleted_blocks: vec![],
+                updated_snapshots: vec![],
             })
             .unwrap();
         assert_eq!(merged.next_seq_for(foreign), 3, "merge_ops must seed the foreign lane");
