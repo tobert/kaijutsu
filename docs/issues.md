@@ -217,45 +217,6 @@ it was not transient. Needs its own investigation — file/line unknown.
 
 ---
 
-## `kj block read` rejects the block id that `kj block list` prints (2026-08-16)
-
-`kj block list` renders ids in a short form:
-
-```
-2d25fb02#60  system/error  [error]  tool error: …
-```
-
-Feeding that straight back in fails:
-
-```
-$ kj block read 2d25fb02#60
-kj block read: malformed id '2d25fb02#60' (expected context_hex_principal_hex_seq)
-```
-
-The accepted form is the full `01a00bbc…2d1e2d3_5948b2…fb02_60`, which the
-listing never shows — so the only way to read a block you just listed is to
-reassemble its id by hand from `kj context info` plus the principal hex. Found
-while triaging the entry above; it cost several turns and is very likely a
-contributor to models thrashing in the block tools.
-
-**A tool's output should be accepted as that tool family's input.** Either
-`block read` accepts the short form (resolving `<principal8>#<seq>` against
-the `--context` already supplied, which is unambiguous), or `block list`
-prints the full id. The first is better — the short form is what makes the
-listing readable.
-
-Amy, on the same thread: *"I wonder if we should hide the block tools from
-most kinds of context. y'all seem to really like peeking around in them. or at
-least we need to give you better search tools."* Worth noting the lever
-already exists — block tools are a binding (`kj binding allow builtin.block`,
-granted by the `director`/`coder` rc, withheld from `musician`), so scoping is
-a per-context_type rc edit, not new machinery. But the thrashing this entry
-documents is an *addressing* failure, not an excess-of-capability one: the
-tool could not be used correctly even by someone who wanted it. Fix the
-addressing before deciding the tools are the problem.
-
----
-
 ## The file write/edit tools are not gated by the approval ledger (Amy, 2026-08-16)
 
 Amy, after a director context rewrote this file wholesale: *"not bad but I
@@ -678,7 +639,7 @@ app-scoped UI slice — it is a wire-schema change and wants its own review.
 
 ---
 
-## Four write-once block fields don't survive oplog replay before the next compaction (found 2026-08-16, DTE removal)
+## Slice 2 ("widen the origin") needs `kj/drift.rs`, so it wasn't done (found 2026-08-17)
 
 `set_stderr`, `set_signature`, `set_tool_use_id`, and `set_output`
 (`crates/kaijutsu-kernel/src/block_store.rs`) mutate `BlockContent` fields
@@ -690,79 +651,46 @@ therefore carries the block's header, unchanged, and nothing that would let
 is only the window between the mutation and the next compaction: a kernel
 restart inside that window replays the oplog and rebuilds the block without
 the stderr/signature/tool_use_id/output change.
+`docs/drifting-dead-letters.md` slice 2 wants `StagedDrift.source_ctx: ContextId`
+to become an origin admitting a non-context sender (a peer with a kind,
+display name, reply address). Changing that field's type is not containable
+inside `drift.rs`: `kj/drift.rs`'s `drift_flush` reads `drift.source_ctx`
+directly in at least four places — two `.short()` calls, the
+`ContextEdgeRow.source_id` write, and the `insert_drift_block_as(...,
+drift.source_ctx, ...)` call whose `source_ctx: ContextId` parameter (in
+`block_store.rs`) a `Peer` variant has no `ContextId` for by construction.
+Widening the field without updating those call sites doesn't compile;
+updating them means editing `kj/drift.rs` and possibly `block_store.rs` — both
+another lane's territory this session, and the wiring is not obviously
+separable from slice 4 ("the cc inbox melts into the drift queue," which
+already owns target/delivery resolution for a peer origin).
 
-This is not new — it predates DTE removal. The pre-migration `ops_since`
-(diamond-types-extended-backed) had exactly the same gap: none of these four
-fields were DTE ops or `BlockHeader` fields, so nothing in the old payload
-carried them either. Found while auditing every `frontier_before`/`ops_since`
-call site during the DTE removal, not introduced by it.
+Not attempted as a half-measure (an unused `DriftOrigin` enum nothing calls)
+because that would be dead code masquerading as progress. Whoever picks this
+up needs write access to `kj/drift.rs`; it is a natural pairing with slice 4,
+since both need the same "peer origin has no `ContextId`" handling in the
+delivery path.
 
-`move_block`'s `order_key` has the same shape of gap (`order_key` lives on
-`BlockSnapshot`, not `BlockHeader`) and is likewise pre-existing.
+## Drift drain acks before the lost+found write, so a narrow crash window remains (2026-08-17)
 
-Fix, if worth it: give `SyncPayload` a slot for these snapshot-only fields
-(or journal a full snapshot instead of a bare header for these five
-mutations), then replay it in `merge_ops`. Not done here — out of scope for
-a DTE-removal migration whose job is text, not fixing an unrelated
-pre-existing gap in metadata replay fidelity.
+The restart-loses-dead-letters bug itself **SHIPPED FIXED 2026-08-17** (slice 3,
+`docs/drifting-dead-letters.md`): the queue is blocks in a well-known
+drift-queue context, `staging`/`dead_letter` are a cursor over it, and cold
+start attaches + rehydrates in `kaijutsu-server/src/rpc.rs` next to the
+lost+found re-adoption. That part is done; this entry is only the residual.
 
----
+`drain_dead_letter()` marks each drained item's durable record consumed
+immediately — **not** after the caller's subsequent write into lost+found
+succeeds, because there is no ack path back into the router for that. A crash
+in the narrow synchronous window between the drain and that write could still
+lose the item.
 
-## The dead-letter queue does not survive a restart (found 2026-08-16)
-
-`DriftRouter.dead_letter` is `Vec<StagedDrift>` held in memory
-(`crates/kaijutsu-kernel/src/drift.rs:165`) and there is **no table for it** —
-`grep dead_letter crates/kaijutsu-kernel/src/kernel_db.rs` returns nothing. A
-kernel restart discards every dead letter.
-
-**The mechanism whose whole job is "content is never silently discarded"
-silently discards content.** Its own doc comment at `:162-165` states that
-guarantee. Worse, the API invites you to come back later — `dead_letters()`
-(`:626`) is explicitly non-consuming "for clients that pair with
-`replay_dead_letter`" (`:635`), and a restart is exactly the event after which
-someone would go looking.
-
-**The fix is probably not a table.** Kaijutsu already has durable queuing and
-the answer was blocks: `ConversationMailbox` stores nothing at all
-(`llm/mailbox.rs:37-42` is a `HydrationState` plus a `seen: HashSet<BlockId>`),
-because the block log IS the queue and the mailbox is only a cursor over it.
-Landing dead letters as blocks in the lost+found context — which
-`lost_found_id`/`adopt_lost_found` (`drift.rs:425-448`) already exist to
-provide — makes them durable, inspectable through ordinary block tooling,
-replayable, and visible in the app, with no new storage and no new format.
-
-Sized as a bug rather than a design: the lost+found context is already the
-documented destination for drained dead letters, so this is moving the drain
-earlier, not inventing a destination.
-
-## Flaky: ACP's tracing-capture test fails about 1 run in 9 (2026-08-16)
-
-`kaijutsu-acp`'s `update::tests::shrink_and_divergence_log_a_loud_warning_not_
-silence` (`crates/kaijutsu-acp/src/update.rs:1088`) failed once during a
-`cargo test --workspace` run, then passed 3 isolated runs, 5 full `-p
-kaijutsu-acp --lib` runs, and a second full workspace run. **Not a regression
-from the text-engine removal** — the ACP crate never linked a text engine.
-
-**What the failure looked like:** the test asserts two warnings land in a
-captured buffer — one naming a shrink, one naming a divergence. The buffer
-held **only the first**. The divergence branch cannot have been skipped by
-logic: `prefix_hash` uses `DefaultHasher::new()`, which is fixed-seed, so
-`prefix_hash("Xabcdef", 6) != mark_for("abcdef").hash` is deterministic. The
-warning fired and was not captured.
-
-**Mechanism unknown, and stated as unknown rather than guessed.** The test
-installs a thread-local subscriber via `tracing::subscriber::with_default` with
-a shared `CaptureWriter`, and both `observe` calls run on that thread, so the
-obvious explanations do not hold up. Suspicion is an interaction with parallel
-test execution under load — it only appeared in a full-workspace run, which is
-the most contended case — but that is a hypothesis, not a diagnosis.
-
-**Why it matters more than one flaky test:** a suite that fails once in nine
-runs for an unexplained reason trains everyone to re-run and move on, which is
-exactly how a real failure gets waved through. Worth fixing by making the
-capture deterministic (a subscriber the test fully owns, or asserting on a
-returned value instead of on log output) rather than by adding a retry.
-
+Accepted deliberately rather than silently: this trades an *unbounded-time*
+loss window (the original bug — content lost across ANY restart before a human
+happened to run `kj drift flush`) for a millisecond one during an active
+flush. Closing it needs an ack path, which means touching `kj/drift.rs`. See
+`persist_item`'s and `drain_dead_letter`'s doc comments in `drift.rs` for the
+full reasoning.
 
 ## A context's version is unobservable from `kj` (2026-08-15)
 
@@ -773,9 +701,11 @@ to read it from the operator surface.
 
 - `kj context` has no `inspect`/`show` verb at all (only the tip "a similar
   subcommand exists: 'unset'").
-- `kj block history <id>` reports version info but demands a full
-  `context_principal_seq` id, which `kj block list` does not print — it prints
-  the short display form (`45d6b370#6`), and `--data` returned empty.
+- `kj block history <id>` reports version info but `--data` returned empty.
+  (The other half of this bullet — that it demanded a full
+  `context_principal_seq` id the listing never printed — was FIXED 2026-08-17:
+  every id-taking block verb now accepts the short `45d6b370#6` display form.
+  The `--data` gap stands.)
 
 Found trying to verify on the live kernel, after the flag-day restart, that a
 long-lived context resumed its real version rather than restarting near zero.
@@ -3111,16 +3041,27 @@ adapter, as built".
   the arm now applies the event (honouring `NeedsResync`) before rebuilding
   the plan, pinned by `build_plan_re_emits_when_a_task_disappears` /
   `build_plan_stays_quiet_when_a_non_task_disappears` in `update.rs`.
-- **Client-identity presets on connect** (Amy, 2026-08-05 evening, first
-  toad day): ACP `initialize` carries `clientInfo` (Implementation
-  name+version) and capabilities — enough to recognize *which* frontend
-  connected. Wire that into the existing per-client config machinery: derive
-  a ClientId from the client identity, let the `/etc/client` cascade
-  (docs/config-ownership.md; metronome was the first consumer) and/or a
-  preset/cast mapping key off it — "toad connections get preset X / cast Y,
-  Happy gets Z." Today every ACP context gets the row-stamped default
-  (ds-v4-flash) regardless of who connected; this is also where the pending
-  ACP-cast decision could land generally instead of as a bridge hardcode.
+- ~~**Client-identity presets on connect**~~ **SHIPPED (cast only) 2026-08-17.**
+  `clientInfo.name` already fed the peer nick (`acp/<name>`, `90bdc53a`); it
+  now also derives a *separate* `/etc/client` cascade key —
+  `bridge::client_config_id` → `acp-<name>` (a peer nick's `/` would
+  misroute a client-config path, which is one segment) — and on `session/new`
+  for a **genuinely fresh context only** (never `session/load`/`resume`,
+  which must not stomp an already-set cast), `KernelBridge::resolve_client_cast`
+  reads `/etc/client/<id>/cast.toml` then the shared `/etc/client/cast.toml`
+  (`{ cast = "<label>" }`) and, if either names one, applies it via
+  `kj context set --cast <label>` over the existing `execute_kj` addressed-command
+  path (`apply_client_cast_preset`, `lib.rs`) — no bridge hardcode, no new RPC.
+  Absent config (the default — nobody has written a `cast.toml` yet) leaves
+  the row-stamped default untouched. Tests: `bridge.rs`'s unit suite for the
+  two pure pieces (`client_config_id` slugification, `parse_cast_config` TOML
+  reading). **Not done:** the "preset X" half of Amy's example — `kj context
+  set` has no `--preset` flag, only `--cast`, so system-prompt/consent
+  selection by client identity is still open; the config files themselves
+  (nobody has written `/etc/client/acp-toad/cast.toml` etc. yet — an operator
+  action, not code); and a handler-level test for `session/new` itself (needs
+  the `KernelBridge` injectable seam the ACP-delete-follow-ups entry below
+  already asks for).
 - **Stable v1 methods left unimplemented**: `session/set_mode` (→
   `context_type` / cast roles) and `session/set_config_option`. Neither is
   advertised in capabilities, so clients should not call them.
