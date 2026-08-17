@@ -415,11 +415,57 @@ statement type it can render truthfully, and refuses (fail-closed, loud,
 downgrade to showing the escaped blob) any statement `plan_program` reports
 as heredoc-bearing. Slice 4b — swap the renderer onto 0.15's
 `PlannedHeredoc`/`expand_fragment` and lift the heredoc refusal — lands
-whenever 0.15 actually ships and is pinned, no earlier. **This is a
-judgment call this doc is making, not a ruling Amy has given** — flag it to
-her: the alternative (wait for 0.15 to ship Slice 4 at all) is equally
-defensible and is what the kaish-lead sequencing note leans toward. Pick
-one before Slice 4 starts.
+whenever 0.15 actually ships and is pinned, no earlier.
+
+**RULED by Amy, 2026-08-17, and she picked a third option neither side
+offered:** *"let's link against local kaish for now, we'll switch back when
+0.15 ships."*
+
+So Slice 4 builds the renderer **once, against the real heredoc surface**, by
+pointing the workspace at the local kaish checkout instead of the crates.io
+pin. This gets the kaish lead's "build it once" without paying the kaish
+lead's wait — the heredoc refusal path never has to be written, and Slice 4b
+collapses into a dependency swap rather than a rewrite.
+
+**Measured against `~/src/kaish` on 2026-08-17, because this doc's earlier
+"0.15" framing was misleading:**
+
+- **There is no 0.15 version number yet.** The workspace `Cargo.toml` there
+  says `version = "0.14.1"`. "Wait for 0.15" is not waiting on a scheduled
+  bump — it is waiting on a release that has not been cut, of code that is
+  already written. That reframing is most of why Amy's answer is the right
+  one.
+- **The surface is real and present.** `kaish-kernel` exports both
+  `expand_fragment` and `PlannedHeredoc` (`crates/kaish-kernel/src/lib.rs:109-110`),
+  with `PlannedHeredoc` threaded through `ast/plan.rs`. `b58e492` (PR #340)
+  is confirmed an ancestor of the checkout's HEAD.
+- **The checkout is NOT on `main`** — it sits on `docs/voice-guidance`, which
+  is `main` (`c72dc32`) plus two docs-only commits, and has an untracked
+  `help-plan.md`. Functionally identical for code purposes today, but a
+  `path` dep follows the working tree, so **whoever wires this must decide
+  and state which revision they mean** rather than inheriting whatever branch
+  the checkout happens to be on. Re-check it before building; it is a working
+  checkout, not a pinned mirror, and CLAUDE.md already records that trap
+  biting us once on the Bevy tree.
+
+**What this costs, recorded so it gets undone.** Yesterday's kaish bump
+(`6ebb0a8b`) deliberately removed the last git source from `Cargo.lock`, and
+its commit message treats "zero git sources" as the win. A local `path`
+dependency is not a git dependency, but it is worse in one specific way: a
+git rev is at least resolvable by anyone who clones, while a `path` dep
+resolves only on a machine that happens to have `~/src/kaish` at the right
+revision. **This makes the workspace unbuildable for anyone but Amy, and
+non-reproducible even for her across machines** — moltar and the MacBook
+would each need the checkout. That is acceptable for a deliberately
+temporary window on a research project, and unacceptable to forget about.
+
+Conditions on taking it, which the implementer owns:
+- Record the exact kaish revision the work was developed against, in the
+  Slice 4 commit message. `path` deps pin nothing, so the revision is
+  otherwise unrecoverable.
+- Treat "0.15 released" as a **standing trigger to revert to a crates.io
+  pin**, not a nice-to-have. File it so it survives this session.
+- Do not let a `path` dep reach a commit that anyone treats as releasable.
 
 Property to KEEP from the deleted latch, unconditionally, in both the
 `kj`-verb gate (already true — see `gate_spec_for_send`'s
