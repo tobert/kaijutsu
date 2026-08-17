@@ -958,6 +958,14 @@ impl DriftRouter {
         &self.dead_letter
     }
 
+    /// How many items are staged for delivery. Observability only — the
+    /// cold-start rehydrate reports what it recovered, and a caller that
+    /// wants the items themselves should take them rather than counting
+    /// them first.
+    pub fn staged_len(&self) -> usize {
+        self.staging.len()
+    }
+
     /// Move a dead-letter item back into the staging queue by id (M2-B4).
     ///
     /// Resets `retry_count` to 0 so the requeued item gets a full set of

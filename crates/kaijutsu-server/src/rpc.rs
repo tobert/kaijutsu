@@ -2043,6 +2043,55 @@ pub async fn create_shared_kernel(
         }
     }
 
+    // Give the drift router its durable backing, then rebuild the queue from
+    // it (docs/drifting-dead-letters.md, slice 3). Until this runs the router
+    // is in-memory-only and a restart silently discards every staged item and
+    // every dead letter — which is the bug slice 3 exists to fix, so the
+    // mechanism being attached is not optional in a real kernel even though
+    // `attach_persistence` is optional in the type.
+    //
+    // Ordering matters and is the whole point: attach, THEN rehydrate, and
+    // both before this kernel serves any traffic. `rehydrate_from_block_log`
+    // REPLACES the cursor wholesale rather than merging, which is correct
+    // for exactly this cold-start call and wrong anywhere else.
+    //
+    // Failure here is loud and non-fatal, matching the lost+found arm above:
+    // a kernel that cannot durably queue drift is still a kernel worth
+    // starting (every other subsystem works, and drift degrades to the
+    // pre-slice-3 in-memory behavior), but nobody should have to infer that
+    // from later symptoms.
+    match kaijutsu_kernel::drift::ensure_drift_queue_context(
+        kernel_arc.drift(),
+        &documents,
+        &kernel_db_arc,
+    ) {
+        Ok(queue_ctx) => {
+            let mut drift = kernel_arc.drift().write();
+            drift.attach_persistence(documents.clone(), queue_ctx);
+            match drift.rehydrate_from_block_log() {
+                Ok(()) => log::info!(
+                    "drift queue durable in context {} ({} staged, {} dead-lettered recovered)",
+                    queue_ctx.short(),
+                    drift.staged_len(),
+                    drift.dead_letters().len(),
+                ),
+                Err(e) => log::warn!(
+                    "drift queue attached to context {} but rehydrate failed — prior staged \
+                     items and dead letters are NOT recovered this boot: {}",
+                    queue_ctx.short(),
+                    e
+                ),
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "failed to resolve the durable drift-queue context — drift stays in-memory only \
+                 and a restart will discard staged items and dead letters: {}",
+                e
+            );
+        }
+    }
+
     // Initialize LLM registry + embedding config from the kernel DB.
     let embedding_config = initialize_kernel_models(&kernel_arc, &kernel_db_arc).await;
 
