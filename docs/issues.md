@@ -3121,6 +3121,53 @@ wire). What it deliberately did NOT do:
   `serverShutdown` and `superseded`; nothing emits them yet. A clean shutdown
   still looks to a client like an ordinary disconnect.
 
+## lfm2d risk scoring into the approval ledger, via rc (Amy asked 2026-08-17: "is lfm2d integration with kernel ledger via rc still in our plans somewhere?")
+
+**Honest answer: no — not as a written plan. Every piece exists; the join
+does not.** Searched kaijutsu's docs and exomemory: nothing connects lfm2d's
+scorer to the ledger through rc. Filing it so the answer stops being "I think
+so." The moment is good — the gate/ledger design is being drafted today
+(`docs/gate-and-shell-split.md`), and this is a hook point in it rather than
+a separate project.
+
+The pieces already in hand:
+
+- **The scorer** — lfm2d serves `/v1/cascade`, which scores a command.
+- **The ledger** — `crates/approval-ledger`, already migrated into `KernelDb`
+  via `KernelDb::migrate_ledger`.
+- **rc** — `/etc/rc/<context_type>/<verb>/SXX-name.kai` already composes
+  per-context behaviour, and is exactly where a per-context-type policy
+  ("this seat asks lfm2d before it runs a destructive verb") belongs, rather
+  than in kernel code.
+- **The seam** — `HookAction::Ask` / `mcp/permission.rs`, which the gate
+  design already routes everything through.
+
+**The constraint that decides the shape, and it is not optional.** The lfm2d
+lane's own measurement (exomemory queue, 2026-08-14): `/v1/cascade` scores
+`git checkout -- crates/` at **0.210 `situation-normal`** — confidently wrong,
+mid-range, in the costly direction, **on an operation that has already
+destroyed uncommitted work in this repo**. The lane's read is
+foreign-training-distribution rather than a calibration bug, which does not
+make the number safer to act on. A companion finding: `lane.route` cosine is
+unusable as an is-this-shell signal ("capital of France" scores 0.98, above a
+genuine shell statement at 0.66).
+
+So: **advisory, never an auto-decider.** A score may RAISE a prompt that would
+not otherwise fire, or enrich one that does; it must never lower one, and must
+never silently allow. That direction is also the doctrinal one — capabilities
+and gates here are ergonomic nudges for mistake-prevention, not security
+(`docs/instrument-design.md`, "Many hands, one trust boundary"), and a
+mistake-prevention nudge that can be talked out of firing by a 350M encoder is
+worse than no nudge, because it trains trust it hasn't earned.
+
+Prerequisite before any wiring: re-measure the scorer against a corpus of the
+destructive `kj` verbs and shell statements the ledger would actually gate.
+The 0.210 receipt is one sample; the decision needs a distribution. That
+measurement is worth doing even if the integration never ships.
+
+See also the LFM2.5 entry immediately below (the model family, runtimes, and
+the candle-in-process decision) and the gate entries above (the seam).
+
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 
 LiquidAI's LFM2.5 encoder branch is a small-model toolbox aimed at exactly
