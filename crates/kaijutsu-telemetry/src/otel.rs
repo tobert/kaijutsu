@@ -243,7 +243,6 @@ pub(crate) fn context_root_span_impl(trace_id: &[u8; 16], name: &'static str) ->
 /// | `tool.*`     | 100% | Tool dispatch                            |
 /// | `drift.*`    | 100% | Cross-context operations                 |
 /// | `rpc.*`      | 10%  | High volume Cap'n Proto calls            |
-/// | `sync.*`     |  1%  | Very high volume sync ops                |
 /// | errors       | 100% | Always capture failures                  |
 /// | other        | 10%  | Default for unclassified spans           |
 #[derive(Debug, Clone)]
@@ -321,8 +320,6 @@ fn sampling_rate(name: &str) -> f64 {
         1.0 // 100% — high-value, low-volume namespaces (sftp control/metadata ops)
     } else if name.starts_with("rpc") {
         0.1 // 10% — rpc, rpc.request, rpc_client.* (high-volume Cap'n Proto)
-    } else if name.starts_with("sync") {
-        0.01 // 1% — very high-volume sync ops
     } else {
         0.1 // 10% default
     }
@@ -368,8 +365,16 @@ mod tests {
         assert_eq!(sampling_rate("list_contexts"), 0.1);
     }
 
+    /// The `sync.*` 1% bucket was for the client-facing `pushOps` RPC,
+    /// which no longer exists (CLAUDE.md "Clients read over the wire and
+    /// write through kaish" — `pushOps` was the only client-editing RPC and
+    /// it is deleted). Nothing in the workspace emits a `sync`-prefixed
+    /// span any more, so that bucket was removed 2026-08-17; a
+    /// `sync.`-named span now falls through to the 10% default like any
+    /// other unclassified span. Kept as a regression guard against the
+    /// bucket quietly coming back with stale semantics.
     #[test]
-    fn sync_sampled_lowest() {
-        assert_eq!(sampling_rate("sync.push_ops"), 0.01);
+    fn sync_prefixed_spans_use_the_default_rate_not_a_dead_bucket() {
+        assert_eq!(sampling_rate("sync.push_ops"), 0.1);
     }
 }

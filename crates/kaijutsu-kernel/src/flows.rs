@@ -41,16 +41,19 @@ use kaijutsu_types::{BlockEventFilter, BlockFlowKind, ContextId, PrincipalId};
 
 /// Origin source for block operations.
 ///
-/// Used to prevent echo loops in bidirectional sync:
-/// - Local operations should be sent to the server
-/// - Remote operations (received from server) should NOT be sent back
+/// Historically also carried `Remote` ("received from remote via
+/// subscription/sync"), to prevent echo loops in a bidirectional-sync
+/// design. That design is gone: the kernel is the sole sequencer and
+/// concurrent merge into kernel documents is structurally impossible
+/// (CLAUDE.md "Durable state and the wire") — no construction site in the
+/// workspace ever produced `Remote`, so it was dead. Removed 2026-08-17
+/// (found during the fit-and-finish sweep, `docs/issues.md`). `Local` is
+/// the only source every `BlockFlow` event carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum OpSource {
     /// Generated locally by tool execution or user action
     #[default]
     Local,
-    /// Received from remote via subscription/sync
-    Remote,
 }
 
 // ============================================================================
@@ -578,7 +581,9 @@ impl BlockFlow {
         }
     }
 
-    /// Get the source of this event (Local or Remote).
+    /// Get the source of this event. `OpSource` has only ever had one
+    /// live variant (`Local`) since `Remote` was removed as dead — see
+    /// `OpSource`'s doc.
     pub fn source(&self) -> OpSource {
         match self {
             Self::Inserted { source, .. }
@@ -597,14 +602,13 @@ impl BlockFlow {
         }
     }
 
-    /// Check if this event originated locally.
+    /// Check if this event originated locally. Always `true` today —
+    /// `OpSource::Remote` was removed as dead (see `OpSource`'s doc) — kept
+    /// as the honest predicate rather than inlining `true` at call sites,
+    /// since a future genuinely-remote source would only need to add a
+    /// variant back, not touch every caller.
     pub fn is_local(&self) -> bool {
         self.source() == OpSource::Local
-    }
-
-    /// Check if this event originated from a remote source.
-    pub fn is_remote(&self) -> bool {
-        self.source() == OpSource::Remote
     }
 
     /// Get the discriminant kind for this event (no payload).
