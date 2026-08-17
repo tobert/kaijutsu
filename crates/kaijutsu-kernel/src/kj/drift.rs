@@ -308,6 +308,12 @@ impl KjDispatcher {
         // what makes `cancel` and batching possible. See `docs/drift-ux.md`.
         if !stage {
             let stage_after_failure = |e: String| {
+                // Attach durable backing before staging, so an item parked
+                // here survives a restart (slice 3). A failure to attach is
+                // reported in the message rather than blocking the stage:
+                // content with nowhere else to go is better parked
+                // non-durably than refused.
+                let durable = self.ensure_drift_queue_persistence();
                 let mut router = self.drift_router().write();
                 match router.stage(
                     context_id,
@@ -319,11 +325,22 @@ impl KjDispatcher {
                 ) {
                     // Loud, not silent: the push failed, but the content is
                     // parked in the queue that already knows how to retry
-                    // and dead-letter rather than lose it.
-                    Ok(id) => KjResult::Err(format!(
-                        "kj drift push: delivery to {dst_query} failed: {e}; staged as \
-                         #{id} — run 'kj drift flush' to retry"
-                    )),
+                    // and dead-letter rather than lose it. If the durable
+                    // backing could not be attached, say so in the same
+                    // breath — "staged" must not imply "will survive a
+                    // restart" when it won't.
+                    Ok(id) => KjResult::Err(match &durable {
+                        Ok(()) => format!(
+                            "kj drift push: delivery to {dst_query} failed: {e}; staged as \
+                             #{id} — run 'kj drift flush' to retry"
+                        ),
+                        Err(attach_err) => format!(
+                            "kj drift push: delivery to {dst_query} failed: {e}; staged as \
+                             #{id} — run 'kj drift flush' to retry. WARNING: the durable \
+                             drift queue could not be attached ({attach_err}), so this item \
+                             will NOT survive a kernel restart"
+                        ),
+                    }),
                     Err(stage_err) => KjResult::Err(format!(
                         "kj drift push: delivery to {dst_query} failed: {e}; staging also \
                          failed: {stage_err} — CONTENT LOST"
@@ -348,7 +365,11 @@ impl KjDispatcher {
             };
         }
 
-        // Stage the drift
+        // Stage the drift. Attach the durable backing first (slice 3) so a
+        // staged item survives a restart; a failure to attach is reported
+        // alongside the success rather than swallowed, since "staged" would
+        // otherwise imply a durability the item does not have.
+        let durable = self.ensure_drift_queue_persistence();
         let staged_id = {
             let mut router = self.drift_router().write();
             match router.stage(
@@ -364,7 +385,14 @@ impl KjDispatcher {
             }
         };
 
-        KjResult::ok(format!("staged drift #{} → {}", staged_id, dst_query))
+        match durable {
+            Ok(()) => KjResult::ok(format!("staged drift #{} → {}", staged_id, dst_query)),
+            Err(attach_err) => KjResult::ok(format!(
+                "staged drift #{} → {} — WARNING: the durable drift queue could not be \
+                 attached ({}), so this item will NOT survive a kernel restart",
+                staged_id, dst_query, attach_err
+            )),
+        }
     }
 
     async fn drift_pull(&self, src_query: &str, prompt: &[String], caller: &KjCaller) -> KjResult {
@@ -812,6 +840,41 @@ impl KjDispatcher {
     /// DB write fails. A failure rolls the document back and returns `Err` —
     /// the caller keeps its dead letters queued rather than writing them into
     /// a context that isn't there.
+    /// Make sure the drift router has a durable backing before an item is
+    /// staged into it (docs/drifting-dead-letters.md, slice 3).
+    ///
+    /// Lazy on purpose, and the laziness is the design — `ensure_lost_found_context`
+    /// below has the same shape for the same reason. Cold start only *adopts*
+    /// an existing drift queue; minting it there would put an infrastructure
+    /// context into `list_active_contexts` on a brand-new kernel that has
+    /// never drifted, where it would show up in `kj context list`, the ring
+    /// rank, and an ACP client's session list. So the queue context comes into
+    /// existence at the first moment something actually needs a durable home.
+    ///
+    /// Idempotent and cheap after the first call: `has_persistence()` short-
+    /// circuits, and `ensure_drift_queue_context` itself checks the router
+    /// cache before the registry before minting.
+    ///
+    /// Returns `Err` only if the queue could not be resolved *or* minted. A
+    /// caller that gets `Err` should still stage — an in-memory stage that
+    /// might not survive a restart beats refusing to accept content that has
+    /// nowhere else to go — but must say so rather than implying durability.
+    fn ensure_drift_queue_persistence(&self) -> Result<(), String> {
+        if self.drift_router().read().has_persistence() {
+            return Ok(());
+        }
+        let queue_ctx = crate::drift::ensure_drift_queue_context(
+            self.drift_router(),
+            self.block_store(),
+            self.kernel_db(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.drift_router()
+            .write()
+            .attach_persistence(self.block_store().clone(), queue_ctx);
+        Ok(())
+    }
+
     fn ensure_lost_found_context(&self) -> Result<ContextId, String> {
         // 1. Router cache — cheap, and correct once this process has resolved
         //    lost+found at least once.

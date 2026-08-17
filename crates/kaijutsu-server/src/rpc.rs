@@ -2043,29 +2043,28 @@ pub async fn create_shared_kernel(
         }
     }
 
-    // Give the drift router its durable backing, then rebuild the queue from
-    // it (docs/drifting-dead-letters.md, slice 3). Until this runs the router
-    // is in-memory-only and a restart silently discards every staged item and
-    // every dead letter — which is the bug slice 3 exists to fix, so the
-    // mechanism being attached is not optional in a real kernel even though
-    // `attach_persistence` is optional in the type.
+    // Re-adopt the persisted drift queue and rebuild the cursor from it
+    // (docs/drifting-dead-letters.md, slice 3). **Adopt-only, never mint** —
+    // exactly like the lost+found arm above, and for the same reason: a
+    // brand-new kernel has never drifted, so minting the queue context here
+    // would put an infrastructure context in `list_active_contexts` before
+    // anything needed it. That is visible to `kj context list`, to the ring
+    // rank, and to an ACP client's session list. Minting stays lazy, on the
+    // first `stage` that needs somewhere durable to put an item
+    // (`KjDispatcher::ensure_drift_queue_persistence`, mirroring
+    // `ensure_lost_found_context`).
     //
-    // Ordering matters and is the whole point: attach, THEN rehydrate, and
-    // both before this kernel serves any traffic. `rehydrate_from_block_log`
-    // REPLACES the cursor wholesale rather than merging, which is correct
-    // for exactly this cold-start call and wrong anywhere else.
+    // Ordering matters within this arm: attach, THEN rehydrate.
+    // `rehydrate_from_block_log` REPLACES the cursor wholesale rather than
+    // merging, which is correct for exactly this cold-start call and wrong
+    // anywhere else.
     //
-    // Failure here is loud and non-fatal, matching the lost+found arm above:
-    // a kernel that cannot durably queue drift is still a kernel worth
-    // starting (every other subsystem works, and drift degrades to the
-    // pre-slice-3 in-memory behavior), but nobody should have to infer that
-    // from later symptoms.
-    match kaijutsu_kernel::drift::ensure_drift_queue_context(
-        kernel_arc.drift(),
-        &documents,
-        &kernel_db_arc,
-    ) {
-        Ok(queue_ctx) => {
+    // Bound to a `let` before the `match` for the same lock-ordering reason
+    // the lost+found lookup above documents: matching directly on the guard
+    // would hold the KernelDb mutex across `drift().write()`.
+    let drift_queue = kernel_db_arc.lock().well_known_context(WellKnownRole::DriftQueue);
+    match drift_queue {
+        Ok(Some(queue_ctx)) => {
             let mut drift = kernel_arc.drift().write();
             drift.attach_persistence(documents.clone(), queue_ctx);
             match drift.rehydrate_from_block_log() {
@@ -2075,6 +2074,10 @@ pub async fn create_shared_kernel(
                     drift.staged_len(),
                     drift.dead_letters().len(),
                 ),
+                // Loud and non-fatal, matching the lost+found arm: a kernel
+                // that cannot rebuild its drift cursor is still worth
+                // starting, but nobody should have to infer the loss from
+                // later symptoms.
                 Err(e) => log::warn!(
                     "drift queue attached to context {} but rehydrate failed — prior staged \
                      items and dead letters are NOT recovered this boot: {}",
@@ -2083,10 +2086,13 @@ pub async fn create_shared_kernel(
                 ),
             }
         }
+        // No row yet: nothing has ever drifted on this kernel, so there is
+        // nothing to recover and nothing to mint. The first stage attaches.
+        Ok(None) => {}
         Err(e) => {
             log::warn!(
-                "failed to resolve the durable drift-queue context — drift stays in-memory only \
-                 and a restart will discard staged items and dead letters: {}",
+                "failed to read the well-known drift queue from KernelDb — drift stays \
+                 in-memory only until the next stage attaches it: {}",
                 e
             );
         }
