@@ -8,13 +8,22 @@
 # wrong answer in the first draft of this script, and two of them look like
 # working shell. Do not "simplify" them back:
 #
-#   1. `x="$(cmd)" || x="FALLBACK"` NEVER FIRES. A command-substitution
-#      assignment always reports success (kaish `Stmt::Assignment` returns
-#      success unconditionally), so the `||` branch is dead code. The first
-#      draft used it for every probe, which made `signal` unreachable — this
-#      script would have logged "no turn requested" forever while looking
-#      healthy. Capture `rc=$?` on the NEXT line instead. (`if x="$(cmd)";
-#      then` is not an escape hatch either — that is a parse error.)
+#   1. `x="$(cmd)" || x="FALLBACK"` — **FIXED in kaish as of 2026-08-17, and
+#      the `rc=$?` idiom below is KEPT ANYWAY.** For most of this script's
+#      life the `||` never fired: a command-substitution assignment reported
+#      success unconditionally, so the branch was dead code. The first draft
+#      used it for every probe, which made `signal` unreachable — this script
+#      would have logged "no turn requested" forever while looking healthy.
+#      kaish now takes the status of the last substitution performed (POSIX
+#      semantics, verified), so `||` works.
+#      **Why the code below still uses `rc=$?` on the next line:** it is
+#      correct on both old and new kaish, and this rc script runs on whatever
+#      kaish the kernel was built against — which right now is a local `path`
+#      dep, not a release. Rewriting to `||` would make the script silently
+#      wrong again the moment anyone builds against a published 0.14.x.
+#      Revisit only once a kaish release carrying the fix is the pinned
+#      dependency. (`if x="$(cmd)"; then` is still not an escape hatch — that
+#      remains a parse error.)
 #   2. Bare numeric tokens lose their leading zero in `case`/`for`, so
 #      `case "$hour" in 00|01)` cannot match `date '+%H'` output. Quoting
 #      fixes it, but numeric comparison says what we mean and has no

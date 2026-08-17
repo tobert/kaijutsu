@@ -6536,8 +6536,6 @@ dependencies = [
 [[package]]
 name = "kaish-glob"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca46877cd7054bab96febfd74cbbee5171117aeefe3e9f45225d76d149e5b58c"
 dependencies = [
  "async-trait",
  "ignore",
@@ -6548,8 +6546,6 @@ dependencies = [
 [[package]]
 name = "kaish-help"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86524376f903577c9662191da4b332d6252fa4b537c9c836161c96283713df6e"
 dependencies = [
  "kaish-types",
 ]
@@ -6557,8 +6553,6 @@ dependencies = [
 [[package]]
 name = "kaish-kernel"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c5acec8d7d4a6ddb8d2073cb46fd2e2c073ef1312de9e26e6453173edb90cb8"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -6599,14 +6593,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
+ "unicode-ident",
+ "unicode-normalization",
  "unicode-width 0.2.2",
 ]
 
 [[package]]
 name = "kaish-tool-api"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fc289a868ae84be26ae734f009c6c9d74730398605fbd589ca0ed69af68b3c5"
 dependencies = [
  "async-trait",
  "clap",
@@ -6616,8 +6610,6 @@ dependencies = [
 [[package]]
 name = "kaish-types"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff88d6ba8a63a0f86bfe2042dbedd6f619eacb8180642f894a839984db83c2d8"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -6630,8 +6622,6 @@ dependencies = [
 [[package]]
 name = "kaish-vfs"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be31036c668524eda6cdf449ec9b7584c83c2632359f5bb9f6122fa7ac998be4"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",

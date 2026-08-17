@@ -903,19 +903,39 @@ mod tests {
             "a successful substitution must keep its value; got: {ok}"
         );
 
-        // The BROKEN idiom, pinned as currently-divergent. See the doc comment:
-        // when kaish learns POSIX assignment status, this flips and should be
-        // updated deliberately.
-        let dead = run(
+        // **FIXED — this canary fired 2026-08-17 and is now flipped.** It used
+        // to assert `[]`, pinning kaish's long-standing divergence: a bare
+        // assignment returned success unconditionally, so `||` never saw the
+        // substitution's failure and declined to fire. The test carried
+        // instructions for exactly this moment and they were followed.
+        //
+        // The fix arrived when kaijutsu linked against the kaish lead's
+        // integration worktree (`integration/kaijutsu-preview`, rev
+        // `21642871…`). Verified against the POSIX reference semantics this
+        // project probed in bash and recorded — a bare assignment takes the
+        // status of the LAST command substitution performed, or 0 if none:
+        //
+        //   false; x=5              rc=0   not stale; no substitution ran
+        //   x="$(false)$(true)"     rc=0   \ last wins — decisively NOT
+        //   x="$(true)$(false)"     rc=1   / "any failed"
+        //   x=$(false) true         rc=0   has a command NAME, so it's that
+        //
+        // All four match. The two middle rows are the ones that are easy to
+        // get wrong from memory, so they are the ones worth having checked.
+        //
+        // **If this ever asserts `[]` again, the dependency moved BACKWARD** —
+        // most likely someone reverted the `path` dep to a crates.io `"0.14"`
+        // before 0.15 was actually released. That is a real regression signal,
+        // not a test to relax.
+        let fixed = run(
             r#"v="$(cat /definitely/not/here)" || v="READ-FAIL"; echo "[$v]""#,
         )
         .await;
         assert!(
-            dead.contains("[]"),
-            "kaish currently does NOT fire `||` after a command-substitution \
-             assignment. If this now reports READ-FAIL the bug was fixed — good; \
-             update this test and the trap comments in \
-             assets/defaults/rc/assistant/tick/S10-checkin.kai. Got: {dead}"
+            fixed.contains("[READ-FAIL]"),
+            "`||` after a command-substitution assignment must fire — fixed in the \
+             linked kaish. Getting `[]` means the kaish dependency regressed to a \
+             version predating the fix. Got: {fixed}"
         );
 
         // Quiet-hours arithmetic: `date '+%H'` is zero-padded, and bare numeric

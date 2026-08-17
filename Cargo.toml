@@ -62,12 +62,37 @@ claude-code-peer = { path = "crates/claude-code-peer" }
 # `subprocess` compiles in host external-command execution; whether a given
 # shell may actually use it is decided per-context at materialization
 # (ExternalExec, gated on the `exec` loadout authority — deny by default).
-# All four ride crates.io again: 0.14 carries the overlay-opt-in kaish-help
-# (`Selector::without_overlay`) that kept us on a git rev through 0.13.
-kaish-kernel = { version = "0.14", features = ["subprocess"] }
-kaish-glob = "0.14"
-kaish-types = "0.14"
-kaish-help = "0.14"
+# TEMPORARY `path` DEPS — Amy, 2026-08-17: *"let's link against local kaish for
+# now, we'll switch back when 0.15 ships."*
+#
+# Pointing at the kaish lead's integration worktree, which merges `main` plus
+# six queued branches (#350 frame-stack, #352 parser-properties, #349
+# unicode-names, #351 name-class-xid, #348 error-presentation, docs/voice-guidance)
+# plus the mid-word-`#` comment fix. Built for exactly this while GitHub's API is
+# down and `main` cannot be merged to.
+#
+# **Developed against kaish rev `21642871a73a413e5af5a54db24dd0a71f464bc2`**
+# (branch `integration/kaijutsu-preview`). Recorded here because a `path` dep
+# pins NOTHING — it follows whatever the working tree holds. The kaish lead has
+# committed to append-only history on that branch while we are linked, and to
+# message before retiring it.
+#
+# Why this over the crates.io pin: the confirmation gate (docs/gate-and-shell-split.md
+# Slice 4) needs `plan_program` *and* the heredoc surface (`expand_fragment` /
+# `PlannedHeredoc`) to render an honest prompt. On 0.14.1 a heredoc body is
+# unrenderable, so a crates.io pin would have meant writing a throwaway
+# heredoc-refusal path and then deleting it.
+#
+# **What this costs, so it gets undone.** `6ebb0a8b` deliberately removed the
+# last git source from `Cargo.lock`. A `path` dep is worse than a git rev in one
+# way: a git rev resolves for anyone who clones, a path resolves only on a
+# machine holding that worktree. **This makes the workspace unbuildable on
+# moltar and the MacBook.** Revert to a crates.io pin when 0.15 ships — that is
+# a standing trigger, not a nice-to-have.
+kaish-kernel = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-kernel", features = ["subprocess"] }
+kaish-glob = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-glob" }
+kaish-types = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-types" }
+kaish-help = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-help" }
 
 # Cap'n Proto
 capnp = "0.25"
