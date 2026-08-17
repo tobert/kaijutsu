@@ -6,6 +6,58 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The short block id we just made acceptable is unusable unquoted, because kaish eats `#` (2026-08-17)
+
+**Found by probing the live kernel right after shipping the fix — the unit
+tests could not catch it, because they call the dispatcher directly and never
+cross kaish's tokenizer.**
+
+`kj block read` now accepts `<principal8>#<seq>`, the short form `kj block
+list` prints, specifically so a listed id can be pasted straight back
+("a tool's output should be accepted as that tool family's input"). Live:
+
+```
+$ kj block read 2d25fb02#3
+kj block read: malformed id '2d25fb02' (expected context_hex_principal_hex_seq, …)
+
+$ kj block read "2d25fb02#3"
+    1  (no hooks registered)          # works
+```
+
+Note the error names `'2d25fb02'` — **kaish stripped `#3` before `kj` ever saw
+the argument.** So the paste-it-back workflow the fix exists for still does not
+work, and the error message points the finger at `kj`.
+
+Measured, with a POSIX control (full repro filed for the kaish lane in
+`~/exomemory/issues/kaish.md`): kaish treats `#` as a comment start **mid-word**
+— `abc#3` becomes `abc`, where bash and `/bin/sh` both yield the literal
+`abc#3` — and it discards the rest of the **line**, including `;`-separated
+commands, silently at exit 0.
+
+**So this is two problems and they need different fixes.** kaish's tokenizer is
+kaish's to fix and is filed there. Ours is that **we chose a display delimiter
+that our own shell cannot pass through**, and `kj` runs inside kaish, so that
+makes the display form wrong regardless of what kaish does next.
+
+Options, for Amy:
+
+1. **Change the delimiter** to something kaish passes through — `2d25fb02:3` or
+   `2d25fb02.3`. This is the real fix: it makes paste-back work unquoted, today,
+   without waiting on kaish. Costs a user-visible form change, and `#` reads
+   naturally as "number."
+2. **Print the id quoted** in `kj block list` (`"2d25fb02#3"`). Honest and
+   immediate, but ugly in a table, and a user retyping without the quotes still
+   fails.
+3. **Keep `#` and improve the error only** — detect a bare 8-hex prefix with no
+   `#seq` and say "`#` starts a comment in kaish; quote the id." Cheapest, and
+   leaves the papercut in place.
+
+Option 3 is worth doing **regardless of which of 1/2 is chosen**, because a
+bare-prefix argument is otherwise indistinguishable from a typo, and today's
+message actively misleads.
+
+---
+
 ## Flaky: `test_ordering_stress_100_bisections` put a Middle block first, once (2026-08-17)
 
 `blocks::block_store::tests::test_ordering_stress_100_bisections` failed once
