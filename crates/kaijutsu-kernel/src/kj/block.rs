@@ -347,9 +347,25 @@ impl KjDispatcher {
         }
 
         let Some((prefix, seq_str)) = id_str.split_once('#') else {
+            // A bare 8-hex word with no `#seq` is almost always the kaish
+            // comment trap, not a typo: kaish starts a comment at a `#` even
+            // MID-WORD, so `kj block read 2d25fb02#3` arrives here as the
+            // truncated `2d25fb02` and the `#3` is gone before kj ever runs
+            // (probed live 2026-08-17 against 0.14.1; bash and /bin/sh both
+            // pass `abc#3` through intact). Without this hint the message
+            // names a value the user never typed, so a shell problem reads as
+            // a kj bug. See docs/issues.md.
+            if prefix_looks_like_a_principal_short(id_str) {
+                return Err(format!(
+                    "malformed id '{id_str}': looks like a short id whose '#<seq>' was \
+                     stripped — kaish treats '#' as a comment even mid-word, so quote it: \
+                     kj block read \"{id_str}#<seq>\""
+                ));
+            }
             return Err(format!(
                 "malformed id '{id_str}' (expected context_hex_principal_hex_seq, \
-                 or the short <principal8>#<seq> form `kj block list` prints)"
+                 or the short <principal8>#<seq> form `kj block list` prints — \
+                 quote it, since kaish eats an unquoted '#')"
             ));
         };
         let Ok(seq) = seq_str.parse::<u64>() else {
@@ -1340,6 +1356,18 @@ pub(crate) fn short_key(id: &kaijutsu_types::BlockId) -> String {
     format!("{}#{}", id.principal_id.short(), id.seq)
 }
 
+/// Does this bare word look like the `<principal8>` half of a short block id
+/// that lost its `#<seq>`?
+///
+/// `PrincipalId::short()` is exactly 8 lowercase hex chars, so a bare word of
+/// that shape arriving where a full id was expected is overwhelmingly the kaish
+/// mid-word-comment trap rather than a typo — see `resolve_block_id`. Kept
+/// deliberately narrow: only an exact 8-char all-hex word qualifies, so a
+/// genuine typo still gets the generic message.
+fn prefix_looks_like_a_principal_short(word: &str) -> bool {
+    word.len() == 8 && word.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn first_line_trunc(s: &str, max: usize) -> String {
     let one_line = s.lines().next().unwrap_or("").to_string();
     if one_line.chars().count() <= max {
@@ -1736,6 +1764,26 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// A bare 8-hex word is the kaish mid-word-comment trap, and the error has
+    /// to say so.
+    ///
+    /// `kj block read 2d25fb02#3` reaches kj as `2d25fb02` — kaish starts a
+    /// comment at a `#` even mid-word and drops the rest of the line (probed
+    /// live 2026-08-17 on 0.14.1; bash and `/bin/sh` both pass `abc#3`
+    /// through). The old message named `'2d25fb02'`, a value the user never
+    /// typed, so a shell problem read as a kj bug. This is the one part of that
+    /// papercut that is worth fixing regardless of whether the display
+    /// delimiter changes.
+    #[test]
+    fn bare_hex_prefix_error_names_the_kaish_comment_trap() {
+        assert!(prefix_looks_like_a_principal_short("2d25fb02"));
+        // Narrow on purpose: a genuine typo gets the generic message.
+        assert!(!prefix_looks_like_a_principal_short("2d25fb0"), "7 chars");
+        assert!(!prefix_looks_like_a_principal_short("2d25fb023"), "9 chars");
+        assert!(!prefix_looks_like_a_principal_short("2d25fb0z"), "not hex");
+        assert!(!prefix_looks_like_a_principal_short(""), "empty");
     }
 
     /// Short-id resolution scopes to the caller's current context and
