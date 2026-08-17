@@ -27,10 +27,12 @@
 //! rehydrated from SQLite at `Broker::set_db` (`mcp/broker.rs:318`), so a
 //! self-lockout survives the restart that undoes it for every other admin
 //! instance. This comment claimed the opposite ("hooks are in-memory") from
-//! before persistence landed; corrected 2026-08-12. There is no `kj hook`
-//! CLI, so the only recovery today is editing kernel SQLite by hand — which
-//! the project's own rule forbids. Tracked in `docs/issues.md` (hook
-//! self-lockout); `hooks_admin_is_subject_to_hooks` pins the behaviour.
+//! before persistence landed; corrected 2026-08-12. `hooks_admin_is_subject_to_hooks`
+//! pins the behaviour. Recovery: `kj hook remove <id>` (`kj/hook.rs`,
+//! `docs/gate-and-shell-split.md` Slice 1) talks to `Broker::persist_hook_delete`
+//! and the in-memory `HookTables` directly, never through `Broker::call_tool`/
+//! `evaluate_phase` — so it is unaffected by the very lockout it exists to
+//! undo. No hand-editing kernel SQLite required anymore.
 //!
 //! Holds `Weak<Broker>` to avoid the Arc-cycle.
 

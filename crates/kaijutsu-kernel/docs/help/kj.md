@@ -86,6 +86,9 @@ drive           Clock one autonomous turn on a context (--prompt)
 editor          open, keys, state, save, quit, list — kernel-owned vi editor sessions
 fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
+hook            list, show, remove, add — broker hook tables, direct (never
+                through hook evaluation); the recovery path for a self-inflicted
+                PreCall Deny("*") lockout
 kaish           primer — composed kaish agent-onboarding guidance (kaish-help);
                 what S05-kaish.kai turns into a per-context system block
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,

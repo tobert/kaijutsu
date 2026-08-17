@@ -31,6 +31,7 @@ pub mod drive;
 pub mod fork;
 pub mod format;
 pub mod gate;
+pub mod hook;
 pub mod kaish;
 pub mod mcp;
 pub mod midi;
@@ -508,6 +509,17 @@ impl KjDispatcher {
         if cmd == "mcp" {
             return self.dispatch_mcp(&argv[1..], caller).await;
         }
+        // `kj hook` administers the broker's hook tables directly
+        // (`Broker::persist_hook_insert`/`persist_hook_delete` + the
+        // in-memory `HookTables`), never through `Broker::call_tool`/
+        // `evaluate_phase` — the recovery path for a self-inflicted
+        // `PreCall Deny("*")` lockout that would otherwise deny
+        // `builtin.hooks`' own admin tools (`docs/gate-and-shell-split.md`
+        // Slice 1). Broker-wide, not scoped to any context — same
+        // exemption rationale as `kj mcp`/`kj policy`.
+        if cmd == "hook" {
+            return self.dispatch_hook(&argv[1..], caller).await;
+        }
         // `kj search` accepts --context ref or --all, no active context
         // required. Same exemption rationale as `kj block`.
         if cmd == "search" {
@@ -898,6 +910,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(binding::BindingArgs::command())
         .subcommand(policy::PolicyArgs::command())
         .subcommand(mcp::McpArgs::command())
+        .subcommand(hook::HookArgs::command())
         .subcommand(search::SearchArgs::command())
         .subcommand(doc::DocArgs::command())
         .subcommand(attach::AttachArgs::command())
