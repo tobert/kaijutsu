@@ -71,11 +71,19 @@ claude-code-peer = { path = "crates/claude-code-peer" }
 # plus the mid-word-`#` comment fix. Built for exactly this while GitHub's API is
 # down and `main` cannot be merged to.
 #
-# **Developed against kaish rev `21642871a73a413e5af5a54db24dd0a71f464bc2`**
+# **Developed against kaish rev `cf106d62a15163d8809d46615baff8662394984c`**
 # (branch `integration/kaijutsu-preview`). Recorded here because a `path` dep
 # pins NOTHING — it follows whatever the working tree holds. The kaish lead has
 # committed to append-only history on that branch while we are linked, and to
-# message before retiring it.
+# message before retiring it; `21642871…` (the rev we first linked at) is
+# verified an ancestor of this one.
+#
+# **This line has already gone stale once, which is the point of having it.** We
+# linked at `21642871…`, the lead appended a merge on top, and the worktree moved
+# under us with nothing in the build to signal it — exactly the failure mode a
+# `path` dep invites. Re-read `git -C /home/atobey/src/wt/kaish-integration
+# rev-parse HEAD` and re-run the suite whenever you touch this; do not assume
+# the rev above is what you just built.
 #
 # Why this over the crates.io pin: the confirmation gate (docs/gate-and-shell-split.md
 # Slice 4) needs `plan_program` *and* the heredoc surface (`expand_fragment` /
