@@ -496,6 +496,120 @@ pub(crate) async fn run_gate(
     // undiscoverable at the same time. Publishing after the loop would
     // reproduce that exactly, telling everyone once it no longer matters.
     announce_ledger_change(db, ledger_flows);
+    // The waiter can vanish without warning, and tuning budgets will never
+    // stop that: a harness kills its hook on its own schedule (Claude Code
+    // at five seconds, Codex at three for `SessionEnd`), a user interrupts,
+    // a client disconnects, `Broker::call_tool` loses its cancellation race
+    // and drops this future mid-poll. Any of those leaves the row `pending`
+    // with nobody behind it — indistinguishable, in `kj ledger list`, from
+    // an ask someone is actually waiting on. A human would answer it and
+    // nothing would run, having been told that answering did something.
+    //
+    // So the signal is taken from the drop itself rather than from any one
+    // cancellation path. The guard does not need to know WHY the waiter
+    // left, which is the point: the ways to be killed are a moving target
+    // and this catches the ones nobody has thought of yet.
+    let mut guard = AbandonOnDrop::arm(db, request_id.clone(), ledger_flows);
+    let outcome = wait_for_decision(db, request_id, wait, ledger_flows).await;
+    guard.disarm();
+    outcome
+}
+
+/// Marks an ask `abandoned` if the wait is dropped before it reaches a
+/// terminal status.
+///
+/// `abandoned` is the ledger's word for "the caller stopped waiting" — a
+/// terminal state distinct from `expired` (the budget ran out while someone
+/// was still listening) and from `denied` (a decision). The status, its
+/// `EventKind`, and `decide::abandon` have existed since the ledger was
+/// written; nothing set them, so every killed call left a row that looked
+/// live.
+///
+/// Drop rather than a cancellation-token branch on purpose: a token catches
+/// the one path that carries it, and this catches every path, including the
+/// ones that are somebody else's process deciding to stop waiting.
+struct AbandonOnDrop<'a> {
+    db: &'a Arc<parking_lot::Mutex<KernelDb>>,
+    flows: &'a SharedLedgerFlowBus,
+    /// `None` once disarmed — the gate reached a terminal outcome itself and
+    /// this guard must not touch the row.
+    request_id: Option<String>,
+}
+
+impl<'a> AbandonOnDrop<'a> {
+    fn arm(
+        db: &'a Arc<parking_lot::Mutex<KernelDb>>,
+        request_id: String,
+        flows: &'a SharedLedgerFlowBus,
+    ) -> Self {
+        Self { db, flows, request_id: Some(request_id) }
+    }
+
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for AbandonOnDrop<'_> {
+    fn drop(&mut self) {
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        // Synchronous work in `Drop` is safe here and nowhere near a blocking
+        // hazard: `abandon` is one `UPDATE` behind a `parking_lot` mutex the
+        // poll loop was already taking every 250ms.
+        let row = {
+            let db = self.db.lock();
+            approval_ledger::decide::abandon(
+                db.conn_for_ledger(),
+                &request_id,
+                Some("the caller stopped waiting (cancelled, disconnected, or killed)"),
+            )
+        };
+        match row {
+            Ok(_) => {
+                tracing::debug!(
+                    target: "kaijutsu::gate",
+                    request_id = %request_id,
+                    "gate wait dropped; ask marked abandoned",
+                );
+                announce_ledger_change(self.db, self.flows);
+            }
+            // Losing to a concurrent answer is the ordinary race, not a
+            // fault: someone decided the ask in the same breath our caller
+            // left. The ledger keeps their decision (guarantee 6 refuses to
+            // move a terminal row) and the `late_decision` event records
+            // that this arrived after.
+            Err(approval_ledger::LedgerError::AlreadyDecided { .. }) => {
+                tracing::debug!(
+                    target: "kaijutsu::gate",
+                    request_id = %request_id,
+                    "gate wait dropped, but the ask was already decided; leaving it",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "kaijutsu::gate",
+                    request_id = %request_id,
+                    error = %e,
+                    "gate wait dropped and the ask could NOT be abandoned; it will sit \
+                     pending until it expires",
+                );
+            }
+        }
+    }
+}
+
+/// Poll the ledger until this ask reaches a terminal status or the budget
+/// elapses. Split out of [`run_gate`] so the abandon guard wraps exactly one
+/// await point and has exactly one place to disarm — a `return` added inside
+/// this loop cannot forget to.
+async fn wait_for_decision(
+    db: &Arc<parking_lot::Mutex<KernelDb>>,
+    request_id: String,
+    wait: Duration,
+    ledger_flows: &SharedLedgerFlowBus,
+) -> GateOutcome {
     let deadline = Instant::now() + wait;
     loop {
         {
@@ -1056,6 +1170,71 @@ mod tests {
         assert_eq!(outcome.verdict, GateVerdict::Unavailable);
         assert_eq!(outcome.ask.as_ref().unwrap().status, ApprovalStatus::Expired);
         assert!(start.elapsed() >= Duration::from_millis(400));
+    }
+
+    /// A caller that stops waiting must leave the ledger telling the truth.
+    ///
+    /// This is the harness-kill shape: something upstream gives up on its own
+    /// schedule and the gate future is simply dropped mid-poll. Before the
+    /// abandon guard the row stayed `pending`, so `kj ledger list` showed an
+    /// ask nobody was behind and a human answering it changed nothing.
+    #[tokio::test]
+    async fn a_dropped_gate_wait_abandons_its_ask() {
+        let d = short_gate_dispatcher().await;
+        let caller = test_caller();
+        let db = d.kernel_db.clone();
+        let flows = d.kernel.ledger_flows().clone();
+
+        // A budget far longer than this test, so expiry can never be the
+        // thing that made the row terminal.
+        let mut gate = Box::pin(run_gate(
+            &db,
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            Duration::from_secs(300),
+            &flows,
+        ));
+
+        // Let it commit the row and settle into the wait.
+        tokio::select! {
+            _ = &mut gate => panic!("the gate must still be waiting, not decided"),
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+
+        let request_id = {
+            let g = db.lock();
+            approval_ledger::ask::list_pending(g.conn_for_ledger())
+                .unwrap()
+                .first()
+                .expect("the ask is pending while the gate waits")
+                .request_id
+                .clone()
+        };
+
+        // The kill.
+        drop(gate);
+
+        let row = {
+            let g = db.lock();
+            approval_ledger::ask::get_approval(g.conn_for_ledger(), &request_id)
+                .unwrap()
+                .expect("the row outlives its waiter")
+        };
+        assert_eq!(
+            row.status,
+            ApprovalStatus::Abandoned,
+            "a dropped wait must abandon its ask, not leave it pending for a human to \
+             answer into nothing"
+        );
+
+        let pending = {
+            let g = db.lock();
+            approval_ledger::ask::list_pending(g.conn_for_ledger()).unwrap()
+        };
+        assert!(
+            pending.is_empty(),
+            "an abandoned ask must leave the pending list — that list is what a human reads"
+        );
     }
 
     /// The fault/verdict split, asserted at the seam it exists to protect.
