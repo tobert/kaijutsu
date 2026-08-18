@@ -6,6 +6,56 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
+
+Found live on toad during the same ACP smoke-test session as the P1 entry
+below. The `grep` tool returned "No matches found" for `^## `, for the literal
+substring `## SFTP` (known to exist), and for bare `##` with no anchor at all
+— against `docs/issues.md`, a real file in the repo. In the same turn, shell
+`grep -c '## ' docs/issues.md` returned `31` and the `read`/`builtin_file__read`
+tool paged the file's contents (with hashline prefixes) without issue. Same
+file, three tools, two different answers about whether it has content.
+
+The agent's own working theory (block `2d25fb02#31` of context `4895806b`):
+*"maybe the grep tool is document-aware and treats the pattern differently...
+maybe the grep tool searches a different view (document blocks) than the
+filesystem backend the read/shell tools see."* Plausible, not confirmed — this
+needs the same treatment as the shell_write entry: reproduce against the
+`grep` tool's actual implementation rather than reasoning from behavior. Worth
+noting against `docs/issues.md`'s own 2026-07-29 "Day-job coding readiness"
+entry, which characterizes `grep` as "document-aware" and "ahead of Claude
+Code's equivalents" (line ~2829) — that claim and this blind spot are not
+obviously reconcilable, and whichever is true should be checked, not assumed.
+Full transcript: `docs/kaijutsu-feedback.md`.
+
+## `kj block read`/`inspect`/`append`/`history` have no `-c`/`--context` flag, so cross-context reads silently resolve against the wrong context (2026-08-18)
+
+`kj block list` (`crates/kaijutsu-kernel/src/kj/block.rs:78-94`) and `kj block
+cat --latest` (`:133-147`) both take `-c`/`--context`. `Read` (`:117-126`),
+`Inspect` (`:96-102`), `Append` (`:148-155`), and `History` (`:156-159`) take
+none — a short id like `2d25fb02#67` always resolves against
+`caller.context_id`, the currently-attached context
+(`resolve_block_id`, `:340-378`), with no flag to point it elsewhere. The
+fully-qualified `context_hex_principal_hex_seq` form (`BlockId::from_key`,
+`:345-347`) does route around this, but nothing in the CLI ever hands you
+that id — `block list`'s own display only ever shows the short
+`<principal8>#<seq>` form, so there's no way to discover the qualifying
+context/principal hex short of already having a raw JSON blob (e.g. a
+`task_create` result) that happens to contain one.
+
+Found independently, twice, on 2026-08-18: by a second ACP context
+(`0d9765f5`) trying to read a dead sibling context's blocks to recover its
+findings, and by the Sonnet subagent that wrote this entry, doing the same
+thing. Both burned several tool calls on `-c` on `read`, on quoting/unquoting
+the `#`, and on the wrong-context short form, before landing on "switch
+context first, then read" as the only reliable path. The fix is either wiring
+`-c` through the remaining four verbs the same way `list`/`cat` already have
+it, or making `block list`'s short-id display resolvable on its own (print or
+accept the qualifying context prefix). Full transcript:
+`docs/kaijutsu-feedback.md`.
+
+---
+
 ## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18)
 
 **Live on toad, 11:00 today.** A turn died with the provider's own words:
@@ -53,30 +103,49 @@ boundary).
 
 ---
 
-## A gated `shell_write` from the LLM path appeared to run ungated (2026-08-18)
+## The ACP binary can silently outlive a wire change (2026-08-18)
 
-Same toad session, 10:57. The model called `shell_write` with
-`echo "canary" > /tmp/kaijutsu-canary.txt`; the kernel logged "Tool
-shell_write succeeded" nine seconds later, and the model concluded in its own
-task notes: *"shell_write canary wrote clean with zero hooks — verified no
-gate on the MCP write path"*.
+**This is what actually cost a morning**, and it is not a gate bug.
 
-That conclusion should be false. `llm_stream` dispatches through
-`dispatch_tool_via_broker_with_cancel`, the same broker path whose
-`ShellServer::call_tool` runs `run_gate` when `!self.read_only` — and a
-direct `execute_tool` call on the same kernel forty minutes earlier DID gate,
-held 81s, and returned only after `kj ledger allow`.
+Amy: *"I didn't see any gates in the ACP."* toad launches
+`target/debug/kaijutsu-acp` — a **build artifact**, not an installed binary.
+Hers was built 09:44; the wire retirement of `PermissionEvents` landed at
+09:46:45 and the kernel restarted onto it at 10:14. So the ACP process was
+still subscribing to a wire the kernel no longer served, its permission pump
+waiting on a channel nothing could feed. A gate could fire, post a real
+ledger row, and never reach the editor.
 
-So one of these is true and we do not yet know which:
-- the gate did run and something auto-allowed it (no rule could have existed
-  — `--remember` was not deployed until `e9c00d5f`), or
-- the LLM turn path reaches `shell_write` by a route that skips the gate, in
-  which case the gate is theatre for the caller it most exists to gate.
+Cap'n Proto made it quiet rather than loud: `subscribePermissionEvents @93`
+became `retired93 @93 ()`, and calling a retired method with extra params is
+tolerated. The feature just goes missing. Nothing logs "your client is
+older than this kernel."
 
-**Do not close this by reasoning.** Reproduce it: drive a `shell_write` from
-an LLM turn on a live kernel and check whether an `approvals` row appears.
-Nine seconds is the suspicious number — too slow for `echo`, far too fast for
-an unanswered gate.
+Worse, the resulting failure blamed the wrong component — toad reported
+*"Agent failed to run — check that the agent is installed... some agents
+require an ACP adapter"*, sending you to reinstall something that was fine.
+
+**Wanted: a version handshake at ACP connect that refuses a mismatched
+kernel, loudly, naming both sides.** We have the precedent — the kaish canary
+that fails loudly on a downgrade rather than letting silent-wrong behavior
+back in (`assets/defaults/rc/...`, and the `deps(kaish)` commits). One error
+line would have replaced a morning of ghost-hunting.
+
+Second-order: because it is a `target/debug` artifact, *any* `cargo build` in
+this checkout changes what toad launches next. Which ACP you get depends on
+when the editor last spawned versus what was last compiled. An installed
+binary with a version stamp would fix both halves.
+
+**Resolved on the way past — the gate DOES run from the LLM turn path.** The
+earlier worry that `shell_write` executed ungated was wrong. Reading the
+session's block log back found a real pending row for that exact canary
+(`origin: shell_gate`, `tool: builtin.shell_write.shell_write`) which Amy
+answered herself with `kj ledger allow`. The model's own `kj ledger list`
+probe came back empty moments earlier — run either before the ask posted or
+after she had answered it — and it wrote that silence down as *"verified no
+gate on the MCP write path"*, which the transcript does not support. Still
+unpinned: the exact ordering between the tool call returning and the ask
+appearing, since block sequence numbers order per-writer rather than by
+wall clock. Full reconstruction in `docs/kaijutsu-feedback.md`.
 
 ---
 
@@ -6550,6 +6619,17 @@ kernel process env into exec-granted shells.
   unknown-command investigation.)
 - **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
   host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
+- **Command availability backlog (2026-08-18, acp smoke test).** Agent shell
+  can't reach `git` or `hostname` ("command not found", exit 127) and the
+  workspace is a git checkout, so agents can't self-orient with `git
+  log`/`git status`. Backlog:
+  - **`git`** — in progress as a kaish-extras plugin; git is a plugin story,
+    not a core builtin. Track landing here.
+  - **`hostname`** — candidate kaijutsu core builtin; kernel knows
+    platform/context identity but nothing exposes a hostname.
+  - **Inventory next:** `which` (above), `uname`, `date`, `sleep` — decide
+    core builtin vs. kaish-extras plugin per command, and document which
+    external-style commands core kaish provides.
 - **`kj context list` registry/DB divergence — narrowed and partly shipped
   (2026-08-04, `register_session` upsert work).** Re-investigated while
   building `register_session`'s upsert/attach fix (was going to "heal the
