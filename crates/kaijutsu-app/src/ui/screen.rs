@@ -7,13 +7,14 @@
 //!
 //! ## Design
 //!
-//! Long-lived entities (containers, block cells) persist and are shown via
-//! Visibility on screen enter.
+//! The conversation's content is a single composited surface
+//! (`view::surface`) hanging off `ConversationRoot` — hiding/showing that one
+//! root is enough to hide/show the whole conversation, since Bevy UI
+//! `Visibility::Hidden` propagates to every descendant.
 
 use bevy::prelude::*;
 
 use super::state::ConversationRoot;
-use crate::cell::{BlockCell, RoleGroupBorder};
 
 /// Which full-viewport view is currently active.
 ///
@@ -67,7 +68,7 @@ impl Plugin for ScreenPlugin {
         // ── Conversation ──
         app.add_systems(
             OnEnter(Screen::Conversation),
-            (show_conversation_root, show_cell_text, set_focus_conversation),
+            (show_conversation_root, set_focus_conversation),
         );
 
         // ── Editor ──
@@ -82,7 +83,7 @@ impl Plugin for ScreenPlugin {
         // double-apply every keystroke to the hidden chat overlay.
         app.add_systems(
             OnEnter(Screen::Editor),
-            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+            (hide_conversation_root, set_focus_conversation),
         );
 
         // ── Diff ──
@@ -93,7 +94,7 @@ impl Plugin for ScreenPlugin {
         // Compose would double-apply them to the hidden chat overlay).
         app.add_systems(
             OnEnter(Screen::Diff),
-            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+            (hide_conversation_root, set_focus_conversation),
         );
 
         // ── Room ──
@@ -104,7 +105,7 @@ impl Plugin for ScreenPlugin {
         // there is no second screen for a station dive to enter any more.
         app.add_systems(
             OnEnter(Screen::Room),
-            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+            (hide_conversation_root, set_focus_conversation),
         );
 
         // ── Fsn ──
@@ -115,7 +116,7 @@ impl Plugin for ScreenPlugin {
         // in `view::fsn::scene`, not here — this only owns the chrome.
         app.add_systems(
             OnEnter(Screen::Fsn),
-            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+            (hide_conversation_root, set_focus_conversation),
         );
     }
 }
@@ -131,35 +132,9 @@ fn show_conversation_root(mut roots: Query<&mut Visibility, With<ConversationRoo
     }
 }
 
-/// Show block cells and role headers when entering conversation.
-fn show_cell_text(
-    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
-    mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
-) {
-    for mut vis in block_cells.iter_mut() {
-        *vis = Visibility::Inherited;
-    }
-    for mut vis in role_headers.iter_mut() {
-        *vis = Visibility::Inherited;
-    }
-}
-
 /// Hide the conversation root when leaving for a full-viewport screen.
 fn hide_conversation_root(mut roots: Query<&mut Visibility, With<ConversationRoot>>) {
     for mut vis in roots.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-}
-
-/// Hide block cells and role headers while a full-viewport screen owns it.
-fn hide_cell_text(
-    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
-    mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
-) {
-    for mut vis in block_cells.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-    for mut vis in role_headers.iter_mut() {
         *vis = Visibility::Hidden;
     }
 }

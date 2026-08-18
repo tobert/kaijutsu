@@ -6,6 +6,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Two features silently lost when the legacy conversation path was deleted (2026-08-18, found during slice 5)
+
+Slice 5 (decapitation, `docs/conversation-surface.md`) deleted the legacy
+per-block-cell path. Deleting its dead code turned two already-broken
+features into compiler-provable dead code — meaning both actually broke back
+in slice 4, when `Surface` became the default renderer, not today. Neither
+regression was caught because nothing failed loudly: the theme knob and the
+component still exist, they just reach no live system.
+
+- **Rainbow user-text effect** (`Theme::font_rainbow`, default **on**).
+  `text::components::{KjTextEffects, rainbow_brush}` were the legacy path's
+  plumbing for it (`view/block_render.rs`'s old `build_block_scenes`); the
+  conversation surface (`view::surface::content`) never grew an equivalent.
+  Kept `#[allow(dead_code)]` (not deleted) as the reference implementation.
+- **Timeline dimming** (`ui::timeline`, "blocks created after the viewing
+  position are hidden or dimmed"). `TimelineVisibility` was spawned and its
+  opacity applied by the legacy path; `ui::timeline::systems::update_block_visibility`
+  still runs and still updates the component, but nothing spawns
+  `TimelineVisibility` on anything any more and nothing reads its opacity
+  into a color — the system is a no-op over an empty query.
+
+Both need genuine design work to port (theme-driven color derivation and a
+visibility/opacity input both live at the wrong layer for the surface's
+entity-free content pipeline), not a one-line fix — noted here rather than
+built speculatively.
+
 ## Two visual-parity remainders on the conversation surface (2026-08-18)
 
 Slice 5 landed the chrome that is *glyphs* — the fieldset top/bottom captions
@@ -26,17 +52,9 @@ and the gutter inclusion checkbox (`view/surface/labels.rs`, the `label_gap`
   a nicety, not a hole.
 - **Focus does not recolor the captions.** Deliberate, and documented on
   `ShapedBlock::labels`: captions derive from the *unfocused* border style so
-  a j/k move never re-uploads a screenful of glyphs. Legacy behaves the same
-  way for a different reason (its labels only re-bake on a content-version
-  bump), so this is parity in practice, not a divergence to fix.
+  a j/k move never re-uploads a screenful of glyphs.
 
-Also noted while porting: legacy gives a bordered block `width: 100%` *plus* a
-`glow_radius * 0.5` margin per side (`view/render.rs:352-359`), so the node
-overflows its own column and the pane's clip cuts the right border. The surface
-lays the box out symmetrically instead, which is a real (small) wrap-width
-difference between the two paths on bordered blocks.
-
-## The gutter checkbox is a tofu box on both render paths (2026-08-18)
+## The gutter checkbox is a tofu box (2026-08-18)
 
 `☑` (U+2611) and `☐` (U+2610) are **not in NotoMono-Regular**, and nothing in
 the shaping stack falls back for them: both shape to `glyph_id: 0` — the
@@ -46,17 +64,18 @@ moltar, and visible in a screenshot as a small hollow rectangle in the right
 gutter of every block.
 
 So the inclusion indicator is currently distinguishable **only by alpha**
-(0.3 included / 0.5 excluded) — the two states draw the identical mark.
-This predates the surface port: legacy shapes the same two characters through
-the same font, so `KAIJUTSU_CONV_SURFACE=0` shows the same box. The surface
-port preserved it deliberately rather than diverging on a font question.
+(0.3 included / 0.5 excluded) — the two states draw the identical mark. This
+predates the surface port (the same two characters through the same font
+produced the same tofu on the old per-block-cell path too, before it was
+deleted); the port preserved it deliberately rather than diverging on a font
+question.
 
 Three ways out, none of them obviously right: substitute ASCII (`[x]`/`[ ]`)
-in `view::surface::labels::checkbox_char` and its legacy twin; ship a symbol
-font and teach the fallback chain about it; or draw the checkbox as an SDF
-quad in the chrome pass (`block_fx.wgsl` already has a gutter-indicator flag
-that draws a dot/ring — `text_glow_params.y` — which the surface did not
-port). Amy's call.
+in `view::surface::labels::checkbox_char`; ship a symbol font and teach the
+fallback chain about it; or draw the checkbox as an SDF quad in the chrome
+pass (`block_fx.wgsl` already has a gutter-indicator flag that draws a
+dot/ring — `text_glow_params.y` — which the surface did not port). Amy's
+call.
 ## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
 
 Found live on toad during the same ACP smoke-test session as the P1 entry
@@ -6846,9 +6865,6 @@ class of ungated per-frame work the slice was killing:
   ids.to_vec()` records the skipped id as present, so no gate (old ids-walk
   or new store-generation) ever sees a change — the block gets no row until
   the doc version moves for some other reason.
-- **`sync_block_cell_buffers`' `needs_update` pre-check** walks every
-  container entity (`block_cells.get(e)`) each frame before deciding to do
-  nothing.
 - **`sync_conversation_geometry` calls `recompute_offsets()` through
   `Mut<_>` unconditionally**, marking `ConversationGeometry` changed every
   frame. Nothing consumes `Changed<ConversationGeometry>` today (verified),

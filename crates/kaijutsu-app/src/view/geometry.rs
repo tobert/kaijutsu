@@ -9,10 +9,10 @@
 //! - Rows are seeded with an **estimated** height ([`estimate_block_height`])
 //!   when first seen, so first load of a long conversation never pays an
 //!   O(N) layout pass (`measured_version == 0` marks an estimate).
-//! - A row's height is replaced by the **measured** height when its entity is
-//!   laid out (`readback_block_heights` calls [`ConversationGeometry::measure`]).
-//!   Measured heights survive entity despawn — scrolling back re-seeds the
-//!   respawned entity from here instead of re-estimating.
+//! - A row's height is replaced by the **measured** height when its shaping
+//!   lands (`apply_shaped_measurements` calls [`ConversationGeometry::measure`]).
+//!   Measured heights survive cache eviction — scrolling back re-shapes the
+//!   block but the document never moves under the reader.
 //! - Reconciliation is gated on the document version and touches the block
 //!   store only for rows it has never seen (`seed_fn` per NEW id) — never a
 //!   full `editor.blocks()` snapshot clone.
@@ -67,11 +67,19 @@ pub struct GeomRow {
     pub kind: BlockKind,
     /// Whether the block rendered collapsed at seed time.
     pub collapsed: bool,
-    /// Indent level (parent nesting), mirrored to `BlockCellLayout`.
+    /// Indent level (parent nesting).
     pub indent_level: u32,
-    /// Document version when this row was first created. Persisted here so a
-    /// despawned block's `TimelineVisibility.created_at_version` survives
-    /// respawn (timeline dimming would otherwise mis-classify it as new).
+    /// Document version when this row was first created.
+    ///
+    /// Currently write-only: it fed `TimelineVisibility.created_at_version`
+    /// seeding in the legacy per-block-cell path (block-cell entities carried
+    /// the timeline-dimming component; a respawned/scrolled-back-into-view
+    /// block reused this to avoid being mis-classified as new), which slice 5
+    /// deleted. The conversation surface never grew an equivalent — timeline
+    /// dimming has had no live reader since `Surface` became the default
+    /// (slice 4); see `docs/issues.md`. Kept because it costs nothing to
+    /// carry and is what a reimplementation would read from first.
+    #[allow(dead_code)]
     pub created_at_version: u64,
 }
 
@@ -154,10 +162,11 @@ pub fn estimate_block_height(
 
 /// Document-order logical geometry for one conversation column.
 ///
-/// Lives beside `BlockCellContainer` on the main cell entity. The single
-/// writer of row *structure* is [`ConversationGeometry::reconcile`]
+/// Lives on the main cell entity (`MainCell`). The single writer of row
+/// *structure* is [`ConversationGeometry::reconcile`]
 /// (`sync_conversation_geometry`); heights are refined by
-/// [`ConversationGeometry::measure`] (`readback_block_heights`).
+/// [`ConversationGeometry::measure`], called from the surface path's Measure
+/// set (`view::surface::shape_cache::apply_shaped_measurements`).
 #[derive(Component, Debug, Default)]
 pub struct ConversationGeometry {
     rows: Vec<GeomRow>,
@@ -348,9 +357,9 @@ impl ConversationGeometry {
                 }
             };
 
-            // Role header derivation — same rules as
-            // `interleave_blocks_and_headers` / `sync_role_headers`: tool
-            // blocks neither carry nor break a role run.
+            // Role header derivation — same rules the surface path's chrome
+            // pass reads off these rows: tool blocks neither carry nor break
+            // a role run.
             let is_tool = matches!(block_row.kind, BlockKind::ToolCall | BlockKind::ToolResult);
             if !is_tool {
                 if prev_role != Some(block_row.role) {
@@ -522,108 +531,14 @@ impl ConversationGeometry {
 }
 
 // ============================================================================
-// ENTITY BAND PLANNING
+// ROW EVICTION MARGIN
 // ============================================================================
 
-/// How far past the viewport (in screens) rows keep/get entities. Spawn
-/// inside ±[`SPAWN_MARGIN_SCREENS`]; despawn only beyond
-/// ±[`DESPAWN_MARGIN_SCREENS`]. The gap between them is hysteresis so a row
-/// sitting at a band edge doesn't thrash spawn/despawn while scrolling.
-/// Virtualize's show window (±1 screen) sits inside the spawn band, so a
-/// row always has an entity — and a rendered texture — before it can
-/// become visible.
-pub const SPAWN_MARGIN_SCREENS: f32 = 2.0;
+/// How far past the viewport (in screens) a row's shaped state is pinned
+/// against LRU eviction (`view::surface::shape_cache`). Rows outside this
+/// margin may be evicted (their measured height in the geometry row stays
+/// put; only the cached glyphs go) and re-shaped on approach.
 pub const DESPAWN_MARGIN_SCREENS: f32 = 4.0;
-
-/// A band plan: which block rows need entities spawned, and which existing
-/// entities should be despawned to reclaim their render resources.
-#[derive(Debug, Default, PartialEq)]
-pub struct BandPlan {
-    pub to_spawn: Vec<BlockId>,
-    pub to_despawn: Vec<BlockId>,
-}
-
-/// Decide entity existence for every block row against the viewport band.
-///
-/// `viewport_height <= 0` (first frames, before the container is measured)
-/// falls back to one nominal screen so a fresh conversation still spawns
-/// its initial window instead of nothing.
-///
-/// `exempt` (the focused block) is never despawned: focus survives
-/// scrolling away, and the `FocusedBlockCell` marker rides the entity.
-pub fn plan_block_band(
-    rows: &[GeomRow],
-    has_entity: impl Fn(&BlockId) -> bool,
-    viewport_top: f32,
-    viewport_height: f32,
-    exempt: Option<BlockId>,
-) -> BandPlan {
-    let vh = if viewport_height > 0.0 {
-        viewport_height
-    } else {
-        600.0
-    };
-    let spawn_top = viewport_top - SPAWN_MARGIN_SCREENS * vh;
-    let spawn_bottom = viewport_top + vh + SPAWN_MARGIN_SCREENS * vh;
-    let keep_top = viewport_top - DESPAWN_MARGIN_SCREENS * vh;
-    let keep_bottom = viewport_top + vh + DESPAWN_MARGIN_SCREENS * vh;
-
-    let mut plan = BandPlan::default();
-    for row in rows {
-        let RowKey::Block(id) = row.key else {
-            continue;
-        };
-        let bottom_edge = row.y_offset + row.height + row.margin_bottom;
-        let in_spawn = bottom_edge >= spawn_top && row.y_offset <= spawn_bottom;
-        let in_keep = bottom_edge >= keep_top && row.y_offset <= keep_bottom;
-        let exists = has_entity(&id);
-
-        if in_spawn && !exists {
-            plan.to_spawn.push(id);
-        } else if !in_keep && exists && Some(id) != exempt {
-            plan.to_despawn.push(id);
-        }
-    }
-    plan
-}
-
-/// Header-row variant of [`plan_block_band`]: same bands, but spawn entries
-/// carry the role the header renders. Headers have no focus exemption.
-pub fn plan_header_band(
-    rows: &[GeomRow],
-    has_entity: impl Fn(&BlockId) -> bool,
-    viewport_top: f32,
-    viewport_height: f32,
-) -> (Vec<(Role, BlockId)>, Vec<BlockId>) {
-    let vh = if viewport_height > 0.0 {
-        viewport_height
-    } else {
-        600.0
-    };
-    let spawn_top = viewport_top - SPAWN_MARGIN_SCREENS * vh;
-    let spawn_bottom = viewport_top + vh + SPAWN_MARGIN_SCREENS * vh;
-    let keep_top = viewport_top - DESPAWN_MARGIN_SCREENS * vh;
-    let keep_bottom = viewport_top + vh + DESPAWN_MARGIN_SCREENS * vh;
-
-    let mut to_spawn = Vec::new();
-    let mut to_despawn = Vec::new();
-    for row in rows {
-        let RowKey::Header(id) = row.key else {
-            continue;
-        };
-        let bottom_edge = row.y_offset + row.height + row.margin_bottom;
-        let in_spawn = bottom_edge >= spawn_top && row.y_offset <= spawn_bottom;
-        let in_keep = bottom_edge >= keep_top && row.y_offset <= keep_bottom;
-        let exists = has_entity(&id);
-
-        if in_spawn && !exists {
-            to_spawn.push((row.role, id));
-        } else if !in_keep && exists {
-            to_despawn.push(id);
-        }
-    }
-    (to_spawn, to_despawn)
-}
 
 /// Build a [`RowSeed`] from a block snapshot — the only place block content
 /// is read for geometry, and it runs once per new row.
@@ -639,7 +554,8 @@ fn row_seed(snapshot: kaijutsu_types::BlockSnapshot) -> RowSeed {
 }
 
 /// Maintain [`ConversationGeometry`] for the main conversation (Update,
-/// before `spawn_block_cells`).
+/// the last thing in `CellPhase::Spawn` — the surface path's Content/Shape/
+/// Measure/Window sets chain directly after it).
 ///
 /// Reconcile is gated on the document version; block content is only read
 /// (one snapshot at a time) for rows the geometry has never seen. Wrap-column
@@ -1378,103 +1294,6 @@ mod tests {
             "a structural reconcile must bump the epoch on its own — offsets \
              alone cannot report an equal-height row replacement"
         );
-    }
-
-    // ---- band planning ----------------------------------------------------
-
-    /// 100 one-line user blocks (42px pitch after the 24px header): plan
-    /// against a 300px viewport at the top of the document.
-    fn banded_geometry() -> ConversationGeometry {
-        let mut g = ConversationGeometry::default();
-        let ids: Vec<BlockId> = (1..=100).map(bid).collect();
-        g.reconcile(&ids, |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
-        g.recompute_offsets();
-        g
-    }
-
-    #[test]
-    fn plan_spawns_only_the_spawn_band_when_nothing_exists() {
-        let g = banded_geometry();
-        let plan = plan_block_band(g.rows(), |_| false, 0.0, 300.0, None);
-        // Spawn band = [-600, 1500]: blocks 0..~35 of 100.
-        assert!(!plan.to_spawn.is_empty());
-        assert!(
-            plan.to_spawn.len() < 45,
-            "spawn band must not cover the whole document: {} of 100",
-            plan.to_spawn.len(),
-        );
-        assert!(plan.to_despawn.is_empty());
-        // Must include the very first block (viewport at top).
-        assert_eq!(plan.to_spawn[0], bid(1));
-    }
-
-    #[test]
-    fn plan_despawns_only_beyond_the_keep_band() {
-        let g = banded_geometry();
-        // Everything exists; viewport at the top. Keep band = [-1200, 2700]:
-        // blocks past y=2700 (block ~64 on) despawn, the hysteresis zone
-        // between spawn and keep bands (blocks ~36..=64) stays untouched.
-        let plan = plan_block_band(g.rows(), |_| true, 0.0, 300.0, None);
-        assert!(plan.to_spawn.is_empty());
-        assert!(!plan.to_despawn.is_empty());
-        let first_despawned_y = g
-            .block_row(plan.to_despawn.first().unwrap())
-            .unwrap()
-            .y_offset;
-        assert!(
-            first_despawned_y > 300.0 + DESPAWN_MARGIN_SCREENS * 300.0,
-            "despawn must start beyond the keep band, got y={first_despawned_y}",
-        );
-    }
-
-    #[test]
-    fn plan_exempts_the_focused_block_from_despawn() {
-        let g = banded_geometry();
-        let focused = bid(100); // far outside the keep band
-        let plan = plan_block_band(g.rows(), |_| true, 0.0, 300.0, Some(focused));
-        assert!(!plan.to_despawn.contains(&focused));
-        // Its neighbors still despawn.
-        assert!(plan.to_despawn.contains(&bid(99)));
-    }
-
-    #[test]
-    fn plan_zero_viewport_height_falls_back_to_a_nominal_screen() {
-        let g = banded_geometry();
-        let plan = plan_block_band(g.rows(), |_| false, 0.0, 0.0, None);
-        // With the 600px fallback the initial window still spawns.
-        assert!(!plan.to_spawn.is_empty());
-        assert!(plan.to_spawn.len() < 100);
-    }
-
-    #[test]
-    fn plan_header_band_spawns_and_despawns_headers() {
-        // Alternate roles so every block starts a role run (header pitch
-        // matches block pitch).
-        let mut g = ConversationGeometry::default();
-        let ids: Vec<BlockId> = (1..=100).map(bid).collect();
-        g.reconcile(
-            &ids,
-            |id| {
-                Some(text_seed(
-                    if id.seq % 2 == 0 { Role::Model } else { Role::User },
-                    40,
-                    0,
-                ))
-            },
-            &params(),
-            1,
-        );
-        g.recompute_offsets();
-
-        let (to_spawn, to_despawn) = plan_header_band(g.rows(), |_| false, 0.0, 300.0);
-        assert!(!to_spawn.is_empty());
-        assert!(to_spawn.len() < 60, "got {} headers", to_spawn.len());
-        assert!(to_despawn.is_empty());
-        assert_eq!(to_spawn[0], (Role::User, bid(1)));
-
-        let (to_spawn, to_despawn) = plan_header_band(g.rows(), |_| true, 0.0, 300.0);
-        assert!(to_spawn.is_empty());
-        assert!(!to_despawn.is_empty());
     }
 
     #[test]

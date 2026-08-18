@@ -275,7 +275,7 @@ pub fn sync_main_cell_to_conversation(
 
     // `CellEditor.store` is a `RenderBlockStore` (`view::render_store`) —
     // the local render buffer every other view system already reads
-    // (block_border.rs, render.rs, diff_view, timeline, …). The change-feed
+    // (block_border.rs, the view systems, diff_view, timeline, …). The change-feed
     // mirror holds plain `BlockSnapshot`s, so
     // `RenderBlockStore::rebuild` materializes them into a fresh store via
     // `insert_from_snapshot`, carrying `collapsed` forward per id across the

@@ -1950,3 +1950,49 @@ was never announced was the same shape a week earlier. It is worth asking, of
 any primitive that ships with its tests and without its wiring, what will
 tell us when it is finally needed — because the answer today was a morning
 spent reading logs in an editor.
+
+## The conversation stops being a widget tree (August 16–18)
+
+The scroll-feel work of the 16th ended with a diagnosis rather than a tuning:
+no gain or ease constant could make a wheel detent cheap while its cost
+scaled with block size. The conversation was a Bevy UI flex column of
+per-block RTT textures — taffy in the scroll path, `replace_children` churn,
+five ungated document walks a frame, and a silent 8192px clamp that
+truncated any block taller than ~273 lines. `docs/conversation-surface.md`
+named the target: *scrolling changes one number*.
+
+Amy's opening idea on the 18th was to cache the blocks as textures and
+composite them. The survey moved the cache one level up: the expensive step
+was Parley shaping, not pixels — the shared MSDF atlas already existed, the
+render pass was already surface-agnostic, and per-block textures were where
+the defects lived. So blocks became **cached shaped glyph runs** — chunked
+on hard lines, keyed by (content version, wrap width, collapse, indent,
+metrics epoch) — assembled into document-space instanced buffers over a
+±1-screen window, drawn into a viewport-sized RTT with scroll as a 64-byte
+uniform and baselines snapped to physical rows in the vertex shader.
+
+Five slices in one sitting, each review-gated (gemini deliberation +
+deepseek agents over whole files, the house combo) and live-verified over
+BRP before its commit. The reviews earned their keep every round: the
+shape-band/window ordering race (blank bands on big jumps — found twice
+independently), the dead reveal-from-top anchor, cache mutations that never
+reached the GPU without a WindowKey move, the incremental tail's unsoundness
+for markdown (a setext underline retro-colors frozen bytes), a stale SVG
+raster surviving its block changing kind. Chrome became instanced SDF quads
+sharing the scroll uniform — borders, captions straddling the stroke,
+focus ring keyed off `FocusTarget` alone. Streaming re-shapes one chunk per
+append; backlog shapes off-thread; theme swaps recolor in place instead of
+rebaking the document.
+
+Slice 5 deleted the legacy path the same day — Amy: "no reason to keep
+legacy in this project," no soak — taking with it `view/render.rs` entire,
+the band lifecycle, the spacer machinery, the taffy readback, the flag
+itself. The deletion surfaced two features the flip had silently orphaned
+(rainbow user text, timeline dimming — issues.md) and the checkbox tofu
+that both paths had always shared. The tall block that started it scrolls
+one detent at a time now.
+
+Side quests the lane forced: reconstructing the kaish-integration worktree
+on moltar (the Cargo.toml comment's warning came true), and a peer-to-peer
+merge of zorak's unpushed wire-handshake line after its deployed kernel
+locked out every origin-built client mid-verification.

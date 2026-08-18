@@ -6,7 +6,7 @@
 //! `assets/shaders/block_fx.wgsl`) with an MSDF-rendered label straddling a
 //! gap in the middle of the line — the same `BlockFxMaterial` +
 //! `collect_msdf_glyphs` machinery every other block's border label uses.
-//! See `view::block_render::sync_role_group_headers` for the ECS wiring.
+//! See `view::surface::chrome` for how the surface path draws it.
 //!
 //! This module holds only the arithmetic that turns a measured label width
 //! into where the gap sits — no font access, no ECS, no vello/scene drawing.

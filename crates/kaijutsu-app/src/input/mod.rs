@@ -136,8 +136,6 @@ pub enum InputPhase {
     Dispatch,
     /// Handle actions (focus cycling, debug, etc.)
     Handle,
-    /// Defensive cleanup of stale state
-    Cleanup,
 }
 
 /// Plugin that registers the focus-based input dispatch system.
@@ -212,7 +210,6 @@ impl Plugin for InputPlugin {
                 InputPhase::SyncContext,
                 InputPhase::Dispatch.after(InputPhase::SyncContext),
                 InputPhase::Handle.after(InputPhase::Dispatch),
-                InputPhase::Cleanup.after(InputPhase::Handle),
             ),
         );
 
@@ -275,18 +272,5 @@ impl Plugin for InputPlugin {
                 .in_set(InputPhase::Handle),
         );
 
-        // Cleanup phase: defensive logic
-        app.add_systems(
-            Update,
-            (
-                systems::cleanup_stale_focused_markers,
-                // Deferred focus marker: nav can focus a block whose entity
-                // is outside the spawn band; once scrolling brings the band
-                // there and spawn_block_cells creates the entity, this
-                // attaches the FocusedBlockCell marker.
-                systems::apply_focused_block_marker,
-            )
-                .in_set(InputPhase::Cleanup),
-        );
     }
 }

@@ -1708,11 +1708,12 @@ fn row_extent(geom: &ConversationGeometry, key: RowKey) -> Option<(f32, f32)> {
 
 /// Feed shaped heights into the geometry and anchor-compensate the scroll.
 ///
-/// The surface path's replacement for `readback_block_heights`, and it runs
-/// **before `smooth_scroll`** rather than in `PostUpdate` — see the module
-/// docs on `view::surface`. The `new_blocks_added` / `pending_scroll_anchor`
-/// / `content_height` bookkeeping moves here verbatim, because
-/// `smooth_scroll` consumes it in the same frame.
+/// The surface path's owner of measurement (the legacy taffy readback is
+/// gone). It runs **after `smooth_scroll`** — see the module docs on
+/// `view::surface` for why the whole chain sits after the ease — so the
+/// `new_blocks_added` / `pending_scroll_anchor` / `content_height`
+/// bookkeeping it maintains is consumed by `smooth_scroll` on the NEXT
+/// frame, the same phase relationship the legacy PostUpdate readback had.
 ///
 /// **Margins come from the geometry's own model**, not from a mirror of
 /// `update_block_cell_nodes`: `reconcile` already decides them (block

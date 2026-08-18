@@ -400,10 +400,7 @@ pub fn handle_screenshot(mut commands: Commands, mut actions: MessageReader<Acti
 // BLOCK NAVIGATION
 // ============================================================================
 
-use crate::cell::{
-    BlockCell, BlockCellContainer, CellEditor, ConversationScrollState,
-    EditorEntities, FocusTarget, FocusedBlockCell, MainCell,
-};
+use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, FocusTarget, MainCell};
 
 /// Navigation direction for block focus.
 enum NavigationDirection {
@@ -419,14 +416,11 @@ enum NavigationDirection {
 /// FocusNextBlock/FocusPrevBlock (shared with Dialog j/k) would
 /// move block focus in the background while a dialog is open.
 pub fn handle_navigate_blocks(
-    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     entities: Res<EditorEntities>,
     geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
-    containers: Query<&BlockCellContainer>,
     mut focus: ResMut<FocusTarget>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    focused_markers: Query<Entity, With<FocusedBlockCell>>,
 ) {
     let mut direction: Option<NavigationDirection> = None;
 
@@ -450,14 +444,6 @@ pub fn handle_navigate_blocks(
     let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
-    // The `BlockCellContainer` only exists on the legacy path (its writer,
-    // `spawn_block_cells`, is flag-gated off under
-    // `ConversationRenderPath::Surface`), and all it is wanted for here is
-    // the `FocusedBlockCell` marker — a legacy affordance. Navigation itself
-    // is geometry-native, so its absence must not stop j/k: the surface path
-    // draws its focus ring from `FocusTarget.block_id` alone
-    // (`view::surface::chrome`).
-    let container = containers.get(main_ent).ok();
 
     // Navigate over geometry block rows: every block is navigable whether or
     // not it currently has an entity (the band respawns it as the scroll
@@ -485,20 +471,10 @@ pub fn handle_navigate_blocks(
 
     let (new_id, row_y, row_h) = block_rows[new_idx];
 
-    // Update focus resource
+    // Update focus resource — the surface path draws its focus ring from
+    // `FocusTarget.block_id` alone (`view::surface::chrome`), so there is no
+    // marker component to move.
     focus.focus_block(new_id);
-
-    // Remove old FocusedBlockCell markers
-    for entity in focused_markers.iter() {
-        commands.entity(entity).remove::<FocusedBlockCell>();
-    }
-
-    // Add FocusedBlockCell marker when the entity exists this frame;
-    // otherwise apply_focused_block_marker picks it up once the band
-    // spawns it (the scroll below moves the band there).
-    if let Some(entity) = container.and_then(|c| c.get_entity(&new_id)) {
-        commands.entity(entity).insert(FocusedBlockCell);
-    }
 
     // Scroll to keep the focused block visible — geometry provides the
     // rect even for entity-less blocks.
@@ -524,15 +500,12 @@ pub fn handle_navigate_blocks(
 /// both rows or a second "jump to this error's parent" action — noted as
 /// follow-up work rather than built speculatively.
 pub fn handle_jump_to_latest_error(
-    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     entities: Res<EditorEntities>,
     editors: Query<&CellEditor, With<MainCell>>,
     geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
-    containers: Query<&BlockCellContainer>,
     mut focus: ResMut<FocusTarget>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    focused_markers: Query<Entity, With<FocusedBlockCell>>,
 ) {
     let mut fired = false;
     for ActionFired { action, .. } in actions.read() {
@@ -553,9 +526,6 @@ pub fn handle_jump_to_latest_error(
     let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
-    // Optional for the same reason as `handle_navigate_blocks`: the marker is
-    // legacy-only, the jump is not.
-    let container = containers.get(main_ent).ok();
 
     let Some(target_id) = find_latest_error_block(&editor.blocks()) else {
         debug!("JumpToLatestError: no non-excluded error blocks in document");
@@ -568,13 +538,6 @@ pub fn handle_jump_to_latest_error(
     let (row_y, row_h) = (row.y_offset, row.height);
 
     focus.focus_block(target_id);
-
-    for entity in focused_markers.iter() {
-        commands.entity(entity).remove::<FocusedBlockCell>();
-    }
-    if let Some(entity) = container.and_then(|c| c.get_entity(&target_id)) {
-        commands.entity(entity).insert(FocusedBlockCell);
-    }
 
     scroll_to_rect_visible(&mut scroll_state, row_y, row_h);
 
@@ -615,44 +578,6 @@ fn next_focus_index(
         },
         NavigationDirection::First => 0,
         NavigationDirection::Last => len - 1,
-    }
-}
-
-/// Apply the `FocusedBlockCell` marker once the focused block's entity
-/// exists. Focus nav can land on a block that is outside the entity band
-/// (despawned); the nav scrolls toward it, the band spawns it a frame or
-/// two later, and this system attaches the marker then. Also strips stale
-/// markers when focus moved on while an entity was despawned.
-pub fn apply_focused_block_marker(
-    mut commands: Commands,
-    entities: Res<EditorEntities>,
-    containers: Query<&BlockCellContainer>,
-    focus: Res<FocusTarget>,
-    marked: Query<(Entity, &BlockCell), With<FocusedBlockCell>>,
-) {
-    let Some(focused_id) = focus.block_id else {
-        return;
-    };
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
-
-    let mut already_marked = false;
-    for (entity, cell) in marked.iter() {
-        if cell.block_id == focused_id {
-            already_marked = true;
-        } else {
-            commands.entity(entity).remove::<FocusedBlockCell>();
-        }
-    }
-
-    if !already_marked
-        && let Some(entity) = container.get_entity(&focused_id)
-    {
-        commands.entity(entity).insert(FocusedBlockCell);
     }
 }
 
@@ -733,7 +658,7 @@ pub fn handle_scroll(
 /// `Thinking`, now shared by `Error` (task: error-render stub collapse).
 pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
-    focus: Res<FocusTarget>,
+    entities: Res<EditorEntities>,
     mut cells: Query<&mut CellEditor>,
 ) {
     for ActionFired { action, .. } in actions.read() {
@@ -741,11 +666,17 @@ pub fn handle_collapse_toggle(
             continue;
         }
 
-        let Some(focused_entity) = focus.entity else {
+        // The editor lives on the MainCell — resolved through
+        // `EditorEntities`, NOT `FocusTarget`: this used to read
+        // `FocusTarget.entity`, whose only writer died with the legacy focus
+        // plumbing, leaving `c` a silent no-op (found by the decapitation
+        // review, 2026-08-18). The toggle is document-wide by design (see
+        // above), so the main cell is the faithful target.
+        let Some(main_ent) = entities.main_cell else {
             continue;
         };
 
-        let Ok(mut editor) = cells.get_mut(focused_entity) else {
+        let Ok(mut editor) = cells.get_mut(main_ent) else {
             continue;
         };
 
@@ -1200,27 +1131,6 @@ fn primary_selection_text(clip: &mut arboard::Clipboard) -> Result<String, arboa
 // To restore inline block editing: add EditingBlock to FocusArea enum,
 // re-add the system body, and wire it back in mod.rs.
 
-// ============================================================================
-// DEFENSIVE CLEANUP
-// ============================================================================
-
-/// Safety net: remove FocusedBlockCell if FocusArea is not Conversation.
-///
-/// Prevents ghost highlights when focus switches to Compose or Dialog.
-pub fn cleanup_stale_focused_markers(
-    mut commands: Commands,
-    focus_area: Res<FocusArea>,
-    focused_markers: Query<Entity, With<FocusedBlockCell>>,
-) {
-    if matches!(*focus_area, FocusArea::Conversation) {
-        return;
-    }
-    for entity in focused_markers.iter() {
-        commands.entity(entity).remove::<FocusedBlockCell>();
-        debug!("Cleaned up stale FocusedBlockCell on {:?}", entity);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1230,14 +1140,61 @@ mod tests {
     use crate::cell::ConversationScrollState;
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
 
-    /// j/k must move focus with **no `BlockCellContainer` in the world**.
-    ///
-    /// That component's only writer is `spawn_block_cells`, which the
-    /// conversation-surface flag gates off — so a hard requirement on it here
-    /// (what this system used to have) means block navigation silently does
-    /// nothing on the surface path, and its focus ring can never move. The
-    /// container is legacy's `FocusedBlockCell` marker bookkeeping; the
-    /// navigation itself reads geometry.
+    /// `c` must toggle collapse with NOTHING but `EditorEntities.main_cell`
+    /// set. The handler used to key off `FocusTarget.entity`, whose only
+    /// writer died with the legacy focus plumbing — leaving CollapseToggle a
+    /// silent no-op (decapitation review, 2026-08-18).
+    #[test]
+    fn collapse_toggle_works_from_editor_entities_alone() {
+        use bevy::prelude::*;
+
+        use super::handle_collapse_toggle;
+        use crate::input::events::ActionFired;
+        use crate::input::{Action, context::InputContext};
+        use crate::view::{CellEditor, EditorEntities, MainCell};
+        use kaijutsu_types::{ContentType, Role, Status};
+
+        let mut app = App::new();
+        app.add_message::<ActionFired>();
+        app.init_resource::<EditorEntities>();
+        app.add_systems(Update, handle_collapse_toggle);
+
+        let mut editor = CellEditor::new();
+        let thinking = editor
+            .store
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "pondering",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .expect("insert thinking block");
+
+        let main_ent = app.world_mut().spawn((editor, MainCell)).id();
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+
+        app.world_mut().write_message(ActionFired::new(
+            Action::CollapseToggle,
+            InputContext::Navigation,
+        ));
+        app.update();
+
+        let editor = app.world().get::<CellEditor>(main_ent).unwrap();
+        let block = editor.store.get_block_snapshot(&thinking).unwrap();
+        assert!(
+            block.collapsed,
+            "CollapseToggle must reach the MainCell editor without FocusTarget.entity",
+        );
+    }
+
+    /// j/k must move focus reading only `ConversationGeometry` — no per-block
+    /// entities exist to query. `handle_navigate_blocks` used to also require
+    /// a `BlockCellContainer` (for the now-deleted `FocusedBlockCell` marker
+    /// bookkeeping); a hard requirement on it would have meant navigation
+    /// silently doing nothing whenever that container was absent.
     #[test]
     fn block_navigation_works_without_the_legacy_cell_container() {
         use bevy::prelude::*;
@@ -1276,7 +1233,6 @@ mod tests {
         );
         geom.recompute_offsets();
 
-        // Deliberately no `BlockCellContainer` — the surface path's world.
         let main_ent = app.world_mut().spawn((geom, MainCell)).id();
         app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
 

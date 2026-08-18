@@ -197,13 +197,15 @@ impl CellEditor {
 /// Consolidates the previous `FocusedCell` and `ConversationFocus` into a single
 /// resource, eliminating confusion about which resource to check for focus state.
 ///
-/// - `entity`: Which entity has keyboard focus (for cursor rendering, input routing)
 /// - `block_id`: Which block is focused for j/k navigation and reply workflows
+///
+/// There is deliberately no `entity` field any more: its only writer died
+/// with the legacy focus plumbing, and the orphaned field cost us a silent
+/// no-op (`handle_collapse_toggle` kept reading it — decapitation review,
+/// 2026-08-18). Focus on the surface path is a block id, full stop.
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
 pub struct FocusTarget {
-    /// Entity with keyboard focus (for cursor rendering).
-    pub entity: Option<Entity>,
     /// Block ID for navigation (j/k, reply workflows).
     #[reflect(ignore)]
     pub block_id: Option<BlockId>,
@@ -219,7 +221,6 @@ impl FocusTarget {
     /// Clear all focus state.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        self.entity = None;
         self.block_id = None;
     }
 
@@ -227,52 +228,20 @@ impl FocusTarget {
     pub fn focus_block(&mut self, block_id: BlockId) {
         self.block_id = Some(block_id);
     }
-
-    /// Set focus to an entity (for cursor/input).
-    #[allow(dead_code)]
-    pub fn focus_entity(&mut self, entity: Entity) {
-        self.entity = Some(entity);
-    }
 }
-
-/// Marker for the currently focused block cell.
-///
-/// Added/removed by the navigate_blocks system to enable visual feedback
-/// and future reply-target workflows.
-#[derive(Component)]
-pub struct FocusedBlockCell;
 
 // ============================================================================
 // CONVERSATION UI LAYOUT COMPONENTS
 // ============================================================================
 
-/// Marker for the scrollable conversation container.
-/// Holds message cells (UserMessage, AgentMessage, tool calls).
+/// Marker for the focused pane's conversation content node.
+///
+/// Holds the surface-path composite (`view::surface::target`) — the
+/// conversation itself is entity-free, so this marks only the flex node the
+/// surface's RTT composites into, not a scrollable column of children.
 #[derive(Component, Reflect)]
 #[reflect(Component)]
 pub struct ConversationContainer;
-
-/// Which edge of the conversation column a spacer occupies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
-pub enum SpacerEdge {
-    Top,
-    Bottom,
-}
-
-/// Marker for one of the two spacer nodes bracketing a `ConversationContainer`'s
-/// virtualized children.
-///
-/// `virtualize_conversation` removes offscreen block/header nodes from taffy
-/// layout via `Node.display = Display::None`; the spacers' `Node.height`
-/// stands in for the removed space so `content_height`/`ScrollPosition.y`
-/// stay correct. Exactly one `Top` and one `Bottom` spacer exist per
-/// `ConversationContainer`, always the first and last child respectively —
-/// see `reorder_conversation_children` and `lifecycle::ensure_conversation_spacers`.
-#[derive(Component, Reflect)]
-#[reflect(Component)]
-pub struct ConversationSpacer {
-    pub edge: SpacerEdge,
-}
 
 // ============================================================================
 // INPUT OVERLAY — Ephemeral input surface
@@ -488,9 +457,10 @@ pub struct OverlayCursorGeometry {
 
 /// Marker for the main conversation view cell.
 ///
-/// NOTE: MainCell no longer renders directly - it holds the CellEditor
-/// (source of truth for content) while BlockCells handle per-block rendering.
-/// Kept as the "owner" entity for BlockCellContainer and TurnCellContainer.
+/// Carries no render state of its own: it holds the `CellEditor` (source of
+/// truth for content) and the `ConversationGeometry` the surface path reads
+/// (`view::surface`) — the "owner" entity every conversation-view system
+/// reaches through `EditorEntities.main_cell`.
 #[derive(Component, Reflect)]
 #[reflect(Component)]
 pub struct MainCell;
@@ -686,26 +656,6 @@ impl ConversationScrollState {
 }
 
 // ============================================================================
-// LAYOUT GENERATION TRACKING
-// ============================================================================
-
-/// Tracks when block layout needs recomputation.
-///
-/// Incremented by systems that modify block content. Layout systems
-/// compare against their last-seen generation to skip redundant work.
-/// This is the key optimization for scroll performance: when scrolling,
-/// content hasn't changed, so we skip the expensive layout recomputation.
-#[derive(Resource, Default)]
-pub struct LayoutGeneration(pub u64);
-
-impl LayoutGeneration {
-    /// Bump the generation counter, signaling that layout needs recomputation.
-    pub fn bump(&mut self) {
-        self.0 = self.0.wrapping_add(1);
-    }
-}
-
-// ============================================================================
 // GLOBAL ERROR QUEUE (context-free RPC errors)
 // ============================================================================
 
@@ -776,244 +726,9 @@ impl GlobalErrorQueue {
     }
 }
 
-// ============================================================================
-// BLOCK-ORIENTED UI COMPONENTS
-// ============================================================================
-//
-// ARCHITECTURE: Each conversation block becomes its own Bevy entity.
-// This enables per-block streaming, independent collapse/expand, and
-// future features like threaded replies.
-//
-// FUTURE DIRECTION:
-// - BlockCells may become focusable for "reply to this block" workflows
-// - Input area could attach to or follow the focused BlockCell
-// - Consider: BlockCell gaining PromptCell-like input capabilities
-// - Turn headers (TurnCell) group blocks by author for visual clarity
-//
-// Current state: BlockCells render read-only content. PromptCell handles input.
-
-/// Marker for a UI entity representing a single content block.
-///
-/// Each block in a conversation gets its own entity with independent:
-/// - GlyphonTextBuffer for rendering
-/// - Layout positioning
-/// - Change tracking (for efficient streaming updates)
-///
-/// FUTURE: May gain focus/input capabilities for threaded conversations.
-///
-/// Note: Not reflectable due to BlockId lacking Default.
-#[derive(Component, Debug)]
-pub struct BlockCell {
-    /// The block ID this cell represents.
-    pub block_id: BlockId,
-    /// Last known content hash/version for dirty tracking.
-    pub last_render_version: Option<u64>,
-    /// Last known text length for layout dirty detection.
-    /// Word-wrap line count can only change when text length changes,
-    /// so this catches wrapping that newline-count missed.
-    pub last_text_len: usize,
-    /// Last known block status for border dirty detection.
-    /// Status changes (Running→Done) affect border kind/animation.
-    pub last_status: kaijutsu_types::Status,
-    /// Last known rainbow effect state for change detection.
-    pub last_rainbow: bool,
-    /// Fingerprint of the inputs the last rich-content detection read
-    /// (`text::rich::rich_input_fingerprint`). `None` until the first
-    /// detection. The document version can't gate this: it is a
-    /// whole-document counter, so one streaming block would re-parse every
-    /// block on screen — see `sync_block_cell_buffers`.
-    pub last_rich_fingerprint: Option<u64>,
-    /// Whether that detection cleared `BlockScene.text` (sparkline/SVG/ABC/
-    /// image render from the parsed value, so the source must not reach
-    /// Parley). Replayed when detection is skipped, because the text
-    /// assignment that runs first puts the source back.
-    pub last_rich_cleared_text: bool,
-}
-
-impl BlockCell {
-    pub fn new(block_id: BlockId) -> Self {
-        Self {
-            block_id,
-            last_render_version: None,
-            last_text_len: 0,
-            last_status: kaijutsu_types::Status::Running,
-            last_rainbow: false,
-            last_rich_fingerprint: None,
-            last_rich_cleared_text: false,
-        }
-    }
-}
-
-/// Container that tracks all BlockCell entities for a conversation view.
-///
-/// Uses an IndexMap to maintain insertion order while providing O(1) lookup.
-/// Attached to the entity that owns the conversation display (e.g., MainCell parent).
-#[derive(Component, Debug, Default, Reflect)]
-#[reflect(Component)]
-pub struct BlockCellContainer {
-    /// Ordered map from block ID to entity — single source of truth.
-    #[reflect(ignore)]
-    pub block_cells: indexmap::IndexMap<BlockId, Entity>,
-    /// Role header entities (one per role transition).
-    pub role_headers: Vec<Entity>,
-}
-
-impl BlockCellContainer {
-    /// Add a new block cell.
-    pub fn add(&mut self, block_id: BlockId, entity: Entity) {
-        self.block_cells.insert(block_id, entity);
-    }
-
-    /// Remove a block cell by entity.
-    pub fn remove(&mut self, entity: Entity) {
-        self.block_cells.retain(|_, e| *e != entity);
-    }
-
-    /// Get entity for a block ID.
-    pub fn get_entity(&self, block_id: &BlockId) -> Option<Entity> {
-        self.block_cells.get(block_id).copied()
-    }
-
-    /// Check if a block ID is already tracked.
-    pub fn contains(&self, block_id: &BlockId) -> bool {
-        self.block_cells.contains_key(block_id)
-    }
-
-    /// Iterate over entities in order.
-    pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
-        self.block_cells.values().copied()
-    }
-
-    /// Re-sort `block_cells` to match `current_blocks` (document order).
-    ///
-    /// Returns `true` if the sort actually changed key order. A pure
-    /// position change — a server `BlockMoved`, or a merge that repositions
-    /// an existing block without adding/removing any — must still surface
-    /// as "order changed" so the caller can bump `LayoutGeneration`.
-    /// Previously this sort ran unconditionally but nothing downstream
-    /// noticed unless a block was also added or removed, so
-    /// `reorder_conversation_children` never re-ran and the visual order
-    /// went stale until app restart.
-    pub fn resort_to_document_order(&mut self, current_blocks: &[BlockId]) -> bool {
-        let before: Vec<BlockId> = self.block_cells.keys().copied().collect();
-
-        let order: std::collections::HashMap<&BlockId, usize> = current_blocks
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id, i))
-            .collect();
-        self.block_cells.sort_by(|a, _, b, _| {
-            let a_idx = order.get(a).copied().unwrap_or(usize::MAX);
-            let b_idx = order.get(b).copied().unwrap_or(usize::MAX);
-            a_idx.cmp(&b_idx)
-        });
-
-        let after: Vec<BlockId> = self.block_cells.keys().copied().collect();
-        before != after
-    }
-}
-
-/// Computed layout for a block cell.
-#[derive(Component, Debug, Default, Reflect)]
-#[reflect(Component)]
-pub struct BlockCellLayout {
-    /// Y position (top) relative to conversation content start.
-    pub y_offset: f32,
-    /// Computed height based on content. Cached from the last frame this
-    /// block was actually laid out (`Display::Flex`) — kept as-is while the
-    /// block is virtualized out (`Display::None`) so the logical geometry
-    /// model stays valid without a live taffy measurement.
-    pub height: f32,
-    /// Indentation level (for nested tool results).
-    pub indent_level: u32,
-    /// `BlockCell.last_render_version` at the time `height` was last
-    /// measured from `ComputedNode`. A mirror of `GeomRow.measured_version`
-    /// for consumers that already hold the entity — the geometry row is the
-    /// source of truth, and virtualization decides purely on the window (see
-    /// `virtualize_conversation`), never on this staleness signal.
-    pub last_measured_version: u64,
-}
-
-// ============================================================================
-// ROLE GROUP BORDER COMPONENTS
-// ============================================================================
-
-/// Role group border entity that appears before first block of each turn.
-/// Rendered via the shared `BlockFxMaterial`/MSDF block pipeline: a
-/// `BorderKind::CenterLine` shader rule with an MSDF role label straddling a
-/// gap in it (see `view::block_render::sync_role_group_headers`).
-///
-/// Replaces the old text-based RoleHeader ("── USER ──────────").
-///
-/// Note: Not fully reflectable due to BlockId lacking Default.
-#[derive(Component, Debug, Clone)]
-pub struct RoleGroupBorder {
-    /// The role this header represents.
-    pub role: kaijutsu_types::Role,
-    /// The block ID this header precedes (for layout positioning).
-    pub block_id: BlockId,
-}
-
-/// Layout information for a role group border.
-#[derive(Component, Debug, Default, Reflect)]
-#[reflect(Component)]
-pub struct RoleGroupBorderLayout {
-    /// Y position (top) relative to conversation content start.
-    pub y_offset: f32,
-    /// Computed height based on content. Same caching contract as
-    /// `BlockCellLayout::height` — held over while `Display::None`.
-    pub height: f32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_block_id(seq: u64) -> BlockId {
-        BlockId::new(ContextId::new(), PrincipalId::new(), seq)
-    }
-
-    #[test]
-    fn resort_to_document_order_reports_no_change_when_already_sorted() {
-        let ids: Vec<BlockId> = (0..3).map(test_block_id).collect();
-        let mut container = BlockCellContainer::default();
-        for id in &ids {
-            container.add(*id, Entity::PLACEHOLDER);
-        }
-        assert!(!container.resort_to_document_order(&ids));
-    }
-
-    #[test]
-    fn resort_to_document_order_reports_change_on_pure_reorder() {
-        // Container built in insertion order A, B, C — then the document
-        // order moves C to the front (a BlockMoved / merge reposition with
-        // no additions or removals). This is the exact case that used to
-        // slip past spawn_block_cells's bump gate.
-        let ids: Vec<BlockId> = (0..3).map(test_block_id).collect();
-        let mut container = BlockCellContainer::default();
-        for id in &ids {
-            container.add(*id, Entity::PLACEHOLDER);
-        }
-
-        let document_order = vec![ids[2], ids[0], ids[1]];
-        assert!(container.resort_to_document_order(&document_order));
-
-        let after: Vec<BlockId> = container.block_cells.keys().copied().collect();
-        assert_eq!(after, document_order);
-    }
-
-    #[test]
-    fn resort_to_document_order_is_idempotent() {
-        let ids: Vec<BlockId> = (0..3).map(test_block_id).collect();
-        let mut container = BlockCellContainer::default();
-        for id in &ids {
-            container.add(*id, Entity::PLACEHOLDER);
-        }
-        let document_order = vec![ids[1], ids[2], ids[0]];
-        assert!(container.resort_to_document_order(&document_order));
-        // Second call against the same target order changes nothing further.
-        assert!(!container.resort_to_document_order(&document_order));
-    }
 
     fn scroll_state(
         content_height: f32,

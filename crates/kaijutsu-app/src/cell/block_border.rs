@@ -4,32 +4,23 @@
 //! `shaders::sync_block_fx` and rasterized by `assets/shaders/block_fx.wgsl`
 //! against the block's MSDF-rendered content texture. No vello scene, no
 //! child entities: the border lives entirely in `MaterialNode<BlockFxMaterial>`
-//! uniforms on the block cell's own entity.
+//! uniforms on the surface's own entity.
 //!
-//! # Two callers, one core
+//! # Entity-free core
 //!
 //! [`compute_border_style`] and [`apply_focus_style`] are **entity-free** and
 //! take [`BorderInputs`] — the handful of snapshot fields the decision
-//! actually reads — rather than a `BlockSnapshot` or an ECS query. The legacy
-//! path ([`determine_block_border_style`]) converts each snapshot on the way
-//! in; the conversation surface (`view::surface::chrome`) carries the same
-//! struct in its content cache and calls the same functions. Neither path may
-//! grow its own copy of the rules: a border that differs between paths is an
-//! A/B difference nobody can attribute.
+//! actually reads — rather than a `BlockSnapshot` or an ECS query. The
+//! conversation surface (`view::surface::chrome`) carries the same struct in
+//! its content cache and calls these directly, so there is exactly one place
+//! the border rules live.
 
 use bevy::prelude::*;
 
 use kaijutsu_types::{BlockId, ErrorCategory, ErrorSeverity, Status, ToolKind};
 
-use crate::connection::RpcConnectionState;
-use crate::text::TextMetrics;
-use crate::connection::drift::DriftState;
 use crate::ui::theme::Theme;
-use crate::view::document::DocumentCache;
-use crate::view::{
-    BlockCell, BlockCellContainer, BlockKind, BlockSnapshot, CellEditor, DriftKind, EditorEntities,
-    FocusedBlockCell, MainCell, Role,
-};
+use crate::view::{BlockKind, BlockSnapshot, DriftKind, Role};
 
 // ============================================================================
 // COMPONENTS
@@ -197,139 +188,10 @@ impl BorderInputs {
 
     /// Whether this block is a *visible* tool result — the predicate that
     /// decides whether the call above it joins to it (`OpenBottom`) or closes
-    /// itself off (`Full`). Shared so both paths pair calls to results the
-    /// same way.
+    /// itself off (`Full`).
     pub fn is_visible_tool_result(&self) -> bool {
         self.kind == BlockKind::ToolResult
             && (!self.content_empty || self.has_output || self.is_error)
-    }
-}
-
-/// Examine each BlockCell's snapshot and add/update/remove `BlockBorderStyle`.
-///
-/// Runs in CellPhase::Buffer (after sync_block_cell_buffers).
-pub fn determine_block_border_style(
-    mut commands: Commands,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    containers: Query<&BlockCellContainer>,
-    block_cells: Query<(
-        Entity,
-        &BlockCell,
-        Option<&BlockBorderStyle>,
-        Option<&BlockExcludedState>,
-        Has<FocusedBlockCell>,
-    )>,
-    focus_gained: Query<(), (With<BlockCell>, Changed<FocusedBlockCell>)>,
-    mut focus_lost: RemovedComponents<FocusedBlockCell>,
-    theme: Res<Theme>,
-    text_metrics: Res<TextMetrics>,
-    layout_gen: Res<super::components::LayoutGeneration>,
-    conn_state: Res<RpcConnectionState>,
-    drift_state: Res<DriftState>,
-    doc_cache: Res<DocumentCache>,
-    mut last_gen: Local<u64>,
-) {
-    // Border styles change when blocks change (add/remove/line count/status,
-    // all folded into layout_gen) — and when keyboard focus moves, which
-    // touches no layout at all: marker insertions arrive via `Changed`,
-    // removals via `RemovedComponents`. Without this escape the focus ring
-    // would wait for the next layout bump — exactly the
-    // change-never-applies trap the 2026-08-04 focus debug called out.
-    let focus_moved = !focus_gained.is_empty() || focus_lost.read().count() > 0;
-    if layout_gen.0 == *last_gen && !focus_moved {
-        return;
-    }
-    *last_gen = layout_gen.0;
-
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-    let Ok(editor) = main_cells.get(main_ent) else {
-        return;
-    };
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
-
-    // Snapshot only the in-band blocks (the container holds the spawn band,
-    // not the whole document) — border styles are a per-entity property.
-    let blocks: std::collections::HashMap<_, _> = container
-        .block_cells
-        .keys()
-        .filter_map(|id| {
-            editor
-                .block_snapshot(id)
-                .map(|s| (*id, BorderInputs::from_snapshot(&s)))
-        })
-        .collect();
-
-    // Build set of tool_call_ids that have a *visible* ToolResult.
-    // Empty success results render no border, so the call should not
-    // use OpenBottom to connect to an invisible block.
-    // In-band snapshots suffice: a ToolResult is adjacent to its call, so
-    // both are in the band whenever either border can render; a call at the
-    // outer band edge may briefly mis-join until its result scrolls in.
-    let has_result: std::collections::HashSet<_> = blocks
-        .values()
-        .filter(|b| b.is_visible_tool_result())
-        .filter_map(|b| b.tool_call_id)
-        .collect();
-
-    // Build context for labels
-    let ctx = BorderContext {
-        username: conn_state
-            .identity
-            .as_ref()
-            .map(|i| i.username.clone())
-            .unwrap_or_default(),
-        model: doc_cache
-            .active_id()
-            .and_then(|ctx_id| drift_state.contexts.iter().find(|c| c.id == ctx_id))
-            .map(|c| c.model.clone())
-            .unwrap_or_default(),
-    };
-
-    for &entity in container.block_cells.values() {
-        let Ok((ent, block_cell, existing_style, existing_excluded, focused)) =
-            block_cells.get(entity)
-        else {
-            continue;
-        };
-
-        let Some(block) = blocks.get(&block_cell.block_id) else {
-            // Block removed — strip border if present
-            if existing_style.is_some() {
-                commands.entity(ent).remove::<BlockBorderStyle>();
-            }
-            continue;
-        };
-
-        // Propagate excluded state to ECS for the gutter indicator shader
-        let new_excluded = BlockExcludedState(block.excluded);
-        if existing_excluded != Some(&new_excluded) {
-            commands.entity(ent).insert(new_excluded);
-        }
-
-        let has_result_below = has_result.contains(&block.id);
-        let new_style = apply_focus_style(
-            compute_border_style(block, &theme, &ctx, has_result_below, text_metrics.cell_font_size),
-            focused,
-            &theme,
-        );
-
-        match (&new_style, existing_style) {
-            (Some(style), Some(existing)) if style == existing => {
-                // Style unchanged — skip insert to avoid triggering change detection
-            }
-            (Some(style), _) => {
-                commands.entity(ent).insert(style.clone());
-            }
-            (None, Some(_)) => {
-                commands.entity(ent).remove::<BlockBorderStyle>();
-            }
-            (None, None) => {} // no border needed
-        }
     }
 }
 
@@ -338,10 +200,9 @@ pub fn determine_block_border_style(
 /// Pure and entity-free — see the module docs. `has_result`: true if this
 /// ToolCall block has a paired ToolResult below.
 ///
-/// `font_size` scales the padding, and that padding is **layout**: the legacy
-/// path lays text out inside it (`build_block_scenes`) and the surface path
-/// subtracts it from the wrap width (`view::surface::chrome`). Changing it
-/// changes where lines break on both paths.
+/// `font_size` scales the padding, and that padding is **layout**: the
+/// surface path subtracts it from the wrap width (`view::surface::chrome`).
+/// Changing it changes where lines break.
 pub fn compute_border_style(
     block: &BorderInputs,
     theme: &Theme,
@@ -596,8 +457,8 @@ pub fn compute_border_style(
     result
 }
 
-/// Overlay keyboard-focus feedback (`FocusedBlockCell`, moved by j/k) onto
-/// a block's computed border style.
+/// Overlay keyboard-focus feedback (`FocusTarget.block_id`, moved by j/k)
+/// onto a block's computed border style.
 ///
 /// Focus lives on the border because the border is the only per-block
 /// visual that can exist for every block kind: the previous indicator — a
@@ -646,110 +507,6 @@ pub fn apply_focus_style(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::components::LayoutGeneration;
-    use kaijutsu_types::{ContentType, Status};
-
-    /// Minimal world for `determine_block_border_style`: a MainCell whose
-    /// editor holds `n` plain user text blocks (borderless under the
-    /// default theme — `block_border_user` is transparent), each with a
-    /// matching `BlockCell` entity in the container.
-    fn border_test_app(block_count: usize) -> (App, Vec<Entity>) {
-        let mut app = App::new();
-        app.init_resource::<crate::text::TextMetrics>();
-        app.init_resource::<Theme>();
-        app.init_resource::<LayoutGeneration>();
-        app.init_resource::<RpcConnectionState>();
-        app.init_resource::<DriftState>();
-        app.init_resource::<DocumentCache>();
-        app.init_resource::<EditorEntities>();
-        app.add_systems(Update, determine_block_border_style);
-
-        let mut editor = CellEditor::new();
-        let mut ids = Vec::with_capacity(block_count);
-        for i in 0..block_count {
-            let id = editor
-                .store
-                .insert_block(
-                    None,
-                    ids.last(),
-                    Role::User,
-                    BlockKind::Text,
-                    format!("block {i}"),
-                    Status::Done,
-                    ContentType::Plain,
-                )
-                .expect("insert_block");
-            ids.push(id);
-        }
-
-        let main_ent = app.world_mut().spawn((editor, MainCell)).id();
-        let mut container = BlockCellContainer::default();
-        let mut cells = Vec::with_capacity(block_count);
-        for &id in &ids {
-            let ent = app.world_mut().spawn(BlockCell::new(id)).id();
-            container.add(id, ent);
-            cells.push(ent);
-        }
-        app.world_mut().entity_mut(main_ent).insert(container);
-        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
-
-        // First compute pass needs a layout generation ahead of the
-        // system's Local high-water mark.
-        app.world_mut().resource_mut::<LayoutGeneration>().bump();
-        app.update();
-        (app, cells)
-    }
-
-    /// The 2026-08-04 regression pair: focus must be VISIBLE (the old
-    /// text-brighten indicator changed zero pixels on markdown blocks) and
-    /// must REVERT when it moves on (the old one never un-highlighted).
-    /// Both focus moves here happen with `LayoutGeneration` untouched, so
-    /// this also pins the `Changed`/`RemovedComponents` escape past the
-    /// layout_gen early-return — without it the ring never tracks j/k.
-    #[test]
-    fn focus_ring_moves_and_reverts_between_blocks() {
-        let (mut app, cells) = border_test_app(2);
-        let (a, b) = (cells[0], cells[1]);
-        let focus_color = app.world().resource::<Theme>().block_border_focus;
-
-        // Borderless baseline: plain user text under the default theme.
-        assert!(app.world().get::<BlockBorderStyle>(a).is_none());
-        assert!(app.world().get::<BlockBorderStyle>(b).is_none());
-
-        // Focus A → A gains the ring, layout untouched.
-        app.world_mut().entity_mut(a).insert(FocusedBlockCell);
-        app.update();
-        let ring = app
-            .world()
-            .get::<BlockBorderStyle>(a)
-            .expect("focused block must gain a visible border");
-        assert_eq!(ring.color, focus_color);
-        assert_eq!(
-            ring.padding,
-            BorderPadding { top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 },
-            "focus on a borderless block must not introduce padding (layout-neutral)"
-        );
-        assert!(app.world().get::<BlockBorderStyle>(b).is_none());
-
-        // Move focus A → B (as handle_navigate_blocks does).
-        app.world_mut().entity_mut(a).remove::<FocusedBlockCell>();
-        app.world_mut().entity_mut(b).insert(FocusedBlockCell);
-        app.update();
-        assert!(
-            app.world().get::<BlockBorderStyle>(a).is_none(),
-            "the ring must revert when focus moves away"
-        );
-        let ring = app
-            .world()
-            .get::<BlockBorderStyle>(b)
-            .expect("newly focused block must gain the ring");
-        assert_eq!(ring.color, focus_color);
-
-        // Unfocus entirely — nothing left behind.
-        app.world_mut().entity_mut(b).remove::<FocusedBlockCell>();
-        app.update();
-        assert!(app.world().get::<BlockBorderStyle>(b).is_none());
-    }
 
     /// Focus over an existing border recolors the stroke and nothing else:
     /// kind, labels, animation, and padding all survive, so focusing a

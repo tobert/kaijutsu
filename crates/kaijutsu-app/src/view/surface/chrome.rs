@@ -684,14 +684,14 @@ pub fn collect_chrome_instances(
                 let Some(entry) = chrome.get(&id) else {
                     continue;
                 };
-                // Focus keys off `FocusTarget.block_id`, never the
-                // `FocusedBlockCell` marker: that marker lives on a legacy
-                // block-cell entity, and there are none on this path.
+                // Focus keys off `FocusTarget.block_id` — the conversation
+                // is entity-free, so there is no per-block marker component
+                // to key off instead.
                 //
                 // Only the focused block pays a clone — `apply_focus_style`
-                // takes ownership because the legacy path inserts what it
-                // returns, and this runs over every in-window row every
-                // frame.
+                // takes ownership (its other caller, before slice 5, was an
+                // entity `insert`, which also wanted ownership), and this
+                // runs over every in-window row every frame.
                 let focused_style;
                 let style = if focus.is_block_focused(&id) {
                     focused_style = apply_focus_style(entry.style.clone(), true, theme);

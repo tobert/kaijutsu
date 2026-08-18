@@ -45,13 +45,14 @@ pub struct SpanBrush {
     pub brush: Brush,
 }
 
-/// Rich content for a block cell — dispatches rendering by format.
+/// Rich content for a conversation block — dispatches rendering by format.
 ///
-/// When present on a block cell entity, `build_block_scenes` renders it:
-/// into MSDF glyphs (Markdown, Output), MSDF glyphs + `MsdfBlockGeometry`
-/// (Abc), a CPU-rasterized `Image`/`ImageNode` child (Svg, via
-/// `text::svg_raster`), or plain UI rectangle children (Sparkline, Image).
-/// No arm reaches the per-block vello scene any more.
+/// Conversation-only: the compose overlay, shell dock, editor, and
+/// diff-view surfaces render plain text and never produce this. The
+/// conversation surface (`view::surface::rich`/`shape_cache`) turns it into
+/// MSDF glyphs (Markdown, Output), MSDF glyphs + geometry (Abc), a cached
+/// CPU raster drawn as a textured quad (Svg, via `text::svg_raster`), or
+/// chrome-drawn placeholder geometry (Sparkline, Image).
 #[derive(Component)]
 pub struct RichContent {
     pub kind: RichContentKind,
@@ -521,9 +522,10 @@ pub fn detect_rich_content(text: &str) -> Option<RichContent> {
 /// twice with the same inputs burns a markdown span parse or a usvg tree
 /// build for an answer the caller already has. The document version cannot
 /// stand in for "did *this* block change": it is a whole-document counter, so
-/// one streaming block bumps it for every block on screen and
-/// `sync_block_cell_buffers` would re-parse the entire spawn band on every
-/// frame of someone else's stream. This is the per-block signal it gates on.
+/// one streaming block bumps it for every block on screen and the surface's
+/// content sync (`view::surface::content::sync_block_content`) would
+/// re-parse the entire spawn band on every frame of someone else's stream.
+/// This is the per-block signal it gates on.
 ///
 /// Hashing is O(text) like the parse it avoids, but it is one linear pass
 /// with no allocation, against span vectors and XML trees.
@@ -749,7 +751,7 @@ mod tests {
         .build()
     }
 
-    /// The property `sync_block_cell_buffers` gates on: a block nobody
+    /// The property `sync_block_content` gates on: a block nobody
     /// touched fingerprints the same, so it never re-parses. The document
     /// version is deliberately not an input — it belongs to the whole
     /// document, and one streaming block bumping it must not drag every other

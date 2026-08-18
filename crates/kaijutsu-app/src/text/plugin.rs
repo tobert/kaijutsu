@@ -294,7 +294,10 @@ fn sync_text_metrics_from_window(
     }
 }
 
-// Rainbow text animation moved to block_render::build_block_scenes.
+// Rainbow text animation lived in the legacy per-block-cell
+// `build_block_scenes`, deleted in slice 5 (docs/conversation-surface.md) —
+// see `text::components::rainbow_brush`'s doc comment for the current status
+// (unported, tracked in docs/issues.md).
 
 #[cfg(test)]
 mod tests {

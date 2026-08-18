@@ -55,7 +55,7 @@ use super::shape_cache::{HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch
 use super::window::{
     SurfaceGeometryRun, SurfaceQuad, SurfaceRun, assemble_geometry, assemble_quads, assemble_runs,
 };
-use super::{ConversationRenderPath, ConversationSurface};
+use super::ConversationSurface;
 
 /// Instances a fresh buffer starts at (≈48 KB) — enough for a screenful of
 /// text without a single growth step, small enough to be uninteresting when a
@@ -388,7 +388,6 @@ pub struct ExtractedConversationSurfaces {
 pub fn extract_conversation_surfaces(
     mut extracted: ResMut<ExtractedConversationSurfaces>,
     buffers: Res<SurfaceGpuBuffers>,
-    path: Extract<Res<ConversationRenderPath>>,
     surfaces: Extract<Query<(Entity, &ConversationSurface, &ChromeInstances, &UiRttTexture)>>,
     computed_nodes: Extract<Query<&ComputedNode>>,
     geometries: Extract<Query<&ConversationGeometry>>,
@@ -406,10 +405,6 @@ pub fn extract_conversation_surfaces(
     theme: Extract<Res<Theme>>,
 ) {
     extracted.items.clear();
-
-    if **path != ConversationRenderPath::Surface {
-        return;
-    }
 
     let Some(main_ent) = entities.main_cell else {
         return;
