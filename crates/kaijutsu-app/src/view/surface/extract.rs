@@ -44,7 +44,7 @@ use crate::text::msdf::surface_renderer::{
     ConversationSurfaceRenderer, GlyphInstance, QuadInstance, SurfaceGeometryVertex,
     SurfaceUniforms, build_geometry_vertices, build_instances, build_quad_instances,
 };
-use crate::view::surface::chrome::{ChromeInstance, ChromeInstances};
+use crate::view::surface::chrome::{BlockChromeCache, ChromeInstance, ChromeInstances};
 use crate::ui::theme::Theme;
 use crate::view::block_render::ExtractedMsdfRenderParams;
 use crate::view::geometry::ConversationGeometry;
@@ -396,6 +396,10 @@ pub fn extract_conversation_surfaces(
     shaped: Extract<Res<ShapedBlockCache>>,
     rasters: Extract<Res<SvgRasterCache>>,
     headers: Extract<Res<HeaderLabelCache>>,
+    // Border captions are placed against the border box, so assembly needs
+    // the layouts chrome computed. Read-only here — it is `sync_block_chrome`
+    // that writes them, a whole schedule earlier.
+    chrome_cache: Extract<Res<BlockChromeCache>>,
     metrics_epoch: Extract<Res<SurfaceMetricsEpoch>>,
     scroll: Extract<Res<ConversationScrollState>>,
     atlas: Extract<Option<Res<MsdfAtlas>>>,
@@ -449,6 +453,8 @@ pub fn extract_conversation_surfaces(
                     geom,
                     &shaped,
                     &headers,
+                    &chrome_cache,
+                    &theme,
                     metrics_epoch,
                     surface.window.row_range.clone(),
                 )),

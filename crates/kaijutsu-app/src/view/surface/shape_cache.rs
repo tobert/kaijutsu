@@ -338,6 +338,40 @@ pub struct ShapedBlock {
     /// stream, which is exactly the final Running→Done reconcile the plan
     /// calls for.
     pub streaming: bool,
+    /// The block's fieldset captions and its gutter checkbox, shaped and
+    /// shared ([`super::labels`]).
+    ///
+    /// # Why they live here and not in a cache of their own
+    ///
+    /// Labels are *glyphs*, so they ride the glyph buffer and a change to one
+    /// must reach the GPU the way any other glyph change does — through
+    /// `ShapedBlockCache::generation`, which `WindowKey` already folds in. Two
+    /// alternatives were rejected:
+    ///
+    /// - **A generation on `BlockChromeCache`.** That cache is rebuilt from
+    ///   the *content band* every frame, so its membership churns with the
+    ///   scroll: putting its generation in `WindowKey` would re-upload the
+    ///   whole window's glyphs on every frame of a drag, which is precisely
+    ///   the cost this rewrite exists to delete. This cache does not churn —
+    ///   it is written on a real re-shape and evicted on an LRU budget.
+    /// - **Folding the label text into [`ShapeKey`].** A tool call finishing
+    ///   would then re-shape its entire body to drop the word "running".
+    ///
+    /// So the shape pass compares the label runs itself
+    /// ([`super::labels::BlockLabels::same_runs`]) and calls
+    /// [`ShapedBlockCache::touch`] when they moved — the same in-place
+    /// mutation path a recolor takes.
+    ///
+    /// **Focus is deliberately not an input.** These are shaped from the
+    /// *unfocused* border style (`chrome::BlockChrome::style`), so moving the
+    /// j/k focus ring recolors the stroke and leaves the captions alone. The
+    /// alternative — re-shaping every label in the focus color — would put
+    /// focus back on the glyph path and re-upload a screenful of glyphs per
+    /// keystroke. Legacy behaves the same way for a different reason: its
+    /// labels are baked into the block texture, which only rebuilds when the
+    /// block's *content* version moves, so a focus change never repaints them
+    /// there either.
+    pub labels: super::labels::BlockLabels,
 }
 
 impl ShapedBlock {
@@ -1083,6 +1117,13 @@ pub fn apply_shape_results(
                 // Backlog shaping is never used for a streaming block, so
                 // this shaping can never license the incremental tail path.
                 streaming: false,
+                // Captions are not shaped on the task thread (they need the
+                // atlas and the theme, neither of which crosses). The pass
+                // that runs immediately after this one fills them in on the
+                // same frame — this system is chained before
+                // `shape_visible_blocks` precisely so a landed block is
+                // complete before anything looks at it.
+                labels: super::labels::BlockLabels::default(),
             },
         );
     }
@@ -1097,6 +1138,7 @@ pub struct ShapeCaches<'w> {
     pub chrome: Res<'w, super::chrome::BlockChromeCache>,
     pub shaped: ResMut<'w, ShapedBlockCache>,
     pub headers: ResMut<'w, HeaderLabelCache>,
+    pub labels: ResMut<'w, super::labels::LabelRunCache>,
     pub tasks: ResMut<'w, ShapeTasks>,
 }
 
@@ -1186,6 +1228,10 @@ pub fn shape_visible_blocks(
     // them — dropping the lot on a theme swap is cheaper than teaching every
     // consumer a wider cache key.
     caches.headers.sync_theme(theme_epoch);
+    // Block captions and the gutter checkbox bake colors the same way, and
+    // their advance widths move with `label_font_size` — so both epochs clear
+    // them. Dropped runs are re-shaped by the walk below, in the same pass.
+    caches.labels.sync_epochs(metrics_epoch, theme_epoch);
 
     caches.shaped.tick = caches.shaped.tick.wrapping_add(1);
     let tick = caches.shaped.tick;
@@ -1223,6 +1269,24 @@ pub fn shape_visible_blocks(
                         .chrome
                         .layout(&id, container_width, row.indent_level, theme.indent_width);
                 let wrap_width = layout.wrap_width;
+                // Captions and the gutter checkbox, shaped from the block's
+                // *unfocused* border style and shared by `(text, color)`. This
+                // happens before the key comparison below because it is
+                // independent of it: a tool call that finishes changes its
+                // captions without changing a byte of its body, and a body
+                // that re-wraps changes no caption at all. See
+                // `ShapedBlock::labels` for why they live on the shaped block.
+                let label_spec = super::labels::block_label_spec(
+                    caches.chrome.get(&id).and_then(|c| c.style.as_ref()),
+                    formatted.border.excluded,
+                );
+                let labels = caches.labels.shape_block(
+                    font,
+                    &label_spec,
+                    theme.label_font_size,
+                    &mut atlas,
+                    &mut font_data,
+                );
                 // A drawn rich kind bakes theme colors into vertices, so the
                 // theme epoch is part of its key and of nobody else's — see
                 // `ShapeKey::rich_theme_epoch`.
@@ -1262,6 +1326,14 @@ pub fn shape_visible_blocks(
                     existing.x_offset = layout.text_x;
                     existing.y_offset = layout.text_y;
                     existing.height = height;
+                    // A caption that appeared, vanished, or changed shade is
+                    // a glyph change like any other: it has to bump the
+                    // generation or the window never re-assembles and the
+                    // GPU keeps drawing "running" on a finished call.
+                    if !existing.labels.same_runs(&labels) {
+                        existing.labels = labels.clone();
+                        mutated = true;
+                    }
 
                     if existing.color == color || !complex {
                         if existing.color != color {
@@ -1394,6 +1466,7 @@ pub fn shape_visible_blocks(
                         color,
                         text_len: formatted.text.len(),
                         streaming,
+                        labels,
                     },
                 );
             }
@@ -1985,6 +2058,7 @@ mod tests {
             color: Color::WHITE,
             text_len: text.len(),
             streaming,
+            labels: crate::view::surface::labels::BlockLabels::default(),
         }
     }
 
@@ -2366,6 +2440,7 @@ mod tests {
             color: Color::WHITE,
             text_len: 0,
             streaming,
+            labels: crate::view::surface::labels::BlockLabels::default(),
         }
     }
 
@@ -2712,6 +2787,7 @@ mod tests {
             color: Color::WHITE,
             text_len: 0,
             streaming: false,
+            labels: crate::view::surface::labels::BlockLabels::default(),
         }
     }
 

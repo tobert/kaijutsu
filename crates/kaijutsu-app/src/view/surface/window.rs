@@ -15,6 +15,10 @@ use crate::text::msdf::geometry::GeometryVertex;
 use crate::text::msdf::{MsdfAtlas, PositionedGlyph};
 use crate::view::geometry::{ConversationGeometry, RowKey};
 
+use crate::ui::theme::Theme;
+
+use super::chrome::BlockChromeCache;
+use super::labels::{self, BlockLabels};
 use super::rich::SvgRasterCache;
 use super::shape_cache::{
     HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch, SurfaceThemeEpoch,
@@ -102,8 +106,9 @@ fn band_contains(band: (f32, f32), offset: f32) -> bool {
 ///
 /// Pure — no ECS — so the assembly the extractor performs is testable without
 /// a render world. Block rows contribute one run per shaped chunk, stacked by
-/// chunk height from the row's `y_offset`; header rows contribute their
-/// cached role label, positioned inside the header row.
+/// chunk height from the row's `y_offset`, plus their border captions and
+/// gutter checkbox; header rows contribute their cached role label,
+/// positioned inside the header row.
 ///
 /// Rows with nothing shaped yet are simply absent from the output: on the
 /// surface path a not-yet-shaped row draws as empty space of the height the
@@ -112,10 +117,16 @@ fn band_contains(band: (f32, f32), offset: f32) -> bool {
 /// treatment — the row still gets its chrome and its reserved height, the gap
 /// only lasts as long as a backlog task, and a skeleton drawn under text that
 /// is about to arrive reads as a flicker rather than as progress.
+///
+/// Captions are placed against the **border box**, which is why the chrome
+/// cache is a parameter: a caption is rect-local, and the shaped block only
+/// knows where its *text* starts (one padding further in).
 pub fn assemble_runs(
     geom: &ConversationGeometry,
     shaped: &ShapedBlockCache,
     headers: &HeaderLabelCache,
+    chrome: &BlockChromeCache,
+    theme: &Theme,
     metrics_epoch: u64,
     row_range: std::ops::Range<usize>,
 ) -> Vec<SurfaceRun> {
@@ -143,6 +154,17 @@ pub fn assemble_runs(
                     }
                     y += chunk.height;
                 }
+                if let Some(entry) = chrome.get(&id) {
+                    push_label_runs(
+                        &mut runs,
+                        &block.labels,
+                        entry.layout.rect_x,
+                        row.y_offset,
+                        entry.layout.rect_width,
+                        row.height,
+                        theme,
+                    );
+                }
             }
             RowKey::Header(_) => {
                 let Some(label) = headers.get(row.role, metrics_epoch) else {
@@ -157,6 +179,56 @@ pub fn assemble_runs(
         }
     }
     runs
+}
+
+/// Append one block's captions and its gutter checkbox to `runs`.
+///
+/// `rect_*` is the block's border box: `rect_x` / `rect_y` its document
+/// origin, `rect_width` / `rect_height` its size. Every placement is
+/// `labels`' arithmetic, which `chrome::border_label_gaps` also calls — the
+/// letters and the hole they sit in come from one source.
+#[allow(clippy::too_many_arguments)]
+fn push_label_runs(
+    runs: &mut Vec<SurfaceRun>,
+    labels: &BlockLabels,
+    rect_x: f32,
+    rect_y: f32,
+    rect_width: f32,
+    rect_height: f32,
+    theme: &Theme,
+) {
+    if let Some(top) = labels.top.as_ref() {
+        let p = labels::top_label_placement(top.width, top.ascent, theme.label_inset, theme.label_pad);
+        runs.push(SurfaceRun {
+            doc_y: rect_y + p.y,
+            x_offset: rect_x + p.x,
+            glyphs: top.glyphs.clone(),
+        });
+    }
+    if let Some(bottom) = labels.bottom.as_ref() {
+        let p = labels::bottom_label_placement(
+            bottom.width,
+            bottom.ascent,
+            rect_width,
+            rect_height,
+            theme.label_inset,
+            theme.label_pad,
+        );
+        runs.push(SurfaceRun {
+            doc_y: rect_y + p.y,
+            x_offset: rect_x + p.x,
+            glyphs: bottom.glyphs.clone(),
+        });
+    }
+    if let Some(checkbox) = labels.checkbox.as_ref() {
+        let p =
+            labels::checkbox_placement(checkbox.width, checkbox.height, rect_width, rect_height);
+        runs.push(SurfaceRun {
+            doc_y: rect_y + p.y,
+            x_offset: rect_x + p.x,
+            glyphs: checkbox.glyphs.clone(),
+        });
+    }
 }
 
 /// Reduce a row range to the geometry runs that draw under its glyphs.
@@ -457,6 +529,24 @@ mod tests {
             color: Color::WHITE,
             text_len: 0,
             streaming: false,
+            labels: BlockLabels::default(),
+        }
+    }
+
+    /// An empty chrome cache + the default theme: `assemble_runs` needs both,
+    /// and a block with no chrome entry draws its text and no captions —
+    /// which is what every test below except the label ones is about.
+    fn no_chrome() -> BlockChromeCache {
+        BlockChromeCache::default()
+    }
+
+    /// A hand-built caption run — the assembly only reads its metrics.
+    fn run(width: f32, ascent: f32) -> labels::LabelRun {
+        labels::LabelRun {
+            glyphs: Arc::new(vec![glyph(0.0)]),
+            width,
+            height: ascent + 3.0,
+            ascent,
         }
     }
 
@@ -495,7 +585,7 @@ mod tests {
         let headers = HeaderLabelCache::default();
 
         // Row 1 is block 1, at y=24.
-        let runs = assemble_runs(&geom, &shaped, &headers, 0, 1..2);
+        let runs = assemble_runs(&geom, &shaped, &headers, &no_chrome(), &Theme::default(), 0, 1..2);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].doc_y, 24.0);
         assert_eq!(runs[1].doc_y, 34.0);
@@ -513,7 +603,15 @@ mod tests {
         block.y_offset = 8.0;
         shaped.insert_for_test(bid(1), block);
 
-        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 1..2);
+        let runs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &no_chrome(),
+            &Theme::default(),
+            0,
+            1..2,
+        );
         assert_eq!(runs[0].doc_y, 32.0, "row y (24) + the top padding (8)");
         assert_eq!(runs[1].doc_y, 42.0);
     }
@@ -523,7 +621,15 @@ mod tests {
         let geom = strip(2);
         let mut shaped = ShapedBlockCache::default();
         shaped.insert_for_test(bid(1), shaped_block(48.0, &[10.0]));
-        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 1..2);
+        let runs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &no_chrome(),
+            &Theme::default(),
+            0,
+            1..2,
+        );
         assert_eq!(runs[0].x_offset, 48.0);
     }
 
@@ -535,7 +641,15 @@ mod tests {
             shaped.insert_for_test(bid(seq), shaped_block(0.0, &[10.0]));
         }
         // Rows: 0 = header, 1..=3 = blocks 1..=3.
-        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 2..3);
+        let runs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &no_chrome(),
+            &Theme::default(),
+            0,
+            2..3,
+        );
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].doc_y, geom.block_row(&bid(2)).unwrap().y_offset);
     }
@@ -544,7 +658,15 @@ mod tests {
     fn a_range_past_the_end_is_clamped_rather_than_panicking() {
         let geom = strip(2);
         let shaped = ShapedBlockCache::default();
-        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 0..999);
+        let runs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &no_chrome(),
+            &Theme::default(),
+            0,
+            0..999,
+        );
         assert!(runs.is_empty());
     }
 
@@ -566,14 +688,14 @@ mod tests {
         );
 
         // Row 0 is the header, at y=0.
-        let runs = assemble_runs(&geom, &shaped, &headers, 3, 0..1);
+        let runs = assemble_runs(&geom, &shaped, &headers, &no_chrome(), &Theme::default(), 3, 0..1);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].doc_y, 4.0);
         assert_eq!(runs[0].x_offset, 18.0);
 
         // A different metrics epoch has no label cached — nothing is drawn
         // rather than something stale.
-        assert!(assemble_runs(&geom, &shaped, &headers, 4, 0..1).is_empty());
+        assert!(assemble_runs(&geom, &shaped, &headers, &no_chrome(), &Theme::default(), 4, 0..1).is_empty());
     }
 
     #[test]
@@ -583,10 +705,134 @@ mod tests {
             &geom,
             &ShapedBlockCache::default(),
             &HeaderLabelCache::default(),
+            &no_chrome(),
+            &Theme::default(),
             0,
             0..4,
         );
         assert!(runs.is_empty());
+    }
+
+    /// A block's captions and its checkbox are placed against its **border
+    /// box**, not against its text origin — and the checkbox draws even on a
+    /// block with no captions at all, because that is where exclusion shows.
+    ///
+    /// The positions here are the ones `chrome::border_label_gaps` cuts its
+    /// hole from; if the two ever disagree, the stroke runs through the words.
+    #[test]
+    fn captions_and_the_checkbox_land_on_the_blocks_border_box() {
+        let theme = Theme::default();
+        let geom = strip(2);
+        let row = geom.block_row(&bid(1)).unwrap();
+
+        // Bordered box: inset 5px from the column, 790 wide.
+        let layout = crate::view::surface::chrome::surface_block_layout(
+            800.0,
+            0,
+            theme.indent_width,
+            10.0,
+            Some(crate::cell::block_border::BorderPadding::default()),
+        );
+        let mut chrome = BlockChromeCache::default();
+        chrome.insert_for_test(
+            bid(1),
+            crate::view::surface::chrome::BlockChrome {
+                style: None,
+                layout,
+            },
+        );
+
+        let (top_w, bottom_w, ascent) = (60.0_f32, 30.0_f32, 9.0_f32);
+        let mut block = shaped_block(layout.text_x, &[10.0]);
+        block.labels = BlockLabels {
+            top: Some(run(top_w, ascent)),
+            bottom: Some(run(bottom_w, ascent)),
+            checkbox: Some(run(11.0, 12.0)),
+        };
+        let mut shaped = ShapedBlockCache::default();
+        shaped.insert_for_test(bid(1), block);
+
+        let runs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &chrome,
+            &theme,
+            0,
+            1..2,
+        );
+        // One text chunk, then top caption, bottom caption, checkbox.
+        assert_eq!(runs.len(), 4);
+
+        let inset = labels::fieldset_inset(ascent);
+        let top = &runs[1];
+        assert_eq!(top.x_offset, layout.rect_x + theme.label_inset + theme.label_pad);
+        assert!((top.doc_y - (row.y_offset + inset - ascent * 0.5)).abs() < 1e-4);
+
+        let bottom = &runs[2];
+        assert_eq!(
+            bottom.x_offset,
+            layout.rect_x + layout.rect_width - theme.label_inset - theme.label_pad - bottom_w,
+        );
+        assert!(
+            (bottom.doc_y - (row.y_offset + row.height - inset - ascent * 0.5)).abs() < 1e-4,
+            "the bottom caption rides the box's bottom stroke, not its top",
+        );
+
+        let checkbox = &runs[3];
+        let cb = run(11.0, 12.0);
+        assert_eq!(
+            checkbox.x_offset,
+            layout.rect_x + layout.rect_width - cb.width - labels::CHECKBOX_RIGHT_MARGIN,
+        );
+        assert_eq!(
+            checkbox.doc_y,
+            row.y_offset + (row.height - cb.height) * 0.5,
+            "the checkbox is centred on the whole block, not on a stroke",
+        );
+    }
+
+    /// A borderless block still marks its inclusion — that mark is the only
+    /// place exclusion is visible on plain text, which is most of a
+    /// conversation.
+    #[test]
+    fn a_borderless_block_still_draws_its_checkbox() {
+        let theme = Theme::default();
+        let geom = strip(2);
+        let layout = crate::view::surface::chrome::surface_block_layout(
+            800.0,
+            0,
+            theme.indent_width,
+            10.0,
+            None,
+        );
+        let mut chrome = BlockChromeCache::default();
+        chrome.insert_for_test(
+            bid(1),
+            crate::view::surface::chrome::BlockChrome {
+                style: None,
+                layout,
+            },
+        );
+        let mut block = shaped_block(0.0, &[10.0]);
+        block.labels.checkbox = Some(run(11.0, 12.0));
+        let mut shaped = ShapedBlockCache::default();
+        shaped.insert_for_test(bid(1), block);
+
+        let runs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &chrome,
+            &theme,
+            0,
+            1..2,
+        );
+        assert_eq!(runs.len(), 2, "the text chunk and the checkbox");
+        assert_eq!(
+            runs[1].x_offset,
+            800.0 - 11.0 - labels::CHECKBOX_RIGHT_MARGIN,
+        );
     }
 
     // ---- assemble_geometry / assemble_quads ------------------------------
@@ -611,7 +857,15 @@ mod tests {
         let mut shaped = ShapedBlockCache::default();
         shaped.insert_for_test(bid(1), block);
 
-        let glyphs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 1..2);
+        let glyphs = assemble_runs(
+            &geom,
+            &shaped,
+            &HeaderLabelCache::default(),
+            &no_chrome(),
+            &Theme::default(),
+            0,
+            1..2,
+        );
         let geometry = assemble_geometry(&geom, &shaped, 1..2);
 
         // Row 1 sits at y=24, plus the 8px top padding.

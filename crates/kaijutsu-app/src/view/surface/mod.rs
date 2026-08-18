@@ -78,6 +78,7 @@ pub mod chrome;
 pub mod chunk;
 pub mod content;
 pub mod extract;
+pub mod labels;
 pub mod rich;
 pub mod shape_cache;
 pub mod target;
@@ -267,6 +268,7 @@ impl Plugin for ConversationSurfacePlugin {
             .init_resource::<chrome::BlockChromeCache>()
             .init_resource::<shape_cache::ShapedBlockCache>()
             .init_resource::<shape_cache::HeaderLabelCache>()
+            .init_resource::<labels::LabelRunCache>()
             .init_resource::<shape_cache::SurfaceMetricsEpoch>()
             .init_resource::<shape_cache::SurfaceThemeEpoch>()
             .init_resource::<shape_cache::ShapeTasks>()

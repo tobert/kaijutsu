@@ -339,25 +339,32 @@ impl ConversationSurfaceRenderer {
                     offset: 16,
                     shader_location: 1,
                 },
+                // label_gap: [top_x0, top_x1, bottom_x0, bottom_x1]
                 VertexAttribute {
-                    format: VertexFormat::Float32x2,
+                    format: VertexFormat::Float32x4,
                     offset: 32,
                     shader_location: 2,
                 },
+                // insets: [top, bottom]
                 VertexAttribute {
                     format: VertexFormat::Float32x2,
-                    offset: 40,
+                    offset: 48,
                     shader_location: 3,
                 },
                 VertexAttribute {
-                    format: VertexFormat::Unorm8x4,
-                    offset: 48,
+                    format: VertexFormat::Float32x2,
+                    offset: 56,
                     shader_location: 4,
                 },
                 VertexAttribute {
-                    format: VertexFormat::Uint32,
-                    offset: 52,
+                    format: VertexFormat::Unorm8x4,
+                    offset: 64,
                     shader_location: 5,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Uint32,
+                    offset: 68,
+                    shader_location: 6,
                 },
             ],
         }
@@ -1319,16 +1326,19 @@ mod tests {
     #[test]
     fn chrome_instance_layout_matches_the_struct() {
         let layout = ConversationSurfaceRenderer::chrome_instance_layout();
-        assert_eq!(layout.array_stride, 56);
+        assert_eq!(layout.array_stride, 72);
         assert_eq!(layout.step_mode, VertexStepMode::Instance);
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
-        assert_eq!(offsets, vec![0, 16, 32, 40, 48, 52]);
-        assert_eq!(std::mem::size_of::<ChromeInstance>(), 56);
+        assert_eq!(offsets, vec![0, 16, 32, 48, 56, 64, 68]);
+        assert_eq!(std::mem::size_of::<ChromeInstance>(), 72);
         assert_eq!(
-            layout.attributes[5].format,
+            layout.attributes[6].format,
             VertexFormat::Uint32,
             "the border kind is an integer on both sides",
         );
+        // The four label-gap floats travel as one attribute, matching
+        // `block_fx.wgsl`'s `label_gaps: vec4` — top pair then bottom pair.
+        assert_eq!(layout.attributes[2].format, VertexFormat::Float32x4);
     }
 
     /// The document origin lives in the two words the uniform used to pad

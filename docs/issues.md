@@ -6,38 +6,57 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## The conversation surface draws no block border labels or gutter checkbox (2026-08-18)
+## Two visual-parity remainders on the conversation surface (2026-08-18)
 
-Slice 2 of the conversation-surface rewrite ports the chrome that is *quads* —
-block borders (every `BorderKind`), the focus ring, breathe/pulse/chase, the
-edge glow, and the role-group divider — into `assets/shaders/surface_chrome.wgsl`
-as instanced SDF rects (`view/surface/chrome.rs`). What it does **not** port is
-the chrome that is *glyphs*:
+Slice 5 landed the chrome that is *glyphs* — the fieldset top/bottom captions
+and the gutter inclusion checkbox (`view/surface/labels.rs`, the `label_gap`
+/`insets` pair on `ChromeInstance`, the ported gap + inset math in
+`assets/shaders/surface_chrome.wgsl`). What is still missing:
 
-- the fieldset **top/bottom labels** ("TOOL CALL <model>", "COMMAND @amy",
-  "thinking", "drift: pull", "running"/"error") that legacy bakes into each
-  block's MSDF texture (`view/block_render.rs:1107-1207`), together with the
-  `border_inset_top/bottom` that lets a label straddle the stroke and the
-  top/bottom `label_gaps` that break the stroke behind it;
-- the **gutter inclusion checkbox** (☑/☐) and the excluded text halo
-  (`text_glow_params.y`).
-
-Both need a label shaping cache keyed by label text — the divider's role label
-is the only one the surface shapes today — plus the per-instance gap fields
-(the mechanism exists: `ChromeInstance::label_gap`, used for the divider). The
-border *color* still dims for an excluded block, so exclusion is visible; the
-checkbox is not.
-
-**Now shipped-visible.** Slice 4 flipped the default to `Surface` without
-these, so "labels disappeared" and "no gutter checkbox" are what a default
-build shows today — the highest-priority remaining gap on the surface path,
-not a pre-flip chore any more. `KAIJUTSU_CONV_SURFACE=0` is the comparison.
+- **Chase-through-label brightening.** `block_fx.wgsl` boosts a running tool
+  call's caption glyphs as the chase wave passes over them, because those
+  glyphs are *in the texture it is shading*. On the surface, chrome is a pass
+  the glyphs are drawn **over**, so the chrome shader cannot reach them. Doing
+  it properly means the glyph pass learning the chase phase (a per-glyph or
+  per-run animation field), which is a real design step, not a port.
+- **The excluded text halo** (`text_glow_params.y` → the 9-tap glow
+  `block_fx.wgsl` puts behind an excluded block's text). Same reason: it reads
+  a per-block texture the surface does not have. Exclusion is still legible on
+  the surface — dimmed border, dimmed caption, hollow ☐ checkbox — so this is
+  a nicety, not a hole.
+- **Focus does not recolor the captions.** Deliberate, and documented on
+  `ShapedBlock::labels`: captions derive from the *unfocused* border style so
+  a j/k move never re-uploads a screenful of glyphs. Legacy behaves the same
+  way for a different reason (its labels only re-bake on a content-version
+  bump), so this is parity in practice, not a divergence to fix.
 
 Also noted while porting: legacy gives a bordered block `width: 100%` *plus* a
 `glow_radius * 0.5` margin per side (`view/render.rs:352-359`), so the node
 overflows its own column and the pane's clip cuts the right border. The surface
 lays the box out symmetrically instead, which is a real (small) wrap-width
 difference between the two paths on bordered blocks.
+
+## The gutter checkbox is a tofu box on both render paths (2026-08-18)
+
+`☑` (U+2611) and `☐` (U+2610) are **not in NotoMono-Regular**, and nothing in
+the shaping stack falls back for them: both shape to `glyph_id: 0` — the
+`.notdef` box — at the same 6.6px advance. Measured against the shipped font
+through `collect_msdf_glyphs_deferred` while eyeballing slice 5 live on
+moltar, and visible in a screenshot as a small hollow rectangle in the right
+gutter of every block.
+
+So the inclusion indicator is currently distinguishable **only by alpha**
+(0.3 included / 0.5 excluded) — the two states draw the identical mark.
+This predates the surface port: legacy shapes the same two characters through
+the same font, so `KAIJUTSU_CONV_SURFACE=0` shows the same box. The surface
+port preserved it deliberately rather than diverging on a font question.
+
+Three ways out, none of them obviously right: substitute ASCII (`[x]`/`[ ]`)
+in `view::surface::labels::checkbox_char` and its legacy twin; ship a symbol
+font and teach the fallback chain about it; or draw the checkbox as an SDF
+quad in the chrome pass (`block_fx.wgsl` already has a gutter-indicator flag
+that draws a dot/ring — `text_glow_params.y` — which the surface did not
+port). Amy's call.
 ## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
 
 Found live on toad during the same ACP smoke-test session as the P1 entry
