@@ -112,6 +112,16 @@ enum LedgerCommand {
     Rules,
     /// Forget a standing rule so its statement escalates to a human again.
     Forget { rule_id: String },
+    /// List rc lifecycle runs (the durable "did the rc lifecycle actually
+    /// fire" checklist — `approval_ledger::rc_runs`), or, with a run id, show
+    /// one run's per-script detail. A bare positional (not a `--run` flag)
+    /// to match `show <request_id>`'s shape — this is the same
+    /// list-vs-show split as the ask verbs, just for the run log instead of
+    /// the approval queue.
+    Runs {
+        /// Show this run's script list instead of the full run listing.
+        run_id: Option<String>,
+    },
 }
 
 impl KjDispatcher {
@@ -143,6 +153,10 @@ impl KjDispatcher {
             }
             LedgerCommand::Rules => self.ledger_rules(),
             LedgerCommand::Forget { rule_id } => self.ledger_forget(&rule_id),
+            LedgerCommand::Runs { run_id } => match run_id {
+                Some(id) => self.ledger_run_show(&id),
+                None => self.ledger_runs_list(),
+            },
         }
     }
 
@@ -414,6 +428,117 @@ impl KjDispatcher {
         // announce it for the same reason `ledger_decide` does.
         crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
         result
+    }
+
+    /// `kj ledger runs` — the rc lifecycle run log, newest first. `.data`
+    /// stays a flat array of run-id strings per the kj list-command
+    /// convention (`ledger_list`/`ledger_rules` do the same).
+    fn ledger_runs_list(&self) -> KjResult {
+        let rows = {
+            let db = self.kernel_db.lock();
+            match approval_ledger::rc_runs::list_runs(db.conn_for_ledger()) {
+                Ok(rows) => rows,
+                Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
+            }
+        };
+        let data = serde_json::Value::Array(
+            rows.iter().map(|r| serde_json::json!(r.run_id.clone())).collect(),
+        );
+        if rows.is_empty() {
+            return KjResult::ok_with_data("(no rc runs recorded)".to_string(), data);
+        }
+        let mut lines = vec![format!(
+            "  {:<38}  {:<12}  {:<20}  {:<8}  {:<13}  {}",
+            "RUN", "CONTEXT", "TYPE", "VERB", "STARTED_MS", "OUTCOME"
+        )];
+        for r in &rows {
+            let context = ContextId::try_from_slice(&r.context_id)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "(unparseable)".to_string());
+            let outcome = match r.outcome {
+                Some(o) => o.to_string(),
+                None => "(running)".to_string(),
+            };
+            lines.push(format!(
+                "  {:<38}  {:<12}  {:<20}  {:<8}  {:<13}  {}",
+                r.run_id, context, r.context_type, r.verb, r.started_at, outcome,
+            ));
+        }
+        lines.push(String::new());
+        lines.push("see one run's scripts with: kj ledger runs <run-id>".into());
+        KjResult::ok_with_data(lines.join("\n"), data)
+    }
+
+    /// `kj ledger runs <run-id>` — one run's metadata plus the per-script
+    /// rows the lifecycle recorded for it (if the run predates this
+    /// wiring, or every script-record write degraded per its own
+    /// `tracing::warn!`, the script list is legitimately empty — reported
+    /// as such, not confused with "no such run").
+    fn ledger_run_show(&self, run_id: &str) -> KjResult {
+        let db = self.kernel_db.lock();
+        let conn = db.conn_for_ledger();
+        let run = match approval_ledger::rc_runs::get_run(conn, run_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return KjResult::Err(format!("kj ledger runs: no such run {run_id}")),
+            Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
+        };
+        let scripts = match approval_ledger::rc_runs::list_run_scripts(conn, run_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
+        };
+
+        let context = ContextId::try_from_slice(&run.context_id).map(|c| c.to_string());
+        let outcome = run.outcome.map(|o| o.to_string());
+
+        let mut lines = vec![
+            format!("run:          {}", run.run_id),
+            format!("context:      {}", context.as_deref().unwrap_or("(unparseable)")),
+            format!("context_type: {}", run.context_type),
+            format!("verb:         {}", run.verb),
+            format!("started_at:   {}", run.started_at),
+            format!(
+                "finished_at:  {}",
+                run.finished_at
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "(still running)".to_string())
+            ),
+            format!("outcome:      {}", outcome.as_deref().unwrap_or("(none yet)")),
+        ];
+        if scripts.is_empty() {
+            lines.push(String::new());
+            lines.push("(no scripts recorded for this run)".to_string());
+        } else {
+            lines.push(String::new());
+            lines.push(format!("  {:<4}  {:<50}  {:<6}  {}", "SEQ", "PATH", "EXIT", "SHA256"));
+            for s in &scripts {
+                lines.push(format!(
+                    "  {:<4}  {:<50}  {:<6}  {}",
+                    s.seq,
+                    s.path,
+                    s.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                    s.body_sha256,
+                ));
+            }
+        }
+
+        let data = serde_json::json!({
+            "run_id": run.run_id,
+            "context_id": context,
+            "context_type": run.context_type,
+            "verb": run.verb,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "outcome": outcome,
+            "scripts": scripts.iter().map(|s| serde_json::json!({
+                "seq": s.seq,
+                "path": s.path,
+                "body_sha256": s.body_sha256,
+                "exit_code": s.exit_code,
+                "started_at": s.started_at,
+                "finished_at": s.finished_at,
+            })).collect::<Vec<_>>(),
+        });
+        KjResult::ok_with_data(lines.join("\n"), data)
     }
 }
 
@@ -936,6 +1061,129 @@ mod tests {
             "clap's error should name the valid choices: {}",
             result.message()
         );
+    }
+
+    // ── `kj ledger runs` ────────────────────────────────────────────────
+
+    /// A privileged caller with no joined context — `kj context create`
+    /// without `--parent` resolves `context_id: None` to no FK lookup,
+    /// unlike `test_caller()`'s fake unregistered context id (which trips
+    /// the `forked_from` FK). Mirrors `lifecycle::tests::unjoined_caller`.
+    fn unjoined_caller() -> KjCaller {
+        KjCaller {
+            principal_id: kaijutsu_types::PrincipalId::new(),
+            context_id: None,
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn ledger_runs_on_a_fresh_ledger_is_empty() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("runs")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(result.message().contains("no rc runs recorded"), "{}", result.message());
+        let data = match &result {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(data.as_array().unwrap().len(), 0);
+    }
+
+    /// `kj ledger runs` lists the rc lifecycle run log after a real
+    /// lifecycle fires, and `.data` stays the flat array-of-ids the kj
+    /// list-command convention promises (same shape `ledger_list`/
+    /// `ledger_rules` use).
+    #[tokio::test]
+    async fn ledger_runs_lists_a_run_after_a_lifecycle_fires() {
+        use crate::kj::test_helpers::install_rc_script_file;
+
+        let d = test_dispatcher().await;
+        let c = unjoined_caller();
+        install_rc_script_file(&d, "/etc/rc/ledgertest/create/S00-noop.kai", "true").await;
+
+        let created = d
+            .dispatch(
+                &[s("context"), s("create"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
+                &c,
+            )
+            .await;
+        assert!(created.is_ok(), "context create failed: {}", created.message());
+
+        let result = d.dispatch(&[s("ledger"), s("runs")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(result.message().contains("ledgertest"), "{}", result.message());
+        assert!(result.message().contains("create"), "{}", result.message());
+
+        let data = match &result {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger runs must emit structured data: {other:?}"),
+        };
+        let ids = data.as_array().expect(".data must be a JSON array of run ids");
+        assert_eq!(ids.len(), 1, "{data}");
+        assert!(ids[0].is_string(), "{data}");
+    }
+
+    /// `kj ledger runs <run-id>` shows one run's metadata plus the
+    /// per-script rows the lifecycle recorded for it.
+    #[tokio::test]
+    async fn ledger_runs_show_lists_one_runs_scripts() {
+        use crate::kj::test_helpers::install_rc_script_file;
+
+        let d = test_dispatcher().await;
+        let c = unjoined_caller();
+        install_rc_script_file(&d, "/etc/rc/ledgertest2/create/S00-hello.kai", "echo hi").await;
+
+        let created = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("create"),
+                    s("ledger-run-show-ctx"),
+                    s("--type"),
+                    s("ledgertest2"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(created.is_ok(), "context create failed: {}", created.message());
+
+        let list = d.dispatch(&[s("ledger"), s("runs")], &c).await;
+        let data = match &list {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("{other:?}"),
+        };
+        let run_id = data[0].as_str().expect("a run id string").to_string();
+
+        let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(shown.message().contains("S00-hello.kai"), "{}", shown.message());
+        let obj = match &shown {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("kj ledger runs <id> must emit structured data: {other:?}"),
+        };
+        assert_eq!(obj["run_id"].as_str(), Some(run_id.as_str()));
+        let scripts = obj["scripts"].as_array().expect("scripts array");
+        assert_eq!(scripts.len(), 1, "{obj}");
+        assert!(
+            scripts[0]["path"].as_str().unwrap().ends_with("S00-hello.kai"),
+            "{obj}"
+        );
+    }
+
+    /// An unknown run id errors loudly — never a blank "show" that could
+    /// read as an empty-but-real run.
+    #[tokio::test]
+    async fn ledger_runs_show_of_an_unknown_id_errors_loudly() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("runs"), s("no-such-run")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("no such run"), "{}", result.message());
     }
 
     mod dispatch_wiring {

@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 
+use approval_ledger::rc_runs;
+use approval_ledger::types::RcOutcome;
 use kaijutsu_types::paths;
 use kaijutsu_types::{
     BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
@@ -205,9 +207,46 @@ impl KjDispatcher {
             }
         };
 
-        let scripts = self.load_rc_scripts(&context_type, verb).await?;
+        // The run log: a durable "checklist of what ran" row for this
+        // (context, verb) invocation — see `approval_ledger::rc_runs`'s module
+        // docs for the incident it answers (a startup rc sweep that silently
+        // never ran, and nothing recorded that). Started as soon as we know
+        // enough to make the row meaningful (`context_type`); every exit from
+        // here on finishes it through `run_guard`, never a bare `return` —
+        // `RunGuard::drop` is the backstop for a path someone adds later and
+        // forgets to wire, mirroring `AbandonOnDrop` in `kj/gate.rs`.
+        //
+        // A ledger write failure here degrades to `tracing::warn!` rather than
+        // failing the lifecycle: rc running is the primary job, the run log is
+        // observability riding alongside it, and refusing someone's
+        // create/fork scripts because a second database couldn't take a write
+        // would be strictly worse than an unlogged run. This is a deliberate,
+        // LOUD degrade — not the silent fallback CLAUDE.md warns against —
+        // because every failure to record is still visible in the logs.
+        let run_id = {
+            let db = self.kernel_db().lock();
+            match rc_runs::start_run(db.conn_for_ledger(), new_id.as_bytes(), &context_type, verb) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(
+                        "rc lifecycle: run log start_run failed (continuing unlogged): {e}"
+                    );
+                    None
+                }
+            }
+        };
+        let mut run_guard = RunGuard::new(self, run_id);
+
+        let scripts = match self.load_rc_scripts(&context_type, verb).await {
+            Ok(s) => s,
+            Err(e) => {
+                run_guard.finish(RcOutcome::Failed);
+                return Err(e);
+            }
+        };
 
         if scripts.is_empty() {
+            run_guard.finish(RcOutcome::Ok);
             return Ok(());
         }
 
@@ -242,13 +281,17 @@ impl KjDispatcher {
                 ),
                 owner,
             );
+            // The recursion guard already inserted a failure block and ran
+            // NO scripts — that is a failed run, not a no-op.
+            run_guard.finish(RcOutcome::Failed);
             return Ok(());
         }
 
         let child_depth = caller.rc_depth + 1;
+        let mut any_script_failed = false;
 
         for script in &scripts {
-            match script.extension.as_str() {
+            let result = match script.extension.as_str() {
                 "md" => run_md_script(self, new_id, script, owner),
                 "kai" => {
                     run_kai_script(
@@ -275,10 +318,19 @@ impl KjDispatcher {
                         format!("rc lifecycle: unknown extension '{other}'"),
                         owner,
                     );
+                    ScriptRunResult::Failed { exit_code: None }
                 }
+            };
+            if matches!(result, ScriptRunResult::Failed { .. }) {
+                any_script_failed = true;
             }
+            run_guard.record_script(script, &result);
         }
 
+        // SysV init.d semantics: one script failing does not stop the rest
+        // (module docs), so the run's own outcome is "did anything fail
+        // across the whole phase", not "did the last script fail".
+        run_guard.finish(if any_script_failed { RcOutcome::Failed } else { RcOutcome::Ok });
         Ok(())
     }
 
@@ -347,12 +399,22 @@ impl KjDispatcher {
     }
 }
 
+/// Whether one rc script's execution succeeded, for the run log
+/// (`RunGuard::record_script`) and for the whole run's own pass/fail outcome.
+/// `exit_code` is `None` wherever there is no process exit code to report —
+/// an `.md` insert failure, a kaish-init failure, an unsupported extension,
+/// or an exec error — the same shape `insert_rc_failure_block` already uses.
+enum ScriptRunResult {
+    Ok,
+    Failed { exit_code: Option<i32> },
+}
+
 fn run_md_script(
     dispatcher: &KjDispatcher,
     new_id: ContextId,
     script: &RcScript,
     principal: PrincipalId,
-) {
+) -> ScriptRunResult {
     let after = dispatcher.block_store().last_block_id(new_id);
     let result = dispatcher.block_store().insert_block_as(
         new_id,
@@ -365,16 +427,20 @@ fn run_md_script(
         ContentType::Markdown,
         Some(principal),
     );
-    if let Err(e) = result {
-        insert_rc_failure_block(
-            dispatcher,
-            new_id,
-            &script.path,
-            &script.sort_key,
-            None,
-            format!("rc .md insert failed: {e}"),
-            principal,
-        );
+    match result {
+        Ok(_) => ScriptRunResult::Ok,
+        Err(e) => {
+            insert_rc_failure_block(
+                dispatcher,
+                new_id,
+                &script.path,
+                &script.sort_key,
+                None,
+                format!("rc .md insert failed: {e}"),
+                principal,
+            );
+            ScriptRunResult::Failed { exit_code: None }
+        }
     }
 }
 
@@ -393,7 +459,7 @@ async fn run_kai_script(
     child_depth: u8,
     extra_vars: &HashMap<String, String>,
     principal: PrincipalId,
-) {
+) -> ScriptRunResult {
     use kaijutsu_types::SessionId;
 
     // Each rc script runs in its own single-use context shell — a snapshot of
@@ -423,7 +489,7 @@ async fn run_kai_script(
                 format!("rc lifecycle: kaish init failed: {e}"),
                 principal,
             );
-            return;
+            return ScriptRunResult::Failed { exit_code: None };
         }
     };
 
@@ -521,6 +587,7 @@ async fn run_kai_script(
                     principal,
                 );
             }
+            ScriptRunResult::Ok
         }
         Ok(exec) => {
             let stdout = exec.text_out().into_owned();
@@ -533,6 +600,7 @@ async fn run_kai_script(
                 tail_output(&stdout, &exec.err),
                 principal,
             );
+            ScriptRunResult::Failed { exit_code: Some(exec.code as i32) }
         }
         Err(e) => {
             insert_rc_failure_block(
@@ -544,6 +612,7 @@ async fn run_kai_script(
                 format!("rc kaish exec error: {e}"),
                 principal,
             );
+            ScriptRunResult::Failed { exit_code: None }
         }
     }
 }
@@ -568,6 +637,108 @@ fn tail_output(stdout: &str, stderr: &str) -> String {
         start += 1;
     }
     format!("[truncated]\n{}", &combined[start..])
+}
+
+/// Current time as Unix milliseconds, for the run log's per-script
+/// `finished_at`. `approval_ledger::time::now_millis` (what `rc_runs::
+/// finish_run` uses for the run row itself) is `pub(crate)` to that crate, so
+/// this is a small local twin rather than a cross-crate visibility change for
+/// one call site — `rc_run_scripts.started_at` already defaults from SQL, so
+/// only `finished_at` needs a value from here.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Guarantees the run-log row started in `run_rc_lifecycle_inner` gets a
+/// `finish_run` call on every exit from that function, mirroring
+/// `AbandonOnDrop` in `kj/gate.rs`: the outcome is set explicitly wherever
+/// it's known (via [`RunGuard::finish`]), and `Drop` is the backstop for a
+/// path someone adds later and forgets to wire. An unfinished row is exactly
+/// what this log exists to make visible, so the backstop marks it `Failed`,
+/// never `Ok` — silently leaving a run unfinished-looking-fine would recreate
+/// the very incident this crate was filed for.
+///
+/// `run_id` is `None` when `start_run` itself failed to record (a ledger
+/// write failure that must not block the lifecycle — see the call site's
+/// comment); every method here is then a harmless no-op, so the rest of
+/// `run_rc_lifecycle_inner` doesn't need its own "is the run log even up"
+/// branch.
+struct RunGuard<'a> {
+    dispatcher: &'a KjDispatcher,
+    run_id: Option<String>,
+}
+
+impl<'a> RunGuard<'a> {
+    fn new(dispatcher: &'a KjDispatcher, run_id: Option<String>) -> Self {
+        Self { dispatcher, run_id }
+    }
+
+    /// Record one script's execution in the run log, best-effort. A failure
+    /// here degrades to a `tracing::warn!` for the same reason `start_run`'s
+    /// does: this is observability riding alongside the lifecycle, not
+    /// gating it, so a second database's hiccup must never cost a context
+    /// its rc scripts.
+    fn record_script(&self, script: &RcScript, result: &ScriptRunResult) {
+        let Some(run_id) = self.run_id.as_deref() else {
+            return;
+        };
+        let db = self.dispatcher.kernel_db().lock();
+        let conn = db.conn_for_ledger();
+        let sha256 = match rc_runs::insert_script_body(conn, &script.content) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "rc lifecycle: run log insert_script_body failed for {}: {e}",
+                    script.path
+                );
+                return;
+            }
+        };
+        let exit_code = match result {
+            ScriptRunResult::Ok => Some(0i64),
+            ScriptRunResult::Failed { exit_code } => exit_code.map(i64::from),
+        };
+        if let Err(e) = rc_runs::record_run_script(
+            conn,
+            run_id,
+            &script.path,
+            &sha256,
+            exit_code,
+            Some(now_millis()),
+        ) {
+            tracing::warn!(
+                "rc lifecycle: run log record_run_script failed for {}: {e}",
+                script.path
+            );
+        }
+    }
+
+    /// Finish the run with `outcome`. Idempotent — the first call clears
+    /// `run_id`, so a later call (including the one from `Drop` on the
+    /// ordinary path) is a no-op rather than a second write against an
+    /// already-finished row (which `finish_run` refuses loudly; swallowing
+    /// that here would be exactly the silent-fallback CLAUDE.md warns
+    /// against, so this avoids it structurally instead).
+    fn finish(&mut self, outcome: RcOutcome) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        let db = self.dispatcher.kernel_db().lock();
+        if let Err(e) = rc_runs::finish_run(db.conn_for_ledger(), &run_id, outcome) {
+            tracing::warn!("rc lifecycle: run log finish_run failed for {run_id}: {e}");
+        }
+    }
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        // Only reached if some exit path forgot to call `finish` explicitly —
+        // see the struct doc for why the backstop outcome is `Failed`.
+        self.finish(RcOutcome::Failed);
+    }
 }
 
 fn insert_rc_failure_block(
@@ -2430,5 +2601,234 @@ esac
             "fork must re-seed exactly one fresh datetime note on top of the copied parent one, got: {:?}",
             block_contents_in(&d, child_id)
         );
+    }
+
+    // ── The rc run log (approval_ledger::rc_runs) ──────────────────────
+
+    /// Find the run-log row for `(ctx, verb)`. Every test in this section
+    /// fires exactly one rc verb per context, so "the one with this verb"
+    /// is unambiguous.
+    fn find_run_for_context(
+        d: &KjDispatcher,
+        ctx: ContextId,
+        verb: &str,
+    ) -> Option<approval_ledger::types::RcRunRow> {
+        let db = d.kernel_db().lock();
+        let ctx_bytes = ctx.as_bytes().to_vec();
+        approval_ledger::rc_runs::list_runs(db.conn_for_ledger())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.context_id == ctx_bytes && r.verb == verb)
+    }
+
+    /// The key test this whole slice exists for: a lifecycle run that FAILS
+    /// still leaves a FINISHED row with a `Failed` outcome. This is exactly
+    /// the incident `approval_ledger::rc_runs`'s module doc names — a
+    /// startup rc sweep that silently never ran, with nothing recording
+    /// that — except here the failure is loud (an Error block already
+    /// exists for it), and the run log's job is to make the *absence* of a
+    /// run just as visible as a loud one.
+    #[tokio::test]
+    async fn a_failing_rc_script_leaves_a_finished_run_with_failed_outcome() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-fail.kai",
+            "test",
+            "create",
+            "S00",
+            "fail",
+            "kai",
+            "exit 9",
+        )
+        .await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-run-fail", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-run-fail");
+
+        let run = find_run_for_context(&d, new_id, "create")
+            .expect("a run row must exist for this (context, verb)");
+        assert!(
+            run.finished_at.is_some(),
+            "a failed run must still be FINISHED, not left looking like it's still \
+             running: {run:?}"
+        );
+        assert_eq!(
+            run.outcome,
+            Some(approval_ledger::types::RcOutcome::Failed),
+            "a script that exited nonzero must fail the run: {run:?}"
+        );
+    }
+
+    /// The non-vacuity companion: a clean lifecycle records started AND
+    /// finished, with an `Ok` outcome — proving the assertion above pins a
+    /// real failure signal, not an always-`None`/always-absent row.
+    #[tokio::test]
+    async fn a_successful_rc_lifecycle_records_a_finished_ok_run() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-noop.kai",
+            "test",
+            "create",
+            "S00",
+            "noop",
+            "kai",
+            "true",
+        )
+        .await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-run-ok", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-run-ok");
+
+        let run = find_run_for_context(&d, new_id, "create")
+            .expect("a run row must exist for this (context, verb)");
+        assert!(run.started_at > 0);
+        assert!(run.finished_at.is_some(), "a clean run must still be finished: {run:?}");
+        assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Ok));
+    }
+
+    /// Per-script rows land in `rc_run_scripts`, in order, each with its
+    /// real exit code and a content-addressed body hash — the detail `kj
+    /// ledger runs <run-id>` reads.
+    #[tokio::test]
+    async fn rc_run_records_per_script_rows_in_order() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-first.kai",
+            "test",
+            "create",
+            "S00",
+            "first",
+            "kai",
+            "true",
+        )
+        .await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S10-second.kai",
+            "test",
+            "create",
+            "S10",
+            "second",
+            "kai",
+            "exit 5",
+        )
+        .await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-run-scripts", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-run-scripts");
+
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        let scripts = {
+            let db = d.kernel_db().lock();
+            approval_ledger::rc_runs::list_run_scripts(db.conn_for_ledger(), &run.run_id).unwrap()
+        };
+        assert_eq!(scripts.len(), 2, "both scripts must be recorded: {scripts:?}");
+        assert!(scripts[0].path.ends_with("S00-first.kai"), "{:?}", scripts[0]);
+        assert_eq!(scripts[0].exit_code, Some(0));
+        assert!(scripts[1].path.ends_with("S10-second.kai"), "{:?}", scripts[1]);
+        assert_eq!(scripts[1].exit_code, Some(5));
+        assert_eq!(
+            run.outcome,
+            Some(approval_ledger::types::RcOutcome::Failed),
+            "one failing script among several fails the whole run (SysV init.d \
+             semantics: every script still runs)"
+        );
+    }
+
+    /// A run that hits the recursion guard runs NO scripts and still
+    /// finishes as `Failed` — that guard is itself a failure, not a
+    /// no-op, and must not leave a dangling unfinished row.
+    #[tokio::test]
+    async fn a_recursion_guarded_run_still_finishes_as_failed() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-noop.md",
+            "test",
+            "create",
+            "S00",
+            "noop",
+            "md",
+            "would-run",
+        )
+        .await;
+        let mut caller = unjoined_caller();
+        caller.rc_depth = MAX_RC_DEPTH;
+
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-run-guarded", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok());
+        let new_id = lookup_context_id(&d, "ctx-run-guarded");
+
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert!(run.finished_at.is_some());
+        assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Failed));
+    }
+
+    /// A verb whose directory exists but has no `.kai`/`.md` scripts in it
+    /// still leaves a finished `Ok` run — the empty case is legitimate, not
+    /// a gap in the log.
+    ///
+    /// Deliberately installs a non-script file (`.txt`) rather than using a
+    /// type with NO rc directory at all (the way `rc_no_scripts_for_type_is_
+    /// noop` does): under `test_dispatcher()`'s host-backed `LocalBackend`,
+    /// a genuinely absent directory's `readdir` fails with `VfsError::Io`
+    /// wrapping `io::ErrorKind::NotFound`, which `load_rc_scripts`'s "missing
+    /// dir → empty" match arms (only `VfsError::NotFound`/`NoMountPoint`)
+    /// do NOT catch — so that shape hits the Err branch, not the empty-
+    /// scripts branch, and asserting `Ok` against it would be testing the
+    /// wrong path. (Production never hits this: `/etc/rc` is always
+    /// `ConfigDocFs`, never `LocalBackend`, there — `kj/mod.rs`'s
+    /// `test_dispatcher` doc says as much. Filed as a documented gap here
+    /// rather than fixed, since it is a test-harness-only backend
+    /// inconsistency, out of scope for this run-log slice — see the
+    /// handoff report.)
+    #[tokio::test]
+    async fn a_verb_with_no_scripts_still_finishes_as_ok() {
+        let d = test_dispatcher().await;
+        install_rc_script_file(
+            &d,
+            "/etc/rc/emptytype/create/README.txt",
+            "not an rc script — just here to make the directory exist",
+        )
+        .await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-run-empty", "--type", "emptytype"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-run-empty");
+
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert!(run.finished_at.is_some());
+        assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Ok));
     }
 }
