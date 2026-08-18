@@ -125,6 +125,46 @@ boundary).
 
 ---
 
+## The Claude Code Stop hook blocks a turn when the kernel is unreachable (2026-08-18)
+
+Hit within minutes of shipping the wire handshake. The hook is
+`target/debug/kaijutsu-mcp hook claude` (`~/.claude/settings.json`, five
+entries). With a version mismatch it failed hard, and Claude Code reported:
+
+    Stop hook feedback: [kaijutsu-mcp mirror error] failed to author text
+    block: permanently failed: bind_kernel: ... client wire version 0,
+    kernel wire version 1 ...
+
+    A hook blocked the turn from ending 9 consecutive times — overriding and
+    ending turn.
+
+**The diagnosis was perfect and the behaviour was wrong.** The block mirror
+is ambient observability: it records a session's turns into the kernel. It is
+not on the critical path of the user's work, and `kaijutsu-types::timeout`
+already says so in the doc for `tiers::HOOK_PATH` — *"if our budget expires
+first we return a permissive response with a note, which is the behaviour the
+hook path already commits to elsewhere — the mirror is ambient, and its
+slowness must not block the user's action any more than its failure does."*
+
+Slowness honours that. **Failure does not**: a `PermanentlyFailed` bind
+retried nine times and blocked the turn each time. The stated policy is
+already right; the failure path just does not implement it.
+
+Fix: any bind/connect failure in the hook path should emit its diagnosis once
+and return a permissive response. A permanent failure especially — retrying
+cannot help, and repeating it nine times converts one clear line into noise
+that buries it. Check `stop_hook_active` in the input as Claude Code's own
+message suggests.
+
+Related: **`target/debug/kaijutsu-mcp` is a fifth kernel-binding artifact**,
+distinct from the installed `~/bin/kaijutsu-mcp` that serves the MCP tools.
+Both must be rebuilt on a wire flag day. The full set is `kaijutsu-server`,
+`kaijutsu-acp`, `kaijutsu-app`, `target/debug/kaijutsu-mcp` (hooks) and
+`~/bin/kaijutsu-mcp` (MCP) — a `cargo build --workspace` covers the four in
+`target/`, the installed one needs its own copy.
+
+---
+
 ## The ACP binary can silently outlive a wire change (2026-08-18)
 
 **This is what actually cost a morning**, and it is not a gate bug.
