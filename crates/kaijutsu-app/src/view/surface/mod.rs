@@ -46,16 +46,17 @@
 //! legacy systems are flag-gated off there is no phase left to sit in. The
 //! orderings above are expressed against the two systems that survive the
 //! rewrite, not against the phases that don't.
-
-// The plugin is registered now, so every *system* here has a caller — what
-// this allow still covers is the groundwork later slices consume:
-// `ShapedChunk::byte_range` and `ShapedBlock::glyph_count` (slice 3's
-// incremental tail + eviction budget), the cache's `total_glyphs`/`tick`,
-// `ShapedLabel`'s measured size, and the instance buffers' `len`/`capacity`
-// accessors (used from tests and diagnostics). It must come off — or narrow
-// to those items — as those slices land, or it will hide genuinely dead code
-// in a module built to be pruned.
-#![allow(dead_code)]
+//!
+//! # Dead code
+//!
+//! This module carried a blanket `#![allow(dead_code)]` through slices 1-2,
+//! covering groundwork later slices would consume. Slice 3 consumed it —
+//! `ShapedChunk::byte_range` (the incremental tail), `ShapedBlock::glyph_count`
+//! and `ShapedBlockCache::total_glyphs` (the eviction budget),
+//! `ShapedBlock::last_used` (the LRU order) — so the blanket allow is gone.
+//! What is left is allowed **item by item**, each with its reason, which is
+//! the point: a new unused item now shows up as a warning instead of hiding
+//! under a module-wide waiver.
 
 use std::ops::Range;
 
@@ -132,6 +133,21 @@ pub struct WindowKey {
     /// [`shape_cache::SurfaceMetricsEpoch`] — font size / line height /
     /// label sizing changed, so shaped runs and header labels are stale.
     pub metrics_epoch: u64,
+    /// [`shape_cache::SurfaceThemeEpoch`] — colors changed. No glyph moved,
+    /// but the runs the window is holding are `Arc`s the recolor pass has
+    /// since replaced (`Arc::make_mut` hands the cache a *new* pointer while
+    /// an assembled window keeps the old one), and the role labels were
+    /// re-shaped outright. So the window must re-assemble even though nothing
+    /// re-shaped.
+    pub theme_epoch: u64,
+    /// [`shape_cache::ShapedBlockCache::generation`] — the cache itself
+    /// mutated: a shape landed (sync or async), a block was evicted, a
+    /// status-driven recolor ran, a placement refreshed. The theme epoch
+    /// cannot stand in for this — `block_color` also encodes *status* (a
+    /// tool call finishing goes amber→fg with no theme write), and an async
+    /// landing whose height exactly matched its estimate moves neither the
+    /// geometry epoch nor anything else here (found by review, 2026-08-18).
+    pub shaped_generation: u64,
     /// Pane content-box size in logical px, rounded to whole pixels. Sub-pixel
     /// jitter from layout is not a reason to rebuild.
     pub viewport: (u32, u32),
@@ -223,7 +239,9 @@ impl Plugin for ConversationSurfacePlugin {
             .init_resource::<chrome::BlockChromeCache>()
             .init_resource::<shape_cache::ShapedBlockCache>()
             .init_resource::<shape_cache::HeaderLabelCache>()
-            .init_resource::<shape_cache::SurfaceMetricsEpoch>();
+            .init_resource::<shape_cache::SurfaceMetricsEpoch>()
+            .init_resource::<shape_cache::SurfaceThemeEpoch>()
+            .init_resource::<shape_cache::ShapeTasks>();
 
         // Content → Shape → Measure → Window, all AFTER the shared scroll
         // ease. Shape's band must be a function of the frame's FINAL offset:
@@ -256,7 +274,11 @@ impl Plugin for ConversationSurfacePlugin {
                 window::ensure_conversation_surfaces,
                 target::attach_surface_targets.after(window::ensure_conversation_surfaces),
                 shape_cache::track_surface_metrics_epoch,
-                content::sync_block_content,
+                shape_cache::track_surface_theme_epoch,
+                // Markdown span brushes are built from theme colors, so the
+                // theme epoch has to be current before content re-derives
+                // them — otherwise a theme swap reuses last frame's palette.
+                content::sync_block_content.after(shape_cache::track_surface_theme_epoch),
                 // Border styles decide the wrap width, so they must be
                 // current before anything shapes against them.
                 chrome::sync_block_chrome.after(content::sync_block_content),
@@ -264,9 +286,17 @@ impl Plugin for ConversationSurfacePlugin {
                 .in_set(SurfaceSet::Content)
                 .run_if(surface_active),
         );
+        // Backlog results land BEFORE the shape pass looks at the band: a
+        // block whose task finished this frame is already in the cache when
+        // the pass reaches it, so the pass sees a matching key instead of
+        // shaping the same text a second time on the main thread.
         app.add_systems(
             Update,
-            shape_cache::shape_visible_blocks
+            (
+                shape_cache::apply_shape_results,
+                shape_cache::shape_visible_blocks,
+            )
+                .chain()
                 .in_set(SurfaceSet::Shape)
                 .run_if(surface_active),
         );

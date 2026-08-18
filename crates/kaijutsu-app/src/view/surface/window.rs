@@ -14,7 +14,7 @@ use crate::cell::{ConversationContainer, ConversationScrollState, EditorEntities
 use crate::text::msdf::{MsdfAtlas, PositionedGlyph};
 use crate::view::geometry::{ConversationGeometry, RowKey};
 
-use super::shape_cache::{HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch};
+use super::shape_cache::{HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch, SurfaceThemeEpoch};
 use super::{ConversationSurface, WindowKey};
 
 /// Screens of slack held on each side of the viewport.
@@ -78,7 +78,10 @@ fn band_contains(band: (f32, f32), offset: f32) -> bool {
 /// Rows with nothing shaped yet are simply absent from the output: on the
 /// surface path a not-yet-shaped row draws as empty space of the height the
 /// geometry already reserved, which is the same thing an estimate always
-/// meant. Slice 3 puts a placeholder treatment there.
+/// meant. Slice 3 kept it that way rather than adding a placeholder
+/// treatment — the row still gets its chrome and its reserved height, the gap
+/// only lasts as long as a backlog task, and a skeleton drawn under text that
+/// is about to arrive reads as a flicker rather than as progress.
 pub fn assemble_runs(
     geom: &ConversationGeometry,
     shaped: &ShapedBlockCache,
@@ -169,6 +172,8 @@ pub fn build_surface_window(
     scroll_state: Res<ConversationScrollState>,
     atlas: Option<Res<MsdfAtlas>>,
     metrics_epoch: Res<SurfaceMetricsEpoch>,
+    theme_epoch: Res<SurfaceThemeEpoch>,
+    shaped: Res<ShapedBlockCache>,
     mut surfaces: Query<&mut ConversationSurface>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -182,6 +187,8 @@ pub fn build_surface_window(
     // `0` to the key and the first real version bump rebuilds the window.
     let atlas_version = atlas.map(|a| a.version).unwrap_or(0);
     let metrics_epoch = metrics_epoch.get();
+    let theme_epoch = theme_epoch.get();
+    let shaped_generation = shaped.generation();
     let offset = scroll_state.offset;
 
     for mut surface in surfaces.iter_mut() {
@@ -207,6 +214,8 @@ pub fn build_surface_window(
             geometry_epoch: geom.epoch(),
             atlas_version,
             metrics_epoch,
+            theme_epoch,
+            shaped_generation,
             viewport: (
                 pane_size.x.round().max(0.0) as u32,
                 pane_size.y.round().max(0.0) as u32,
@@ -304,6 +313,7 @@ mod tests {
                 byte_range: i..i + 1,
                 glyphs: Arc::new(vec![glyph(i as f32)]),
                 height: *h,
+                frozen: false,
             })
             .collect();
         ShapedBlock {
@@ -321,6 +331,9 @@ mod tests {
             y_offset: 0.0,
             glyph_count: chunk_heights.len(),
             last_used: 0,
+            color: Color::WHITE,
+            text_len: 0,
+            streaming: false,
         }
     }
 
@@ -459,6 +472,8 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<EditorEntities>();
         app.init_resource::<SurfaceMetricsEpoch>();
+        app.init_resource::<SurfaceThemeEpoch>();
+        app.init_resource::<ShapedBlockCache>();
         app.insert_resource(ConversationScrollState {
             offset,
             target_offset: offset,
@@ -552,6 +567,25 @@ mod tests {
         let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
         atlas.version = 999;
         app.insert_resource(atlas);
+        app.update();
+
+        assert_eq!(surface_of(&app, surface).buffer_version, before + 1);
+    }
+
+    /// A cache mutation with nothing else moving must reach the GPU: a
+    /// status-driven recolor (tool call finishing amber→fg) or an async
+    /// landing whose height exactly matched its estimate bumps NO other
+    /// `WindowKey` field, and without `shaped_generation` the window never
+    /// re-assembled and the screen kept the stale colors indefinitely
+    /// (review find, 2026-08-18).
+    #[test]
+    fn a_shaped_cache_mutation_alone_rebuilds_the_window() {
+        let (mut app, surface) = setup_window_app(400.0);
+        let before = surface_of(&app, surface).buffer_version;
+
+        app.world_mut()
+            .resource_mut::<ShapedBlockCache>()
+            .insert_for_test(bid(1), shaped_block(0.0, &[30.0]));
         app.update();
 
         assert_eq!(surface_of(&app, surface).buffer_version, before + 1);

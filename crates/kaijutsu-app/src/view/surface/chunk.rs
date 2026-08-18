@@ -34,9 +34,10 @@
 //! baselines raw).
 //!
 //! Chunking buys two things the rewrite needs: a streamed block's tail
-//! re-shapes at chunk granularity instead of whole-block (slice 3), and a
-//! giant block's shaped glyphs live in several right-sized `Arc`s that the
-//! extractor can hand to the GPU without ever deep-cloning the whole thing.
+//! re-shapes at chunk granularity instead of whole-block — see
+//! [`frozen_chunk_count`] and `shape_cache::incremental_prefix` — and a giant
+//! block's shaped glyphs live in several right-sized `Arc`s that the extractor
+//! can hand to the GPU without ever deep-cloning the whole thing.
 
 use std::ops::Range;
 
@@ -93,6 +94,37 @@ pub fn chunk_ranges(text: &str, chunk_lines: usize) -> Vec<Range<usize>> {
         ranges.push(start..text.len());
     }
     ranges
+}
+
+/// How many **leading** chunks of `ranges` are complete — full at
+/// `chunk_lines` hard lines and closed by the `\n` that ended the last of
+/// them.
+///
+/// This is the freeze predicate (slice 3): a complete chunk's bytes can never
+/// change while text is appended to the end of the block, because
+/// [`chunk_ranges`] is a left-to-right fold that only ever emits a boundary
+/// once it has counted `chunk_lines` newlines. So a complete chunk's shaped
+/// glyphs stay valid for the life of the stream and its `Arc` is reused by
+/// pointer; only the trailing incomplete chunk re-shapes on a content bump.
+///
+/// [`chunk_ranges`] guarantees every range but the last is complete by
+/// construction, so only the last one is actually examined — the check is O(one
+/// chunk), not O(text). The last range is complete exactly when the text ended
+/// on a boundary, which the fold expresses as "there was no remainder", but
+/// `ranges` alone can't say that, hence the newline count.
+pub fn frozen_chunk_count(text: &str, ranges: &[Range<usize>], chunk_lines: usize) -> usize {
+    let chunk_lines = chunk_lines.max(1);
+    let Some(last) = ranges.last() else {
+        return 0;
+    };
+    let tail = &text[last.clone()];
+    let complete =
+        tail.ends_with('\n') && tail.bytes().filter(|b| *b == b'\n').count() == chunk_lines;
+    if complete {
+        ranges.len()
+    } else {
+        ranges.len() - 1
+    }
 }
 
 /// The text a chunk is actually shaped from: its bytes minus **one** trailing
@@ -269,6 +301,65 @@ mod tests {
         assert_eq!(chunk_shaping_text(text, &(0..2)), "a");
         // A chunk that does not end on a break is untouched.
         assert_eq!(chunk_shaping_text("abc", &(0..3)), "abc");
+    }
+
+    // ---- frozen_chunk_count ----------------------------------------------
+
+    /// The freeze rule, at the boundary that decides it: a chunk is frozen
+    /// only when it is *full*. A trailing chunk that merely happens to end on
+    /// a newline (the block's text ends with one) is still going to grow, and
+    /// freezing it would pin a stale layout for the rest of the stream.
+    #[test]
+    fn only_full_chunks_freeze() {
+        // Two complete 2-line chunks, nothing left over.
+        let text = "a\nb\nc\nd\n";
+        let ranges = chunk_ranges(text, 2);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(frozen_chunk_count(text, &ranges, 2), 2);
+
+        // Same text plus a partial line: the tail chunk is open.
+        let text = "a\nb\nc\nd\ne";
+        let ranges = chunk_ranges(text, 2);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(frozen_chunk_count(text, &ranges, 2), 2);
+
+        // A tail that ends on a newline but isn't full yet — the case a
+        // naive `ends_with('\n')` test would get wrong.
+        let text = "a\nb\nc\n";
+        let ranges = chunk_ranges(text, 2);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(frozen_chunk_count(text, &ranges, 2), 1);
+    }
+
+    #[test]
+    fn a_single_open_chunk_freezes_nothing() {
+        let text = "one\ntwo";
+        assert_eq!(frozen_chunk_count(text, &chunk_ranges(text, 64), 64), 0);
+        assert_eq!(frozen_chunk_count("", &chunk_ranges("", 64), 64), 0);
+        assert_eq!(frozen_chunk_count("", &[], 64), 0);
+    }
+
+    /// The property the whole incremental-tail design rests on: appending to
+    /// the end of a block never disturbs a frozen chunk's byte range. If this
+    /// fails, reusing a frozen chunk's glyphs reuses them against different
+    /// bytes.
+    #[test]
+    fn appending_never_moves_a_frozen_chunks_range() {
+        let mut text = String::new();
+        let mut frozen: Vec<Range<usize>> = Vec::new();
+        for i in 0..40 {
+            text.push_str(&format!("line {i}\n"));
+            let ranges = chunk_ranges(&text, 4);
+            let count = frozen_chunk_count(&text, &ranges, 4);
+            for (j, range) in ranges[..count].iter().enumerate() {
+                match frozen.get(j) {
+                    Some(prev) => assert_eq!(prev, range, "frozen chunk {j} moved at append {i}"),
+                    None => frozen.push(range.clone()),
+                }
+            }
+            assert!(count <= ranges.len());
+        }
+        assert!(frozen.len() > 5, "test premise: chunks must have frozen");
     }
 
     // ---- slice_spans -----------------------------------------------------

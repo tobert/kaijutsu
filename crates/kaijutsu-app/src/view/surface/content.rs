@@ -2,10 +2,19 @@
 //!
 //! [`BlockContentCache`] is the entity-free replacement for the pair
 //! `sync_block_cell_buffers` + `BlockScene` (`view/render.rs`): the same
-//! `format_single_block` / `block_color` / rich-detection flow, the same
-//! streaming debounce, but the answer lands in a resource keyed by block id
-//! rather than on a spawned `BlockCell` entity. That is the whole point —
-//! the surface has no per-block entities to hang a `BlockScene` on.
+//! `format_single_block` / `block_color` / rich-detection flow, but the answer
+//! lands in a resource keyed by block id rather than on a spawned `BlockCell`
+//! entity. That is the whole point — the surface has no per-block entities to
+//! hang a `BlockScene` on.
+//!
+//! **No streaming debounce here** (slice 3). The legacy path suppresses
+//! re-formatting a large `Running` block that grew by fewer than 200 bytes,
+//! because on that path a re-format is a whole-block re-shape and a whole-block
+//! re-raster. On the surface path a content bump re-shapes the block's *open
+//! tail chunk* and nothing else (`super::shape_cache::incremental_prefix`), so
+//! the debounce would buy nothing and cost the one thing it was never worth:
+//! a streamed reply that visibly lags its own text. The legacy debounce stays
+//! where it is, guarding the path that still needs it.
 //!
 //! Rich content is **detected but not built** in this slice: the kind is
 //! recorded on [`FormattedBlock::rich`] so slice 4 can route ABC / SVG /
@@ -36,15 +45,6 @@ use crate::view::geometry::{ConversationGeometry, RowKey};
 /// shaper asks for it keeps a fast scroll from paying format+shape in the
 /// same frame.
 pub const CONTENT_SLACK_SCREENS: f32 = 2.0;
-
-/// Debounce thresholds for a large *streaming* block, ported verbatim from
-/// `sync_block_cell_buffers` (`view/render.rs:98-108`): while a block is
-/// `Running` and already past `DEBOUNCE_MIN_SIZE`, a growth of fewer than
-/// `DEBOUNCE_CHARS` bytes doesn't earn a re-format. It dies in slice 3, when
-/// the tail chunk re-shapes on its own and re-formatting a huge block stops
-/// being the expensive part.
-const DEBOUNCE_CHARS: usize = 200;
-const DEBOUNCE_MIN_SIZE: usize = 10_000;
 
 /// Which rich renderer a block *would* use, recorded without building it.
 ///
@@ -78,14 +78,22 @@ impl RichKindInfo {
 /// One block's display text and everything the shaper needs to lay it out.
 #[derive(Debug, Clone)]
 pub struct FormattedBlock {
-    /// Document version at the moment this block's *rendered form* last
+    /// Document version at the moment this block's *shaped form* last
     /// actually changed.
     ///
     /// Not simply "the version we last looked at it": re-formatting an
-    /// unchanged block on somebody else's version bump must not invalidate
-    /// its shaped glyphs, so the stamp only moves when the text, color or
-    /// rich kind moved with it. This is what `ShapeKey.content_version`
-    /// compares.
+    /// unchanged block on somebody else's version bump must not invalidate its
+    /// shaped glyphs, so the stamp only moves when something parley would lay
+    /// out differently moved with it — the text, the span structure, or the
+    /// rich kind. This is what `ShapeKey.content_version` compares.
+    ///
+    /// **`color` is deliberately not in it.** A color change is not a shaping
+    /// event: `shape_cache::recolor_block` repaints cached glyphs in place
+    /// without touching a position. Putting color here would re-shape the
+    /// whole conversation on a theme swap — exactly the full-document rebake
+    /// the rewrite exists to delete. Spans *are* in it, because a span change
+    /// is the one color change that cannot be repainted in place (see
+    /// `recolor_block`).
     pub version: u64,
     /// The text to shape — `format_single_block`'s output, or markdown's
     /// `plain_text` where detection produced spans for it.
@@ -97,8 +105,12 @@ pub struct FormattedBlock {
     pub spans: Vec<SpanBrush>,
     /// Which rich renderer this block wants, once one exists for it.
     pub rich: Option<RichKindInfo>,
-    /// Last seen block status — drives the streaming debounce, and tells the
-    /// content sweep which out-of-band blocks still need refreshing.
+    /// Last seen block status.
+    ///
+    /// Two readers. The content sweep uses it to keep refreshing a streaming
+    /// block that has scrolled out of the band (its height would otherwise
+    /// freeze mid-stream), and `super::shape_cache` uses it to keep a
+    /// `Running` block off the async path and on the incremental tail.
     pub status: Status,
     /// The border decision's inputs, projected off the same snapshot the text
     /// came from ([`BorderInputs`]).
@@ -112,6 +124,33 @@ pub struct FormattedBlock {
     /// streaming neighbour's version bump doesn't drag every block through a
     /// re-parse (same gate as `view/render.rs:152-160`).
     fingerprint: u64,
+    /// [`super::shape_cache::SurfaceThemeEpoch`] at the last detection run.
+    ///
+    /// Part of the reuse gate alongside `fingerprint`: markdown's span brushes
+    /// are built from **theme** colors, and the fingerprint only covers the
+    /// block's own inputs — so without this a theme swap would silently keep
+    /// the old palette on every markdown block until its text next changed.
+    theme_epoch: u64,
+    /// Fingerprint of `spans`, so a span-only change (a theme swap repainting
+    /// markdown) can move `version` without comparing brush lists.
+    spans_fingerprint: u64,
+}
+
+/// Order-sensitive fingerprint of a span list: its ranges and its colors.
+///
+/// `SpanBrush` has no `PartialEq` (peniko brushes carry gradients and images),
+/// and the only question asked of it here is "did the coloring move", so a
+/// hash of the resolved RGBA is both sufficient and cheap.
+fn spans_fingerprint(spans: &[SpanBrush]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    spans.len().hash(&mut hasher);
+    for span in spans {
+        span.start.hash(&mut hasher);
+        span.end.hash(&mut hasher);
+        crate::text::msdf::layout_bridge::brush_to_rgba8(&span.brush).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Formatted display text for every block the surface might draw.
@@ -121,8 +160,14 @@ pub struct FormattedBlock {
 /// so this grows with how far the user has scrolled. Consumers must iterate a
 /// band of geometry rows and `get` each one — never iterate the cache — or
 /// they inherit that growth as a per-frame cost (`super::chrome` did, briefly;
-/// kaibo/deepseek review, 2026-08-18). Slice 3's LRU eviction is what finally
-/// bounds it.
+/// kaibo/deepseek review, 2026-08-18).
+///
+/// Slice 3 bounded the *shaped* cache (`shape_cache::SHAPE_CACHE_MAX_GLYPHS`)
+/// and deliberately not this one: glyphs are ~32 bytes each and dominate,
+/// while this holds strings the block store already holds. Bounding it is
+/// open work, tracked in `docs/issues.md` — the eviction rule would be the
+/// same pinned-window LRU, and the reason it isn't shared is that the two
+/// caches are wanted at different bands.
 #[derive(Resource, Debug, Default)]
 pub struct BlockContentCache {
     blocks: HashMap<BlockId, FormattedBlock>,
@@ -170,6 +215,8 @@ impl BlockContentCache {
                 status: border.status,
                 border,
                 fingerprint: 0,
+                theme_epoch: 0,
+                spans_fingerprint: 0,
             },
         );
     }
@@ -185,12 +232,14 @@ impl BlockContentCache {
 /// The band is `visible_rows` with [`CONTENT_SLACK_SCREENS`] of slack on each
 /// side, plus every block the cache last saw `Running`. A block whose
 /// snapshot has vanished is dropped rather than left stale.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_block_content(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     geometries: Query<&ConversationGeometry>,
     scroll_state: Res<ConversationScrollState>,
     theme: Res<Theme>,
+    theme_epoch: Res<super::shape_cache::SurfaceThemeEpoch>,
     svg_fontdb: Res<crate::text::SvgFontDb>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut cache: ResMut<BlockContentCache>,
@@ -226,6 +275,7 @@ pub fn sync_block_content(
     }
 
     let local_ctx = doc_cache.active_id();
+    let epoch = theme_epoch.get();
 
     for id in wanted {
         let Some(block) = editor.block_snapshot(&id) else {
@@ -237,19 +287,6 @@ pub fn sync_block_content(
 
         let text = format_single_block(&block, local_ctx, &|pid| editor.block_snapshot(pid));
 
-        // Streaming debounce: a huge Running block that only grew a little
-        // isn't worth re-formatting (and, downstream, re-shaping) this tick.
-        if block.status == Status::Running
-            && text.len() > DEBOUNCE_MIN_SIZE
-            && let Some(prev) = cache.blocks.get(&id)
-            && !prev.text.is_empty()
-        {
-            let growth = text.len().saturating_sub(prev.text.len());
-            if growth > 0 && growth < DEBOUNCE_CHARS {
-                continue;
-            }
-        }
-
         let color = block_color(&block, &theme);
         let fingerprint = crate::text::rich::rich_input_fingerprint(&text, &block);
 
@@ -257,11 +294,13 @@ pub fn sync_block_content(
         // inputs it reads haven't moved — the same gate `sync_block_cell_buffers`
         // uses, and for the same reason: `doc_version` is a whole-document
         // counter, so one streaming block would otherwise drag every in-band
-        // block through a re-parse every frame.
+        // block through a re-parse every frame. The theme epoch joins the gate
+        // because markdown's spans are built from theme colors, which the
+        // block-input fingerprint knows nothing about.
         let reuse_detection = cache
             .blocks
             .get(&id)
-            .is_some_and(|prev| prev.fingerprint == fingerprint);
+            .is_some_and(|prev| prev.fingerprint == fingerprint && prev.theme_epoch == epoch);
 
         let (text, spans, rich) = if reuse_detection {
             let prev = &cache.blocks[&id];
@@ -271,9 +310,14 @@ pub fn sync_block_content(
         } else {
             detect(&block, text, &theme, &svg_fontdb)
         };
+        let spans_fp = spans_fingerprint(&spans);
 
+        // Only shaping-relevant movement restamps the version — colors are the
+        // shaper's fast path, not its trigger (see `FormattedBlock::version`).
         let changed = match cache.blocks.get(&id) {
-            Some(prev) => prev.text != text || prev.color != color || prev.rich != rich,
+            Some(prev) => {
+                prev.text != text || prev.rich != rich || prev.spans_fingerprint != spans_fp
+            }
             None => true,
         };
         let version = match cache.blocks.get(&id) {
@@ -292,6 +336,8 @@ pub fn sync_block_content(
                 status: block.status,
                 border: BorderInputs::from_snapshot(&block),
                 fingerprint,
+                theme_epoch: epoch,
+                spans_fingerprint: spans_fp,
             },
         );
     }
@@ -387,10 +433,12 @@ mod tests {
         app.init_resource::<crate::cell::DocumentCache>();
         app.init_resource::<ConversationScrollState>();
         app.init_resource::<BlockContentCache>();
+        app.init_resource::<crate::view::surface::shape_cache::SurfaceThemeEpoch>();
         app.add_systems(
             Update,
             (
                 crate::view::geometry::sync_conversation_geometry,
+                crate::view::surface::shape_cache::track_surface_theme_epoch,
                 sync_block_content,
             )
                 .chain(),
@@ -524,12 +572,16 @@ mod tests {
         assert!(cache(&app).get(&ids[0]).is_some());
     }
 
-    /// The debounce, at the seam it guards: a huge `Running` block that grew
-    /// by a handful of characters keeps its previous text this tick.
+    /// The debounce is **gone** on this path, and this is the test that says
+    /// so: a 10-character append to a 10 KB `Running` block lands the same
+    /// tick. On the legacy path the same edit is suppressed, because there a
+    /// re-format means re-shaping and re-rastering the whole block; here it
+    /// means re-shaping one chunk. A streamed reply that visibly lags its own
+    /// text was the price of the old rule, and nothing pays it now.
     #[test]
-    fn a_large_streaming_block_debounces_small_growth() {
+    fn a_small_append_to_a_large_streaming_block_lands_immediately() {
         let mut app = content_app();
-        let big = "x".repeat(DEBOUNCE_MIN_SIZE + 100);
+        let big = "x".repeat(10_000 + 100);
         let mut editor = CellEditor::new();
         let id = editor
             .store
@@ -552,23 +604,42 @@ mod tests {
             .main_cell = Some(main_ent);
         app.update();
         let first_len = cache(&app).get(&id).unwrap().text.len();
-        assert!(first_len > DEBOUNCE_MIN_SIZE, "test premise: block is large");
+        assert!(first_len > 10_000, "test premise: the block is large");
 
-        let small_growth = format!("{big}{}", "y".repeat(10));
-        edit_block(&mut app, id, &small_growth);
+        let grown = format!("{big}{}", "y".repeat(10));
+        edit_block(&mut app, id, &grown);
         app.update();
+
         assert_eq!(
             cache(&app).get(&id).unwrap().text.len(),
-            first_len,
-            "a 10-char growth on a 10k block must be debounced",
+            first_len + 10,
+            "a 10-char append must reach the surface the tick it happens",
         );
+    }
 
-        let big_growth = format!("{small_growth}{}", "z".repeat(DEBOUNCE_CHARS + 10));
-        edit_block(&mut app, id, &big_growth);
+    /// A color-only change must NOT restamp the content version: colors are
+    /// repainted in place by `shape_cache::recolor_block`, and restamping
+    /// would re-shape the whole conversation on a theme swap — the very
+    /// full-document rebake this rewrite deletes.
+    #[test]
+    fn a_color_change_alone_does_not_restamp_the_version() {
+        let mut app = content_app();
+        let ids = seed(&mut app, &["hello"]);
         app.update();
-        assert!(
-            cache(&app).get(&id).unwrap().text.len() > first_len,
-            "growth past the debounce threshold must land",
+        let before = cache(&app).get(&ids[0]).unwrap().version;
+        let color_before = cache(&app).get(&ids[0]).unwrap().color;
+
+        // Repaint the role this block draws in, and bump the document version
+        // so the sweep genuinely re-derives everything.
+        app.world_mut().resource_mut::<Theme>().block_user = Color::srgb(1.0, 0.0, 1.0);
+        edit_block(&mut app, ids[0], "hello");
+        app.update();
+
+        let after = cache(&app).get(&ids[0]).unwrap();
+        assert_ne!(after.color, color_before, "test premise: the color moved");
+        assert_eq!(
+            after.version, before,
+            "a color-only change must not invalidate shaped glyphs",
         );
     }
 }

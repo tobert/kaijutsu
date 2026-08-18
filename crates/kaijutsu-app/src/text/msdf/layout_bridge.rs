@@ -162,7 +162,12 @@ fn collect_with(
 }
 
 /// Convert a Brush to RGBA8.
-fn brush_to_rgba8(brush: &Brush) -> [u8; 4] {
+///
+/// `pub(crate)` because it is the one place that decides what color a brush
+/// *is* for this renderer, and the conversation surface fingerprints span
+/// colors against exactly that decision — a second copy of the match would be
+/// a second answer.
+pub(crate) fn brush_to_rgba8(brush: &Brush) -> [u8; 4] {
     match brush {
         Brush::Solid(color) => {
             let [r, g, b, a] = color.components;

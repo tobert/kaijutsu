@@ -6571,3 +6571,17 @@ class of ungated per-frame work the slice was killing:
   frame. Nothing consumes `Changed<ConversationGeometry>` today (verified),
   but the first consumer that tries will be silently defeated. The surface
   rewrite should use `epoch()`, not change detection.
+
+## `BlockContentCache` is still unbounded (surface slice 3, 2026-08-18)
+
+Slice 3 bounded the *shaped* cache (`SHAPE_CACHE_MAX_GLYPHS`, LRU beyond
+`DESPAWN_MARGIN_SCREENS`), because glyphs are ~32 bytes each and dominate
+memory. `view/surface/content.rs`'s `BlockContentCache` was left alone and
+still only evicts blocks that leave the **document**, so it grows with how far
+the user has scrolled — a second copy of the conversation's rendered text,
+alongside the block store's own. Not urgent (strings, not glyph arrays) and it
+does not affect frame cost, since every consumer iterates a geometry band
+rather than the cache. The fix is the same pinned-window LRU
+(`shape_cache::plan_evictions` is already generic over `(id, weight,
+last_used)`); the reason it wasn't shared is that the two caches are wanted at
+different bands (content ±2 screens, shape ±1), so the pin sets differ.

@@ -13,11 +13,32 @@
 //! and atlas version most importantly — the first is a uniform, the second
 //! only re-resolves UVs).
 //!
-//! **Slice 1 scope.** Shaping is synchronous and whole-block: the same cost
-//! profile the legacy path already pays when a block enters the band, so no
-//! regression, but no win yet either. The async backlog, tail freezing, LRU
-//! eviction and the theme-recolor fast path are slice 3 — `glyph_count` and
-//! `last_used` are kept live here so that slice has its inputs from day one.
+//! **Slice 3 scope** (slice 1 built the cache; this is what it grew into).
+//! Four rules now sit on top of the key comparison, and each one exists to
+//! keep a different cost off the frame:
+//!
+//! - **Sync only where it shows.** Rows within [`SYNC_SLACK_SCREENS`] of the
+//!   viewport shape on the main thread, because a placeholder there is a
+//!   visible hole. Everything else in the shape band goes to [`ShapeTasks`] on
+//!   `AsyncComputeTaskPool`, nearest-row-first, and lands through
+//!   [`apply_shape_results`]. Off-thread shaping is safe because the parley
+//!   context is per-thread (`text/shaping/context.rs`); the atlas is not, so
+//!   tasks return glyph keys and fonts for the main thread to replay.
+//! - **A streaming block never re-shapes what it already shaped.** Complete
+//!   chunks freeze ([`super::chunk::frozen_chunk_count`]) and their `Arc`s are
+//!   reused by pointer; a content bump re-shapes the open tail chunk only, on
+//!   the main thread, because one chunk is cheap and a streaming block must
+//!   never wait on a task. This is what let the 200-char format debounce die.
+//! - **The cache is bounded.** [`SHAPE_CACHE_MAX_GLYPHS`] worth of glyphs, LRU
+//!   beyond `DESPAWN_MARGIN_SCREENS` screens of the viewport; in-window rows
+//!   and streaming blocks are never evicted, and an evicted row keeps its
+//!   measured height in the geometry, so it re-shapes (async) on approach
+//!   without moving the document.
+//! - **A theme color change is not a shaping event** — for the span-free
+//!   majority. [`recolor_block`] rewrites glyph colors through
+//!   `Arc::make_mut` and does not touch a single position. Spanned blocks
+//!   (markdown) can't take that path and re-shape instead; see
+//!   [`recolor_block`] for why the split is forced rather than chosen.
 //!
 //! Where a block's text sits — its wrap width, its inset inside a border box,
 //! and therefore its row height — is decided by [`super::chrome`], because
@@ -25,15 +46,17 @@
 //! for the layout and bakes it into [`ShapedBlock`]; it does not re-derive
 //! it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use kaijutsu_types::{BlockId, Role};
+use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
+use kaijutsu_types::{BlockId, Role, Status};
 use peniko::Brush;
 
 use crate::cell::{ConversationScrollState, EditorEntities};
-use crate::text::components::bevy_color_to_brush;
+use crate::text::components::{bevy_color_to_brush, color_to_rgba8};
 use crate::text::msdf::glyph::GlyphKey;
 use crate::text::msdf::layout_bridge::{
     collect_msdf_glyphs_deferred, collect_msdf_glyphs_styled_deferred,
@@ -43,10 +66,11 @@ use crate::text::rich::SpanBrush;
 use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 use crate::text::{ShapingFonts, TextMetrics};
 use crate::ui::theme::Theme;
-use crate::view::geometry::{ConversationGeometry, RowKey};
+use crate::view::geometry::{ConversationGeometry, DESPAWN_MARGIN_SCREENS, RowKey};
 use crate::view::role_divider;
 
-use super::chunk::{CHUNK_LINES, chunk_ranges, chunk_shaping_text, slice_spans};
+use super::chrome::BlockLayout;
+use super::chunk::{CHUNK_LINES, chunk_ranges, chunk_shaping_text, frozen_chunk_count, slice_spans};
 
 /// How many screens of slack, on each side of the viewport, get shaped.
 ///
@@ -54,6 +78,31 @@ use super::chunk::{CHUNK_LINES, chunk_ranges, chunk_shaping_text, slice_spans};
 /// the window will never assemble is wasted work, and *not* shaping one it
 /// will assemble is a hole in the drawing.
 pub const SHAPE_SLACK_SCREENS: f32 = 1.0;
+
+/// Screens of slack inside which shaping happens **on the main thread**.
+///
+/// Half a screen either side of the viewport: what is visible now, plus about
+/// one wheel detent's worth of what is about to be. A row in here that is not
+/// shaped is a visible hole (chrome and reserved height, no text), so it is
+/// worth a frame hitch; a row outside it is invisible, so it is worth a task
+/// instead. The rest of [`SHAPE_SLACK_SCREENS`] is the backlog.
+pub const SYNC_SLACK_SCREENS: f32 = 0.5;
+
+/// Glyphs the shaped cache may hold before LRU eviction starts.
+///
+/// ~1.5M glyphs ≈ 48 MB of `PositionedGlyph` (32 bytes each). That is several
+/// hundred screens of dense text — a budget that only a very long scroll-back
+/// reaches, which is exactly the case the old per-block-texture path could not
+/// survive at all.
+pub const SHAPE_CACHE_MAX_GLYPHS: usize = 1_500_000;
+
+/// How many backlog shaping tasks may be in flight at once.
+///
+/// The cap is what makes "visible-first" mean anything: candidates are sorted
+/// by distance from the viewport and only the nearest ones are spawned, so a
+/// jump into the middle of a long document doesn't queue the whole band in
+/// arrival-order and then land the far rows first.
+pub const MAX_SHAPE_TASKS_IN_FLIGHT: usize = 24;
 
 // ============================================================================
 // METRICS EPOCH
@@ -110,6 +159,43 @@ pub fn track_surface_metrics_epoch(
     e.epoch = e.epoch.wrapping_add(1);
 }
 
+/// Monotonic token for "theme colors changed, everything painted is stale".
+///
+/// Deliberately coarser than [`SurfaceMetricsEpoch`]: it moves on **any**
+/// `Theme` mutation rather than on a fingerprint of the colors that matter.
+/// Two reasons, and both are about not lying. First, "the colors that matter"
+/// is a wide, growing set — every block-role color, every markdown token
+/// color, the divider and label colors, plus whatever a future block kind
+/// paints with — and a fingerprint that forgets one fails silently, as text
+/// that keeps the old theme until it happens to re-shape. Second, `Theme` is
+/// written from exactly one place (`connection::actor_plugin`, on a theme
+/// change from the kernel), so "changed" here is a genuine event, not a
+/// per-frame churn: over-triggering costs one recolor pass on a real theme
+/// swap and nothing at all otherwise.
+///
+/// The font-size half of a theme change is still [`SurfaceMetricsEpoch`]'s
+/// job — that one *must* re-shape, and its fingerprint is what keeps a
+/// scale-factor change from being mistaken for it.
+#[derive(Resource, Debug, Default)]
+pub struct SurfaceThemeEpoch {
+    epoch: u64,
+}
+
+impl SurfaceThemeEpoch {
+    pub fn get(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Bump [`SurfaceThemeEpoch`] whenever the theme resource is written.
+pub fn track_surface_theme_epoch(theme: Res<Theme>, mut epoch: ResMut<SurfaceThemeEpoch>) {
+    if !theme.is_changed() {
+        return;
+    }
+    let e = epoch.as_mut();
+    e.epoch = e.epoch.wrapping_add(1);
+}
+
 // ============================================================================
 // CACHE TYPES
 // ============================================================================
@@ -149,10 +235,20 @@ pub struct ShapeKey {
 #[derive(Debug, Clone)]
 pub struct ShapedChunk {
     /// Byte range within the block's text (see `chunk::chunk_ranges`).
-    pub byte_range: std::ops::Range<usize>,
+    pub byte_range: Range<usize>,
     pub glyphs: Arc<Vec<PositionedGlyph>>,
     /// This chunk's layout height — the amount the next chunk stacks down by.
     pub height: f32,
+    /// The chunk is **complete**: `CHUNK_LINES` hard lines closed by a `\n`,
+    /// so appending to the end of the block can never change its bytes
+    /// ([`super::chunk::frozen_chunk_count`]). A streaming block's frozen
+    /// chunks are carried forward by `Arc` clone on every content bump — the
+    /// pointer, not the glyphs.
+    ///
+    /// Frozen is about *bytes*, not about the `Arc`: [`recolor_block`] will
+    /// still `make_mut` a frozen chunk, because repainting doesn't move a
+    /// glyph.
+    pub frozen: bool,
 }
 
 /// A block's cached shaping.
@@ -174,11 +270,43 @@ pub struct ShapedBlock {
     /// Vertical offset of the text within the block's row — the border's top
     /// padding (`chrome::BlockLayout::text_y`).
     pub y_offset: f32,
-    /// Total glyphs held here — the input to slice 3's memory budget.
+    /// Total glyphs held here — the input to the memory budget
+    /// ([`SHAPE_CACHE_MAX_GLYPHS`]).
     pub glyph_count: usize,
-    /// [`ShapedBlockCache::tick`] at the last time this block was wanted —
-    /// slice 3's LRU input.
+    /// [`ShapedBlockCache::tick`] at the last pass that wanted this block —
+    /// the LRU input. Stamped for every band row the shape pass visits,
+    /// whether or not it re-shaped, which is what makes "least recently
+    /// wanted" and "least recently drawable" the same ordering.
     pub last_used: u64,
+    /// The base color these glyphs were painted with.
+    ///
+    /// Outside [`ShapeKey`] on purpose: color is not a shaping input, so a
+    /// theme swap (or a block going dim on exclusion) must be able to repaint
+    /// without re-shaping. [`shape_visible_blocks`] compares this against the
+    /// formatted block's current color and takes [`recolor_block`] when it
+    /// can.
+    pub color: Color,
+    /// Byte length of the text these chunks were shaped from — the monotonic
+    /// guard on the incremental-tail path.
+    pub text_len: usize,
+    /// This shaping was produced while the block was `Running`.
+    ///
+    /// It is what licenses [`incremental_prefix`]: a streaming block's text is
+    /// append-only (`docs/crdt-position-2026-08.md`, "streaming is 100%
+    /// append"), so a chunk that was complete when it was shaped is still the
+    /// same bytes now. A `Done` block's text can be *edited*, where equal byte
+    /// ranges say nothing about equal bytes — so an edit to a settled block
+    /// always re-shapes whole. The flag survives one frame past the end of the
+    /// stream, which is exactly the final Running→Done reconcile the plan
+    /// calls for.
+    pub streaming: bool,
+}
+
+impl ShapedBlock {
+    /// Leading chunks whose bytes are settled — see [`ShapedChunk::frozen`].
+    fn frozen_chunks(&self) -> usize {
+        self.chunks.iter().take_while(|c| c.frozen).count()
+    }
 }
 
 /// Shaped glyph runs for every block the surface might draw.
@@ -188,6 +316,21 @@ pub struct ShapedBlockCache {
     /// Incremented once per [`shape_visible_blocks`] pass; stamped onto every
     /// block the pass wanted.
     tick: u64,
+    /// Running sum of `blocks[_].glyph_count`.
+    ///
+    /// Maintained by [`Self::insert`] / [`Self::remove`] rather than summed on
+    /// demand, because the eviction check reads it **every frame** and the
+    /// whole point of the budget is that a cache big enough to need it is also
+    /// big enough that walking it per frame is a cost of its own.
+    total_glyphs: usize,
+    /// Bumped on every mutation a drawn frame could differ by: insert,
+    /// removal, an in-place recolor, a placement refresh. This is how a cache
+    /// change REACHES THE GPU — `WindowKey` folds it in, so the window
+    /// re-assembles and re-uploads even when nothing else moved. Without it, a
+    /// recolor (a tool call finishing amber→fg), an async landing whose
+    /// height matched its estimate, or a padding-only placement shift would
+    /// mutate the cache and never repaint (found by review, 2026-08-18).
+    generation: u64,
 }
 
 impl ShapedBlockCache {
@@ -199,19 +342,67 @@ impl ShapedBlockCache {
         self.blocks.len()
     }
 
-    #[allow(dead_code)] // Symmetry with `len`; slice 3's eviction wants it.
+    #[allow(dead_code)] // Symmetry with `len`; exercised by tests.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
-    /// Total glyphs held across every cached block — slice 3 evicts against
-    /// this, and diagnostics can report it now.
+    /// Total glyphs held across every cached block — what eviction budgets
+    /// against, and what diagnostics report.
     pub fn total_glyphs(&self) -> usize {
-        self.blocks.values().map(|b| b.glyph_count).sum()
+        self.total_glyphs
     }
 
+    #[allow(dead_code)] // Model accessor for tests and diagnostics.
     pub fn tick(&self) -> u64 {
         self.tick
+    }
+
+    /// See the field doc on [`Self::generation`] — a `WindowKey` input.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Record an in-place mutation of an already-cached block (recolor,
+    /// placement refresh) so the window re-uploads it.
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The one write path. Every insert goes through here so `total_glyphs`
+    /// can never drift from the map — a drift would either stall eviction
+    /// forever or evict a cache that fits.
+    fn insert(&mut self, id: BlockId, block: ShapedBlock) {
+        let added = block.glyph_count;
+        if let Some(old) = self.blocks.insert(id, block) {
+            self.total_glyphs -= old.glyph_count;
+        }
+        self.total_glyphs += added;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn remove(&mut self, id: &BlockId) -> Option<ShapedBlock> {
+        let old = self.blocks.remove(id)?;
+        self.total_glyphs -= old.glyph_count;
+        self.generation = self.generation.wrapping_add(1);
+        Some(old)
+    }
+
+    /// Drop every block the predicate rejects, keeping the glyph total right.
+    fn retain(&mut self, mut keep: impl FnMut(&BlockId) -> bool) {
+        let mut freed = 0usize;
+        self.blocks.retain(|id, block| {
+            if keep(id) {
+                true
+            } else {
+                freed += block.glyph_count;
+                false
+            }
+        });
+        if freed > 0 {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.total_glyphs -= freed;
     }
 
     /// Seed a shaped block directly. Test-only: the production writer is
@@ -219,7 +410,7 @@ impl ShapedBlockCache {
     /// contents without a font context or an atlas.
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, id: BlockId, block: ShapedBlock) {
-        self.blocks.insert(id, block);
+        self.insert(id, block);
     }
 }
 
@@ -234,16 +425,22 @@ pub struct ShapedLabel {
     /// centered on the divider line, matching `sync_role_group_headers`.
     pub y_offset: f32,
     pub width: f32,
+    /// Measured label height. Unread on the drawing path — the label is
+    /// positioned by `y_offset`, which already centred it in the header row —
+    /// but it is what that centring was computed from, and dropping it would
+    /// leave the arithmetic in `shape_role_label` unexplained.
+    #[allow(dead_code)]
     pub height: f32,
 }
 
 /// Shaped USER/ASSISTANT/… labels, keyed by `(role, metrics_epoch)`.
 ///
-/// Tiny and shared: one entry per role, not per header row. Theme *colors*
-/// are baked into the glyphs here and are deliberately not part of the key —
-/// recoloring cached runs in place is slice 3's fast path, and a theme swap
-/// in slice 1 is handled by the cache being rebuilt on the next metrics bump
-/// or app restart. Noted rather than hidden.
+/// Tiny and shared: one entry per role, not per header row. Theme *colors* are
+/// baked into the glyphs here, and rather than widen the key with a theme
+/// epoch — which would ripple a parameter through `assemble_runs` and
+/// `collect_chrome_instances` for five entries — the whole map is dropped when
+/// the theme moves ([`Self::sync_theme`]). Five re-layouts on a theme swap is
+/// not a cost worth designing around.
 ///
 /// The map is keyed on [`role_index`] rather than `Role` itself: `Role` is a
 /// wire type in `kaijutsu-types` and does not derive `Hash`, and teaching a
@@ -252,6 +449,7 @@ pub struct ShapedLabel {
 #[derive(Resource, Debug, Default)]
 pub struct HeaderLabelCache {
     labels: HashMap<(u8, u64), ShapedLabel>,
+    theme_epoch: u64,
 }
 
 /// Dense index for a `Role`, for use as a hash key. Exhaustive on purpose —
@@ -271,8 +469,22 @@ impl HeaderLabelCache {
         self.labels.get(&(role_index(role), metrics_epoch))
     }
 
+    #[allow(dead_code)] // Model accessor, exercised by tests.
     pub fn len(&self) -> usize {
         self.labels.len()
+    }
+
+    /// Drop every cached label when the theme moves, so the next pass
+    /// re-shapes them in the new colors. Returns whether anything was
+    /// dropped.
+    pub fn sync_theme(&mut self, theme_epoch: u64) -> bool {
+        if self.theme_epoch == theme_epoch {
+            return false;
+        }
+        self.theme_epoch = theme_epoch;
+        let had = !self.labels.is_empty();
+        self.labels.clear();
+        had
     }
 
     /// Seed a shaped label directly — test-only, same reasoning as
@@ -317,16 +529,92 @@ pub fn block_text_style(text_metrics: &TextMetrics, brush: Brush) -> VelloTextSt
     }
 }
 
+/// What one shaping pass produced, main-thread effects still owed.
+///
+/// The atlas and [`FontDataMap`] are main-world resources a task cannot
+/// touch, so shaping hands back what it *would* have written into them:
+/// `glyph_keys` to replay through [`MsdfAtlas::request`], and `fonts` to
+/// replay through [`FontDataMap::register`]. Skipping either yields a cache
+/// full of glyphs the atlas can never fill.
+#[derive(Debug, Default)]
+pub struct ShapeOutput {
+    pub chunks: Vec<ShapedChunk>,
+    /// Sum of the chunk heights.
+    pub text_height: f32,
+    pub glyph_keys: Vec<GlyphKey>,
+    /// Fonts every glyph run resolved to. Cheap to carry — `FontData` is a
+    /// refcounted blob, so this clones pointers, not font files.
+    pub fonts: Vec<parley::FontData>,
+}
+
+impl ShapeOutput {
+    /// Replay the deferred main-thread effects. The one place that knows the
+    /// deferred-collector contract has two halves.
+    fn apply_deferred(&self, atlas: &mut MsdfAtlas, font_data: &mut FontDataMap) {
+        for font in &self.fonts {
+            font_data.register(font);
+        }
+        for key in &self.glyph_keys {
+            atlas.request(*key);
+        }
+    }
+}
+
+/// Shape one chunk of a block's text into chunk-local glyphs.
+///
+/// Pure: no atlas, no font map, no ECS — so it runs identically on the main
+/// thread and on `AsyncComputeTaskPool` (the parley context is per-thread,
+/// `text/shaping/context.rs`).
+pub fn shape_chunk(
+    font: &VelloFont,
+    text: &str,
+    spans: &[SpanBrush],
+    style: &VelloTextStyle,
+    max_advance: Option<f32>,
+    range: Range<usize>,
+    frozen: bool,
+    out: &mut ShapeOutput,
+) {
+    let chunk_text = chunk_shaping_text(text, &range);
+    let chunk_spans = slice_spans(spans, range.clone());
+
+    // Ranged styles (`layout_spanned` + the styled collector) are the only
+    // path that colors a span starting mid-run; the plain path is kept for
+    // the span-free majority because it skips parley's run splitting
+    // entirely.
+    let (glyphs, keys, layout_height) = if chunk_spans.is_empty() {
+        let layout = font.layout(chunk_text, style, VelloTextAlign::Left, max_advance);
+        collect_fonts(&layout, &mut out.fonts);
+        let (glyphs, keys) =
+            collect_msdf_glyphs_deferred(&layout, &[], &style.brush, (0.0, 0.0));
+        (glyphs, keys, layout.height())
+    } else {
+        let layout = font.layout_spanned(
+            chunk_text,
+            style,
+            VelloTextAlign::Left,
+            max_advance,
+            &chunk_spans,
+        );
+        collect_fonts(&layout, &mut out.fonts);
+        let (glyphs, keys) = collect_msdf_glyphs_styled_deferred(&layout, (0.0, 0.0));
+        (glyphs, keys, layout.height())
+    };
+
+    out.glyph_keys.extend(keys);
+    out.text_height += layout_height;
+    out.chunks.push(ShapedChunk {
+        byte_range: range,
+        glyphs: Arc::new(glyphs),
+        height: layout_height,
+        frozen,
+    });
+}
+
 /// Shape one block's text into chunked, chunk-local glyph runs.
 ///
-/// Returns the chunks, the total height, and the deduplicated glyph keys the
-/// caller must replay into [`MsdfAtlas::request`] — the deferred-collector
-/// contract, kept even though this slice runs on the main thread, because
-/// slice 3 moves exactly this function onto the task pool.
-///
-/// `font_data` is fed every glyph run's font so the MSDF generator has bytes
-/// to rasterize from; skipping it yields a cache full of glyphs the atlas can
-/// never fill.
+/// Pure for the same reason [`shape_chunk`] is — this is what the backlog
+/// tasks call.
 pub fn shape_block(
     font: &VelloFont,
     text: &str,
@@ -334,71 +622,470 @@ pub fn shape_block(
     style: &VelloTextStyle,
     wrap_width: f32,
     chunk_lines: usize,
-    font_data: &mut FontDataMap,
-) -> (Vec<ShapedChunk>, f32, Vec<GlyphKey>) {
+) -> ShapeOutput {
+    let ranges = chunk_ranges(text, chunk_lines);
+    let frozen = frozen_chunk_count(text, &ranges, chunk_lines);
     let max_advance = (wrap_width > 0.0).then_some(wrap_width);
-    let fallback = style.brush.clone();
 
-    let mut chunks = Vec::new();
-    let mut keys = Vec::new();
-    let mut height = 0.0_f32;
-
-    for range in chunk_ranges(text, chunk_lines) {
-        let chunk_text = chunk_shaping_text(text, &range);
-        let chunk_spans = slice_spans(spans, range.clone());
-
-        // Ranged styles (`layout_spanned` + the styled collector) are the
-        // only path that colors a span starting mid-run; the plain path is
-        // kept for the span-free majority because it skips parley's run
-        // splitting entirely.
-        let (glyphs, chunk_keys, layout_height) = if chunk_spans.is_empty() {
-            let layout = font.layout(chunk_text, style, VelloTextAlign::Left, max_advance);
-            register_fonts(&layout, font_data);
-            let (glyphs, keys) =
-                collect_msdf_glyphs_deferred(&layout, &[], &fallback, (0.0, 0.0));
-            (glyphs, keys, layout.height())
-        } else {
-            let layout = font.layout_spanned(
-                chunk_text,
-                style,
-                VelloTextAlign::Left,
-                max_advance,
-                &chunk_spans,
-            );
-            register_fonts(&layout, font_data);
-            let (glyphs, keys) = collect_msdf_glyphs_styled_deferred(&layout, (0.0, 0.0));
-            (glyphs, keys, layout.height())
-        };
-
-        keys.extend(chunk_keys);
-        height += layout_height;
-        chunks.push(ShapedChunk {
-            byte_range: range,
-            glyphs: Arc::new(glyphs),
-            height: layout_height,
-        });
+    let mut out = ShapeOutput::default();
+    for (i, range) in ranges.into_iter().enumerate() {
+        shape_chunk(
+            font,
+            text,
+            spans,
+            style,
+            max_advance,
+            range,
+            i < frozen,
+            &mut out,
+        );
     }
-
-    (chunks, height, keys)
+    out
 }
 
-/// Register every font a layout used, so MSDF generation has its bytes.
-fn register_fonts(layout: &parley::Layout<Brush>, font_data: &mut FontDataMap) {
+/// Collect every font a layout used, so MSDF generation has its bytes.
+///
+/// Deduplicated on [`FontId`] (a pointer, so the comparison is free) because
+/// a chunk is dozens of glyph runs over the same one or two fonts, and the
+/// list is carried across a thread boundary.
+fn collect_fonts(layout: &parley::Layout<Brush>, fonts: &mut Vec<parley::FontData>) {
     for line in layout.lines() {
         for item in line.items() {
             if let parley::PositionedLayoutItem::GlyphRun(run) = item {
-                font_data.register(run.run().font());
+                let font = run.run().font();
+                let id = crate::text::msdf::glyph::FontId::from_parley(font);
+                if !fonts
+                    .iter()
+                    .any(|f| crate::text::msdf::glyph::FontId::from_parley(f) == id)
+                {
+                    fonts.push(font.clone());
+                }
             }
         }
     }
 }
 
+// ============================================================================
+// INCREMENTAL TAIL
+// ============================================================================
+
+/// How many of `existing`'s chunks a new shaping of `text` can inherit
+/// verbatim, or `None` if the block has to be re-shaped whole.
+///
+/// This is the streaming fast path's whole decision, and it is deliberately
+/// conservative — every clause below rules out a way the cached glyphs could
+/// describe different bytes than the ones on screen:
+///
+/// - **`existing.streaming`.** The cached shaping was made while the block was
+///   `Running`, so the only edit that can have happened since is an append
+///   (kaijutsu streams by `push_str`; there is no text CRDT and no in-place
+///   mutation of a running block). A settled block's text can be *edited*,
+///   and then equal byte ranges say nothing about equal bytes.
+/// - **Nothing but the content version moved.** Wrap width, indent, collapse
+///   and the metrics epoch all change the line grid, and a frozen chunk's
+///   glyphs are only valid for the grid they were laid out in.
+/// - **The text did not shrink**, and the frozen ranges still tile the same
+///   bytes. A truncation or a regenerate mid-stream fails this and takes the
+///   whole path.
+/// - **The color did not move.** Frozen chunks carry their colors baked into
+///   the glyphs, so inheriting them under a new palette would leave the head
+///   of a streaming block in the old theme while its tail arrived in the new
+///   one. A span-free block never reaches here for a color change (it is
+///   repainted in place instead).
+/// - **The block is not spanned.** Byte-identical frozen ranges do NOT prove
+///   a spanned block's *rendering* is unchanged: markdown re-interprets the
+///   whole text on every append, and an append can recolor bytes that are
+///   already frozen — stream `"Title\n"`, then append `"==="`, and the
+///   frozen line retroactively becomes a heading; an `md_*`-token-only theme
+///   change moves span brushes while the base color (the clause above) holds
+///   still. Bytes + base color are a proof only for span-free text, so a
+///   spanned block always re-shapes whole (found by review, 2026-08-18).
+///
+/// Returns the number of leading chunks to keep — the caller re-shapes
+/// `ranges[n..]` and clones the first `n` `Arc`s by pointer.
+pub fn incremental_prefix(
+    existing: &ShapedBlock,
+    key: &ShapeKey,
+    color: Color,
+    text: &str,
+    ranges: &[Range<usize>],
+    spanned: bool,
+) -> Option<usize> {
+    if spanned || !existing.streaming || text.len() < existing.text_len || existing.color != color
+    {
+        return None;
+    }
+    let only_content_moved = ShapeKey {
+        content_version: existing.key.content_version,
+        ..*key
+    } == existing.key;
+    if !only_content_moved {
+        return None;
+    }
+
+    let n = existing.frozen_chunks();
+    if n == 0 || n > ranges.len() {
+        return None;
+    }
+    for (chunk, range) in existing.chunks[..n].iter().zip(&ranges[..n]) {
+        if chunk.byte_range != *range {
+            return None;
+        }
+    }
+    Some(n)
+}
+
+// ============================================================================
+// RECOLOR
+// ============================================================================
+
+/// Repaint a shaped block's glyphs without moving one of them.
+///
+/// The theme fast path: color is not a shaping property (the same fact
+/// `layout_bridge`'s `spanned_and_plain_layouts_position_glyphs_identically`
+/// pins), so a theme swap is a memory rewrite rather than a parley run.
+/// `Arc::make_mut` clones a chunk's glyphs only if the render world still
+/// holds the previous pointer — the frame after, it writes in place.
+///
+/// **Span-free blocks only, and that split is forced, not chosen.**
+/// [`PositionedGlyph`] carries no byte offset, so there is no way to map a
+/// re-derived span's byte range back onto the glyphs it colored: parley
+/// resolved that mapping during shaping and did not keep it. Carrying a byte
+/// index per glyph to enable it would cost every block memory to make one
+/// rare event cheaper for the minority of blocks that are spanned (markdown,
+/// diff). So a spanned block whose colors moved re-shapes instead — through
+/// the ordinary backlog, visible-first, which is what a content bump on it
+/// would do anyway. Callers must check `spans.is_empty()`; this function does
+/// not know about spans and would happily flatten them.
+pub fn recolor_block(block: &mut ShapedBlock, color: Color) {
+    let rgba = color_to_rgba8(color);
+    for chunk in &mut block.chunks {
+        // A chunk already in the target color keeps its `Arc` — worth the
+        // scan, because it is what keeps a repaint of an unchanged block from
+        // deep-cloning every glyph the render world is holding.
+        if chunk.glyphs.iter().all(|g| g.color == rgba) {
+            continue;
+        }
+        for glyph in Arc::make_mut(&mut chunk.glyphs) {
+            glyph.color = rgba;
+        }
+    }
+    block.color = color;
+}
+
+// ============================================================================
+// EVICTION
+// ============================================================================
+
+/// Choose least-recently-used blocks to drop until the cache fits `budget`.
+///
+/// `candidates` are the *evictable* entries — `(id, glyph_count, last_used)`
+/// for blocks that are neither in the pinned window nor streaming — and
+/// `total` is the whole cache's glyph count, pinned blocks included. Pinned
+/// glyphs therefore count against the budget without ever being freed, which
+/// is the honest arithmetic: if the pinned window alone exceeds the budget,
+/// this evicts everything it may and stops, rather than pretending it
+/// succeeded or evicting something that is on screen.
+///
+/// Ties on `last_used` fall to `sort_by_key`'s stable order; there is nothing
+/// to prefer between two blocks last wanted on the same pass.
+/// Which cached blocks eviction is even allowed to consider.
+///
+/// Two pins, and they are different kinds of promise. A block in `pinned` is
+/// close enough to the viewport that dropping it would cost a re-shape the
+/// user might see. A **streaming** block is pinned wherever it sits, because
+/// its frozen chunks are the thing the incremental tail is built on — evicting
+/// one turns the next tick's one-chunk update into a whole-block re-shape, and
+/// then the tick after that, for as long as the stream runs.
+pub fn eviction_candidates(
+    shaped: &ShapedBlockCache,
+    pinned: &HashSet<BlockId>,
+) -> Vec<(BlockId, usize, u64)> {
+    shaped
+        .blocks
+        .iter()
+        .filter(|(id, block)| !pinned.contains(id) && !block.streaming)
+        .map(|(id, block)| (*id, block.glyph_count, block.last_used))
+        .collect()
+}
+
+pub fn plan_evictions(
+    candidates: &mut [(BlockId, usize, u64)],
+    total: usize,
+    budget: usize,
+) -> Vec<BlockId> {
+    if total <= budget {
+        return Vec::new();
+    }
+    candidates.sort_by_key(|(_, _, last_used)| *last_used);
+
+    let mut freed = 0usize;
+    let mut evicted = Vec::new();
+    for (id, glyphs, _) in candidates.iter() {
+        if total - freed <= budget {
+            break;
+        }
+        freed += glyphs;
+        evicted.push(*id);
+    }
+    evicted
+}
+
+// ============================================================================
+// BACKLOG SHAPING (OFF-THREAD)
+// ============================================================================
+
+/// Everything one backlog shaping task needs, snapshotted on the main thread.
+///
+/// Owned, not borrowed, all the way down: the task outlives the system that
+/// spawned it, and the caches it read from are `Res` for the length of one
+/// system run. `VelloFont` is a family name, so cloning it is a `String`.
+#[derive(Clone)]
+pub struct ShapeJob {
+    pub block: BlockId,
+    pub key: ShapeKey,
+    pub font: VelloFont,
+    pub text: String,
+    pub spans: Vec<SpanBrush>,
+    pub style: VelloTextStyle,
+    pub wrap_width: f32,
+    pub chunk_lines: usize,
+    /// The color the glyphs will carry, kept so the landed block can answer
+    /// "do I need a recolor?" without re-deriving it from the brush.
+    pub color: Color,
+    /// Where this block sits in the column at spawn time.
+    ///
+    /// Carried through the task so [`apply_shape_results`] can land a block
+    /// that is no longer in the shape band — its height has to reach the
+    /// geometry either way. A padding-only move (a ToolResult joining its
+    /// call) that happens while the task runs is not in [`ShapeKey`] and is
+    /// therefore not detected here; the shape pass refreshes placement for
+    /// every band row on the next frame, which is where that correction has
+    /// always come from.
+    pub layout: BlockLayout,
+}
+
+/// One finished backlog shaping, waiting for the main thread.
+pub struct ShapedResult {
+    pub block: BlockId,
+    pub key: ShapeKey,
+    pub output: ShapeOutput,
+    pub color: Color,
+    pub text_len: usize,
+    pub layout: BlockLayout,
+}
+
+/// Run one shaping job. Pure — the body of the spawned task, called directly
+/// by tests (which have no `AsyncComputeTaskPool`).
+pub fn run_shape_job(job: ShapeJob) -> ShapedResult {
+    let output = shape_block(
+        &job.font,
+        &job.text,
+        &job.spans,
+        &job.style,
+        job.wrap_width,
+        job.chunk_lines,
+    );
+    ShapedResult {
+        block: job.block,
+        key: job.key,
+        output,
+        color: job.color,
+        text_len: job.text.len(),
+        layout: job.layout,
+    }
+}
+
+/// In-flight backlog shaping.
+///
+/// The `in_flight` map is both the duplicate-spawn guard and the staleness
+/// oracle, and it can be both because it holds exactly one key per block: the
+/// key of the **most recently spawned** task. A result whose key doesn't match
+/// the entry is superseded (a newer task, a sync re-shape, or an eviction has
+/// happened since) and is dropped — last-writer-wins, decided by what the main
+/// thread most recently asked for rather than by arrival order.
+#[derive(Resource, Default)]
+pub struct ShapeTasks {
+    tasks: Vec<Task<ShapedResult>>,
+    in_flight: HashMap<BlockId, ShapeKey>,
+}
+
+impl std::fmt::Debug for ShapeTasks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShapeTasks")
+            .field("tasks", &self.tasks.len())
+            .field("in_flight", &self.in_flight.len())
+            .finish()
+    }
+}
+
+impl ShapeTasks {
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Is a task for exactly this `(block, key)` already running?
+    pub fn is_pending(&self, block: &BlockId, key: &ShapeKey) -> bool {
+        self.in_flight.get(block) == Some(key)
+    }
+
+    /// Record a spawn. Overwrites any older key for the block, which is what
+    /// makes the older task's result stale on arrival.
+    fn note_spawned(&mut self, block: BlockId, key: ShapeKey) {
+        self.in_flight.insert(block, key);
+    }
+
+    /// Should a landed result be applied? Clears the entry when it should.
+    ///
+    /// Separate from the task draining so the decision is testable without a
+    /// task pool — the same shape `generator.rs` uses for its retry budget.
+    pub fn accept(&mut self, block: &BlockId, key: &ShapeKey) -> bool {
+        if self.in_flight.get(block) != Some(key) {
+            return false;
+        }
+        self.in_flight.remove(block);
+        true
+    }
+
+    /// Forget any in-flight task for `block` — its result will be dropped on
+    /// arrival. Called when the main thread shapes the block itself, or drops
+    /// it from the cache.
+    pub fn cancel(&mut self, block: &BlockId) {
+        self.in_flight.remove(block);
+    }
+
+    /// Spawn a job unless one for the same `(block, key)` is already running.
+    /// Returns whether a task was actually spawned.
+    pub fn spawn(&mut self, job: ShapeJob) -> bool {
+        if self.is_pending(&job.block, &job.key) {
+            return false;
+        }
+        let (block, key) = (job.block, job.key);
+        let task = AsyncComputeTaskPool::get().spawn(async move { run_shape_job(job) });
+        self.note_spawned(block, key);
+        self.tasks.push(task);
+        true
+    }
+
+    /// Take every finished task's result, leaving the rest running.
+    fn drain_finished(&mut self) -> Vec<ShapedResult> {
+        let mut done = Vec::new();
+        self.tasks.retain_mut(|task| {
+            if task.is_finished() {
+                done.push(block_on(future::poll_once(task)).expect("finished task must yield"));
+                false
+            } else {
+                true
+            }
+        });
+        done
+    }
+}
+
+/// Land finished backlog shapings into the cache.
+///
+/// Runs in [`super::SurfaceSet::Shape`] **before** [`shape_visible_blocks`],
+/// so a block whose backlog result arrives this frame is already in the cache
+/// when the shape pass looks at it — otherwise the pass would see a key
+/// mismatch and shape it a second time, synchronously, which is precisely the
+/// hitch the backlog exists to avoid.
+///
+/// Heights reach `ConversationGeometry` the ordinary way: the landed block's
+/// `height` differs from the row's, [`apply_shaped_measurements`] (next set)
+/// notices, and the anchor compensation it already performs covers async
+/// pop-in above the viewport exactly as it covers any other late measurement.
+pub fn apply_shape_results(
+    mut tasks: ResMut<ShapeTasks>,
+    atlas: Option<ResMut<MsdfAtlas>>,
+    font_data: Option<ResMut<FontDataMap>>,
+    mut shaped: ResMut<ShapedBlockCache>,
+) {
+    // Without an atlas there is nowhere to request the glyphs, and inserting
+    // the block anyway would stamp a matching `ShapeKey` on a run that can
+    // never be rasterized — the same trap `shape_visible_blocks` guards. The
+    // check comes **before** the drain on purpose: draining here would throw
+    // the results away while leaving their in-flight claims standing, and the
+    // block would then never be spawned for again. Leaving the tasks parked
+    // costs nothing — they are already finished — and they land intact on the
+    // first frame the render world is up.
+    let (Some(mut atlas), Some(mut font_data)) = (atlas, font_data) else {
+        return;
+    };
+
+    let finished = tasks.drain_finished();
+    if finished.is_empty() {
+        return;
+    }
+
+    for result in finished {
+        if !tasks.accept(&result.block, &result.key) {
+            // Superseded while it ran. Dropping it is the whole point of
+            // last-writer-wins: the cache already holds — or is about to hold
+            // — a shaping of newer text.
+            continue;
+        }
+        result.output.apply_deferred(&mut atlas, &mut font_data);
+
+        let glyph_count = result.output.chunks.iter().map(|c| c.glyphs.len()).sum();
+        let tick = shaped.tick;
+        shaped.insert(
+            result.block,
+            ShapedBlock {
+                key: result.key,
+                height: result.layout.outer_height(result.output.text_height),
+                text_height: result.output.text_height,
+                chunks: result.output.chunks,
+                x_offset: result.layout.text_x,
+                y_offset: result.layout.text_y,
+                glyph_count,
+                last_used: tick,
+                color: result.color,
+                text_len: result.text_len,
+                // Backlog shaping is never used for a streaming block, so
+                // this shaping can never license the incremental tail path.
+                streaming: false,
+            },
+        );
+    }
+}
+
+/// The caches [`shape_visible_blocks`] reads and writes, bundled so the
+/// system stays under Bevy's parameter-tuple limit — and so the shape pass's
+/// working set is one thing with a name rather than five loose arguments.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ShapeCaches<'w> {
+    pub content: Res<'w, super::content::BlockContentCache>,
+    pub chrome: Res<'w, super::chrome::BlockChromeCache>,
+    pub shaped: ResMut<'w, ShapedBlockCache>,
+    pub headers: ResMut<'w, HeaderLabelCache>,
+    pub tasks: ResMut<'w, ShapeTasks>,
+}
+
+/// The two epochs that invalidate shaped runs, bundled for the same reason.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ShapeEpochs<'w> {
+    pub metrics: Res<'w, SurfaceMetricsEpoch>,
+    pub theme: Res<'w, SurfaceThemeEpoch>,
+}
+
 /// Shape the blocks (and role labels) inside the window band.
 ///
-/// Synchronous and whole-block this slice. A block whose [`ShapeKey`] still
-/// matches its cache entry costs one comparison; a mismatch pays the full
-/// parley layout right here, on the main thread, where the atlas can be
-/// requested on the spot.
+/// The pass is one walk of the shape band, and every row it visits takes
+/// exactly one of five outcomes:
+///
+/// 1. **Key matches, color matches** — stamp `last_used`, refresh placement,
+///    done. The common case, and it costs one comparison.
+/// 2. **Key matches, color moved** — [`recolor_block`] in place for a
+///    span-free block; a spanned one falls through to a re-shape.
+/// 3. **Streaming tail** — [`incremental_prefix`] says the frozen chunks
+///    still describe the same bytes, so only the open tail chunk re-shapes.
+///    Always synchronous: a `Running` block must never wait on a task, and
+///    one chunk is bounded work no matter how tall the block grew.
+/// 4. **Inside [`SYNC_SLACK_SCREENS`]** — full re-shape on the main thread,
+///    because an unshaped row this close to the viewport is a visible hole.
+/// 5. **Anything else in the band** — a [`ShapeJob`] queued for the backlog,
+///    nearest row first. The row keeps drawing its chrome and its reserved
+///    height until the result lands.
 #[allow(clippy::too_many_arguments)]
 pub fn shape_visible_blocks(
     entities: Res<EditorEntities>,
@@ -409,13 +1096,10 @@ pub fn shape_visible_blocks(
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    metrics_epoch: Res<SurfaceMetricsEpoch>,
-    content: Res<super::content::BlockContentCache>,
-    chrome: Res<super::chrome::BlockChromeCache>,
+    epochs: ShapeEpochs,
+    mut caches: ShapeCaches,
     atlas: Option<ResMut<MsdfAtlas>>,
     font_data: Option<ResMut<FontDataMap>>,
-    mut shaped: ResMut<ShapedBlockCache>,
-    mut headers: ResMut<HeaderLabelCache>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -451,13 +1135,28 @@ pub fn shape_visible_blocks(
     } else {
         600.0
     };
-    let band = geom.visible_rows(scroll_state.offset, vh, SHAPE_SLACK_SCREENS * vh);
-    let metrics_epoch = metrics_epoch.get();
+    let offset = scroll_state.offset;
+    let band = geom.visible_rows(offset, vh, SHAPE_SLACK_SCREENS * vh);
+    // The rows close enough that not drawing them would show: shaping these
+    // is worth a frame hitch, shaping the rest is not.
+    let sync_band = geom.visible_rows(offset, vh, SYNC_SLACK_SCREENS * vh);
+    let metrics_epoch = epochs.metrics.get();
+    let theme_epoch = epochs.theme.get();
 
-    shaped.tick = shaped.tick.wrapping_add(1);
-    let tick = shaped.tick;
+    // Role labels bake theme colors into their glyphs, and there are five of
+    // them — dropping the lot on a theme swap is cheaper than teaching every
+    // consumer a wider cache key.
+    caches.headers.sync_theme(theme_epoch);
 
-    for row in &geom.rows()[band] {
+    caches.shaped.tick = caches.shaped.tick.wrapping_add(1);
+    let tick = caches.shaped.tick;
+
+    // Backlog candidates, paired with their distance from the viewport top so
+    // the nearest ones win the in-flight budget.
+    let mut backlog: Vec<(f32, ShapeJob)> = Vec::new();
+
+    for (i, row) in geom.rows()[band.clone()].iter().enumerate() {
+        let row_index = band.start + i;
         match row.key {
             RowKey::Header(_) => {
                 shape_role_label(
@@ -465,13 +1164,13 @@ pub fn shape_visible_blocks(
                     row.role,
                     metrics_epoch,
                     &theme,
-                    &mut headers,
+                    &mut caches.headers,
                     &mut atlas,
                     &mut font_data,
                 );
             }
             RowKey::Block(id) => {
-                let Some(formatted) = content.get(&id) else {
+                let Some(formatted) = caches.content.get(&id) else {
                     // Content sync hasn't reached this row yet (it runs with a
                     // wider band, so this is a first-frame ordering case, not
                     // a hole). It will be here next frame.
@@ -480,12 +1179,10 @@ pub fn shape_visible_blocks(
                 // Chrome decides the wrap width: a bordered block's text is
                 // laid out inside its padding, exactly as `build_block_scenes`
                 // lays it out inside the same padding on the legacy path.
-                let layout = chrome.layout(
-                    &id,
-                    container_width,
-                    row.indent_level,
-                    theme.indent_width,
-                );
+                let layout =
+                    caches
+                        .chrome
+                        .layout(&id, container_width, row.indent_level, theme.indent_width);
                 let wrap_width = layout.wrap_width;
                 let key = ShapeKey {
                     content_version: formatted.version,
@@ -494,58 +1191,261 @@ pub fn shape_visible_blocks(
                     indent_level: row.indent_level,
                     metrics_epoch,
                 };
+                let streaming = formatted.status == Status::Running;
+                let color = formatted.color;
+                let spanned = !formatted.spans.is_empty();
 
-                if let Some(existing) = shaped.blocks.get_mut(&id) {
-                    if existing.key == key {
-                        existing.last_used = tick;
-                        // Padding can move without the wrap width moving —
-                        // a ToolResult that joins the call above it loses
-                        // half its top padding, and nothing horizontal
-                        // changes. Refresh the placement every pass (three
-                        // stores) rather than adding a non-shaping input to
-                        // `ShapeKey` and re-shaping for it.
-                        existing.x_offset = layout.text_x;
-                        existing.y_offset = layout.text_y;
-                        existing.height = layout.outer_height(existing.text_height);
-                        continue;
+                let mut key_match_settled = false;
+                if let Some(existing) = caches.shaped.blocks.get_mut(&id)
+                    && existing.key == key
+                {
+                    existing.last_used = tick;
+                    // Padding can move without the wrap width moving — a
+                    // ToolResult that joins the call above it loses half its
+                    // top padding, and nothing horizontal changes. Refresh the
+                    // placement every pass rather than adding a non-shaping
+                    // input to `ShapeKey` and re-shaping for it — but compare
+                    // first: an actual move (like a recolor below) must bump
+                    // the cache generation or the GPU never re-uploads it.
+                    let height = layout.outer_height(existing.text_height);
+                    let mut mutated = existing.x_offset != layout.text_x
+                        || existing.y_offset != layout.text_y
+                        || existing.height != height;
+                    existing.x_offset = layout.text_x;
+                    existing.y_offset = layout.text_y;
+                    existing.height = height;
+
+                    if existing.color == color || !spanned {
+                        if existing.color != color {
+                            recolor_block(existing, color);
+                            mutated = true;
+                        }
+                        // The incremental-tail licence expires the moment the
+                        // block settles: from here on its text can be *edited*,
+                        // and equal byte ranges would no longer imply equal
+                        // bytes. Cleared only on this arm — the re-shape path
+                        // below still needs the old value to make the final
+                        // Running→Done reconcile incremental.
+                        existing.streaming &= streaming;
+                        key_match_settled = true;
+                    }
+                    // Otherwise: a spanned block whose colors moved cannot be
+                    // repainted in place (see `recolor_block`); it re-shapes
+                    // like any other content change.
+                    if mutated {
+                        caches.shaped.touch();
                     }
                 }
-
-                let style = block_text_style(&text_metrics, bevy_color_to_brush(formatted.color));
-                let (chunks, text_height, keys) = shape_block(
-                    font,
-                    &formatted.text,
-                    &formatted.spans,
-                    &style,
-                    wrap_width,
-                    CHUNK_LINES,
-                    &mut font_data,
-                );
-                for key in keys {
-                    atlas.request(key);
+                if key_match_settled {
+                    continue;
                 }
 
-                let glyph_count = chunks.iter().map(|c| c.glyphs.len()).sum();
-                shaped.blocks.insert(
+                // Can the streaming fast path carry most of this block
+                // forward? Only asked of a block that was shaped mid-stream,
+                // so `chunk_ranges` never runs for a settled one.
+                let inherit = match caches.shaped.get(&id) {
+                    Some(existing) if existing.streaming => {
+                        let ranges = chunk_ranges(&formatted.text, CHUNK_LINES);
+                        incremental_prefix(existing, &key, color, &formatted.text, &ranges, spanned)
+                            .map(|n| (n, ranges))
+                    }
+                    _ => None,
+                };
+
+                let style = block_text_style(&text_metrics, bevy_color_to_brush(color));
+
+                // Everything close enough to see, everything streaming, and
+                // everything the tail path can finish cheaply stays on this
+                // thread. The rest becomes a job.
+                if !sync_band.contains(&row_index) && !streaming && inherit.is_none() {
+                    if !caches.tasks.is_pending(&id, &key) {
+                        backlog.push((
+                            (row.y_offset - offset).abs(),
+                            ShapeJob {
+                                block: id,
+                                key,
+                                font: font.clone(),
+                                text: formatted.text.clone(),
+                                spans: formatted.spans.clone(),
+                                style,
+                                wrap_width,
+                                chunk_lines: CHUNK_LINES,
+                                color,
+                                layout,
+                            },
+                        ));
+                    }
+                    continue;
+                }
+
+                // Shaping it here supersedes anything in flight for it.
+                caches.tasks.cancel(&id);
+
+                let output = match inherit {
+                    Some((n, ranges)) => {
+                        // Frozen chunks come across by `Arc` clone — the
+                        // pointer, not the glyphs. This is the whole win of
+                        // chunking: a 5000-line streamed block costs one chunk
+                        // of parley per tick, forever.
+                        let inherited: Vec<ShapedChunk> =
+                            caches.shaped.blocks[&id].chunks[..n].to_vec();
+                        shape_tail(
+                            font,
+                            inherited,
+                            &formatted.text,
+                            &formatted.spans,
+                            &style,
+                            wrap_width,
+                            &ranges,
+                        )
+                    }
+                    None => shape_block(
+                        font,
+                        &formatted.text,
+                        &formatted.spans,
+                        &style,
+                        wrap_width,
+                        CHUNK_LINES,
+                    ),
+                };
+                output.apply_deferred(&mut atlas, &mut font_data);
+
+                let glyph_count = output.chunks.iter().map(|c| c.glyphs.len()).sum();
+                caches.shaped.insert(
                     id,
                     ShapedBlock {
                         key,
-                        chunks,
-                        height: layout.outer_height(text_height),
-                        text_height,
+                        height: layout.outer_height(output.text_height),
+                        text_height: output.text_height,
+                        chunks: output.chunks,
                         x_offset: layout.text_x,
                         y_offset: layout.text_y,
                         glyph_count,
                         last_used: tick,
+                        color,
+                        text_len: formatted.text.len(),
+                        streaming,
                     },
                 );
             }
         }
     }
 
+    spawn_backlog(&mut caches.tasks, backlog);
+
     // Blocks the document dropped keep neither text nor glyphs.
-    if shaped.len() > content.len() {
-        shaped.blocks.retain(|id, _| content.get(id).is_some());
+    if caches.shaped.len() > caches.content.len() {
+        let content = &caches.content;
+        let tasks = &mut caches.tasks;
+        caches.shaped.retain(|id| {
+            if content.get(id).is_some() {
+                true
+            } else {
+                tasks.cancel(id);
+                false
+            }
+        });
+    }
+
+    evict_shaped_blocks(&mut caches, geom, offset, vh);
+}
+
+/// Spawn the nearest backlog jobs, up to the in-flight cap.
+///
+/// Sorting by distance is what "visible-first" means with a bounded pool: a
+/// jump into the middle of a long document queues the whole band, and without
+/// an ordering the rows that land first would be whichever the map iterated
+/// first — reliably the wrong ones.
+fn spawn_backlog(tasks: &mut ShapeTasks, mut backlog: Vec<(f32, ShapeJob)>) {
+    if backlog.is_empty() {
+        return;
+    }
+    let room = MAX_SHAPE_TASKS_IN_FLIGHT.saturating_sub(tasks.in_flight());
+    if room == 0 {
+        return;
+    }
+    backlog.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, job) in backlog.into_iter().take(room) {
+        tasks.spawn(job);
+    }
+}
+
+/// Re-shape a streaming block's open tail, inheriting its frozen chunks.
+///
+/// `inherited` is the frozen prefix [`incremental_prefix`] approved, already
+/// `Arc`-cloned; `ranges` is the new chunk plan, whose first `inherited.len()`
+/// entries are byte-for-byte the ranges those chunks were shaped from.
+fn shape_tail(
+    font: &VelloFont,
+    inherited: Vec<ShapedChunk>,
+    text: &str,
+    spans: &[SpanBrush],
+    style: &VelloTextStyle,
+    wrap_width: f32,
+    ranges: &[Range<usize>],
+) -> ShapeOutput {
+    let keep = inherited.len();
+    let frozen = frozen_chunk_count(text, ranges, CHUNK_LINES);
+    let max_advance = (wrap_width > 0.0).then_some(wrap_width);
+
+    let mut out = ShapeOutput {
+        text_height: inherited.iter().map(|c| c.height).sum(),
+        chunks: inherited,
+        ..Default::default()
+    };
+    for (i, range) in ranges.iter().enumerate().skip(keep) {
+        shape_chunk(
+            font,
+            text,
+            spans,
+            style,
+            max_advance,
+            range.clone(),
+            i < frozen,
+            &mut out,
+        );
+    }
+    out
+}
+
+/// Drop least-recently-used shaped blocks until the cache fits its budget.
+///
+/// The pinned window is `DESPAWN_MARGIN_SCREENS` on each side — the same
+/// hysteresis band the legacy entity lifecycle uses, and deliberately much
+/// wider than the shape band, so a block does not get evicted and re-shaped by
+/// scrolling one screen back and forth. Streaming blocks are pinned wherever
+/// they sit: evicting one would throw away the frozen chunks the incremental
+/// tail is built on, and the next tick would re-shape the whole thing.
+///
+/// An evicted row keeps its **measured height** in `ConversationGeometry` —
+/// rows outlive their glyphs there — so eviction never moves the document. The
+/// row re-shapes through the backlog when it comes back within a screen.
+fn evict_shaped_blocks(
+    caches: &mut ShapeCaches,
+    geom: &ConversationGeometry,
+    offset: f32,
+    vh: f32,
+) {
+    if caches.shaped.total_glyphs() <= SHAPE_CACHE_MAX_GLYPHS {
+        return;
+    }
+
+    let pinned_rows = geom.visible_rows(offset, vh, DESPAWN_MARGIN_SCREENS * vh);
+    let pinned: HashSet<BlockId> = geom.rows()[pinned_rows]
+        .iter()
+        .filter_map(|row| match row.key {
+            RowKey::Block(id) => Some(id),
+            RowKey::Header(_) => None,
+        })
+        .collect();
+
+    let mut candidates = eviction_candidates(&caches.shaped, &pinned);
+    let total = caches.shaped.total_glyphs();
+    for id in plan_evictions(&mut candidates, total, SHAPE_CACHE_MAX_GLYPHS) {
+        caches.shaped.remove(&id);
+        // An in-flight result for an evicted block would re-insert it only to
+        // be evicted again next frame.
+        caches.tasks.cancel(&id);
     }
 }
 
@@ -596,7 +1496,11 @@ fn shape_role_label(
     // theme constant the geometry reconcile already reserves for it.
     let y_offset = ((theme.role_header_height - height) * 0.5).max(0.0);
 
-    register_fonts(&layout, font_data);
+    let mut fonts = Vec::new();
+    collect_fonts(&layout, &mut fonts);
+    for font in &fonts {
+        font_data.register(font);
+    }
     let (glyphs, keys) = collect_msdf_glyphs_deferred(&layout, &[], &brush, (0.0, 0.0));
     for key in keys {
         atlas.request(key);
@@ -902,29 +1806,13 @@ mod tests {
     #[test]
     fn shaped_height_is_line_height_times_lines() {
         let font = mono();
-        let mut font_data = FontDataMap::default();
-        let (_, one_line, _) = shape_block(
-            &font,
-            "one",
-            &[],
-            &style(),
-            10_000.0,
-            CHUNK_LINES,
-            &mut font_data,
-        );
+        let one_line = shape_block(&font, "one", &[], &style(), 10_000.0, CHUNK_LINES).text_height;
         assert!(one_line > 0.0, "a single line must have a height");
 
         for lines in [2_usize, 5, 40] {
             let text = vec!["one"; lines].join("\n");
-            let (_, height, _) = shape_block(
-                &font,
-                &text,
-                &[],
-                &style(),
-                10_000.0,
-                CHUNK_LINES,
-                &mut font_data,
-            );
+            let height =
+                shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES).text_height;
             assert!(
                 (height - one_line * lines as f32).abs() < 0.05,
                 "{lines} lines measured {height}, expected {}",
@@ -939,23 +1827,15 @@ mod tests {
     #[test]
     fn block_height_is_the_sum_of_its_chunk_heights() {
         let font = mono();
-        let mut font_data = FontDataMap::default();
         let text = (0..200)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (chunks, height, _) = shape_block(
-            &font,
-            &text,
-            &[],
-            &style(),
-            10_000.0,
-            CHUNK_LINES,
-            &mut font_data,
-        );
+        let out = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        let chunks = &out.chunks;
         assert!(chunks.len() > 1, "test premise: 200 lines must chunk");
         let stacked: f32 = chunks.iter().map(|c| c.height).sum();
-        assert!((height - stacked).abs() < 0.01);
+        assert!((out.text_height - stacked).abs() < 0.01);
         assert_eq!(
             chunks.last().unwrap().byte_range.end,
             text.len(),
@@ -970,7 +1850,6 @@ mod tests {
     #[test]
     fn shape_block_stacks_chunks_where_a_whole_layout_would_put_them() {
         let font = mono();
-        let mut font_data = FontDataMap::default();
         let text = (0..150)
             .map(|i| format!("line {i} with a little more text on it"))
             .collect::<Vec<_>>()
@@ -981,15 +1860,7 @@ mod tests {
         let (expected, _) =
             collect_msdf_glyphs_deferred(&whole, &[], &style().brush, (0.0, 0.0));
 
-        let (chunks, _, _) = shape_block(
-            &font,
-            &text,
-            &[],
-            &style(),
-            wrap,
-            CHUNK_LINES,
-            &mut font_data,
-        );
+        let chunks = shape_block(&font, &text, &[], &style(), wrap, CHUNK_LINES).chunks;
         assert!(chunks.len() > 1, "test premise: the text must chunk");
 
         let mut actual = Vec::new();
@@ -1017,13 +1888,612 @@ mod tests {
     #[test]
     fn empty_text_still_shapes_one_chunk() {
         let font = mono();
-        let mut font_data = FontDataMap::default();
-        let (chunks, height, keys) =
-            shape_block(&font, "", &[], &style(), 400.0, CHUNK_LINES, &mut font_data);
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].glyphs.is_empty());
-        assert!(keys.is_empty());
-        assert!(height >= 0.0);
+        let out = shape_block(&font, "", &[], &style(), 400.0, CHUNK_LINES);
+        assert_eq!(out.chunks.len(), 1);
+        assert!(out.chunks[0].glyphs.is_empty());
+        assert!(out.glyph_keys.is_empty());
+        assert!(out.text_height >= 0.0);
+        assert!(!out.chunks[0].frozen, "an empty chunk is still open");
+    }
+
+
+    // ---- slice 3: incremental tail ---------------------------------------
+
+    /// Wrap a `ShapeOutput` the way the shape pass does, so the tail-path
+    /// tests exercise the same `ShapedBlock` shape production builds.
+    fn shaped_from(out: ShapeOutput, key: ShapeKey, text: &str, streaming: bool) -> ShapedBlock {
+        ShapedBlock {
+            key,
+            glyph_count: out.chunks.iter().map(|c| c.glyphs.len()).sum(),
+            height: out.text_height,
+            text_height: out.text_height,
+            chunks: out.chunks,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            last_used: 0,
+            color: Color::WHITE,
+            text_len: text.len(),
+            streaming,
+        }
+    }
+
+    /// A block long enough to fill one chunk and open a second.
+    fn streamed_text(extra_lines: usize) -> String {
+        (0..CHUNK_LINES + extra_lines)
+            .map(|i| format!("line {i} of a streamed reply"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The incremental tail's whole point.** Appending to a streaming block
+    /// must reuse its frozen chunks *by pointer* — not re-shape them, not even
+    /// copy them. `Arc::ptr_eq` is the assertion because that is exactly what
+    /// the render world sees: an unchanged pointer is an upload it can skip.
+    ///
+    /// And the result must still be the document: the stacked chunks have to
+    /// agree with a whole re-shape of the grown text, or the fast path is
+    /// drawing something the geometry never measured.
+    #[test]
+    fn a_tail_append_reuses_the_frozen_chunks_by_pointer() {
+        let font = mono();
+        let text = streamed_text(5);
+        let key = key();
+
+        let first = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        assert!(first.chunks.len() >= 2, "test premise: the text must chunk");
+        assert!(first.chunks[0].frozen, "a full chunk must freeze");
+        assert!(
+            !first.chunks.last().unwrap().frozen,
+            "the open tail must not freeze",
+        );
+        let existing = shaped_from(first, key, &text, true);
+
+        // The stream appends one more line.
+        let grown = format!("{text}\nline extra");
+        let grown_key = ShapeKey {
+            content_version: key.content_version + 1,
+            ..key
+        };
+        let ranges = chunk_ranges(&grown, CHUNK_LINES);
+        let inherit = incremental_prefix(&existing, &grown_key, Color::WHITE, &grown, &ranges, false)
+            .expect("an append to a streaming block must take the tail path");
+        assert_eq!(inherit, 1, "exactly the frozen prefix comes across");
+
+        let out = shape_tail(
+            &font,
+            existing.chunks[..inherit].to_vec(),
+            &grown,
+            &[],
+            &style(),
+            10_000.0,
+            &ranges,
+        );
+
+        assert!(
+            Arc::ptr_eq(&out.chunks[0].glyphs, &existing.chunks[0].glyphs),
+            "a frozen chunk must be carried forward as the same allocation",
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &out.chunks[1].glyphs,
+                &existing.chunks[1].glyphs,
+            ),
+            "the open tail must actually have been re-shaped",
+        );
+
+        // The cheap answer and the expensive answer must be the same answer.
+        let whole = shape_block(&font, &grown, &[], &style(), 10_000.0, CHUNK_LINES);
+        assert_eq!(out.chunks.len(), whole.chunks.len());
+        assert!(
+            (out.text_height - whole.text_height).abs() < 0.01,
+            "tail-shaped height {} vs whole {}",
+            out.text_height,
+            whole.text_height,
+        );
+        for (i, (a, b)) in out.chunks.iter().zip(whole.chunks.iter()).enumerate() {
+            assert_eq!(a.byte_range, b.byte_range, "chunk {i} range");
+            assert_eq!(a.glyphs.len(), b.glyphs.len(), "chunk {i} glyph count");
+            assert_eq!(a.frozen, b.frozen, "chunk {i} frozen flag");
+        }
+    }
+
+    /// Appending repeatedly must keep freezing: after enough lines the second
+    /// chunk closes too, and from then on it is carried by pointer as well.
+    /// Without this the "cost per tick is one chunk" claim degrades to "one
+    /// chunk, and then everything after it".
+    #[test]
+    fn a_chunk_freezes_as_soon_as_it_fills() {
+        let font = mono();
+        let text = streamed_text(5);
+        let mut block = shaped_from(shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES), key(), &text, true);
+        let mut text = text;
+
+        // Push past the second chunk boundary one line at a time.
+        for i in 0..CHUNK_LINES {
+            text = format!("{text}\nappended {i}");
+            let next = ShapeKey {
+                content_version: block.key.content_version + 1,
+                ..block.key
+            };
+            let ranges = chunk_ranges(&text, CHUNK_LINES);
+            let inherit = incremental_prefix(&block, &next, Color::WHITE, &text, &ranges, false)
+                .expect("every append must stay on the tail path");
+            let out = shape_tail(
+                &font,
+                block.chunks[..inherit].to_vec(),
+                &text,
+                &[],
+                &style(),
+                10_000.0,
+                &ranges,
+            );
+            block = shaped_from(out, next, &text, true);
+        }
+
+        assert!(block.chunks.len() >= 3, "test premise: a third chunk opened");
+        assert!(
+            block.chunks[1].frozen,
+            "the second chunk must have frozen once it filled",
+        );
+        let whole = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        assert!(
+            (block.text_height - whole.text_height).abs() < 0.05,
+            "{} incremental appends drifted: {} vs {}",
+            CHUNK_LINES,
+            block.text_height,
+            whole.text_height,
+        );
+    }
+
+    /// Every clause of the incremental gate must actually gate. A block that
+    /// slips through one of these reuses glyphs against different bytes, which
+    /// is the one failure mode of this design that is silent.
+    #[test]
+    fn the_incremental_gate_rejects_everything_it_should() {
+        let font = mono();
+        let text = streamed_text(5);
+        let out = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        let base = key();
+        let streaming = shaped_from(out, base, &text, true);
+        let grown = format!("{text}\nline extra");
+        let grown_ranges = chunk_ranges(&grown, CHUNK_LINES);
+        let next = ShapeKey {
+            content_version: base.content_version + 1,
+            ..base
+        };
+
+        // Sanity: the honest case is accepted.
+        assert!(incremental_prefix(&streaming, &next, Color::WHITE, &grown, &grown_ranges, false).is_some());
+
+        // A settled block: its text can have been *edited*, so equal byte
+        // ranges say nothing about equal bytes.
+        let mut settled = streaming.clone();
+        settled.streaming = false;
+        assert_eq!(
+            incremental_prefix(&settled, &next, Color::WHITE, &grown, &grown_ranges, false),
+            None,
+            "a Done block must re-shape whole",
+        );
+
+        // A wrap-width change re-flows every line, frozen or not.
+        let rewrapped = ShapeKey {
+            wrap_width_bits: 320.0_f32.to_bits(),
+            ..next
+        };
+        assert_eq!(
+            incremental_prefix(&streaming, &rewrapped, Color::WHITE, &grown, &grown_ranges, false),
+            None,
+            "a resize must re-shape whole",
+        );
+
+        // A metrics change (font size) likewise.
+        let remetriced = ShapeKey {
+            metrics_epoch: next.metrics_epoch + 1,
+            ..next
+        };
+        assert_eq!(
+            incremental_prefix(&streaming, &remetriced, Color::WHITE, &grown, &grown_ranges, false),
+            None,
+        );
+
+        // Text that shrank is not an append.
+        let shrunk = &text[..text.len() / 2];
+        let shrunk_ranges = chunk_ranges(shrunk, CHUNK_LINES);
+        assert_eq!(
+            incremental_prefix(&streaming, &next, Color::WHITE, shrunk, &shrunk_ranges, false),
+            None,
+            "a truncation must re-shape whole",
+        );
+
+        // A frozen range that no longer tiles the same bytes (an edit that
+        // grew an early line) must be rejected even though the text got
+        // longer.
+        let edited = format!("prefix inserted at the very top\n{grown}");
+        let edited_ranges = chunk_ranges(&edited, CHUNK_LINES);
+        assert_eq!(
+            incremental_prefix(&streaming, &next, Color::WHITE, &edited, &edited_ranges, false),
+            None,
+            "a shifted frozen range must re-shape whole",
+        );
+
+        // A color change: frozen chunks carry their colors baked in, so
+        // inheriting them under a new palette would leave the head of the
+        // block in the old theme while its tail arrived in the new one.
+        assert_eq!(
+            incremental_prefix(
+                &streaming,
+                &next,
+                Color::srgb(1.0, 0.0, 0.5),
+                &grown,
+                &grown_ranges,
+                false,
+            ),
+            None,
+            "a repainted streaming block must re-shape whole",
+        );
+
+        // Spanned blocks NEVER take the tail path: byte-identical frozen
+        // ranges don't prove the rendering is unchanged when spans re-derive
+        // over the whole text (setext heading retro-coloring a frozen line;
+        // an md_*-token theme change moving brushes under a still base
+        // color). Same inputs that pass for span-free text must refuse.
+        assert_eq!(
+            incremental_prefix(&streaming, &next, Color::WHITE, &grown, &grown_ranges, true),
+            None,
+            "a spanned streaming block must re-shape whole",
+        );
+
+        // Nothing frozen yet: a short streaming block has one open chunk and
+        // there is nothing to inherit.
+        let short = "one\ntwo";
+        let short_block = shaped_from(
+            shape_block(&font, short, &[], &style(), 10_000.0, CHUNK_LINES),
+            base,
+            short,
+            true,
+        );
+        let short_grown = "one\ntwo\nthree";
+        assert_eq!(
+            incremental_prefix(
+                &short_block,
+                &next,
+                Color::WHITE,
+                short_grown,
+                &chunk_ranges(short_grown, CHUNK_LINES),
+                false,
+            ),
+            None,
+            "with no frozen chunk the tail path has nothing to save",
+        );
+    }
+
+    // ---- slice 3: async backlog ------------------------------------------
+
+    /// A task per `(block, key)`, not per frame. The shape band is walked
+    /// every tick, so without this guard a backlog row would spawn a duplicate
+    /// task 60 times a second until the first one finished.
+    #[test]
+    fn a_second_task_is_not_spawned_for_an_in_flight_key() {
+        let mut tasks = ShapeTasks::default();
+        let id = bid(1);
+        let k = key();
+
+        assert!(!tasks.is_pending(&id, &k));
+        tasks.note_spawned(id, k);
+        assert!(tasks.is_pending(&id, &k), "the spawn must be remembered");
+        assert_eq!(tasks.in_flight(), 1);
+
+        // Same block, newer key: a different request, so it is *not* pending
+        // and the newer spawn replaces the older one's claim.
+        let newer = ShapeKey {
+            content_version: k.content_version + 1,
+            ..k
+        };
+        assert!(!tasks.is_pending(&id, &newer));
+        tasks.note_spawned(id, newer);
+        assert_eq!(tasks.in_flight(), 1, "one claim per block, always the newest");
+    }
+
+    /// Last-writer-wins, decided by what the main thread most recently asked
+    /// for. The old task still finishes — nothing cancels a running future —
+    /// so the drop has to happen on arrival or the cache ends up holding a
+    /// shaping of text that has already moved on.
+    #[test]
+    fn a_stale_async_result_is_dropped() {
+        let mut tasks = ShapeTasks::default();
+        let id = bid(1);
+        let old = key();
+        let new = ShapeKey {
+            content_version: old.content_version + 1,
+            ..old
+        };
+
+        tasks.note_spawned(id, old);
+        tasks.note_spawned(id, new);
+
+        assert!(
+            !tasks.accept(&id, &old),
+            "the superseded task's result must be dropped",
+        );
+        assert!(
+            tasks.accept(&id, &new),
+            "the current task's result must be applied",
+        );
+        assert_eq!(tasks.in_flight(), 0, "accepting clears the claim");
+        assert!(
+            !tasks.accept(&id, &new),
+            "a result can only be accepted once",
+        );
+    }
+
+    /// The main thread shaping a block itself supersedes anything in flight
+    /// for it — otherwise a backlog result landing a frame later would
+    /// overwrite the synchronous answer with an older one.
+    #[test]
+    fn a_cancelled_blocks_result_is_dropped() {
+        let mut tasks = ShapeTasks::default();
+        let id = bid(1);
+        let k = key();
+        tasks.note_spawned(id, k);
+        tasks.cancel(&id);
+        assert!(!tasks.accept(&id, &k));
+        assert_eq!(tasks.in_flight(), 0);
+    }
+
+    /// The job → result path is a pure function, so it can be checked without
+    /// a task pool: what a task would produce must equal what the synchronous
+    /// path produces for the same inputs. If these ever diverge, whether a
+    /// block was near the viewport when it shaped becomes visible.
+    #[test]
+    fn a_backlog_job_shapes_exactly_what_the_sync_path_would() {
+        let font = mono();
+        let text = streamed_text(3);
+        let layout = super::super::chrome::surface_block_layout(800.0, 0, 24.0, 0.0, None);
+
+        let result = run_shape_job(ShapeJob {
+            block: bid(1),
+            key: key(),
+            font: font.clone(),
+            text: text.clone(),
+            spans: Vec::new(),
+            style: style(),
+            wrap_width: layout.wrap_width,
+            chunk_lines: CHUNK_LINES,
+            color: Color::WHITE,
+            layout,
+        });
+        let direct = shape_block(&font, &text, &[], &style(), layout.wrap_width, CHUNK_LINES);
+
+        assert_eq!(result.block, bid(1));
+        assert_eq!(result.text_len, text.len());
+        assert_eq!(result.output.chunks.len(), direct.chunks.len());
+        assert_eq!(result.output.text_height, direct.text_height);
+        assert_eq!(result.output.glyph_keys, direct.glyph_keys);
+        for (a, b) in result.output.chunks.iter().zip(direct.chunks.iter()) {
+            assert_eq!(a.byte_range, b.byte_range);
+            assert_eq!(a.frozen, b.frozen);
+            assert_eq!(a.glyphs.len(), b.glyphs.len());
+        }
+        assert!(
+            !result.output.fonts.is_empty(),
+            "the task must carry back the fonts the main thread has to register",
+        );
+    }
+
+    // ---- slice 3: eviction ------------------------------------------------
+
+    fn cached(glyphs: usize, last_used: u64, streaming: bool) -> ShapedBlock {
+        ShapedBlock {
+            key: key(),
+            chunks: Vec::new(),
+            height: 10.0,
+            text_height: 10.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            glyph_count: glyphs,
+            last_used,
+            color: Color::WHITE,
+            text_len: 0,
+            streaming,
+        }
+    }
+
+    #[test]
+    fn a_cache_inside_its_budget_evicts_nothing() {
+        let mut candidates = vec![(bid(1), 100, 1), (bid(2), 100, 2)];
+        assert!(plan_evictions(&mut candidates, 200, 1000).is_empty());
+        // Exactly at the budget is inside it.
+        assert!(plan_evictions(&mut candidates, 200, 200).is_empty());
+    }
+
+    /// Least-recently-used first, and only as many as the budget demands —
+    /// eviction is a trim, not a purge.
+    #[test]
+    fn eviction_drops_the_oldest_until_the_budget_fits() {
+        let mut candidates = vec![
+            (bid(1), 100, 30), // newest
+            (bid(2), 100, 10), // oldest
+            (bid(3), 100, 20),
+        ];
+        let evicted = plan_evictions(&mut candidates, 300, 150);
+        assert_eq!(
+            evicted,
+            vec![bid(2), bid(3)],
+            "oldest first, stopping as soon as 300 - freed <= 150",
+        );
+    }
+
+    /// Pinned glyphs count against the budget but can never be freed. When the
+    /// pinned set alone busts it, eviction takes everything it may and stops —
+    /// the honest outcome, rather than dropping a row that is on screen.
+    #[test]
+    fn a_budget_smaller_than_the_pinned_set_evicts_only_what_it_may() {
+        // 1000 glyphs total, of which only 200 are evictable.
+        let mut candidates = vec![(bid(9), 200, 1)];
+        let evicted = plan_evictions(&mut candidates, 1000, 100);
+        assert_eq!(evicted, vec![bid(9)]);
+    }
+
+    /// The two pins, at the seam that applies them: a block in the window and
+    /// a streaming block anywhere are both invisible to eviction.
+    #[test]
+    fn in_window_and_streaming_blocks_are_never_eviction_candidates() {
+        let mut cache = ShapedBlockCache::default();
+        cache.insert_for_test(bid(1), cached(10, 1, false)); // pinned by window
+        cache.insert_for_test(bid(2), cached(20, 2, true)); // streaming
+        cache.insert_for_test(bid(3), cached(30, 3, false)); // evictable
+
+        let pinned: HashSet<BlockId> = [bid(1)].into_iter().collect();
+        let candidates = eviction_candidates(&cache, &pinned);
+        assert_eq!(
+            candidates,
+            vec![(bid(3), 30, 3)],
+            "only the out-of-window, settled block may be evicted",
+        );
+    }
+
+    /// The budget is read every frame, so the running total has to be right —
+    /// a drift either stalls eviction forever or evicts a cache that fits.
+    #[test]
+    fn the_glyph_total_tracks_every_insert_and_remove() {
+        let mut cache = ShapedBlockCache::default();
+        assert_eq!(cache.total_glyphs(), 0);
+
+        cache.insert_for_test(bid(1), cached(100, 1, false));
+        cache.insert_for_test(bid(2), cached(250, 1, false));
+        assert_eq!(cache.total_glyphs(), 350);
+
+        // Replacing an entry accounts for both sides.
+        cache.insert_for_test(bid(1), cached(40, 2, false));
+        assert_eq!(cache.total_glyphs(), 290);
+
+        cache.remove(&bid(2));
+        assert_eq!(cache.total_glyphs(), 40);
+
+        cache.insert_for_test(bid(3), cached(7, 1, false));
+        cache.retain(|id| *id == bid(3));
+        assert_eq!(cache.total_glyphs(), 7);
+        assert_eq!(
+            cache.total_glyphs(),
+            cache.blocks.values().map(|b| b.glyph_count).sum::<usize>(),
+            "the running total must equal the recomputed one",
+        );
+    }
+
+    // ---- slice 3: theme recolor -------------------------------------------
+
+    /// **Recolor moves colors and nothing else.** Bit-identical positions is
+    /// the assertion, not "close enough": the whole claim that a theme swap
+    /// needs no shaping rests on it, and a float comparison with a tolerance
+    /// would hide exactly the bug that would break it.
+    #[test]
+    fn recolor_repaints_without_moving_a_single_glyph() {
+        let font = mono();
+        let text = "the quick brown fox\njumps over the lazy dog";
+        let out = shape_block(&font, text, &[], &style(), 200.0, CHUNK_LINES);
+        let before: Vec<PositionedGlyph> =
+            out.chunks.iter().flat_map(|c| c.glyphs.iter().cloned()).collect();
+        assert!(!before.is_empty(), "test premise: the text must have glyphs");
+
+        let mut block = shaped_from(out, key(), text, false);
+        let new_color = Color::srgb(1.0, 0.0, 0.5);
+        recolor_block(&mut block, new_color);
+
+        let after: Vec<PositionedGlyph> =
+            block.chunks.iter().flat_map(|c| c.glyphs.iter().cloned()).collect();
+        assert_eq!(before.len(), after.len());
+        let want = color_to_rgba8(new_color);
+        for (i, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+            assert_eq!(a.key, b.key, "glyph {i} changed identity");
+            assert_eq!(a.x.to_bits(), b.x.to_bits(), "glyph {i} moved in x");
+            assert_eq!(a.y.to_bits(), b.y.to_bits(), "glyph {i} moved in y");
+            assert_eq!(
+                a.font_size.to_bits(),
+                b.font_size.to_bits(),
+                "glyph {i} resized",
+            );
+            assert_eq!(b.color, want, "glyph {i} kept the old color");
+        }
+        assert_eq!(block.color, new_color, "the cached color must be restamped");
+    }
+
+    /// A repaint to the color a block already has must keep its allocations —
+    /// otherwise the "no-op" path deep-clones every glyph the render world is
+    /// holding, which is worse than doing nothing at all.
+    #[test]
+    fn recoloring_to_the_same_color_keeps_the_allocation() {
+        let font = mono();
+        let text = "unchanged";
+        let out = shape_block(&font, text, &[], &style(), 200.0, CHUNK_LINES);
+        let mut block = shaped_from(out, key(), text, false);
+        // `style()` paints white, so this is genuinely a no-op.
+        let held: Vec<Arc<Vec<PositionedGlyph>>> =
+            block.chunks.iter().map(|c| c.glyphs.clone()).collect();
+
+        recolor_block(&mut block, Color::WHITE);
+
+        for (i, (chunk, before)) in block.chunks.iter().zip(held.iter()).enumerate() {
+            assert!(
+                Arc::ptr_eq(&chunk.glyphs, before),
+                "chunk {i} was cloned for a repaint that changed nothing",
+            );
+        }
+    }
+
+    /// The theme epoch is an event counter, not a per-frame one: a frame that
+    /// doesn't touch the theme must not invalidate anything.
+    #[test]
+    fn the_theme_epoch_moves_once_per_theme_write() {
+        let mut app = App::new();
+        app.init_resource::<Theme>();
+        app.init_resource::<SurfaceThemeEpoch>();
+        app.add_systems(Update, track_surface_theme_epoch);
+
+        app.update();
+        let first = app.world().resource::<SurfaceThemeEpoch>().get();
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<SurfaceThemeEpoch>().get(),
+            first,
+            "an untouched theme must not bump the epoch",
+        );
+
+        app.world_mut().resource_mut::<Theme>().block_user = Color::srgb(0.1, 0.2, 0.3);
+        app.update();
+        assert_eq!(app.world().resource::<SurfaceThemeEpoch>().get(), first + 1);
+        app.update();
+        assert_eq!(
+            app.world().resource::<SurfaceThemeEpoch>().get(),
+            first + 1,
+            "the bump is per write, not per frame after one",
+        );
+    }
+
+    /// Role labels bake theme colors into their glyphs, so a theme swap has to
+    /// drop them — this is the cache-clearing half of the recolor story.
+    #[test]
+    fn a_theme_bump_drops_the_cached_role_labels() {
+        let mut headers = HeaderLabelCache::default();
+        headers.insert_for_test(
+            Role::User,
+            1,
+            ShapedLabel {
+                glyphs: Arc::new(Vec::new()),
+                x_offset: 0.0,
+                y_offset: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        );
+        assert_eq!(headers.len(), 1);
+
+        assert!(!headers.sync_theme(0), "epoch 0 is where it started");
+        assert_eq!(headers.len(), 1);
+
+        assert!(headers.sync_theme(1), "a theme bump must clear the labels");
+        assert_eq!(headers.len(), 0);
+        assert!(!headers.sync_theme(1), "and only once per bump");
     }
 
     // ---- apply_measurements ----------------------------------------------
@@ -1146,7 +2616,13 @@ mod tests {
     }
 
     fn insert_shaped(app: &mut App, id: BlockId, height: f32) {
-        let block = ShapedBlock {
+        app.world_mut()
+            .resource_mut::<ShapedBlockCache>()
+            .insert_for_test(id, block_of_height(height));
+    }
+
+    fn block_of_height(height: f32) -> ShapedBlock {
+        ShapedBlock {
             key: ShapeKey {
                 content_version: 5,
                 wrap_width_bits: 800.0_f32.to_bits(),
@@ -1161,11 +2637,10 @@ mod tests {
             y_offset: 0.0,
             glyph_count: 0,
             last_used: 0,
-        };
-        app.world_mut()
-            .resource_mut::<ShapedBlockCache>()
-            .blocks
-            .insert(id, block);
+            color: Color::WHITE,
+            text_len: 0,
+            streaming: false,
+        }
     }
 
     #[test]
@@ -1179,6 +2654,38 @@ mod tests {
         let state = app.world().resource::<ConversationScrollState>();
         assert_eq!(state.offset, 560.0);
         assert_eq!(state.target_offset, 560.0);
+    }
+
+    /// **Async pop-in is anchor-compensated.** A backlog row above the
+    /// viewport lands its real height a frame or more after the reader
+    /// scrolled past it. The compensation is the same one a synchronous
+    /// measurement gets — it keys off the height changing, not off who
+    /// changed it — but that is worth a test of its own, because "the row was
+    /// already measured once" is exactly the assumption that would break it,
+    /// and deep-scrolling through a backfilling document is the case where a
+    /// drift is most visible.
+    #[test]
+    fn a_late_async_landing_above_the_viewport_still_shifts_the_offset() {
+        let mut app = measure_app(false, 500.0);
+        install_geometry(&mut app, strip(4));
+
+        // Frame 1: block 1 has no shaped entry — it draws chrome and the
+        // height the geometry estimated, which is what an unshaped band row
+        // does on this path.
+        app.update();
+        let settled = app.world().resource::<ConversationScrollState>().offset;
+
+        // Frame 2: the backlog result lands, 60px taller than the estimate.
+        insert_shaped(&mut app, bid(1), 90.0);
+        app.update();
+
+        let state = app.world().resource::<ConversationScrollState>();
+        assert_eq!(
+            state.offset,
+            settled + 60.0,
+            "a late landing above the viewport must carry the viewport with it",
+        );
+        assert_eq!(state.target_offset, settled + 60.0);
     }
 
     /// Follow mode is exempt: it re-clamps to the bottom every frame, and

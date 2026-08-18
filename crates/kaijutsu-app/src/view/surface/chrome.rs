@@ -207,11 +207,16 @@ impl BlockChromeCache {
         self.container_width
     }
 
+    #[allow(dead_code)] // Model accessor, exercised by tests and diagnostics.
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
 
+    // Seeds a chrome entry without a content cache. No caller since the
+    // instance tests moved to building the cache through `chrome_cache`; kept
+    // because the surface's other test modules reach for the same shape.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn insert_for_test(&mut self, id: BlockId, chrome: BlockChrome) {
         self.blocks.insert(id, chrome);
     }
@@ -347,6 +352,11 @@ pub fn sync_block_chrome(
 
 /// Border kind, as the shader's `BK_*` constants. Same numbering as
 /// `block_fx.wgsl` so the two shaders can be read side by side.
+// The shader's `BK_NONE`: a block with no border never reaches the instance
+// buffer at all, so nothing on this side emits it. It stays for parity with
+// `surface_chrome.wgsl`'s constant block — a gap in the numbering would make
+// the two impossible to read side by side.
+#[allow(dead_code)]
 pub const CHROME_KIND_NONE: u32 = 0;
 pub const CHROME_KIND_FULL: u32 = 1;
 pub const CHROME_KIND_TOP_ACCENT: u32 = 2;
