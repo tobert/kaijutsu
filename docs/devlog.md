@@ -1879,3 +1879,74 @@ runs on `ropey` underneath, so those keep it — and describes compose input
 not at all, so a draft stays a `String` with a revision counter beside it.
 Three surfaces ended up with three representations, each chosen against what
 it actually does to its own text rather than handed one engine to share.
+
+## Two doorbells, one ledger (August 18)
+
+The approval ledger had been carrying a second, quieter system beside it for
+months, and nobody had said so out loud. `kj cc send` and `shell_write` went
+through `run_gate`: a durable row, rules that could auto-decide, an answer
+reachable from any shell. A hook's `Ask` action went somewhere else entirely
+— a `Uuid::new_v4`, a thirty-second budget, a blocking round trip over its
+own wire, and no durable record at all. Two mechanisms for one idea, and the
+seam between them was invisible because each worked.
+
+What settled it was not an argument but three pieces of evidence sitting in
+the ledger's own source. `Origin::Hook` existed, documented *"a hook's `ask`
+action fired"*, and had never once been constructed. `NewAsk.hook_id` had
+been nullable and unpopulated since the schema was written. And `NewOption`'s
+`{option_id, label, kind}` mapped one-to-one onto ACP's `PermissionOption`,
+while the code that fired an Ask passed `options: Vec::new()` and let the far
+end invent allow and deny for itself. The ledger had been built to absorb the
+hook path and never told. Amy's ruling was to retire the doorbell rather than
+merge into it: one durable record, one announcement, one write path.
+
+The melt was the easy half. The instructive half was what fell out of it.
+
+`GateOutcome` could say `allowed: false` and nothing more, so `run_gate` had
+been reporting its own faults — a rules read that errored, an ask row that
+went missing — as `status: Denied`. The `shell_write` caller rendered both as
+one error, so it had never mattered. The hook path could not afford that: a
+ruling from the day before required a model to distinguish a refusal from an
+absent control, and a database fault arriving as a refusal would have
+defeated that ruling at precisely the seam it protected. The fix was a
+three-way verdict, and then a second look showed `status` carrying the same
+lie one layer down — typed `ApprovalStatus`, so the two faults that happen
+before any row exists had to name some status, and they named `Denied` beside
+a `request_id` of `""`. Both became one `Option<AskRef>`: a row exists with
+an id and a status, or there is no row. Two separate `Option`s could have
+expressed a third state that cannot happen.
+
+Then the deployment taught the rest. A gated call held for eighty-one seconds
+and returned only after a human answered it from an entirely different
+surface — the loop working end to end for the first time. But the same day,
+driving kaijutsu from an editor over ACP, the seams showed themselves in a
+row. A turn died on the model provider refusing an assistant message whose
+tool calls had no matching results, and the cause was a repair pass that
+enumerated one vector while looking the previous message up in another; the
+first fully-orphaned message it skipped desynchronised the two, and every
+later pair was checked against the wrong assistant and dropped. One skip, and
+the rest of the conversation was collateral. The session list took
+sixty-eight round trips because `ContextInfo` carried fifteen fields and not
+the one the caller needed, so the client had no choice but to assemble by
+looping. And no approval ever reached the editor, because the editor launches
+a build artifact that had been compiled two minutes before the wire it spoke
+was retired — Cap'n Proto tolerating a call to a retired ordinal, so the
+feature went missing rather than failing.
+
+That last one is the lesson worth keeping. The failure did not look like a
+version problem; it looked like an editor that could not find its adapter,
+and it sent a morning in the wrong direction. The answer was a handshake that
+refuses a mismatched peer and names which side is stale — and a flag day to
+install it, because a client old enough to cause the problem is old enough
+not to know to check. It caught a real mismatch within minutes of shipping,
+on a path nobody had thought about, and it named it exactly.
+
+The through-line of the day is that four separate primitives — `Origin::Hook`,
+`decide::abandon`, `rules::learn_from_approval`, and the whole `rc_runs`
+table — were built, tested, and never called. None of them were wrong. Each
+had been written slightly ahead of the thing that would need it, and nothing
+in a green test suite says *this code has no caller*. The gate that fired and
+was never announced was the same shape a week earlier. It is worth asking, of
+any primitive that ships with its tests and without its wiring, what will
+tell us when it is finally needed — because the answer today was a morning
+spent reading logs in an editor.
