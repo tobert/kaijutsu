@@ -89,8 +89,12 @@ hook            list, show, remove, add — broker hook tables, direct (never
                 PreCall Deny("*") lockout
 kaish           primer — composed kaish agent-onboarding guidance (kaish-help);
                 what S05-kaish.kai turns into a per-context system block
-ledger          list, show, allow, deny — answer pending approval-ledger asks
-                left by gated verbs (e.g. `kj cc send`)
+ledger          list, show, allow, deny, rules, forget — answer pending
+                approval-ledger asks left by gated verbs (e.g. `kj cc send`);
+                allow/deny take `--remember <session|always>` to generalize
+                the decision into a standing rule (refused for `allow` when
+                a statement has a free variable), `rules` lists standing
+                rules, `forget <rule-id>` revokes one
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
                 bevy_brp, …); configured-vs-actually-running visibility + reconcile
 midi            list, show — CRDT-owned MIDI device profiles at

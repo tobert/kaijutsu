@@ -210,6 +210,19 @@ pub fn get_rule(conn: &Connection, rule_id: &str) -> Result<Option<RuleRow>> {
     .map_err(LedgerError::from)
 }
 
+/// List every active (not revoked) rule, most recently created first. The
+/// `kj ledger rules` answering-side view — a remember with no way to see
+/// what got remembered is half a feature.
+pub fn list_rules(conn: &Connection) -> Result<Vec<RuleRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT rule_id, statement_digest, authorized_label, context_id, principal_id,
+                scope, allow, created_at, created_by, learned_from, revoked_at
+         FROM approval_rules WHERE revoked_at IS NULL ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([], row_to_rule)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<RuleRow> {
     let scope_raw: String = row.get(5)?;
     let allow: i64 = row.get(6)?;
@@ -471,5 +484,25 @@ mod tests {
     fn revoking_an_unknown_rule_is_not_found() {
         let conn = open_memory();
         assert!(matches!(revoke(&conn, "no-such-rule").unwrap_err(), LedgerError::RuleNotFound(_)));
+    }
+
+    #[test]
+    fn list_rules_returns_only_active_rules_newest_first() {
+        let conn = open_memory();
+        let first = make_rule(&conn, "digest-list-1", VarBinding::Bound, "rm a", true);
+        std::thread::sleep(std::time::Duration::from_millis(2)); // distinct created_at
+        let second = make_rule(&conn, "digest-list-2", VarBinding::Bound, "rm b", true);
+        let revoked = make_rule(&conn, "digest-list-3", VarBinding::Bound, "rm c", true);
+        revoke(&conn, &revoked.rule_id).unwrap();
+
+        let rules = list_rules(&conn).unwrap();
+        let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
+        assert_eq!(ids, vec![second.rule_id.as_str(), first.rule_id.as_str()], "newest first, revoked excluded");
+    }
+
+    #[test]
+    fn list_rules_on_an_empty_table_is_empty() {
+        let conn = open_memory();
+        assert!(list_rules(&conn).unwrap().is_empty());
     }
 }

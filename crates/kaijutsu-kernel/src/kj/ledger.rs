@@ -5,10 +5,13 @@
 //! any shell, any client, minutes later if need be — answers it here.
 //!
 //! ```sh
-//! kj ledger list               # what is waiting for a decision
-//! kj ledger show <request-id>  # one ask, with its statement
-//! kj ledger allow <request-id> # claim + allow (exactly one answerer wins)
-//! kj ledger deny <request-id>  # claim + deny
+//! kj ledger list                            # what is waiting for a decision
+//! kj ledger show <request-id>               # one ask, with its statement
+//! kj ledger allow <request-id>               # claim + allow (exactly one answerer wins)
+//! kj ledger deny <request-id>                # claim + deny
+//! kj ledger allow <request-id> --remember always  # + generalize into a standing rule
+//! kj ledger rules                            # list standing rules
+//! kj ledger forget <rule-id>                 # revoke one
 //! ```
 //!
 //! Answering is a two-step ledger transaction by design: [`claim`] moves
@@ -18,10 +21,25 @@
 //! terminal write. A row that went terminal elsewhere first answers back
 //! `AlreadyDecided` — the late answer is still recorded in the event log,
 //! but it does not overwrite anything (guarantee 6).
+//!
+//! `--remember <session|always>` is a THIRD step, gated on the second: once
+//! `decide` commits, [`learn_every_statement`] tries to generalize every
+//! statement of the ask into a standing [`approval_ledger::rules`] row, all
+//! in one transaction — either every statement's rule is written, or none
+//! are (see that function's doc for why a partial rule set is worse than no
+//! rule at all). `approval_ledger::rules::learn_from_approval` refuses to
+//! create an `allow` rule for a statement with any free variable (Amy's
+//! 2026-08-17 ruling, `docs/gate-and-shell-split.md` ruling 3); this module
+//! never re-implements that check, only reports what the ledger said. Once
+//! a rule exists, [`crate::kj::gate::run_gate`]'s `rules::redeem` step
+//! auto-decides the next identical ask without asking anyone —
+//! `kj ledger forget` is how that stops.
 
 use approval_ledger::error::LedgerError;
+use approval_ledger::types::RuleScope;
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -37,6 +55,34 @@ pub(crate) struct LedgerArgs {
     command: LedgerCommand,
 }
 
+/// `--remember <scope>` on `allow`/`deny` — a clap `ValueEnum` so a typo
+/// (`--remember forever`) fails at parse time with clap's own "possible
+/// values are..." message, rather than surfacing as a ledger error deep
+/// inside `ledger_decide`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RememberScopeArg {
+    /// Only within the context/principal that asked.
+    Session,
+    /// Any context/principal presenting the same statement + label.
+    Always,
+}
+
+impl RememberScopeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Always => "always",
+        }
+    }
+
+    fn to_rule_scope(self) -> RuleScope {
+        match self {
+            Self::Session => RuleScope::Session,
+            Self::Always => RuleScope::Always,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum LedgerCommand {
     /// List asks still waiting for a decision (status pending or claimed).
@@ -44,9 +90,28 @@ enum LedgerCommand {
     /// Show one ask in full, including the statement being authorized.
     Show { request_id: String },
     /// Allow one ask (claims it first; exactly one answerer wins).
-    Allow { request_id: String },
+    Allow {
+        request_id: String,
+        /// Remember this decision as a standing rule for future identical
+        /// asks. Refused for `allow` when any covered statement has a free
+        /// variable (Amy's 2026-08-17 ruling, `docs/gate-and-shell-split.md`
+        /// ruling 3) — the decision on THIS ask still stands either way.
+        #[arg(long)]
+        remember: Option<RememberScopeArg>,
+    },
     /// Deny one ask (claims it first; exactly one answerer wins).
-    Deny { request_id: String },
+    Deny {
+        request_id: String,
+        /// Remember this decision as a standing rule for future identical
+        /// asks. A `deny` rule is always permitted, even with a free
+        /// variable (a standing deny is strictly safety-increasing).
+        #[arg(long)]
+        remember: Option<RememberScopeArg>,
+    },
+    /// List active (not-yet-forgotten) standing rules.
+    Rules,
+    /// Forget a standing rule so its statement escalates to a human again.
+    Forget { rule_id: String },
 }
 
 impl KjDispatcher {
@@ -70,8 +135,14 @@ impl KjDispatcher {
         match parsed.command {
             LedgerCommand::List => self.ledger_list(),
             LedgerCommand::Show { request_id } => self.ledger_show(&request_id),
-            LedgerCommand::Allow { request_id } => self.ledger_decide(&request_id, true, caller),
-            LedgerCommand::Deny { request_id } => self.ledger_decide(&request_id, false, caller),
+            LedgerCommand::Allow { request_id, remember } => {
+                self.ledger_decide(&request_id, true, caller, remember)
+            }
+            LedgerCommand::Deny { request_id, remember } => {
+                self.ledger_decide(&request_id, false, caller, remember)
+            }
+            LedgerCommand::Rules => self.ledger_rules(),
+            LedgerCommand::Forget { rule_id } => self.ledger_forget(&rule_id),
         }
     }
 
@@ -163,8 +234,23 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    /// Claim + decide one ask as the calling principal.
-    fn ledger_decide(&self, request_id: &str, allow: bool, caller: &KjCaller) -> KjResult {
+    /// Claim + decide one ask as the calling principal, then — only if
+    /// `--remember` was given and the decide succeeded — try to generalize
+    /// EVERY statement of the ask into a standing rule (step 2 of the
+    /// module's design; see `learn_every_statement`'s doc for why this is
+    /// all-or-nothing).
+    ///
+    /// `remember_scope` on the `decide` call is the audit record of what the
+    /// human ASKED for, independent of whether a rule ended up existing —
+    /// those are different facts and this keeps them separately true even
+    /// when the rule write is refused below.
+    fn ledger_decide(
+        &self,
+        request_id: &str,
+        allow: bool,
+        caller: &KjCaller,
+        remember: Option<RememberScopeArg>,
+    ) -> KjResult {
         let verb = if allow { "allow" } else { "deny" };
 
         // The ledger work is scoped so the `KernelDb` guard is RELEASED before
@@ -205,21 +291,66 @@ impl KjDispatcher {
                     allow,
                     decided_by: Some(principal),
                     decided_option: Some(if allow { "allow_once" } else { "deny" }),
-                    remember_scope: None,
+                    remember_scope: remember.map(RememberScopeArg::as_str),
                     auto_reason: None,
                 },
             ) {
-                Ok(row) => KjResult::ok_with_data(
-                    format!(
-                        "{verb}ed ask {request_id} ({})",
-                        row.description
-                    ),
-                    serde_json::json!({
+                Ok(row) => {
+                    let mut message = format!("{verb}ed ask {request_id} ({})", row.description);
+                    let mut data = serde_json::json!({
                         "request_id": row.request_id,
                         "status": row.status.to_string(),
                         "verb": verb,
-                    }),
-                ),
+                    });
+
+                    // Step 2, gated on `--remember`: this ask's decision has
+                    // already committed above, so nothing below can undo it —
+                    // a refusal here only changes whether a RULE exists, never
+                    // whether this ask was allowed or denied.
+                    if let Some(remember) = remember {
+                        match learn_every_statement(
+                            conn,
+                            request_id,
+                            remember.to_rule_scope(),
+                            allow,
+                            principal,
+                        ) {
+                            Ok(n) => {
+                                message.push_str(&format!(
+                                    "; remembered as a standing {} rule ({n} statement{})",
+                                    remember.as_str(),
+                                    if n == 1 { "" } else { "s" },
+                                ));
+                                data["remembered"] = serde_json::json!({
+                                    "scope": remember.as_str(),
+                                    "statements": n,
+                                });
+                            }
+                            Err(e) => {
+                                // The offending variable is the whole point of
+                                // this arm (Amy's 2026-08-17 ruling) — surface
+                                // `LedgerError::FreeVariableRule`'s fields
+                                // rather than flattening to `{e}`'s prose, so
+                                // a caller parsing `.data` can act on it too.
+                                message.push_str(&format!(
+                                    "; NOT remembered: {e} — the {verb} on THIS ask still stands"
+                                ));
+                                data["remembered"] = serde_json::json!(false);
+                                data["remember_error"] = serde_json::json!({
+                                    "message": e.to_string(),
+                                    "free_variable": match &e {
+                                        LedgerError::FreeVariableRule { var_name, .. } => {
+                                            serde_json::json!(var_name)
+                                        }
+                                        _ => serde_json::Value::Null,
+                                    },
+                                });
+                            }
+                        }
+                    }
+
+                    KjResult::ok_with_data(message, data)
+                }
                 Err(LedgerError::AlreadyDecided { status, .. }) => KjResult::Err(format!(
                     "kj ledger: ask {request_id} was already decided ({status}) — \
                      your late answer was recorded in the event log but changed nothing"
@@ -231,6 +362,105 @@ impl KjDispatcher {
         crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
         result
     }
+
+    fn ledger_rules(&self) -> KjResult {
+        let rows = {
+            let db = self.kernel_db.lock();
+            match approval_ledger::rules::list_rules(db.conn_for_ledger()) {
+                Ok(rows) => rows,
+                Err(e) => return KjResult::Err(format!("kj ledger rules: {e}")),
+            }
+        };
+        let data = serde_json::Value::Array(
+            rows.iter().map(|r| serde_json::json!(r.rule_id.clone())).collect(),
+        );
+        if rows.is_empty() {
+            return KjResult::ok_with_data("(no active rules)".to_string(), data);
+        }
+        let mut lines = vec![format!(
+            "  {:<36}  {:<7}  {:<5}  {}",
+            "RULE", "SCOPE", "ALLOW", "LABEL"
+        )];
+        for r in &rows {
+            lines.push(format!(
+                "  {:<36}  {:<7}  {:<5}  {}",
+                r.rule_id,
+                r.scope.as_str(),
+                if r.allow { "yes" } else { "no" },
+                r.authorized_label,
+            ));
+        }
+        lines.push(String::new());
+        lines.push("forget with: kj ledger forget <rule-id>".into());
+        KjResult::ok_with_data(lines.join("\n"), data)
+    }
+
+    fn ledger_forget(&self, rule_id: &str) -> KjResult {
+        let result = {
+            let db = self.kernel_db.lock();
+            match approval_ledger::rules::revoke(db.conn_for_ledger(), rule_id) {
+                Ok(()) => KjResult::ok_with_data(
+                    format!("forgot rule {rule_id} — its statement escalates to a human again"),
+                    serde_json::json!({ "rule_id": rule_id }),
+                ),
+                Err(LedgerError::RuleNotFound(_)) => {
+                    return KjResult::Err(format!("kj ledger: no such rule {rule_id}"));
+                }
+                Err(e) => return KjResult::Err(format!("kj ledger forget: {e}")),
+            }
+        };
+        // A revoke is a ledger mutation like any other (its trigger bumps the
+        // same `ledger_generation` counter `announce_ledger_change` reads) —
+        // announce it for the same reason `ledger_decide` does.
+        crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+        result
+    }
+}
+
+/// Generalize EVERY statement of `request_id` into a standing rule, all in
+/// one transaction: if any statement's rule is refused (guarantee 3, a free
+/// variable on an `allow`), NONE of the rules for this ask are written.
+///
+/// This is not a nice-to-have. `run_gate`'s `AskCoverage::verdict` only
+/// auto-allows when EVERY statement of a future identical ask is covered
+/// (`approval-ledger/src/types.rs`'s `AskCoverage::verdict`) — a partial rule
+/// set from a multi-statement `shell_write` submission would sit in the
+/// table doing nothing (every future redemption of that ask still escalates
+/// on the uncovered statement) while `kj ledger allow --remember` told the
+/// human "remembered". That is exactly the silent fallback CLAUDE.md warns
+/// against: writing rows that appear to do something but don't.
+///
+/// Returns the number of statements learned (== the ask's statement count)
+/// on success.
+fn learn_every_statement(
+    conn: &Connection,
+    request_id: &str,
+    scope: RuleScope,
+    allow: bool,
+    created_by: &[u8],
+) -> approval_ledger::error::Result<usize> {
+    let statements = approval_ledger::ask::load_ask_statements(conn, request_id)?;
+    // `Transaction::new_unchecked` (not `Connection::transaction`, which
+    // needs `&mut Connection` — this crate is only ever handed a shared
+    // `&Connection` via `KernelDb::conn_for_ledger`) opens a real `BEGIN
+    // IMMEDIATE` transaction over the same connection `decide` already
+    // committed on above; dropping it without `commit()` rolls back
+    // (rusqlite's default `DropBehavior`), which is what every early
+    // `?`-return below relies on.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for stmt in &statements {
+        approval_ledger::rules::learn_from_approval(
+            &tx,
+            request_id,
+            stmt.stmt_seq,
+            scope,
+            allow,
+            Some(created_by),
+        )?;
+    }
+    let learned = statements.len();
+    tx.commit()?;
+    Ok(learned)
 }
 
 #[cfg(test)]
@@ -263,6 +493,44 @@ mod tests {
                 source_index: None,
             }],
         }
+    }
+
+    /// A `shell_write`-shaped spec with NO free variables — unlike `spec()`
+    /// above (whose `MESSAGE` var is deliberately free so it can never be
+    /// remembered, per `the_ask_message_body_is_free_so_allow_rules_cannot_learn_it`
+    /// in `kj/gate.rs`), this one can actually be learned as an allow rule.
+    /// Two calls with the same `(label, rendered)` build digest-identical
+    /// asks, which is what makes "remember, then ask again unattended" a
+    /// meaningful test.
+    fn shell_spec(label: &str, rendered: &str) -> GateSpec {
+        GateSpec {
+            origin: approval_ledger::types::Origin::ShellGate,
+            instance: "builtin.shell_write".into(),
+            tool: "shell_write".into(),
+            hook_id: None,
+            description: format!("shell_write: {rendered:?}"),
+            authorized_label: label.to_string(),
+            statements: vec![crate::kj::gate::GatedStatement {
+                rendered: rendered.to_string(),
+                statement_kind: "command".into(),
+                vars: vec![],
+                source_index: Some(0),
+            }],
+        }
+    }
+
+    /// Poll `list_pending` until one ask shows up, returning its id. Shared
+    /// by every test below that fires `run_gate` in the background and needs
+    /// the request id to answer it.
+    async fn wait_for_pending(d: &crate::kj::KjDispatcher) -> String {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let db = d.kernel_db.lock();
+            if let Some(row) = approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap().first() {
+                return row.request_id.clone();
+            }
+        }
+        panic!("no ask ever went pending");
     }
 
     #[tokio::test]
@@ -423,6 +691,251 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such ask"));
+    }
+
+    /// The whole point of this slice: a remembered allow rule must make the
+    /// NEXT identical ask auto-allow without anyone answering it — no second
+    /// `kj ledger allow`. This is the test that proves the auto-allow branch
+    /// in `approval_ledger::rules::redeem` is reachable in production, not
+    /// just exercised from inside the ledger crate's own test suite.
+    ///
+    /// Uses `shell_spec` (no free variables), NOT `spec()` — `spec()`'s
+    /// `MESSAGE` var is deliberately free and can never be remembered (see
+    /// `the_ask_message_body_is_free_so_allow_rules_cannot_learn_it` in
+    /// `kj/gate.rs`).
+    #[tokio::test]
+    async fn remembering_an_allow_makes_the_next_identical_ask_auto_allow() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let label = "kaish-source";
+        let rendered = "ls -la /srv/builds";
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move {
+            run_gate(&db, &caller, shell_spec(label, rendered), Duration::from_secs(30), &flows).await
+        });
+
+        let request_id = wait_for_pending(&d).await;
+        let result = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
+            .await;
+        assert!(result.is_ok(), "allow --remember must succeed: {result:?}");
+        assert!(
+            result.message().contains("remembered"),
+            "message must say what was remembered: {}",
+            result.message()
+        );
+        let outcome = gate.await.unwrap();
+        assert!(outcome.allowed(), "the answered ask itself must still be allowed");
+
+        // A rule now exists. Fire an IDENTICAL ask (same origin, label,
+        // rendered text) and let it run unattended, on a short budget —
+        // nobody calls `kj ledger allow` this time.
+        let db2 = d.kernel_db.clone();
+        let flows2 = d.kernel.ledger_flows().clone();
+        let outcome2 = run_gate(
+            &db2,
+            &c,
+            shell_spec(label, rendered),
+            Duration::from_millis(400),
+            &flows2,
+        )
+        .await;
+
+        assert!(
+            outcome2.allowed(),
+            "a remembered allow rule must auto-allow the next identical ask: {outcome2:?}"
+        );
+        assert_eq!(outcome2.verdict, crate::kj::gate::GateVerdict::Allowed);
+        assert!(
+            outcome2.reason.contains("rule"),
+            "the reason must show this was a RULE decision, not a human one: {}",
+            outcome2.reason
+        );
+        let ask2 = outcome2.ask.expect("an auto-decided ask still gets a durable row");
+        assert_eq!(ask2.status, approval_ledger::types::ApprovalStatus::Allowed);
+    }
+
+    /// Amy's 2026-08-17 ruling pinned at the CLI seam: a `kj cc send`-shaped
+    /// ask has a free `MESSAGE` variable, so `--remember` must refuse to
+    /// create a rule for it — while the decision on THIS ask still goes
+    /// through exactly as if `--remember` had never been passed.
+    #[tokio::test]
+    async fn remembering_an_allow_is_refused_when_a_statement_has_a_free_variable() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move {
+            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
+        });
+
+        let request_id = wait_for_pending(&d).await;
+        let result = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
+            .await;
+        assert!(
+            result.is_ok(),
+            "the ask's own allow/deny must still succeed even when remembering is refused: {result:?}"
+        );
+        assert!(
+            result.message().contains("NOT remembered"),
+            "must say plainly that nothing was remembered: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("MESSAGE"),
+            "must name the offending free variable: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("still stands"),
+            "must make clear the decision on THIS ask was not undone: {}",
+            result.message()
+        );
+
+        let outcome = gate.await.unwrap();
+        assert!(outcome.allowed(), "the ask itself was allowed, independent of the refused rule");
+
+        let db = d.kernel_db.lock();
+        let count: i64 = db
+            .conn_for_ledger()
+            .query_row("SELECT COUNT(*) FROM approval_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no rule may exist after a refused remember");
+    }
+
+    /// `--remember session` round-trips through `kj ledger rules` — the
+    /// scope typed on the CLI is exactly the scope the rule reports, and the
+    /// structured `.data` is the array-of-ids `KjResult::ok_with_data`'s
+    /// doc comment promises for list commands.
+    #[tokio::test]
+    async fn remember_session_scope_round_trips_through_kj_ledger_rules() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let label = "kaish-source";
+        let rendered = "echo session-scoped";
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move {
+            run_gate(&db, &caller, shell_spec(label, rendered), Duration::from_secs(30), &flows).await
+        });
+        let request_id = wait_for_pending(&d).await;
+        let result = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("session")], &c)
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(result.message().contains("session"), "{}", result.message());
+        assert!(gate.await.unwrap().allowed());
+
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(rules.is_ok(), "{rules:?}");
+        assert!(rules.message().contains("session"), "{}", rules.message());
+        let data = match &rules {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger rules must emit structured data: {other:?}"),
+        };
+        let ids = data.as_array().expect(".data must be a JSON array of rule ids");
+        assert_eq!(ids.len(), 1, "{data}");
+        assert!(ids[0].is_string(), "{data}");
+    }
+
+    /// A remember with no way to un-remember is a trap: `kj ledger forget`
+    /// must make the NEXT identical ask escalate again, exactly as if the
+    /// rule had never been learned.
+    #[tokio::test]
+    async fn forgetting_a_rule_makes_the_next_identical_ask_escalate_again() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let label = "kaish-source";
+        let rendered = "echo forget-me";
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move {
+            run_gate(&db, &caller, shell_spec(label, rendered), Duration::from_secs(30), &flows).await
+        });
+        let request_id = wait_for_pending(&d).await;
+        d.dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
+            .await;
+        assert!(gate.await.unwrap().allowed());
+
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        let data = match &rules {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("{other:?}"),
+        };
+        let rule_id = data[0].as_str().expect("a rule id string").to_string();
+
+        let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &c).await;
+        assert!(forgotten.is_ok(), "{forgotten:?}");
+
+        let rules_after = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(
+            rules_after.message().contains("no active rules"),
+            "{}",
+            rules_after.message()
+        );
+
+        // The next identical ask must escalate — no rule left to auto-allow
+        // it, so an unattended short budget must expire, not allow.
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &c,
+            shell_spec(label, rendered),
+            Duration::from_millis(400),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert!(!outcome.allowed(), "a forgotten rule must not keep auto-allowing: {outcome:?}");
+        assert_eq!(outcome.verdict, crate::kj::gate::GateVerdict::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_unknown_rule_id_errors_loudly() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("forget"), s("no-such-rule")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("no such rule"));
+    }
+
+    #[tokio::test]
+    async fn ledger_rules_on_a_fresh_ledger_is_empty() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(result.is_ok());
+        assert!(result.message().contains("no active rules"));
+        let data = match &result {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(data.as_array().unwrap().len(), 0);
+    }
+
+    /// `--remember <bad-value>` must fail at clap parse time with a message
+    /// naming the valid choices, not deep inside `ledger_decide`.
+    #[tokio::test]
+    async fn an_invalid_remember_scope_fails_at_parse_time() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(&[s("ledger"), s("allow"), s("deadbeef"), s("--remember"), s("forever")], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("session") && result.message().contains("always"),
+            "clap's error should name the valid choices: {}",
+            result.message()
+        );
     }
 
     mod dispatch_wiring {
