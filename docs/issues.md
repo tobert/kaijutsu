@@ -56,6 +56,28 @@ accept the qualifying context prefix). Full transcript:
 
 ---
 
+## `load_rc_scripts` reads "directory absent" differently per backend (2026-08-18)
+
+`load_rc_scripts` treats a missing rc directory as "no scripts" — correct,
+since a context type with no scripts for a verb is ordinary. But the match
+only catches `VfsError::NotFound` and `VfsError::NoMountPoint`. A host-backed
+`LocalBackend` reports a genuinely absent directory as
+`VfsError::Io(io::ErrorKind::NotFound)`, which falls through to the error
+branch instead.
+
+Production is unaffected: `/etc/rc` is always mounted `ConfigDocFs`, which
+returns the typed variants. It bites the **test harness** — `test_dispatcher()`
+mounts `LocalBackend` — which means any test exercising the no-scripts path
+was quietly asserting something other than what it looked like.
+
+Found while wiring the rc run log (`0a3cc566`) and documented in that test
+rather than fixed, to keep the slice honest. The fix is either widening the
+match to include `Io(NotFound)` or making the backends agree on how absence
+is reported — the second is better and bigger: two backends disagreeing about
+"not there" will keep producing this shape of surprise.
+
+---
+
 ## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18)
 
 **Live on toad, 11:00 today.** A turn died with the provider's own words:
