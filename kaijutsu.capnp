@@ -1524,35 +1524,20 @@ interface PermissionEvents {
 # ============================================================================
 # Approval-ledger change notification
 # ============================================================================
-# Deliberately the OPPOSITE shape from `PermissionEvents` above, and the
-# contrast is the design. `onAsk` is a blocking round trip whose *response*
-# is the decision. This one is fire-and-forget and carries no decision, no
-# ask id, no status, no content — only "the ledger moved, generation N."
+# Carries a generation and nothing else — no ask id, no status, no content.
+# Two properties depend on that emptiness:
 #
-# Amy's ruling (2026-08-17), which is why the ledger is a ledger: "all the
-# things around it can react to information-light events and then work with
-# the ledger to do safe changes from state to state... it gets informed
-# there is new information and it polls when it's ready." A client marks a
-# cache dirty, or renders a prompt, or does nothing at all because some
-# other view is showing. None of that policy is encoded here.
+# - Coalescing is lossless. N changes inside a delivery window collapse to
+#   one notification bearing the highest generation, and a client that polls
+#   afterwards still observes all N.
+# - A dropped notification cannot corrupt anything; the worst case is a late
+#   poll. The ledger is the authority, and answering is its claim/decide
+#   transaction (exactly one answerer wins), reached through `kj ledger`.
 #
-# Two properties follow from carrying only a generation:
-#
-# - **Coalescing is lossless.** N ledger changes inside a delivery window
-#   collapse to ONE notification bearing the highest generation, and a
-#   client that then polls still observes all N. A payload carrying ask
-#   content could not be collapsed that way without losing facts.
-# - **A dropped notification cannot corrupt anything.** The worst case is a
-#   late poll, never a wrong answer: the ledger, not this message, is the
-#   authority. Answering stays the ledger's `claim`/`decide` transaction
-#   (exactly one answerer wins) reached through `kj approve`.
-#
-# The generation is durable in the ledger's own SQLite and maintained by
-# triggers, so it cannot claim a fact that did not commit; the kernel jumps
-# it ahead by a small gap at boot so a restart reads as a discontinuity
-# rather than a silent resume. Int64 rather than UInt64 because SQLite's
-# INTEGER *is* i64 — unsigned would buy only a lossy conversion, and at
-# human answer rates 2^63 is not a concern.
+# The generation is durable in the ledger's SQLite and maintained by
+# triggers, so it cannot report a change that did not commit. The kernel
+# jumps it ahead by a gap at boot, so a restart reads as a discontinuity
+# rather than a silent resume. Int64 because SQLite's INTEGER is i64.
 
 interface LedgerEvents {
   # Next free ordinal: 1. Ordinals are dense and permanent — never
@@ -2225,16 +2210,15 @@ interface Kernel {
   # timeout fail-closed policy this bridges to.
   subscribePermissionEvents @93 (callback :PermissionEvents);
 
-  # Kernel-wide approval-ledger change notification. Kernel-wide for the
-  # same reason as `subscribePermissionEvents` — a ledger change can
-  # originate from any call path (a gated `shell_write` in one context, a
-  # `kj approve` answered from a shell, a rule learned by a sibling) — but
-  # unlike that one this delivers no decision and expects no answer. See
-  # `LedgerEvents` above for why the payload is only a generation.
+  # Kernel-wide: a ledger change can originate from any call path (a gated
+  # `shell_write` in one context, a `kj ledger` answer typed in a shell, a
+  # rule learned by a sibling), so one subscription serves every context.
+  # No per-context filter parameter — the notification carries no context
+  # to filter on.
   #
-  # Delivery coalesces on the server side within the change feed's latency
-  # budget (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`), which
-  # is sound here precisely because collapsing generations loses nothing.
+  # Delivery coalesces server-side within the change feed's latency budget
+  # (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`), which is sound
+  # because collapsing generations loses nothing.
   subscribeLedgerEvents @101 (callback :LedgerEvents);
 
   # ==========================================================================
