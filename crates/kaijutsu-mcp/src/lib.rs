@@ -1253,21 +1253,37 @@ impl KaijutsuMcp {
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.kaish_exec")]
-    async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> String {
+    async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> CallToolResult {
         let actor = match self.actor() {
             Some(a) => a,
-            None => return "Error: kaish_exec requires --connect to kaijutsu-server".to_string(),
+            None => {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Error: kaish_exec requires --connect to kaijutsu-server",
+                )]);
+            }
         };
 
         match actor.execute_tool(&req.tool, &req.params).await {
-            Ok(result) => {
-                if result.success {
-                    result.output
-                } else {
-                    format!("Tool error: {}", result.output)
-                }
+            Ok(result) if result.success => {
+                CallToolResult::success(vec![ContentBlock::text(result.output)])
             }
-            Err(e) => format!("Error: {e}"),
+            Ok(result) => {
+                // `error` is the failure reason (kaish's stderr, or the
+                // dispatch error when the tool never ran); `output` is
+                // whatever stdout the tool produced before failing. Lead
+                // with the reason and keep both when both are present —
+                // dropping either loses information a model needs to
+                // recover.
+                let reason = if result.error.is_empty() {
+                    result.output
+                } else if result.output.is_empty() {
+                    result.error
+                } else {
+                    format!("{}\n{}", result.error, result.output)
+                };
+                CallToolResult::error(vec![ContentBlock::text(format!("Tool error: {reason}"))])
+            }
+            Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
         }
     }
 
