@@ -842,7 +842,7 @@ consumer exists, so building it now would mint a well-known context with no
 producers. That is exactly the bug `19e0c047` shipped and `66597891` fixed
 for the drift queue. It lands with the traffic it exists to absorb.
 
-**Slice 4.6 — the gate ladder.** Slice 4.5 made the gate discoverable and
+**Slice 4.6 — the gate ladder — SHIPPED 2026-08-18** (`cb93cd57`), verified live: a gated `shell_write` held 81.2s and returned its output after `kj ledger allow` from another surface. Slice 4.5 made the gate discoverable and
 the first live test found it unusable anyway: a gated `shell_write` came
 back `call timed out after 30s`, not the gate's `nobody answered ask <id>,
 nothing was run`. The ask stayed pending and was answerable afterwards, so
@@ -886,8 +886,19 @@ legitimate long commands at 120s. And the client override fixes a broader
 pre-existing bug: any tool call over 30s was reported as a client timeout
 while the kernel kept working for up to 120s.
 
-**Slice 4.7 — the Ask path melts into the ledger, and `kj approve` becomes
-`kj ledger`.** The shape is in "The shared seam" above. Two notes on the
+**Slice 4.7 — the Ask path melts into the ledger — SHIPPED 2026-08-18**
+(`29897e4a` rename, `ac9b1449` groundwork, `42a7147a` the melt, `17b0db6b` the
+wire retirement, `8ffa3773` the abandon guard).
+
+**Slice 4.8 — a killed caller abandons its ask — SHIPPED 2026-08-18**
+(`8ffa3773`). Amy: *"the harnesses will kill it on their own if they get
+impatient anyways, so we should maybe check the signal paths to accommodate
+that rather than trying to tune our way out of kills happening."*
+`decide::abandon` had existed with no production caller, so every killed
+gated call left its row `pending` — indistinguishable in `kj ledger list`
+from an ask someone was waiting on. `AbandonOnDrop` takes the signal from the
+drop rather than from any one cancellation path, because the ways to be
+killed are a moving target. The shape is in "The shared seam" above. Two notes on the
 rename, which rides along because the melt writes the model-facing strings
 that name this surface.
 
