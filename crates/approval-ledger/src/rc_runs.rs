@@ -101,19 +101,27 @@ pub fn insert_script_body(conn: &Connection, body: &str) -> Result<String> {
 }
 
 /// Record one script's execution within a run, in order.
+///
+/// `started_at` must be captured by the caller *before* the script runs —
+/// not left to the `rc_run_scripts.started_at` SQL `DEFAULT`, which fires
+/// at INSERT time and is therefore always at or after `finished_at` (the
+/// script has already finished by the time anything calls this function).
+/// The schema `DEFAULT` stays in place as a backstop for any other writer,
+/// but this is the one caller and it always supplies an explicit value.
 pub fn record_run_script(
     conn: &Connection,
     run_id: &str,
     path: &str,
     body_sha256: &str,
     exit_code: Option<i64>,
+    started_at: i64,
     finished_at: Option<i64>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO rc_run_scripts (run_id, seq, path, body_sha256, exit_code, finished_at)
+        "INSERT INTO rc_run_scripts (run_id, seq, path, body_sha256, exit_code, started_at, finished_at)
          VALUES (?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM rc_run_scripts WHERE run_id = ?1),
-                 ?2, ?3, ?4, ?5)",
-        params![run_id, path, body_sha256, exit_code, finished_at],
+                 ?2, ?3, ?4, ?5, ?6)",
+        params![run_id, path, body_sha256, exit_code, started_at, finished_at],
     )?;
     Ok(())
 }
@@ -230,8 +238,8 @@ mod tests {
         let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
         let sha_a = insert_script_body(&conn, "S00-stance.kai body").unwrap();
         let sha_b = insert_script_body(&conn, "S10-tools.kai body").unwrap();
-        record_run_script(&conn, &run_id, "S00-stance.kai", &sha_a, Some(0), Some(1)).unwrap();
-        record_run_script(&conn, &run_id, "S10-tools.kai", &sha_b, Some(0), Some(2)).unwrap();
+        record_run_script(&conn, &run_id, "S00-stance.kai", &sha_a, Some(0), 1, Some(2)).unwrap();
+        record_run_script(&conn, &run_id, "S10-tools.kai", &sha_b, Some(0), 3, Some(4)).unwrap();
 
         let scripts = list_run_scripts(&conn, &run_id).unwrap();
         assert_eq!(scripts.len(), 2);
@@ -239,5 +247,49 @@ mod tests {
         assert_eq!(scripts[1].path, "S10-tools.kai");
         assert_eq!(scripts[0].seq, 0);
         assert_eq!(scripts[1].seq, 1);
+    }
+
+    /// The real invariant: a script's `started_at` must never be after its
+    /// `finished_at`, and a script that takes measurable time must record a
+    /// `started_at` measurably before its `finished_at`.
+    ///
+    /// Before the fix, `record_run_script` didn't accept a `started_at` at
+    /// all — the SQL `DEFAULT` on `rc_run_scripts.started_at` fired at
+    /// *insert* time, which is necessarily after the caller already
+    /// captured `finished_at` (the script already ran by the time anyone
+    /// calls this function). This test pins the real ordering: capture
+    /// `finished_at`, let measurable time pass, THEN call the recording
+    /// function — reproducing exactly the shape of the bug (insert
+    /// happens strictly after the timestamp the caller is trying to
+    /// record against) instead of relying on it showing up at ms
+    /// resolution by chance, which is why it was hidden in production.
+    #[test]
+    fn started_at_is_measurably_before_finished_at() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        let sha = insert_script_body(&conn, "S00-stance.kai body").unwrap();
+
+        let started_at = crate::time::now_millis();
+        std::thread::sleep(std::time::Duration::from_millis(50)); // measurable script runtime
+        let finished_at = crate::time::now_millis();
+
+        record_run_script(&conn, &run_id, "S00-stance.kai", &sha, Some(0), started_at, Some(finished_at)).unwrap();
+
+        let scripts = list_run_scripts(&conn, &run_id).unwrap();
+        assert_eq!(scripts.len(), 1);
+        let row = &scripts[0];
+        let recorded_finished_at = row.finished_at.expect("finished_at was supplied");
+        assert!(
+            row.started_at <= recorded_finished_at,
+            "started_at ({}) must not be after finished_at ({})",
+            row.started_at,
+            recorded_finished_at
+        );
+        assert!(
+            recorded_finished_at - row.started_at >= 10,
+            "a script that measurably slept must record a measurable duration; got started_at={} finished_at={}",
+            row.started_at,
+            recorded_finished_at
+        );
     }
 }

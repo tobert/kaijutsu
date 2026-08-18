@@ -291,6 +291,7 @@ impl KjDispatcher {
         let mut any_script_failed = false;
 
         for script in &scripts {
+            let script_started_at = now_millis();
             let result = match script.extension.as_str() {
                 "md" => run_md_script(self, new_id, script, owner),
                 "kai" => {
@@ -324,7 +325,7 @@ impl KjDispatcher {
             if matches!(result, ScriptRunResult::Failed { .. }) {
                 any_script_failed = true;
             }
-            run_guard.record_script(script, &result);
+            run_guard.record_script(script, script_started_at, &result);
         }
 
         // SysV init.d semantics: one script failing does not stop the rest
@@ -640,11 +641,13 @@ fn tail_output(stdout: &str, stderr: &str) -> String {
 }
 
 /// Current time as Unix milliseconds, for the run log's per-script
-/// `finished_at`. `approval_ledger::time::now_millis` (what `rc_runs::
-/// finish_run` uses for the run row itself) is `pub(crate)` to that crate, so
-/// this is a small local twin rather than a cross-crate visibility change for
-/// one call site — `rc_run_scripts.started_at` already defaults from SQL, so
-/// only `finished_at` needs a value from here.
+/// `started_at`/`finished_at`. `approval_ledger::time::now_millis` (what
+/// `rc_runs::finish_run` uses for the run row itself) is `pub(crate)` to
+/// that crate, so this is a small local twin rather than a cross-crate
+/// visibility change for one call site. Both timestamps are captured here
+/// in Rust, not left to `rc_run_scripts.started_at`'s SQL `DEFAULT` — that
+/// default only fires at INSERT time, which is after the script already
+/// ran, so relying on it would make `started_at` always >= `finished_at`.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -681,7 +684,13 @@ impl<'a> RunGuard<'a> {
     /// does: this is observability riding alongside the lifecycle, not
     /// gating it, so a second database's hiccup must never cost a context
     /// its rc scripts.
-    fn record_script(&self, script: &RcScript, result: &ScriptRunResult) {
+    ///
+    /// `started_at` must be captured by the caller immediately before the
+    /// script ran — this method (and the INSERT it drives) only happens
+    /// *after* the script has already finished, so leaving `started_at` to
+    /// the SQL `DEFAULT` would stamp it at insert time and make it
+    /// impossible for `started_at` to precede `finished_at`.
+    fn record_script(&self, script: &RcScript, started_at: i64, result: &ScriptRunResult) {
         let Some(run_id) = self.run_id.as_deref() else {
             return;
         };
@@ -707,6 +716,7 @@ impl<'a> RunGuard<'a> {
             &script.path,
             &sha256,
             exit_code,
+            started_at,
             Some(now_millis()),
         ) {
             tracing::warn!(
@@ -2748,6 +2758,13 @@ esac
         assert_eq!(scripts[0].exit_code, Some(0));
         assert!(scripts[1].path.ends_with("S10-second.kai"), "{:?}", scripts[1]);
         assert_eq!(scripts[1].exit_code, Some(5));
+        for s in &scripts {
+            let finished = s.finished_at.expect("finished_at recorded");
+            assert!(
+                s.started_at <= finished,
+                "started_at must not be after finished_at: {s:?}"
+            );
+        }
         assert_eq!(
             run.outcome,
             Some(approval_ledger::types::RcOutcome::Failed),
