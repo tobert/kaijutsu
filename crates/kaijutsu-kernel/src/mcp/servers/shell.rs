@@ -490,10 +490,17 @@ impl McpServerLike for ShellServer {
                 dispatcher.kernel().ledger_flows(),
             )
             .await;
-            if !outcome.allowed {
+            if !outcome.allowed() {
+                // Both refusals fail closed, and both surface as `Protocol`
+                // here — `McpError::GateUnavailable` carries a `HookId` and
+                // this gate has no hook behind it. The distinction a model
+                // needs still arrives, in the reason `run_gate` wrote: a
+                // ledger fault says so in words rather than being dressed
+                // up as somebody's decision.
                 return Err(McpError::Protocol(format!(
-                    "shell_write: approval gate refused [ask {}] ({}): {} — nothing was run",
-                    outcome.request_id, outcome.status, outcome.reason
+                    "shell_write: approval gate refused [{}]: {} — nothing was run",
+                    outcome.ask_description(),
+                    outcome.reason
                 )));
             }
         }

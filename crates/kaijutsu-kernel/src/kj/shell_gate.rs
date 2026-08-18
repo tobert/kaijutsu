@@ -153,8 +153,9 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
 
     Ok(GateSpec {
         origin: Origin::ShellGate,
-        instance: INSTANCE,
-        tool: TOOL,
+        instance: INSTANCE.into(),
+        tool: TOOL.into(),
+        hook_id: None,
         description,
         authorized_label: label,
         statements,

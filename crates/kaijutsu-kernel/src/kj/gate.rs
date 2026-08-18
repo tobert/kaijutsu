@@ -67,15 +67,77 @@ use crate::flows::SharedLedgerFlowBus;
 use crate::kernel_db::KernelDb;
 use crate::kj::KjCaller;
 
+/// How a gate wait ended — a decision, or the absence of one.
+///
+/// The three-way split exists because "the gate said no" and "the gate
+/// could not do its job" are different facts, and collapsing them is its
+/// own failure family: a fault that reads as a policy decision teaches a
+/// caller the wrong lesson (*that action is refused*) about a control that
+/// was simply absent. The `shell_write` caller renders both as one error so
+/// it never noticed, but the hook path must map them to `McpError::Denied`
+/// and `McpError::GateUnavailable` respectively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    /// A human or a rule decided yes.
+    Allowed,
+    /// A human or a rule decided no. A real verdict.
+    Denied,
+    /// No decision was reached: the ledger could not be read or written, the
+    /// ask row went missing, or nobody answered before the budget elapsed.
+    /// Still fail-closed — the call does not proceed — but it is not a
+    /// verdict, and must never be reported as one.
+    Unavailable,
+}
+
+/// The durable ask an outcome belongs to. Present whenever the gate got far
+/// enough to commit a row; absent only on the two faults that happen BEFORE
+/// anything durable exists (the rule read failed, or `create_ask` failed).
+///
+/// A pair rather than two `Option` fields because the id and the status are
+/// the same fact — a row either exists with both, or does not exist at all,
+/// and two independent `Option`s could express a third state that cannot
+/// happen.
+#[derive(Debug, Clone)]
+pub(crate) struct AskRef {
+    pub request_id: String,
+    pub status: ApprovalStatus,
+}
+
 /// How a gate wait ended.
 #[derive(Debug, Clone)]
 pub(crate) struct GateOutcome {
-    pub allowed: bool,
-    pub request_id: String,
-    pub status: ApprovalStatus,
+    pub verdict: GateVerdict,
+    /// The ledger row this outcome belongs to, when there is one. `None`
+    /// means the gate failed before recording anything: there is no id to
+    /// show a human and nothing for `kj ledger` to find, and saying so
+    /// beats printing an empty string where an id belongs.
+    pub ask: Option<AskRef>,
     /// Human-readable reason, always populated — on refusal it says exactly
     /// why (denied by whom, expired after how long, which rule fired).
     pub reason: String,
+}
+
+impl GateOutcome {
+    /// Whether the gated action may proceed. The only question callers that
+    /// do not distinguish a fault from a refusal need to ask.
+    pub fn allowed(&self) -> bool {
+        matches!(self.verdict, GateVerdict::Allowed)
+    }
+
+    /// `"<id> (<status>)"`, or a plain statement that nothing was recorded.
+    /// Callers put this in the message a model reads, so it must never
+    /// render a blank where an ask id is expected.
+    pub fn ask_description(&self) -> String {
+        match &self.ask {
+            Some(a) => format!("ask {} ({})", a.request_id, a.status),
+            None => "no ask was recorded".to_string(),
+        }
+    }
+
+    /// A fault before anything durable existed.
+    fn unavailable_without_row(reason: String) -> Self {
+        Self { verdict: GateVerdict::Unavailable, ask: None, reason }
+    }
 }
 
 /// One statement inside a [`GateSpec`] — a ledger statement in waiting.
@@ -118,9 +180,17 @@ pub(crate) struct GatedStatement {
 pub(crate) struct GateSpec {
     pub origin: Origin,
     /// Ledger `instance` column, e.g. `"builtin.kj"` or `"builtin.shell_write"`.
-    pub instance: &'static str,
+    ///
+    /// Owned rather than `&'static str` because a hook ask names whatever
+    /// instance the hooked call was headed for, which is only known at fire
+    /// time. The two static callers pay one allocation per gate, at human
+    /// answer rates.
+    pub instance: String,
     /// Ledger `tool` column, e.g. `"cc.send"` or `"shell_write"`.
-    pub tool: &'static str,
+    pub tool: String,
+    /// The `HookEntry` id, when this ask came from a hook's `Ask` action.
+    /// `None` for a gate a `kj` verb or the shell tool opened on itself.
+    pub hook_id: Option<String>,
     /// Human-readable summary shown to whoever answers.
     pub description: String,
     /// The RAW typed reference (research-pass finding #3) — never a resolved
@@ -168,9 +238,9 @@ fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
         context_id: caller_context_bytes(caller),
         principal_id: caller.principal_id.as_bytes().to_vec(),
         origin: spec.origin,
-        instance: Some(spec.instance.to_string()),
-        tool: Some(spec.tool.into()),
-        hook_id: None,
+        instance: Some(spec.instance.clone()),
+        tool: Some(spec.tool.clone()),
+        hook_id: spec.hook_id.clone(),
         description: spec.description.clone(),
         statements: spec
             .statements
@@ -188,7 +258,7 @@ fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
                 // build. Threading kaish's real `PlannedCommand` tree
                 // through here is future work, not required for Slice 4.
                 commands: vec![NewPlanCommand {
-                    name: spec.tool.into(),
+                    name: spec.tool.clone(),
                     args: vec![NewPlannedValue::Plain(s.rendered.clone())],
                     redirects: vec![],
                     backgrounded: false,
@@ -344,12 +414,10 @@ pub(crate) async fn run_gate(
         ) {
             Ok(coverage) => coverage,
             Err(e) => {
-                return GateOutcome {
-                    allowed: false,
-                    request_id: String::new(),
-                    status: ApprovalStatus::Denied,
-                    reason: format!("approval gate failed to check rules: {e} (fail-closed)"),
-                };
+                return GateOutcome::unavailable_without_row(format!(
+                    "approval gate could not read its rules: {e} (fail-closed — this is a \
+                     ledger fault, not a decision)"
+                ));
             }
         }
     };
@@ -363,12 +431,10 @@ pub(crate) async fn run_gate(
         match approval_ledger::ask::create_ask(db.conn_for_ledger(), &ask) {
             Ok(id) => id,
             Err(e) => {
-                return GateOutcome {
-                    allowed: false,
-                    request_id: String::new(),
-                    status: ApprovalStatus::Denied,
-                    reason: format!("approval gate failed to record the ask: {e} (fail-closed)"),
-                };
+                return GateOutcome::unavailable_without_row(format!(
+                    "approval gate could not record the ask: {e} (fail-closed — this is a \
+                     ledger fault, not a decision)"
+                ));
             }
         }
     };
@@ -397,16 +463,24 @@ pub(crate) async fn run_gate(
         announce_ledger_change(db, ledger_flows);
         return match row {
             Ok(row) => GateOutcome {
-                allowed: row.status.is_allowed(),
-                request_id,
-                status: row.status,
+                verdict: if row.status.is_allowed() {
+                    GateVerdict::Allowed
+                } else {
+                    GateVerdict::Denied
+                },
+                ask: Some(AskRef { request_id, status: row.status }),
                 reason: auto_reason.to_string(),
             },
+            // The ask committed and its decision did not, so the row exists
+            // and is still pending — a fault, and one that leaves something
+            // `kj ledger` can still be pointed at.
             Err(e) => GateOutcome {
-                allowed: false,
-                request_id,
-                status: ApprovalStatus::Denied,
-                reason: format!("approval gate failed to record the rule decision: {e}"),
+                verdict: GateVerdict::Unavailable,
+                ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
+                reason: format!(
+                    "approval gate could not record the rule decision: {e} (fail-closed — \
+                     this is a ledger fault, not a decision)"
+                ),
             },
         };
     }
@@ -448,19 +522,24 @@ pub(crate) async fn run_gate(
                         )
                     };
                     return GateOutcome {
-                        allowed,
-                        request_id,
-                        status: row.status,
+                        verdict: if allowed {
+                            GateVerdict::Allowed
+                        } else {
+                            GateVerdict::Denied
+                        },
+                        ask: Some(AskRef { request_id, status: row.status }),
                         reason,
                     };
                 }
                 Ok(_) => {} // still pending/claimed — keep waiting
                 Err(e) => {
                     return GateOutcome {
-                        allowed: false,
-                        request_id,
-                        status: ApprovalStatus::Denied,
-                        reason: format!("approval gate lost its ask row: {e} (fail-closed)"),
+                        verdict: GateVerdict::Unavailable,
+                        ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
+                        reason: format!(
+                            "approval gate lost track of its ask row: {e} (fail-closed — \
+                             this is a ledger fault, not a decision)"
+                        ),
                     };
                 }
             }
@@ -479,10 +558,13 @@ pub(crate) async fn run_gate(
                  (answer faster next time, or raise gate_wait_timeout)",
                 wait.as_secs()
             );
+            // Nobody decided. Fail-closed, but an unanswered ask is the
+            // absence of a decision, not a refusal — a caller told "denied"
+            // here would learn that the action is disallowed, when the truth
+            // is that no one was around to say.
             return GateOutcome {
-                allowed: false,
-                request_id,
-                status,
+                verdict: GateVerdict::Unavailable,
+                ask: Some(AskRef { request_id, status }),
                 reason,
             };
         }
@@ -499,8 +581,9 @@ mod tests {
     fn cc_spec(target: &str) -> GateSpec {
         GateSpec {
             origin: Origin::KjVerb,
-            instance: "builtin.kj",
-            tool: "cc.send",
+            instance: "builtin.kj".into(),
+            tool: "cc.send".into(),
+            hook_id: None,
             description: format!("send a cross-session message to CC session {target:?}"),
             authorized_label: target.to_string(),
             statements: vec![GatedStatement {
@@ -521,8 +604,9 @@ mod tests {
     fn two_statement_spec(label: &str, first: &str, second: &str, second_index: usize) -> GateSpec {
         GateSpec {
             origin: Origin::ShellGate,
-            instance: "builtin.shell_write",
-            tool: "shell_write",
+            instance: "builtin.shell_write".into(),
+            tool: "shell_write".into(),
+            hook_id: None,
             description: format!("shell_write: {first:?}; {second:?}"),
             authorized_label: label.to_string(),
             statements: vec![
@@ -564,18 +648,21 @@ mod tests {
         )
         .await;
 
-        assert!(!outcome.allowed, "an unanswered gate must refuse");
-        assert_eq!(outcome.status, ApprovalStatus::Expired);
+        assert!(!outcome.allowed(), "an unanswered gate must refuse");
+        // Nobody answered, so nobody decided: unavailable, NOT denied.
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable);
+        let ask = outcome.ask.as_ref().expect("an expired ask still has a row");
+        assert_eq!(ask.status, ApprovalStatus::Expired);
         assert!(outcome.reason.contains("no human answered"));
         assert!(start.elapsed() >= Duration::from_millis(400));
-        assert!(!outcome.request_id.is_empty());
+        assert!(!ask.request_id.is_empty());
 
         // Guarantee 1, verified from the outside: the row is on disk,
         // terminal, and carries the RAW typed label (finding #3), not a
         // resolved one.
         let db = d.kernel_db.clone();
         let db = db.lock();
-        let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &outcome.request_id)
+        let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &ask.request_id)
             .unwrap()
             .expect("the ask row must exist after the gate");
         assert_eq!(row.status, ApprovalStatus::Expired);
@@ -636,9 +723,11 @@ mod tests {
         }
 
         let outcome = gate.await.unwrap();
-        assert!(outcome.allowed, "an allow answer must open the gate");
-        assert_eq!(outcome.status, ApprovalStatus::Allowed);
-        assert_eq!(outcome.request_id, request_id);
+        assert!(outcome.allowed(), "an allow answer must open the gate");
+        assert_eq!(outcome.verdict, GateVerdict::Allowed);
+        let ask = outcome.ask.expect("an answered ask has a row");
+        assert_eq!(ask.status, ApprovalStatus::Allowed);
+        assert_eq!(ask.request_id, request_id);
     }
 
     /// The point of the whole notification slice: an escalated ask is
@@ -726,7 +815,7 @@ mod tests {
         }
 
         let outcome = gate.await.unwrap();
-        assert!(outcome.allowed, "an allow answer must open the gate");
+        assert!(outcome.allowed(), "an allow answer must open the gate");
     }
 
     #[tokio::test]
@@ -775,8 +864,9 @@ mod tests {
         }
 
         let outcome = gate.await.unwrap();
-        assert!(!outcome.allowed);
-        assert_eq!(outcome.status, ApprovalStatus::Denied);
+        assert!(!outcome.allowed());
+        assert_eq!(outcome.verdict, GateVerdict::Denied);
+        assert_eq!(outcome.ask.as_ref().unwrap().status, ApprovalStatus::Denied);
         assert!(outcome.reason.contains("refused"));
     }
 
@@ -844,7 +934,7 @@ mod tests {
                 "no ALLOW rule may be learned from a statement with a free variable: {learned:?}"
             );
         }
-        assert!(gate.await.unwrap().allowed);
+        assert!(gate.await.unwrap().allowed());
     }
 
     /// Seed a standing DENY rule for exactly `(digest, label)`, scope
@@ -928,8 +1018,11 @@ mod tests {
         )
         .await;
 
-        assert!(!outcome.allowed, "a deny rule on one statement must refuse the whole call");
-        assert_eq!(outcome.status, ApprovalStatus::Denied);
+        assert!(!outcome.allowed(), "a deny rule on one statement must refuse the whole call");
+        // A standing DENY rule is a decision someone made earlier, so this
+        // is a verdict — the rule path and the human path agree.
+        assert_eq!(outcome.verdict, GateVerdict::Denied);
+        assert_eq!(outcome.ask.as_ref().unwrap().status, ApprovalStatus::Denied);
         assert!(
             outcome.reason.contains("#2") && outcome.reason.contains("rm -rf foo"),
             "reason must name the ACTUAL denied statement (#2, `rm -rf foo`): {}",
@@ -959,8 +1052,54 @@ mod tests {
         )
         .await;
 
-        assert!(!outcome.allowed);
-        assert_eq!(outcome.status, ApprovalStatus::Expired);
+        assert!(!outcome.allowed());
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable);
+        assert_eq!(outcome.ask.as_ref().unwrap().status, ApprovalStatus::Expired);
         assert!(start.elapsed() >= Duration::from_millis(400));
+    }
+
+    /// The fault/verdict split, asserted at the seam it exists to protect.
+    ///
+    /// A gate that cannot reach its ledger must not report the same thing a
+    /// human refusal reports. Driven by handing `run_gate` a closed
+    /// database, which is the cheapest honest way to make the rule read
+    /// fail before any row is written.
+    #[tokio::test]
+    async fn a_ledger_fault_is_unavailable_not_denied() {
+        let d = short_gate_dispatcher().await;
+        let caller = test_caller();
+
+        // Take the rules table out from under the gate so `rules::redeem`
+        // fails on its very first read — before any row is written, which
+        // is the branch that must report "no ask was recorded".
+        {
+            let db = d.kernel_db.lock();
+            db.conn_for_ledger()
+                .execute_batch("DROP TABLE approval_rules;")
+                .expect("dropping the rules table is the fault being injected");
+        }
+
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            Duration::from_millis(400),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+
+        assert!(!outcome.allowed(), "a broken ledger must still fail closed");
+        assert_eq!(
+            outcome.verdict,
+            GateVerdict::Unavailable,
+            "a ledger fault reported as `Denied` teaches a caller that the action is \
+             disallowed, when the truth is that the control was absent — that is the \
+             collapse this split exists to prevent"
+        );
+        assert!(
+            outcome.ask.is_none(),
+            "nothing durable was recorded, so there is no ask id to hand anyone"
+        );
+        assert_eq!(outcome.ask_description(), "no ask was recorded");
     }
 }

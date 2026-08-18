@@ -32,6 +32,7 @@ pub mod fork;
 pub mod format;
 pub mod gate;
 pub mod hook;
+pub mod hook_gate;
 pub mod kaish;
 pub mod mcp;
 pub mod midi;

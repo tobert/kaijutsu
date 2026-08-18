@@ -238,8 +238,9 @@ mod tests {
     fn spec() -> GateSpec {
         GateSpec {
             origin: approval_ledger::types::Origin::KjVerb,
-            instance: "builtin.kj",
-            tool: "cc.send",
+            instance: "builtin.kj".into(),
+            tool: "cc.send".into(),
+            hook_id: None,
             description: "test ask".into(),
             authorized_label: "some-target".into(),
             statements: vec![crate::kj::gate::GatedStatement {
@@ -295,8 +296,11 @@ mod tests {
             .await;
         assert!(result.is_ok(), "deny must succeed: {result:?}");
         let outcome = gate.await.unwrap();
-        assert!(!outcome.allowed);
-        assert_eq!(outcome.request_id, request_id);
+        assert!(!outcome.allowed());
+        // A human said no. That IS a verdict — distinct from the gate
+        // being unable to reach one.
+        assert_eq!(outcome.verdict, crate::kj::gate::GateVerdict::Denied);
+        assert_eq!(outcome.ask.expect("a denied ask has a row").request_id, request_id);
     }
 
     #[tokio::test]
@@ -340,7 +344,7 @@ mod tests {
         assert!(again.message().contains("not `pending`") || again.message().contains("already"));
 
         let outcome = gate.await.unwrap();
-        assert!(outcome.allowed);
+        assert!(outcome.allowed());
     }
 
     #[tokio::test]

@@ -114,10 +114,11 @@ impl KjDispatcher {
                     self.kernel.ledger_flows(),
                 )
                 .await;
-                if !outcome.allowed {
+                if !outcome.allowed() {
                     return KjResult::Err(format!(
-                        "kj cc send: approval gate refused [ask {}] ({}): {}",
-                        outcome.request_id, outcome.status, outcome.reason
+                        "kj cc send: approval gate refused [{}]: {}",
+                        outcome.ask_description(),
+                        outcome.reason
                     ));
                 }
                 cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, false)
@@ -157,8 +158,9 @@ fn gate_spec_for_send(
     let preview: String = message.chars().take(200).collect();
     crate::kj::gate::GateSpec {
         origin: approval_ledger::types::Origin::KjVerb,
-        instance: "builtin.kj",
-        tool: "cc.send",
+        instance: "builtin.kj".into(),
+        tool: "cc.send".into(),
+        hook_id: None,
         description: format!(
             "send a cross-session message to Claude Code session {target:?}{resolution}: {preview}"
         ),
