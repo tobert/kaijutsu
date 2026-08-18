@@ -57,31 +57,6 @@ up in real prose. Add to it when you hit one.
 
 ---
 
-## A failed `shell_write` reports `Tool error:` with no reason (2026-08-18)
-
-Found while testing the `--remember` path end to end on the live kernel. An
-allowed `shell_write` whose command fails returns:
-
-    {"content": [{"type": "text", "text": "Tool error: "}], "isError": false}
-
-Two defects in one response. The reason is **empty** — the caller is told
-something failed and nothing about what, which is the opposite of the
-"fast and informative failures" rule in AGENTS.md "Writing style". And
-`isError` is **false** while the text says "Tool error", so a client
-branching on the typed field disagrees with a client reading the text.
-
-Reproduced deliberately: `echo "x" > scratch/remember-test.txt` from a freshly
-registered MCP context returns the empty error and writes nothing, because
-`scratch/` does not resolve in that context's VFS cwd. `echo hello-from-gate`
-through the identical path returns `hello-from-gate\n` normally, so the gate
-and the execution path are fine — only the error reporting is lost.
-
-The gate is not implicated. The ask was allowed, the statement ran, and the
-failure happened downstream in kaish/VFS path resolution. Whatever converts
-that failure into an MCP result is dropping the message.
-
----
-
 ## The conversation surface draws no block border labels or gutter checkbox (2026-08-18)
 
 Slice 2 of the conversation-surface rewrite ports the chrome that is *quads* —
