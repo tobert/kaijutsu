@@ -109,7 +109,30 @@ impl KernelBridge {
         let client = connect_ssh(config.clone())
             .await
             .context("ssh connect to kaijutsu-server")?;
-        let (_kernel, kernel_id) = client.bind_kernel().await.context("bind kernel")?;
+        let (_kernel, kernel_id) = client.bind_kernel().await.map_err(|e| {
+            let msg = e.to_string();
+            // A wire-version mismatch is the one connect failure where the
+            // human needs a single unambiguous line on stderr rather than
+            // an anyhow chain: an ACP client's only diagnostic channel
+            // before a session exists is stderr, and this is exactly the
+            // failure mode (docs/issues.md, "The ACP binary can silently
+            // outlive a wire change") a rebuild fixes. `msg` already names
+            // both wire versions and, via `wire_version_mismatch_message`,
+            // which side is stale — only append the ACP-specific rebuild
+            // command when THIS binary is the stale side; the kernel-stale
+            // case's message already tells the operator to rebuild and
+            // restart the server, and appending ACP-rebuild advice there
+            // would blame the side that's actually correct.
+            if msg.contains("client is stale") {
+                eprintln!(
+                    "kaijutsu-acp: wire version mismatch — {msg} Rebuild this binary: \
+                     cargo build -p kaijutsu-acp"
+                );
+            } else if msg.contains("kernel is stale") {
+                eprintln!("kaijutsu-acp: wire version mismatch — {msg}");
+            }
+            anyhow::Error::from(e)
+        }).context("bind kernel")?;
         drop(client);
         tracing::info!(kernel = %kernel_id, "bound kernel");
 

@@ -2,6 +2,8 @@
 //!
 //! Uses ephemeral SSH keys generated in memory for testing.
 
+use std::net::SocketAddr;
+
 mod common;
 use common::*;
 
@@ -84,6 +86,106 @@ fn test_bind_kernel_creates_kernel() {
         let info = kernel.get_info().await.unwrap();
         assert!(!kernel_id.is_nil());
         assert_eq!(info.id, kernel_id);
+    });
+}
+
+/// Drives the raw `bindKernel` capnp method with an explicit wire version,
+/// bypassing `kaijutsu_client::RpcClient::bind_kernel` (which always sends
+/// the crate's own `WIRE_VERSION`, so it can never exercise a mismatch), and
+/// returns the refusal's error text. Panics if the kernel does not refuse.
+async fn bind_kernel_raw_expect_refused(addr: SocketAddr, client_wire_version: u32) -> String {
+    let config = kaijutsu_client::SshConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        username: "test_user".to_string(),
+        key_source: kaijutsu_client::KeySource::ephemeral(),
+        insecure: true,
+    };
+    let mut ssh = kaijutsu_client::SshClient::new(config);
+    let channel = ssh.connect().await.expect("SSH connect failed");
+
+    // Mirrors `RpcClient::from_stream`, but keeps the raw `world::Client`
+    // so the caller can set an explicitly wrong wire version.
+    let compat_stream = tokio_util::compat::TokioAsyncReadCompatExt::compat(channel.into_stream());
+    let (reader, writer) = futures::AsyncReadExt::split(compat_stream);
+    let rpc_network = Box::new(capnp_rpc::twoparty::VatNetwork::new(
+        futures::io::BufReader::new(reader),
+        futures::io::BufWriter::new(writer),
+        capnp_rpc::rpc_twoparty_capnp::Side::Client,
+        Default::default(),
+    ));
+    let mut rpc_system = capnp_rpc::RpcSystem::new(rpc_network, None);
+    let world: kaijutsu_client::kaijutsu_capnp::world::Client =
+        rpc_system.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+    tokio::task::spawn_local(rpc_system);
+
+    let mut request = world.bind_kernel_request();
+    request.get().set_wire_version(client_wire_version);
+    match request.send().promise.await {
+        Ok(_) => panic!("mismatched wire version must be refused, not tolerated"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A client older than the kernel (sends a version below
+/// `kaijutsu_types::WIRE_VERSION`) is refused, and the client — the stale
+/// side — gets the rebuild advice. Regression guard for docs/issues.md,
+/// "The ACP binary can silently outlive a wire change", and for the
+/// follow-up defect where the remedy named the wrong side regardless of
+/// which one was actually stale.
+#[test]
+fn test_bind_kernel_rejects_stale_client() {
+    run_local(async {
+        let addr = start_server().await;
+        // 0 is the reserved "predates this field" sentinel — always below
+        // any real version, so this is always the client-stale direction.
+        const STALE_CLIENT_VERSION: u32 = 0;
+        let msg = bind_kernel_raw_expect_refused(addr, STALE_CLIENT_VERSION).await;
+
+        assert!(
+            msg.contains(&STALE_CLIENT_VERSION.to_string()),
+            "error must name the client's wire version: {msg}"
+        );
+        assert!(
+            msg.contains(&kaijutsu_types::WIRE_VERSION.to_string()),
+            "error must name the kernel's wire version: {msg}"
+        );
+        assert!(msg.contains("client is stale"), "error must blame the client: {msg}");
+        assert!(
+            !msg.contains("kernel is stale"),
+            "error must not also blame the kernel, which is correct: {msg}"
+        );
+    });
+}
+
+/// A client newer than the kernel (sends a version above
+/// `kaijutsu_types::WIRE_VERSION`) is refused too, and this time the
+/// *kernel* — the stale side — gets the rebuild-and-restart advice, not the
+/// client that is actually correct.
+#[test]
+fn test_bind_kernel_rejects_stale_kernel() {
+    run_local(async {
+        let addr = start_server().await;
+        const NEWER_CLIENT_VERSION: u32 = 999_999;
+        assert!(
+            NEWER_CLIENT_VERSION > kaijutsu_types::WIRE_VERSION,
+            "test constant must actually be newer than the real version"
+        );
+        let msg = bind_kernel_raw_expect_refused(addr, NEWER_CLIENT_VERSION).await;
+
+        assert!(
+            msg.contains(&NEWER_CLIENT_VERSION.to_string()),
+            "error must name the client's wire version: {msg}"
+        );
+        assert!(
+            msg.contains(&kaijutsu_types::WIRE_VERSION.to_string()),
+            "error must name the kernel's wire version: {msg}"
+        );
+        assert!(msg.contains("kernel is stale"), "error must blame the kernel: {msg}");
+        assert!(
+            !msg.contains("client is stale"),
+            "error must not also blame the client, which is correct: {msg}"
+        );
     });
 }
 

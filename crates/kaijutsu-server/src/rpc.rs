@@ -2259,8 +2259,23 @@ impl world::Server for WorldImpl {
         params: world::BindKernelParams,
         mut results: world::BindKernelResults,
     ) -> Promise<(), capnp::Error> {
-        let _params_reader = pry!(params.get());
+        let params_reader = pry!(params.get());
         let _span = tracing::info_span!("rpc", method = "bind_kernel").entered();
+
+        // Wire-version handshake: refuse a mismatched client at connect,
+        // loudly, before it can do anything half-working. A client that
+        // predates this field sends capnp's UInt32 default (0), which is
+        // below any real version and is exactly the case we want refused.
+        // See kaijutsu_types::WIRE_VERSION for the flag-day rule.
+        let client_wire_version = params_reader.get_wire_version();
+        if client_wire_version != kaijutsu_types::WIRE_VERSION {
+            let msg = kaijutsu_types::wire_version_mismatch_message(
+                client_wire_version,
+                kaijutsu_types::WIRE_VERSION,
+            );
+            log::error!("bind_kernel refused: {msg}");
+            return Promise::err(capnp::Error::failed(msg));
+        }
 
         // No kernel creation — hand out the shared kernel capability.
         let kernel = self.registry.kernel.clone();
@@ -2270,6 +2285,7 @@ impl world::Server for WorldImpl {
         );
         results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
         results.get().set_kernel_id(kernel.id.as_bytes());
+        results.get().set_wire_version(kaijutsu_types::WIRE_VERSION);
         Promise::ok(())
     }
 }

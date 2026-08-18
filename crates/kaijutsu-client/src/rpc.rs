@@ -299,8 +299,24 @@ impl RpcClient {
             trace.set_traceparent(&traceparent);
             trace.set_tracestate(&tracestate);
         }
+        request.get().set_wire_version(kaijutsu_types::WIRE_VERSION);
         let response = request.send().promise.await?;
         let reader = response.get()?;
+
+        // Symmetric check: the kernel already refuses a mismatched client
+        // (an old-client-vs-new-kernel bind fails at the server and surfaces
+        // as a Capnp error above). This covers the other direction — a new
+        // client against an old kernel that doesn't know the `wireVersion`
+        // field at all sends capnp's UInt32 default (0) in its results, so
+        // it reads as a mismatch here too.
+        let kernel_wire_version = reader.get_wire_version();
+        if kernel_wire_version != kaijutsu_types::WIRE_VERSION {
+            return Err(RpcError::Other(kaijutsu_types::wire_version_mismatch_message(
+                kaijutsu_types::WIRE_VERSION,
+                kernel_wire_version,
+            )));
+        }
+
         let kernel = reader.get_kernel()?;
         let kernel_id = parse_kernel_id(reader.get_kernel_id()?)?;
 

@@ -1556,7 +1556,15 @@ interface World {
 
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
-  bindKernel @2 (trace :TraceContext) -> (kernel :Kernel, kernelId :Data);
+  # `wireVersion` is the client's `kaijutsu_types::WIRE_VERSION`. An old
+  # client that predates this field sends capnp's struct default (0), which
+  # is below any real version and is refused — this is what makes the
+  # handshake a hard flag day rather than a silent downgrade. The kernel
+  # returns its own `wireVersion` in the results so a client can name both
+  # numbers in its error even when the kernel is the older side. See
+  # docs/issues.md, "The ACP binary can silently outlive a wire change".
+  bindKernel @2 (trace :TraceContext, wireVersion :UInt32)
+      -> (kernel :Kernel, kernelId :Data, wireVersion :UInt32);
 }
 
 interface Kernel {

@@ -4197,4 +4197,72 @@ mod tests {
         assert!(actor.peer_registration.is_none());
         assert!(!actor.peer_attach_pending);
     }
+
+    /// A `bindKernel` wire-version mismatch (`kaijutsu_types::WIRE_VERSION`,
+    /// docs/issues.md "The ACP binary can silently outlive a wire change")
+    /// must stop the actor cold, not feed the reconnect FSM's Cooldown loop.
+    /// Three things have to hold together for that:
+    ///
+    /// 1. The mismatch error text (as `RpcClient::bind_kernel` actually
+    ///    formats it) doesn't accidentally look like a disconnect —
+    ///    `is_disconnect_error` is the real classifier `connect_handshake`
+    ///    uses to pick `ConnectOutcome::Transient` vs `Permanent`, and a
+    ///    false-positive there would silently route this into infinite
+    ///    backoff instead.
+    /// 2. `on_connect_outcome(Permanent(..))` from `Connecting` lands in
+    ///    `Terminal` directly — never `Cooldown` — so no retry is scheduled.
+    /// 3. A command against the resulting `Terminal` actor surfaces as
+    ///    `CallError::PermanentlyFailed`, naming both wire versions, which
+    ///    is the variant callers are told to surface loudly rather than spin
+    ///    on (see `CallError`'s doc comment).
+    #[test]
+    fn wire_version_mismatch_reaches_terminal_not_a_retry_loop() {
+        let msg = "bind_kernel: client wire version 1, kernel wire version 2 — rebuild the \
+                    client (target/debug/kaijutsu-acp is a build artifact and can outlive a \
+                    wire change)"
+            .to_string();
+
+        // 1. Must classify as non-disconnect, or connect_handshake would
+        //    treat it as Transient and retry forever.
+        assert!(
+            !is_disconnect_error(&msg),
+            "a wire-version mismatch must not be misclassified as a disconnect: {msg}"
+        );
+
+        // 2. Feeding it through the real outcome handler must land in
+        //    Terminal, not Cooldown.
+        let mut actor = test_actor();
+        actor.state = ActorState::Connecting {
+            attempt: 1,
+            started_at: Instant::now(),
+        };
+        actor.on_connect_outcome(ConnectOutcome::Permanent(msg.clone()));
+        match &actor.state {
+            ActorState::Terminal { reason } => assert_eq!(reason, &msg),
+            other => panic!(
+                "wire-version mismatch must reach Terminal (no retry), got {other:?}"
+            ),
+        }
+
+        // 3. A caller's command against that Terminal actor gets
+        //    PermanentlyFailed, naming both versions — not NotReady/Cooldown,
+        //    which a caller might reasonably wait out.
+        let (peer_tx, _peer_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor.reject_terminal(RpcCommand::AttachPeer {
+            config: PeerConfig {
+                nick: "acp/toad".into(),
+                instance: "toad-1".into(),
+            },
+            invocation_tx: peer_tx,
+            reply: reply_tx,
+        });
+        match reply_rx.blocking_recv() {
+            Ok(Err(CallError::PermanentlyFailed(reason))) => {
+                assert!(reason.contains('1'), "should name the client version: {reason}");
+                assert!(reason.contains('2'), "should name the kernel version: {reason}");
+            }
+            other => panic!("expected PermanentlyFailed naming both versions, got {other:?}"),
+        }
+    }
 }
