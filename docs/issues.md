@@ -6,6 +6,62 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Three `kj fork` findings recovered from a clobbered backlog (2026-07-04, recovered 2026-08-18)
+
+Recovered from a stale whole-file `write` that overwrote `docs/issues.md` with
+a 2026-06-29 vintage (see the entry below on `write` having no staleness
+guard). These three were the only genuinely new content in that copy and would
+have been lost with it. Not re-verified since 2026-07-04 — confirm before
+working them.
+
+- **`kj fork --compact` label conflict says nothing useful.** The error is a
+  bare `label conflict: label 'X' already in use`. It does not name the
+  existing context, does not suggest `kj context list --tree` to find it, and
+  does not hint at a rename. The caller cannot tell a partial success (the
+  context exists and is usable) from "pick a new name". Fix: name the existing
+  context id in the error and point at `kj context switch` or a rename.
+- **`kj fork --include` rejects the range forms its own help documents.**
+  `--include "end-2:"` and `--include "0:1"` both fail with `is not a valid
+  endpoint — expected an integer, 'end', or 'end-N'`. `end-N` is documented in
+  `--help` and the parser refuses it; bare integer ranges fail too, which
+  suggests the problem is deeper than the `end-N` case. While this holds there
+  is no working way to fork a near-empty child via `--include`.
+- **`kj fork --compact` cannot cross providers.** `kj fork --compact --model
+  deepseek/deepseek-v4-pro` from a haiku context fails with `LLM summarization
+  failed: invalid request: not_found_error: model: deepseek-v4-pro` — the
+  distillation appears to run on the *target* model rather than the *calling*
+  context's. Fix: default `--distill-model` to the calling context's model, or
+  detect the cross-provider case and say so, naming `--distill-model`.
+
+---
+
+## `write` has no staleness guard, and it cost the backlog 115 entries (2026-08-18)
+
+`docs/issues.md` was overwritten in the working tree with its 2026-06-29
+content: 6900 lines and 138 entries down to 1944 and 23, with 8 long-retired
+entries resurrected — including `ToolCtx::patient`, whose own removal commit
+(`f4e4ac3a`) is titled "drop the shipped ToolCtx::patient backlog entry".
+Recovered from `3f8b54d3`.
+
+The asymmetry that allowed it: `edit`'s hashline mode reverifies the line hash
+before writing, so **"a stale edit fails loud instead of corrupting"**
+(`mcp/servers/file.rs:65`). `write` is `create_or_replace` with no precondition
+at all (`file.rs:477`). The careful path is guarded; the blunt one, the only
+one that can destroy a whole file in a single call, is not.
+
+Worth deciding: should `write` to an **existing** file require something —
+a generation/hash precondition, or an explicit overwrite intent — while
+`write` to a new path stays a plain create? A whole-file replace of a
+6900-line file from a context holding seven-week-old content is not a
+hypothetical.
+
+Related, found while diagnosing this: the file tools refuse an **absolute**
+path when the context has no cwd, and say so themselves — "cannot resolve any
+path — relative or otherwise". An absolute path needs no cwd. Also, a cwd set
+via the `shell` tool did not reach the file tool's exec context.
+
+---
+
 ## The writing-style guide is absorbed but not yet applied (2026-08-18)
 
 `AGENTS.md` "Writing style" landed today, adapted from kaish's guide. The rules
