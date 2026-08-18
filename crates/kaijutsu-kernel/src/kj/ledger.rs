@@ -36,12 +36,12 @@
 //! `kj ledger forget` is how that stops.
 
 use approval_ledger::error::LedgerError;
-use approval_ledger::types::RuleScope;
+use approval_ledger::types::{ApprovalStatus, Origin, RuleScope};
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, refs, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -83,20 +83,165 @@ impl RememberScopeArg {
     }
 }
 
+/// `--origin <origin>` on `list` — a `ValueEnum` so a typo fails at parse
+/// time with clap's own "possible values are..." message rather than
+/// coming back as a silently empty result. Values match `approvals.origin`'s
+/// own `CHECK`-constrained strings (`schema.rs` in `approval-ledger`)
+/// exactly — `shell_gate`/`kj_verb`, not clap's default kebab-case.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum OriginArg {
+    /// A hook's `ask` action fired.
+    Hook,
+    /// The shell tool gated a command before executing it.
+    ShellGate,
+    /// A privileged `kj` verb gated itself.
+    KjVerb,
+}
+
+impl OriginArg {
+    fn to_ledger(self) -> Origin {
+        match self {
+            Self::Hook => Origin::Hook,
+            Self::ShellGate => Origin::ShellGate,
+            Self::KjVerb => Origin::KjVerb,
+        }
+    }
+}
+
+/// `--status <status>` on `list` — same ValueEnum-for-typos reasoning as
+/// `OriginArg`. A terminal value (`allowed`/`denied`/`expired`/
+/// `abandoned`) switches the listing to decided asks by itself; `pending`/
+/// `claimed` stay in the live queue. See `ledger_list`'s doc for exactly
+/// how this composes with `--history`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum StatusArg {
+    Pending,
+    Claimed,
+    Allowed,
+    Denied,
+    Expired,
+    Abandoned,
+}
+
+impl StatusArg {
+    fn to_ledger(self) -> ApprovalStatus {
+        match self {
+            Self::Pending => ApprovalStatus::Pending,
+            Self::Claimed => ApprovalStatus::Claimed,
+            Self::Allowed => ApprovalStatus::Allowed,
+            Self::Denied => ApprovalStatus::Denied,
+            Self::Expired => ApprovalStatus::Expired,
+            Self::Abandoned => ApprovalStatus::Abandoned,
+        }
+    }
+}
+
+/// `--verb <verb>` on `runs` — validated against
+/// [`super::lifecycle::RC_VERBS`] instead of its own duplicate `ValueEnum`.
+/// That list is already documented as "the single source of truth" for
+/// which verbs the scheduler fires; a second, hand-maintained enum here
+/// would be exactly the drift hazard its own doc comment warns about. Still
+/// fails at clap parse time with a "possible values" style message — just
+/// sourced from the one place that's allowed to define the set.
+fn parse_verb_arg(s: &str) -> Result<String, String> {
+    if super::lifecycle::RC_VERBS.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "invalid value '{s}' for '--verb': possible values are: {}",
+            super::lifecycle::RC_VERBS.join(", ")
+        ))
+    }
+}
+
+/// Parse `--since <duration>` — `30m`, `2h`, `7d`. One integer immediately
+/// followed by exactly one unit letter; no absolute timestamps, no
+/// fractional numbers, no combined units (Amy's ruling: one format, no
+/// ambiguity). Garbage is rejected loudly — CLAUDE.md's stance against
+/// silent fallbacks applies just as much to a mistyped flag as to
+/// anything else; `--since 5x` must be an error, never "no filter".
+fn parse_since_duration_ms(s: &str) -> Result<i64, String> {
+    let bad = || {
+        format!(
+            "kj ledger: invalid --since {s:?} — use an integer followed by m/h/d, e.g. 30m, 2h, 7d"
+        )
+    };
+    if s.is_empty() {
+        return Err(bad());
+    }
+    let unit = s.chars().next_back().expect("checked non-empty above");
+    let digits = &s[..s.len() - unit.len_utf8()];
+    let n: i64 = digits.parse().map_err(|_| bad())?;
+    if n <= 0 {
+        return Err(bad());
+    }
+    let per_unit_ms: i64 = match unit {
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
+        _ => return Err(bad()),
+    };
+    n.checked_mul(per_unit_ms).ok_or_else(bad)
+}
+
+/// Resolve a `--since` duration (in ms) against the current wall clock
+/// into an absolute epoch-ms cutoff — `created_at`/`started_at` at or
+/// after this value is "within the window".
+fn since_cutoff_ms(duration_ms: i64) -> i64 {
+    kaijutsu_types::now_millis() as i64 - duration_ms
+}
+
+/// The "showing N of TOTAL" line every `kj ledger` listing prints when
+/// `--limit` cut real rows off the end — Amy's ruling: a silently
+/// truncated list is the quiet fallback CLAUDE.md treats as a defect, so
+/// the line only appears when something was actually cut (`None`
+/// otherwise; an untruncated listing stays uncluttered). `extra_flags` is
+/// the command-specific narrowing flags beyond `--since`/`--limit` to
+/// mention (asks have `--origin`/`--status`; runs have `--context`/
+/// `--verb`; rules have neither).
+fn truncation_notice(shown: usize, total: i64, extra_flags: &str) -> Option<String> {
+    if (shown as i64) < total {
+        Some(format!(
+            "showing {shown} of {total} — raise with --limit, or narrow with --since{extra_flags}"
+        ))
+    } else {
+        None
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum LedgerCommand {
-    /// List asks. By default shows the live queue — asks still `pending`
-    /// or `claimed`. With `--history`, shows decided asks instead —
-    /// `allowed`, `denied`, `expired`, or `abandoned` — most recently
-    /// created first, capped at `--limit` (default 20).
+    /// List asks. By default, shows the live pending queue, oldest first
+    /// (the order you drain a work queue in), capped at `--limit` (default
+    /// 20) — `claimed` asks are deliberately excluded: an answerer is
+    /// already working them, and listing them invites a second answerer to
+    /// step on that claim (see `--status claimed` to see them anyway).
+    /// `--history` shows decided asks instead — `allowed`, `denied`,
+    /// `expired`, or `abandoned` — most recently created first.
+    /// `--since`/`--origin`/`--status` narrow either listing; a decided
+    /// `--status` value (e.g. `allowed`) switches to the history view by
+    /// itself, so `--history` never needs to be passed alongside it.
     List {
         /// Show decided asks instead of the pending/claimed queue.
         #[arg(long)]
         history: bool,
-        /// Maximum decided asks to return with --history. Ignored
-        /// without --history. Default 20.
+        /// Newest N rows (oldest N for the pending queue). Default 20.
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Only asks created within this long of now: an integer plus
+        /// m/h/d, e.g. 30m, 2h, 7d. No absolute timestamps.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only asks from this origin.
+        #[arg(long)]
+        origin: Option<OriginArg>,
+        /// Only asks in this status. A decided value (allowed/denied/
+        /// expired/abandoned) shows history without needing --history too;
+        /// `claimed` shows the in-flight queue the default hides.
+        #[arg(long)]
+        status: Option<StatusArg>,
     },
     /// Show one ask in full, including the statement being authorized.
     /// Works for a decided ask as well as a pending one.
@@ -129,8 +274,17 @@ enum LedgerCommand {
         #[arg(long)]
         remember: Option<RememberScopeArg>,
     },
-    /// List active (not-yet-forgotten) standing rules.
-    Rules,
+    /// List active (not-yet-forgotten) standing rules, most recently
+    /// created first, capped at `--limit` (default 20).
+    Rules {
+        /// Newest N rules. Default 20.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Only rules created within this long of now: an integer plus
+        /// m/h/d, e.g. 30m, 2h, 7d. No absolute timestamps.
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Forget a standing rule so its statement escalates to a human again.
     Forget {
         /// The rule to forget. Rule ids come from `kj ledger rules`.
@@ -138,12 +292,27 @@ enum LedgerCommand {
     },
     // A bare positional rather than a `--run` flag, to match `Show`'s shape:
     // the same list-vs-show split as the ask verbs, applied to the run log.
-    /// List rc lifecycle runs, most recent first — the durable record of
-    /// whether a context's rc scripts actually ran.
+    /// List rc lifecycle runs, most recent first, capped at `--limit`
+    /// (default 20) — the durable record of whether a context's rc
+    /// scripts actually ran.
     Runs {
         /// Show this run's per-script detail instead of the run listing.
         /// Run ids come from `kj ledger runs`. Lists all runs when omitted.
         run_id: Option<String>,
+        /// Newest N runs. Default 20.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Only runs started within this long of now: an integer plus
+        /// m/h/d, e.g. 30m, 2h, 7d. No absolute timestamps.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only runs for this context. Accepts `.` (current), a label, or
+        /// a hex id prefix — same resolution `kj context` commands use.
+        #[arg(long)]
+        context: Option<String>,
+        /// Only runs for this rc lifecycle verb (create, fork, ...).
+        #[arg(long, value_parser = parse_verb_arg)]
+        verb: Option<String>,
     },
 }
 
@@ -166,7 +335,9 @@ impl KjDispatcher {
             }
         };
         match parsed.command {
-            LedgerCommand::List { history, limit } => self.ledger_list(history, limit),
+            LedgerCommand::List { history, limit, since, origin, status } => {
+                self.ledger_list(history, limit, since.as_deref(), origin, status)
+            }
             LedgerCommand::Show { request_id } => self.ledger_show(&request_id),
             LedgerCommand::Allow { request_id, remember } => {
                 self.ledger_decide(&request_id, true, caller, remember)
@@ -174,41 +345,89 @@ impl KjDispatcher {
             LedgerCommand::Deny { request_id, remember } => {
                 self.ledger_decide(&request_id, false, caller, remember)
             }
-            LedgerCommand::Rules => self.ledger_rules(),
+            LedgerCommand::Rules { limit, since } => self.ledger_rules(limit, since.as_deref()),
             LedgerCommand::Forget { rule_id } => self.ledger_forget(&rule_id),
-            LedgerCommand::Runs { run_id } => match run_id {
+            LedgerCommand::Runs { run_id, limit, since, context, verb } => match run_id {
                 Some(id) => self.ledger_run_show(&id),
-                None => self.ledger_runs_list(),
+                None => self.ledger_runs_list(caller, limit, since.as_deref(), context.as_deref(), verb.as_deref()),
             },
         }
     }
 
-    /// `kj ledger list` / `kj ledger list --history`. `history` selects
-    /// which of `approval_ledger::ask`'s two partitioning queries runs —
-    /// `list_pending` (the live queue) or `list_history` (decided asks,
-    /// bounded by `limit`) — the rendering below is shared because both
-    /// return the same `ApprovalRow` shape.
-    fn ledger_list(&self, history: bool, limit: u32) -> KjResult {
-        let rows = {
+    /// `kj ledger list`. `--status` fully determines both which single
+    /// status is queried AND the listing's mode: a status is queue-style
+    /// (oldest first, the order you drain a work queue in) unless it's
+    /// terminal, in which case it's history-style (newest first) — its own
+    /// terminality decides that, so `--status allowed` alone switches to
+    /// history and `--status claimed` alone stays queue-style, and
+    /// `--history` never needs to be passed alongside either (Amy's
+    /// ruling: "`--status allowed` clearly implies history; make that
+    /// work sensibly rather than making the user pass both"). Without
+    /// `--status`, the bare `--history` flag picks between the two modes
+    /// this command has always had: the default pending-only queue, or
+    /// the four-terminal-status history view.
+    fn ledger_list(
+        &self,
+        history: bool,
+        limit: u32,
+        since: Option<&str>,
+        origin: Option<OriginArg>,
+        status: Option<StatusArg>,
+    ) -> KjResult {
+        let since_ms = match since {
+            Some(s) => match parse_since_duration_ms(s) {
+                Ok(ms) => Some(since_cutoff_ms(ms)),
+                Err(e) => return KjResult::Err(e),
+            },
+            None => None,
+        };
+
+        let (statuses, newest_first, is_default_pending) = match status {
+            Some(s) => {
+                let ledger_status = s.to_ledger();
+                (vec![ledger_status], ledger_status.is_terminal(), false)
+            }
+            None if history => (
+                vec![
+                    ApprovalStatus::Allowed,
+                    ApprovalStatus::Denied,
+                    ApprovalStatus::Expired,
+                    ApprovalStatus::Abandoned,
+                ],
+                true,
+                false,
+            ),
+            None => (vec![ApprovalStatus::Pending], false, true),
+        };
+
+        let filter = approval_ledger::ask::AskListFilter {
+            statuses,
+            origin: origin.map(OriginArg::to_ledger),
+            since_ms,
+            limit: limit as i64,
+            newest_first,
+        };
+        let (rows, total) = {
             let db = self.kernel_db.lock();
-            let conn = db.conn_for_ledger();
-            let result = if history {
-                approval_ledger::ask::list_history(conn, limit as i64)
-            } else {
-                approval_ledger::ask::list_pending(conn)
-            };
-            match result {
-                Ok(rows) => rows,
+            match approval_ledger::ask::list_asks_filtered(db.conn_for_ledger(), &filter) {
+                Ok(r) => r,
                 Err(e) => return KjResult::Err(format!("kj ledger list: {e}")),
             }
         };
+
         let data = serde_json::Value::Array(
             rows.iter()
                 .map(|r| serde_json::json!(r.request_id.clone()))
                 .collect(),
         );
         if rows.is_empty() {
-            let msg = if history { "(no decided asks)" } else { "(no pending approvals)" };
+            let msg = if is_default_pending {
+                "(no pending approvals)"
+            } else if newest_first {
+                "(no decided asks)"
+            } else {
+                "(no matching asks)"
+            };
             return KjResult::ok_with_data(msg.to_string(), data);
         }
         let mut lines = vec![format!(
@@ -225,7 +444,11 @@ impl KjDispatcher {
             ));
         }
         lines.push(String::new());
-        if history {
+        if let Some(notice) = truncation_notice(rows.len(), total, "/--origin/--status") {
+            lines.push(notice);
+            lines.push(String::new());
+        }
+        if newest_first {
             lines.push("see full detail with: kj ledger show <request-id>".into());
         } else {
             lines.push("answer with: kj ledger allow <request-id>  |  kj ledger deny <request-id>".into());
@@ -421,11 +644,20 @@ impl KjDispatcher {
         result
     }
 
-    fn ledger_rules(&self) -> KjResult {
-        let rows = {
+    /// `kj ledger rules --limit/--since`, most recently created first.
+    fn ledger_rules(&self, limit: u32, since: Option<&str>) -> KjResult {
+        let since_ms = match since {
+            Some(s) => match parse_since_duration_ms(s) {
+                Ok(ms) => Some(since_cutoff_ms(ms)),
+                Err(e) => return KjResult::Err(e),
+            },
+            None => None,
+        };
+        let filter = approval_ledger::rules::RuleListFilter { since_ms, limit: limit as i64 };
+        let (rows, total) = {
             let db = self.kernel_db.lock();
-            match approval_ledger::rules::list_rules(db.conn_for_ledger()) {
-                Ok(rows) => rows,
+            match approval_ledger::rules::list_rules_filtered(db.conn_for_ledger(), &filter) {
+                Ok(r) => r,
                 Err(e) => return KjResult::Err(format!("kj ledger rules: {e}")),
             }
         };
@@ -449,6 +681,10 @@ impl KjDispatcher {
             ));
         }
         lines.push(String::new());
+        if let Some(notice) = truncation_notice(rows.len(), total, "") {
+            lines.push(notice);
+            lines.push(String::new());
+        }
         lines.push("forget with: kj ledger forget <rule-id>".into());
         KjResult::ok_with_data(lines.join("\n"), data)
     }
@@ -474,14 +710,46 @@ impl KjDispatcher {
         result
     }
 
-    /// `kj ledger runs` — the rc lifecycle run log, newest first. `.data`
-    /// stays a flat array of run-id strings per the kj list-command
-    /// convention (`ledger_list`/`ledger_rules` do the same).
-    fn ledger_runs_list(&self) -> KjResult {
-        let rows = {
+    /// `kj ledger runs --limit/--since/--context/--verb` — the rc
+    /// lifecycle run log, newest first. `.data` stays a flat array of
+    /// run-id strings per the kj list-command convention (`ledger_list`/
+    /// `ledger_rules` do the same). `--context` accepts `.`/label/hex
+    /// prefix through the same resolver `kj context` commands use
+    /// ([`refs::resolve_context_ref`]) rather than requiring a caller to
+    /// type a full id.
+    fn ledger_runs_list(
+        &self,
+        caller: &KjCaller,
+        limit: u32,
+        since: Option<&str>,
+        context: Option<&str>,
+        verb: Option<&str>,
+    ) -> KjResult {
+        let since_ms = match since {
+            Some(s) => match parse_since_duration_ms(s) {
+                Ok(ms) => Some(since_cutoff_ms(ms)),
+                Err(e) => return KjResult::Err(e),
+            },
+            None => None,
+        };
+
+        let (rows, total) = {
             let db = self.kernel_db.lock();
-            match approval_ledger::rc_runs::list_runs(db.conn_for_ledger()) {
-                Ok(rows) => rows,
+            let context_id = match context {
+                Some(c) => match refs::resolve_context_ref(&refs::parse_context_ref(c), caller, &db) {
+                    Ok(id) => Some(id),
+                    Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
+                },
+                None => None,
+            };
+            let filter = approval_ledger::rc_runs::RunListFilter {
+                context_id: context_id.map(|c| c.as_bytes().to_vec()),
+                verb: verb.map(|v| v.to_string()),
+                since_ms,
+                limit: limit as i64,
+            };
+            match approval_ledger::rc_runs::list_runs_filtered(db.conn_for_ledger(), &filter) {
+                Ok(r) => r,
                 Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
             }
         };
@@ -509,6 +777,10 @@ impl KjDispatcher {
             ));
         }
         lines.push(String::new());
+        if let Some(notice) = truncation_notice(rows.len(), total, "/--context/--verb") {
+            lines.push(notice);
+            lines.push(String::new());
+        }
         lines.push("see one run's scripts with: kj ledger runs <run-id>".into());
         KjResult::ok_with_data(lines.join("\n"), data)
     }
@@ -1365,6 +1637,433 @@ mod tests {
         let result = d.dispatch(&[s("ledger"), s("runs"), s("no-such-run")], &c).await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such run"), "{}", result.message());
+    }
+
+    // ── `--limit`/`--since`/`--origin`/`--status`/`--context`/`--verb` ──
+    //
+    // Amy's ruling: cap the pending queue too (default 20), and say so
+    // loudly when rows are cut. These tests seed rows DIRECTLY through
+    // `approval_ledger`'s own write API (bypassing `run_gate`/kaish
+    // entirely) so a 25-row queue doesn't mean 25 real gate round trips —
+    // this is a CLI listing test, not another exercise of the gate.
+
+    /// Insert `n` pending asks with caller-controlled, strictly increasing
+    /// `created_at` timestamps (`start_ms`, `start_ms + step_ms`, ...) —
+    /// not the DB's own-clock default, which can't be trusted to give
+    /// distinct milliseconds across a tight loop. Deterministic ordering
+    /// is the whole point: `--since`/`--limit`/newest-vs-oldest-first
+    /// assertions need to know exactly which id is "older".
+    fn seed_pending_asks(
+        conn: &rusqlite::Connection,
+        ctx: ContextId,
+        principal: kaijutsu_types::PrincipalId,
+        origin: approval_ledger::types::Origin,
+        label: &str,
+        n: usize,
+        start_ms: i64,
+        step_ms: i64,
+    ) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let ask = approval_ledger::types::NewAsk {
+                    context_id: ctx.as_bytes().to_vec(),
+                    principal_id: principal.as_bytes().to_vec(),
+                    origin,
+                    instance: None,
+                    tool: None,
+                    hook_id: None,
+                    description: format!("{label} {i}"),
+                    statements: vec![],
+                    authorized_label: None,
+                    rc_run_id: None,
+                    expires_at: None,
+                    options: vec![],
+                    signals: vec![],
+                };
+                let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
+                conn.execute(
+                    "UPDATE approvals SET created_at = ?1 WHERE request_id = ?2",
+                    rusqlite::params![start_ms + (i as i64) * step_ms, request_id],
+                )
+                .unwrap();
+                request_id
+            })
+            .collect()
+    }
+
+    fn data_ids(result: &KjResult) -> Vec<String> {
+        match result {
+            KjResult::Ok { data: Some(v), .. } => v
+                .as_array()
+                .expect(".data must be an array")
+                .iter()
+                .map(|x| x.as_str().expect("array of id strings").to_string())
+                .collect(),
+            other => panic!("expected structured .data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ledger_list_default_limit_caps_the_pending_queue_and_says_so() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let ctx = c.context_id.expect("test caller has a context");
+        {
+            let db = d.kernel_db.lock();
+            seed_pending_asks(
+                db.conn_for_ledger(),
+                ctx,
+                c.principal_id,
+                approval_ledger::types::Origin::ShellGate,
+                "ask",
+                25,
+                1_000,
+                10,
+            );
+        }
+
+        let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(data_ids(&result).len(), 20, "default limit must cap the pending queue at 20");
+        assert!(
+            result.message().contains("showing 20 of 25"),
+            "a truncated listing must say so loudly, per Amy's ruling: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_list_no_truncation_notice_when_nothing_is_cut() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let ctx = c.context_id.expect("test caller has a context");
+        {
+            let db = d.kernel_db.lock();
+            seed_pending_asks(
+                db.conn_for_ledger(),
+                ctx,
+                c.principal_id,
+                approval_ledger::types::Origin::ShellGate,
+                "ask",
+                3,
+                1_000,
+                10,
+            );
+        }
+
+        let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(data_ids(&result).len(), 3);
+        assert!(
+            !result.message().to_lowercase().contains("showing"),
+            "no truncation notice belongs on an untruncated listing: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_list_limit_flag_narrows_the_pending_queue() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let ctx = c.context_id.expect("test caller has a context");
+        {
+            let db = d.kernel_db.lock();
+            seed_pending_asks(
+                db.conn_for_ledger(),
+                ctx,
+                c.principal_id,
+                approval_ledger::types::Origin::ShellGate,
+                "ask",
+                5,
+                1_000,
+                10,
+            );
+        }
+
+        let result = d.dispatch(&[s("ledger"), s("list"), s("--limit"), s("2")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(data_ids(&result).len(), 2);
+        assert!(result.message().contains("showing 2 of 5"), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn ledger_list_since_excludes_older_asks() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let ctx = c.context_id.expect("test caller has a context");
+        let now = kaijutsu_types::now_millis() as i64;
+        let (old_ids, new_ids) = {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let old = seed_pending_asks(
+                conn,
+                ctx,
+                c.principal_id,
+                approval_ledger::types::Origin::ShellGate,
+                "old",
+                2,
+                now - 5 * 3_600_000, // 5 hours ago
+                1,
+            );
+            let new = seed_pending_asks(
+                conn,
+                ctx,
+                c.principal_id,
+                approval_ledger::types::Origin::ShellGate,
+                "new",
+                1,
+                now - 60_000, // 1 minute ago
+                1,
+            );
+            (old, new)
+        };
+
+        let result = d.dispatch(&[s("ledger"), s("list"), s("--since"), s("30m")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        let ids = data_ids(&result);
+        assert_eq!(ids, new_ids, "--since 30m must keep only the row inside the window");
+        for old in &old_ids {
+            assert!(!ids.contains(old), "an older row leaked through --since: {ids:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ledger_list_bad_since_errors_loudly_instead_of_silently_matching_everything() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("list"), s("--since"), s("5x")], &c).await;
+        assert!(!result.is_ok(), "garbage --since must be refused, not treated as \"no filter\"");
+        assert!(result.message().contains("--since"), "{}", result.message());
+        // Must be refused as a bad DURATION, not as an unrecognized flag —
+        // otherwise this assertion would pass today for the wrong reason
+        // (clap's own "unexpected argument '--since'" also contains the
+        // substring "--since").
+        assert!(
+            !result.message().contains("unexpected argument"),
+            "must be a duration-format error, not clap not recognizing --since at all: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_list_origin_filter_narrows_to_the_requested_origin() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let ctx = c.context_id.expect("test caller has a context");
+        let (hook_ids, shell_ids) = {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let hook = seed_pending_asks(conn, ctx, c.principal_id, approval_ledger::types::Origin::Hook, "hook", 2, 1_000, 10);
+            let shell =
+                seed_pending_asks(conn, ctx, c.principal_id, approval_ledger::types::Origin::ShellGate, "shell", 1, 2_000, 10);
+            (hook, shell)
+        };
+
+        let result = d.dispatch(&[s("ledger"), s("list"), s("--origin"), s("hook")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        let ids = data_ids(&result);
+        for h in &hook_ids {
+            assert!(ids.contains(h), "{ids:?}");
+        }
+        for sg in &shell_ids {
+            assert!(!ids.contains(sg), "--origin hook must exclude shell_gate rows: {ids:?}");
+        }
+    }
+
+    /// `--status <bad-value>` must fail at clap parse time naming the valid
+    /// choices, same guarantee `--remember` already gets.
+    #[tokio::test]
+    async fn ledger_list_invalid_status_fails_at_parse_time() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("list"), s("--status"), s("bogus")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("pending") && result.message().contains("allowed"), "{}", result.message());
+    }
+
+    /// Amy's ruling: `--status allowed` alone (no `--history`) must show
+    /// allowed asks — the user should never have to pass both.
+    #[tokio::test]
+    async fn ledger_list_status_allowed_implies_history_without_the_flag() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await });
+        let request_id = wait_for_pending(&d).await;
+        let allow = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c).await;
+        assert!(allow.is_ok(), "{allow:?}");
+        let _ = gate.await;
+
+        let result = d.dispatch(&[s("ledger"), s("list"), s("--status"), s("allowed")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            data_ids(&result).contains(&request_id),
+            "--status allowed alone must show the allowed ask without --history"
+        );
+
+        let pending = d.dispatch(&[s("ledger"), s("list")], &c).await;
+        assert!(
+            !data_ids(&pending).contains(&request_id),
+            "a decided ask must not also show in the default pending queue"
+        );
+    }
+
+    /// `kj ledger list`'s default excludes `claimed` on purpose (an
+    /// answerer is already working it) — but `--status claimed` must still
+    /// let someone see it deliberately.
+    #[tokio::test]
+    async fn ledger_list_status_claimed_shows_rows_hidden_by_default() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await });
+        let request_id = wait_for_pending(&d).await;
+        {
+            let db = d.kernel_db.lock();
+            approval_ledger::claim::claim(db.conn_for_ledger(), &request_id, c.principal_id.as_bytes()).unwrap();
+        }
+
+        let default_list = d.dispatch(&[s("ledger"), s("list")], &c).await;
+        assert!(
+            !data_ids(&default_list).contains(&request_id),
+            "claimed rows stay out of the default queue — an answerer already owns it"
+        );
+
+        let claimed_list = d.dispatch(&[s("ledger"), s("list"), s("--status"), s("claimed")], &c).await;
+        assert!(claimed_list.is_ok(), "{claimed_list:?}");
+        assert!(
+            data_ids(&claimed_list).contains(&request_id),
+            "--status claimed must surface it deliberately"
+        );
+
+        let _ = d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c).await;
+        let _ = gate.await;
+    }
+
+    #[tokio::test]
+    async fn ledger_rules_limit_and_since_cap_and_report_truncation() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let ctx = c.context_id.expect("test caller has a context");
+        let mut rule_ids = Vec::new();
+        {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            for i in 0..3 {
+                let ask = approval_ledger::types::NewAsk {
+                    context_id: ctx.as_bytes().to_vec(),
+                    principal_id: c.principal_id.as_bytes().to_vec(),
+                    origin: approval_ledger::types::Origin::ShellGate,
+                    instance: None,
+                    tool: None,
+                    hook_id: None,
+                    description: format!("rule-ask-{i}"),
+                    statements: vec![approval_ledger::types::NewPlanStatement {
+                        statement_digest: format!("digest-{i}"),
+                        rendered: format!("echo {i}"),
+                        statement_kind: "command".into(),
+                        commands: vec![],
+                        vars: vec![],
+                    }],
+                    authorized_label: Some(format!("label-{i}")),
+                    rc_run_id: None,
+                    expires_at: None,
+                    options: vec![],
+                    signals: vec![],
+                };
+                let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
+                approval_ledger::decide::decide(
+                    conn,
+                    &request_id,
+                    approval_ledger::decide::DecideInput { allow: true, ..Default::default() },
+                )
+                .unwrap();
+                let rule = approval_ledger::rules::learn_from_approval(
+                    conn,
+                    &request_id,
+                    0,
+                    approval_ledger::types::RuleScope::Always,
+                    true,
+                    None,
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE approval_rules SET created_at = ?1 WHERE rule_id = ?2",
+                    rusqlite::params![1_000 + i as i64 * 10, rule.rule_id],
+                )
+                .unwrap();
+                rule_ids.push(rule.rule_id);
+            }
+        }
+
+        let result = d.dispatch(&[s("ledger"), s("rules"), s("--limit"), s("2")], &c).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(data_ids(&result).len(), 2);
+        assert!(result.message().contains("showing 2 of 3"), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn ledger_runs_context_and_verb_filters_narrow_and_limit_truncates() {
+        let d = test_dispatcher().await;
+        let ctx_a = crate::kj::test_helpers::register_context(&d, Some("runs-ctx-a"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_b = crate::kj::test_helpers::register_context(&d, Some("runs-ctx-b"), None, kaijutsu_types::PrincipalId::new());
+        let c = crate::kj::test_helpers::caller_with_context(ctx_a);
+
+        let (run_a1, run_a2, run_b1) = {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let run_a1 = approval_ledger::rc_runs::start_run(conn, ctx_a.as_bytes(), "coder", "create").unwrap();
+            conn.execute("UPDATE rc_runs SET started_at = ?1 WHERE run_id = ?2", rusqlite::params![1_000, run_a1])
+                .unwrap();
+            let run_a2 = approval_ledger::rc_runs::start_run(conn, ctx_a.as_bytes(), "coder", "fork").unwrap();
+            conn.execute("UPDATE rc_runs SET started_at = ?1 WHERE run_id = ?2", rusqlite::params![2_000, run_a2])
+                .unwrap();
+            let run_b1 = approval_ledger::rc_runs::start_run(conn, ctx_b.as_bytes(), "coder", "create").unwrap();
+            conn.execute("UPDATE rc_runs SET started_at = ?1 WHERE run_id = ?2", rusqlite::params![3_000, run_b1])
+                .unwrap();
+            (run_a1, run_a2, run_b1)
+        };
+
+        let by_context = d.dispatch(&[s("ledger"), s("runs"), s("--context"), s(&ctx_a.to_string())], &c).await;
+        assert!(by_context.is_ok(), "{by_context:?}");
+        let ids = data_ids(&by_context);
+        assert!(ids.contains(&run_a1) && ids.contains(&run_a2), "{ids:?}");
+        assert!(!ids.contains(&run_b1), "--context must exclude the other context's run: {ids:?}");
+
+        let by_verb = d.dispatch(&[s("ledger"), s("runs"), s("--verb"), s("fork")], &c).await;
+        assert!(by_verb.is_ok(), "{by_verb:?}");
+        assert_eq!(data_ids(&by_verb), vec![run_a2.clone()], "--verb fork must narrow to just the fork run");
+
+        let limited = d.dispatch(&[s("ledger"), s("runs"), s("--limit"), s("1")], &c).await;
+        assert!(limited.is_ok(), "{limited:?}");
+        assert!(limited.message().contains("showing 1 of 3"), "{}", limited.message());
+
+        let bad_verb = d.dispatch(&[s("ledger"), s("runs"), s("--verb"), s("nonsense")], &c).await;
+        assert!(!bad_verb.is_ok(), "an unwired verb must be refused at parse time, not silently accepted");
+    }
+
+    /// AGENTS.md "Writing style" → "Published text": help is a product
+    /// surface. The old wording claimed the default queue shows asks
+    /// still "`pending` or `claimed`" — the query is `status = 'pending'`
+    /// only (`ask.rs`'s `list_pending` doc explains why: a claimed ask
+    /// already has an answerer working it). This pins the fix.
+    #[test]
+    fn published_list_help_does_not_claim_claimed_asks_show_by_default() {
+        use clap::CommandFactory;
+        let cmd = LedgerArgs::command();
+        let list_sub = cmd.find_subcommand("list").expect("list subcommand exists");
+        let about = list_sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+        assert!(
+            !about.to_lowercase().contains("or `claimed`") && !about.to_lowercase().contains("or claimed"),
+            "the default queue does not include claimed asks; help must not claim it does: {about}"
+        );
+        assert!(about.contains("pending"), "{about}");
     }
 
     mod dispatch_wiring {

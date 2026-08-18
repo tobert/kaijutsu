@@ -295,6 +295,82 @@ pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
     Ok(rows)
 }
 
+/// Filter + page for [`list_asks_filtered`] — the CLI's `kj ledger list`
+/// (`--limit`/`--since`/`--origin`/`--status`). `list_pending`/
+/// `list_history` above are UNCHANGED and stay unfiltered/fixed-order —
+/// the gate's polling loop and MCP's ask surfacing call those directly
+/// and this struct exists so the CLI's new flags never have to reach
+/// through those signatures.
+#[derive(Debug, Clone)]
+pub struct AskListFilter {
+    /// `status IN (...)`. Never empty in practice — every caller passes
+    /// at least one status; an empty list here would mean "no status
+    /// filter at all", which no `kj ledger list` mode wants.
+    pub statuses: Vec<crate::types::ApprovalStatus>,
+    pub origin: Option<crate::types::Origin>,
+    /// `created_at >= since_ms`, if set. An absolute epoch-ms cutoff —
+    /// this crate never reads the wall clock for a filter (the one place
+    /// it reads the clock at all is `time.rs`'s `now_millis`, and that's
+    /// for values THIS crate writes, not a query bound); the caller
+    /// resolves `--since <duration>` against "now" before calling in.
+    pub since_ms: Option<i64>,
+    pub limit: i64,
+    /// `ORDER BY created_at DESC` when true (history-style, newest
+    /// first), `ASC` when false (queue-style, oldest first — the order
+    /// you drain a work queue in).
+    pub newest_first: bool,
+}
+
+/// Run `filter` against `approvals` and return the page of rows plus the
+/// COUNT of every row that matched before `LIMIT` was applied. The count
+/// is what `kj ledger list` needs to say "showing N of TOTAL" whenever a
+/// listing was cut — Amy's ruling: a silently truncated list is exactly
+/// the quiet fallback CLAUDE.md treats as a defect, so the caller must be
+/// able to tell "there were more rows" from "that's everything" without a
+/// second query.
+pub fn list_asks_filtered(conn: &Connection, filter: &AskListFilter) -> Result<(Vec<ApprovalRow>, i64)> {
+    use rusqlite::types::Value;
+
+    let mut where_sql = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if !filter.statuses.is_empty() {
+        let placeholders = filter.statuses.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        where_sql.push(format!("status IN ({placeholders})"));
+        params.extend(filter.statuses.iter().map(|s| Value::Text(s.as_str().to_string())));
+    }
+    if let Some(origin) = filter.origin {
+        where_sql.push("origin = ?".to_string());
+        params.push(Value::Text(origin.as_str().to_string()));
+    }
+    if let Some(since_ms) = filter.since_ms {
+        where_sql.push("created_at >= ?".to_string());
+        params.push(Value::Integer(since_ms));
+    }
+    let where_clause =
+        if where_sql.is_empty() { String::new() } else { format!("WHERE {}", where_sql.join(" AND ")) };
+
+    let count_sql = format!("SELECT COUNT(*) FROM approvals {where_clause}");
+    let total: i64 =
+        conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
+
+    let order = if filter.newest_first { "DESC" } else { "ASC" };
+    let select_sql = format!(
+        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+                description, authorized_label, rc_run_id, status, created_at,
+                expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
+                remember_scope, auto_reason
+         FROM approvals {where_clause} ORDER BY created_at {order} LIMIT ?"
+    );
+    let mut select_params = params;
+    select_params.push(Value::Integer(filter.limit));
+    let mut stmt = conn.prepare(&select_sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(select_params.into_iter()), row_to_approval)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
 /// The choices offered on this ask, in presentation order.
 pub fn list_options(conn: &Connection, request_id: &str) -> Result<Vec<OptionRow>> {
     let mut stmt = conn.prepare(
@@ -745,5 +821,134 @@ mod tests {
 
         let all = list_history(&conn, 10).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    // ── `list_asks_filtered` (kj ledger list --limit/--since/--origin/--status) ──
+
+    fn set_created_at(conn: &Connection, request_id: &str, ms: i64) {
+        conn.execute(
+            "UPDATE approvals SET created_at = ?1 WHERE request_id = ?2",
+            params![ms, request_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_asks_filtered_limit_caps_rows_and_reports_the_true_total() {
+        let conn = open_memory();
+        for _ in 0..5 {
+            create_ask(&conn, &minimal_ask()).unwrap();
+        }
+        let filter = AskListFilter {
+            statuses: vec![ApprovalStatus::Pending],
+            origin: None,
+            since_ms: None,
+            limit: 2,
+            newest_first: false,
+        };
+        let (rows, total) = list_asks_filtered(&conn, &filter).unwrap();
+        assert_eq!(rows.len(), 2, "limit must cap the returned page");
+        assert_eq!(total, 5, "the count must reflect every matching row, not just the page");
+    }
+
+    #[test]
+    fn list_asks_filtered_since_ms_excludes_older_rows() {
+        let conn = open_memory();
+        let old_id = create_ask(&conn, &minimal_ask()).unwrap();
+        set_created_at(&conn, &old_id, 1_000);
+        let new_id = create_ask(&conn, &minimal_ask()).unwrap();
+        set_created_at(&conn, &new_id, 10_000);
+
+        let filter = AskListFilter {
+            statuses: vec![ApprovalStatus::Pending],
+            origin: None,
+            since_ms: Some(5_000),
+            limit: 20,
+            newest_first: false,
+        };
+        let (rows, total) = list_asks_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1, "the older row must not count toward the total either");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, new_id, "only the row at/after the cutoff must appear");
+    }
+
+    #[test]
+    fn list_asks_filtered_origin_narrows_to_the_requested_origin() {
+        let conn = open_memory();
+        let mut hook_ask = minimal_ask();
+        hook_ask.origin = Origin::Hook;
+        let hook_id = create_ask(&conn, &hook_ask).unwrap();
+        let mut verb_ask = minimal_ask();
+        verb_ask.origin = Origin::KjVerb;
+        create_ask(&conn, &verb_ask).unwrap();
+
+        let filter = AskListFilter {
+            statuses: vec![ApprovalStatus::Pending],
+            origin: Some(Origin::Hook),
+            since_ms: None,
+            limit: 20,
+            newest_first: false,
+        };
+        let (rows, total) = list_asks_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, hook_id);
+    }
+
+    /// `kj ledger list`'s default query deliberately excludes `claimed` —
+    /// but a caller that explicitly asks for `claimed` (e.g. `--status
+    /// claimed`) must still be able to see it. This is the guarantee
+    /// `list_pending`'s doc comment carves out an exception for.
+    #[test]
+    fn list_asks_filtered_status_claimed_is_visible_when_explicitly_requested() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        crate::claim::claim(&conn, &request_id, b"claimant").unwrap();
+
+        let filter = AskListFilter {
+            statuses: vec![ApprovalStatus::Claimed],
+            origin: None,
+            since_ms: None,
+            limit: 20,
+            newest_first: false,
+        };
+        let (rows, total) = list_asks_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1, "an explicit --status claimed must find the claimed row");
+        assert_eq!(rows[0].request_id, request_id);
+
+        // And the default pending-only filter must NOT show it.
+        let pending_only = AskListFilter {
+            statuses: vec![ApprovalStatus::Pending],
+            origin: None,
+            since_ms: None,
+            limit: 20,
+            newest_first: false,
+        };
+        let (pending_rows, pending_total) = list_asks_filtered(&conn, &pending_only).unwrap();
+        assert_eq!(pending_total, 0, "a claimed row must not leak into the pending-only filter");
+        assert!(pending_rows.is_empty());
+    }
+
+    #[test]
+    fn list_asks_filtered_newest_first_toggles_order() {
+        let conn = open_memory();
+        let first = create_ask(&conn, &minimal_ask()).unwrap();
+        set_created_at(&conn, &first, 1_000);
+        let second = create_ask(&conn, &minimal_ask()).unwrap();
+        set_created_at(&conn, &second, 2_000);
+
+        let desc_filter = AskListFilter {
+            statuses: vec![ApprovalStatus::Pending],
+            origin: None,
+            since_ms: None,
+            limit: 20,
+            newest_first: true,
+        };
+        let (rows, _) = list_asks_filtered(&conn, &desc_filter).unwrap();
+        assert_eq!(rows.iter().map(|r| r.request_id.clone()).collect::<Vec<_>>(), vec![second.clone(), first.clone()]);
+
+        let asc_filter = AskListFilter { newest_first: false, ..desc_filter };
+        let (rows, _) = list_asks_filtered(&conn, &asc_filter).unwrap();
+        assert_eq!(rows.iter().map(|r| r.request_id.clone()).collect::<Vec<_>>(), vec![first, second]);
     }
 }

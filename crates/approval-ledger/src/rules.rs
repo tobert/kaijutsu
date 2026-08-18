@@ -223,6 +223,52 @@ pub fn list_rules(conn: &Connection) -> Result<Vec<RuleRow>> {
     Ok(rows)
 }
 
+/// Filter + page for [`list_rules_filtered`] — `kj ledger rules`'s
+/// `--limit`/`--since`. [`list_rules`] above stays unfiltered/unbounded
+/// (no other caller needs it capped); this struct is the CLI's own query.
+#[derive(Debug, Clone, Default)]
+pub struct RuleListFilter {
+    /// `created_at >= since_ms`, if set — an absolute epoch-ms cutoff the
+    /// caller resolves against "now" before calling in (same convention
+    /// as [`crate::ask::AskListFilter::since_ms`]).
+    pub since_ms: Option<i64>,
+    pub limit: i64,
+}
+
+/// Every active (not revoked) rule matching `filter`, most recently
+/// created first, plus the COUNT of every matching row before `LIMIT` —
+/// the number `kj ledger rules` needs to say "showing N of TOTAL" when a
+/// listing was cut (same reasoning as
+/// [`crate::ask::list_asks_filtered`]'s doc).
+pub fn list_rules_filtered(conn: &Connection, filter: &RuleListFilter) -> Result<(Vec<RuleRow>, i64)> {
+    use rusqlite::types::Value;
+
+    let mut where_sql = vec!["revoked_at IS NULL".to_string()];
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(since_ms) = filter.since_ms {
+        where_sql.push("created_at >= ?".to_string());
+        params.push(Value::Integer(since_ms));
+    }
+    let where_clause = format!("WHERE {}", where_sql.join(" AND "));
+
+    let count_sql = format!("SELECT COUNT(*) FROM approval_rules {where_clause}");
+    let total: i64 =
+        conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
+
+    let select_sql = format!(
+        "SELECT rule_id, statement_digest, authorized_label, context_id, principal_id,
+                scope, allow, created_at, created_by, learned_from, revoked_at
+         FROM approval_rules {where_clause} ORDER BY created_at DESC LIMIT ?"
+    );
+    let mut select_params = params;
+    select_params.push(Value::Integer(filter.limit));
+    let mut stmt = conn.prepare(&select_sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(select_params.into_iter()), row_to_rule)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
 fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<RuleRow> {
     let scope_raw: String = row.get(5)?;
     let allow: i64 = row.get(6)?;
@@ -504,5 +550,41 @@ mod tests {
     fn list_rules_on_an_empty_table_is_empty() {
         let conn = open_memory();
         assert!(list_rules(&conn).unwrap().is_empty());
+    }
+
+    // ── `list_rules_filtered` (kj ledger rules --limit/--since) ─────────
+
+    fn set_rule_created_at(conn: &Connection, rule_id: &str, ms: i64) {
+        conn.execute("UPDATE approval_rules SET created_at = ?1 WHERE rule_id = ?2", params![ms, rule_id]).unwrap();
+    }
+
+    #[test]
+    fn list_rules_filtered_limit_caps_rows_and_reports_the_true_total() {
+        let conn = open_memory();
+        make_rule(&conn, "d1", VarBinding::Bound, "ok", true);
+        make_rule(&conn, "d2", VarBinding::Bound, "ok", true);
+        make_rule(&conn, "d3", VarBinding::Bound, "ok", true);
+
+        let filter = RuleListFilter { limit: 1, ..Default::default() };
+        let (rows, total) = list_rules_filtered(&conn, &filter).unwrap();
+        assert_eq!(rows.len(), 1, "limit must cap the returned page");
+        assert_eq!(total, 3, "the count must reflect every matching row, not just the page");
+    }
+
+    #[test]
+    fn list_rules_filtered_since_ms_excludes_older_rules_and_revoked_rules_never_count() {
+        let conn = open_memory();
+        let old_rule = make_rule(&conn, "digest-old", VarBinding::Bound, "ok", true);
+        set_rule_created_at(&conn, &old_rule.rule_id, 1_000);
+        let new_rule = make_rule(&conn, "digest-new", VarBinding::Bound, "ok", true);
+        set_rule_created_at(&conn, &new_rule.rule_id, 10_000);
+        let revoked_rule = make_rule(&conn, "digest-revoked", VarBinding::Bound, "ok", true);
+        set_rule_created_at(&conn, &revoked_rule.rule_id, 10_000);
+        revoke(&conn, &revoked_rule.rule_id).unwrap();
+
+        let filter = RuleListFilter { since_ms: Some(5_000), limit: 20 };
+        let (rows, total) = list_rules_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1, "only the new, active rule matches");
+        assert_eq!(rows[0].rule_id, new_rule.rule_id);
     }
 }

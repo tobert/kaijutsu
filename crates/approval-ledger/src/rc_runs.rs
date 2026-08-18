@@ -54,6 +54,64 @@ pub fn list_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
     Ok(rows)
 }
 
+/// Filter + page for [`list_runs_filtered`] — `kj ledger runs`'s
+/// `--limit`/`--since`/`--context`/`--verb`. [`list_runs`] above stays
+/// unfiltered/unbounded for its existing caller (`kj rc` lifecycle
+/// bookkeeping in `kaijutsu-kernel`); this struct is the CLI's own query,
+/// kept separate so that caller's signature never has to change.
+#[derive(Debug, Clone, Default)]
+pub struct RunListFilter {
+    pub context_id: Option<Vec<u8>>,
+    pub verb: Option<String>,
+    /// `started_at >= since_ms`, if set — an absolute epoch-ms cutoff the
+    /// caller resolves against "now" before calling in (same convention
+    /// as [`crate::ask::AskListFilter::since_ms`]).
+    pub since_ms: Option<i64>,
+    pub limit: i64,
+}
+
+/// Run `filter` against `rc_runs`, newest-started first, and return the
+/// page plus the COUNT of every matching row before `LIMIT` — the number
+/// `kj ledger runs` needs to say "showing N of TOTAL" when a listing was
+/// cut (same reasoning as [`crate::ask::list_asks_filtered`]'s doc).
+pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(Vec<RcRunRow>, i64)> {
+    use rusqlite::types::Value;
+
+    let mut where_sql = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if let Some(context_id) = &filter.context_id {
+        where_sql.push("context_id = ?".to_string());
+        params.push(Value::Blob(context_id.clone()));
+    }
+    if let Some(verb) = &filter.verb {
+        where_sql.push("verb = ?".to_string());
+        params.push(Value::Text(verb.clone()));
+    }
+    if let Some(since_ms) = filter.since_ms {
+        where_sql.push("started_at >= ?".to_string());
+        params.push(Value::Integer(since_ms));
+    }
+    let where_clause =
+        if where_sql.is_empty() { String::new() } else { format!("WHERE {}", where_sql.join(" AND ")) };
+
+    let count_sql = format!("SELECT COUNT(*) FROM rc_runs {where_clause}");
+    let total: i64 =
+        conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
+
+    let select_sql = format!(
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
+         FROM rc_runs {where_clause} ORDER BY started_at DESC LIMIT ?"
+    );
+    let mut select_params = params;
+    select_params.push(Value::Integer(filter.limit));
+    let mut stmt = conn.prepare(&select_sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(select_params.into_iter()), row_to_run)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RcRunRow>> {
     conn.query_row(
         "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
@@ -291,5 +349,62 @@ mod tests {
             row.started_at,
             recorded_finished_at
         );
+    }
+
+    // ── `list_runs_filtered` (kj ledger runs --limit/--since/--context/--verb) ──
+
+    fn set_started_at(conn: &Connection, run_id: &str, ms: i64) {
+        conn.execute("UPDATE rc_runs SET started_at = ?1 WHERE run_id = ?2", params![ms, run_id]).unwrap();
+    }
+
+    #[test]
+    fn list_runs_filtered_limit_caps_rows_and_reports_the_true_total() {
+        let conn = open_memory();
+        for _ in 0..5 {
+            start_run(&conn, b"ctx", "coder", "create").unwrap();
+        }
+        let filter = RunListFilter { limit: 2, ..Default::default() };
+        let (rows, total) = list_runs_filtered(&conn, &filter).unwrap();
+        assert_eq!(rows.len(), 2, "limit must cap the returned page");
+        assert_eq!(total, 5, "the count must reflect every matching row, not just the page");
+    }
+
+    #[test]
+    fn list_runs_filtered_since_ms_excludes_older_runs() {
+        let conn = open_memory();
+        let old_run = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_started_at(&conn, &old_run, 1_000);
+        let new_run = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_started_at(&conn, &new_run, 10_000);
+
+        let filter = RunListFilter { since_ms: Some(5_000), limit: 20, ..Default::default() };
+        let (rows, total) = list_runs_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].run_id, new_run);
+    }
+
+    #[test]
+    fn list_runs_filtered_context_narrows_to_the_requested_context() {
+        let conn = open_memory();
+        let ctx_a_run = start_run(&conn, b"ctx-a", "coder", "create").unwrap();
+        start_run(&conn, b"ctx-b", "coder", "create").unwrap();
+
+        let filter =
+            RunListFilter { context_id: Some(b"ctx-a".to_vec()), limit: 20, ..Default::default() };
+        let (rows, total) = list_runs_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].run_id, ctx_a_run);
+    }
+
+    #[test]
+    fn list_runs_filtered_verb_narrows_to_the_requested_verb() {
+        let conn = open_memory();
+        let fork_run = start_run(&conn, b"ctx", "coder", "fork").unwrap();
+        start_run(&conn, b"ctx", "coder", "create").unwrap();
+
+        let filter = RunListFilter { verb: Some("fork".to_string()), limit: 20, ..Default::default() };
+        let (rows, total) = list_runs_filtered(&conn, &filter).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].run_id, fork_run);
     }
 }
