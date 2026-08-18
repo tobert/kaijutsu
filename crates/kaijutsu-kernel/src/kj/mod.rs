@@ -1553,3 +1553,111 @@ mod require_cap_outcome_tests {
         );
     }
 }
+
+/// The published-prose test: `kj` help is shipped to models, so it is checked
+/// like any other product surface.
+///
+/// AGENTS.md "Writing style", "Published text" is the rule this enforces. Every
+/// `///` on a clap struct reaches an agent through [`kj_command`] reflection,
+/// which makes an internal module path a dead end for its reader and an
+/// undocumented positional a guess. Both are cheap to introduce and invisible
+/// without a test, because nothing else reads this prose back.
+#[cfg(test)]
+mod published_prose {
+    use super::kj_command;
+
+    /// Walk every command and subcommand, yielding `(path, kind, text)` for
+    /// each piece of published prose: the command's own `about`, and each
+    /// argument's help.
+    fn published_text(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, String)>) {
+        let here = if path.is_empty() {
+            cmd.get_name().to_string()
+        } else {
+            format!("{path} {}", cmd.get_name())
+        };
+        if let Some(about) = cmd.get_about() {
+            out.push((here.clone(), "about".to_string(), about.to_string()));
+        }
+        for arg in cmd.get_arguments() {
+            if matches!(arg.get_id().as_str(), "help" | "version" | "json") {
+                continue;
+            }
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            let kind = if arg.is_positional() { "positional" } else { "flag" };
+            out.push((
+                format!("{here} <{}>", arg.get_id()),
+                kind.to_string(),
+                help,
+            ));
+        }
+        for sub in cmd.get_subcommands() {
+            published_text(sub, &here, out);
+        }
+    }
+
+    /// A Rust path (`some_crate::some_module`) in published help is
+    /// unresolvable to the agent reading it. Rationale belongs in a `//`
+    /// comment, which reflection never publishes.
+    fn looks_like_a_rust_path(text: &str) -> bool {
+        // A `kj ...` example is the one legitimate `::`-free-form exception;
+        // everything else carrying `::` is a Rust path. Type-qualified paths
+        // (`ContextRow::paused_at`) count — an earlier version of this check
+        // required a lowercase first letter and let every one of them through.
+        text.split_whitespace().any(|word| {
+            let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != ':' && c != '_');
+            w.contains("::") && !w.starts_with("kj")
+        })
+    }
+
+    #[test]
+    fn published_help_does_not_leak_internal_rust_paths() {
+        let cmd = kj_command();
+        let mut all = Vec::new();
+        published_text(&cmd, "", &mut all);
+
+        let leaks: Vec<_> = all
+            .iter()
+            .filter(|(_, _, text)| looks_like_a_rust_path(text))
+            .collect();
+
+        assert!(
+            leaks.is_empty(),
+            "published `kj` help must not name internal Rust paths — move the \
+             reference into a `//` comment (AGENTS.md \"Writing style\", \
+             \"Published text\"). Found {}:\n{}",
+            leaks.len(),
+            leaks
+                .iter()
+                .map(|(path, kind, text)| format!("  {path} ({kind}): {text}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// A required positional with no help is the opposite failure from a wordy
+    /// one, and worse: the reader cannot even guess what to pass.
+    #[test]
+    fn every_required_positional_publishes_a_description() {
+        let cmd = kj_command();
+        let mut all = Vec::new();
+        published_text(&cmd, "", &mut all);
+
+        let undocumented: Vec<_> = all
+            .iter()
+            .filter(|(_, kind, text)| kind == "positional" && text.trim().is_empty())
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "every published positional needs a description saying what to pass \
+             and where to get it (AGENTS.md \"Writing style\", \"Published \
+             text\"). Found {}:\n{}",
+            undocumented.len(),
+            undocumented
+                .iter()
+                .map(|(path, _, _)| format!("  {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}

@@ -78,19 +78,34 @@ enum ContextCommand {
         tree: bool,
     },
     /// Show a context's metadata (default: current).
-    Info { context: Option<String> },
+    Info {
+        /// Context to show. Defaults to the current context. Ids and
+        /// labels come from `kj context list`.
+        context: Option<String>,
+    },
     /// Render the system prompt this context actually gets: the exact
     /// `base → rc sections → <situation>` assembly the LLM turn path
-    /// builds (`crate::llm::build_system_prompt`), so prompt/stance tuning
-    /// can be verified against live kernel state instead of inferred from rc
-    /// scripts (default: current).
-    Prompt { context: Option<String> },
+    /// builds, so prompt/stance tuning can be verified against live kernel
+    /// state instead of inferred from rc scripts (default: current).
+    // Mirrors `crate::llm::build_system_prompt` (llm_stream.rs's
+    // `spawn_llm_for_prompt`) exactly, reading the live DriftRouter handle
+    // rather than falling back to the KernelDb row — a resolved target with
+    // no drift handle renders label/state/provider/model all absent, the
+    // same honest gap a real turn would hit.
+    Prompt {
+        /// Context whose system prompt to render. Defaults to the current
+        /// context. Ids and labels come from `kj context list`.
+        context: Option<String>,
+    },
     /// Print the current context.
     #[command(alias = "show")]
     Current,
     /// Switch the session to another context.
     #[command(alias = "sw")]
-    Switch { context: String },
+    Switch {
+        /// Context to switch to. Ids and labels come from `kj context list`.
+        context: String,
+    },
     /// Create a new context. Label is positional or `--name`.
     #[command(alias = "new")]
     Create {
@@ -111,15 +126,23 @@ enum ContextCommand {
     /// Re-run the `create` rc lifecycle on a context left with no usable
     /// loadout — the repair for a create-time rc failure (default: current).
     /// Refuses a context that already has a loadout.
-    Rebind { context: Option<String> },
+    Rebind {
+        /// Context to repair. Defaults to the current context. Ids and
+        /// labels come from `kj context list`.
+        context: Option<String>,
+    },
     /// Apply settable config to an existing context (default: current).
     Set {
+        /// Context to update. Defaults to the current context. Ids and
+        /// labels come from `kj context list`.
         context: Option<String>,
         #[command(flatten)]
         config: ContextConfigArgs,
     },
     /// Remove an env var from a context, or clear its assigned cast.
     Unset {
+        /// Context to update. Defaults to the current context. Ids and
+        /// labels come from `kj context list`.
         context: Option<String>,
         /// Env var key to remove
         #[arg(long)]
@@ -130,11 +153,18 @@ enum ContextCommand {
         cast: bool,
     },
     /// Show fork lineage from a context up to root (default: current).
-    Log { context: Option<String> },
+    Log {
+        /// Context to show lineage for. Defaults to the current context.
+        /// Ids and labels come from `kj context list`.
+        context: Option<String>,
+    },
     /// Reparent a context under a new parent.
     #[command(alias = "mv")]
     Move {
+        /// Context to reparent. Ids and labels come from `kj context list`.
         context: String,
+        /// New parent to fork the structural edge from. Ids and labels
+        /// come from `kj context list`.
         new_parent: String,
     },
     /// Rename a context — set its label (default: current). Refuses a label
@@ -148,32 +178,70 @@ enum ContextCommand {
         context: Option<String>,
     },
     /// Soft-delete a context (latched).
-    Archive { context: String },
+    Archive {
+        /// Context to archive, along with its structural subtree. Ids and
+        /// labels come from `kj context list`.
+        context: String,
+    },
     /// Conclude a context — mark this work "done" (the time-well's hot→recent
     /// transition). Reversible via fork; not latched, not destructive.
     #[command(alias = "done")]
-    Conclude { context: String },
+    Conclude {
+        /// Context to conclude. Does not recurse into children. Ids and
+        /// labels come from `kj context list`.
+        context: String,
+    },
     /// Promote a context into ring 0 ("active"). Not latched, not
     /// capability-gated (same as conclude). First promote wins the
     /// timestamp — re-promoting an already-promoted context is a no-op.
-    Promote { context: String },
+    Promote {
+        /// Context to promote. An archived context (reachable by full id)
+        /// is resurrected rather than refused. Ids and labels come from
+        /// `kj context list`.
+        context: String,
+    },
     /// Push a context outward one step on the demote ladder: promoted →
     /// unpromoted, unpromoted/undemoted → demoted, already demoted →
     /// archived. Not latched (each step is reversible except the last).
-    Demote { context: String },
-    /// Set the "suspend activity" flag (design-only — no behavioral gating
-    /// yet; see the doc on `ContextRow::paused_at`).
-    Pause { context: String },
+    Demote {
+        /// Context to push one step down the ladder. Ids and labels come
+        /// from `kj context list`.
+        context: String,
+    },
+    // The flag itself is `ContextRow::paused_at`; see its doc for the
+    // design intent behind a flag that nothing reads yet.
+    /// Set the "suspend activity" flag. Records intent only — nothing gates
+    /// behavior on it yet. Clear it with `kj context resume`.
+    Pause {
+        /// Context to pause. Ids and labels come from `kj context list`.
+        context: String,
+    },
     /// Clear the "suspend activity" flag.
-    Resume { context: String },
+    Resume {
+        /// Context to resume. Ids and labels come from `kj context list`.
+        context: String,
+    },
     /// Permanently delete a context (latched).
     #[command(alias = "rm")]
-    Remove { context: String },
+    Remove {
+        /// Context to delete. Cannot be the current context. Ids and
+        /// labels come from `kj context list`.
+        context: String,
+    },
     /// Move a label to a different context (latched).
-    Retag { label: String, context: String },
+    Retag {
+        /// Label to move. Taken from whichever context currently holds it,
+        /// if any.
+        label: String,
+        /// Context to give the label to. Ids and labels come from
+        /// `kj context list`.
+        context: String,
+    },
     /// Set or clear the conversation hydration window — `[0, marker] ∪ last-N`
     /// instead of the whole history (the cost guard for endless musician logs).
     Hydrate {
+        /// Context whose hydration window to set or clear. Defaults to the
+        /// current context. Ids and labels come from `kj context list`.
         context: Option<String>,
         /// Keep the last N blocks as the sliding tail (with the pinned prefix).
         #[arg(long)]

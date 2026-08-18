@@ -55,9 +55,10 @@ enum TransportCommand {
         /// context label.
         #[arg(long)]
         track: Option<String>,
-        /// Wake this context every N beats on the track clock (wakeup divisor).
-        /// Overrides any persisted value. Default: musician default (32 beats,
-        /// `Attachment::musician_default`/`hyoushigi/mod.rs`).
+        // The default comes from `Attachment::musician_default`
+        // (hyoushigi/mod.rs); keep the number below in step with it.
+        /// Wake this context every N beats on the track clock (wakeup
+        /// divisor). Overrides any persisted value. Defaults to 32 beats.
         #[arg(long)]
         wakeup: Option<u64>,
         /// Self-fork rotate cadence in phrases. Overrides any persisted value.

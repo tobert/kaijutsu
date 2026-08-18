@@ -6,6 +6,74 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The writing-style guide is absorbed but not yet applied (2026-08-18)
+
+`AGENTS.md` "Writing style" landed today, adapted from kaish's guide. The rules
+are written; the corpus does not follow them yet. Apply it as you touch prose —
+this is a standing practice, not a one-shot sweep, and a mass rename would be
+exactly the naive sweep the Slice 5 notes warn about.
+
+Where the gap is largest, in priority order:
+
+1. **Published `kj` help.** Every `///` on a clap struct field is reflected into
+   help that agents read. Three live violations in `kj ledger` alone, all
+   confirmed by running `--help` against the kernel rather than by grepping:
+
+   - `LedgerCommand::Runs` publishes `approval_ledger::rc_runs` and a paragraph
+     about why it takes a bare positional instead of a `--run` flag. This is
+     the worked example in the guide.
+   - `--remember` publishes "Amy's 2026-08-17 ruling,
+     `docs/gate-and-shell-split.md` ruling 3" — an internal cross-reference the
+     reader cannot resolve. The behavior it describes (refused when a covered
+     statement has a free variable) is right and should stay; the citation
+     belongs in a `//` comment.
+   - The opposite failure, in the same command: `allow <REQUEST_ID>` and
+     `forget <RULE_ID>` publish an **empty** description. A required positional
+     with no help is worse than a wordy one.
+
+   Audit a verb's whole clap struct when you touch it; the visit supplies the
+   context to judge each line.
+
+   **Two of these are now enforced by a test.** `kj::published_prose` in
+   `crates/kaijutsu-kernel/src/kj/mod.rs` walks `kj_command()`'s reflection and
+   fails on an internal Rust path in published help, or a positional with an
+   empty description. Run `cargo test -p kaijutsu-kernel published_prose`. It
+   does not check tone, specificity, or whether a default is stated — those
+   still need eyes. Extend it before extending the prose rules by hand.
+2. **MCP tool schemas** — same rule, wider audience.
+3. **`docs/kj-help/`** — read by models mid-task.
+4. **rc `.md` blocks** under `/etc/rc`, which land in the system-prompt slot.
+   The most expensive prose in the repo.
+
+**Do not mass-rename `seam` or `surface`.** Measured 2026-08-18: `seam` appears
+143 times in `docs/` and 210 times in `crates/`; `surface` appears 307 times in
+`docs/`. kaish's guide says "write boundary, not seam" and treats `surface` as a
+hedge. Kaijutsu keeps both words with its own meanings — see the guide's "One
+term, one meaning". The rule to enforce is *one meaning per word*, not a
+substitution.
+
+The Terms table in the guide is the source, and it grows when a collision shows
+up in real prose. Add to it when you hit one.
+
+---
+
+## The ledger's auto-allow path has never fired in production (2026-08-18)
+
+`kj ledger allow --remember` shipped today, so `rules::redeem` can now find a
+row — the branch is reachable. It has still never run: `kj ledger rules` on the
+live kernel returns `(no active rules)`.
+
+Verify it end to end on a real ask rather than only in tests. Answer one with
+`kj ledger allow <request-id> --remember always`, then trigger the same
+statement again and confirm it auto-decides without asking. `kj ledger forget
+<rule-id>` puts it back.
+
+Worth doing soon because hook asks have no free variables (`kj/hook_gate.rs`),
+so every one of them is eligible to be remembered — the ergonomic payoff is
+largest exactly where the path is least exercised.
+
+---
+
 ## The conversation surface draws no block border labels or gutter checkbox (2026-08-18)
 
 Slice 2 of the conversation-surface rewrite ports the chrome that is *quads* —
@@ -240,53 +308,6 @@ gate on the MCP write path"*, which the transcript does not support. Still
 unpinned: the exact ordering between the tool call returning and the ask
 appearing, since block sequence numbers order per-writer rather than by
 wall clock. Full reconstruction in `docs/kaijutsu-feedback.md`.
-
----
-
-## The approval ledger's auto-allow branch is unreachable in production (2026-08-18)
-
-`run_gate`'s step 1 is `approval_ledger::rules::redeem` — the check that lets
-a remembered rule allow or deny without asking anyone. **Nothing can ever put
-a row in that table.** `rules::learn_from_approval` is called only from
-`kj/gate.rs` tests (lines 834 and 897; `#[cfg(test)]` starts at 493), and
-`kj ledger allow` passes `remember_scope: None`. So `redeem` always finds
-nothing, and the whole auto-decide branch — including the `AskCoverage`
-composition logic and its tests — describes a state production cannot reach.
-
-`rules::revoke` and `rules::get_rule` have no production caller either.
-
-The surface that would fix it is `kj ledger allow --remember <scope>`, which
-is exactly what Amy's 2026-08-18 ruling #4 governs: refuse when free
-variables exist, for now, and shape the key so a predicate-shaped allow can
-be added later without a migration. Note the melt makes this more valuable,
-not less — a hook `Ask` has no free variables at all
-(`kj/hook_gate.rs`), so every hook ask is eligible to be remembered, and
-without this surface none of them can be.
-
-Also unwired at the same seam: `PermissionAnswer::remember` was carried over
-the wire and dropped ("interpretation/storage of remembered scope is a
-follow-up"). The melt retires that field; the ledger's `remember_scope` is
-where it should have been going.
-
----
-
-## `approval_ledger::rc_runs` is built, tested, and has zero callers (2026-08-18)
-
-The rc lifecycle run log — `start_run` / `finish_run` / `get_run`, plus its
-`rc_runs` and `rc_run_scripts` tables and an `approvals.rc_run_id` foreign
-key — has **no caller anywhere outside its own crate**. Verified by grep
-across `crates/`.
-
-Its own module doc names the incident it was written for: *"a morning where
-an assistant seat's startup rc scripts silently never ran, and nothing
-recorded that — a durable run log would have made it visible on run one
-instead of by review."* That incident is still uncovered, because the rc
-runner never calls it.
-
-The wiring point is `KjDispatcher::run_kai_script` / the rc lifecycle
-runner: `start_run` when a verb's script set begins, `finish_run` with the
-outcome when it ends. Cheap, and it turns "did rc actually run?" from a
-question you answer by reading logs into one you answer with a query.
 
 ---
 
