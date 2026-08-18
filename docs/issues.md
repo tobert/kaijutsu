@@ -57,20 +57,28 @@ up in real prose. Add to it when you hit one.
 
 ---
 
-## The ledger's auto-allow path has never fired in production (2026-08-18)
+## A failed `shell_write` reports `Tool error:` with no reason (2026-08-18)
 
-`kj ledger allow --remember` shipped today, so `rules::redeem` can now find a
-row — the branch is reachable. It has still never run: `kj ledger rules` on the
-live kernel returns `(no active rules)`.
+Found while testing the `--remember` path end to end on the live kernel. An
+allowed `shell_write` whose command fails returns:
 
-Verify it end to end on a real ask rather than only in tests. Answer one with
-`kj ledger allow <request-id> --remember always`, then trigger the same
-statement again and confirm it auto-decides without asking. `kj ledger forget
-<rule-id>` puts it back.
+    {"content": [{"type": "text", "text": "Tool error: "}], "isError": false}
 
-Worth doing soon because hook asks have no free variables (`kj/hook_gate.rs`),
-so every one of them is eligible to be remembered — the ergonomic payoff is
-largest exactly where the path is least exercised.
+Two defects in one response. The reason is **empty** — the caller is told
+something failed and nothing about what, which is the opposite of the
+"fast and informative failures" rule in AGENTS.md "Writing style". And
+`isError` is **false** while the text says "Tool error", so a client
+branching on the typed field disagrees with a client reading the text.
+
+Reproduced deliberately: `echo "x" > scratch/remember-test.txt` from a freshly
+registered MCP context returns the empty error and writes nothing, because
+`scratch/` does not resolve in that context's VFS cwd. `echo hello-from-gate`
+through the identical path returns `hello-from-gate\n` normally, so the gate
+and the execution path are fine — only the error reporting is lost.
+
+The gate is not implicated. The ask was allowed, the statement ran, and the
+failure happened downstream in kaish/VFS path resolution. Whatever converts
+that failure into an MCP result is dropping the message.
 
 ---
 

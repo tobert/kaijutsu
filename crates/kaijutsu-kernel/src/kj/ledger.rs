@@ -349,7 +349,12 @@ impl KjDispatcher {
                 },
             ) {
                 Ok(row) => {
-                    let mut message = format!("{verb}ed ask {request_id} ({})", row.description);
+                    // Past tense is spelled out, not built by appending "ed"
+                    // to `verb` — that produced "denyed" in shipped output.
+                    // Past tense is spelled out rather than built by appending
+                    // "ed" to `verb` — that construction shipped "denyed".
+                    let decided = if allow { "allowed" } else { "denied" };
+                    let mut message = format!("{decided} ask {request_id} ({})", row.description);
                     let mut data = serde_json::json!({
                         "request_id": row.request_id,
                         "status": row.status.to_string(),
@@ -844,6 +849,36 @@ mod tests {
         d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
             .await;
         let _ = gate.await;
+    }
+
+    /// Both decision verbs report themselves in correct English. The `deny`
+    /// half is the point: the message is built from the verb name, and
+    /// appending "ed" to "deny" shipped "denyed" to every human who denied
+    /// an ask. The pre-existing assertion covered only the `allow` branch,
+    /// where that construction happens to be correct.
+    #[tokio::test]
+    async fn a_decision_reports_itself_in_correct_english() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        for (verb, expected) in [("allow", "allowed ask"), ("deny", "denied ask")] {
+            let db = d.kernel_db.clone();
+            let flows = d.kernel.ledger_flows().clone();
+            let caller = c.clone();
+            let gate = tokio::spawn(async move {
+                run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
+            });
+            let request_id = wait_for_pending(&d).await;
+
+            let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], &c).await;
+            assert!(result.is_ok(), "{verb} must succeed: {result:?}");
+            assert!(
+                result.message().starts_with(expected),
+                "`kj ledger {verb}` must report \"{expected}\", got: {}",
+                result.message()
+            );
+            let _ = gate.await;
+        }
     }
 
     #[tokio::test]
