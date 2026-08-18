@@ -6,6 +6,53 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The approval ledger's auto-allow branch is unreachable in production (2026-08-18)
+
+`run_gate`'s step 1 is `approval_ledger::rules::redeem` — the check that lets
+a remembered rule allow or deny without asking anyone. **Nothing can ever put
+a row in that table.** `rules::learn_from_approval` is called only from
+`kj/gate.rs` tests (lines 834 and 897; `#[cfg(test)]` starts at 493), and
+`kj ledger allow` passes `remember_scope: None`. So `redeem` always finds
+nothing, and the whole auto-decide branch — including the `AskCoverage`
+composition logic and its tests — describes a state production cannot reach.
+
+`rules::revoke` and `rules::get_rule` have no production caller either.
+
+The surface that would fix it is `kj ledger allow --remember <scope>`, which
+is exactly what Amy's 2026-08-18 ruling #4 governs: refuse when free
+variables exist, for now, and shape the key so a predicate-shaped allow can
+be added later without a migration. Note the melt makes this more valuable,
+not less — a hook `Ask` has no free variables at all
+(`kj/hook_gate.rs`), so every hook ask is eligible to be remembered, and
+without this surface none of them can be.
+
+Also unwired at the same seam: `PermissionAnswer::remember` was carried over
+the wire and dropped ("interpretation/storage of remembered scope is a
+follow-up"). The melt retires that field; the ledger's `remember_scope` is
+where it should have been going.
+
+---
+
+## `approval_ledger::rc_runs` is built, tested, and has zero callers (2026-08-18)
+
+The rc lifecycle run log — `start_run` / `finish_run` / `get_run`, plus its
+`rc_runs` and `rc_run_scripts` tables and an `approvals.rc_run_id` foreign
+key — has **no caller anywhere outside its own crate**. Verified by grep
+across `crates/`.
+
+Its own module doc names the incident it was written for: *"a morning where
+an assistant seat's startup rc scripts silently never ran, and nothing
+recorded that — a durable run log would have made it visible on run one
+instead of by review."* That incident is still uncovered, because the rc
+runner never calls it.
+
+The wiring point is `KjDispatcher::run_kai_script` / the rc lifecycle
+runner: `start_run` when a verb's script set begins, `finish_run` with the
+outcome when it ends. Cheap, and it turns "did rc actually run?" from a
+question you answer by reading logs into one you answer with a query.
+
+---
+
 ## The short block id we just made acceptable is unusable unquoted, because kaish eats `#` (2026-08-17)
 
 **Found by probing the live kernel right after shipping the fix — the unit
