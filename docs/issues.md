@@ -960,9 +960,9 @@ Polish backlog:
   nothing is active; fine for power, but if unfocused reading feels
   laggy on first wheel touch, consider reactive(100ms) unfocused while
   the conversation screen is showing.
-- Flick event bursts each pay a full ~26ms frame on a 205k-px document
-  (heats a core) — that cost is the surface renderer's to kill
-  (docs/conversation-surface.md), not a scroll-tuning knob.
+- ~~Flick-burst frame cost~~ SHIPPED 2026-08-18: the surface renderer
+  landed (scroll = one uniform inside the window band); frame cost no
+  longer scales with document or block size.
 - App window came back 960x600@scale1 after restarts (was ~1920@2x that
   morning) — window geometry restore may be broken or KWin-side; check
   whether kaijutsu should remember size/position itself.
