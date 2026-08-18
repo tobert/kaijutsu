@@ -778,11 +778,21 @@ impl Kernel {
         // `facade:shell` grant no longer reaches this instance. Holds
         // Weak<Broker> to reach the kj dispatcher (wired post-bootstrap by
         // `set_kj_dispatcher`) and materialize a per-context kaish on demand.
+        //
+        // `InstancePolicy::for_kernel_gated` (not the generic `for_kernel`):
+        // this is the ONE builtin instance that can reach `kj::gate::run_gate`
+        // through `Broker::call_tool` (its own `!self.read_only` check below
+        // gates only the write path; `builtin.shell`'s read-only twin never
+        // gates, and no other builtin server calls into the gate). Its broker
+        // cap must be the gate ladder's `gate::BROKER_CALL`, not
+        // `mcp_call_timeout_default` — see `mcp/policy.rs`'s doc on
+        // `for_kernel_gated` for why the generic default would reopen the
+        // defect the ladder closes.
         let shell_write_server = Arc::new(
             crate::mcp::servers::ShellServer::new(Arc::downgrade(&self.broker)),
         );
         self.broker
-            .register_silently(shell_write_server, InstancePolicy::for_kernel(self))
+            .register_silently(shell_write_server, InstancePolicy::for_kernel_gated(self))
             .await?;
 
         // builtin.shell — the SAFE, unmarked twin (`ShellServer::new_read_only`,

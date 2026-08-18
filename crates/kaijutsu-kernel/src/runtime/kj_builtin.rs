@@ -671,11 +671,15 @@ impl Tool for KjBuiltin {
         // a patient hold the watchdog would kill the gate long before its own
         // deadline fired — "passes tests, dies in production" (docs/issues.md,
         // Gate slice 1a, finding #1). The hold and the gate's poll deadline
-        // read the SAME `gate_wait_timeout` so they cannot drift apart.
+        // now both route through `TimeoutPolicy::effective_gate_wait()`
+        // (`kaijutsu_types::timeout::gate`) instead of reading
+        // `gate_wait_timeout` raw, so they cannot drift apart — and neither
+        // can drift past what the outer MCP/RPC hops of the gate ladder can
+        // absorb.
         let budget = if is_distill_verb(&argv) {
             Some(self.dispatcher.kernel().timeouts().llm_request_timeout)
         } else if is_gated_verb(&argv) {
-            Some(self.dispatcher.kernel().timeouts().gate_wait_timeout)
+            Some(self.dispatcher.kernel().timeouts().effective_gate_wait())
         } else {
             None
         };

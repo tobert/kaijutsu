@@ -443,37 +443,45 @@ impl McpServerLike for ShellServer {
                 rc_depth: 0,
                 privileged: false,
             };
-            // **The gate's own deadline must fire before the broker's.**
+            // **The gate's own deadline must fire before the broker's — and
+            // the broker's before the client's.**
             //
             // `run_gate` blocks on a human answering from another surface
-            // (`kj approve`), up to `gate_wait_timeout` — 300s by default.
-            // But this call is running *inside* a broker `call_tool`, which
-            // enforces `InstancePolicy::call_timeout`
-            // (`mcp_call_timeout_default`, 120s by default). The broker wins
-            // that race, so an unanswered gate would surface as a generic MCP
-            // timeout instead of the gate's honest "nobody answered, nothing
-            // was run" — and the gate's own advice ("answer faster, or raise
-            // `gate_wait_timeout`") would be useless, since raising it past
-            // the broker's cap changes nothing.
+            // (`kj approve`). This call runs *inside* a broker `call_tool`,
+            // which is itself the answer to an RPC dispatched by a client
+            // with its own per-call deadline. One logical wait, enforced at
+            // three more hops outside this function, and each outer hop
+            // must give up STRICTLY LATER than the one inside it — otherwise
+            // the outermost hop (closest to the model) fires first and the
+            // gate's honest "nobody answered ask `<id>`, nothing was run"
+            // — the ask id a human needs — gets replaced by a generic
+            // timeout that knows nothing about the gate. That is exactly
+            // what used to happen here: the client's RPC deadline was
+            // SHORTER than this function's own wait, so it won the race.
             //
-            // Fail-closed is preserved either way; what is lost without this
-            // clamp is the *reason*, which is exactly the fault-reads-as-
-            // something-else family this project keeps filing. This is the
-            // same hazard `runtime::kj_builtin` solves for gated `kj` verbs
-            // with a patient hold (see its comment citing "Gate slice 1a,
-            // finding #1" — "passes tests, dies in production"); the MCP path
-            // has no such hold, so it clamps instead.
+            // This used to be a locally-computed clamp (`min(gate_wait,
+            // mcp_call_timeout_default - 5s)`) with a comment ending "if a
+            // third caller ever needs this, lift it into one place rather
+            // than copying the arithmetic." A third caller (the client RPC
+            // hop) did need it, so the arithmetic now lives in exactly one
+            // place: `kaijutsu_types::timeout::gate`. `effective_gate_wait()`
+            // is this hop's half of that ladder — the broker's `call_tool`
+            // cap for this instance (`InstancePolicy::for_kernel_gated`,
+            // `gate::BROKER_CALL`) and the client's per-call override
+            // (`gate::CLIENT_CALL`, `kaijutsu-client::actor::dispatch_deadline!`)
+            // are the other two rungs, ordered by construction and pinned by
+            // a test (`gate_ladder_fires_caller_first`) instead of by three
+            // independently-tuned numbers agreeing by luck.
             //
-            // The margin gives `run_gate` room to write its terminal ledger
-            // row and return before the broker's axe falls. Two timeouts that
-            // must stay ordered is precisely the "two things that must agree"
-            // shape worth distrusting — if a third caller ever needs this,
-            // lift it into one place rather than copying the arithmetic.
-            let timeouts = dispatcher.kernel().timeouts();
-            let broker_cap = timeouts
-                .mcp_call_timeout_default
-                .saturating_sub(std::time::Duration::from_secs(5));
-            let wait = timeouts.gate_wait_timeout.min(broker_cap);
+            // Fail-closed is preserved regardless of which hop times out;
+            // what the ladder protects is the *reason*, which is exactly the
+            // fault-reads-as-something-else family this project keeps
+            // filing. This is the same hazard `runtime::kj_builtin` solves
+            // for gated `kj` verbs with a patient hold (see its comment
+            // citing "Gate slice 1a, finding #1" — "passes tests, dies in
+            // production"); the MCP path has no such hold, so it leans on
+            // the ladder instead.
+            let wait = dispatcher.kernel().timeouts().effective_gate_wait();
             let outcome = crate::kj::gate::run_gate(
                 dispatcher.kernel_db(),
                 &caller,
@@ -852,38 +860,36 @@ mod tests {
         (broker, d)
     }
 
-    /// The gate's deadline must be clamped under the broker's, so an
+    /// The gate's deadline must be ordered under the broker's, so an
     /// unanswered gate returns the gate's honest reason rather than a generic
-    /// MCP timeout.
+    /// MCP timeout. This USED to be a clamp computed by hand right here
+    /// (`min(gate_wait, mcp_call_timeout_default - 5s)`); it is now enforced
+    /// by the shared `kaijutsu_types::timeout::gate` ladder —
+    /// `effective_gate_wait()` on the kernel side, `gate::BROKER_CALL` as
+    /// this instance's `InstancePolicy` cap (`for_kernel_gated`, NOT the
+    /// generic `mcp_call_timeout_default` every other instance uses).
     ///
-    /// Defaults make this a real race, not a hypothetical: `gate_wait_timeout`
-    /// is 300s and `mcp_call_timeout_default` is 120s, so unclamped the broker
-    /// always wins and the "nobody answered, nothing was run" message — plus
-    /// the ask id a human needs to go find — is lost. Fail-closed survives
-    /// either way; the *reason* is what the clamp protects, which is the same
-    /// fault-reads-as-something-else family as `GateUnavailable` vs `Denied`.
-    ///
-    /// Asserts the ordering rather than a literal duration, so retuning either
-    /// timeout cannot quietly invert it.
+    /// Asserts the ordering rather than a literal duration, so retuning
+    /// either bound cannot quietly invert it. `gate_ladder_fires_caller_first`
+    /// (`kaijutsu-types::timeout`) pins the ladder's constants in isolation;
+    /// this is the integration check that the call site here actually reads
+    /// through it rather than reintroducing a local clamp.
     #[test]
-    fn the_gate_deadline_is_clamped_under_the_broker_call_timeout() {
+    fn the_gate_deadline_is_ordered_under_the_broker_call_timeout() {
         let t = kaijutsu_types::TimeoutPolicy::default();
-        let broker_cap = t
-            .mcp_call_timeout_default
-            .saturating_sub(std::time::Duration::from_secs(5));
-        let effective = t.gate_wait_timeout.min(broker_cap);
+        let effective = t.effective_gate_wait();
         assert!(
-            effective < t.mcp_call_timeout_default,
+            effective < kaijutsu_types::timeout::gate::BROKER_CALL,
             "the gate must resolve BEFORE the broker cancels the call, or its reason is lost \
-             (gate {:?}, broker {:?}, effective {:?})",
-            t.gate_wait_timeout,
-            t.mcp_call_timeout_default,
-            effective
+             (effective gate wait {:?}, broker cap {:?})",
+            effective,
+            kaijutsu_types::timeout::gate::BROKER_CALL
         );
         assert!(
-            t.gate_wait_timeout > t.mcp_call_timeout_default,
-            "if this fails the clamp became a no-op and this test stopped testing anything — \
-             defaults were retuned so the gate is already shorter than the broker cap"
+            kaijutsu_types::timeout::gate::MAX_KERNEL_WAIT
+                < kaijutsu_types::timeout::gate::BROKER_CALL,
+            "if this fails the ladder became a no-op and this test stopped testing anything — \
+             the gate ceiling caught up with (or passed) the broker cap it's supposed to clear"
         );
     }
 

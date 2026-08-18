@@ -104,7 +104,7 @@ impl KjDispatcher {
                 if dry_run {
                     return cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, true);
                 }
-                let wait = self.kernel.timeouts().gate_wait_timeout;
+                let wait = self.kernel.timeouts().effective_gate_wait();
                 let spec = gate_spec_for_send(&target, &message, &sessions_dir);
                 let outcome = crate::kj::gate::run_gate(
                     &self.kernel_db,

@@ -155,7 +155,13 @@ pub enum CallError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
-    /// Per-call deadline (`RPC_CALL_TIMEOUT` or per-call override) exceeded.
+    /// Per-call deadline exceeded — `RPC_CALL_TIMEOUT` for most commands
+    /// (`dispatch!`), or a per-call override for the few dispatched through
+    /// `dispatch_deadline!` instead (today: `ExecuteTool`, `CallMcpTool`
+    /// and `ExecuteKj`, at `kaijutsu_types::timeout::gate::CLIENT_CALL`,
+    /// because each can reach a gate holding for a human answer). The carried
+    /// `Duration` is always the deadline that actually fired, so the
+    /// message names the right number either way.
     /// Connection is NOT torn down — the handler hung, not the pipe.
     #[error("call timed out after {0:?}")]
     Timeout(Duration),
@@ -1876,18 +1882,26 @@ fn is_disconnect_error(msg: &str) -> bool {
     msg.contains("Disconnected") || msg.contains("disconnected")
 }
 
-/// Run a single RPC call with the global per-call deadline, mapping the
-/// outcome into `CallError`. On disconnect-class errors, signals `close_tx`
-/// so the actor can transition to Closing.
-async fn run_rpc_call<T, F, E>(
+/// Run a single RPC call against an EXPLICIT deadline, mapping the outcome
+/// into `CallError`. On disconnect-class errors, signals `close_tx` so the
+/// actor can transition to Closing.
+///
+/// [`run_rpc_call`] is the thin, common-case wrapper over this that supplies
+/// the global [`RPC_CALL_TIMEOUT`]. This function exists so a command whose
+/// RPC may reach a longer logical wait — today, a gated `shell_write` call
+/// blocking on `kj::gate::run_gate` — can override the deadline without
+/// touching every other command's behavior. See [`dispatch_deadline!`] and
+/// `kaijutsu_types::timeout::gate`.
+async fn run_rpc_call_with_deadline<T, F, E>(
     fut: F,
     close_tx: &mpsc::Sender<CloseCause>,
+    deadline: Duration,
 ) -> Result<T, CallError>
 where
     F: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
-    match tokio::time::timeout(RPC_CALL_TIMEOUT, fut).await {
+    match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(e)) => {
             let msg = e.to_string();
@@ -1898,8 +1912,22 @@ where
             }
             Err(CallError::Rpc(msg))
         }
-        Err(_) => Err(CallError::Timeout(RPC_CALL_TIMEOUT)),
+        Err(_) => Err(CallError::Timeout(deadline)),
     }
+}
+
+/// Run a single RPC call with the global per-call deadline ([`RPC_CALL_TIMEOUT`]),
+/// mapping the outcome into `CallError`. On disconnect-class errors, signals
+/// `close_tx` so the actor can transition to Closing.
+async fn run_rpc_call<T, F, E>(
+    fut: F,
+    close_tx: &mpsc::Sender<CloseCause>,
+) -> Result<T, CallError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    run_rpc_call_with_deadline(fut, close_tx, RPC_CALL_TIMEOUT).await
 }
 
 /// Dispatch macro that invokes `run_rpc_call` and forwards the result to the
@@ -1908,6 +1936,22 @@ macro_rules! dispatch {
     ($kernel:ident, $reply:ident, $close_tx:ident, $k:ident, $call:expr) => {{
         let $k = &$kernel;
         let result = run_rpc_call($call, &$close_tx).await;
+        let _ = $reply.send(result);
+    }};
+}
+
+/// Sibling of [`dispatch!`] for commands whose call may reach a gated tool —
+/// `kj::gate::run_gate` blocking on a human answering from another surface.
+/// The global [`RPC_CALL_TIMEOUT`] (request tier, 30s) is far shorter than
+/// that wait, so a command on this path uses an explicit, longer deadline
+/// instead — `kaijutsu_types::timeout::gate::CLIENT_CALL` is the one this
+/// crate hands to the gate-capable commands today. Every OTHER command keeps
+/// going through `dispatch!` unchanged: a genuinely wedged RPC must still
+/// report back in `RPC_CALL_TIMEOUT`, not silently wait longer everywhere.
+macro_rules! dispatch_deadline {
+    ($kernel:ident, $reply:ident, $close_tx:ident, $k:ident, $deadline:expr, $call:expr) => {{
+        let $k = &$kernel;
+        let result = run_rpc_call_with_deadline($call, &$close_tx, $deadline).await;
         let _ = $reply.send(result);
     }};
 }
@@ -3409,8 +3453,26 @@ async fn dispatch_kernel_command(
         RpcCommand::SetContextCwd { context_id, path, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_cwd(context_id, &path));
         }
+        // `executeKj` runs the verb SYNCHRONOUSLY on the server
+        // (`execute_kj_command` returns exit code and output, unlike
+        // `shellExecute`, which spawns and hands back a block id), and some
+        // `kj` verbs block on the approval gate — `kj cc send` today, plus
+        // the six `Latch` producers Slice 5 migrates. So this reaches the
+        // gate exactly the way `ExecuteTool` does, and needs the same
+        // deadline. It is also the path ACP drives `kj` through.
+        //
+        // Applied to the whole verb surface rather than just the gated
+        // ones: the client cannot tell a gated argv from an ungated one
+        // without duplicating `is_gated_verb` here, and a second copy of
+        // that policy would drift from the kernel's. The kernel is what
+        // bounds the wait (`effective_gate_wait()`); this side's only job
+        // is to not fire first.
         RpcCommand::ExecuteKj { context_id, argv, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.execute_kj(context_id, &argv));
+            dispatch_deadline!(
+                kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
+                k.execute_kj(context_id, &argv)
+            );
         }
         RpcCommand::GetKjCommandCatalog { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_kj_command_catalog(context_id));
@@ -3494,10 +3556,27 @@ async fn dispatch_kernel_command(
         }
 
         // ── Tool Execution ──
+        //
+        // `ExecuteTool` and `CallMcpTool` both route (server-side, through
+        // `dispatch_tool_via_broker` → `Broker::call_tool`) to whichever
+        // instance the resolved tool name lands on — including
+        // `builtin.shell_write`, the only BROKER instance that reaches
+        // `kj::gate::run_gate` (`ExecuteKj` below reaches the same gate by
+        // the other route, through kaish) (verified by reading
+        // `kaijutsu-server::rpc::{execute_tool, call_mcp_tool}`). Both need
+        // the gate ladder's client-side deadline instead of the generic
+        // `RPC_CALL_TIMEOUT`, or the client gives up on an answerable gate
+        // ask long before the gate itself would. `GetToolSchemas` and
+        // `ListMcpResources` never dispatch a tool call, so they stay on
+        // `dispatch!`.
         RpcCommand::ExecuteTool {
             tool, params, reply,
         } => {
-            dispatch!(kernel, reply, close_tx, k, k.execute_tool(&tool, &params));
+            dispatch_deadline!(
+                kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
+                k.execute_tool(&tool, &params)
+            );
         }
         RpcCommand::GetToolSchemas { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_tool_schemas());
@@ -3505,8 +3584,9 @@ async fn dispatch_kernel_command(
         RpcCommand::CallMcpTool {
             tool, arguments, reply,
         } => {
-            dispatch!(
+            dispatch_deadline!(
                 kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
                 k.call_mcp_tool(&tool, &arguments)
             );
         }
@@ -3859,6 +3939,37 @@ mod tests {
         assert!(is_disconnect_error("disconnected from peer"));
         assert!(!is_disconnect_error("Failed: invalid context ID"));
         assert!(!is_disconnect_error("Overloaded: too many requests"));
+    }
+
+    /// The deadline `dispatch_deadline!` hands the gate-reaching commands
+    /// must clear the broker's cap for the gate-capable instance, or the
+    /// client would give up before the broker even has a chance to cancel —
+    /// racing the broker's `Timeout` instead of reporting the gate's own
+    /// reason. Enforced here rather than left to the shared
+    /// `gate_ladder_fires_caller_first` test in `kaijutsu-types`, because
+    /// THIS crate is the one that could silently pass the wrong constant to
+    /// `dispatch_deadline!` at the call site — a typo'd `RPC_CALL_TIMEOUT`
+    /// or `gate::BROKER_CALL` would still compile.
+    #[test]
+    fn gated_command_deadline_clears_the_broker_call_cap() {
+        let deadline = kaijutsu_types::timeout::gate::CLIENT_CALL;
+        assert!(
+            deadline > kaijutsu_types::timeout::gate::BROKER_CALL,
+            "the client's per-call deadline for a gate-capable command must \
+             outlast the broker's cap ({:?}), or the client gives up first \
+             and destroys the broker's/gate's honest error \
+             (client deadline {:?})",
+            kaijutsu_types::timeout::gate::BROKER_CALL,
+            deadline
+        );
+        // A genuinely wedged RPC must still report far sooner than the gate
+        // deadline would ever be reached — this isn't a blanket raise of
+        // every command's timeout, just the two that can reach the gate.
+        assert!(
+            RPC_CALL_TIMEOUT < deadline,
+            "the gated deadline should be strictly longer than the default \
+             request-tier RPC_CALL_TIMEOUT, or there was no defect to fix"
+        );
     }
 
     #[test]
