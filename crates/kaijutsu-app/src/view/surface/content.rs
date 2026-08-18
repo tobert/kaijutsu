@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use kaijutsu_types::{BlockId, Status};
 
+use crate::cell::block_border::BorderInputs;
 use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, MainCell};
 use crate::text::rich::{RichContentKind, SpanBrush};
 use crate::ui::theme::Theme;
@@ -99,6 +100,14 @@ pub struct FormattedBlock {
     /// Last seen block status — drives the streaming debounce, and tells the
     /// content sweep which out-of-band blocks still need refreshing.
     pub status: Status,
+    /// The border decision's inputs, projected off the same snapshot the text
+    /// came from ([`BorderInputs`]).
+    ///
+    /// Deliberately **outside** `version`: status, error and exclusion move
+    /// without changing a glyph, and restamping the content version for them
+    /// would re-shape the block every time a tool call finished. Chrome reads
+    /// this and keeps its own version (`super::chrome`).
+    pub border: BorderInputs,
     /// `rich_input_fingerprint` of the inputs detection last ran on, so a
     /// streaming neighbour's version bump doesn't drag every block through a
     /// re-parse (same gate as `view/render.rs:152-160`).
@@ -106,6 +115,14 @@ pub struct FormattedBlock {
 }
 
 /// Formatted display text for every block the surface might draw.
+///
+/// **Not band-bounded**: entries are added for the content band and only
+/// removed when a block leaves the *document* ([`BlockContentCache::retain_ids`]),
+/// so this grows with how far the user has scrolled. Consumers must iterate a
+/// band of geometry rows and `get` each one — never iterate the cache — or
+/// they inherit that growth as a per-frame cost (`super::chrome` did, briefly;
+/// kaibo/deepseek review, 2026-08-18). Slice 3's LRU eviction is what finally
+/// bounds it.
 #[derive(Resource, Debug, Default)]
 pub struct BlockContentCache {
     blocks: HashMap<BlockId, FormattedBlock>,
@@ -135,6 +152,26 @@ impl BlockContentCache {
             .filter(|(_, fb)| fb.status == Status::Running)
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Seed a formatted block directly. Test-only: `super::chrome`'s tests
+    /// need a populated content cache without a block store or a font
+    /// context, and `fingerprint` is private to this module.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, id: BlockId, border: BorderInputs) {
+        self.blocks.insert(
+            id,
+            FormattedBlock {
+                version: 1,
+                text: String::new(),
+                color: Color::WHITE,
+                spans: Vec::new(),
+                rich: None,
+                status: border.status,
+                border,
+                fingerprint: 0,
+            },
+        );
     }
 
     /// Drop everything the document no longer contains.
@@ -253,6 +290,7 @@ pub fn sync_block_content(
                 spans,
                 rich,
                 status: block.status,
+                border: BorderInputs::from_snapshot(&block),
                 fingerprint,
             },
         );

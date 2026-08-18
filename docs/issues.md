@@ -6,6 +6,37 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The conversation surface draws no block border labels or gutter checkbox (2026-08-18)
+
+Slice 2 of the conversation-surface rewrite ports the chrome that is *quads* —
+block borders (every `BorderKind`), the focus ring, breathe/pulse/chase, the
+edge glow, and the role-group divider — into `assets/shaders/surface_chrome.wgsl`
+as instanced SDF rects (`view/surface/chrome.rs`). What it does **not** port is
+the chrome that is *glyphs*:
+
+- the fieldset **top/bottom labels** ("TOOL CALL <model>", "COMMAND @amy",
+  "thinking", "drift: pull", "running"/"error") that legacy bakes into each
+  block's MSDF texture (`view/block_render.rs:1107-1207`), together with the
+  `border_inset_top/bottom` that lets a label straddle the stroke and the
+  top/bottom `label_gaps` that break the stroke behind it;
+- the **gutter inclusion checkbox** (☑/☐) and the excluded text halo
+  (`text_glow_params.y`).
+
+Both need a label shaping cache keyed by label text — the divider's role label
+is the only one the surface shapes today — plus the per-instance gap fields
+(the mechanism exists: `ChromeInstance::label_gap`, used for the divider). The
+border *color* still dims for an excluded block, so exclusion is visible; the
+checkbox is not. Do this before the flag flips to `Surface` by default (slice
+4), or the A/B will read as "labels disappeared".
+
+Also noted while porting: legacy gives a bordered block `width: 100%` *plus* a
+`glow_radius * 0.5` margin per side (`view/render.rs:352-359`), so the node
+overflows its own column and the pane's clip cuts the right border. The surface
+lays the box out symmetrically instead, which is a real (small) wrap-width
+difference between the two paths on bordered blocks.
+
+---
+
 ## The short block id we just made acceptable is unusable unquoted, because kaish eats `#` (2026-08-17)
 
 **Found by probing the live kernel right after shipping the fix — the unit

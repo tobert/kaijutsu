@@ -97,7 +97,9 @@ pub fn assemble_runs(
                 let Some(block) = shaped.get(&id) else {
                     continue;
                 };
-                let mut y = row.y_offset;
+                // `y_offset` is the border's top padding: the text starts
+                // inside the box chrome draws, not at the row's top edge.
+                let mut y = row.y_offset + block.y_offset;
                 for chunk in &block.chunks {
                     if !chunk.glyphs.is_empty() {
                         runs.push(SurfaceRun {
@@ -313,8 +315,10 @@ mod tests {
                 metrics_epoch: 1,
             },
             height: chunk_heights.iter().sum(),
+            text_height: chunk_heights.iter().sum(),
             chunks,
             x_offset,
+            y_offset: 0.0,
             glyph_count: chunk_heights.len(),
             last_used: 0,
         }
@@ -360,6 +364,22 @@ mod tests {
         assert_eq!(runs[0].doc_y, 24.0);
         assert_eq!(runs[1].doc_y, 34.0);
         assert_eq!(runs[2].doc_y, 54.0);
+    }
+
+    /// A bordered block's text starts inside its top padding — the same inset
+    /// the chrome quad reserves (`chrome::BlockLayout`). Without it the first
+    /// line sits on the border stroke.
+    #[test]
+    fn the_border_padding_pushes_the_runs_down_inside_the_row() {
+        let geom = strip(3);
+        let mut shaped = ShapedBlockCache::default();
+        let mut block = shaped_block(0.0, &[10.0, 20.0]);
+        block.y_offset = 8.0;
+        shaped.insert_for_test(bid(1), block);
+
+        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 1..2);
+        assert_eq!(runs[0].doc_y, 32.0, "row y (24) + the top padding (8)");
+        assert_eq!(runs[1].doc_y, 42.0);
     }
 
     #[test]

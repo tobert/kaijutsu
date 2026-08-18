@@ -22,6 +22,7 @@
 //! work at all: when the key is current it does not even assemble the runs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bevy::color::LinearRgba;
 use bevy::prelude::*;
@@ -42,6 +43,7 @@ use crate::text::msdf::renderer::ExtractedMsdfAtlas;
 use crate::text::msdf::surface_renderer::{
     ConversationSurfaceRenderer, GlyphInstance, SurfaceUniforms, build_instances,
 };
+use crate::view::surface::chrome::{ChromeInstance, ChromeInstances};
 use crate::ui::theme::Theme;
 use crate::view::block_render::ExtractedMsdfRenderParams;
 use crate::view::geometry::ConversationGeometry;
@@ -69,6 +71,17 @@ pub struct InstanceBufferKey {
     pub atlas_version: u64,
 }
 
+/// What a chrome buffer's contents were built from.
+///
+/// Its own key, and its own version: chrome changes on focus moves and status
+/// pulses that touch no glyph, and glyph windows rebuild on scrolls that
+/// touch no border. Sharing one version would make each pay the other's
+/// uploads.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ChromeBufferKey {
+    pub chrome_version: u64,
+}
+
 /// Capacity (in instances) to allocate when `needed` no longer fits.
 ///
 /// Doubling from the current capacity, never shrinking: a conversation that
@@ -83,20 +96,84 @@ pub fn grow_capacity(current: usize, needed: usize) -> usize {
     capacity
 }
 
-struct SurfaceInstanceBuffer {
+struct SurfaceInstanceBuffer<K> {
     /// `None` until the surface first has something to draw.
     buffer: Option<Buffer>,
     /// Instances the allocation can hold.
     capacity: usize,
     /// Instances actually written.
     len: u32,
-    key: InstanceBufferKey,
+    key: K,
+}
+
+/// Write `instances` into a surface's entry in `map`, growing (never
+/// shrinking) the allocation first if they don't fit.
+///
+/// Generic over the instance type because the glyph and chrome buffers differ
+/// in nothing but stride and label — and over the key type because they are
+/// versioned independently.
+fn upload_into<T: bytemuck::Pod, K: Copy>(
+    map: &mut HashMap<Entity, SurfaceInstanceBuffer<K>>,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    surface: Entity,
+    key: K,
+    instances: &[T],
+    label: &'static str,
+) {
+    let entry = map
+        .entry(surface)
+        .or_insert_with(|| SurfaceInstanceBuffer {
+            buffer: None,
+            capacity: 0,
+            len: 0,
+            key,
+        });
+    entry.key = key;
+    entry.len = instances.len() as u32;
+
+    if instances.is_empty() {
+        // An empty window is a legitimate state (nothing shaped yet); the
+        // key is still recorded so it isn't re-assembled every frame.
+        return;
+    }
+
+    if entry.buffer.is_none() || entry.capacity < instances.len() {
+        let capacity = grow_capacity(entry.capacity, instances.len());
+        entry.buffer = Some(device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size: (capacity * std::mem::size_of::<T>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        entry.capacity = capacity;
+    }
+
+    let buffer = entry
+        .buffer
+        .as_ref()
+        .expect("instance buffer was just allocated");
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(instances));
+}
+
+/// The buffer + instance count to draw out of one map, if there is anything.
+fn draw_range_of<K>(
+    map: &HashMap<Entity, SurfaceInstanceBuffer<K>>,
+    surface: Entity,
+) -> Option<(&Buffer, u32)> {
+    let entry = map.get(&surface)?;
+    let buffer = entry.buffer.as_ref()?;
+    if entry.len == 0 {
+        return None;
+    }
+    Some((buffer, entry.len))
 }
 
 /// Persistent per-surface instance buffers, owned by the render world.
 #[derive(Resource, Default)]
 pub struct SurfaceGpuBuffers {
-    entries: HashMap<Entity, SurfaceInstanceBuffer>,
+    entries: HashMap<Entity, SurfaceInstanceBuffer<InstanceBufferKey>>,
+    chrome: HashMap<Entity, SurfaceInstanceBuffer<ChromeBufferKey>>,
 }
 
 impl SurfaceGpuBuffers {
@@ -108,14 +185,21 @@ impl SurfaceGpuBuffers {
             .is_some_and(|entry| entry.key == key)
     }
 
+    /// Whether `surface`'s chrome buffer already holds `key`'s instances.
+    pub fn chrome_is_current(&self, surface: Entity, key: ChromeBufferKey) -> bool {
+        self.chrome
+            .get(&surface)
+            .is_some_and(|entry| entry.key == key)
+    }
+
     /// The buffer + instance count to draw, if there is anything to draw.
     pub fn draw_range(&self, surface: Entity) -> Option<(&Buffer, u32)> {
-        let entry = self.entries.get(&surface)?;
-        let buffer = entry.buffer.as_ref()?;
-        if entry.len == 0 {
-            return None;
-        }
-        Some((buffer, entry.len))
+        draw_range_of(&self.entries, surface)
+    }
+
+    /// The chrome buffer + instance count to draw.
+    pub fn chrome_draw_range(&self, surface: Entity) -> Option<(&Buffer, u32)> {
+        draw_range_of(&self.chrome, surface)
     }
 
     /// Instances currently uploaded for a surface (0 when it has never been
@@ -140,40 +224,36 @@ impl SurfaceGpuBuffers {
         key: InstanceBufferKey,
         instances: &[GlyphInstance],
     ) {
-        let entry = self
-            .entries
-            .entry(surface)
-            .or_insert_with(|| SurfaceInstanceBuffer {
-                buffer: None,
-                capacity: 0,
-                len: 0,
-                key,
-            });
-        entry.key = key;
-        entry.len = instances.len() as u32;
+        upload_into(
+            &mut self.entries,
+            device,
+            queue,
+            surface,
+            key,
+            instances,
+            "conversation_surface_instances",
+        );
+    }
 
-        if instances.is_empty() {
-            // An empty window is a legitimate state (nothing shaped yet); the
-            // key is still recorded so it isn't re-assembled every frame.
-            return;
-        }
-
-        if entry.buffer.is_none() || entry.capacity < instances.len() {
-            let capacity = grow_capacity(entry.capacity, instances.len());
-            entry.buffer = Some(device.create_buffer(&BufferDescriptor {
-                label: Some("conversation_surface_instances"),
-                size: (capacity * std::mem::size_of::<GlyphInstance>()) as u64,
-                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            entry.capacity = capacity;
-        }
-
-        let buffer = entry
-            .buffer
-            .as_ref()
-            .expect("instance buffer was just allocated");
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(instances));
+    /// Write `instances` into `surface`'s chrome buffer. Same capacity
+    /// doubling, separate allocation.
+    pub fn upload_chrome(
+        &mut self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        surface: Entity,
+        key: ChromeBufferKey,
+        instances: &[ChromeInstance],
+    ) {
+        upload_into(
+            &mut self.chrome,
+            device,
+            queue,
+            surface,
+            key,
+            instances,
+            "conversation_surface_chrome",
+        );
     }
 
     /// Drop buffers for surfaces that no longer exist (pane closed, split
@@ -181,6 +261,7 @@ impl SurfaceGpuBuffers {
     /// surfaces that extracted.
     pub fn retain_surfaces(&mut self, live: &HashSet<Entity>) {
         self.entries.retain(|entity, _| live.contains(entity));
+        self.chrome.retain(|entity, _| live.contains(entity));
     }
 }
 
@@ -197,12 +278,20 @@ pub struct ExtractedSurface {
     /// Scroll offset in logical document px, read in `ExtractSchedule`.
     pub scroll_offset: f32,
     pub key: InstanceBufferKey,
+    pub chrome_key: ChromeBufferKey,
+    /// Where document (0,0) sits in the target, logical px — the pane's
+    /// padding (see [`SurfaceUniforms::origin_logical`]).
+    pub origin_logical: [f32; 2],
     /// Opaque background the pass clears to (see `target.rs` for why opaque,
     /// and why it is *linear*).
     pub clear: LinearRgba,
     /// `Some` when the instance buffer must be rebuilt from these runs;
     /// `None` when the GPU already holds instances built from `key`.
     pub rebuild: Option<Vec<SurfaceRun>>,
+    /// `Some` when the chrome buffer must be re-uploaded. Already built (the
+    /// main world assembles chrome instances directly), so this is a pointer,
+    /// not a copy.
+    pub chrome_rebuild: Option<Arc<Vec<ChromeInstance>>>,
 }
 
 /// Everything extracted for this frame's surfaces.
@@ -218,7 +307,8 @@ pub fn extract_conversation_surfaces(
     mut extracted: ResMut<ExtractedConversationSurfaces>,
     buffers: Res<SurfaceGpuBuffers>,
     path: Extract<Res<ConversationRenderPath>>,
-    surfaces: Extract<Query<(Entity, &ConversationSurface, &UiRttTexture)>>,
+    surfaces: Extract<Query<(Entity, &ConversationSurface, &ChromeInstances, &UiRttTexture)>>,
+    computed_nodes: Extract<Query<&ComputedNode>>,
     geometries: Extract<Query<&ConversationGeometry>>,
     entities: Extract<Res<EditorEntities>>,
     shaped: Extract<Res<ShapedBlockCache>>,
@@ -256,7 +346,7 @@ pub fn extract_conversation_surfaces(
         ..theme.bg.to_linear()
     };
 
-    for (entity, surface, rtt) in surfaces.iter() {
+    for (entity, surface, chrome, rtt) in surfaces.iter() {
         // A texture that has never been allocated has nothing to draw into;
         // `resize_surface_targets` gets to it on the frame layout produces a
         // size, and this picks it up the frame after.
@@ -280,6 +370,29 @@ pub fn extract_conversation_surfaces(
             ))
         };
 
+        let chrome_key = ChromeBufferKey {
+            chrome_version: chrome.version,
+        };
+        let chrome_rebuild = if buffers.chrome_is_current(entity, chrome_key) {
+            None
+        } else {
+            Some(chrome.instances.clone())
+        };
+
+        // The composite node is inset to the pane's padding box, so document
+        // (0,0) — measured from the CONTENT box — sits one padding in. A pane
+        // that hasn't been laid out contributes zero, which is the same
+        // origin slice 1 drew at.
+        let origin_logical = computed_nodes
+            .get(surface.pane)
+            .map(|node| {
+                // `ComputedNode::padding` is physical px, as `min_inset` /
+                // `max_inset` from the border box's corners.
+                let inv = node.inverse_scale_factor();
+                (node.padding.min_inset * inv).to_array()
+            })
+            .unwrap_or([0.0, 0.0]);
+
         extracted.items.push(ExtractedSurface {
             surface: entity,
             target: rtt.image.clone(),
@@ -291,8 +404,11 @@ pub fn extract_conversation_surfaces(
             scale: rtt.width as f32 / rtt.built_width,
             scroll_offset: scroll.offset,
             key,
+            chrome_key,
+            origin_logical,
             clear,
             rebuild,
+            chrome_rebuild,
         });
     }
 }
@@ -334,6 +450,9 @@ pub fn render_conversation_surfaces(
             build_instances(runs, &atlas, &mut instances);
             buffers.upload(&device, &queue, item.surface, item.key, &instances);
         }
+        if let Some(chrome) = &item.chrome_rebuild {
+            buffers.upload_chrome(&device, &queue, item.surface, item.chrome_key, chrome);
+        }
 
         let uniforms = SurfaceUniforms {
             viewport_phys: item.viewport_phys,
@@ -348,8 +467,7 @@ pub fn render_conversation_surfaces(
             text_bias: params.text_bias,
             gamma_correction: params.gamma_correction,
             time: params.time,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            origin_logical: item.origin_logical,
         };
 
         let result = renderer.encode_render(
@@ -360,6 +478,7 @@ pub fn render_conversation_surfaces(
             &atlas.texture,
             &item.target,
             buffers.draw_range(item.surface),
+            buffers.chrome_draw_range(item.surface),
             &uniforms,
             item.clear,
         );

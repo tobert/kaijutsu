@@ -36,8 +36,10 @@ struct Uniforms {
     text_bias: f32,
     gamma_correction: f32,
     time: f32,
-    _pad0: f32,
-    _pad1: f32,
+    // Document (0,0) inside the render target, LOGICAL px. The texture covers
+    // the pane's PADDING box while document coordinates are measured from its
+    // CONTENT box; this is the difference. See view/surface/target.rs.
+    origin_logical: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -84,13 +86,17 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, inst: InstanceInput) -> Vert
 
     // X: logical document space → physical, NEVER snapped. Sub-pixel
     // advances are what keep kerning and monospace columns correct.
-    let x_phys = (inst.baseline_doc.x + inst.quad_offset.x + corner.x * inst.quad_size.x)
-        * uniforms.scale;
+    let x_phys = (inst.baseline_doc.x + inst.quad_offset.x + corner.x * inst.quad_size.x
+        + uniforms.origin_logical.x) * uniforms.scale;
 
     // Y: subtract the scroll offset in LOGICAL space, convert to physical,
     // and snap the BASELINE (not the corner) to an integer physical row.
-    // Mirror of snap_baseline_phys() in surface_renderer.rs.
-    let y_base_phys = round((inst.baseline_doc.y - uniforms.scroll_offset) * uniforms.scale);
+    // Mirror of snap_baseline_phys() in surface_renderer.rs — the document
+    // origin is folded into the doc-space Y before the identical formula, so
+    // the snap still lands on a real physical scanline.
+    let y_base_phys = round(
+        (inst.baseline_doc.y - uniforms.scroll_offset + uniforms.origin_logical.y) * uniforms.scale
+    );
     // The quad is then placed relative to the snapped baseline, so a glyph's
     // shape is rigid — only where the whole quad lands moves with scroll.
     let y_phys = y_base_phys + (inst.quad_offset.y + corner.y * inst.quad_size.y) * uniforms.scale;

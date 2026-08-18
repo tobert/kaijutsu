@@ -4,10 +4,10 @@
 //! size, never document size — which a plain `ImageNode` composites back into
 //! the pane. That is the editor/diff-surface precedent
 //! (`view/editor/render.rs`'s `msdf_surface_bundle`) minus the
-//! `BlockFxMaterial`: slice 1 has no borders, glow or label decoration to
-//! post-process, so the extra material would be a second full-screen draw of
-//! the same pixels for nothing. Slice 2 adds chrome as instanced SDF quads
-//! *inside* this texture, not as a material on top of it.
+//! `BlockFxMaterial`: there is nothing to post-process, because the chrome a
+//! material would have drawn is instanced *inside* this texture instead
+//! (`super::chrome`) — one pass, not a second full-screen draw of the same
+//! pixels.
 //!
 //! # Why the texture is opaque
 //!
@@ -40,11 +40,25 @@
 //! rather than the pane's. Sizing from the node that actually gets drawn is
 //! what keeps the doc→NDC mapping exact; taking the pane's content box
 //! instead would disagree by the pane's padding and shear the text
-//! sub-pixel. The consequence is that the surface's drawing origin is the
-//! pane's *padding* box, so document x=0 lands ~4px left of where the legacy
-//! per-block cells start (they are content-box children). Cosmetic, flagged,
-//! and cheapest to fix later by zeroing the pane padding on the surface path
-//! — not by re-deriving a second size here.
+//! sub-pixel.
+//!
+//! # The document origin
+//!
+//! An absolutely-positioned child is laid out against its parent's **padding**
+//! box, so this texture covers the pane's padding box — while every document
+//! coordinate in the model is measured from the pane's **content** box (that
+//! is what `logical_content_size` hands the window and the shaper). In slice 1
+//! that difference drew the whole surface ~4px up and left of where the legacy
+//! content-box cells sit.
+//!
+//! It is closed by carrying the pane's padding as
+//! `SurfaceUniforms::origin_logical`, added to every document coordinate in
+//! both shaders. The alternative — zeroing the pane's padding under the
+//! surface flag (`ui/tiling_reconciler.rs`) — was rejected because the flag is
+//! BRP-mutable for live A/B: the padding would have to be re-written on every
+//! flip, and the two paths would then be compared at *different* layouts,
+//! which is exactly what an A/B must not do. A uniform costs nothing and
+//! leaves the pane's border/focus styling and both paths' layout untouched.
 
 use bevy::prelude::*;
 

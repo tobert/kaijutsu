@@ -450,9 +450,14 @@ pub fn handle_navigate_blocks(
     let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
+    // The `BlockCellContainer` only exists on the legacy path (its writer,
+    // `spawn_block_cells`, is flag-gated off under
+    // `ConversationRenderPath::Surface`), and all it is wanted for here is
+    // the `FocusedBlockCell` marker — a legacy affordance. Navigation itself
+    // is geometry-native, so its absence must not stop j/k: the surface path
+    // draws its focus ring from `FocusTarget.block_id` alone
+    // (`view::surface::chrome`).
+    let container = containers.get(main_ent).ok();
 
     // Navigate over geometry block rows: every block is navigable whether or
     // not it currently has an entity (the band respawns it as the scroll
@@ -491,7 +496,7 @@ pub fn handle_navigate_blocks(
     // Add FocusedBlockCell marker when the entity exists this frame;
     // otherwise apply_focused_block_marker picks it up once the band
     // spawns it (the scroll below moves the band there).
-    if let Some(entity) = container.get_entity(&new_id) {
+    if let Some(entity) = container.and_then(|c| c.get_entity(&new_id)) {
         commands.entity(entity).insert(FocusedBlockCell);
     }
 
@@ -548,9 +553,9 @@ pub fn handle_jump_to_latest_error(
     let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
+    // Optional for the same reason as `handle_navigate_blocks`: the marker is
+    // legacy-only, the jump is not.
+    let container = containers.get(main_ent).ok();
 
     let Some(target_id) = find_latest_error_block(&editor.blocks()) else {
         debug!("JumpToLatestError: no non-excluded error blocks in document");
@@ -567,7 +572,7 @@ pub fn handle_jump_to_latest_error(
     for entity in focused_markers.iter() {
         commands.entity(entity).remove::<FocusedBlockCell>();
     }
-    if let Some(entity) = container.get_entity(&target_id) {
+    if let Some(entity) = container.and_then(|c| c.get_entity(&target_id)) {
         commands.entity(entity).insert(FocusedBlockCell);
     }
 
@@ -1218,9 +1223,75 @@ pub fn cleanup_stale_focused_markers(
 
 #[cfg(test)]
 mod tests {
-    use super::{NavigationDirection, find_latest_error_block, next_focus_index, scroll_to_rect_visible};
+    use super::{
+        NavigationDirection, find_latest_error_block, handle_navigate_blocks, next_focus_index,
+        scroll_to_rect_visible,
+    };
     use crate::cell::ConversationScrollState;
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
+
+    /// j/k must move focus with **no `BlockCellContainer` in the world**.
+    ///
+    /// That component's only writer is `spawn_block_cells`, which the
+    /// conversation-surface flag gates off — so a hard requirement on it here
+    /// (what this system used to have) means block navigation silently does
+    /// nothing on the surface path, and its focus ring can never move. The
+    /// container is legacy's `FocusedBlockCell` marker bookkeeping; the
+    /// navigation itself reads geometry.
+    #[test]
+    fn block_navigation_works_without_the_legacy_cell_container() {
+        use bevy::prelude::*;
+
+        use crate::input::events::ActionFired;
+        use crate::input::{Action, context::InputContext};
+        use crate::view::geometry::{ConversationGeometry, EstimateParams, RowSeed};
+        use crate::view::{EditorEntities, FocusTarget, MainCell};
+        use kaijutsu_types::Role;
+
+        let mut app = App::new();
+        app.add_message::<ActionFired>();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<FocusTarget>();
+        app.init_resource::<ConversationScrollState>();
+        app.add_systems(Update, handle_navigate_blocks);
+
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let ids: Vec<BlockId> = (1..=3).map(|seq| BlockId::new(ctx, principal, seq)).collect();
+        let mut geom = ConversationGeometry::default();
+        geom.reconcile(
+            &ids,
+            |_| {
+                Some(RowSeed {
+                    text_len: 10,
+                    newline_count: 0,
+                    role: Role::User,
+                    kind: BlockKind::Text,
+                    collapsed: false,
+                    parent_id: None,
+                })
+            },
+            &EstimateParams::default(),
+            1,
+        );
+        geom.recompute_offsets();
+
+        // Deliberately no `BlockCellContainer` — the surface path's world.
+        let main_ent = app.world_mut().spawn((geom, MainCell)).id();
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+
+        app.world_mut().write_message(ActionFired::new(
+            Action::FocusFirstBlock,
+            InputContext::Navigation,
+        ));
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<FocusTarget>().block_id,
+            Some(ids[0]),
+            "j/k must reach FocusTarget without any block-cell entities",
+        );
+    }
 
     fn block(seq: u64, kind: BlockKind, status: Status, excluded: bool) -> kaijutsu_types::BlockSnapshot {
         let id = BlockId::new(ContextId::new(), PrincipalId::new(), seq);

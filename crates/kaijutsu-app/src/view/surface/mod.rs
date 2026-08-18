@@ -2,12 +2,14 @@
 //!
 //! This is the entity-free half of the conversation-surface rewrite
 //! (`docs/conversation-surface.md`): block text is formatted into a cache
-//! keyed by `BlockId` ([`content`]), shaped once into chunked glyph runs
+//! keyed by `BlockId` ([`content`]), given a border and the layout that
+//! border implies ([`chrome`]), shaped once into chunked glyph runs
 //! ([`chunk`] + [`shape_cache`]), measured back into
 //! [`ConversationGeometry`], and finally reduced to a scroll window of
-//! document-space runs the render world will extract ([`window`]). No Bevy
-//! UI node, no per-block RTT, no taffy — a block that scrolls into view
-//! costs a binary search and a buffer re-upload, not a spawn.
+//! document-space runs and chrome quads the render world will extract
+//! ([`window`] + [`chrome`]). No Bevy UI node, no per-block RTT, no taffy —
+//! a block that scrolls into view costs a binary search and a buffer
+//! re-upload, not a spawn.
 //!
 //! Everything here is **behind the flag**: [`ConversationRenderPath`]
 //! selects `Legacy` (today's `cell/plugin.rs` systems) or `Surface` (these),
@@ -63,6 +65,7 @@ use bevy::render::{
     renderer::RenderDevice,
 };
 
+pub mod chrome;
 pub mod chunk;
 pub mod content;
 pub mod extract;
@@ -150,11 +153,13 @@ pub struct SurfaceWindow {
 /// One conversation pane's drawing surface.
 ///
 /// Spawned one-per-[`crate::cell::ConversationContainer`] by
-/// [`window::ensure_conversation_surfaces`]. Carries no UI node of its own in
-/// this slice — the RTT + `ImageNode` composition lands with the render-world
-/// half.
+/// [`window::ensure_conversation_surfaces`]. The RTT + `ImageNode` composite
+/// arrives with [`target::attach_surface_targets`]; the chrome instances ride
+/// along as a required component so a surface can never exist without a place
+/// to put its borders.
 #[derive(Component, Debug, Reflect)]
 #[reflect(Component)]
+#[require(chrome::ChromeInstances)]
 pub struct ConversationSurface {
     /// The `ConversationContainer` entity this surface draws for. Its
     /// `ComputedNode` is the viewport size; its pane owns the scroll state.
@@ -179,15 +184,17 @@ impl ConversationSurface {
 /// one sits where it does relative to `smooth_scroll`.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SurfaceSet {
-    /// Format block text into [`content::BlockContentCache`]; keep the
-    /// per-pane surface entities in step with the panes.
+    /// Format block text into [`content::BlockContentCache`] and its border
+    /// into [`chrome::BlockChromeCache`]; keep the per-pane surface entities
+    /// in step with the panes.
     Content,
     /// Shape in-window blocks into [`shape_cache::ShapedBlockCache`].
     Shape,
     /// Feed shaped heights back into `ConversationGeometry` and
     /// anchor-compensate the scroll offset.
     Measure,
-    /// Decide the slack window each surface holds buffers for.
+    /// Decide the slack window each surface holds buffers for, and assemble
+    /// the chrome quads that cover it.
     Window,
 }
 
@@ -213,6 +220,7 @@ impl Plugin for ConversationSurfacePlugin {
 
         app.insert_resource(ConversationRenderPath::from_env())
             .init_resource::<content::BlockContentCache>()
+            .init_resource::<chrome::BlockChromeCache>()
             .init_resource::<shape_cache::ShapedBlockCache>()
             .init_resource::<shape_cache::HeaderLabelCache>()
             .init_resource::<shape_cache::SurfaceMetricsEpoch>();
@@ -249,6 +257,9 @@ impl Plugin for ConversationSurfacePlugin {
                 target::attach_surface_targets.after(window::ensure_conversation_surfaces),
                 shape_cache::track_surface_metrics_epoch,
                 content::sync_block_content,
+                // Border styles decide the wrap width, so they must be
+                // current before anything shapes against them.
+                chrome::sync_block_chrome.after(content::sync_block_content),
             )
                 .in_set(SurfaceSet::Content)
                 .run_if(surface_active),
@@ -267,7 +278,13 @@ impl Plugin for ConversationSurfacePlugin {
         );
         app.add_systems(
             Update,
-            window::build_surface_window
+            (
+                window::build_surface_window,
+                // Chrome rects are a function of the built window's rows, so
+                // this follows — and carries its own version, so a focus move
+                // or a status pulse never re-uploads a glyph.
+                chrome::build_chrome_instances.after(window::build_surface_window),
+            )
                 .in_set(SurfaceSet::Window)
                 .run_if(surface_active),
         );

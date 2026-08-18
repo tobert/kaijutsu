@@ -18,8 +18,12 @@
 //! regression, but no win yet either. The async backlog, tail freezing, LRU
 //! eviction and the theme-recolor fast path are slice 3 — `glyph_count` and
 //! `last_used` are kept live here so that slice has its inputs from day one.
-//! Chrome (borders, padding, labels) is slice 2, so a block's shaped height
-//! is its text height with no border padding added.
+//!
+//! Where a block's text sits — its wrap width, its inset inside a border box,
+//! and therefore its row height — is decided by [`super::chrome`], because
+//! the border padding is a layout property of the border. This module asks
+//! for the layout and bakes it into [`ShapedBlock`]; it does not re-derive
+//! it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,12 +160,20 @@ pub struct ShapedChunk {
 pub struct ShapedBlock {
     pub key: ShapeKey,
     pub chunks: Vec<ShapedChunk>,
-    /// Total text height (sum of chunk heights). No border padding — chrome
-    /// is slice 2.
+    /// The row height the geometry measures: text height **plus** the border
+    /// padding above and below it, matching legacy's
+    /// `content_height + pad_top + pad_bottom` (`build_block_scenes`).
     pub height: f32,
-    /// Horizontal offset of the block's text origin within the surface
-    /// (indent). Baked at shape time so assembly needs no theme access.
+    /// Sum of the chunk heights — the text alone.
+    pub text_height: f32,
+    /// Horizontal offset of the block's text origin within the surface:
+    /// indent + the border box's margin + its left padding
+    /// (`chrome::BlockLayout::text_x`). Baked at shape time so assembly needs
+    /// no theme access.
     pub x_offset: f32,
+    /// Vertical offset of the text within the block's row — the border's top
+    /// padding (`chrome::BlockLayout::text_y`).
+    pub y_offset: f32,
     /// Total glyphs held here — the input to slice 3's memory budget.
     pub glyph_count: usize,
     /// [`ShapedBlockCache::tick`] at the last time this block was wanted —
@@ -275,7 +287,7 @@ impl HeaderLabelCache {
 // SHAPING
 // ============================================================================
 
-/// The wrap width available to a block's text.
+/// The column width available to a block, indent removed.
 ///
 /// Derived the same way `sync_conversation_geometry` derives its estimate
 /// columns (`geometry.rs:591-598`): the conversation container's
@@ -283,9 +295,9 @@ impl HeaderLabelCache {
 /// heights, scroll offsets, wrap widths — comes from one source. Indent
 /// (`update_block_cell_nodes`'s left margin) comes off the top.
 ///
-/// Slice 1 has no chrome, so the border glow margin and border padding the
-/// legacy node carries are *not* subtracted; that arrives with slice 2 and
-/// will narrow every block by a few px at that point.
+/// This is the *column*, not the wrap width: a bordered block also loses its
+/// glow margin and its padding, which `super::chrome::surface_block_layout`
+/// takes off on top of this.
 pub fn surface_wrap_width(container_width: f32, indent_level: u32, indent_width: f32) -> f32 {
     (container_width - indent_level as f32 * indent_width).max(1.0)
 }
@@ -399,6 +411,7 @@ pub fn shape_visible_blocks(
     font_handles: Res<ShapingFonts>,
     metrics_epoch: Res<SurfaceMetricsEpoch>,
     content: Res<super::content::BlockContentCache>,
+    chrome: Res<super::chrome::BlockChromeCache>,
     atlas: Option<ResMut<MsdfAtlas>>,
     font_data: Option<ResMut<FontDataMap>>,
     mut shaped: ResMut<ShapedBlockCache>,
@@ -464,8 +477,16 @@ pub fn shape_visible_blocks(
                     // a hole). It will be here next frame.
                     continue;
                 };
-                let wrap_width =
-                    surface_wrap_width(container_width, row.indent_level, theme.indent_width);
+                // Chrome decides the wrap width: a bordered block's text is
+                // laid out inside its padding, exactly as `build_block_scenes`
+                // lays it out inside the same padding on the legacy path.
+                let layout = chrome.layout(
+                    &id,
+                    container_width,
+                    row.indent_level,
+                    theme.indent_width,
+                );
+                let wrap_width = layout.wrap_width;
                 let key = ShapeKey {
                     content_version: formatted.version,
                     wrap_width_bits: wrap_width.to_bits(),
@@ -477,12 +498,21 @@ pub fn shape_visible_blocks(
                 if let Some(existing) = shaped.blocks.get_mut(&id) {
                     if existing.key == key {
                         existing.last_used = tick;
+                        // Padding can move without the wrap width moving —
+                        // a ToolResult that joins the call above it loses
+                        // half its top padding, and nothing horizontal
+                        // changes. Refresh the placement every pass (three
+                        // stores) rather than adding a non-shaping input to
+                        // `ShapeKey` and re-shaping for it.
+                        existing.x_offset = layout.text_x;
+                        existing.y_offset = layout.text_y;
+                        existing.height = layout.outer_height(existing.text_height);
                         continue;
                     }
                 }
 
                 let style = block_text_style(&text_metrics, bevy_color_to_brush(formatted.color));
-                let (chunks, height, keys) = shape_block(
+                let (chunks, text_height, keys) = shape_block(
                     font,
                     &formatted.text,
                     &formatted.spans,
@@ -501,8 +531,10 @@ pub fn shape_visible_blocks(
                     ShapedBlock {
                         key,
                         chunks,
-                        height,
-                        x_offset: row.indent_level as f32 * theme.indent_width,
+                        height: layout.outer_height(text_height),
+                        text_height,
+                        x_offset: layout.text_x,
+                        y_offset: layout.text_y,
                         glyph_count,
                         last_used: tick,
                     },
@@ -1124,7 +1156,9 @@ mod tests {
             },
             chunks: Vec::new(),
             height,
+            text_height: height,
             x_offset: 0.0,
+            y_offset: 0.0,
             glyph_count: 0,
             last_used: 0,
         };

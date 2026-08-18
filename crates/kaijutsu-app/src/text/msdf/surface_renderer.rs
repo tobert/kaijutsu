@@ -48,6 +48,7 @@ use bevy::render::{
 use bytemuck::{Pod, Zeroable};
 
 use super::renderer::{ExtractedMsdfAtlas, MSDF_PX_PER_EM};
+use crate::view::surface::chrome::ChromeInstance;
 use crate::view::surface::window::SurfaceRun;
 
 /// Vertices per glyph quad (non-indexed triangle list).
@@ -92,9 +93,10 @@ pub struct GlyphInstance {
 /// paid down (a tracked follow-up in the plan's Risks).
 ///
 /// Layout is hand-checked against the WGSL `Uniforms` struct: every member is
-/// 4-byte aligned, the two `vec2`s sit at offsets 0 and 16 (8-aligned as WGSL
-/// requires), and two trailing pads round the size to 64 so the uniform
-/// binding is a multiple of 16.
+/// 4-byte aligned, the three `vec2`s sit at offsets 0, 16 and 56 (8-aligned as
+/// WGSL requires), and the block is 64 bytes so the uniform binding is a
+/// multiple of 16. Both `msdf_surface.wgsl` and `surface_chrome.wgsl` mirror
+/// it — a field added here is added twice.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, ShaderType)]
 pub struct SurfaceUniforms {
@@ -115,12 +117,24 @@ pub struct SurfaceUniforms {
     pub vert_scale: f32,
     pub text_bias: f32,
     pub gamma_correction: f32,
-    /// Seconds, for animated effects. Unused in slice 1 (no rainbow on the
-    /// surface path yet) but kept so the uniform doesn't have to change shape
-    /// when chrome animation lands in slice 2.
+    /// Seconds, for animated effects — the chrome pass's breathe/pulse/chase
+    /// clock (`surface_chrome.wgsl`). The glyph pass ignores it.
     pub time: f32,
-    pub _pad0: f32,
-    pub _pad1: f32,
+    /// Where document (0, 0) sits inside the render target, in **logical**
+    /// px.
+    ///
+    /// The composite node is absolutely positioned at all four insets zero,
+    /// so the texture covers the pane's **padding** box, while every document
+    /// coordinate in the model is measured from the **content** box (that is
+    /// what `logical_content_size` gives the window and the shaper). The
+    /// difference is the pane's padding, and carrying it here is what keeps
+    /// the surface's text and chrome landing on the same pixels the legacy
+    /// per-block cells land on — see `view/surface/target.rs`.
+    ///
+    /// It occupies the two trailing pads the struct used to carry, so the
+    /// uniform is still 64 bytes and still 8-byte aligned where WGSL needs a
+    /// `vec2`.
+    pub origin_logical: [f32; 2],
 }
 
 impl Default for SurfaceUniforms {
@@ -138,8 +152,7 @@ impl Default for SurfaceUniforms {
             text_bias: 0.5,
             gamma_correction: 0.85,
             time: 0.0,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            origin_logical: [0.0, 0.0],
         }
     }
 }
@@ -152,6 +165,9 @@ impl Default for SurfaceUniforms {
 /// ```wgsl
 /// let y_base_phys = round((in.baseline_doc.y - u.scroll_offset) * u.scale);
 /// ```
+///
+/// (The shader folds `u.origin_logical.y` into the doc-space Y before this —
+/// a constant document offset, not a change to the formula.)
 ///
 /// Snapping happens *after* the scroll subtraction and *in physical space*,
 /// for the reason `MsdfBlockRenderer::build_vertices` documents at length: at
@@ -174,12 +190,20 @@ pub fn snap_baseline_phys(doc_y: f32, scroll: f32, scale: f32) -> f32 {
     ((doc_y - scroll) * scale).round()
 }
 
-/// Render-world resource: the instanced glyph pipeline.
+/// Render-world resource: the instanced glyph pipeline **and** the instanced
+/// chrome pipeline.
+///
+/// Two pipelines, one pass, one uniform buffer. The chrome pipeline gets its
+/// own bind group layout — uniform only, no atlas — so borders draw on a
+/// frame where the glyph atlas hasn't reached the GPU yet, instead of
+/// inheriting the text pass's readiness.
 #[derive(Resource)]
 pub struct ConversationSurfaceRenderer {
     pub pipeline: CachedRenderPipelineId,
     pub bind_group_layout: BindGroupLayout,
     pub sampler: Sampler,
+    pub chrome_pipeline: CachedRenderPipelineId,
+    pub chrome_bind_group_layout: BindGroupLayout,
 }
 
 /// What a surface pass actually managed to encode. Split rather than a bare
@@ -229,6 +253,48 @@ impl ConversationSurfaceRenderer {
                 VertexAttribute {
                     format: VertexFormat::Float32,
                     offset: 44,
+                    shader_location: 5,
+                },
+            ],
+        }
+    }
+
+    /// The chrome instance layout. Attribute offsets mirror
+    /// [`ChromeInstance`]'s field order exactly; both are pinned by
+    /// `chrome_instance_layout_matches_the_struct`.
+    pub fn chrome_instance_layout() -> VertexBufferLayout {
+        VertexBufferLayout {
+            array_stride: std::mem::size_of::<ChromeInstance>() as u64,
+            step_mode: VertexStepMode::Instance,
+            attributes: vec![
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 16,
+                    shader_location: 1,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x2,
+                    offset: 32,
+                    shader_location: 2,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x2,
+                    offset: 40,
+                    shader_location: 3,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Unorm8x4,
+                    offset: 48,
+                    shader_location: 4,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Uint32,
+                    offset: 52,
                     shader_location: 5,
                 },
             ],
@@ -316,10 +382,69 @@ impl ConversationSurfaceRenderer {
             zero_initialize_workgroup_memory: false,
         });
 
+        // ── Chrome ──────────────────────────────────────────────────────
+        //
+        // Uniform only: no atlas, no sampler. Borders must be able to draw on
+        // a frame the glyph atlas hasn't reached the GPU on.
+        let chrome_layout_entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX_FRAGMENT,
+            (uniform_buffer::<SurfaceUniforms>(false),),
+        );
+        let chrome_bind_group_layout_descriptor = BindGroupLayoutDescriptor::new(
+            "surface_chrome_bind_group_layout",
+            &chrome_layout_entries,
+        );
+        let chrome_bind_group_layout = device.create_bind_group_layout(
+            "surface_chrome_bind_group_layout",
+            &chrome_layout_entries,
+        );
+        let chrome_shader = asset_server.load("shaders/surface_chrome.wgsl");
+        let chrome_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("surface_chrome_pipeline".into()),
+            layout: vec![chrome_bind_group_layout_descriptor],
+            vertex: VertexState {
+                shader: chrome_shader.clone(),
+                entry_point: Some("vertex".into()),
+                shader_defs: vec![],
+                buffers: vec![Self::chrome_instance_layout()],
+            },
+            fragment: Some(FragmentState {
+                shader: chrome_shader,
+                entry_point: Some("fragment".into()),
+                shader_defs: vec![],
+                targets: vec![Some(ColorTargetState {
+                    format: TextureFormat::Rgba8Unorm,
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::OneMinusSrcAlpha,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::OneMinusSrcAlpha,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            immediate_size: 0,
+            zero_initialize_workgroup_memory: false,
+        });
+
         Self {
             pipeline,
             bind_group_layout,
             sampler,
+            chrome_pipeline,
+            chrome_bind_group_layout,
         }
     }
 
@@ -331,6 +456,11 @@ impl ConversationSurfaceRenderer {
     /// nothing to draw: the surface owns every pixel of its viewport, so a
     /// frame that draws no glyphs must still repaint the background rather
     /// than leave the previous frame's text standing.
+    ///
+    /// Chrome draws **first**, glyphs over it — `block_fx.wgsl` composites
+    /// both the border stroke and its glow behind the block's text, so
+    /// putting the quads under the glyphs is what reproduces it (see
+    /// `view::surface::chrome`).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_render(
         &self,
@@ -341,6 +471,7 @@ impl ConversationSurfaceRenderer {
         atlas_image: &Handle<Image>,
         target_image: &Handle<Image>,
         instances: Option<(&Buffer, u32)>,
+        chrome: Option<(&Buffer, u32)>,
         uniforms: &SurfaceUniforms,
         clear: bevy::color::LinearRgba,
     ) -> SurfacePassResult {
@@ -361,22 +492,46 @@ impl ConversationSurfaceRenderer {
                 Some((pipeline, atlas_gpu, buffer, count))
             });
 
-        let bind_group = draw.map(|(_, atlas_gpu, _, _)| {
-            let uniform_buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+        let chrome_draw = chrome
+            .filter(|(_, count)| *count > 0)
+            .and_then(|(buffer, count)| {
+                let pipeline = pipeline_cache.get_render_pipeline(self.chrome_pipeline)?;
+                Some((pipeline, buffer, count))
+            });
+
+        // One uniform buffer for both pipelines — the two bind group layouts
+        // differ only in what else they carry.
+        let uniform_buffer = (draw.is_some() || chrome_draw.is_some()).then(|| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("msdf_surface_uniforms"),
                 contents: bytemuck::bytes_of(uniforms),
                 usage: BufferUsages::UNIFORM,
-            });
-            device.create_bind_group(
-                "msdf_surface_bind_group",
-                &self.bind_group_layout,
-                &BindGroupEntries::sequential((
-                    uniform_buffer.as_entire_binding(),
-                    &atlas_gpu.texture_view,
-                    &self.sampler,
-                )),
-            )
+            })
         });
+
+        let bind_group = draw.zip(uniform_buffer.as_ref()).map(
+            |((_, atlas_gpu, _, _), uniform_buffer)| {
+                device.create_bind_group(
+                    "msdf_surface_bind_group",
+                    &self.bind_group_layout,
+                    &BindGroupEntries::sequential((
+                        uniform_buffer.as_entire_binding(),
+                        &atlas_gpu.texture_view,
+                        &self.sampler,
+                    )),
+                )
+            },
+        );
+
+        let chrome_bind_group = chrome_draw.zip(uniform_buffer.as_ref()).map(
+            |(_, uniform_buffer)| {
+                device.create_bind_group(
+                    "surface_chrome_bind_group",
+                    &self.chrome_bind_group_layout,
+                    &BindGroupEntries::sequential((uniform_buffer.as_entire_binding(),)),
+                )
+            },
+        );
 
         let mut drawn = 0u32;
         {
@@ -396,6 +551,15 @@ impl ConversationSurfaceRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+
+            if let (Some((pipeline, buffer, count)), Some(bind_group)) =
+                (chrome_draw, &chrome_bind_group)
+            {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, bind_group, &[]);
+                render_pass.set_vertex_buffer(0, *buffer.slice(..));
+                render_pass.draw(0..SURFACE_QUAD_VERTICES, 0..count);
+            }
 
             if let (Some((pipeline, _, buffer, count)), Some(bind_group)) = (draw, &bind_group) {
                 render_pass.set_pipeline(pipeline);
@@ -743,5 +907,38 @@ mod tests {
         assert_eq!(std::mem::size_of::<SurfaceUniforms>(), 64);
         assert_eq!(std::mem::size_of::<SurfaceUniforms>() % 16, 0);
         assert_eq!(SurfaceUniforms::min_size().get(), 64);
+    }
+
+    /// Same contract for the chrome pipeline: the stride and offsets are what
+    /// `surface_chrome.wgsl`'s `@location`s read, and `kind` is a `u32` —
+    /// reading it as a float (or at the wrong offset) draws every border as
+    /// the wrong kind, silently.
+    #[test]
+    fn chrome_instance_layout_matches_the_struct() {
+        let layout = ConversationSurfaceRenderer::chrome_instance_layout();
+        assert_eq!(layout.array_stride, 56);
+        assert_eq!(layout.step_mode, VertexStepMode::Instance);
+        let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
+        assert_eq!(offsets, vec![0, 16, 32, 40, 48, 52]);
+        assert_eq!(std::mem::size_of::<ChromeInstance>(), 56);
+        assert_eq!(
+            layout.attributes[5].format,
+            VertexFormat::Uint32,
+            "the border kind is an integer on both sides",
+        );
+    }
+
+    /// The document origin lives in the two words the uniform used to pad
+    /// with, so the block stays 64 bytes. A `vec2` in WGSL needs 8-byte
+    /// alignment, and offset 56 is the last place one fits.
+    #[test]
+    fn the_document_origin_occupies_the_uniforms_trailing_pad() {
+        let uniforms = SurfaceUniforms {
+            origin_logical: [4.0, 4.0],
+            ..SurfaceUniforms::default()
+        };
+        let bytes = bytemuck::bytes_of(&uniforms);
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(&bytes[56..64], bytemuck::bytes_of(&[4.0_f32, 4.0_f32]));
     }
 }

@@ -5,10 +5,21 @@
 //! against the block's MSDF-rendered content texture. No vello scene, no
 //! child entities: the border lives entirely in `MaterialNode<BlockFxMaterial>`
 //! uniforms on the block cell's own entity.
+//!
+//! # Two callers, one core
+//!
+//! [`compute_border_style`] and [`apply_focus_style`] are **entity-free** and
+//! take [`BorderInputs`] — the handful of snapshot fields the decision
+//! actually reads — rather than a `BlockSnapshot` or an ECS query. The legacy
+//! path ([`determine_block_border_style`]) converts each snapshot on the way
+//! in; the conversation surface (`view::surface::chrome`) carries the same
+//! struct in its content cache and calls the same functions. Neither path may
+//! grow its own copy of the rules: a border that differs between paths is an
+//! A/B difference nobody can attribute.
 
 use bevy::prelude::*;
 
-use kaijutsu_types::ToolKind;
+use kaijutsu_types::{BlockId, ErrorCategory, ErrorSeverity, Status, ToolKind};
 
 use crate::connection::RpcConnectionState;
 use crate::text::TextMetrics;
@@ -132,9 +143,66 @@ pub struct BlockExcludedState(pub bool);
 // ============================================================================
 
 /// Context for computing border labels (username, model name).
-struct BorderContext {
-    username: String,
-    model: String,
+#[derive(Debug, Default, Clone)]
+pub struct BorderContext {
+    pub username: String,
+    pub model: String,
+}
+
+/// Everything [`compute_border_style`] reads out of a block.
+///
+/// A `Copy` projection of `BlockSnapshot`, deliberately narrow: it is what
+/// lets the border rules run somewhere that has no snapshot in hand (the
+/// surface's `BlockContentCache` stores one of these per block and never
+/// touches the block store again). `content` collapses to the one question the
+/// rules ask of it — is it blank — so the struct stays allocation-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderInputs {
+    pub id: BlockId,
+    pub kind: BlockKind,
+    pub role: Role,
+    pub status: Status,
+    pub tool_kind: Option<ToolKind>,
+    pub tool_call_id: Option<BlockId>,
+    /// `content.trim().is_empty()` — an empty successful tool result draws no
+    /// border at all.
+    pub content_empty: bool,
+    pub has_output: bool,
+    pub is_error: bool,
+    pub collapsed: bool,
+    pub excluded: bool,
+    pub drift_kind: Option<DriftKind>,
+    /// `(category, severity)` from a structured error payload.
+    pub error: Option<(ErrorCategory, ErrorSeverity)>,
+}
+
+impl BorderInputs {
+    pub fn from_snapshot(block: &BlockSnapshot) -> Self {
+        Self {
+            id: block.id,
+            kind: block.kind,
+            role: block.role,
+            status: block.status,
+            tool_kind: block.tool_kind,
+            tool_call_id: block.tool_call_id,
+            content_empty: block.content.trim().is_empty(),
+            has_output: block.output.is_some(),
+            is_error: block.is_error,
+            collapsed: block.collapsed,
+            excluded: block.excluded,
+            drift_kind: block.drift_kind,
+            error: block.error.as_ref().map(|e| (e.category, e.severity)),
+        }
+    }
+
+    /// Whether this block is a *visible* tool result — the predicate that
+    /// decides whether the call above it joins to it (`OpenBottom`) or closes
+    /// itself off (`Full`). Shared so both paths pair calls to results the
+    /// same way.
+    pub fn is_visible_tool_result(&self) -> bool {
+        self.kind == BlockKind::ToolResult
+            && (!self.content_empty || self.has_output || self.is_error)
+    }
 }
 
 /// Examine each BlockCell's snapshot and add/update/remove `BlockBorderStyle`.
@@ -189,7 +257,11 @@ pub fn determine_block_border_style(
     let blocks: std::collections::HashMap<_, _> = container
         .block_cells
         .keys()
-        .filter_map(|id| editor.block_snapshot(id).map(|s| (*id, s)))
+        .filter_map(|id| {
+            editor
+                .block_snapshot(id)
+                .map(|s| (*id, BorderInputs::from_snapshot(&s)))
+        })
         .collect();
 
     // Build set of tool_call_ids that have a *visible* ToolResult.
@@ -200,8 +272,7 @@ pub fn determine_block_border_style(
     // outer band edge may briefly mis-join until its result scrolls in.
     let has_result: std::collections::HashSet<_> = blocks
         .values()
-        .filter(|b| b.kind == BlockKind::ToolResult)
-        .filter(|b| !b.content.trim().is_empty() || b.output.is_some() || b.is_error)
+        .filter(|b| b.is_visible_tool_result())
         .filter_map(|b| b.tool_call_id)
         .collect();
 
@@ -264,16 +335,20 @@ pub fn determine_block_border_style(
 
 /// Decide border style for a block based on kind, status, and content.
 ///
-/// `has_result`: true if this ToolCall block has a paired ToolResult below.
-fn compute_border_style(
-    block: &BlockSnapshot,
+/// Pure and entity-free — see the module docs. `has_result`: true if this
+/// ToolCall block has a paired ToolResult below.
+///
+/// `font_size` scales the padding, and that padding is **layout**: the legacy
+/// path lays text out inside it (`build_block_scenes`) and the surface path
+/// subtracts it from the wrap width (`view::surface::chrome`). Changing it
+/// changes where lines break on both paths.
+pub fn compute_border_style(
+    block: &BorderInputs,
     theme: &Theme,
     ctx: &BorderContext,
     has_result: bool,
     font_size: f32,
 ) -> Option<BlockBorderStyle> {
-    use kaijutsu_types::Status;
-
     // Padding scales with font size: block_border_padding is a multiplier.
     // This defines the clearance between the border stroke and text content.
     let base = theme.block_border_padding * font_size;
@@ -350,9 +425,7 @@ fn compute_border_style(
             })
         }
         BlockKind::ToolResult => {
-            let content = block.content.trim();
-            let has_output = block.output.is_some();
-            if content.is_empty() && !has_output && !block.is_error {
+            if !block.is_visible_tool_result() {
                 return None; // empty success — no border
             }
 
@@ -469,33 +542,30 @@ fn compute_border_style(
             })
         }
         BlockKind::Error => {
-            let (color, animation, border_kind) =
-                match block.error.as_ref().map(|e| e.severity) {
-                    Some(kaijutsu_types::ErrorSeverity::Warning) => (
-                        theme.block_border_error_warning,
-                        BorderAnimation::None,
-                        BorderKind::Dashed,
-                    ),
-                    Some(kaijutsu_types::ErrorSeverity::Fatal) => (
-                        theme.block_border_error_fatal,
-                        BorderAnimation::Pulse,
-                        BorderKind::Full,
-                    ),
-                    _ => (
-                        theme.block_border_error,
-                        BorderAnimation::Pulse,
-                        BorderKind::Full,
-                    ),
-                };
+            let (color, animation, border_kind) = match block.error.map(|(_, severity)| severity) {
+                Some(ErrorSeverity::Warning) => (
+                    theme.block_border_error_warning,
+                    BorderAnimation::None,
+                    BorderKind::Dashed,
+                ),
+                Some(ErrorSeverity::Fatal) => (
+                    theme.block_border_error_fatal,
+                    BorderAnimation::Pulse,
+                    BorderKind::Full,
+                ),
+                _ => (
+                    theme.block_border_error,
+                    BorderAnimation::Pulse,
+                    BorderKind::Full,
+                ),
+            };
             let severity_label = block
                 .error
-                .as_ref()
-                .map(|e| e.severity.as_str())
+                .map(|(_, severity)| severity.as_str())
                 .unwrap_or("error");
             let category_label = block
                 .error
-                .as_ref()
-                .map(|e| e.category.as_str())
+                .map(|(category, _)| category.as_str())
                 .unwrap_or("error");
             Some(BlockBorderStyle {
                 kind: border_kind,
@@ -542,7 +612,7 @@ fn compute_border_style(
 ///   Padding feeds text layout in `build_block_scenes`.
 /// - A borderless block gains a minimal ring with ZERO padding — the same
 ///   clearance as no border at all, drawn purely by the `block_fx` shader.
-fn apply_focus_style(
+pub fn apply_focus_style(
     style: Option<BlockBorderStyle>,
     focused: bool,
     theme: &Theme,
