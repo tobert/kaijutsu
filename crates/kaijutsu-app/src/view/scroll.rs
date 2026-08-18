@@ -5,6 +5,7 @@ use bevy::winit::WinitSettings;
 
 use crate::cell::{ConversationScrollState, EditorEntities};
 use crate::input::ScrollConfig;
+use crate::view::surface::ConversationRenderPath;
 
 /// Exponential-decay ease progress for a frame of length `dt` (seconds) at
 /// rate `smooth_speed` (per second): the fraction of the remaining distance
@@ -27,11 +28,23 @@ fn ease_t(smooth_speed: f32, dt: f32) -> f32 {
 /// In follow mode, locks directly to bottom (no interpolation).
 /// Interpolation is only used for manual scrolling (wheel, Page Up/Down, etc.)
 /// to prevent "chasing a moving target" stutter during streaming.
+///
+/// Runs unconditionally on **both** conversation render paths — legacy and
+/// surface (`view::surface`) — because `ConversationScrollState.offset` is
+/// the one piece of scroll state every consumer reads: legacy translates it
+/// into `ScrollPosition` for taffy, the surface path reads `offset` straight
+/// off this resource at window-extraction time (`view::surface::window`).
+/// Only the final `ScrollPosition` write below is path-specific — taffy
+/// doesn't exist on the surface path's draw surface, so there is nothing for
+/// that write to drive — and is skipped under `Surface` while everything
+/// above it (the easing math, `scroll_state` itself) keeps running
+/// identically on both paths.
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
     time: Res<Time>,
     config: Res<ScrollConfig>,
     entities: Res<EditorEntities>,
+    render_path: Res<ConversationRenderPath>,
     mut scroll_positions: Query<
         (&mut ScrollPosition, &ComputedNode),
         With<crate::cell::ConversationContainer>,
@@ -109,19 +122,36 @@ pub fn smooth_scroll(
         state.visible_height = new_visible;
     }
 
+    // `ScrollPosition` is the legacy taffy translation of `offset` — the
+    // surface path has no taffy node to scroll and reads `offset` off
+    // `ConversationScrollState` directly at window-extraction time. Under
+    // `Surface` the position must be actively held at ZERO, not merely left
+    // unwritten: bevy_ui translates every child of the container by it,
+    // absolute-positioned ones included, so a stale value (e.g. from a live
+    // Legacy→Surface flip over BRP) parks the surface composite thousands of
+    // px off-screen (found live, 2026-08-18: UiGlobalTransform y = -2213).
     if let Some(conv) = entities.conversation_container
         && let Ok((mut scroll_pos, _)) = scroll_positions.get_mut(conv)
     {
-        // Write the raw logical offset — no rounding. `ScrollPosition` is
-        // logical px; Bevy multiplies by the scale factor and floors to a
-        // physical pixel downstream. Rounding here first threw away
-        // sub-pixel resolution before that multiply, which at 2x scale (or
-        // higher) halved (or worse) the granularity actually available —
-        // e.g. a 0.6 logical-px change (1.2 physical px at 2x, a real,
-        // renderable step) rounded to 0 and was dropped entirely.
-        let current_y = scroll_pos.y;
-        if (new_offset - current_y).abs() > 0.01 {
-            **scroll_pos = Vec2::new(scroll_pos.x, new_offset);
+        match *render_path {
+            ConversationRenderPath::Legacy => {
+                // Write the raw logical offset — no rounding. `ScrollPosition` is
+                // logical px; Bevy multiplies by the scale factor and floors to a
+                // physical pixel downstream. Rounding here first threw away
+                // sub-pixel resolution before that multiply, which at 2x scale (or
+                // higher) halved (or worse) the granularity actually available —
+                // e.g. a 0.6 logical-px change (1.2 physical px at 2x, a real,
+                // renderable step) rounded to 0 and was dropped entirely.
+                let current_y = scroll_pos.y;
+                if (new_offset - current_y).abs() > 0.01 {
+                    **scroll_pos = Vec2::new(scroll_pos.x, new_offset);
+                }
+            }
+            ConversationRenderPath::Surface => {
+                if scroll_pos.x != 0.0 || scroll_pos.y != 0.0 {
+                    **scroll_pos = Vec2::ZERO;
+                }
+            }
         }
     }
 }

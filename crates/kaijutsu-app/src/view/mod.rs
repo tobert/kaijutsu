@@ -43,6 +43,7 @@ pub mod scene_palette;
 pub mod shell_dock;
 pub mod scroll;
 pub mod submit;
+pub mod surface;
 pub mod sync;
 pub mod time_well;
 pub mod tracker;

@@ -31,6 +31,11 @@ use super::sparkline::{
 use crate::view::format::{OutputLayout, compute_output_layout, format_output_data};
 
 /// Per-span brush mapping: byte range → Brush.
+///
+/// `Clone`/`Debug` so the conversation surface can cache spans alongside the
+/// formatted text they describe and slice them per shaping chunk
+/// (`view::surface::chunk::slice_spans`).
+#[derive(Clone, Debug)]
 pub struct SpanBrush {
     /// Byte offset of span start in the concatenated plain text.
     pub start: usize,

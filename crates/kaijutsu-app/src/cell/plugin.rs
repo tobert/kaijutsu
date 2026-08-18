@@ -40,6 +40,8 @@ use crate::view::{
     SubmitFailed, ViewingConversation,
 };
 
+use crate::view::surface::ConversationRenderPath;
+
 use crate::view::geometry as view_geometry;
 use crate::view::lifecycle as view_lifecycle;
 use crate::view::overlay as view_overlay;
@@ -48,6 +50,17 @@ use crate::view::render as view_render;
 use crate::view::scroll as view_scroll;
 use crate::view::submit as view_submit;
 use crate::view::sync as view_sync;
+
+/// Run condition: the legacy taffy conversation path is live (the default).
+///
+/// The mirror image of `view::surface::surface_active`, but defined here
+/// rather than there — this gates the *legacy* systems this file owns, not
+/// the surface path's own systems. Kept as one named condition (rather than
+/// a closure per call site) so every gated system reads the same way and a
+/// `grep` for `legacy_active` finds the whole gated set.
+fn legacy_active(path: Res<ConversationRenderPath>) -> bool {
+    *path == ConversationRenderPath::Legacy
+}
 
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
@@ -152,11 +165,15 @@ impl Plugin for CellPlugin {
                 view_shell_dock::spawn_shell_dock,
                 view_lifecycle::track_conversation_container.after(view_lifecycle::spawn_main_cell),
                 view_lifecycle::ensure_conversation_spacers
-                    .after(view_lifecycle::track_conversation_container),
+                    .after(view_lifecycle::track_conversation_container)
+                    .run_if(legacy_active),
                 view_geometry::sync_conversation_geometry,
                 view_lifecycle::spawn_block_cells
-                    .after(view_geometry::sync_conversation_geometry),
-                view_lifecycle::sync_role_headers.after(view_lifecycle::spawn_block_cells),
+                    .after(view_geometry::sync_conversation_geometry)
+                    .run_if(legacy_active),
+                view_lifecycle::sync_role_headers
+                    .after(view_lifecycle::spawn_block_cells)
+                    .run_if(legacy_active),
                 ApplyDeferred
                     .after(view_lifecycle::sync_role_headers)
                     .after(view_lifecycle::ensure_conversation_spacers),
@@ -175,7 +192,7 @@ impl Plugin for CellPlugin {
                 crate::view::block_render::repaint_block_scenes_on_theme_change
                     .before(view_render::sync_block_cell_buffers),
                 // Block cell buffers (TopLeft anchor)
-                view_render::sync_block_cell_buffers,
+                view_render::sync_block_cell_buffers.run_if(legacy_active),
                 // Input overlay (chat)
                 view_overlay::update_summon_animation,
                 view_overlay::sync_overlay_visibility.after(view_overlay::update_summon_animation),
@@ -199,13 +216,18 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
-                view_render::layout_block_cells,
-                view_render::update_block_cell_nodes.after(view_render::layout_block_cells),
+                view_render::layout_block_cells.run_if(legacy_active),
+                view_render::update_block_cell_nodes
+                    .after(view_render::layout_block_cells)
+                    .run_if(legacy_active),
                 view_render::reorder_conversation_children
-                    .after(view_render::update_block_cell_nodes),
+                    .after(view_render::update_block_cell_nodes)
+                    .run_if(legacy_active),
                 view_scroll::smooth_scroll.after(view_render::layout_block_cells),
                 view_scroll::scroll_render_mode.after(view_scroll::smooth_scroll),
-                view_render::virtualize_conversation.after(view_scroll::smooth_scroll),
+                view_render::virtualize_conversation
+                    .after(view_scroll::smooth_scroll)
+                    .run_if(legacy_active),
             )
                 .in_set(CellPhase::Layout),
         );
@@ -226,10 +248,80 @@ impl Plugin for CellPlugin {
         app.add_systems(
             PostUpdate,
             (
-                view_render::readback_block_heights.after(bevy::ui::UiSystems::Layout),
+                view_render::readback_block_heights
+                    .after(bevy::ui::UiSystems::Layout)
+                    .run_if(legacy_active),
                 view_overlay::build_overlay_glyphs.after(bevy::ui::UiSystems::Layout),
                 view_shell_dock::build_shell_dock_glyphs.after(bevy::ui::UiSystems::Layout),
             ),
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_gate_tests {
+    use super::*;
+    use crate::view::lifecycle::ensure_conversation_spacers;
+
+    /// Mirrors `view::surface::tests::surface_active_only_for_the_surface_path`
+    /// on the other side of the fence: the condition legacy systems gate on
+    /// must actually distinguish the two `ConversationRenderPath` states.
+    #[test]
+    fn legacy_active_only_for_the_legacy_path() {
+        let mut world = World::new();
+        world.insert_resource(ConversationRenderPath::Legacy);
+        let mut sys = IntoSystem::into_system(legacy_active);
+        sys.initialize(&mut world);
+        assert!(sys.run((), &mut world).unwrap());
+
+        world.insert_resource(ConversationRenderPath::Surface);
+        assert!(!sys.run((), &mut world).unwrap());
+    }
+
+    /// End-to-end through an actual `run_if`-gated schedule (not just the
+    /// bare condition function): `ensure_conversation_spacers` — the
+    /// conversation-spacer upkeep system — must spawn spacers under `Legacy`
+    /// and must not touch the world at all under `Surface`, exactly the
+    /// double-measurement fight the flag exists to prevent (see
+    /// `view::surface` module docs).
+    #[test]
+    fn spacer_upkeep_runs_under_legacy_and_is_skipped_under_surface() {
+        let mut legacy_app = App::new();
+        legacy_app.insert_resource(ConversationRenderPath::Legacy);
+        legacy_app.init_resource::<crate::cell::EditorEntities>();
+        legacy_app.add_systems(Update, ensure_conversation_spacers.run_if(legacy_active));
+        let conv = legacy_app.world_mut().spawn_empty().id();
+        legacy_app
+            .world_mut()
+            .resource_mut::<crate::cell::EditorEntities>()
+            .conversation_container = Some(conv);
+        legacy_app.update();
+        assert!(
+            legacy_app
+                .world()
+                .resource::<crate::cell::EditorEntities>()
+                .top_spacer
+                .is_some(),
+            "legacy path must still run spacer upkeep"
+        );
+
+        let mut surface_app = App::new();
+        surface_app.insert_resource(ConversationRenderPath::Surface);
+        surface_app.init_resource::<crate::cell::EditorEntities>();
+        surface_app.add_systems(Update, ensure_conversation_spacers.run_if(legacy_active));
+        let conv = surface_app.world_mut().spawn_empty().id();
+        surface_app
+            .world_mut()
+            .resource_mut::<crate::cell::EditorEntities>()
+            .conversation_container = Some(conv);
+        surface_app.update();
+        assert!(
+            surface_app
+                .world()
+                .resource::<crate::cell::EditorEntities>()
+                .top_spacer
+                .is_none(),
+            "surface path must not run the legacy spacer upkeep system"
         );
     }
 }

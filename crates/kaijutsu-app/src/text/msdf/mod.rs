@@ -32,6 +32,7 @@ pub mod layout_bridge;
 pub mod music_bridge;
 pub mod music_geometry_renderer;
 pub mod renderer;
+pub mod surface_renderer;
 
 pub use atlas::MsdfAtlas;
 pub use generator::MsdfGenerator;

@@ -232,6 +232,13 @@ fn main() {
         .add_plugins(input::InputPlugin)
         // Cell editing
         .add_plugins(cell::CellPlugin)
+        // Conversation surface rewrite (docs/conversation-surface.md), slice 1:
+        // resources + systems behind ConversationRenderPath. Legacy is the
+        // default; KAIJUTSU_CONV_SURFACE=1 flips a session to Surface. Must
+        // come after CellPlugin — its Update-schedule `.after`/`.before`
+        // anchors (`sync_conversation_geometry`, `smooth_scroll`) are
+        // registered there.
+        .add_plugins(view::surface::ConversationSurfacePlugin)
         // Per-block MSDF texture rendering (also serves role headers + dock chrome)
         .add_plugins(view::block_render::BlockRenderPlugin)
         // Peer transport (drift navigation: kernel → app invocations)
