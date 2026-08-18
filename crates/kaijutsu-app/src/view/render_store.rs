@@ -18,6 +18,7 @@
 //! id-to-index map.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId,
@@ -52,12 +53,20 @@ impl std::fmt::Display for RenderStoreError {
 
 impl std::error::Error for RenderStoreError {}
 
+/// Source of [`RenderBlockStore::generation`]. Process-global and minted in
+/// `new`, so no store can be constructed without a distinct id and no swap
+/// site can forget to bump one. Starts at 1 so `0` stays available to
+/// consumers as "no store seen yet".
+static NEXT_STORE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 /// Ordered render buffer for one `CellEditor` — see the module doc.
 pub struct RenderBlockStore {
     context_id: ContextId,
     principal_id: PrincipalId,
     blocks: Vec<BlockSnapshot>,
     index: HashMap<BlockId, usize>,
+    /// Instance id — see [`RenderBlockStore::generation`].
+    generation: u64,
     /// Next per-principal seq for ids minted by `insert_block`. This store
     /// never observes foreign seq lanes (`insert_from_snapshot` carries its
     /// own id) — there is one writer, so one lane.
@@ -73,9 +82,23 @@ impl RenderBlockStore {
             principal_id,
             blocks: Vec::new(),
             index: HashMap::new(),
+            generation: NEXT_STORE_GENERATION.fetch_add(1, Ordering::Relaxed),
             next_seq: 0,
             version: 0,
         }
+    }
+
+    /// Instance id of this store, unique for the life of the process.
+    ///
+    /// `sync_main_cell_to_conversation` never mutates a store in place across
+    /// a context switch — it builds a fresh one with [`rebuild`](Self::rebuild)
+    /// and assigns it over `CellEditor.store`. The document version cannot see
+    /// that: a hydrated context can land on the same number the welcome buffer
+    /// was already at. This is the O(1) signal for "the store under me was
+    /// replaced", so a consumer's expensive re-derivation (the geometry
+    /// reconcile's document-order id walk) is paid only when it might matter.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Rebuild the `index` map for `blocks[start..]` — every insert/remove

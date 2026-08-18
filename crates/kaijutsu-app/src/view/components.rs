@@ -141,6 +141,14 @@ impl CellEditor {
         self.store.version()
     }
 
+    /// Instance id of the current render store — see
+    /// [`RenderBlockStore::generation`]. Changes exactly when the store was
+    /// replaced wholesale (context switch, re-hydrate), which the document
+    /// version alone can't report.
+    pub fn store_generation(&self) -> u64 {
+        self.store.generation()
+    }
+
     /// Check if the editor has any blocks.
     #[allow(dead_code)]
     pub fn has_blocks(&self) -> bool {
@@ -809,6 +817,17 @@ pub struct BlockCell {
     pub last_status: kaijutsu_types::Status,
     /// Last known rainbow effect state for change detection.
     pub last_rainbow: bool,
+    /// Fingerprint of the inputs the last rich-content detection read
+    /// (`text::rich::rich_input_fingerprint`). `None` until the first
+    /// detection. The document version can't gate this: it is a
+    /// whole-document counter, so one streaming block would re-parse every
+    /// block on screen — see `sync_block_cell_buffers`.
+    pub last_rich_fingerprint: Option<u64>,
+    /// Whether that detection cleared `BlockScene.text` (sparkline/SVG/ABC/
+    /// image render from the parsed value, so the source must not reach
+    /// Parley). Replayed when detection is skipped, because the text
+    /// assignment that runs first puts the source back.
+    pub last_rich_cleared_text: bool,
 }
 
 impl BlockCell {
@@ -819,6 +838,8 @@ impl BlockCell {
             last_text_len: 0,
             last_status: kaijutsu_types::Status::Running,
             last_rainbow: false,
+            last_rich_fingerprint: None,
+            last_rich_cleared_text: false,
         }
     }
 }

@@ -20,7 +20,7 @@ use peniko::Brush;
 
 use std::sync::Arc;
 
-use kaijutsu_types::{ContentType, OutputData, OutputEntryType};
+use kaijutsu_types::{BlockSnapshot, ContentType, OutputData, OutputEntryType, OutputNode};
 
 use super::components::{bevy_color_to_brush, color_to_rgba8 as rgba8};
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
@@ -353,7 +353,7 @@ pub fn diff_minimap_colors(theme: &crate::ui::theme::Theme) -> super::diff::Mini
 /// Returns `None` for simple text (no coloring needed).
 /// For tabular/tree/list data, returns a `RichContent::Output` with
 /// pre-computed layout for per-cell coloring.
-pub fn detect_output_content(output: &OutputData, _version: u64) -> Option<RichContent> {
+pub fn detect_output_content(output: &OutputData) -> Option<RichContent> {
     // A rich_json-ONLY payload (kj's structured `.output` sideband, wired
     // through OutputData::rich_json) has an empty node tree AND no headers —
     // there is nothing here for the tree/table renderer to lay out. Rendering
@@ -503,11 +503,69 @@ pub(crate) fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a 
 /// When `content_type` is provided, skips heuristic detection and uses the
 /// declared type directly. Falls back to sniffing when `content_type` is `None`.
 #[allow(dead_code)]
-pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
+pub fn detect_rich_content(text: &str) -> Option<RichContent> {
     // No block status available at this (unused) call site — `is_streaming`
     // only changes which diagnostic a parse failure logs, not behavior, so
     // `false` ("treat as at rest") is a safe default here.
-    detect_rich_content_typed(text, 0, ContentType::Plain, None, false)
+    detect_rich_content_typed(text, ContentType::Plain, None, false)
+}
+
+/// Fingerprint of every input the detectors above read for one block.
+///
+/// Detection is pure over these — there is no cache inside it, so calling it
+/// twice with the same inputs burns a markdown span parse or a usvg tree
+/// build for an answer the caller already has. The document version cannot
+/// stand in for "did *this* block change": it is a whole-document counter, so
+/// one streaming block bumps it for every block on screen and
+/// `sync_block_cell_buffers` would re-parse the entire spawn band on every
+/// frame of someone else's stream. This is the per-block signal it gates on.
+///
+/// Hashing is O(text) like the parse it avoids, but it is one linear pass
+/// with no allocation, against span vectors and XML trees.
+///
+/// `OutputData::rich_json` is deliberately absent: nothing on this path reads
+/// it (`detect_output_content` explicitly falls through for a rich_json-only
+/// payload), and `serde_json::Value` is not `Hash`. If a renderer ever starts
+/// reading it, it has to join the fingerprint in the same commit.
+pub fn rich_input_fingerprint(text: &str, block: &BlockSnapshot) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    // Discriminants rather than the values: every one of these is a fieldless
+    // enum, and `mem::discriminant` needs no derive on the type to stay
+    // correct if a variant is added.
+    std::mem::discriminant(&block.content_type).hash(&mut hasher);
+    std::mem::discriminant(&block.kind).hash(&mut hasher);
+    std::mem::discriminant(&block.role).hash(&mut hasher);
+    // `is_streaming` — it only picks which diagnostic a failed SVG parse
+    // logs, but Running → Done is exactly when the at-rest complaint should
+    // get its chance to fire.
+    std::mem::discriminant(&block.status).hash(&mut hasher);
+    block.is_error.hash(&mut hasher);
+    match block.output {
+        None => hasher.write_u8(0),
+        Some(ref output) => {
+            hasher.write_u8(1);
+            output.headers.hash(&mut hasher);
+            hash_output_nodes(&output.root, &mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Structural hash of an `OutputData` node tree — everything
+/// `compute_output_layout` colors by, including the entry types that never
+/// reach the formatted text.
+fn hash_output_nodes<H: std::hash::Hasher>(nodes: &[OutputNode], hasher: &mut H) {
+    use std::hash::Hash;
+    hasher.write_usize(nodes.len());
+    for node in nodes {
+        node.name.hash(hasher);
+        std::mem::discriminant(&node.entry_type).hash(hasher);
+        node.text.hash(hasher);
+        node.cells.hash(hasher);
+        hash_output_nodes(&node.children, hasher);
+    }
 }
 
 /// Detect rich content with a content type hint.
@@ -535,9 +593,12 @@ pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
 /// `is_streaming` should reflect `block.status == Status::Running` — it only
 /// changes which diagnostic an SVG parse failure logs (see `try_parse_svg`),
 /// never the returned content.
+///
+/// Pure over its arguments and not cheap: callers must gate re-entry
+/// themselves — see [`rich_input_fingerprint`], which is exactly this
+/// function's input set.
 pub fn detect_rich_content_typed(
     text: &str,
-    _version: u64,
     content_type: ContentType,
     svg_fontdb: Option<&super::SvgFontDb>,
     is_streaming: bool,
@@ -671,6 +732,88 @@ pub fn detect_rich_content_typed(
 mod tests {
     use super::*;
 
+    // ── rich_input_fingerprint (the re-parse gate) ──────────────────────────
+
+    fn text_block() -> BlockSnapshot {
+        use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId};
+        kaijutsu_types::BlockSnapshotBuilder::new(
+            BlockId::new(ContextId::new(), PrincipalId::new(), 0),
+            BlockKind::Text,
+        )
+        .content("# heading\n\nbody\n")
+        .build()
+    }
+
+    /// The property `sync_block_cell_buffers` gates on: a block nobody
+    /// touched fingerprints the same, so it never re-parses. The document
+    /// version is deliberately not an input — it belongs to the whole
+    /// document, and one streaming block bumping it must not drag every other
+    /// block on screen through a markdown parse.
+    #[test]
+    fn fingerprint_is_stable_for_an_untouched_block() {
+        let block = text_block();
+        let text = block.content.clone();
+        assert_eq!(
+            rich_input_fingerprint(&text, &block),
+            rich_input_fingerprint(&text, &block),
+            "identical inputs must fingerprint identically or nothing is ever reused"
+        );
+    }
+
+    #[test]
+    fn fingerprint_moves_when_the_text_grows() {
+        let block = text_block();
+        let before = rich_input_fingerprint(&block.content, &block);
+        let after = rich_input_fingerprint(&format!("{} more", block.content), &block);
+        assert_ne!(before, after, "a streaming block must keep re-parsing");
+    }
+
+    #[test]
+    fn fingerprint_moves_when_the_declared_content_type_changes() {
+        // Content and content_type are separate LWW registers — a retype with
+        // untouched text is a legitimate state, and it changes the answer.
+        let mut block = text_block();
+        let text = block.content.clone();
+        let before = rich_input_fingerprint(&text, &block);
+        block.content_type = ContentType::Diff;
+        assert_ne!(before, rich_input_fingerprint(&text, &block));
+    }
+
+    #[test]
+    fn fingerprint_moves_when_the_block_stops_streaming() {
+        let mut block = text_block();
+        let text = block.content.clone();
+        block.status = kaijutsu_types::Status::Running;
+        let streaming = rich_input_fingerprint(&text, &block);
+        block.status = kaijutsu_types::Status::Done;
+        assert_ne!(
+            streaming,
+            rich_input_fingerprint(&text, &block),
+            "Running → Done is when the at-rest SVG diagnostic gets its chance to fire"
+        );
+    }
+
+    /// `OutputData` carries per-entry types that never reach the formatted
+    /// text but do drive `compute_output_layout`'s coloring. Keying the gate
+    /// on the text alone would let a recolor pass unnoticed.
+    #[test]
+    fn fingerprint_moves_when_only_an_output_entry_type_changes() {
+        let mut block = text_block();
+        let text = block.content.clone();
+        let node = |t| vec![OutputNode::new("thing").with_entry_type(t)];
+
+        block.output = Some(OutputData::nodes(node(OutputEntryType::File)));
+        let as_file = rich_input_fingerprint(&text, &block);
+
+        block.output = Some(OutputData::nodes(node(OutputEntryType::Directory)));
+        assert_ne!(
+            as_file,
+            rich_input_fingerprint(&text, &block),
+            "an entry-type recolor is invisible in the formatted text — the \
+             fingerprint has to see it"
+        );
+    }
+
     /// A rich_json-only `OutputData` (kj's structured `.output` sideband —
     /// see `KjBuiltin::execute`) has an empty `root`: there is no node tree
     /// for the table/tree renderer to lay out. `detect_output_content` must
@@ -686,7 +829,7 @@ mod tests {
         assert!(output.root.is_empty(), "test premise: no node tree");
 
         assert!(
-            detect_output_content(&output, 0).is_none(),
+            detect_output_content(&output).is_none(),
             "rich_json-only OutputData must yield the text path (None), not a blank structured view"
         );
     }
@@ -705,7 +848,7 @@ mod tests {
         assert!(output.headers.is_some(), "test premise: has columns");
 
         assert!(
-            detect_output_content(&output, 0).is_some(),
+            detect_output_content(&output).is_some(),
             "headers-only OutputData must proceed past the empty-root guard \
              and render as a (header-only) table, not fall back to plain text"
         );
@@ -744,7 +887,7 @@ mod tests {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0">
             <rect width="10" height="10" fill="red"/>
         </svg>"#;
-        let result = detect_rich_content_typed(svg, 0, ContentType::Svg, None, false);
+        let result = detect_rich_content_typed(svg, ContentType::Svg, None, false);
         if let Some(rich) = result {
             assert!(
                 !matches!(rich.kind, RichContentKind::Svg { .. }),
@@ -769,7 +912,6 @@ mod tests {
         let text = kaijutsu_diff::fixtures::read("canonical/single_file_modify.diff");
         let preview = diff_preview(detect_rich_content_typed(
             &text,
-            0,
             ContentType::Diff,
             None,
             false,
@@ -787,7 +929,6 @@ mod tests {
     fn declared_diff_that_does_not_parse_still_renders_as_a_diff_error() {
         let preview = diff_preview(detect_rich_content_typed(
             "I am not a diff.\n",
-            0,
             ContentType::Diff,
             None,
             false,
@@ -801,7 +942,7 @@ mod tests {
     #[test]
     fn declared_diff_is_never_empty_even_for_empty_content() {
         assert!(
-            detect_rich_content_typed("", 0, ContentType::Diff, None, false).is_some(),
+            detect_rich_content_typed("", ContentType::Diff, None, false).is_some(),
             "an empty declared-Diff block must still render something"
         );
     }
@@ -814,7 +955,6 @@ mod tests {
         let fenced = format!("```diff\n{body}```\n");
         let preview = diff_preview(detect_rich_content_typed(
             &fenced,
-            0,
             ContentType::Plain,
             None,
             false,
@@ -830,7 +970,7 @@ mod tests {
     #[test]
     fn a_fenced_block_that_is_not_a_diff_falls_through() {
         let fenced = "```diff\nnot actually a diff\n```\n";
-        let rich = detect_rich_content_typed(fenced, 0, ContentType::Plain, None, false);
+        let rich = detect_rich_content_typed(fenced, ContentType::Plain, None, false);
         assert!(
             diff_preview(rich).is_none(),
             "a non-diff ```diff fence must not become a diff preview"

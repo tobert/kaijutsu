@@ -175,10 +175,18 @@ pub struct ConversationGeometry {
     /// the version gate alone can't see — stale rows then feed the band a
     /// dead id and the spawn/despawn loop never converges.
     block_ids: Vec<BlockId>,
+    /// Store instance the last reconcile read
+    /// (`CellEditor::store_generation`). Generations start at 1, so a
+    /// freshly-inserted geometry never matches a live store and always
+    /// reconciles on its first frame.
+    pub last_store_generation: u64,
     /// Cols used for the current estimates (re-estimation gate on resize).
     pub cols: usize,
     /// Prefix sums need recomputation.
     dirty: bool,
+    /// Bumped whenever laid-out geometry actually changed — see
+    /// [`ConversationGeometry::epoch`].
+    epoch: u64,
 }
 
 impl ConversationGeometry {
@@ -195,6 +203,59 @@ impl ConversationGeometry {
     /// geometry was last reconciled against.
     pub fn ids_match(&self, ids: &[BlockId]) -> bool {
         self.block_ids == ids
+    }
+
+    /// Change token for "the laid-out geometry moved".
+    ///
+    /// Bumped by a structural [`reconcile`](Self::reconcile), and by a
+    /// [`recompute_offsets`](Self::recompute_offsets) pass that actually
+    /// shifted a row or resized the document. A consumer caching anything
+    /// derived from offsets (the GPU row window) compares this instead of
+    /// re-deriving every frame.
+    ///
+    /// Both halves are needed, and neither subsumes the other: heights move
+    /// without the structure changing (a measurement lands), and the
+    /// structure changes without any offset moving (a row is replaced by one
+    /// of identical height, so every prefix sum and the content height come
+    /// out the same while the row → block mapping is different).
+    #[allow(dead_code)] // Model accessor; exercised by tests, no prod caller yet.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The contiguous index range of rows intersecting the viewport band
+    /// `[top - slack, top + height + slack)`.
+    ///
+    /// Rows tile the document with no gaps — a row's bottom edge
+    /// (`y_offset + height + margin_bottom`) *is* the next row's `y_offset`,
+    /// which makes both edges of the band a binary search over a monotone
+    /// predicate rather than a walk. Margin is part of the row's extent here,
+    /// the same as in [`plan_block_band`].
+    ///
+    /// The band is half-open: a row whose bottom edge lands exactly on
+    /// `band_top`, or whose top lands exactly on `band_bottom`, contributes
+    /// zero area and is excluded. A band that starts above the document or
+    /// ends past it yields an empty range positioned where it belongs
+    /// (`0..0` / `len..len`), so callers can use it as a splice point.
+    ///
+    /// Offsets must be current — call after
+    /// [`recompute_offsets`](Self::recompute_offsets).
+    #[allow(dead_code)] // Model accessor; exercised by tests, no prod caller yet.
+    pub fn visible_rows(&self, top: f32, height: f32, slack: f32) -> std::ops::Range<usize> {
+        debug_assert!(
+            !self.dirty,
+            "visible_rows read stale offsets — recompute_offsets first"
+        );
+        let band_top = top - slack;
+        let band_bottom = top + height + slack;
+        let start = self
+            .rows
+            .partition_point(|r| r.y_offset + r.height + r.margin_bottom <= band_top);
+        let end = self.rows.partition_point(|r| r.y_offset < band_bottom);
+        // A degenerate band (negative height/slack, i.e. band_bottom <
+        // band_top) is a caller bug, not data corruption — the honest answer
+        // is "no rows", and an inverted Range would panic on use.
+        start..end.max(start)
     }
 
     /// Look up the header row preceding block `id`, if that block starts a
@@ -241,10 +302,13 @@ impl ConversationGeometry {
         for id in ids {
             let block_row = match old_block_index.get(id) {
                 Some(&i) => {
-                    let mut row = old_rows[i].clone();
-                    // y_offset recomputed below; everything else carries.
-                    row.y_offset = 0.0;
-                    row
+                    // Everything carries, `y_offset` included: it is
+                    // authoritative only after `recompute_offsets` (which
+                    // `dirty` below forces), and zeroing it here would make
+                    // every reconcile look like it moved every row — the
+                    // epoch would then bump on version bumps that changed
+                    // nothing.
+                    old_rows[i].clone()
                 }
                 None => {
                     let Some(seed) = seed_fn(id) else {
@@ -346,6 +410,13 @@ impl ConversationGeometry {
         self.last_doc_version = doc_version;
         self.cols = params.cols;
         self.dirty = true;
+        if structure_changed {
+            // A structural change can land on byte-identical offsets (a row
+            // replaced by one of the same height), so `recompute_offsets`
+            // cannot be the only thing that bumps the epoch — see
+            // [`ConversationGeometry::epoch`].
+            self.epoch += 1;
+        }
         structure_changed
     }
 
@@ -419,17 +490,32 @@ impl ConversationGeometry {
 
     /// Recompute prefix sums + content height if any row changed. Returns
     /// `true` if offsets were recomputed.
+    ///
+    /// The pass tracks whether it *moved* anything, not merely whether it
+    /// ran: `dirty` says "a row might have changed", the movement check says
+    /// "the document laid out differently", and only the latter bumps
+    /// [`epoch`](Self::epoch).
     pub fn recompute_offsets(&mut self) -> bool {
         if !self.dirty {
             return false;
         }
         let mut y = 0.0_f32;
+        let mut moved = false;
         for row in &mut self.rows {
-            row.y_offset = y;
+            if row.y_offset != y {
+                row.y_offset = y;
+                moved = true;
+            }
             y += row.height + row.margin_bottom;
         }
-        self.content_height = y;
+        if self.content_height != y {
+            self.content_height = y;
+            moved = true;
+        }
         self.dirty = false;
+        if moved {
+            self.epoch += 1;
+        }
         true
     }
 
@@ -609,15 +695,31 @@ pub fn sync_conversation_geometry(
     // can replace the store wholesale at a coincidentally-equal version
     // (welcome → hydrated context), which stalls a version-only gate on
     // stale rows and feeds the entity band a dead id forever.
+    //
+    // The id-sequence check is the expensive one — `block_ids()` allocates a
+    // Vec every call — and the swap it guards against is not something a
+    // version comparison can detect. The store's instance generation is: it
+    // is minted per `RenderBlockStore`, and the swap site (`view/sync.rs`'s
+    // `editor.store = store`) can't forget to move it. So gate the walk on
+    // "version moved OR the store under us was replaced" — two u64 compares
+    // on the frame where neither happened — and keep `ids_match` as the
+    // decision it always was for the swap case, since a swap that reproduced
+    // the same document order needs no reconcile.
     let doc_version = editor.version();
-    let ids = editor.block_ids();
-    if doc_version != geom.last_doc_version || !geom.ids_match(&ids) {
-        geom.reconcile(
-            &ids,
-            |id| editor.block_snapshot(id).map(row_seed),
-            &params,
-            doc_version,
-        );
+    let store_generation = editor.store_generation();
+    let version_changed = doc_version != geom.last_doc_version;
+    let store_swapped = store_generation != geom.last_store_generation;
+    if version_changed || store_swapped {
+        let ids = editor.block_ids();
+        if version_changed || !geom.ids_match(&ids) {
+            geom.reconcile(
+                &ids,
+                |id| editor.block_snapshot(id).map(row_seed),
+                &params,
+                doc_version,
+            );
+        }
+        geom.last_store_generation = store_generation;
     } else if cols.abs_diff(geom.cols) > 2 {
         // Resize changed the wrap width materially — refresh estimates from
         // cached text stats (no store access).
@@ -991,6 +1093,291 @@ mod tests {
         assert!(g.block_row(&bid(1)).is_none());
         assert!(g.block_row(&bid(2)).is_some());
         assert!(g.ids_match(&[bid(2)]));
+    }
+
+    // ---- sync_conversation_geometry: the reconcile gate --------------------
+
+    /// Minimal headless `App` running just `sync_conversation_geometry` —
+    /// enough resources for it to reach the gate, no rendering plugins.
+    fn gate_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<crate::cell::EditorEntities>();
+        app.init_resource::<crate::text::TextMetrics>();
+        app.init_resource::<crate::ui::theme::Theme>();
+        app.add_systems(Update, sync_conversation_geometry);
+        app
+    }
+
+    /// A fresh store holding one block, at version 1 — the same version a
+    /// one-block store reaches on its own, which is the whole point.
+    fn one_block_store() -> (crate::view::render_store::RenderBlockStore, BlockId) {
+        use kaijutsu_types::{ContentType, Status};
+        let (ctx, prin) = (ContextId::new(), PrincipalId::new());
+        let mut store = crate::view::render_store::RenderBlockStore::new(ctx, prin);
+        let id = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .expect("insert_block");
+        (store, id)
+    }
+
+    /// Regression (live-found on zorak), at the system level: a context
+    /// switch replaces `CellEditor.store` wholesale and the new store can sit
+    /// at the same document version the old one was at (welcome → hydrated
+    /// context). The reconcile gate must still fire, or stale rows feed the
+    /// entity band a dead id and the spawn/despawn loop never converges.
+    ///
+    /// This is the test the per-frame `block_ids()` walk existed to satisfy;
+    /// it now rides `CellEditor::store_generation`, so it fails loudly if
+    /// that signal is dropped or the gate regresses to version-only.
+    #[test]
+    fn store_swap_at_equal_version_still_reconciles() {
+        let mut app = gate_app();
+        let (store_a, id_a) = one_block_store();
+        let mut editor = crate::cell::CellEditor::new();
+        editor.store = store_a;
+        let version = editor.version();
+
+        let main_ent = app.world_mut().spawn((editor, crate::cell::MainCell)).id();
+        app.world_mut()
+            .resource_mut::<crate::cell::EditorEntities>()
+            .main_cell = Some(main_ent);
+
+        // First run inserts the component, second reconciles against it.
+        app.update();
+        app.update();
+        assert!(
+            app.world()
+                .get::<ConversationGeometry>(main_ent)
+                .unwrap()
+                .block_row(&id_a)
+                .is_some(),
+            "test premise: the first document reconciled"
+        );
+
+        let (store_b, id_b) = one_block_store();
+        assert_eq!(
+            store_b.version(),
+            version,
+            "test premise: the swapped-in store sits at the same version"
+        );
+        app.world_mut()
+            .get_mut::<crate::cell::CellEditor>(main_ent)
+            .unwrap()
+            .store = store_b;
+
+        app.update();
+        let geom = app.world().get::<ConversationGeometry>(main_ent).unwrap();
+        assert!(
+            geom.block_row(&id_b).is_some(),
+            "the swapped-in document must reconcile despite the equal version"
+        );
+        assert!(
+            geom.block_row(&id_a).is_none(),
+            "the replaced document's rows must be gone, not left to feed the band a dead id"
+        );
+    }
+
+    /// The other half of the gate: an idle frame — same store, same version —
+    /// must not reconcile. `reconcile` is what stamps `last_doc_version` and
+    /// rebuilds the row vector; observing the epoch is the cheap proxy for
+    /// "nothing was redone".
+    #[test]
+    fn idle_frames_do_not_reconcile() {
+        let mut app = gate_app();
+        let (store, id) = one_block_store();
+        let mut editor = crate::cell::CellEditor::new();
+        editor.store = store;
+
+        let main_ent = app.world_mut().spawn((editor, crate::cell::MainCell)).id();
+        app.world_mut()
+            .resource_mut::<crate::cell::EditorEntities>()
+            .main_cell = Some(main_ent);
+
+        app.update();
+        app.update();
+        let settled = app
+            .world()
+            .get::<ConversationGeometry>(main_ent)
+            .unwrap()
+            .epoch();
+        assert!(
+            app.world()
+                .get::<ConversationGeometry>(main_ent)
+                .unwrap()
+                .block_row(&id)
+                .is_some(),
+            "test premise: the document reconciled"
+        );
+
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .get::<ConversationGeometry>(main_ent)
+                .unwrap()
+                .epoch(),
+            settled,
+            "an idle frame must not reconcile or move offsets"
+        );
+    }
+
+    // ---- visible_rows -----------------------------------------------------
+
+    /// Same-role blocks, so the row strip is: header (20 + 4 margin) at y=0,
+    /// then `n` blocks of 42 pitch (30 + 12) starting at y=24. Row `i >= 1`
+    /// spans `[24 + (i-1) * 42, 24 + i * 42)`.
+    fn strip(n: u64) -> ConversationGeometry {
+        let mut g = ConversationGeometry::default();
+        let ids: Vec<BlockId> = (1..=n).map(bid).collect();
+        g.reconcile(&ids, |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
+        g.recompute_offsets();
+        g
+    }
+
+    #[test]
+    fn visible_rows_empty_geometry_is_empty_at_zero() {
+        let g = ConversationGeometry::default();
+        assert_eq!(g.visible_rows(0.0, 300.0, 0.0), 0..0);
+    }
+
+    #[test]
+    fn visible_rows_selects_exactly_the_rows_the_band_covers() {
+        let g = strip(4);
+        // Band [66, 108) is precisely row 2's extent.
+        let range = g.visible_rows(66.0, 42.0, 0.0);
+        assert_eq!(range, 2..3);
+        assert_eq!(g.rows()[range.start].key, RowKey::Block(bid(2)));
+    }
+
+    #[test]
+    fn visible_rows_excludes_rows_that_only_touch_the_band_edges() {
+        let g = strip(4);
+        // Row 1 ends exactly at 66 (the band top) and row 3 starts exactly at
+        // 108 (the band bottom): both contribute zero area, so a half-open
+        // band must leave them out rather than spawn work for a sliver.
+        assert_eq!(g.rows()[1].y_offset + g.rows()[1].height + g.rows()[1].margin_bottom, 66.0);
+        assert_eq!(g.rows()[3].y_offset, 108.0);
+        assert_eq!(g.visible_rows(66.0, 42.0, 0.0), 2..3);
+    }
+
+    #[test]
+    fn visible_rows_slack_pulls_in_the_neighbours() {
+        let g = strip(4);
+        // One unit of slack on each side reaches past both touching edges.
+        assert_eq!(g.visible_rows(66.0, 42.0, 1.0), 1..4);
+    }
+
+    #[test]
+    fn visible_rows_band_above_the_document_is_empty_at_the_start() {
+        let g = strip(4);
+        assert_eq!(g.visible_rows(-1000.0, 100.0, 0.0), 0..0);
+    }
+
+    #[test]
+    fn visible_rows_band_past_the_end_is_empty_at_the_end() {
+        let g = strip(4);
+        let len = g.rows().len();
+        assert_eq!(g.visible_rows(g.content_height + 10.0, 100.0, 0.0), len..len);
+    }
+
+    #[test]
+    fn visible_rows_negative_top_clamps_to_the_first_row() {
+        let g = strip(4);
+        // Band [-50, 50): the header and the first block, nothing above.
+        assert_eq!(g.visible_rows(-50.0, 100.0, 0.0), 0..2);
+    }
+
+    #[test]
+    fn visible_rows_single_row_taller_than_the_band() {
+        let mut g = ConversationGeometry::default();
+        g.reconcile(&[bid(1)], |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
+        g.measure(RowKey::Block(bid(1)), 1000.0, 12.0, 2);
+        g.recompute_offsets();
+        // The band sits entirely inside row 1 — it must still be returned,
+        // which a "row top inside the band" test would miss.
+        let range = g.visible_rows(300.0, 100.0, 0.0);
+        assert_eq!(range, 1..2);
+        assert_eq!(g.rows()[1].key, RowKey::Block(bid(1)));
+    }
+
+    #[test]
+    fn visible_rows_whole_document_band_covers_every_row() {
+        let g = strip(10);
+        assert_eq!(g.visible_rows(0.0, g.content_height, 0.0), 0..g.rows().len());
+    }
+
+    // ---- epoch ------------------------------------------------------------
+
+    #[test]
+    fn epoch_does_not_move_when_recompute_has_nothing_to_do() {
+        let mut g = strip(3);
+        let before = g.epoch();
+        assert!(!g.recompute_offsets(), "test premise: not dirty");
+        assert_eq!(g.epoch(), before);
+    }
+
+    #[test]
+    fn epoch_bumps_when_a_measure_shifts_offsets() {
+        let mut g = strip(3);
+        let before = g.epoch();
+        g.measure(RowKey::Block(bid(1)), 90.0, 12.0, 2);
+        assert!(g.recompute_offsets());
+        assert!(
+            g.epoch() > before,
+            "a measurement that moved every row below it must bump the epoch"
+        );
+    }
+
+    #[test]
+    fn epoch_is_stable_across_a_version_bump_that_changes_no_row() {
+        let mut g = strip(3);
+        let before = g.epoch();
+        let ids: Vec<BlockId> = (1..=3).map(bid).collect();
+        // The reconcile the version gate fires on every document bump: same
+        // ids, same heights. Nothing about the layout moved, so the GPU
+        // window has no reason to rebuild.
+        assert!(!g.reconcile(
+            &ids,
+            |_| panic!("seed_fn must not be called for known rows"),
+            &params(),
+            2,
+        ));
+        assert!(g.recompute_offsets());
+        assert_eq!(
+            g.epoch(),
+            before,
+            "a version bump that moved no row must not bump the geometry epoch"
+        );
+    }
+
+    #[test]
+    fn epoch_bumps_on_a_structural_reconcile_before_offsets_are_recomputed() {
+        let mut g = strip(3);
+        let before = g.epoch();
+        // Replace the tail block with a different id of identical height: the
+        // prefix sums and content height come out byte-identical, so only the
+        // structural bump can tell a consumer the row → block mapping moved.
+        let changed = g.reconcile(
+            &[bid(1), bid(2), bid(4)],
+            |_| Some(text_seed(Role::User, 40, 0)),
+            &params(),
+            2,
+        );
+        assert!(changed);
+        assert!(
+            g.epoch() > before,
+            "a structural reconcile must bump the epoch on its own — offsets \
+             alone cannot report an equal-height row replacement"
+        );
     }
 
     // ---- band planning ----------------------------------------------------

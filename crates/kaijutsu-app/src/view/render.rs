@@ -140,55 +140,76 @@ pub fn sync_block_cell_buffers(
             && block.output.is_some()
             && !block.is_error;
 
-        let mut actually_rich = false;
-        if is_rich_candidate
-            && let Some(rich) = crate::text::rich::detect_rich_content_typed(
-                &text,
-                doc_version,
-                block.content_type,
-                Some(&svg_fontdb),
-                block.status == kaijutsu_types::Status::Running,
-            )
-        {
-            // For sparklines and SVGs: clear text so Parley doesn't re-measure
-            // large source text every frame. Height is driven by min_height
-            // set in render_rich_content.
-            let needs_text_cleared = matches!(
-                rich.kind,
-                crate::text::rich::RichContentKind::Sparkline(_)
-                    | crate::text::rich::RichContentKind::Svg { .. }
-                    | crate::text::rich::RichContentKind::Abc { .. }
-                    | crate::text::rich::RichContentKind::Image { .. }
-            );
-            if needs_text_cleared {
+        // Detection is the expensive half of this system — markdown span
+        // parsing, a usvg tree build, an output layout — and it reads only
+        // this block's text, declared type, status and structured output.
+        // `doc_version` cannot gate it: it is a whole-document counter, so
+        // one streaming block drags every other in-band block through a
+        // re-parse on every frame. Fingerprint what detection actually reads
+        // and let the `RichContent` already on the entity stand when nothing
+        // moved. (A streaming block's own text *does* change every version —
+        // that re-parse is real work, not this one.)
+        let rich_fingerprint = crate::text::rich::rich_input_fingerprint(&text, block);
+        if block_cell.last_rich_fingerprint == Some(rich_fingerprint) {
+            // Same answer as last time, still on the entity. Only the text
+            // clear has to be replayed — the assignment above just put the
+            // source back into BlockScene.
+            if block_cell.last_rich_cleared_text {
                 block_scene.text = String::new();
             }
-            commands.entity(entity).insert(rich);
-            actually_rich = true;
-        }
-        if !actually_rich
-            && is_typed_result
-            && let Some(rich) = crate::text::rich::detect_rich_content_typed(
-                &text,
-                doc_version,
-                block.content_type,
-                Some(&svg_fontdb),
-                block.status == kaijutsu_types::Status::Running,
-            )
-        {
-            commands.entity(entity).insert(rich);
-            actually_rich = true;
-        }
-        if !actually_rich
-            && is_output_candidate
-            && let Some(ref output) = block.output
-            && let Some(rich) = crate::text::rich::detect_output_content(output, doc_version)
-        {
-            commands.entity(entity).insert(rich);
-            actually_rich = true;
-        }
-        if !actually_rich {
-            commands.entity(entity).remove::<crate::text::RichContent>();
+        } else {
+            let mut actually_rich = false;
+            let mut cleared_text = false;
+            if is_rich_candidate
+                && let Some(rich) = crate::text::rich::detect_rich_content_typed(
+                    &text,
+                    block.content_type,
+                    Some(&svg_fontdb),
+                    block.status == kaijutsu_types::Status::Running,
+                )
+            {
+                // For sparklines and SVGs: clear text so Parley doesn't re-measure
+                // large source text every frame. Height is driven by min_height
+                // set in render_rich_content.
+                let needs_text_cleared = matches!(
+                    rich.kind,
+                    crate::text::rich::RichContentKind::Sparkline(_)
+                        | crate::text::rich::RichContentKind::Svg { .. }
+                        | crate::text::rich::RichContentKind::Abc { .. }
+                        | crate::text::rich::RichContentKind::Image { .. }
+                );
+                if needs_text_cleared {
+                    block_scene.text = String::new();
+                    cleared_text = true;
+                }
+                commands.entity(entity).insert(rich);
+                actually_rich = true;
+            }
+            if !actually_rich
+                && is_typed_result
+                && let Some(rich) = crate::text::rich::detect_rich_content_typed(
+                    &text,
+                    block.content_type,
+                    Some(&svg_fontdb),
+                    block.status == kaijutsu_types::Status::Running,
+                )
+            {
+                commands.entity(entity).insert(rich);
+                actually_rich = true;
+            }
+            if !actually_rich
+                && is_output_candidate
+                && let Some(ref output) = block.output
+                && let Some(rich) = crate::text::rich::detect_output_content(output)
+            {
+                commands.entity(entity).insert(rich);
+                actually_rich = true;
+            }
+            if !actually_rich {
+                commands.entity(entity).remove::<crate::text::RichContent>();
+            }
+            block_cell.last_rich_fingerprint = Some(rich_fingerprint);
+            block_cell.last_rich_cleared_text = cleared_text;
         }
 
         // Store color on BlockScene for build_block_scenes

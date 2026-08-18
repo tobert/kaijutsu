@@ -6520,3 +6520,23 @@ system-prompt sections, per-type policy matrix, fork re-seeds.
 "note when the turn gap crosses a threshold / every N turns") wants the
 `BeforeModelTurn` hook seam (Turn Loop section) once it lands; per-turn drip
 stays out of the cached prefix by the same placement rule.
+
+## Conversation-view latent costs found during surface slice 0 (2026-08-18)
+
+Side-finds from the slice-0 gating work (opus review pass); none fixed, all
+pre-existing. The first is a real latent bug, the other two are the same
+class of ungated per-frame work the slice was killing:
+
+- **`ConversationGeometry::reconcile` never retries a `None` seed.** The doc
+  comment promises "retried next reconcile", but `self.block_ids =
+  ids.to_vec()` records the skipped id as present, so no gate (old ids-walk
+  or new store-generation) ever sees a change — the block gets no row until
+  the doc version moves for some other reason.
+- **`sync_block_cell_buffers`' `needs_update` pre-check** walks every
+  container entity (`block_cells.get(e)`) each frame before deciding to do
+  nothing.
+- **`sync_conversation_geometry` calls `recompute_offsets()` through
+  `Mut<_>` unconditionally**, marking `ConversationGeometry` changed every
+  frame. Nothing consumes `Changed<ConversationGeometry>` today (verified),
+  but the first consumer that tries will be silently defeated. The surface
+  rewrite should use `epoch()`, not change detection.
