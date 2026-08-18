@@ -85,41 +85,64 @@ impl RememberScopeArg {
 
 #[derive(Subcommand, Debug)]
 enum LedgerCommand {
-    /// List asks still waiting for a decision (status pending or claimed).
-    List,
+    /// List asks. By default shows the live queue — asks still `pending`
+    /// or `claimed`. With `--history`, shows decided asks instead —
+    /// `allowed`, `denied`, `expired`, or `abandoned` — most recently
+    /// created first, capped at `--limit` (default 20).
+    List {
+        /// Show decided asks instead of the pending/claimed queue.
+        #[arg(long)]
+        history: bool,
+        /// Maximum decided asks to return with --history. Ignored
+        /// without --history. Default 20.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
     /// Show one ask in full, including the statement being authorized.
-    Show { request_id: String },
+    /// Works for a decided ask as well as a pending one.
+    Show {
+        /// The ask to show. Request ids come from `kj ledger list`.
+        request_id: String,
+    },
     /// Allow one ask (claims it first; exactly one answerer wins).
     Allow {
+        /// The ask to allow. Request ids come from `kj ledger list`.
         request_id: String,
-        /// Remember this decision as a standing rule for future identical
-        /// asks. Refused for `allow` when any covered statement has a free
-        /// variable (Amy's 2026-08-17 ruling, `docs/gate-and-shell-split.md`
-        /// ruling 3) — the decision on THIS ask still stands either way.
+        // Why an `allow` rule is refused over a free variable, and why the
+        // ask's own decision survives that refusal: `docs/gate-and-shell-split.md`,
+        // "Rulings". Published help states the behavior, not the ruling.
+        /// Remember this decision as a standing rule, so future identical
+        /// asks decide without asking anyone. Refused when any covered
+        /// statement has a free variable; the decision on THIS ask still
+        /// stands either way. Off by default. Undo with `kj ledger forget`.
         #[arg(long)]
         remember: Option<RememberScopeArg>,
     },
     /// Deny one ask (claims it first; exactly one answerer wins).
     Deny {
+        /// The ask to deny. Request ids come from `kj ledger list`.
         request_id: String,
-        /// Remember this decision as a standing rule for future identical
-        /// asks. A `deny` rule is always permitted, even with a free
-        /// variable (a standing deny is strictly safety-increasing).
+        /// Remember this decision as a standing rule, so future identical
+        /// asks are denied without asking anyone. Always permitted, even
+        /// when a covered statement has a free variable. Off by default.
+        /// Undo with `kj ledger forget`.
         #[arg(long)]
         remember: Option<RememberScopeArg>,
     },
     /// List active (not-yet-forgotten) standing rules.
     Rules,
     /// Forget a standing rule so its statement escalates to a human again.
-    Forget { rule_id: String },
-    /// List rc lifecycle runs (the durable "did the rc lifecycle actually
-    /// fire" checklist — `approval_ledger::rc_runs`), or, with a run id, show
-    /// one run's per-script detail. A bare positional (not a `--run` flag)
-    /// to match `show <request_id>`'s shape — this is the same
-    /// list-vs-show split as the ask verbs, just for the run log instead of
-    /// the approval queue.
+    Forget {
+        /// The rule to forget. Rule ids come from `kj ledger rules`.
+        rule_id: String,
+    },
+    // A bare positional rather than a `--run` flag, to match `Show`'s shape:
+    // the same list-vs-show split as the ask verbs, applied to the run log.
+    /// List rc lifecycle runs, most recent first — the durable record of
+    /// whether a context's rc scripts actually ran.
     Runs {
-        /// Show this run's script list instead of the full run listing.
+        /// Show this run's per-script detail instead of the run listing.
+        /// Run ids come from `kj ledger runs`. Lists all runs when omitted.
         run_id: Option<String>,
     },
 }
@@ -143,7 +166,7 @@ impl KjDispatcher {
             }
         };
         match parsed.command {
-            LedgerCommand::List => self.ledger_list(),
+            LedgerCommand::List { history, limit } => self.ledger_list(history, limit),
             LedgerCommand::Show { request_id } => self.ledger_show(&request_id),
             LedgerCommand::Allow { request_id, remember } => {
                 self.ledger_decide(&request_id, true, caller, remember)
@@ -160,10 +183,21 @@ impl KjDispatcher {
         }
     }
 
-    fn ledger_list(&self) -> KjResult {
+    /// `kj ledger list` / `kj ledger list --history`. `history` selects
+    /// which of `approval_ledger::ask`'s two partitioning queries runs —
+    /// `list_pending` (the live queue) or `list_history` (decided asks,
+    /// bounded by `limit`) — the rendering below is shared because both
+    /// return the same `ApprovalRow` shape.
+    fn ledger_list(&self, history: bool, limit: u32) -> KjResult {
         let rows = {
             let db = self.kernel_db.lock();
-            match approval_ledger::ask::list_pending(db.conn_for_ledger()) {
+            let conn = db.conn_for_ledger();
+            let result = if history {
+                approval_ledger::ask::list_history(conn, limit as i64)
+            } else {
+                approval_ledger::ask::list_pending(conn)
+            };
+            match result {
                 Ok(rows) => rows,
                 Err(e) => return KjResult::Err(format!("kj ledger list: {e}")),
             }
@@ -174,7 +208,8 @@ impl KjDispatcher {
                 .collect(),
         );
         if rows.is_empty() {
-            return KjResult::ok_with_data("(no pending approvals)".to_string(), data);
+            let msg = if history { "(no decided asks)" } else { "(no pending approvals)" };
+            return KjResult::ok_with_data(msg.to_string(), data);
         }
         let mut lines = vec![format!(
             "  {:<38}  {:<8}  {:<9}  {}",
@@ -190,7 +225,11 @@ impl KjDispatcher {
             ));
         }
         lines.push(String::new());
-        lines.push("answer with: kj ledger allow <request-id>  |  kj ledger deny <request-id>".into());
+        if history {
+            lines.push("see full detail with: kj ledger show <request-id>".into());
+        } else {
+            lines.push("answer with: kj ledger allow <request-id>  |  kj ledger deny <request-id>".into());
+        }
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
@@ -816,6 +855,113 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such ask"));
+    }
+
+    /// A decided ask must drop off `kj ledger list`'s live queue and show
+    /// up under `kj ledger list --history` instead — the audit-trail
+    /// read-back this slice adds. Asserted on the typed `.data` payload
+    /// (an array of request-id strings, per the kj list-command
+    /// convention), never on a substring of the human-readable table.
+    #[tokio::test]
+    async fn ledger_list_history_shows_a_decided_ask_and_the_plain_list_drops_it() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let db = d.kernel_db.clone();
+        let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
+        let gate = tokio::spawn(async move {
+            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
+        });
+        let request_id = wait_for_pending(&d).await;
+
+        let deny = d
+            .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
+            .await;
+        assert!(deny.is_ok(), "deny must succeed: {deny:?}");
+        let _ = gate.await;
+
+        let plain = d.dispatch(&[s("ledger"), s("list")], &c).await;
+        assert!(plain.is_ok(), "{plain:?}");
+        let plain_data = match &plain {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("kj ledger list must emit structured data: {other:?}"),
+        };
+        assert!(
+            !plain_data
+                .as_array()
+                .expect(".data must be an array")
+                .iter()
+                .any(|v| v.as_str() == Some(request_id.as_str())),
+            "a decided ask must not appear in the live queue: {plain_data}"
+        );
+
+        let history = d
+            .dispatch(&[s("ledger"), s("list"), s("--history")], &c)
+            .await;
+        assert!(history.is_ok(), "{history:?}");
+        let history_data = match &history {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("kj ledger list --history must emit structured data: {other:?}"),
+        };
+        assert!(
+            history_data
+                .as_array()
+                .expect(".data must be an array")
+                .iter()
+                .any(|v| v.as_str() == Some(request_id.as_str())),
+            "the decided ask must appear in --history: {history_data}"
+        );
+    }
+
+    /// `--limit` bounds the `.data` array, and the default keeps the most
+    /// recently created decided ask first.
+    #[tokio::test]
+    async fn ledger_list_history_limit_caps_the_data_array_newest_first() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        async fn decide_one(d: &crate::kj::KjDispatcher, c: &KjCaller, allow: bool) -> String {
+            let db = d.kernel_db.clone();
+            let caller = c.clone();
+            let flows = d.kernel.ledger_flows().clone();
+            let gate =
+                tokio::spawn(async move { run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await });
+            let request_id = wait_for_pending(d).await;
+            let verb = if allow { "allow" } else { "deny" };
+            let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], c).await;
+            assert!(result.is_ok(), "{verb} must succeed: {result:?}");
+            let _ = gate.await;
+            request_id
+        }
+
+        let first = decide_one(&d, &c, false).await;
+        // Force a distinct `created_at` millisecond so "newest first" is
+        // asserting real ordering, not a coincidence.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = decide_one(&d, &c, true).await;
+
+        let capped = d
+            .dispatch(&[s("ledger"), s("list"), s("--history"), s("--limit"), s("1")], &c)
+            .await;
+        assert!(capped.is_ok(), "{capped:?}");
+        let capped_ids: Vec<String> = match &capped {
+            KjResult::Ok { data: Some(v), .. } => {
+                v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(capped_ids, vec![second.clone()], "--limit 1 keeps only the newest decided ask");
+
+        let all = d.dispatch(&[s("ledger"), s("list"), s("--history")], &c).await;
+        let all_ids: Vec<String> = match &all {
+            KjResult::Ok { data: Some(v), .. } => {
+                v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(all_ids.contains(&first), "{all_ids:?}");
+        assert!(all_ids.contains(&second), "{all_ids:?}");
     }
 
     /// The whole point of this slice: a remembered allow rule must make the

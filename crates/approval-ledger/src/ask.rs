@@ -273,6 +273,28 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
     Ok(rows)
 }
 
+/// Every decided ask — `allowed`, `denied`, `expired`, or `abandoned`
+/// (i.e. [`crate::types::ApprovalStatus::is_terminal`]) — most recently
+/// created first, capped at `limit` rows. This is the audit-trail
+/// read-back `list_pending` doesn't provide: `pending`/`claimed` rows
+/// never appear here, and once a row lands here it never appears in
+/// `list_pending` again (the two queries partition `approvals` by status).
+/// Ordered by `created_at` rather than `decided_at` because `decide`'s
+/// `expire`/`abandon` legs leave `decided_at` NULL (see `decide.rs`'s
+/// `transition`) — `created_at` is the one timestamp every row has.
+pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+                description, authorized_label, rc_run_id, status, created_at,
+                expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
+                remember_scope, auto_reason
+         FROM approvals WHERE status IN ('allowed', 'denied', 'expired', 'abandoned')
+         ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The choices offered on this ask, in presentation order.
 pub fn list_options(conn: &Connection, request_id: &str) -> Result<Vec<OptionRow>> {
     let mut stmt = conn.prepare(
@@ -664,5 +686,64 @@ mod tests {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
         assert!(list_events(&conn, &request_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_history_only_returns_terminal_asks_and_excludes_them_from_list_pending() {
+        let conn = open_memory();
+        let id_a = create_ask(&conn, &minimal_ask()).unwrap();
+        let id_b = create_ask(&conn, &minimal_ask()).unwrap();
+
+        // Both still pending: history is empty, list_pending has both.
+        assert!(list_history(&conn, 10).unwrap().is_empty());
+        assert_eq!(list_pending(&conn).unwrap().len(), 2);
+
+        let decided = crate::decide::decide(
+            &conn,
+            &id_a,
+            crate::decide::DecideInput { allow: false, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(decided.status, ApprovalStatus::Denied);
+
+        let history = list_history(&conn, 10).unwrap();
+        assert_eq!(history.len(), 1, "only the decided ask shows up in history: {history:?}");
+        assert_eq!(history[0].request_id, id_a);
+        assert_eq!(history[0].status, ApprovalStatus::Denied);
+
+        let pending = list_pending(&conn).unwrap();
+        assert_eq!(pending.len(), 1, "the decided ask must drop out of the pending queue");
+        assert_eq!(pending[0].request_id, id_b);
+    }
+
+    #[test]
+    fn list_history_caps_at_limit_newest_decided_first() {
+        let conn = open_memory();
+        let id_a = create_ask(&conn, &minimal_ask()).unwrap();
+        crate::decide::decide(
+            &conn,
+            &id_a,
+            crate::decide::DecideInput { allow: false, ..Default::default() },
+        )
+        .unwrap();
+
+        // Force a distinct `created_at` millisecond so ordering isn't
+        // coincidental.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let id_b = create_ask(&conn, &minimal_ask()).unwrap();
+        crate::decide::decide(
+            &conn,
+            &id_b,
+            crate::decide::DecideInput { allow: true, ..Default::default() },
+        )
+        .unwrap();
+
+        let capped = list_history(&conn, 1).unwrap();
+        assert_eq!(capped.len(), 1, "limit=1 must return exactly one row");
+        assert_eq!(capped[0].request_id, id_b, "newest-created decided ask must sort first");
+
+        let all = list_history(&conn, 10).unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
