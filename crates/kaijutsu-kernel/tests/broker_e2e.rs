@@ -658,7 +658,12 @@ async fn policy_show_and_set_round_trip() {
 }
 
 #[tokio::test]
-async fn unknown_tool_name_surfaces_tool_not_found() {
+async fn unknown_tool_name_surfaces_a_sorted_available_list() {
+    // A name that never resolved anywhere (typo/hallucination) must yield
+    // the dedicated `UnknownToolName` variant — not the old
+    // `ToolNotFound { instance: InstanceId::new(""), .. }` hack — carrying
+    // the names actually visible to this context, sorted, with `total`
+    // equal to `available.len()` while under the cap.
     let fx = setup().await;
 
     let err = fx
@@ -667,10 +672,97 @@ async fn unknown_tool_name_surfaces_tool_not_found() {
         .await
         .expect_err("unknown tool must error");
 
-    assert!(
-        matches!(err, McpError::ToolNotFound { ref tool, .. } if tool == "does_not_exist"),
-        "expected ToolNotFound(tool=does_not_exist), got {err:?}"
+    let msg = err.to_string();
+    assert!(!msg.contains("InstanceId"), "message must not leak internals: {msg}");
+
+    match err {
+        McpError::UnknownToolName { tool, available, total } => {
+            assert_eq!(tool, "does_not_exist");
+            assert!(!available.is_empty(), "the default binding sees real tools");
+            assert!(
+                !available.contains(&"does_not_exist".to_string()),
+                "the unknown name itself must not appear in its own suggestion list"
+            );
+            assert_eq!(
+                total,
+                available.len(),
+                "under the cap, total must equal the full list length"
+            );
+            let mut sorted = available.clone();
+            sorted.sort();
+            assert_eq!(available, sorted, "names must be sorted for determinism");
+        }
+        other => panic!("expected McpError::UnknownToolName, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tool_resolution_error_truncates_over_the_cap_and_says_how_many_were_omitted() {
+    // A context with many visible tools (several external/mock servers)
+    // must not dump an unbounded list into the error. Above
+    // `error::TOOL_LIST_CAP` (60) the error lists only the first 60 sorted
+    // names and reports how many more exist, pointing at `tool_search`.
+    let fx = setup().await;
+
+    for i in 0..70 {
+        let mock = Arc::new(LocalMock::new(&format!("test.mock{i}")));
+        fx.kernel
+            .broker()
+            .register(mock, InstancePolicy::default())
+            .await
+            .unwrap();
+    }
+
+    let mut binding = ContextToolBinding::new();
+    for inst in fx.kernel.broker().list_instances().await {
+        binding.allow(inst);
+    }
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    let seed_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        fx.exec_ctx.session_id,
+        fx.exec_ctx.kernel_id,
     );
+    let visible_count = fx
+        .kernel
+        .broker()
+        .list_visible_tools(fx.ctx_id, &seed_ctx)
+        .await
+        .unwrap()
+        .len();
+    assert!(
+        visible_count > 60,
+        "test setup must exceed the cap, got {visible_count}"
+    );
+
+    let err = fx
+        .kernel
+        .dispatch_tool_via_broker("does_not_exist_either", "{}", &fx.exec_ctx)
+        .await
+        .expect_err("unknown tool must error");
+    let msg = err.to_string();
+
+    match err {
+        McpError::UnknownToolName { tool, available, total } => {
+            assert_eq!(tool, "does_not_exist_either");
+            assert_eq!(available.len(), 60, "list truncates to the cap");
+            assert_eq!(total, visible_count, "total is the untruncated count");
+            let omitted = total - available.len();
+            assert!(
+                msg.contains(&omitted.to_string()),
+                "message must state the omitted count ({omitted}): {msg}"
+            );
+            assert!(
+                msg.contains("tool_search"),
+                "message must name the real follow-up tool: {msg}"
+            );
+            let mut sorted = available.clone();
+            sorted.sort();
+            assert_eq!(available, sorted, "names must be sorted for determinism");
+        }
+        other => panic!("expected McpError::UnknownToolName, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -705,10 +797,38 @@ async fn denied_tool_call_names_the_tool_and_context_not_an_empty_or_confusing_e
         "error must name the denying context: {msg}"
     );
     assert!(
-        matches!(err, McpError::LoadoutDenied { ref tool, context } if tool == "write" && context == fx.ctx_id),
-        "expected LoadoutDenied for a registered-but-ungranted tool (not ToolNotFound, \
-         which would read as a typo), got {err:?}"
+        !msg.contains("does not exist"),
+        "a denial must not read like the unknown-name case: {msg}"
     );
+
+    match err {
+        McpError::LoadoutDenied {
+            tool,
+            context,
+            available,
+            total,
+        } => {
+            assert_eq!(tool, "write");
+            assert_eq!(context, fx.ctx_id);
+            // The narrow binding this test set up grants exactly
+            // `builtin.file:read` — `available` is what this context can
+            // actually call instead, so it must carry that grant and
+            // nothing about the denied `write` tool.
+            assert!(
+                !available.is_empty(),
+                "a denial should still list what the context CAN call"
+            );
+            assert!(
+                !available.contains(&"write".to_string()),
+                "the denied tool must not appear in its own alternative list"
+            );
+            assert_eq!(total, available.len(), "under the cap, total == available.len()");
+        }
+        other => panic!(
+            "expected LoadoutDenied for a registered-but-ungranted tool (not ToolNotFound/\
+             UnknownToolName, which would read as a typo), got {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]

@@ -428,9 +428,7 @@ impl Kernel {
         tool_ctx: &ExecContext,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ExecResult, crate::mcp::McpError> {
-        use crate::mcp::{
-            CallContext, InstanceId, KernelCallParams, McpError, ToolContent, TraceContext,
-        };
+        use crate::mcp::{CallContext, KernelCallParams, McpError, ToolContent, TraceContext};
 
         // Deny-by-default: use whatever binding the context has (assigned by
         // its rc `create`/`fork` lifecycle). No first-touch permissive seeding
@@ -460,6 +458,10 @@ impl Kernel {
         let visible = broker
             .list_visible_tools(tool_ctx.context_id, &seed_ctx)
             .await?;
+        // Names visible to this context, captured before `visible` is
+        // consumed below — both error branches on the `None` arm need them
+        // to tell the caller what it could call instead.
+        let visible_names: Vec<String> = visible.iter().map(|(name, _)| name.clone()).collect();
         let (instance, tool) = match visible
             .into_iter()
             .find(|(visible_name, _)| visible_name == tool_name)
@@ -479,15 +481,19 @@ impl Kernel {
                     .await
                     .into_iter()
                     .any(|(name, _, _, _)| name == tool_name);
+                let (available, total) = crate::mcp::error::tool_name_list(visible_names);
                 return Err(if known {
                     McpError::LoadoutDenied {
                         context: tool_ctx.context_id,
                         tool: tool_name.to_string(),
+                        available,
+                        total,
                     }
                 } else {
-                    McpError::ToolNotFound {
-                        instance: InstanceId::new(""),
+                    McpError::UnknownToolName {
                         tool: tool_name.to_string(),
+                        available,
+                        total,
                     }
                 });
             }

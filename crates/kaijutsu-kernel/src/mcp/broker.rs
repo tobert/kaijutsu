@@ -2399,6 +2399,14 @@ fn error_to_hook_json(e: &McpError) -> String {
             "ToolNotFound",
             serde_json::json!({"instance": instance.as_str(), "tool": tool}),
         ),
+        McpError::UnknownToolName {
+            tool,
+            available,
+            total,
+        } => (
+            "UnknownToolName",
+            serde_json::json!({"tool": tool, "available": available, "total": total}),
+        ),
         McpError::InstanceNotFound(instance) => (
             "InstanceNotFound",
             serde_json::json!({"instance": instance.as_str()}),
@@ -2427,9 +2435,19 @@ fn error_to_hook_json(e: &McpError) -> String {
             "FacadeDenied",
             serde_json::json!({"facade": facade}),
         ),
-        McpError::LoadoutDenied { context, tool } => (
+        McpError::LoadoutDenied {
+            context,
+            tool,
+            available,
+            total,
+        } => (
             "LoadoutDenied",
-            serde_json::json!({"context": context.to_string(), "tool": tool}),
+            serde_json::json!({
+                "context": context.to_string(),
+                "tool": tool,
+                "available": available,
+                "total": total,
+            }),
         ),
         McpError::BindingUnavailable { context, reason } => (
             "BindingUnavailable",

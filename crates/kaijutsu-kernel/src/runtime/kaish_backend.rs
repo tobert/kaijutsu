@@ -687,6 +687,14 @@ impl KernelBackend for KaijutsuBackend {
                 crate::mcp::McpError::ToolNotFound { tool, .. } => {
                     BackendError::ToolNotFound(tool)
                 }
+                // Central dispatch's never-resolved-anywhere case (typo or
+                // hallucinated name) — same "no such tool" outcome from this
+                // caller's point of view as `ToolNotFound` above, just
+                // carrying the visible-tool-list detail `McpError`'s Display
+                // already renders into `other.to_string()` for the message.
+                crate::mcp::McpError::UnknownToolName { tool, .. } => {
+                    BackendError::ToolNotFound(tool)
+                }
                 other => BackendError::Io(other.to_string()),
             })?;
 

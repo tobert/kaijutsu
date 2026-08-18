@@ -46,6 +46,48 @@ pub enum CoalescerError {
     WindowClosed,
 }
 
+/// Cap on how many visible tool names a resolution error lists inline.
+/// Above this, the error names only the first `TOOL_LIST_CAP` (sorted) and
+/// reports how many more exist instead of enumerating them — a typical
+/// context sees on the order of 50 tools (well under the cap), but a
+/// context bound to several external MCP servers could see many more.
+pub const TOOL_LIST_CAP: usize = 60;
+
+/// Build the `(shown, total)` payload for a tool-resolution error from the
+/// full set of names visible to the calling context: sorts and dedups for
+/// determinism, then truncates the list the error carries to
+/// [`TOOL_LIST_CAP`]. `total` keeps the untruncated count so the message
+/// can say how many names were left out.
+pub fn tool_name_list(mut names: Vec<String>) -> (Vec<String>, usize) {
+    names.sort();
+    names.dedup();
+    let total = names.len();
+    names.truncate(TOOL_LIST_CAP);
+    (names, total)
+}
+
+/// Render the "here's what you could call instead" clause shared by
+/// [`McpError::UnknownToolName`] and [`McpError::LoadoutDenied`] — same
+/// underlying data (a context's visible-tool list), so the two messages
+/// can't drift apart on how they describe it.
+fn available_tools_clause(available: &[String], total: usize) -> String {
+    if available.is_empty() {
+        return "no tools are visible to this context".to_string();
+    }
+    let joined = available.join(", ");
+    let tool_word = if total == 1 { "tool is" } else { "tools are" };
+    if total > available.len() {
+        let omitted = total - available.len();
+        format!(
+            "{total} {tool_word} visible to this context; showing the first {} and \
+             omitting {omitted} more (call tool_search to find the rest): {joined}",
+            available.len()
+        )
+    } else {
+        format!("{total} {tool_word} visible to this context: {joined}")
+    }
+}
+
 /// Broker-internal errors (§4.5, D-26).
 #[derive(Debug, Error)]
 pub enum McpError {
@@ -54,6 +96,24 @@ pub enum McpError {
 
     #[error("tool `{tool}` not found on instance {instance}")]
     ToolNotFound { instance: InstanceId, tool: String },
+
+    /// `tool_name` never resolved to anything in the broker's unfiltered
+    /// registry — a typo or a hallucinated name, as distinct from
+    /// [`McpError::LoadoutDenied`] (the name is real, this context's
+    /// loadout just doesn't grant it). Carries the names actually visible
+    /// to the calling context so the caller has something to retry with
+    /// instead of a bare "not found". The one construction site (central
+    /// broker dispatch, `Kernel::dispatch_tool_via_broker_with_cancel`)
+    /// already has the visible-tool list in hand; this variant retires
+    /// that call site's former fallback of building a `ToolNotFound` with
+    /// an empty `InstanceId`, which named no server because there wasn't
+    /// one to name.
+    #[error("tool `{tool}` does not exist — check for a typo. {}", available_tools_clause(available, *total))]
+    UnknownToolName {
+        tool: String,
+        available: Vec<String>,
+        total: usize,
+    },
 
     #[error("instance {0} not registered with broker")]
     InstanceNotFound(InstanceId),
@@ -107,16 +167,26 @@ pub enum McpError {
 
     /// A tool call named something that exists somewhere in the broker's
     /// registry, but this context's loadout/binding doesn't grant it — as
-    /// distinct from [`McpError::ToolNotFound`], which means the name never
-    /// resolved to anything at all (a typo or a hallucinated tool). Both look
-    /// identical to `binding.resolve()` (deny-by-default hides the tool the
-    /// same way either way), so the dispatch path checks the unfiltered
-    /// registry to tell them apart before reporting which one happened.
+    /// distinct from [`McpError::UnknownToolName`], which means the name
+    /// never resolved to anything at all (a typo or a hallucinated tool).
+    /// Both look identical to `binding.resolve()` (deny-by-default hides the
+    /// tool the same way either way), so the dispatch path checks the
+    /// unfiltered registry to tell them apart before reporting which one
+    /// happened. Carries the same visible-tool-list data as
+    /// `UnknownToolName` — this is arguably where it helps most: the tool
+    /// exists, this context may not call it, here is what it may call
+    /// instead.
     #[error(
         "tool `{tool}` denied to context {context}: not granted by its loadout/binding \
-         (deny-by-default — see `kj binding show`/`kj binding allow`)"
+         (deny-by-default — see `kj binding show`/`kj binding allow`). {}",
+        available_tools_clause(available, *total)
     )]
-    LoadoutDenied { context: ContextId, tool: String },
+    LoadoutDenied {
+        context: ContextId,
+        tool: String,
+        available: Vec<String>,
+        total: usize,
+    },
 
     /// The context's tool binding could not be read from the kernel DB (a
     /// real storage/IO failure, not "never bound" — that case returns an
