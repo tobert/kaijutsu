@@ -19,7 +19,7 @@
 //! Amy, 2026-08-16: *"yeah kj cc send should go through the ledger."*
 //! Injecting a turn into another agent's session is exactly the action a
 //! human should authorize, so every real send first leaves a durable ask
-//! row ([`crate::kj::gate`]) and waits for an answer (`kj approve`) until
+//! row ([`crate::kj::gate`]) and waits for an answer (`kj ledger`) until
 //! `gate_wait_timeout` — fail-closed on elapse. `--dry-run` writes nothing
 //! and is exempt.
 

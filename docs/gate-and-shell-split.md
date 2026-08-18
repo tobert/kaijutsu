@@ -35,10 +35,10 @@ both; it invents neither.
    already shipped, tested, and trigger-backed. What this doc adds is the
    forward-compatible shape for loosening it later (see "The ledger key,
    including the future predicate shape").
-2. **`kj cc send`** (`crates/kaijutsu-kernel/src/kj/{cc,gate,approve}.rs`) —
+2. **`kj cc send`** (`crates/kaijutsu-kernel/src/kj/{cc,gate,ledger}.rs`) —
    the first working consumer: a `GateSpec` (hand-authored, not
    `plan_program`-derived, because a `kj` verb isn't kaish source text),
-   `run_gate` (rules first → durable ask → wait-or-expire), and `kj approve
+   `run_gate` (rules first → durable ask → wait-or-expire), and `kj ledger
    list/show/allow/deny` as the answering CLI. This is the template Slice 5
    below extends to the six `Latch` producers, and Slice 4 generalizes to
    real kaish source.
@@ -114,7 +114,7 @@ kaish builtin that bypasses the broker `call_tool` / facade gates entirely
 facade gate"*). `kj` already had this property before this doc; `kj hook`
 just uses it for hooks specifically.
 
-**Shape**, following the `kj mcp` / `kj approve` precedent:
+**Shape**, following the `kj mcp` / `kj ledger` precedent:
 
 ```
 kj hook list                    # every persisted hook, phase + match + action
@@ -746,8 +746,8 @@ refuses the whole call; an uncovered submission escalates and blocks on
 real `ShellServer` MCP wiring; a `literal: false` heredoc is rendered and
 gated normally, with an explicit assertion that the prompt never presents
 substituted text as final; the `Stmt::Empty` index-gap regression tests
-above; `kj approve` answers a `shell_write` ask like a `kj cc send` ask,
-through the real `kj approve list`/`allow` verbs, not the ledger API
+above; `kj ledger` answers a `shell_write` ask like a `kj cc send` ask,
+through the real `kj ledger list`/`allow` verbs, not the ledger API
 directly.
 
 **Slice 4.5 — the ledger announces.** Slice 4 shipped a gate that was
@@ -814,7 +814,7 @@ The pieces:
   `listPendingApprovals`/`getApproval` read RPCs: two permanent ordinals
   serving one subject, versus one additive field making *every* `kj` verb's
   structured output wire-reachable. Reads land on `executeKj`; **writes stay
-  `kj approve`**, so the ledger's exactly-one-answerer transaction remains
+  `kj ledger`**, so the ledger's exactly-one-answerer transaction remains
   the single decision path and no new write surface exists to drift from it.
 
 **Where the announcement fires is the whole point:** immediately after
@@ -826,7 +826,7 @@ while every other test still passed. Pinned by
 verified to fail when the announcement is moved.
 
 Auto-decisions and expiry announce too (both are durable transitions a
-client rendering the ask needs to see), and `kj approve` announces after
+client rendering the ask needs to see), and `kj ledger` announces after
 answering — with its `KernelDb` guard explicitly scoped so it is released
 first, since `announce_ledger_change` re-takes that same non-reentrant
 `parking_lot::Mutex` to read the committed generation.
@@ -928,7 +928,7 @@ slice:
   and a pending ask row exists, not that a specific enum variant came
   back).
 - The bare `--confirm` flag and its `${verb} --confirm` hint text are
-  deleted for these six verbs — confirmation now happens via `kj approve
+  deleted for these six verbs — confirmation now happens via `kj ledger
   allow <request-id>`, a different verb, answerable from any session, not a
   flag on the one that triggered the ask.
 - `is_gated_verb`'s distill-only special case goes away; it now covers all
@@ -992,7 +992,7 @@ synchronous shape — a verb refuses immediately, prints "retype this with
 `--confirm`," and the SAME caller's next call executes it directly, no
 ledger, no other party. `run_gate` is a different shape entirely: it
 blocks the ONE call, in-process, up to `gate_wait_timeout`, while any
-session's `kj approve` (or a `subscribePermissionEvents` subscriber, once
+session's `kj ledger` (or a `subscribePermissionEvents` subscriber, once
 the shared seam lands) can decide it; by the time the call returns, the ask
 is already terminal. There is no "pending, resubmit" state in the new
 model for a `NeedsApproval`-shaped variant to name — the lead's suggested
@@ -1013,7 +1013,7 @@ ledger's own facts, not a retyped command):
 
 | Old | New | Why this name |
 |---|---|---|
-| `kj.latch.command` / `kj.latch.target` baggage keys | `kj.approval.request_id` | The old pair told the caller what to retype. The new fact a caller needs is which ledger row to look up — `kj approve show <id>`, or hand it to a human — so one key replaces two. |
+| `kj.latch.command` / `kj.latch.target` baggage keys | `kj.approval.request_id` | The old pair told the caller what to retype. The new fact a caller needs is which ledger row to look up — `kj ledger show <id>`, or hand it to a human — so one key replaces two. |
 | (nothing — `hint` had no successor fact) | `kj.approval.status` | The terminal `ApprovalStatus` (`denied`/`expired`/`abandoned`), so a caller can tell "a human said no" from "nobody answered" (Ruling 2's distinction) without parsing the prose message. New, not renamed — the old shape never carried this because the old shape never waited for anyone. |
 | `latch_result(command, target, reason, hint) -> ExecResult` | `attach_approval_baggage(result: &mut ExecResult, request_id: &str, status: ApprovalStatus)` | Mutates in place rather than constructing a fresh `ExecResult`, because the caller (`run_gate`'s callers) already has one from `KjResult::Err` and is only attaching two facts to it, not building a result shape from scratch the way the old latch did. |
 | `latch_from_result(&ExecResult) -> Option<KjLatchInfo>` | `approval_from_result(&ExecResult) -> Option<KjApprovalInfo>` | Read-side mirror of the above; same rename logic. |
@@ -1082,7 +1082,7 @@ Slice 5 needs to make here is behavioral, not lexical:
 {
   "reason": "kj command was refused by the approval gate (denied): <message>",
   "approval": { "request_id": "...", "status": "denied", "message": "..." },
-  "next_steps": "kj approve show <request_id> from any session; allow/deny it there"
+  "next_steps": "kj ledger show <request_id> from any session; allow/deny it there"
 }
 ```
 
@@ -1174,7 +1174,7 @@ exactly as they are.
   `docs/issues.md`'s entry for it suggests.** The entry ("Gate slice 1a —
   three findings from the research pass") reads as a stopped-mid-flight
   status ("stopped at the manifest wiring when the day ended"), but
-  `kj/gate.rs` and `kj/approve.rs` are complete, tested (rules-first
+  `kj/gate.rs` and `kj/ledger.rs` are complete, tested (rules-first
   short-circuit, patient-hold timeout coordination, an auto-decided path,
   a human-answers-from-elsewhere path, a deny path, and the guarantee-3
   free-variable end-to-end test), and already wired as `kj cc send`'s real

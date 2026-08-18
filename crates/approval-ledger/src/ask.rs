@@ -255,7 +255,7 @@ fn sql_err(e: LedgerError) -> rusqlite::Error {
 }
 
 /// Every `pending` ask, oldest first — the CLI-answerer's queue
-/// (`kj approve list`). Same ordering as [`crate::claim::claim_next`]'s
+/// (`kj ledger list`). Same ordering as [`crate::claim::claim_next`]'s
 /// `ORDER BY created_at`, so "what's next" reads the same whether a caller
 /// claims one at a time or lists the whole backlog at once. Deliberately
 /// `pending` only, not `claimed` too: a claimed-but-undecided row already

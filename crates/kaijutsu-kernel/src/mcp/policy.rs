@@ -65,7 +65,7 @@ impl InstancePolicy {
     /// never gates, and no other builtin server calls `run_gate`).
     ///
     /// A gate-capable instance holds for a HUMAN to answer from another
-    /// surface (`kj approve`), not for a normal tool's own work, so it is
+    /// surface (`kj ledger`), not for a normal tool's own work, so it is
     /// bounded by the gate ladder (`kaijutsu_types::timeout::gate`) rather
     /// than the generic `mcp_call_timeout_default` every other instance
     /// uses. Using the generic default here reopens the exact defect the

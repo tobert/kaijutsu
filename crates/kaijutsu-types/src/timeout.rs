@@ -129,7 +129,7 @@ pub mod peer {
 /// The gate ladder — one logical deadline enforced at FOUR hops.
 ///
 /// A gated `shell_write` call is `run_gate` blocking on a human answering
-/// from another surface (`kj approve`), wrapped inside a broker
+/// from another surface (`kj ledger`), wrapped inside a broker
 /// `Broker::call_tool`, wrapped inside a client RPC dispatch. Three hops
 /// deep, each with its own timeout, and — until this module existed — each
 /// with its own independently-chosen number:

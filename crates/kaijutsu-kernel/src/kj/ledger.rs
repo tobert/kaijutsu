@@ -1,14 +1,14 @@
-//! `kj approve` — answer the approval ledger's pending asks.
+//! `kj ledger` — answer the approval ledger's pending asks.
 //!
 //! The answering half of the gate in [`crate::kj::gate`]: a gated verb
 //! (`kj cc send` today) leaves a durable ask row and waits; a human — in
 //! any shell, any client, minutes later if need be — answers it here.
 //!
 //! ```sh
-//! kj approve list               # what is waiting for a decision
-//! kj approve show <request-id>  # one ask, with its statement
-//! kj approve allow <request-id> # claim + allow (exactly one answerer wins)
-//! kj approve deny <request-id>  # claim + deny
+//! kj ledger list               # what is waiting for a decision
+//! kj ledger show <request-id>  # one ask, with its statement
+//! kj ledger allow <request-id> # claim + allow (exactly one answerer wins)
+//! kj ledger deny <request-id>  # claim + deny
 //! ```
 //!
 //! Answering is a two-step ledger transaction by design: [`claim`] moves
@@ -27,18 +27,18 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "approve",
+    name = "ledger",
     about = "Answer pending approval-ledger asks left by gated kj verbs",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-pub(crate) struct ApproveArgs {
+pub(crate) struct LedgerArgs {
     #[command(subcommand)]
-    command: ApproveCommand,
+    command: LedgerCommand,
 }
 
 #[derive(Subcommand, Debug)]
-enum ApproveCommand {
+enum LedgerCommand {
     /// List asks still waiting for a decision (status pending or claimed).
     List,
     /// Show one ask in full, including the statement being authorized.
@@ -50,11 +50,11 @@ enum ApproveCommand {
 }
 
 impl KjDispatcher {
-    pub(crate) fn dispatch_approve(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    pub(crate) fn dispatch_ledger(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return clap_help_for::<ApproveArgs>();
+            return clap_help_for::<LedgerArgs>();
         }
-        let parsed = match ApproveArgs::try_parse_from(argv) {
+        let parsed = match LedgerArgs::try_parse_from(argv) {
             Ok(p) => p,
             Err(e) => {
                 if matches!(
@@ -64,23 +64,23 @@ impl KjDispatcher {
                 ) {
                     return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
                 }
-                return KjResult::Err(format!("kj approve: {e}"));
+                return KjResult::Err(format!("kj ledger: {e}"));
             }
         };
         match parsed.command {
-            ApproveCommand::List => self.approve_list(),
-            ApproveCommand::Show { request_id } => self.approve_show(&request_id),
-            ApproveCommand::Allow { request_id } => self.approve_decide(&request_id, true, caller),
-            ApproveCommand::Deny { request_id } => self.approve_decide(&request_id, false, caller),
+            LedgerCommand::List => self.ledger_list(),
+            LedgerCommand::Show { request_id } => self.ledger_show(&request_id),
+            LedgerCommand::Allow { request_id } => self.ledger_decide(&request_id, true, caller),
+            LedgerCommand::Deny { request_id } => self.ledger_decide(&request_id, false, caller),
         }
     }
 
-    fn approve_list(&self) -> KjResult {
+    fn ledger_list(&self) -> KjResult {
         let rows = {
             let db = self.kernel_db.lock();
             match approval_ledger::ask::list_pending(db.conn_for_ledger()) {
                 Ok(rows) => rows,
-                Err(e) => return KjResult::Err(format!("kj approve list: {e}")),
+                Err(e) => return KjResult::Err(format!("kj ledger list: {e}")),
             }
         };
         let data = serde_json::Value::Array(
@@ -105,23 +105,23 @@ impl KjDispatcher {
             ));
         }
         lines.push(String::new());
-        lines.push("answer with: kj approve allow <request-id>  |  kj approve deny <request-id>".into());
+        lines.push("answer with: kj ledger allow <request-id>  |  kj ledger deny <request-id>".into());
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    fn approve_show(&self, request_id: &str) -> KjResult {
+    fn ledger_show(&self, request_id: &str) -> KjResult {
         let db = self.kernel_db.lock();
         let conn = db.conn_for_ledger();
         let row = match approval_ledger::ask::get_approval(conn, request_id) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return KjResult::Err(format!("kj approve: no such ask {request_id}"));
+                return KjResult::Err(format!("kj ledger: no such ask {request_id}"));
             }
-            Err(e) => return KjResult::Err(format!("kj approve show: {e}")),
+            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
         };
         let statements = match approval_ledger::ask::load_ask_statements(conn, request_id) {
             Ok(s) => s,
-            Err(e) => return KjResult::Err(format!("kj approve show: {e}")),
+            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
         };
 
         let mut lines = vec![
@@ -154,7 +154,7 @@ impl KjDispatcher {
     }
 
     /// Claim + decide one ask as the calling principal.
-    fn approve_decide(&self, request_id: &str, allow: bool, caller: &KjCaller) -> KjResult {
+    fn ledger_decide(&self, request_id: &str, allow: bool, caller: &KjCaller) -> KjResult {
         let verb = if allow { "allow" } else { "deny" };
 
         // The ledger work is scoped so the `KernelDb` guard is RELEASED before
@@ -174,14 +174,14 @@ impl KjDispatcher {
                 // to announce — return straight out rather than falling
                 // through to the notification below.
                 Err(LedgerError::NotFound(_)) => {
-                    return KjResult::Err(format!("kj approve: no such ask {request_id}"));
+                    return KjResult::Err(format!("kj ledger: no such ask {request_id}"));
                 }
                 Err(e @ LedgerError::NotClaimable { .. }) => {
                     // Someone else is answering, or the gate already expired it —
                     // say which, loudly; a silent no-op here reads as "done".
-                    return KjResult::Err(format!("kj approve: {e}"));
+                    return KjResult::Err(format!("kj ledger: {e}"));
                 }
-                Err(e) => return KjResult::Err(format!("kj approve: {e}")),
+                Err(e) => return KjResult::Err(format!("kj ledger: {e}")),
             }
 
             // Past the claim, a mutation HAS committed (pending → claimed), so
@@ -211,10 +211,10 @@ impl KjDispatcher {
                     }),
                 ),
                 Err(LedgerError::AlreadyDecided { status, .. }) => KjResult::Err(format!(
-                    "kj approve: ask {request_id} was already decided ({status}) — \
+                    "kj ledger: ask {request_id} was already decided ({status}) — \
                      your late answer was recorded in the event log but changed nothing"
                 )),
-                Err(e) => KjResult::Err(format!("kj approve: {e}")),
+                Err(e) => KjResult::Err(format!("kj ledger: {e}")),
             }
         };
 
@@ -255,11 +255,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_list_is_empty_then_shows_a_gated_ask() {
+    async fn ledger_list_is_empty_then_shows_a_gated_ask() {
         let d = test_dispatcher().await;
         let c = test_caller();
 
-        let result = d.dispatch(&[s("approve"), s("list")], &c).await;
+        let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
         assert!(result.is_ok());
         assert!(result.message().contains("no pending approvals"));
 
@@ -274,14 +274,14 @@ mod tests {
         let mut listed = String::new();
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let result = d.dispatch(&[s("approve"), s("list")], &c).await;
+            let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
             if result.message().contains("test ask") {
                 listed = result.message().to_string();
                 break;
             }
         }
         assert!(listed.contains("test ask"), "list must show the ask: {listed}");
-        assert!(listed.contains("kj approve allow"));
+        assert!(listed.contains("kj ledger allow"));
 
         // Deny it through the verb; the gate must observe the refusal.
         let request_id = listed
@@ -291,7 +291,7 @@ mod tests {
             .expect("request id is the first column")
             .to_string();
         let result = d
-            .dispatch(&[s("approve"), s("deny"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
             .await;
         assert!(result.is_ok(), "deny must succeed: {result:?}");
         let outcome = gate.await.unwrap();
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_allow_opens_the_gate_and_a_second_answer_is_loud() {
+    async fn ledger_allow_opens_the_gate_and_a_second_answer_is_loud() {
         let d = test_dispatcher().await;
         let c = test_caller();
 
@@ -326,7 +326,7 @@ mod tests {
         assert!(!request_id.is_empty());
 
         let result = d
-            .dispatch(&[s("approve"), s("allow"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c)
             .await;
         assert!(result.is_ok(), "allow must succeed: {result:?}");
         assert!(result.message().starts_with("allowed ask"));
@@ -334,7 +334,7 @@ mod tests {
         // Answering again is a loud error naming the terminal status, never
         // a silent no-op (guarantee 6).
         let again = d
-            .dispatch(&[s("approve"), s("allow"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c)
             .await;
         assert!(!again.is_ok());
         assert!(again.message().contains("not `pending`") || again.message().contains("already"));
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_show_renders_the_statement_being_authorized() {
+    async fn ledger_show_renders_the_statement_being_authorized() {
         let d = test_dispatcher().await;
         let c = test_caller();
 
@@ -369,7 +369,7 @@ mod tests {
         }
 
         let result = d
-            .dispatch(&[s("approve"), s("show"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("show"), s(&request_id)], &c)
             .await;
         assert!(result.is_ok(), "{result:?}");
         let msg = result.message();
@@ -377,17 +377,17 @@ mod tests {
         assert!(msg.contains("some-target"), "raw typed label, finding #3: {msg}");
 
         // Clean up the pending ask so the spawned gate terminates.
-        d.dispatch(&[s("approve"), s("deny"), s(&request_id)], &c)
+        d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
             .await;
         let _ = gate.await;
     }
 
     #[tokio::test]
-    async fn approve_of_an_unknown_id_errors_loudly() {
+    async fn ledger_of_an_unknown_id_errors_loudly() {
         let d = test_dispatcher().await;
         let c = test_caller();
         let result = d
-            .dispatch(&[s("approve"), s("allow"), s("deadbeef")], &c)
+            .dispatch(&[s("ledger"), s("allow"), s("deadbeef")], &c)
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such ask"));
@@ -397,21 +397,21 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn approve_bare_renders_help() {
+        async fn ledger_bare_renders_help() {
             let d = test_dispatcher().await;
             let c = test_caller();
-            let result = d.dispatch(&[s("approve")], &c).await;
+            let result = d.dispatch(&[s("ledger")], &c).await;
             assert!(
                 matches!(&result, KjResult::Ok { ephemeral: true, .. }),
-                "kj approve (no subcommand) should render help, got {result:?}"
+                "kj ledger (no subcommand) should render help, got {result:?}"
             );
         }
 
-        /// `kj approve` reads the kernel DB, not a context — it must work
+        /// `kj ledger` reads the kernel DB, not a context — it must work
         /// from a shell with no context joined (the place a human goes to
         /// answer a gate).
         #[tokio::test]
-        async fn approve_works_without_a_joined_context() {
+        async fn ledger_works_without_a_joined_context() {
             let d = test_dispatcher().await;
             let c = KjCaller {
                 principal_id: kaijutsu_types::PrincipalId::new(),
@@ -421,7 +421,7 @@ mod tests {
                 rc_depth: 0,
                 privileged: false,
             };
-            let result = d.dispatch(&[s("approve"), s("list")], &c).await;
+            let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
             assert!(result.is_ok(), "{result:?}");
         }
     }

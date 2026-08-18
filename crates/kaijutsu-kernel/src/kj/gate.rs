@@ -31,7 +31,7 @@
 //!    commits before anything waits (ledger guarantee 1). The ask row is the
 //!    durable record regardless of how the wait ends.
 //! 3. **The wait** — poll the row until it goes terminal (somebody answered
-//!    via `kj approve`) or `gate_wait_timeout` elapses. Elapse calls
+//!    via `kj ledger`) or `gate_wait_timeout` elapses. Elapse calls
 //!    [`approval_ledger::decide::expire`] and refuses: **fail-closed, loud,
 //!    with the request id in the error** so a human can inspect what was
 //!    asked.
@@ -49,8 +49,8 @@
 //!
 //! ## Answering
 //!
-//! From any shell: `kj approve list`, `kj approve allow <id>` /
-//! `kj approve deny <id>` (see [`crate::kj::approve`]). The ledger's claim
+//! From any shell: `kj ledger list`, `kj ledger allow <id>` /
+//! `kj ledger deny <id>` (see [`crate::kj::ledger`]). The ledger's claim
 //! race (guarantee 5) makes concurrent answers safe: exactly one answerer
 //! wins, losers read a loud `AlreadyDecided`/claim failure, never a silent
 //! no-op.
@@ -131,7 +131,7 @@ pub(crate) struct GateSpec {
     pub statements: Vec<GatedStatement>,
 }
 
-/// Poll interval for the wait loop. Sub-second keeps `kj approve` answers
+/// Poll interval for the wait loop. Sub-second keeps `kj ledger` answers
 /// feeling instant without hammering the (sub-ms, mutex-guarded) DB read.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -181,7 +181,7 @@ fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
                 statement_kind: s.statement_kind.clone(),
                 // A synthetic single command wrapping the whole rendered
                 // text — NOT kaish's real per-command/per-arg structure.
-                // `rendered` (shown verbatim by `kj approve show`) is the
+                // `rendered` (shown verbatim by `kj ledger show`) is the
                 // full-fidelity surface a human reads; this satisfies the
                 // schema's NOT NULL `approval_plan_commands` row without
                 // claiming a command-level breakdown this gate doesn't
@@ -223,7 +223,7 @@ fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
 }
 
 /// Truncate a statement's rendered text for a one-line reason string — the
-/// full text is always available via `kj approve show <id>`.
+/// full text is always available via `kj ledger show <id>`.
 fn truncate_for_reason(s: &str) -> String {
     const LIMIT: usize = 120;
     if s.chars().count() <= LIMIT {
@@ -411,7 +411,7 @@ pub(crate) async fn run_gate(
         };
     }
 
-    // 3. Escalate: wait for a human answer (`kj approve`) until terminal or
+    // 3. Escalate: wait for a human answer (`kj ledger`) until terminal or
     //    the shared budget elapses.
     //
     // Announce BEFORE the wait, not after it. This is the notification the
@@ -442,7 +442,7 @@ pub(crate) async fn run_gate(
                         )
                     } else {
                         format!(
-                            "refused: ask {request_id} ended `{}` — answer it with `kj approve \
+                            "refused: ask {request_id} ended `{}` — answer it with `kj ledger \
                              allow {request_id}` before the gate expires next time",
                             row.status
                         )
@@ -604,7 +604,7 @@ mod tests {
         });
 
         // ...then answer it from a DIFFERENT principal, the way a human in
-        // another shell would (`kj approve allow`).
+        // another shell would (`kj ledger allow`).
         let mut request_id = String::new();
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(50)).await;

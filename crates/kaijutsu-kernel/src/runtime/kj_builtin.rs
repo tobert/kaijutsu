@@ -666,7 +666,7 @@ impl Tool for KjBuiltin {
         //
         // Approval-gated verbs (`kj cc send` today) get the same treatment for
         // the same reason, one degree worse: they block on a HUMAN answering
-        // from another surface (`kj approve`), up to `gate_wait_timeout`. The
+        // from another surface (`kj ledger`), up to `gate_wait_timeout`. The
         // rc/hook kaish budgets are 10–30s, far shorter than that, so without
         // a patient hold the watchdog would kill the gate long before its own
         // deadline fired — "passes tests, dies in production" (docs/issues.md,
@@ -2084,7 +2084,7 @@ mod tests {
         assert!(!is_gated_verb(&argv("cc send --dry-run kaijutsu-chan hi")));
         assert!(!is_gated_verb(&argv("cc list")));
         assert!(!is_gated_verb(&argv("cc")));
-        assert!(!is_gated_verb(&argv("approve list")));
+        assert!(!is_gated_verb(&argv("ledger list")));
         assert!(!is_gated_verb(&argv("context list")));
         assert!(!is_gated_verb(&[]));
     }

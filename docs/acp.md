@@ -781,13 +781,13 @@ that remain genuinely open:
   polls the ledger when it feels like it, or marks a cache dirty and does
   nothing; none of that policy is in the kernel. Reads come back over
   `executeKj`'s `data` field (every `kj` verb's structured output is on the
-  wire now); answering stays `kj approve`, so the ledger's
+  wire now); answering stays `kj ledger`, so the ledger's
   exactly-one-answerer `claim`/`decide` transaction remains the single
   decision path.
 
   **What is left is the ACP consumer**: subscribe, poll on notification,
   project pending asks into `session/request_permission`, and answer via
-  `executeKj` running `kj approve`. Note the contrast with the *other*
+  `executeKj` running `kj ledger`. Note the contrast with the *other*
   approval path — `PermissionEvents::onAsk @93` is a blocking round trip
   whose response IS the decision, and its client channel is take-once
   because each envelope carries a one-shot answer sender. `onChanged` has no

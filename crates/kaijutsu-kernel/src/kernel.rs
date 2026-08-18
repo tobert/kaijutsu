@@ -135,7 +135,7 @@ pub struct Kernel {
     /// serializes these onto the `EditorEvents` capnp callback.
     editor_flows: SharedEditorFlowBus,
     /// FlowBus for approval-ledger change notifications — the push channel
-    /// that replaces polling `kj approve list` and hoping. Published by
+    /// that replaces polling `kj ledger list` and hoping. Published by
     /// [`Self::notify_ledger_changed`] after a ledger mutation commits;
     /// the server's `subscribe_ledger_events` bridge coalesces and forwards
     /// them onto the `LedgerEvents` capnp callback.

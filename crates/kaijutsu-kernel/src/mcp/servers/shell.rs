@@ -447,7 +447,7 @@ impl McpServerLike for ShellServer {
             // the broker's before the client's.**
             //
             // `run_gate` blocks on a human answering from another surface
-            // (`kj approve`). This call runs *inside* a broker `call_tool`,
+            // (`kj ledger`). This call runs *inside* a broker `call_tool`,
             // which is itself the answer to an RPC dispatched by a client
             // with its own per-call deadline. One logical wait, enforced at
             // three more hops outside this function, and each outer hop
@@ -734,7 +734,7 @@ mod tests {
     /// `shell_write` is gated (`docs/gate-and-shell-split.md`, "Slice 4") —
     /// a test that calls it synchronously now leaves a pending approval
     /// ledger ask and must answer its own ask (the way a human running `kj
-    /// approve allow` would) or the call blocks until `gate_wait_timeout`.
+    /// ledger allow` would) or the call blocks until `gate_wait_timeout`.
     /// Spawn this BEFORE the call it answers, mirroring `kj::gate`'s own
     /// test pattern (`an_answer_from_another_principal_is_honored`).
     fn spawn_gate_answerer(
@@ -961,15 +961,15 @@ mod tests {
         }
     }
 
-    /// **Slice 4 spec test — required.** `kj approve` (the SAME verb `kj cc
+    /// **Slice 4 spec test — required.** `kj ledger` (the SAME verb `kj cc
     /// send`'s ask is answered through) must see and answer a `shell_write`
     /// ask with no special-casing by origin: one answering surface for
     /// every gated producer.
     #[tokio::test]
-    async fn kj_approve_answers_a_shell_write_ask_like_a_cc_send_ask() {
+    async fn kj_ledger_answers_a_shell_write_ask_like_a_cc_send_ask() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("approve-shw"), None, principal);
+        let ctx_id = register_context(&d, Some("ledger-shw"), None, principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await;
@@ -986,12 +986,12 @@ mod tests {
                 .await
         });
 
-        let approve_caller = test_caller();
+        let ledger_caller = test_caller();
         let mut request_id = String::new();
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let listing = d
-                .dispatch(&["approve".to_string(), "list".to_string()], &approve_caller)
+                .dispatch(&["ledger".to_string(), "list".to_string()], &ledger_caller)
                 .await;
             if listing.message().contains("shell_gate") {
                 request_id = listing
@@ -1004,20 +1004,20 @@ mod tests {
                 break;
             }
         }
-        assert!(!request_id.is_empty(), "kj approve list must show the shell_write ask");
+        assert!(!request_id.is_empty(), "kj ledger list must show the shell_write ask");
 
         let allow = d
             .dispatch(
-                &["approve".to_string(), "allow".to_string(), request_id.clone()],
-                &approve_caller,
+                &["ledger".to_string(), "allow".to_string(), request_id.clone()],
+                &ledger_caller,
             )
             .await;
-        assert!(allow.is_ok(), "kj approve allow must answer a shell_write ask: {allow:?}");
+        assert!(allow.is_ok(), "kj ledger allow must answer a shell_write ask: {allow:?}");
 
         let result = gate_call
             .await
             .unwrap()
-            .expect("shell_write call should succeed once kj approve allows it");
+            .expect("shell_write call should succeed once kj ledger allows it");
         assert!(!result.is_error);
         match result.content.first().expect("content") {
             ToolContent::Text(s) => {

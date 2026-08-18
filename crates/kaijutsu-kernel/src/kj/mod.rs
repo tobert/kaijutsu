@@ -13,7 +13,7 @@ pub mod attach;
 pub mod audio;
 pub mod backend;
 pub mod binding;
-pub mod approve;
+pub mod ledger;
 pub mod block;
 pub mod cache;
 pub mod cas;
@@ -449,11 +449,11 @@ impl KjDispatcher {
         if cmd == "cc" {
             return self.dispatch_cc(&argv[1..], caller).await;
         }
-        // `kj approve` answers approval-ledger asks — it reads the kernel
+        // `kj ledger` answers approval-ledger asks — it reads the kernel
         // DB, not a context, and a human must be able to reach it from a
         // shell with no context joined (that is the point of the gate).
-        if cmd == "approve" {
-            return self.dispatch_approve(&argv[1..], caller);
+        if cmd == "ledger" {
+            return self.dispatch_ledger(&argv[1..], caller);
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
@@ -897,7 +897,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(alias::AliasArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(cc::CcArgs::command())
-        .subcommand(approve::ApproveArgs::command())
+        .subcommand(ledger::LedgerArgs::command())
         .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())
         .subcommand(midi::MidiArgs::command())
