@@ -6,6 +6,43 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## kaish loses a command substitution in a non-last pipeline stage (2026-08-18, via kaish-lead)
+
+**Silent zero bytes at exit 0.** Confirmed against the kernel's embedded kaish
+today:
+
+    echo $(echo sub) | cat      # kaish: nothing.  bash: "sub"
+
+Not new — it shipped in 0.14.1, so every kaish revision kaijutsu has run
+carries it. A function as a non-last stage fails the same way.
+
+**Measured scope in this repo: zero occurrences.** rc scripts, Rust string
+literals, and `contrib/` were all checked. The forms we actually use are safe,
+and the distinction is worth keeping straight because it is narrow:
+
+| form | result |
+|---|---|
+| `x="$(echo a \| cat)"` — pipeline *inside* the substitution | works |
+| `echo $(echo c) \| cat` — substitution in a non-last *stage* | **empty** |
+
+rc's `fleet_total="$(grep … \| sed … \| grep -c .)"` is the safe form. Keep it
+that way: assign first, then pipe the variable.
+
+Amy has held the kaish 0.15 release to fix it. Worth a canary that fails loudly
+if the broken behavior is still present when we next bump — the pattern from
+"Pin a divergence WITH instructions".
+
+Two related notes from the same source: `~/src/wt/kaish-integration`, which
+this repo path-deps, is **62 commits behind kaish main**, so do not rebase onto
+it expecting 0.15. And kaish #366 moves the `[N]` background-job announcement
+from stdout to stderr — breaking for embedders that parse it off stdout.
+Kaijutsu is unaffected today because `background_exec.rs` runs its own
+`JobManager` rather than reading kaish's announcement, but that is exactly the
+code the open "Background exec → kaish's job system" item would replace. Check
+this before doing that migration, not after.
+
+---
+
 ## Three `kj fork` findings recovered from a clobbered backlog (2026-07-04, recovered 2026-08-18)
 
 Recovered from a stale whole-file `write` that overwrote `docs/issues.md` with
