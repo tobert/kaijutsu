@@ -49,7 +49,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::renderer::{ExtractedMsdfAtlas, MSDF_PX_PER_EM};
 use crate::view::surface::chrome::ChromeInstance;
-use crate::view::surface::window::SurfaceRun;
+use crate::view::surface::window::{SurfaceGeometryRun, SurfaceQuad, SurfaceRun};
 
 /// Vertices per glyph quad (non-indexed triangle list).
 pub const SURFACE_QUAD_VERTICES: u32 = 6;
@@ -157,6 +157,32 @@ impl Default for SurfaceUniforms {
     }
 }
 
+/// The color target every surface pipeline writes: premultiplied-alpha over,
+/// into the surface's non-sRGB RTT.
+///
+/// One function rather than four copies — they are not merely similar, they
+/// must be *identical*, because the four passes composite into the same
+/// texture and a blend factor that drifted on one of them would show up as a
+/// halo nobody could attribute.
+fn premultiplied_target() -> ColorTargetState {
+    ColorTargetState {
+        format: TextureFormat::Rgba8Unorm,
+        blend: Some(BlendState {
+            color: BlendComponent {
+                src_factor: BlendFactor::One,
+                dst_factor: BlendFactor::OneMinusSrcAlpha,
+                operation: BlendOperation::Add,
+            },
+            alpha: BlendComponent {
+                src_factor: BlendFactor::One,
+                dst_factor: BlendFactor::OneMinusSrcAlpha,
+                operation: BlendOperation::Add,
+            },
+        }),
+        write_mask: ColorWrites::ALL,
+    }
+}
+
 /// The baseline's physical-pixel row for a document-space Y at a given
 /// scroll offset and HiDPI scale.
 ///
@@ -190,13 +216,45 @@ pub fn snap_baseline_phys(doc_y: f32, scroll: f32, scale: f32) -> f32 {
     ((doc_y - scroll) * scale).round()
 }
 
-/// Render-world resource: the instanced glyph pipeline **and** the instanced
-/// chrome pipeline.
+/// One flat-colored geometry vertex, in document-space logical pixels.
 ///
-/// Two pipelines, one pass, one uniform buffer. The chrome pipeline gets its
-/// own bind group layout — uniform only, no atlas — so borders draw on a
-/// frame where the glyph atlas hasn't reached the GPU yet, instead of
-/// inheriting the text pass's readiness.
+/// Not instanced — a triangle list is what the builders produce
+/// (`text::msdf::geometry`, `text::diff`, `text::sparkline`), and inventing an
+/// instance shape for arbitrary triangulated shapes would mean re-deriving
+/// them.
+///
+/// `anchor_doc_y` is what keeps the shapes rigid: every vertex of a run
+/// carries the same anchor, which the shader snaps to a physical row exactly
+/// as it snaps a glyph baseline, and `pos_doc.y` is an unsnapped offset from
+/// it. Snapping each vertex on its own would make a 1.2px staff line
+/// disappear or double depending on where the scroll happened to be.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct SurfaceGeometryVertex {
+    /// `x` = document x, logical px. `y` = offset from `anchor_doc_y`.
+    pub pos_doc: [f32; 2],
+    /// The run's document y — the value the shader snaps.
+    pub anchor_doc_y: f32,
+    /// Straight (non-premultiplied) RGBA8.
+    pub color: [u8; 4],
+}
+
+/// One textured quad — an SVG raster — in document-space logical pixels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct QuadInstance {
+    /// `[x, y, w, h]`, logical document px.
+    pub rect_doc: [f32; 4],
+}
+
+/// Render-world resource: the four pipelines a conversation surface draws
+/// with — instanced glyphs, instanced chrome quads, flat geometry, and
+/// textured quads.
+///
+/// Four pipelines, one pass, one uniform buffer. Each gets the bind group
+/// layout it actually needs — chrome and geometry are uniform-only, so
+/// borders and staff lines draw on a frame where the glyph atlas hasn't
+/// reached the GPU yet instead of inheriting the text pass's readiness.
 #[derive(Resource)]
 pub struct ConversationSurfaceRenderer {
     pub pipeline: CachedRenderPipelineId,
@@ -204,6 +262,10 @@ pub struct ConversationSurfaceRenderer {
     pub sampler: Sampler,
     pub chrome_pipeline: CachedRenderPipelineId,
     pub chrome_bind_group_layout: BindGroupLayout,
+    pub geometry_pipeline: CachedRenderPipelineId,
+    pub geometry_bind_group_layout: BindGroupLayout,
+    pub quad_pipeline: CachedRenderPipelineId,
+    pub quad_bind_group_layout: BindGroupLayout,
 }
 
 /// What a surface pass actually managed to encode. Split rather than a bare
@@ -298,6 +360,45 @@ impl ConversationSurfaceRenderer {
                     shader_location: 5,
                 },
             ],
+        }
+    }
+
+    /// The geometry vertex layout — vertex-stepped, mirroring
+    /// [`SurfaceGeometryVertex`]'s fields.
+    pub fn geometry_vertex_layout() -> VertexBufferLayout {
+        VertexBufferLayout {
+            array_stride: std::mem::size_of::<SurfaceGeometryVertex>() as u64,
+            step_mode: VertexStepMode::Vertex,
+            attributes: vec![
+                VertexAttribute {
+                    format: VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32,
+                    offset: 8,
+                    shader_location: 1,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Unorm8x4,
+                    offset: 12,
+                    shader_location: 2,
+                },
+            ],
+        }
+    }
+
+    /// The quad instance layout — one `vec4` rect per instance.
+    pub fn quad_instance_layout() -> VertexBufferLayout {
+        VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadInstance>() as u64,
+            step_mode: VertexStepMode::Instance,
+            attributes: vec![VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 0,
+            }],
         }
     }
 
@@ -439,12 +540,100 @@ impl ConversationSurfaceRenderer {
             zero_initialize_workgroup_memory: false,
         });
 
+        // ── Geometry ────────────────────────────────────────────────────
+        //
+        // Uniform only, like chrome: a staff line samples nothing.
+        let geometry_layout_entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX_FRAGMENT,
+            (uniform_buffer::<SurfaceUniforms>(false),),
+        );
+        let geometry_bind_group_layout_descriptor = BindGroupLayoutDescriptor::new(
+            "surface_geometry_bind_group_layout",
+            &geometry_layout_entries,
+        );
+        let geometry_bind_group_layout = device.create_bind_group_layout(
+            "surface_geometry_bind_group_layout",
+            &geometry_layout_entries,
+        );
+        let geometry_shader = asset_server.load("shaders/surface_geometry.wgsl");
+        let geometry_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("surface_geometry_pipeline".into()),
+            layout: vec![geometry_bind_group_layout_descriptor],
+            vertex: VertexState {
+                shader: geometry_shader.clone(),
+                entry_point: Some("vertex".into()),
+                shader_defs: vec![],
+                buffers: vec![Self::geometry_vertex_layout()],
+            },
+            fragment: Some(FragmentState {
+                shader: geometry_shader,
+                entry_point: Some("fragment".into()),
+                shader_defs: vec![],
+                targets: vec![Some(premultiplied_target())],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            immediate_size: 0,
+            zero_initialize_workgroup_memory: false,
+        });
+
+        // ── Textured quads (SVG rasters) ────────────────────────────────
+        //
+        // Its own sampler is not worth a second allocation — the atlas
+        // sampler is already linear/clamp, which is what a downscaled raster
+        // wants too.
+        let quad_layout_entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX_FRAGMENT,
+            (
+                uniform_buffer::<SurfaceUniforms>(false),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler_binding(SamplerBindingType::Filtering),
+            ),
+        );
+        let quad_bind_group_layout_descriptor =
+            BindGroupLayoutDescriptor::new("surface_quad_bind_group_layout", &quad_layout_entries);
+        let quad_bind_group_layout =
+            device.create_bind_group_layout("surface_quad_bind_group_layout", &quad_layout_entries);
+        let quad_shader = asset_server.load("shaders/surface_quad.wgsl");
+        let quad_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("surface_quad_pipeline".into()),
+            layout: vec![quad_bind_group_layout_descriptor],
+            vertex: VertexState {
+                shader: quad_shader.clone(),
+                entry_point: Some("vertex".into()),
+                shader_defs: vec![],
+                buffers: vec![Self::quad_instance_layout()],
+            },
+            fragment: Some(FragmentState {
+                shader: quad_shader,
+                entry_point: Some("fragment".into()),
+                shader_defs: vec![],
+                targets: vec![Some(premultiplied_target())],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            immediate_size: 0,
+            zero_initialize_workgroup_memory: false,
+        });
+
         Self {
             pipeline,
             bind_group_layout,
             sampler,
             chrome_pipeline,
             chrome_bind_group_layout,
+            geometry_pipeline,
+            geometry_bind_group_layout,
+            quad_pipeline,
+            quad_bind_group_layout,
         }
     }
 
@@ -457,10 +646,15 @@ impl ConversationSurfaceRenderer {
     /// frame that draws no glyphs must still repaint the background rather
     /// than leave the previous frame's text standing.
     ///
-    /// Chrome draws **first**, glyphs over it — `block_fx.wgsl` composites
-    /// both the border stroke and its glow behind the block's text, so
-    /// putting the quads under the glyphs is what reproduces it (see
-    /// `view::surface::chrome`).
+    /// **Draw order: chrome → geometry → rasters → glyphs.** Chrome first
+    /// because `block_fx.wgsl` composites both the border stroke and its glow
+    /// behind the block's text (see `view::surface::chrome`); geometry next
+    /// because that is the order the legacy path composites it in
+    /// (`render_msdf_block_textures` runs `MusicGeometryRenderer` before the
+    /// glyph pass, so noteheads land on staff lines and diff text on its
+    /// bands); rasters after geometry and before glyphs, where the legacy
+    /// child `ImageNode` sits — above the block's background, below anything
+    /// textual.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_render(
         &self,
@@ -472,6 +666,8 @@ impl ConversationSurfaceRenderer {
         target_image: &Handle<Image>,
         instances: Option<(&Buffer, u32)>,
         chrome: Option<(&Buffer, u32)>,
+        geometry: Option<(&Buffer, u32)>,
+        quads: Option<(&Buffer, &[Handle<Image>])>,
         uniforms: &SurfaceUniforms,
         clear: bevy::color::LinearRgba,
     ) -> SurfacePassResult {
@@ -499,9 +695,29 @@ impl ConversationSurfaceRenderer {
                 Some((pipeline, buffer, count))
             });
 
-        // One uniform buffer for both pipelines — the two bind group layouts
+        let geometry_draw = geometry
+            .filter(|(_, count)| *count > 0)
+            .and_then(|(buffer, count)| {
+                let pipeline = pipeline_cache.get_render_pipeline(self.geometry_pipeline)?;
+                Some((pipeline, buffer, count))
+            });
+
+        // Rasters resolve per quad: a texture that hasn't reached the GPU yet
+        // skips its own quad rather than the whole pass.
+        let quad_draw = quads
+            .filter(|(_, images)| !images.is_empty())
+            .and_then(|(buffer, images)| {
+                let pipeline = pipeline_cache.get_render_pipeline(self.quad_pipeline)?;
+                Some((pipeline, buffer, images))
+            });
+
+        // One uniform buffer for every pipeline — the bind group layouts
         // differ only in what else they carry.
-        let uniform_buffer = (draw.is_some() || chrome_draw.is_some()).then(|| {
+        let uniform_buffer = (draw.is_some()
+            || chrome_draw.is_some()
+            || geometry_draw.is_some()
+            || quad_draw.is_some())
+        .then(|| {
             device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("msdf_surface_uniforms"),
                 contents: bytemuck::bytes_of(uniforms),
@@ -533,6 +749,41 @@ impl ConversationSurfaceRenderer {
             },
         );
 
+        let geometry_bind_group = geometry_draw.zip(uniform_buffer.as_ref()).map(
+            |(_, uniform_buffer)| {
+                device.create_bind_group(
+                    "surface_geometry_bind_group",
+                    &self.geometry_bind_group_layout,
+                    &BindGroupEntries::sequential((uniform_buffer.as_entire_binding(),)),
+                )
+            },
+        );
+
+        // One bind group per raster, built up front so the render pass borrows
+        // them rather than the device. A handful at most are ever visible.
+        let quad_bind_groups: Vec<(u32, BindGroup)> = match (&quad_draw, uniform_buffer.as_ref()) {
+            (Some((_, _, images)), Some(uniform_buffer)) => images
+                .iter()
+                .enumerate()
+                .filter_map(|(i, handle)| {
+                    let gpu = gpu_images.get(handle)?;
+                    Some((
+                        i as u32,
+                        device.create_bind_group(
+                            "surface_quad_bind_group",
+                            &self.quad_bind_group_layout,
+                            &BindGroupEntries::sequential((
+                                uniform_buffer.as_entire_binding(),
+                                &gpu.texture_view,
+                                &self.sampler,
+                            )),
+                        ),
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
         let mut drawn = 0u32;
         {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -559,6 +810,27 @@ impl ConversationSurfaceRenderer {
                 render_pass.set_bind_group(0, bind_group, &[]);
                 render_pass.set_vertex_buffer(0, *buffer.slice(..));
                 render_pass.draw(0..SURFACE_QUAD_VERTICES, 0..count);
+            }
+
+            if let (Some((pipeline, buffer, count)), Some(bind_group)) =
+                (geometry_draw, &geometry_bind_group)
+            {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, bind_group, &[]);
+                render_pass.set_vertex_buffer(0, *buffer.slice(..));
+                // Vertex-stepped, not instanced: `count` is vertices.
+                render_pass.draw(0..count, 0..1);
+            }
+
+            if let Some((pipeline, buffer, _)) = quad_draw
+                && !quad_bind_groups.is_empty()
+            {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_vertex_buffer(0, *buffer.slice(..));
+                for (index, bind_group) in &quad_bind_groups {
+                    render_pass.set_bind_group(0, bind_group, &[]);
+                    render_pass.draw(0..SURFACE_QUAD_VERTICES, *index..*index + 1);
+                }
             }
 
             if let (Some((pipeline, _, buffer, count)), Some(bind_group)) = (draw, &bind_group) {
@@ -615,6 +887,46 @@ pub fn build_instances(
                 importance: glyph.importance,
             });
         }
+    }
+}
+
+/// Turn assembled document-space geometry runs into GPU vertices.
+///
+/// The only work is folding the run's `x_offset` into each vertex's x and
+/// hanging the run's `doc_y` on every vertex as the snap anchor — the shapes
+/// themselves were built in chunk-local logical px by the same builders the
+/// legacy path uses, and nothing here reinterprets them.
+pub fn build_geometry_vertices(runs: &[SurfaceGeometryRun], out: &mut Vec<SurfaceGeometryVertex>) {
+    out.clear();
+    for run in runs {
+        for vertex in run.vertices.iter() {
+            out.push(SurfaceGeometryVertex {
+                pos_doc: [run.x_offset + vertex.x, vertex.y],
+                anchor_doc_y: run.doc_y,
+                color: vertex.color,
+            });
+        }
+    }
+}
+
+/// Split assembled quads into the instance buffer's contents and the parallel
+/// list of textures to bind, one per instance.
+///
+/// Parallel rather than paired because the instance buffer is `Pod` and a
+/// `Handle<Image>` is not; the index into one is the instance index into the
+/// other, which is exactly what `encode_render` draws with.
+pub fn build_quad_instances(
+    quads: &[SurfaceQuad],
+    out: &mut Vec<QuadInstance>,
+    images: &mut Vec<Handle<Image>>,
+) {
+    out.clear();
+    images.clear();
+    for quad in quads {
+        out.push(QuadInstance {
+            rect_doc: quad.doc_rect,
+        });
+        images.push(quad.image.clone());
     }
 }
 
@@ -907,6 +1219,97 @@ mod tests {
         assert_eq!(std::mem::size_of::<SurfaceUniforms>(), 64);
         assert_eq!(std::mem::size_of::<SurfaceUniforms>() % 16, 0);
         assert_eq!(SurfaceUniforms::min_size().get(), 64);
+    }
+
+    // ---- geometry + quads ------------------------------------------------
+
+    fn geom_vertex(x: f32, y: f32) -> crate::text::msdf::geometry::GeometryVertex {
+        crate::text::msdf::geometry::GeometryVertex { x, y, color: [10, 20, 30, 255] }
+    }
+
+    /// The geometry builder folds the run's `x_offset` into each vertex's x
+    /// and hangs the run's `doc_y` on every vertex as the SNAP ANCHOR, leaving
+    /// the y a local offset. That split is the whole reason a 1.2px staff line
+    /// keeps its width while scrolling: one rounding per run, not one per
+    /// vertex.
+    #[test]
+    fn geometry_vertices_carry_a_shared_anchor_and_a_folded_x() {
+        let runs = vec![
+            SurfaceGeometryRun {
+                doc_y: 100.0,
+                x_offset: 12.0,
+                vertices: Arc::new(vec![geom_vertex(0.0, 0.0), geom_vertex(4.0, 30.0)]),
+            },
+            SurfaceGeometryRun {
+                doc_y: 200.0,
+                x_offset: 0.0,
+                vertices: Arc::new(vec![geom_vertex(1.0, 2.0)]),
+            },
+        ];
+        let mut out = Vec::new();
+        build_geometry_vertices(&runs, &mut out);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].pos_doc, [12.0, 0.0]);
+        assert_eq!(out[0].anchor_doc_y, 100.0);
+        assert_eq!(out[1].pos_doc, [16.0, 30.0], "x folds the indent, y stays local");
+        assert_eq!(
+            out[1].anchor_doc_y, out[0].anchor_doc_y,
+            "every vertex of a run shares the anchor, or the shape deforms on snap",
+        );
+        assert_eq!(out[2].anchor_doc_y, 200.0);
+        assert_eq!(out[0].color, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn building_geometry_clears_the_previous_frames_vertices() {
+        let mut out = vec![SurfaceGeometryVertex {
+            pos_doc: [9.0, 9.0],
+            anchor_doc_y: 9.0,
+            color: [0; 4],
+        }];
+        build_geometry_vertices(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// The quad rects and their textures come out index-aligned — that
+    /// pairing is what `encode_render` draws with (`draw(.., i..i+1)` under
+    /// the i-th bind group), so a mismatch would put one block's picture in
+    /// another block's rectangle.
+    #[test]
+    fn quad_instances_stay_index_aligned_with_their_textures() {
+        let quads = vec![
+            SurfaceQuad { doc_rect: [1.0, 2.0, 3.0, 4.0], image: Handle::default() },
+            SurfaceQuad { doc_rect: [5.0, 6.0, 7.0, 8.0], image: Handle::default() },
+        ];
+        let (mut instances, mut images) = (Vec::new(), Vec::new());
+        build_quad_instances(&quads, &mut instances, &mut images);
+        assert_eq!(instances.len(), images.len());
+        assert_eq!(instances[1].rect_doc, [5.0, 6.0, 7.0, 8.0]);
+
+        build_quad_instances(&[], &mut instances, &mut images);
+        assert!(instances.is_empty() && images.is_empty());
+    }
+
+    /// Stride and offsets for the two new pipelines, same contract as the
+    /// glyph and chrome layouts above.
+    #[test]
+    fn geometry_and_quad_layouts_match_their_structs() {
+        let geometry = ConversationSurfaceRenderer::geometry_vertex_layout();
+        assert_eq!(geometry.array_stride, 16);
+        assert_eq!(
+            geometry.step_mode,
+            VertexStepMode::Vertex,
+            "geometry is a triangle list, not instanced — the draw call counts vertices",
+        );
+        let offsets: Vec<u64> = geometry.attributes.iter().map(|a| a.offset).collect();
+        assert_eq!(offsets, vec![0, 8, 12]);
+        assert_eq!(std::mem::size_of::<SurfaceGeometryVertex>(), 16);
+
+        let quad = ConversationSurfaceRenderer::quad_instance_layout();
+        assert_eq!(quad.array_stride, 16);
+        assert_eq!(quad.step_mode, VertexStepMode::Instance);
+        assert_eq!(std::mem::size_of::<QuadInstance>(), 16);
     }
 
     /// Same contract for the chrome pipeline: the stride and offsets are what

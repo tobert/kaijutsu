@@ -11,11 +11,19 @@
 //! a block that scrolls into view costs a binary search and a buffer
 //! re-upload, not a spawn.
 //!
-//! Everything here is **behind the flag**: [`ConversationRenderPath`]
-//! selects `Legacy` (today's `cell/plugin.rs` systems) or `Surface` (these),
-//! and every system in this plugin carries `run_if(surface_active)`. The
-//! shared spine — `sync_conversation_geometry`, `smooth_scroll`,
-//! `scroll_render_mode` — runs on both paths and is not touched here.
+//! Rich content rides the same spine: [`rich`] turns a detected ABC tune,
+//! diff, sparkline or image placeholder into the geometry that draws under a
+//! block's glyphs, and an SVG into a cached raster the surface draws as a
+//! textured quad. Four pipelines, one pass, in that order — chrome, geometry,
+//! rasters, glyphs (`text::msdf::surface_renderer`).
+//!
+//! [`ConversationRenderPath`] still selects `Legacy` (today's
+//! `cell/plugin.rs` systems) or `Surface` (these), and every system in this
+//! plugin carries `run_if(surface_active)` — but **`Surface` is the default**
+//! as of slice 4, and the flag exists now only so a suspicion can be checked
+//! against the path slice 5 deletes. The shared spine —
+//! `sync_conversation_geometry`, `smooth_scroll`, `scroll_render_mode` — runs
+//! on both paths and is not touched here.
 //!
 //! # Schedule placement
 //!
@@ -70,6 +78,7 @@ pub mod chrome;
 pub mod chunk;
 pub mod content;
 pub mod extract;
+pub mod rich;
 pub mod shape_cache;
 pub mod target;
 pub mod window;
@@ -83,31 +92,50 @@ pub const SURFACE_ENV: &str = "KAIJUTSU_CONV_SURFACE";
 /// this module's direct-draw path. Reflected so a live session can be A/B'd
 /// over BRP (`world_mutate_resources`) without a restart — the whole point
 /// of carrying two paths at once.
+///
+/// **`Surface` is the default as of slice 4** — the slice that brought rich
+/// content across, which was the last thing Legacy could draw and Surface
+/// could not. The flag survives only as an escape hatch until slice 5
+/// deletes the legacy path outright (Amy, 2026-08-18: "no reason to keep
+/// legacy in this project"), so `KAIJUTSU_CONV_SURFACE=0` is a way to check
+/// a suspicion, not a supported configuration.
 #[derive(Resource, Reflect, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[reflect(Resource)]
 pub enum ConversationRenderPath {
-    #[default]
     Legacy,
+    #[default]
     Surface,
 }
 
 impl ConversationRenderPath {
-    /// Read the startup default from [`SURFACE_ENV`]: `1`/`true` (any case)
-    /// selects `Surface`, anything else — including an unset or unparseable
-    /// value — leaves `Legacy`. Deliberately not an error: this is a
-    /// developer A/B switch, and the safe interpretation of a typo is "the
-    /// path that has shipped".
+    /// Read the startup default from [`SURFACE_ENV`]: `0`/`false` (any case)
+    /// selects `Legacy`, everything else — including unset, and including a
+    /// typo — leaves the default `Surface`.
+    ///
+    /// The asymmetry is deliberate and it is the same rule as before, just
+    /// pointed the other way: an unparseable value resolves to *the path that
+    /// ships*, because a developer A/B switch should never turn a typo into a
+    /// different renderer than the one everyone else is running.
     pub fn from_env() -> Self {
-        match std::env::var(SURFACE_ENV) {
-            Ok(v) => {
+        Self::from_env_value(std::env::var(SURFACE_ENV).ok().as_deref())
+    }
+
+    /// The decision itself, as a function of the variable's value.
+    ///
+    /// Split out so the matrix (unset / `0` / `1` / nonsense) is testable
+    /// without writing to the process environment — a global that other tests
+    /// in the same binary are reading concurrently.
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            Some(v) => {
                 let v = v.trim().to_ascii_lowercase();
-                if v == "1" || v == "true" {
-                    Self::Surface
-                } else {
+                if v == "0" || v == "false" {
                     Self::Legacy
+                } else {
+                    Self::Surface
                 }
             }
-            Err(_) => Self::Legacy,
+            None => Self::Surface,
         }
     }
 }
@@ -241,7 +269,8 @@ impl Plugin for ConversationSurfacePlugin {
             .init_resource::<shape_cache::HeaderLabelCache>()
             .init_resource::<shape_cache::SurfaceMetricsEpoch>()
             .init_resource::<shape_cache::SurfaceThemeEpoch>()
-            .init_resource::<shape_cache::ShapeTasks>();
+            .init_resource::<shape_cache::ShapeTasks>()
+            .init_resource::<rich::SvgRasterCache>();
 
         // Content → Shape → Measure → Window, all AFTER the shared scroll
         // ease. Shape's band must be a function of the frame's FINAL offset:
@@ -295,6 +324,12 @@ impl Plugin for ConversationSurfacePlugin {
             (
                 shape_cache::apply_shape_results,
                 shape_cache::shape_visible_blocks,
+                // After shaping, because it re-derives the same wrap widths
+                // and must read the frame's, not the previous frame's. It
+                // owes the row no height — the shaper computes an SVG's draw
+                // size without needing its pixels — so nothing downstream
+                // waits on the raster.
+                rich::sync_svg_rasters,
             )
                 .chain()
                 .in_set(SurfaceSet::Shape)
@@ -376,9 +411,27 @@ impl Plugin for ConversationSurfacePlugin {
 mod tests {
     use super::*;
 
+    /// The slice-4 exit criterion, pinned: the surface path is what a build
+    /// with no environment set runs.
     #[test]
-    fn render_path_defaults_to_legacy() {
-        assert_eq!(ConversationRenderPath::default(), ConversationRenderPath::Legacy);
+    fn render_path_defaults_to_surface() {
+        assert_eq!(ConversationRenderPath::default(), ConversationRenderPath::Surface);
+    }
+
+    /// The env matrix after the flip. `0`/`false` is the only way back to
+    /// Legacy; unset is Surface, and so is anything unrecognized — a typo
+    /// must not silently select the path that is on its way out.
+    #[test]
+    fn env_selects_legacy_only_when_it_says_so() {
+        use ConversationRenderPath::{Legacy, Surface};
+        assert_eq!(ConversationRenderPath::from_env_value(None), Surface);
+        assert_eq!(ConversationRenderPath::from_env_value(Some("0")), Legacy);
+        assert_eq!(ConversationRenderPath::from_env_value(Some("false")), Legacy);
+        assert_eq!(ConversationRenderPath::from_env_value(Some(" FALSE ")), Legacy);
+        assert_eq!(ConversationRenderPath::from_env_value(Some("1")), Surface);
+        assert_eq!(ConversationRenderPath::from_env_value(Some("true")), Surface);
+        assert_eq!(ConversationRenderPath::from_env_value(Some("")), Surface);
+        assert_eq!(ConversationRenderPath::from_env_value(Some("yes-please")), Surface);
     }
 
     /// The flag is a run condition, so its two states must actually be

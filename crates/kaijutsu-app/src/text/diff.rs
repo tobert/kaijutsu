@@ -718,6 +718,33 @@ fn band_color(class: DiffLineClass, colors: &DiffBandColors) -> Option<[u8; 4]> 
     }
 }
 
+/// One [`PreviewRow`] per **wrapped visual line** of a laid-out preview,
+/// addressed by its start byte.
+///
+/// A long `+` line that wraps must be tinted across every row it occupies,
+/// which is why this counts visual lines rather than the preview's own
+/// logical lines. `top`/`bottom` come out in the block-local LOGICAL space
+/// the glyphs use, so the bands and the text they sit behind are placed from
+/// the same numbers.
+///
+/// Extracted so the two callers — `view::block_render`'s Diff arm and the
+/// conversation surface's rich shaper — cannot drift on which axis parley
+/// 0.9's per-axis line metrics report (the block axis is the line's
+/// top/bottom; the inline axis is not).
+pub fn preview_rows(layout: &parley::Layout<peniko::Brush>) -> Vec<PreviewRow> {
+    layout
+        .lines()
+        .map(|line| {
+            let m = line.metrics();
+            PreviewRow {
+                text_offset: line.text_range().start,
+                top: m.block_min_coord,
+                bottom: m.block_max_coord,
+            }
+        })
+        .collect()
+}
+
 /// Build the per-line background bands as flat-colored triangles.
 ///
 /// Pure math in block-local LOGICAL pixels — the same space as

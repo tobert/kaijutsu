@@ -26,8 +26,12 @@ Both need a label shaping cache keyed by label text — the divider's role label
 is the only one the surface shapes today — plus the per-instance gap fields
 (the mechanism exists: `ChromeInstance::label_gap`, used for the divider). The
 border *color* still dims for an excluded block, so exclusion is visible; the
-checkbox is not. Do this before the flag flips to `Surface` by default (slice
-4), or the A/B will read as "labels disappeared".
+checkbox is not.
+
+**Now shipped-visible.** Slice 4 flipped the default to `Surface` without
+these, so "labels disappeared" and "no gutter checkbox" are what a default
+build shows today — the highest-priority remaining gap on the surface path,
+not a pre-flip chore any more. `KAIJUTSU_CONV_SURFACE=0` is the comparison.
 
 Also noted while porting: legacy gives a bordered block `width: 100%` *plus* a
 `glow_radius * 0.5` margin per side (`view/render.rs:352-359`), so the node
@@ -6845,3 +6849,21 @@ rather than the cache. The fix is the same pinned-window LRU
 (`shape_cache::plan_evictions` is already generic over `(id, weight,
 last_used)`); the reason it wasn't shared is that the two caches are wanted at
 different bands (content ±2 screens, shape ±1), so the pin sets differ.
+
+## A streaming rich block re-parses and re-draws whole, every tick (surface slice 4, 2026-08-18)
+
+The surface's streaming fast path is "re-shape the open tail chunk only", and
+the drawn rich kinds (ABC, diff, sparkline, SVG, image) are explicitly outside
+it: they shape as one chunk, whole, on the main thread
+(`view/surface/rich.rs`). For a block that arrives complete — which is what a
+`ToolResult` normally is — that costs one engrave/parse. For one that
+*streams*, every content bump re-runs detection (a diff parse, an ABC parse)
+**and** re-runs the builders, with no debounce, because `view/surface/content.rs`
+deliberately dropped the 200-char one the legacy path still has
+(`view/render.rs:98-108`).
+
+Bounded, not free: `text::diff` spends its byte and line budgets before parley
+ever sees the preview, and the engraver's output is the tune's. Nobody has
+measured a streamed diff on this path. If it bites, the fix is a debounce
+scoped to `RichKindInfo::is_drawn()` blocks in `Running` status — the one place
+the legacy rule was actually earning its keep — not a general one.

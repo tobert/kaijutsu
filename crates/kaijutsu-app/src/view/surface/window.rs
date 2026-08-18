@@ -11,10 +11,14 @@
 use bevy::prelude::*;
 
 use crate::cell::{ConversationContainer, ConversationScrollState, EditorEntities};
+use crate::text::msdf::geometry::GeometryVertex;
 use crate::text::msdf::{MsdfAtlas, PositionedGlyph};
 use crate::view::geometry::{ConversationGeometry, RowKey};
 
-use super::shape_cache::{HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch, SurfaceThemeEpoch};
+use super::rich::SvgRasterCache;
+use super::shape_cache::{
+    HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch, SurfaceThemeEpoch,
+};
 use super::{ConversationSurface, WindowKey};
 
 /// Screens of slack held on each side of the viewport.
@@ -39,6 +43,32 @@ pub struct SurfaceRun {
     /// label's inset.
     pub x_offset: f32,
     pub glyphs: std::sync::Arc<Vec<PositionedGlyph>>,
+}
+
+/// One drawable run of flat-colored triangles in **document space**.
+///
+/// The geometry lane's counterpart to [`SurfaceRun`], and it stacks the same
+/// way: `doc_y` is the chunk's top, `x_offset` the block's text origin, and
+/// the vertices inside are chunk-local. Kept separate from the glyph runs
+/// rather than interleaved because the two go to different pipelines and the
+/// draw order between them is fixed (geometry under glyphs — a staff line
+/// belongs behind its noteheads, a diff band behind its text).
+#[derive(Debug, Clone)]
+pub struct SurfaceGeometryRun {
+    pub doc_y: f32,
+    pub x_offset: f32,
+    pub vertices: std::sync::Arc<Vec<GeometryVertex>>,
+}
+
+/// One textured quad in **document space** — an SVG raster.
+///
+/// `doc_rect` is `[x, y, w, h]` in logical px. There are never many (an SVG
+/// per block, and only the ones in the window), which is why this is a plain
+/// list carried whole rather than a versioned buffer.
+#[derive(Debug, Clone)]
+pub struct SurfaceQuad {
+    pub doc_rect: [f32; 4],
+    pub image: Handle<Image>,
 }
 
 /// The inclusive scroll-offset band a window built at `offset` stays valid
@@ -127,6 +157,95 @@ pub fn assemble_runs(
         }
     }
     runs
+}
+
+/// Reduce a row range to the geometry runs that draw under its glyphs.
+///
+/// Walks the rows exactly as [`assemble_runs`] does and stacks by the same
+/// chunk heights, so a block's staff lines and its noteheads are placed from
+/// one arithmetic rather than two. Kept a separate walk rather than a second
+/// return value because the window is a couple of screens of rows and the
+/// clarity is worth more than the walk; a conversation with no rich content
+/// produces an empty vector and uploads nothing.
+pub fn assemble_geometry(
+    geom: &ConversationGeometry,
+    shaped: &ShapedBlockCache,
+    row_range: std::ops::Range<usize>,
+) -> Vec<SurfaceGeometryRun> {
+    let rows = geom.rows();
+    let start = row_range.start.min(rows.len());
+    let end = row_range.end.min(rows.len());
+
+    let mut runs = Vec::new();
+    for row in &rows[start..end] {
+        let RowKey::Block(id) = row.key else {
+            continue;
+        };
+        let Some(block) = shaped.get(&id) else {
+            continue;
+        };
+        let mut y = row.y_offset + block.y_offset;
+        for chunk in &block.chunks {
+            if !chunk.geometry.is_empty() {
+                runs.push(SurfaceGeometryRun {
+                    doc_y: y,
+                    x_offset: block.x_offset,
+                    vertices: chunk.geometry.clone(),
+                });
+            }
+            y += chunk.height;
+        }
+    }
+    runs
+}
+
+/// Reduce a row range to the textured quads that draw in it.
+///
+/// A block contributes a quad when it has a rasterized SVG; the rect is the
+/// block's text origin and the raster's own logical draw size, so the picture
+/// lands inside the border padding exactly where its reserved height was
+/// measured. A block whose raster hasn't been produced yet contributes
+/// nothing and draws as the empty space its height already reserved — the
+/// same treatment an unshaped row gets.
+pub fn assemble_quads(
+    geom: &ConversationGeometry,
+    shaped: &ShapedBlockCache,
+    rasters: &SvgRasterCache,
+    row_range: std::ops::Range<usize>,
+) -> Vec<SurfaceQuad> {
+    if rasters.is_empty() {
+        return Vec::new();
+    }
+    let rows = geom.rows();
+    let start = row_range.start.min(rows.len());
+    let end = row_range.end.min(rows.len());
+
+    let mut quads = Vec::new();
+    for row in &rows[start..end] {
+        let RowKey::Block(id) = row.key else {
+            continue;
+        };
+        let Some(raster) = rasters.get(&id) else {
+            continue;
+        };
+        // Placement comes from the shaped block for the same reason the
+        // glyphs' does: `x_offset`/`y_offset` are the border box's insets,
+        // and a raster drawn outside them would sit on its own border.
+        let (x_offset, y_offset) = match shaped.get(&id) {
+            Some(block) => (block.x_offset, block.y_offset),
+            None => continue,
+        };
+        quads.push(SurfaceQuad {
+            doc_rect: [
+                x_offset,
+                row.y_offset + y_offset,
+                raster.draw.0,
+                raster.draw.1,
+            ],
+            image: raster.image.clone(),
+        });
+    }
+    quads
 }
 
 /// Keep one [`ConversationSurface`] per [`ConversationContainer`].
@@ -305,6 +424,8 @@ mod tests {
         }
     }
 
+    use super::super::shape_cache::empty_geometry;
+
     fn shaped_block(x_offset: f32, chunk_heights: &[f32]) -> ShapedBlock {
         let chunks: Vec<ShapedChunk> = chunk_heights
             .iter()
@@ -312,6 +433,7 @@ mod tests {
             .map(|(i, h)| ShapedChunk {
                 byte_range: i..i + 1,
                 glyphs: Arc::new(vec![glyph(i as f32)]),
+                geometry: empty_geometry(),
                 height: *h,
                 frozen: false,
             })
@@ -323,6 +445,7 @@ mod tests {
                 collapsed: false,
                 indent_level: 0,
                 metrics_epoch: 1,
+                rich_theme_epoch: 0,
             },
             height: chunk_heights.iter().sum(),
             text_height: chunk_heights.iter().sum(),
@@ -466,6 +589,80 @@ mod tests {
         assert!(runs.is_empty());
     }
 
+    // ---- assemble_geometry / assemble_quads ------------------------------
+
+    fn vertex(y: f32) -> GeometryVertex {
+        GeometryVertex { x: 3.0, y, color: [1, 2, 3, 4] }
+    }
+
+    /// A block whose chunks mix glyphs and geometry: the geometry runs must
+    /// stack on the SAME accumulated chunk heights the glyph runs do, or a
+    /// staff line and its noteheads land on different rows. Chunk 1 carries
+    /// only geometry, which is what a rich block looks like — so a walk that
+    /// advanced `y` only for glyph-bearing chunks would put chunk 2 in
+    /// chunk 1's place.
+    #[test]
+    fn geometry_runs_stack_on_the_same_chunk_heights_as_glyph_runs() {
+        let geom = strip(3);
+        let mut block = shaped_block(12.0, &[10.0, 20.0, 5.0]);
+        block.y_offset = 8.0;
+        block.chunks[1].glyphs = Arc::new(Vec::new());
+        block.chunks[1].geometry = Arc::new(vec![vertex(0.0), vertex(20.0)]);
+        let mut shaped = ShapedBlockCache::default();
+        shaped.insert_for_test(bid(1), block);
+
+        let glyphs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(), 0, 1..2);
+        let geometry = assemble_geometry(&geom, &shaped, 1..2);
+
+        // Row 1 sits at y=24, plus the 8px top padding.
+        assert_eq!(glyphs.len(), 2, "the geometry-only chunk contributes no glyph run");
+        assert_eq!(glyphs[0].doc_y, 32.0);
+        assert_eq!(glyphs[1].doc_y, 62.0, "chunk 2 is past chunks 0 and 1 (10 + 20)");
+
+        assert_eq!(geometry.len(), 1);
+        assert_eq!(geometry[0].doc_y, 42.0, "chunk 1's top: 32 + 10");
+        assert_eq!(geometry[0].x_offset, 12.0, "the block's indent, same as the glyphs'");
+        assert_eq!(geometry[0].vertices.len(), 2);
+    }
+
+    #[test]
+    fn a_block_with_no_geometry_contributes_no_geometry_runs() {
+        let geom = strip(2);
+        let mut shaped = ShapedBlockCache::default();
+        shaped.insert_for_test(bid(1), shaped_block(0.0, &[10.0, 10.0]));
+        assert!(assemble_geometry(&geom, &shaped, 0..999).is_empty());
+    }
+
+    #[test]
+    fn a_rasterized_svg_becomes_a_quad_at_the_blocks_text_origin() {
+        let geom = strip(3);
+        let mut block = shaped_block(12.0, &[64.0]);
+        block.y_offset = 8.0;
+        block.chunks[0].glyphs = Arc::new(Vec::new());
+        let mut shaped = ShapedBlockCache::default();
+        shaped.insert_for_test(bid(1), block);
+
+        let mut rasters = SvgRasterCache::default();
+        rasters.insert(
+            bid(1),
+            crate::view::surface::rich::SvgRaster {
+                content_version: 1,
+                physical: (200, 128),
+                draw: (100.0, 64.0),
+                image: Handle::default(),
+            },
+        );
+
+        let quads = assemble_quads(&geom, &shaped, &rasters, 1..2);
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].doc_rect, [12.0, 32.0, 100.0, 64.0]);
+
+        // Out of the window: nothing.
+        assert!(assemble_quads(&geom, &shaped, &rasters, 2..3).is_empty());
+        // No rasters at all: the early-out, and the usual case.
+        assert!(assemble_quads(&geom, &shaped, &SvgRasterCache::default(), 0..999).is_empty());
+    }
+
     // ---- build_surface_window --------------------------------------------
 
     fn window_app(offset: f32) -> App {
@@ -474,6 +671,7 @@ mod tests {
         app.init_resource::<SurfaceMetricsEpoch>();
         app.init_resource::<SurfaceThemeEpoch>();
         app.init_resource::<ShapedBlockCache>();
+        app.init_resource::<SvgRasterCache>();
         app.insert_resource(ConversationScrollState {
             offset,
             target_offset: offset,

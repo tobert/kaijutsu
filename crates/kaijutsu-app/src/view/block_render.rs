@@ -235,7 +235,7 @@ fn spawn_image_child(
 /// sampling, same as any asset-loaded PNG/JPEG. Not a render target (contrast
 /// `ui_rtt::create_ui_rtt_texture`) — no `RENDER_ATTACHMENT`/`STORAGE_BINDING`
 /// usage needed, just sampling.
-fn create_svg_raster_image(
+pub(crate) fn create_svg_raster_image(
     images: &mut Assets<Image>,
     width: u32,
     height: u32,
@@ -259,7 +259,11 @@ fn create_svg_raster_image(
 
 /// Dark background for the image placeholder rect (no real CAS→decode
 /// pipeline yet — see the `RichContentKind::Image` arm in `build_block_scenes`).
-const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
+///
+/// `pub(crate)` so the conversation surface draws the identical placeholder
+/// (`view::surface::rich`) instead of picking its own shade of "not an image
+/// yet".
+pub(crate) const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
 
 /// One full repaint per theme arrival, so raster-time knobs reach blocks
 /// that are already on screen. Raster inputs sit behind TWO doc-version
@@ -932,23 +936,10 @@ pub fn build_block_scenes(
 
                     // One row per WRAPPED visual line, addressed by its start
                     // byte — a long `+` line that wraps must be tinted across
-                    // every row it occupies. `min_coord`/`max_coord` are the
-                    // line's top/bottom in the same block-local LOGICAL space
-                    // the glyphs use.
-                    let rows: Vec<crate::text::diff::PreviewRow> = layout
-                        .lines()
-                        .map(|line| {
-                            let m = line.metrics();
-                            crate::text::diff::PreviewRow {
-                                text_offset: line.text_range().start,
-                                // parley 0.9 split min/max_coord per axis. 0.7's
-                                // pair was documented as the line's top/bottom,
-                                // i.e. the block axis — not the inline one.
-                                top: m.block_min_coord,
-                                bottom: m.block_max_coord,
-                            }
-                        })
-                        .collect();
+                    // every row it occupies. The conversation surface's rich
+                    // shaper builds the same rows from the same helper, so
+                    // the two paths cannot disagree about where a band goes.
+                    let rows = crate::text::diff::preview_rows(&layout);
                     msdf_geometry.vertices = crate::text::diff::build_diff_band_geometry(
                         preview,
                         &rows,

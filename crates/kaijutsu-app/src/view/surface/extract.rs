@@ -41,7 +41,8 @@ use crate::cell::{ConversationScrollState, EditorEntities};
 use crate::text::msdf::MsdfAtlas;
 use crate::text::msdf::renderer::ExtractedMsdfAtlas;
 use crate::text::msdf::surface_renderer::{
-    ConversationSurfaceRenderer, GlyphInstance, SurfaceUniforms, build_instances,
+    ConversationSurfaceRenderer, GlyphInstance, QuadInstance, SurfaceGeometryVertex,
+    SurfaceUniforms, build_geometry_vertices, build_instances, build_quad_instances,
 };
 use crate::view::surface::chrome::{ChromeInstance, ChromeInstances};
 use crate::ui::theme::Theme;
@@ -49,8 +50,11 @@ use crate::view::block_render::ExtractedMsdfRenderParams;
 use crate::view::geometry::ConversationGeometry;
 use crate::view::ui_rtt::UiRttTexture;
 
+use super::rich::SvgRasterCache;
 use super::shape_cache::{HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch};
-use super::window::{SurfaceRun, assemble_runs};
+use super::window::{
+    SurfaceGeometryRun, SurfaceQuad, SurfaceRun, assemble_geometry, assemble_quads, assemble_runs,
+};
 use super::{ConversationRenderPath, ConversationSurface};
 
 /// Instances a fresh buffer starts at (≈48 KB) — enough for a screenful of
@@ -170,10 +174,17 @@ fn draw_range_of<K>(
 }
 
 /// Persistent per-surface instance buffers, owned by the render world.
+///
+/// The geometry buffer shares the glyphs' [`InstanceBufferKey`] because it
+/// shares their trigger: both are assembled from the window's rows, so they
+/// go stale together and re-uploading one without the other would draw a
+/// staff under last window's notes.
 #[derive(Resource, Default)]
 pub struct SurfaceGpuBuffers {
     entries: HashMap<Entity, SurfaceInstanceBuffer<InstanceBufferKey>>,
     chrome: HashMap<Entity, SurfaceInstanceBuffer<ChromeBufferKey>>,
+    geometry: HashMap<Entity, SurfaceInstanceBuffer<InstanceBufferKey>>,
+    quads: HashMap<Entity, SurfaceInstanceBuffer<InstanceBufferKey>>,
 }
 
 impl SurfaceGpuBuffers {
@@ -200,6 +211,19 @@ impl SurfaceGpuBuffers {
     /// The chrome buffer + instance count to draw.
     pub fn chrome_draw_range(&self, surface: Entity) -> Option<(&Buffer, u32)> {
         draw_range_of(&self.chrome, surface)
+    }
+
+    /// The geometry buffer + **vertex** count to draw (this one is
+    /// vertex-stepped, not instanced).
+    pub fn geometry_draw_range(&self, surface: Entity) -> Option<(&Buffer, u32)> {
+        draw_range_of(&self.geometry, surface)
+    }
+
+    /// The quad instance buffer. The count comes from the extracted texture
+    /// list instead, because a quad whose texture isn't on the GPU yet is
+    /// skipped individually.
+    pub fn quad_buffer(&self, surface: Entity) -> Option<&Buffer> {
+        self.quads.get(&surface)?.buffer.as_ref()
     }
 
     /// Instances currently uploaded for a surface (0 when it has never been
@@ -257,12 +281,54 @@ impl SurfaceGpuBuffers {
         );
     }
 
+    /// Write `vertices` into `surface`'s geometry buffer.
+    pub fn upload_geometry(
+        &mut self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        surface: Entity,
+        key: InstanceBufferKey,
+        vertices: &[SurfaceGeometryVertex],
+    ) {
+        upload_into(
+            &mut self.geometry,
+            device,
+            queue,
+            surface,
+            key,
+            vertices,
+            "conversation_surface_geometry",
+        );
+    }
+
+    /// Write `instances` into `surface`'s textured-quad buffer.
+    pub fn upload_quads(
+        &mut self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        surface: Entity,
+        key: InstanceBufferKey,
+        instances: &[QuadInstance],
+    ) {
+        upload_into(
+            &mut self.quads,
+            device,
+            queue,
+            surface,
+            key,
+            instances,
+            "conversation_surface_quads",
+        );
+    }
+
     /// Drop buffers for surfaces that no longer exist (pane closed, split
     /// rebuilt). Called once per frame from the render system with the set of
     /// surfaces that extracted.
     pub fn retain_surfaces(&mut self, live: &HashSet<Entity>) {
         self.entries.retain(|entity, _| live.contains(entity));
         self.chrome.retain(|entity, _| live.contains(entity));
+        self.geometry.retain(|entity, _| live.contains(entity));
+        self.quads.retain(|entity, _| live.contains(entity));
     }
 }
 
@@ -289,6 +355,21 @@ pub struct ExtractedSurface {
     /// `Some` when the instance buffer must be rebuilt from these runs;
     /// `None` when the GPU already holds instances built from `key`.
     pub rebuild: Option<Vec<SurfaceRun>>,
+    /// Geometry runs for the same window, rebuilt under the same condition —
+    /// they share `key` because they share the window that produced them.
+    pub geometry_rebuild: Option<Vec<SurfaceGeometryRun>>,
+    /// Textured quads (SVG rasters) in the window — assembled **every frame**,
+    /// unlike the two buffers above.
+    ///
+    /// Not because they change every frame, but because the draw needs their
+    /// `Handle<Image>`s every frame (a texture is bound per quad, and handles
+    /// are not `Pod` so they cannot live in the buffer). Carrying the rects
+    /// alongside them costs nothing next to that, and skipping the version
+    /// dance removes the one way a texture list and an instance buffer could
+    /// disagree about which rect belongs to which picture. `assemble_quads`
+    /// returns immediately when no block has a raster, which is the usual
+    /// case.
+    pub quads: Vec<SurfaceQuad>,
     /// `Some` when the chrome buffer must be re-uploaded. Already built (the
     /// main world assembles chrome instances directly), so this is a pointer,
     /// not a copy.
@@ -313,6 +394,7 @@ pub fn extract_conversation_surfaces(
     geometries: Extract<Query<&ConversationGeometry>>,
     entities: Extract<Res<EditorEntities>>,
     shaped: Extract<Res<ShapedBlockCache>>,
+    rasters: Extract<Res<SvgRasterCache>>,
     headers: Extract<Res<HeaderLabelCache>>,
     metrics_epoch: Extract<Res<SurfaceMetricsEpoch>>,
     scroll: Extract<Res<ConversationScrollState>>,
@@ -359,17 +441,25 @@ pub fn extract_conversation_surfaces(
             buffer_version: surface.buffer_version,
             atlas_version,
         };
-        let rebuild = if buffers.is_current(entity, key) {
-            None
+        let (rebuild, geometry_rebuild) = if buffers.is_current(entity, key) {
+            (None, None)
         } else {
-            Some(assemble_runs(
-                geom,
-                &shaped,
-                &headers,
-                metrics_epoch,
-                surface.window.row_range.clone(),
-            ))
+            (
+                Some(assemble_runs(
+                    geom,
+                    &shaped,
+                    &headers,
+                    metrics_epoch,
+                    surface.window.row_range.clone(),
+                )),
+                Some(assemble_geometry(
+                    geom,
+                    &shaped,
+                    surface.window.row_range.clone(),
+                )),
+            )
         };
+        let quads = assemble_quads(geom, &shaped, &rasters, surface.window.row_range.clone());
 
         let chrome_key = ChromeBufferKey {
             chrome_version: chrome.version,
@@ -409,6 +499,8 @@ pub fn extract_conversation_surfaces(
             origin_logical,
             clear,
             rebuild,
+            geometry_rebuild,
+            quads,
             chrome_rebuild,
         });
     }
@@ -424,6 +516,9 @@ pub fn render_conversation_surfaces(
     extracted: Res<ExtractedConversationSurfaces>,
     mut buffers: ResMut<SurfaceGpuBuffers>,
     mut instances: Local<Vec<GlyphInstance>>,
+    mut geometry: Local<Vec<SurfaceGeometryVertex>>,
+    mut quad_instances: Local<Vec<QuadInstance>>,
+    mut quad_images: Local<Vec<Handle<Image>>>,
     mut skips: Local<HashMap<Entity, u32>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -451,9 +546,15 @@ pub fn render_conversation_surfaces(
             build_instances(runs, &atlas, &mut instances);
             buffers.upload(&device, &queue, item.surface, item.key, &instances);
         }
+        if let Some(runs) = &item.geometry_rebuild {
+            build_geometry_vertices(runs, &mut geometry);
+            buffers.upload_geometry(&device, &queue, item.surface, item.key, &geometry);
+        }
         if let Some(chrome) = &item.chrome_rebuild {
             buffers.upload_chrome(&device, &queue, item.surface, item.chrome_key, chrome);
         }
+        build_quad_instances(&item.quads, &mut quad_instances, &mut quad_images);
+        buffers.upload_quads(&device, &queue, item.surface, item.key, &quad_instances);
 
         let uniforms = SurfaceUniforms {
             viewport_phys: item.viewport_phys,
@@ -480,6 +581,10 @@ pub fn render_conversation_surfaces(
             &item.target,
             buffers.draw_range(item.surface),
             buffers.chrome_draw_range(item.surface),
+            buffers.geometry_draw_range(item.surface),
+            buffers
+                .quad_buffer(item.surface)
+                .map(|buffer| (buffer, quad_images.as_slice())),
             &uniforms,
             item.clear,
         );

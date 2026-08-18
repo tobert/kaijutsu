@@ -57,6 +57,7 @@ use peniko::Brush;
 
 use crate::cell::{ConversationScrollState, EditorEntities};
 use crate::text::components::{bevy_color_to_brush, color_to_rgba8};
+use crate::text::msdf::geometry::GeometryVertex;
 use crate::text::msdf::glyph::GlyphKey;
 use crate::text::msdf::layout_bridge::{
     collect_msdf_glyphs_deferred, collect_msdf_glyphs_styled_deferred,
@@ -71,6 +72,7 @@ use crate::view::role_divider;
 
 use super::chrome::BlockLayout;
 use super::chunk::{CHUNK_LINES, chunk_ranges, chunk_shaping_text, frozen_chunk_count, slice_spans};
+use super::content::RichKindInfo;
 
 /// How many screens of slack, on each side of the viewport, get shaped.
 ///
@@ -223,6 +225,21 @@ pub struct ShapeKey {
     pub indent_level: u32,
     /// [`SurfaceMetricsEpoch::get`].
     pub metrics_epoch: u64,
+    /// [`SurfaceThemeEpoch::get`] — **but only for the drawn rich kinds**
+    /// ([`super::content::RichKindInfo::is_drawn`]); zero for everything
+    /// else.
+    ///
+    /// A diff band is `theme.diff_insert_bg` and a sparkline stroke is
+    /// `theme.sparkline_line_color`: colors that belong to the theme, not to
+    /// the block, and that are baked into vertices no recolor pass can find
+    /// (`recolor_block` knows about glyphs, and a band is not a glyph). So
+    /// for those kinds a theme swap genuinely invalidates the shaping.
+    ///
+    /// It is zero for plain text on purpose, and that zero is load-bearing:
+    /// putting the theme epoch in every block's key would re-shape the whole
+    /// conversation on a theme swap, which is the full-document rebake this
+    /// rewrite exists to delete.
+    pub rich_theme_epoch: u64,
 }
 
 /// One chunk's shaped glyphs, in **chunk-local** coordinates: x from 0 at the
@@ -237,6 +254,16 @@ pub struct ShapedChunk {
     /// Byte range within the block's text (see `chunk::chunk_ranges`).
     pub byte_range: Range<usize>,
     pub glyphs: Arc<Vec<PositionedGlyph>>,
+    /// Flat-colored triangles drawn **under** this chunk's glyphs: an ABC
+    /// staff, a diff's background bands and word washes, a sparkline plot,
+    /// an image placeholder rect ([`super::rich`]). Same chunk-local
+    /// coordinates as `glyphs`, same `Arc` for the same reason — assembly
+    /// hands the pointer to the render world.
+    ///
+    /// Empty for every text chunk, which is nearly all of them; the shared
+    /// [`empty_geometry`] allocation keeps that case from costing one `Arc`
+    /// per chunk.
+    pub geometry: Arc<Vec<GeometryVertex>>,
     /// This chunk's layout height — the amount the next chunk stacks down by.
     pub height: f32,
     /// The chunk is **complete**: `CHUNK_LINES` hard lines closed by a `\n`,
@@ -249,6 +276,17 @@ pub struct ShapedChunk {
     /// still `make_mut` a frozen chunk, because repainting doesn't move a
     /// glyph.
     pub frozen: bool,
+}
+
+/// The one empty geometry vector every text chunk shares.
+///
+/// `Arc<Vec<_>>` in the struct rather than `Option<Arc<Vec<_>>>` so the
+/// drawing side reads `if !chunk.geometry.is_empty()` symmetrically with the
+/// glyph check right above it; this keeps that symmetry from costing an
+/// allocation on the path that never has geometry.
+pub fn empty_geometry() -> Arc<Vec<GeometryVertex>> {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<GeometryVertex>>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
 }
 
 /// A block's cached shaping.
@@ -606,6 +644,7 @@ pub fn shape_chunk(
     out.chunks.push(ShapedChunk {
         byte_range: range,
         glyphs: Arc::new(glyphs),
+        geometry: empty_geometry(),
         height: layout_height,
         frozen,
     });
@@ -648,7 +687,7 @@ pub fn shape_block(
 /// Deduplicated on [`FontId`] (a pointer, so the comparison is free) because
 /// a chunk is dozens of glyph runs over the same one or two fonts, and the
 /// list is carried across a thread boundary.
-fn collect_fonts(layout: &parley::Layout<Brush>, fonts: &mut Vec<parley::FontData>) {
+pub(crate) fn collect_fonts(layout: &parley::Layout<Brush>, fonts: &mut Vec<parley::FontData>) {
     for line in layout.lines() {
         for item in line.items() {
             if let parley::PositionedLayoutItem::GlyphRun(run) = item {
@@ -1184,16 +1223,25 @@ pub fn shape_visible_blocks(
                         .chrome
                         .layout(&id, container_width, row.indent_level, theme.indent_width);
                 let wrap_width = layout.wrap_width;
+                // A drawn rich kind bakes theme colors into vertices, so the
+                // theme epoch is part of its key and of nobody else's — see
+                // `ShapeKey::rich_theme_epoch`.
+                let rich_drawn = formatted.rich.is_some_and(RichKindInfo::is_drawn);
                 let key = ShapeKey {
                     content_version: formatted.version,
                     wrap_width_bits: wrap_width.to_bits(),
                     collapsed: row.collapsed,
                     indent_level: row.indent_level,
                     metrics_epoch,
+                    rich_theme_epoch: if rich_drawn { theme_epoch } else { 0 },
                 };
                 let streaming = formatted.status == Status::Running;
                 let color = formatted.color;
-                let spanned = !formatted.spans.is_empty();
+                // The two kinds of block that can't be repainted in place and
+                // can't inherit a frozen prefix: one because parley resolved
+                // its span→glyph mapping and threw it away, the other because
+                // its drawing is geometry a glyph recolor cannot reach.
+                let complex = !formatted.spans.is_empty() || rich_drawn;
 
                 let mut key_match_settled = false;
                 if let Some(existing) = caches.shaped.blocks.get_mut(&id)
@@ -1215,7 +1263,7 @@ pub fn shape_visible_blocks(
                     existing.y_offset = layout.text_y;
                     existing.height = height;
 
-                    if existing.color == color || !spanned {
+                    if existing.color == color || !complex {
                         if existing.color != color {
                             recolor_block(existing, color);
                             mutated = true;
@@ -1229,9 +1277,10 @@ pub fn shape_visible_blocks(
                         existing.streaming &= streaming;
                         key_match_settled = true;
                     }
-                    // Otherwise: a spanned block whose colors moved cannot be
-                    // repainted in place (see `recolor_block`); it re-shapes
-                    // like any other content change.
+                    // Otherwise: a spanned or drawn block whose colors moved
+                    // cannot be repainted in place (see `recolor_block`, and
+                    // `complex` above); it re-shapes like any other content
+                    // change.
                     if mutated {
                         caches.shaped.touch();
                     }
@@ -1246,7 +1295,7 @@ pub fn shape_visible_blocks(
                 let inherit = match caches.shaped.get(&id) {
                     Some(existing) if existing.streaming => {
                         let ranges = chunk_ranges(&formatted.text, CHUNK_LINES);
-                        incremental_prefix(existing, &key, color, &formatted.text, &ranges, spanned)
+                        incremental_prefix(existing, &key, color, &formatted.text, &ranges, complex)
                             .map(|n| (n, ranges))
                     }
                     _ => None,
@@ -1256,8 +1305,11 @@ pub fn shape_visible_blocks(
 
                 // Everything close enough to see, everything streaming, and
                 // everything the tail path can finish cheaply stays on this
-                // thread. The rest becomes a job.
-                if !sync_band.contains(&row_index) && !streaming && inherit.is_none() {
+                // thread. So does every drawn rich kind, which needs the
+                // atlas and the theme — neither of which crosses to a task.
+                // The rest becomes a job.
+                if !sync_band.contains(&row_index) && !streaming && !rich_drawn && inherit.is_none()
+                {
                     if !caches.tasks.is_pending(&id, &key) {
                         backlog.push((
                             (row.y_offset - offset).abs(),
@@ -1281,7 +1333,23 @@ pub fn shape_visible_blocks(
                 // Shaping it here supersedes anything in flight for it.
                 caches.tasks.cancel(&id);
 
-                let output = match inherit {
+                let output = if rich_drawn {
+                    // Detection kept the payload; without it there is nothing
+                    // to draw and shaping the empty string would stamp a
+                    // matching key on an empty block. Skipping leaves the key
+                    // mismatched, so the next frame tries again.
+                    let Some(kind) = formatted.rich_content.as_ref().map(|p| p.kind()) else {
+                        continue;
+                    };
+                    super::rich::RichShaper {
+                        font,
+                        theme: &theme,
+                        atlas: &mut atlas,
+                        font_data: &mut font_data,
+                    }
+                    .shape(kind, &formatted.text, &formatted.spans, &style, wrap_width)
+                } else {
+                    match inherit {
                     Some((n, ranges)) => {
                         // Frozen chunks come across by `Arc` clone — the
                         // pointer, not the glyphs. This is the whole win of
@@ -1307,6 +1375,7 @@ pub fn shape_visible_blocks(
                         wrap_width,
                         CHUNK_LINES,
                     ),
+                    }
                 };
                 output.apply_deferred(&mut atlas, &mut font_data);
 
@@ -1758,6 +1827,7 @@ mod tests {
             collapsed: false,
             indent_level: 0,
             metrics_epoch: 3,
+            rich_theme_epoch: 0,
         }
     }
 
@@ -1774,6 +1844,7 @@ mod tests {
             ShapeKey { collapsed: true, ..base },
             ShapeKey { indent_level: 1, ..base },
             ShapeKey { metrics_epoch: 4, ..base },
+            ShapeKey { rich_theme_epoch: 1, ..base },
         ];
         for (i, variant) in variants.iter().enumerate() {
             assert_ne!(*variant, base, "ShapeKey field {i} does not affect equality");
@@ -2629,6 +2700,7 @@ mod tests {
                 collapsed: false,
                 indent_level: 0,
                 metrics_epoch: 1,
+                rich_theme_epoch: 0,
             },
             chunks: Vec::new(),
             height,
