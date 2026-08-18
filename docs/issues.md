@@ -6,6 +6,80 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18)
+
+**Live on toad, 11:00 today.** A turn died with the provider's own words:
+
+    invalid_request_error: An assistant message with 'tool_calls' must be
+    followed by tool messages responding to each 'tool_call_id'
+
+Three retries, then the ACP agent exited and toad reported "Agent failed to
+run" — which reads to a user as a toad/adapter install problem and is not.
+
+`llm::hydrate` already has a repair pass, and the logs show it running in
+**both** directions on the same call id:
+
+    synthesizing tool_results for orphaned tool_uses  msg_idx=52
+        missing=["call_00_MdNfTA3XnIhwOtlVFWuY4556"]
+    dropping orphaned tool_result (late arrival)      msg_idx=65
+        tool_use_id="call_00_MdNfTA3XnIhwOtlVFWuY4556"
+
+It synthesized a placeholder result at 52 and dropped the *real* result at
+65. Both halves are individually defensible; together they still shipped an
+invalid request.
+
+**The shape of the bug is the design, not the arithmetic.** Both passes are
+adjacent-window heuristics: synthesis looks only at `messages[i + 1]` for
+coverage, and the drop keeps only results whose `tool_use` is in the
+immediately preceding assistant message. A result that lands more than one
+message after its call (a slow tool, or a mailbox flush that interleaves an
+unrelated writer) falls outside both windows. Two heuristics that each
+"repair" independently can disagree, and nothing checks the result.
+
+What it should be: **one pass that establishes the invariant, plus a
+validation that refuses to send a message list violating it.** Today the
+violation is discovered by the provider, after three retries, and the error
+never names our own call id. We should detect it before the request leaves,
+and say which `tool_use_id` is unpaired.
+
+Related and worth keeping in view: `CLAUDE.md` says the mailbox is the
+atomicity gate that keeps tool_use+tool_result pairs from being split by
+unrelated writers. Either that gate is not covering this path, or the pairs
+are being split after it — worth finding out which before patching hydrate.
+
+**Remediation for a poisoned context today**: exclude the offending blocks,
+then fork (the documented path — exclusions land at the next hydrate
+boundary).
+
+---
+
+## A gated `shell_write` from the LLM path appeared to run ungated (2026-08-18)
+
+Same toad session, 10:57. The model called `shell_write` with
+`echo "canary" > /tmp/kaijutsu-canary.txt`; the kernel logged "Tool
+shell_write succeeded" nine seconds later, and the model concluded in its own
+task notes: *"shell_write canary wrote clean with zero hooks — verified no
+gate on the MCP write path"*.
+
+That conclusion should be false. `llm_stream` dispatches through
+`dispatch_tool_via_broker_with_cancel`, the same broker path whose
+`ShellServer::call_tool` runs `run_gate` when `!self.read_only` — and a
+direct `execute_tool` call on the same kernel forty minutes earlier DID gate,
+held 81s, and returned only after `kj ledger allow`.
+
+So one of these is true and we do not yet know which:
+- the gate did run and something auto-allowed it (no rule could have existed
+  — `--remember` was not deployed until `e9c00d5f`), or
+- the LLM turn path reaches `shell_write` by a route that skips the gate, in
+  which case the gate is theatre for the caller it most exists to gate.
+
+**Do not close this by reasoning.** Reproduce it: drive a `shell_write` from
+an LLM turn on a live kernel and check whether an `approvals` row appears.
+Nine seconds is the suspicious number — too slow for `echo`, far too fast for
+an unanswered gate.
+
+---
+
 ## The approval ledger's auto-allow branch is unreachable in production (2026-08-18)
 
 `run_gate`'s step 1 is `approval_ledger::rules::redeem` — the check that lets
