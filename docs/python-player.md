@@ -51,7 +51,13 @@ melted into this doc.
 - **Notebooks, science, MIDI.** A Jupyter cell that joins a context, reads
   the score, emits blocks.
 - **Sandbox/venv experiment space** for agent-callable Python (see
-  "Exec ownership" below).
+  "Exec ownership" below). **This lane has left this document (2026-08-17.)**
+  It is the *inbound* arrow — kaijutsu runs Python — and it shares only the word
+  "Python" with the wheel, which is Python-drives-kaijutsu. Different transport,
+  lifecycle, trust envelope, and exec question. It is now explored in
+  `docs/wasi-ramblings.md` as WASI guest hosting, where the interpreter is a
+  swappable artifact rather than a pyo3 dependency. **Judge the wheel on lane 2
+  alone.**
 
 ## Doctrine
 
