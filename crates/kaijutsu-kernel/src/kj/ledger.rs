@@ -21,7 +21,7 @@
 
 use approval_ledger::error::LedgerError;
 use clap::{Parser, Subcommand};
-use kaijutsu_types::ContentType;
+use kaijutsu_types::{ContentType, ContextId};
 
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -142,10 +142,20 @@ impl KjDispatcher {
         if let Some(decided) = &row.decided_option {
             lines.push(format!("decided:    {decided}"));
         }
+        // `context_id`, `instance`, `tool` and `hook_id` are here for a
+        // client that has to ROUTE this ask, not just render it: an ACP
+        // session, or the app, needs to know which context an ask belongs
+        // to before it can decide whose screen to put it on. They were
+        // missing while the only reader was a human at a shell, who
+        // already knew.
         let data = serde_json::json!({
             "request_id": row.request_id,
+            "context_id": ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()),
             "status": row.status.to_string(),
             "origin": row.origin.to_string(),
+            "instance": row.instance,
+            "tool": row.tool,
+            "hook_id": row.hook_id,
             "description": row.description,
             "authorized_label": row.authorized_label,
             "statements": statements.iter().map(|s| s.statement.rendered.clone()).collect::<Vec<_>>(),
@@ -379,6 +389,24 @@ mod tests {
         let msg = result.message();
         assert!(msg.contains("kj cc send ${TARGET} ${MESSAGE}"), "{msg}");
         assert!(msg.contains("some-target"), "raw typed label, finding #3: {msg}");
+
+        // The structured payload has to carry enough to ROUTE the ask, not
+        // just print it: a client with several live sessions decides whose
+        // screen this belongs on by its context, and cannot do that from
+        // prose. Asserted here because the human-readable rendering above
+        // would keep passing while a client silently lost the ability.
+        let data = match &result {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger show must emit structured data: {other:?}"),
+        };
+        assert_eq!(
+            data["context_id"].as_str(),
+            Some(c.context_id.expect("the test caller has a context").to_string().as_str()),
+            "show must name the context the ask belongs to: {data}"
+        );
+        assert_eq!(data["instance"].as_str(), Some("builtin.kj"), "{data}");
+        assert_eq!(data["tool"].as_str(), Some("cc.send"), "{data}");
+        assert_eq!(data["request_id"].as_str(), Some(request_id.as_str()), "{data}");
 
         // Clean up the pending ask so the spawned gate terminates.
         d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
