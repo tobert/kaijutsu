@@ -1627,6 +1627,77 @@ impl HasSubject for EditorFlow {
 }
 
 // ============================================================================
+// Approval-Ledger Flow Events
+// ============================================================================
+
+/// The approval ledger moved.
+///
+/// Deliberately the least informative event in this module, and that is the
+/// design (Amy, 2026-08-17): *"all the things around it can react to
+/// information-light events and then work with the ledger to do safe changes
+/// from state to state… it gets informed there is new information and it
+/// polls when it's ready."* No ask id, no status, no verdict — a subscriber
+/// learns only that the ledger is no longer where it left it, and decides
+/// for itself whether to look. A client with some other view showing may
+/// mark a cache dirty and do nothing at all; none of that policy lives here.
+///
+/// The generation is durable in the ledger's own SQLite and bumped by
+/// triggers inside the same transaction as the mutation, so it can never
+/// announce a fact that did not commit. `i64` because SQLite's INTEGER is
+/// i64 — an unsigned counter would buy only a lossy conversion at that
+/// boundary.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum LedgerFlow {
+    /// The ledger committed something. Poll it if you care.
+    Changed {
+        /// The ledger's generation *after* the change.
+        generation: i64,
+    },
+}
+
+impl LedgerFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Changed { .. } => "ledger.changed",
+        }
+    }
+
+    /// The ledger generation this event announces.
+    pub fn generation(&self) -> i64 {
+        match self {
+            Self::Changed { generation } => *generation,
+        }
+    }
+}
+
+impl HasSubject for LedgerFlow {
+    fn subject(&self) -> &'static str {
+        LedgerFlow::subject(self)
+    }
+}
+
+impl FlowTopics for LedgerFlow {
+    const TOPICS: &[&'static str] = &["ledger.changed"];
+
+    /// The timing lane — drop the oldest and keep going, never terminate.
+    ///
+    /// This is the lane's general contract ("latency-first; drop the oldest
+    /// on overflow"), not its musical use: this is its own bus, so nothing
+    /// here competes with a beat for drain priority.
+    ///
+    /// The lossless lane would be actively *wrong* here. Terminating a
+    /// subscription because a burst of approvals outran a slow client would
+    /// force a reconnect-and-resync over events that are pure hints — while
+    /// dropping every one of them but the last costs a subscriber nothing,
+    /// because the generation is monotonic and the ledger is the authority.
+    /// Only the newest number has any information in it.
+    fn topic_class(_topic: &str) -> TopicClass {
+        TopicClass::Timing
+    }
+}
+
+// ============================================================================
 // Shared FlowBus Handle
 // ============================================================================
 
@@ -1638,6 +1709,9 @@ pub type SharedTurnFlowBus = Arc<FlowBus<TurnFlow>>;
 
 /// Thread-safe handle to an EditorFlow bus.
 pub type SharedEditorFlowBus = Arc<FlowBus<EditorFlow>>;
+
+/// Thread-safe handle to a LedgerFlow bus.
+pub type SharedLedgerFlowBus = Arc<FlowBus<LedgerFlow>>;
 
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
@@ -1651,6 +1725,11 @@ pub fn shared_turn_flow_bus(capacity: usize) -> SharedTurnFlowBus {
 
 /// Create a new shared editor flow bus.
 pub fn shared_editor_flow_bus(capacity: usize) -> SharedEditorFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared approval-ledger flow bus.
+pub fn shared_ledger_flow_bus(capacity: usize) -> SharedLedgerFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 

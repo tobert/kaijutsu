@@ -109,6 +109,7 @@ use kaijutsu_kernel::{
     block_store::BlockStore,
     flows::EditorFlow,
     flows::FlowMessage,
+    flows::LedgerFlow,
     flows::{TurnFlow, TurnOrigin, TurnStopReason},
     shared_block_flow_bus,
 };
@@ -4506,6 +4507,18 @@ impl kernel::Server for KernelImpl {
                 out.set_latch_message("");
                 out.set_has_latch(false);
             }
+            // `KjResult::Ok`'s structured data, JSON-encoded — empty string
+            // when the verb produced none. A `serde_json::Value` never
+            // itself serializes to the empty string, so this is unambiguous
+            // and no separate `hasData` bool is needed (see kaijutsu.capnp's
+            // comment on `executeKj`). `serde_json::to_string` on a `Value`
+            // we built ourselves cannot fail (its `Number` type structurally
+            // excludes NaN/Infinity) — `expect` rather than a silent
+            // fallback to empty string, which would corrupt "none".
+            let data_json = executed.data.as_ref().map(|v| {
+                serde_json::to_string(v).expect("serde_json::Value always serializes")
+            }).unwrap_or_default();
+            out.set_data(&data_json);
             Ok(())
         }.instrument(trace_span))
     }
@@ -4750,6 +4763,146 @@ impl kernel::Server for KernelImpl {
             subscribers.write().await.push(tx);
             Ok(())
         })
+    }
+
+    /// Push channel: bridges the kernel's `LedgerFlow` bus (one topic,
+    /// `ledger.changed`) onto the client's `LedgerEvents` callback.
+    ///
+    /// Kernel-wide, same reasoning as `subscribe_permission_events`/
+    /// `subscribe_turn_events` — a ledger change can originate from any call
+    /// path, so one subscription serves every context a client cares about.
+    ///
+    /// Two deliberate departures from `subscribe_editor`'s shape, both
+    /// required by `LedgerFlow` living on `TopicClass::Timing`
+    /// (drop-oldest-on-overflow, never terminates — see `flows.rs`'s doc
+    /// comment on `LedgerFlow`):
+    ///
+    /// - **Coalesce before sending.** Once the first event arrives, hold
+    ///   `context_feed::FEED_BATCH_WINDOW` open and drain everything else
+    ///   ready, then send ONE `on_changed` carrying the *highest* generation
+    ///   seen. Reusing the change feed's own latency budget rather than a
+    ///   second constant is deliberate — one number to tune, and the capnp
+    ///   doc comment on `subscribeLedgerEvents` already promises this. This
+    ///   coalescing is lossless for this payload: N changes collapsing into
+    ///   one notification bearing the newest generation loses no fact a
+    ///   client can observe, because a client that polls after the
+    ///   notification sees everything up to and including generation N
+    ///   regardless of how many intermediate generations were ever
+    ///   announced. That would NOT be true of a content-bearing event.
+    /// - **`FlowRecv::Terminated` does not disconnect.** `subscribe_editor`
+    ///   treats a termination as a reason to drop the connection because a
+    ///   gap in editor state means a renderer silently shows a stale buffer.
+    ///   Here a dropped notification costs a subscriber nothing but a late
+    ///   poll — the ledger, not this message, is the authority — and the
+    ///   Timing lane's contract means this should never actually fire.
+    ///   Logged loudly as a should-not-happen and the subscription task
+    ///   ends cleanly, but the connection lives on.
+    fn subscribe_ledger_events(
+        self: Rc<Self>,
+        params: kernel::SubscribeLedgerEventsParams,
+        _results: kernel::SubscribeLedgerEventsResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_ledger_events").entered();
+        let callback = pry!(pry!(params.get()).get_callback());
+        {
+            let ledger_flows = self.kernel.kernel.ledger_flows().clone();
+            let kernel_id = self.kernel.id;
+            let conn_cancel = self.connection.borrow().cancel_token();
+
+            tokio::task::spawn_local(async move {
+                let mut sub = ledger_flows.subscribe("ledger.changed");
+                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
+                const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+                log::debug!("Started ledger-events subscription for kernel {}", kernel_id);
+
+                'outer: loop {
+                    // 1. Block until the first event (or the connection dying).
+                    let first = tokio::select! {
+                        _ = conn_cancel.cancelled() => {
+                            log::debug!("ledger-events bridge cancelled with connection");
+                            break;
+                        }
+                        ev = sub.recv_event() => ev,
+                    };
+                    let mut highest_generation = match first {
+                        None => break,
+                        Some(kaijutsu_kernel::flows::FlowRecv::Message(m)) => {
+                            let LedgerFlow::Changed { generation } = m.payload;
+                            generation
+                        }
+                        // Should-not-happen: this bus is on the Timing lane
+                        // (drop-oldest, never-terminate — see `LedgerFlow`'s
+                        // doc comment), so a subscription is never supposed
+                        // to observe a termination. Log loudly and end just
+                        // this subscription task; a hint channel losing a
+                        // late poll is not a reason to drop the connection.
+                        Some(kaijutsu_kernel::flows::FlowRecv::Terminated(info)) => {
+                            tracing::error!(
+                                kernel = %kernel_id,
+                                topic = info.topic,
+                                delivered = info.delivered,
+                                "ledger-events subscriber was terminated on a \
+                                 lane documented to never terminate — bus bug; \
+                                 ending this subscription, connection stays up"
+                            );
+                            break;
+                        }
+                    };
+
+                    // 2. Hold the window open, coalescing to the highest
+                    //    generation seen. Lossless for this payload — see the
+                    //    doc comment above.
+                    let deadline =
+                        tokio::time::Instant::now() + crate::context_feed::FEED_BATCH_WINDOW;
+                    loop {
+                        let next = tokio::select! {
+                            _ = conn_cancel.cancelled() => {
+                                log::debug!("ledger-events bridge cancelled with connection");
+                                break 'outer;
+                            }
+                            ev = tokio::time::timeout_at(deadline, sub.recv_event()) => ev,
+                        };
+                        match next {
+                            // Window expired, or the bus closed — ship what we have.
+                            Err(_) | Ok(None) => break,
+                            Ok(Some(kaijutsu_kernel::flows::FlowRecv::Message(m))) => {
+                                let LedgerFlow::Changed { generation } = m.payload;
+                                highest_generation = highest_generation.max(generation);
+                            }
+                            Ok(Some(kaijutsu_kernel::flows::FlowRecv::Terminated(info))) => {
+                                tracing::error!(
+                                    kernel = %kernel_id,
+                                    topic = info.topic,
+                                    delivered = info.delivered,
+                                    "ledger-events subscriber was terminated on a \
+                                     lane documented to never terminate — bus bug; \
+                                     ending this subscription, connection stays up"
+                                );
+                                break 'outer;
+                            }
+                        }
+                    }
+
+                    // 3. Send the one coalesced notification.
+                    let mut req = callback.on_changed_request();
+                    req.get().set_generation(highest_generation);
+                    let success =
+                        await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await;
+
+                    if !health.record(success) {
+                        log::warn!(
+                            "ledger-events bridge for kernel {} stopping: callback \
+                             failures continuous for over {:?} — reaping subscriber",
+                            kernel_id,
+                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
+                        );
+                        break;
+                    }
+                }
+                log::debug!("ledger-events bridge task for kernel {} ended", kernel_id);
+            });
+        }
+        Promise::ok(())
     }
 
     // ========================================================================
@@ -8622,6 +8775,11 @@ struct ExecutedKj {
     stderr: String,
     command_block_id: kaijutsu_types::BlockId,
     latch: Option<ExecutedKjLatch>,
+    /// `KjResult::Ok`'s structured data (via `block_output_data`'s
+    /// `rich_json`), carried alongside the block-persistence path that
+    /// already wrote it onto the output block. `None` when the verb
+    /// produced no structured payload.
+    data: Option<serde_json::Value>,
 }
 
 struct ExecutedKjLatch { command: String, target: String, message: String }
@@ -8680,7 +8838,9 @@ async fn execute_kj_command(
                 .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
             documents.set_status(context_id, &command_block_id, Status::Error)
                 .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
-            return Ok(ExecutedKj { exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None });
+            return Ok(ExecutedKj {
+                exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None, data: None,
+            });
         }
     };
     // kj's confirmation gate rides kaish's opaque `baggage` channel as of
@@ -8703,8 +8863,9 @@ async fn execute_kj_command(
         documents.set_stderr(context_id, &output_block_id, Some(stderr.clone()))
             .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
     }
-    if let Some(output) = block_output_data(&result) {
-        documents.set_output(context_id, &output_block_id, Some(&output))
+    let output_data = block_output_data(&result);
+    if let Some(output) = &output_data {
+        documents.set_output(context_id, &output_block_id, Some(output))
             .map_err(|e| capnp::Error::failed(format!("failed to persist kj data: {e}")))?;
     }
     let exit_code = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
@@ -8721,7 +8882,8 @@ async fn execute_kj_command(
         .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
     documents.set_status(context_id, &command_block_id, status)
         .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
-    Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch })
+    let data = output_data.and_then(|od| od.rich_json);
+    Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch, data })
 }
 
 #[cfg(test)]

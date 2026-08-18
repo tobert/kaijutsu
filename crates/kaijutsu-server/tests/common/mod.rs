@@ -157,6 +157,40 @@ pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> Socke
     addr
 }
 
+/// Start a plain ephemeral server (like `start_server`), but also hand back
+/// the live `SharedKernel` it constructed — via `SshServer`'s test-only
+/// `run_on_listener_with_kernel_sink` — so a test can reach kernel-internal
+/// buses (e.g. `LedgerFlow`) that have no dedicated RPC to drive them.
+///
+/// See `ledger_events_wire.rs` for the motivating case: unlike a permission
+/// ask (drivable via `hook_add` + `call_mcp_tool`), producing a genuine
+/// approval-ledger change means exercising the ledger's rule/escalation
+/// machinery — kernel territory, not this crate's. This lets the wire test
+/// stay honest about testing the bridge (kaijutsu-server's job) without
+/// reaching for kernel internals it doesn't own.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn start_server_with_kernel_handle() -> (SocketAddr, kaijutsu_server::SharedKernel) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let config = SshServerConfig::ephemeral(addr.port());
+    let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+
+    tokio::task::spawn_local(async move {
+        let server = SshServer::new(config);
+        if let Err(e) = server
+            .run_on_listener_with_kernel_sink(listener, kernel_tx)
+            .await
+        {
+            log::error!("Server error: {}", e);
+        }
+    });
+
+    let kernel = kernel_rx.await.expect("server dropped the kernel handle before sending it");
+    tokio::task::yield_now().await;
+    (addr, kernel)
+}
+
 /// Connect to server with ephemeral key.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn connect_client(addr: SocketAddr) -> RpcClient {

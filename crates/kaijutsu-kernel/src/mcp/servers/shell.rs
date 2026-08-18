@@ -474,8 +474,14 @@ impl McpServerLike for ShellServer {
                 .mcp_call_timeout_default
                 .saturating_sub(std::time::Duration::from_secs(5));
             let wait = timeouts.gate_wait_timeout.min(broker_cap);
-            let outcome =
-                crate::kj::gate::run_gate(dispatcher.kernel_db(), &caller, spec, wait).await;
+            let outcome = crate::kj::gate::run_gate(
+                dispatcher.kernel_db(),
+                &caller,
+                spec,
+                wait,
+                dispatcher.kernel().ledger_flows(),
+            )
+            .await;
             if !outcome.allowed {
                 return Err(McpError::Protocol(format!(
                     "shell_write: approval gate refused [ask {}] ({}): {} — nothing was run",

@@ -719,6 +719,98 @@ above; `kj approve` answers a `shell_write` ask like a `kj cc send` ask,
 through the real `kj approve list`/`allow` verbs, not the ledger API
 directly.
 
+**Slice 4.5 — the ledger announces.** Slice 4 shipped a gate that was
+correct and undiscoverable: `run_gate` created a durable ask, then blocked,
+and *notified nobody*. No block, no wire event, no log line. On a live
+kernel a model calling `shell_write` would hang for the whole budget while
+no human had any way to learn an answer was wanted — the ask was answerable
+and invisible at the same time. This slice is the notification.
+
+**Amy's ruling (2026-08-17), which set the whole shape:** *"The fire and
+forget is why the ledger is a ledger: all the things around it can react to
+information-light events and then work with the ledger to do safe changes
+from state to state. So we have a clear message to clients that a ledger
+thing has happened, and it can poll the ledger and see if it cares. maybe it
+just marks its cache dirty when some other view is showing and does nothing.
+we don't need to encode that anywhere."*
+
+So the event carries **only a generation number** — no ask id, no status, no
+content. Two properties follow, and both are load-bearing:
+
+- **Coalescing is lossless.** N changes inside a delivery window collapse to
+  one notification bearing the highest generation, and a client that then
+  polls still observes all N. A content-bearing event could not be collapsed
+  that way without losing facts. This is what makes the 4ms batching window
+  (matching `context_feed::FEED_BATCH_WINDOW`) free rather than a trade.
+- **A dropped notification cannot corrupt anything.** Worst case is a late
+  poll, never a wrong answer: the ledger is the authority, and answering
+  still goes through its `claim`/`decide` transaction. Hence the `Timing`
+  lane (drop-oldest, never terminate) rather than the lossless one, which
+  would force a reconnect-and-resync over pure hints.
+
+The pieces:
+
+- **`ledger_generation`** — a one-row table in the ledger's own schema,
+  bumped by six SQLite **triggers** on `approvals`/`approval_events`/
+  `approval_rules` rather than by each Rust write path, so a future write
+  path gets the bump for free instead of depending on someone remembering
+  (the same "exactly one implementation" reasoning `events.rs` gives for
+  `seq`). A trigger fires inside the caller's transaction, so a rolled-back
+  mutation takes its bump down with it: **the counter can never announce a
+  fact that did not commit.** `i64`, because SQLite's INTEGER *is* i64.
+- **A restart gap of 100**, applied once per `KernelDb` open — deliberately
+  not inside `approval_ledger::migrate`, which is idempotent and may run
+  more than once, so folding it in would make the jump depend on call count.
+  Persistence already gives monotonicity; the gap is insurance for the cases
+  that break it (crash mid-transaction, restored backup) and makes a restart
+  legible as a discontinuity.
+- **`LedgerFlow::Changed` on its own `FlowBus`** — its own bus because a
+  ledger change belongs to no context, which is also why
+  `subscribeLedgerEvents` is kernel-wide.
+- **`subscribeLedgerEvents @101` + `interface LedgerEvents`** — one new
+  ordinal, the only wire growth. Deliberately the opposite shape from
+  `PermissionEvents::onAsk @93`: that is a blocking round trip whose
+  *response* is the decision; this delivers no decision and expects no
+  answer. Because there is no one-shot answer channel to honor, the client
+  side is a **broadcast** fan-out, not the take-once `mpsc` that
+  `take_permission_asks()` must be — which is what will let the app show an
+  indicator while ACP separately renders a prompt.
+- **`executeKj` gains a `data :Text` result field**, JSON-encoded, always
+  wired when the verb produced any (Amy: *"executeKj should always wire up
+  data even without explicit --json on the pipeline. why not?"*). Empty
+  means none; JSON is never legitimately the empty string, so no `hasData`
+  bool. This replaced an earlier proposal to add bespoke
+  `listPendingApprovals`/`getApproval` read RPCs: two permanent ordinals
+  serving one subject, versus one additive field making *every* `kj` verb's
+  structured output wire-reachable. Reads land on `executeKj`; **writes stay
+  `kj approve`**, so the ledger's exactly-one-answerer transaction remains
+  the single decision path and no new write surface exists to drift from it.
+
+**Where the announcement fires is the whole point:** immediately after
+`create_ask` commits and **before** the wait loop, never after `run_gate`
+returns. Publishing after the loop would tell everyone once the answer no
+longer mattered — reproducing the exact silent hang this slice removes,
+while every other test still passed. Pinned by
+`an_escalated_ask_is_announced_before_the_wait_not_after`, which was
+verified to fail when the announcement is moved.
+
+Auto-decisions and expiry announce too (both are durable transitions a
+client rendering the ask needs to see), and `kj approve` announces after
+answering — with its `KernelDb` guard explicitly scoped so it is released
+first, since `announce_ledger_change` re-takes that same non-reentrant
+`parking_lot::Mutex` to read the committed generation.
+
+**Proposed for the ACP slice rather than this one — awaiting Amy's word, do
+not treat as settled:** the `WellKnownRole::Approvals`
+context that gives ledger-driven `executeKj` tool calls somewhere to journal
+other than the caller's working context. Amy approved it as symbiotic with
+the broadcast — *"Each tool call is either bootstrap or broadcast driven,
+and is almost entirely there just to be observable, which means more of the
+records are actionable"* — but nothing polls the ledger until the ACP
+consumer exists, so building it now would mint a well-known context with no
+producers. That is exactly the bug `19e0c047` shipped and `66597891` fixed
+for the drift queue. It lands with the traffic it exists to absorb.
+
 **Slice 5 — retire the six `Latch` producers, and retire the word with
 them.** `kj/workspace.rs`, `kj/doc.rs`, `kj/context.rs` (×2 —
 archive/remove and retag), `kj/preset.rs` each get a `GateSpec` builder
@@ -975,7 +1067,7 @@ exactly as they are.
   the comment.
 - **Line/ordinal citations drift under concurrent editing — expect it, don't
   trust a citation without re-checking.** The task brief's `broker.rs:1465`
-  (for the hook-hydrate comment) and `subscribePermissionEvents @103` both
+  (for the hook-hydrate comment) and `subscribePermissionEvents @93` both
   point at different code than they did when written — hydrate logic sits
   around `broker.rs:313-392` at HEAD, and the ordinal is `@93`
   (`kaijutsu.capnp:2185`). Three other lanes are editing this same tree

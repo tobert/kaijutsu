@@ -53,7 +53,12 @@ use crate::kaijutsu_capnp::{context_event, context_observer};
 /// Two jobs at once: it coalesces a token burst into one call, and it gives a
 /// racing publisher time to land so the sort below can order them. Small enough
 /// that a lone edit still feels immediate.
-const FEED_BATCH_WINDOW: Duration = Duration::from_millis(4);
+///
+/// `pub(crate)` so `rpc.rs`'s `subscribe_ledger_events` can reuse the exact
+/// same latency budget rather than defining a second constant that could
+/// drift from this one — the capnp doc comment on `subscribeLedgerEvents`
+/// names this constant by path.
+pub(crate) const FEED_BATCH_WINDOW: Duration = Duration::from_millis(4);
 
 /// Hard cap on one delivery, so a firehose cannot grow an unbounded message.
 const FEED_BATCH_MAX: usize = 512;

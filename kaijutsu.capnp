@@ -1521,6 +1521,47 @@ interface PermissionEvents {
   onAsk @0 (request :PermissionAskRequest) -> (response :PermissionAskResponse);
 }
 
+# ============================================================================
+# Approval-ledger change notification
+# ============================================================================
+# Deliberately the OPPOSITE shape from `PermissionEvents` above, and the
+# contrast is the design. `onAsk` is a blocking round trip whose *response*
+# is the decision. This one is fire-and-forget and carries no decision, no
+# ask id, no status, no content — only "the ledger moved, generation N."
+#
+# Amy's ruling (2026-08-17), which is why the ledger is a ledger: "all the
+# things around it can react to information-light events and then work with
+# the ledger to do safe changes from state to state... it gets informed
+# there is new information and it polls when it's ready." A client marks a
+# cache dirty, or renders a prompt, or does nothing at all because some
+# other view is showing. None of that policy is encoded here.
+#
+# Two properties follow from carrying only a generation:
+#
+# - **Coalescing is lossless.** N ledger changes inside a delivery window
+#   collapse to ONE notification bearing the highest generation, and a
+#   client that then polls still observes all N. A payload carrying ask
+#   content could not be collapsed that way without losing facts.
+# - **A dropped notification cannot corrupt anything.** The worst case is a
+#   late poll, never a wrong answer: the ledger, not this message, is the
+#   authority. Answering stays the ledger's `claim`/`decide` transaction
+#   (exactly one answerer wins) reached through `kj approve`.
+#
+# The generation is durable in the ledger's own SQLite and maintained by
+# triggers, so it cannot claim a fact that did not commit; the kernel jumps
+# it ahead by a small gap at boot so a restart reads as a discontinuity
+# rather than a silent resume. Int64 rather than UInt64 because SQLite's
+# INTEGER *is* i64 — unsigned would buy only a lossy conversion, and at
+# human answer rates 2^63 is not a concern.
+
+interface LedgerEvents {
+  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # reuse one, and never renumber outside a flag day; retiring a method
+  # leaves a `retiredNN @NN ();` stub instead.
+
+  onChanged @0 (generation :Int64) -> ();
+}
+
 # MCP Completion — argument value suggestions
 struct McpCompletionResult {
   values @0 :List(Text);     # Suggested completions
@@ -1576,7 +1617,7 @@ interface World {
 }
 
 interface Kernel {
-  # Next free ordinal: 101. Ordinals are dense and permanent — never
+  # Next free ordinal: 102. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -2184,6 +2225,18 @@ interface Kernel {
   # timeout fail-closed policy this bridges to.
   subscribePermissionEvents @93 (callback :PermissionEvents);
 
+  # Kernel-wide approval-ledger change notification. Kernel-wide for the
+  # same reason as `subscribePermissionEvents` — a ledger change can
+  # originate from any call path (a gated `shell_write` in one context, a
+  # `kj approve` answered from a shell, a rule learned by a sibling) — but
+  # unlike that one this delivers no decision and expects no answer. See
+  # `LedgerEvents` above for why the payload is only a generation.
+  #
+  # Delivery coalesces on the server side within the change feed's latency
+  # budget (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`), which
+  # is sound here precisely because collapsing generations loses nothing.
+  subscribeLedgerEvents @101 (callback :LedgerEvents);
+
   # ==========================================================================
   # kj (context-addressed command execution)
   # ==========================================================================
@@ -2201,7 +2254,24 @@ interface Kernel {
     latchCommand :Text,
     latchTarget :Text,
     latchMessage :Text,
-    hasLatch :Bool
+    hasLatch :Bool,
+    # `KjResult`'s structured data, JSON-encoded — empty when the verb
+    # produced none. ALWAYS wired when available: no `--json` flag, no
+    # opt-in parameter (Amy, 2026-08-17: "executeKj should always wire up
+    # data even without explicit --json on the pipeline. why not?"). The
+    # RPC therefore does not grow the `kj` surface at all while keeping the
+    # typing intact across the wire, and a client can `jq` it the same way
+    # kaish already can.
+    #
+    # It was already being computed and persisted onto the *output* block
+    # (`block_output_data` → `set_output`), reachable only by following the
+    # change feed and correlating — and `commandBlockId`, not the output
+    # block's id, is what this method returns. Carrying it here is a return
+    # path for a value the call already produced.
+    #
+    # Some `kj` verbs do not populate `.data` yet; filling those in is
+    # ordinary follow-up work, not a blocker for this field.
+    data :Text
   );
 
   # ACP-facing command metadata. argvPrefix is the exact kj argv represented

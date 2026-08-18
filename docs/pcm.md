@@ -61,7 +61,7 @@ pub trait RenderSink: Send {
   mutability. Don't "fix" it.
 
 The delivery path: kernel publishes `BlockFlow::RenderCue` on the FlowBus →
-both rpc bridges forward → `onRenderCue @13` (`kaijutsu.capnp`) → client
+both rpc bridges forward → `onRenderCue @9` (`kaijutsu.capnp`) → client
 forwarder emits `ServerEvent::RenderCue` → app systems. It's a directive,
 not a block — `matches_filter` bypasses it.
 

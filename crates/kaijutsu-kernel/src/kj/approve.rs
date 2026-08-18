@@ -155,52 +155,71 @@ impl KjDispatcher {
 
     /// Claim + decide one ask as the calling principal.
     fn approve_decide(&self, request_id: &str, allow: bool, caller: &KjCaller) -> KjResult {
-        let db = self.kernel_db.lock();
-        let conn = db.conn_for_ledger();
-        let principal = caller.principal_id.as_bytes();
-
-        match approval_ledger::claim::claim(conn, request_id, principal) {
-            Ok(_) => {}
-            Err(LedgerError::NotFound(_)) => {
-                return KjResult::Err(format!("kj approve: no such ask {request_id}"));
-            }
-            Err(e @ LedgerError::NotClaimable { .. }) => {
-                // Someone else is answering, or the gate already expired it —
-                // say which, loudly; a silent no-op here reads as "done".
-                return KjResult::Err(format!("kj approve: {e}"));
-            }
-            Err(e) => return KjResult::Err(format!("kj approve: {e}")),
-        }
-
         let verb = if allow { "allow" } else { "deny" };
-        match approval_ledger::decide::decide(
-            conn,
-            request_id,
-            approval_ledger::decide::DecideInput {
-                allow,
-                decided_by: Some(principal),
-                decided_option: Some(if allow { "allow_once" } else { "deny" }),
-                remember_scope: None,
-                auto_reason: None,
-            },
-        ) {
-            Ok(row) => KjResult::ok_with_data(
-                format!(
-                    "{verb}ed ask {request_id} ({})",
-                    row.description
+
+        // The ledger work is scoped so the `KernelDb` guard is RELEASED before
+        // the notification below. `announce_ledger_change` takes the same
+        // mutex to read the committed generation, and `parking_lot::Mutex` is
+        // not reentrant — announcing while still holding it would deadlock the
+        // answerer, which is a far worse failure than the silent hang this
+        // whole slice set out to fix.
+        let result = {
+            let db = self.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let principal = caller.principal_id.as_bytes();
+
+            match approval_ledger::claim::claim(conn, request_id, principal) {
+                Ok(_) => {}
+                // Nothing committed on any of these arms, so there is nothing
+                // to announce — return straight out rather than falling
+                // through to the notification below.
+                Err(LedgerError::NotFound(_)) => {
+                    return KjResult::Err(format!("kj approve: no such ask {request_id}"));
+                }
+                Err(e @ LedgerError::NotClaimable { .. }) => {
+                    // Someone else is answering, or the gate already expired it —
+                    // say which, loudly; a silent no-op here reads as "done".
+                    return KjResult::Err(format!("kj approve: {e}"));
+                }
+                Err(e) => return KjResult::Err(format!("kj approve: {e}")),
+            }
+
+            // Past the claim, a mutation HAS committed (pending → claimed), so
+            // every path from here announces — including the error arms. A
+            // failed decide after a successful claim still moved the ledger,
+            // and a client rendering this ask as pending needs to know.
+            match approval_ledger::decide::decide(
+                conn,
+                request_id,
+                approval_ledger::decide::DecideInput {
+                    allow,
+                    decided_by: Some(principal),
+                    decided_option: Some(if allow { "allow_once" } else { "deny" }),
+                    remember_scope: None,
+                    auto_reason: None,
+                },
+            ) {
+                Ok(row) => KjResult::ok_with_data(
+                    format!(
+                        "{verb}ed ask {request_id} ({})",
+                        row.description
+                    ),
+                    serde_json::json!({
+                        "request_id": row.request_id,
+                        "status": row.status.to_string(),
+                        "verb": verb,
+                    }),
                 ),
-                serde_json::json!({
-                    "request_id": row.request_id,
-                    "status": row.status.to_string(),
-                    "verb": verb,
-                }),
-            ),
-            Err(LedgerError::AlreadyDecided { status, .. }) => KjResult::Err(format!(
-                "kj approve: ask {request_id} was already decided ({status}) — \
-                 your late answer was recorded in the event log but changed nothing"
-            )),
-            Err(e) => KjResult::Err(format!("kj approve: {e}")),
-        }
+                Err(LedgerError::AlreadyDecided { status, .. }) => KjResult::Err(format!(
+                    "kj approve: ask {request_id} was already decided ({status}) — \
+                     your late answer was recorded in the event log but changed nothing"
+                )),
+                Err(e) => KjResult::Err(format!("kj approve: {e}")),
+            }
+        };
+
+        crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+        result
     }
 }
 
@@ -248,8 +267,9 @@ mod tests {
         // pending ask; it must appear in the list.
         let db = d.kernel_db.clone();
         let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30)).await
+            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
         });
         let mut listed = String::new();
         for _ in 0..40 {
@@ -286,8 +306,9 @@ mod tests {
 
         let db = d.kernel_db.clone();
         let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30)).await
+            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
         });
 
         let mut request_id = String::new();
@@ -329,8 +350,9 @@ mod tests {
 
         let db = d.kernel_db.clone();
         let caller = c.clone();
+        let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30)).await
+            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
         });
 
         let mut request_id = String::new();

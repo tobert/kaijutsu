@@ -65,6 +65,7 @@ pub mod claim;
 pub mod decide;
 pub mod error;
 mod events;
+pub mod generation;
 pub mod rc_runs;
 pub mod rules;
 pub mod schema;

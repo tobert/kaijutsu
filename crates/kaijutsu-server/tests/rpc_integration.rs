@@ -884,6 +884,47 @@ fn test_kj_rpc_is_addressed_curated_and_keeps_ambient_context() {
     });
 }
 
+/// `executeKj`'s `data` field carries `KjResult::Ok`'s structured payload
+/// back over the wire, always wired (no `--json` opt-in). `kj context list`
+/// is a known `.data` producer (a JSON array of context handles); `kj
+/// context current` is a known non-producer (`KjResult::ok`, plain text
+/// only). This is the round-trip regression guard: a client must be able to
+/// `serde_json` the field's content, not just observe that it exists.
+#[test]
+fn test_execute_kj_carries_structured_data_when_the_verb_produces_it() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context_a = kernel.create_context("kj-data-a").await.unwrap();
+        let _context_b = kernel.create_context("kj-data-b").await.unwrap();
+
+        let list_argv = vec!["context".into(), "list".into()];
+        let listed = kernel.execute_kj(context_a, &list_argv).await.unwrap();
+        assert_eq!(listed.exit_code, 0, "{}", listed.stderr);
+        let data = listed.data.as_ref().unwrap_or_else(|| {
+            panic!("kj context list must wire structured data; stdout was: {}", listed.stdout)
+        });
+        let handles = data.as_array().unwrap_or_else(|| {
+            panic!("kj context list's data must be a JSON array, got: {data:?}")
+        });
+        let handle_strings: Vec<&str> = handles.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            handle_strings.contains(&"kj-data-a") && handle_strings.contains(&"kj-data-b"),
+            "expected both context handles in the round-tripped data array, got: {handle_strings:?}"
+        );
+
+        let current_argv = vec!["context".into(), "current".into()];
+        let current = kernel.execute_kj(context_a, &current_argv).await.unwrap();
+        assert_eq!(current.exit_code, 0, "{}", current.stderr);
+        assert_eq!(
+            current.data, None,
+            "kj context current is a plain-text KjResult::ok with no structured payload; \
+             the wire field must decode back to None (empty string), not Some"
+        );
+    });
+}
+
 #[test]
 fn test_shell_var_round_trips_through_context() {
     run_local(async {

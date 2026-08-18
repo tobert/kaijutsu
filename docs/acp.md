@@ -274,7 +274,7 @@ on the phone. Still open per timewell.md: table-edge rail rendering, pinning
 
 **Verified on the wire (2026-08-05).** No schema change was needed:
 `ContextHandleInfo.promotedAt/@17`, `.demotedAt/@18`, `.pausedAt/@19`
-(`kaijutsu.capnp:637-639`) ride `listContexts` and are decoded into
+(`kaijutsu.capnp:772-774`) ride `listContexts` and are decoded into
 `ContextInfo` (`kaijutsu-client/src/rpc.rs:2845`). *Seat order* is not on the
 wire and does not need to be: `kaijutsu_viz::layout::assign_ring_seats` is a
 zero-dep pure function, so the bridge computes the identical seating the app
@@ -330,8 +330,10 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
    joins Invoke/Deny/Log/ShortCircuit (`hook_table.rs`), with an
    `HookActionWire::Ask { description }` admin-wire surface and DB
    persistence (`hooks.action_ask_description`) alongside the others.
-   `PermissionEvents::onAsk` (`kaijutsu.capnp`, ordinal `@103` on `Kernel`
-   for `subscribePermissionEvents`) is modeled on `ElicitationEvents::
+   `PermissionEvents::onAsk` (`kaijutsu.capnp`, ordinal `@93` on `Kernel`
+   for `subscribePermissionEvents` — this doc said `@103` until 2026-08-17;
+   an ordinal cleanup moved it and the prose did not follow, so re-grep the
+   schema rather than trusting a number written here) is modeled on `ElicitationEvents::
    onRequest`'s blocking call/response shape but is deliberately
    **kernel-wide, not per-connection**: `HookAction::Ask` can fire from any
    call path (autonomous turn, sibling context, kaish script), so there's no
@@ -770,6 +772,38 @@ that remain genuinely open:
 - Permission UX on mobile: ACP `session/request_permission` now works, but the
   shared approval ledger will eventually need an inline ACP projection that
   stays one system with kj/CLI/app approval management.
+
+  **Half of this is now built** (2026-08-17, `docs/gate-and-shell-split.md`
+  "Slice 4.5"). The ledger no longer notifies nobody: `subscribeLedgerEvents
+  @101` / `LedgerEvents::onChanged(generation)` is a kernel-wide,
+  fire-and-forget announcement that the ledger moved, carrying **only** a
+  durable generation number — no ask id, no status, no content. A client
+  polls the ledger when it feels like it, or marks a cache dirty and does
+  nothing; none of that policy is in the kernel. Reads come back over
+  `executeKj`'s `data` field (every `kj` verb's structured output is on the
+  wire now); answering stays `kj approve`, so the ledger's
+  exactly-one-answerer `claim`/`decide` transaction remains the single
+  decision path.
+
+  **What is left is the ACP consumer**: subscribe, poll on notification,
+  project pending asks into `session/request_permission`, and answer via
+  `executeKj` running `kj approve`. Note the contrast with the *other*
+  approval path — `PermissionEvents::onAsk @93` is a blocking round trip
+  whose response IS the decision, and its client channel is take-once
+  because each envelope carries a one-shot answer sender. `onChanged` has no
+  answer to honor, so its client side is a broadcast and the app can show an
+  indicator while ACP renders the prompt.
+
+  The end state is one approval system: `HookAction::Ask` becomes a ledger
+  ask too, and `@93` retires into a `retired93 @93 ();` stub.
+
+- **Live gap, unrelated to the above and worth fixing:** the Bevy app never
+  calls `ActorHandle::take_permission_asks()` (`kaijutsu-client/src/actor.rs`),
+  though the actor subscribes on every connect. With only the app attached,
+  the forwarding task's send finds no receiver, breaks, and the kernel's
+  forwarder answers dropped-receiver — so a `HookAction::Ask` **fails closed
+  with nothing shown to the human**. Silent by construction; found while
+  designing Slice 4.5.
 - Happy's relay architecture (E2E-encrypted sync server) vs. plain
   ACP-over-local-bridge: if we want push notifications to the phone, we may
   end up wanting a relay too. Study the clone before deciding.

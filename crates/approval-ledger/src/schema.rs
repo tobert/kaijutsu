@@ -466,6 +466,99 @@ BEGIN
     SELECT RAISE(ABORT, 'refusing an allow-always rule: statement has a free variable, or its digest is unrecorded (guarantee 3, fail-closed)');
 END;
 
+-- ── Ledger generation (a durable, trigger-maintained change counter) ──
+-- The kernel broadcasts one fire-and-forget "something in the ledger
+-- changed" notification to connected clients (Amy's ruling: information-
+-- light events — no ask id, no status, no content, so a client that
+-- doesn't care never has to look). `generation` is the entire payload of
+-- that broadcast: a number that goes up exactly when something durable
+-- changed underneath it, and never any other time.
+--
+-- One row, `CHECK (id = 1)` enforced — this is a scalar, not a table, and
+-- the CHECK is what a normal INSERT/DELETE cannot violate their way
+-- around. Deliberately durable in SQLite rather than an in-memory
+-- `AtomicU64`: a counter that resets to zero on every kernel restart
+-- cannot tell a client "nothing happened while you were away" from "the
+-- process came back up" — only a value that survives the restart in the
+-- same place the facts it counts live can make that distinction honestly.
+--
+-- `generation` is `INTEGER` — SQLite's native affinity, i.e. a signed
+-- 64-bit integer — not an unsigned type. An unsigned counter would only
+-- buy a lossy conversion at the SQLite boundary (SQLite's INTEGER storage
+-- class IS i64; there is no unsigned column type to have one instead),
+-- and at human approval-answering rates this counter will never approach
+-- 2^63. There is no realistic scenario in which the sign bit unsigned
+-- would reclaim is ever the constraint that matters.
+CREATE TABLE IF NOT EXISTS ledger_generation (
+    id         INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL
+);
+-- Idempotent seed: `migrate` may run more than once (per `DDL`'s own
+-- doc comment above) and must never re-zero an already-advancing counter.
+INSERT OR IGNORE INTO ledger_generation (id, generation) VALUES (1, 0);
+
+-- The triggers below are the ONLY writers of `generation` during normal
+-- operation (the one deliberate exception, `bump_for_restart` in
+-- `generation.rs`, is documented there). No Rust write path in this crate
+-- calls `UPDATE ledger_generation` itself — the same reasoning
+-- `events.rs`'s module doc gives for `seq` having exactly one
+-- implementation applies here too: a table this ledger grows later gets
+-- its bump for free by adding one more trigger, instead of depending on
+-- every future write function remembering to call a bump helper by hand.
+--
+-- Each trigger fires `AFTER` its mutation, inside the SAME transaction —
+-- a SQLite trigger is never a separate implicit transaction of its own.
+-- That is the whole point: the bump can only ever land in the database
+-- alongside the fact that caused it. A transaction that inserts an
+-- approval and then rolls back takes its trigger-fired bump down with
+-- it, so nothing observing `generation` can ever see a change number for
+-- a fact that was not actually committed (pinned by
+-- `generation_does_not_advance_on_a_rolled_back_transaction` in
+-- `generation.rs`'s tests).
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_approval_insert
+AFTER INSERT ON approvals
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_approval_update
+AFTER UPDATE ON approvals
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_event_insert
+AFTER INSERT ON approval_events
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+-- Rules are included on purpose, not only the ask/event tables: a newly
+-- learned allow-always rule changes what a FUTURE ask does before that
+-- ask ever exists (guarantee 3's whole mechanism) — a client that only
+-- watched `approvals`/`approval_events` would miss the one write that
+-- silently changes its own next redemption outcome. All three mutation
+-- kinds are covered: `revoke` (`rules::revoke`) is an UPDATE today, but a
+-- future DELETE path is covered too, on the same "don't rely on every
+-- write path remembering" reasoning as the rest of this section.
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_rule_insert
+AFTER INSERT ON approval_rules
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_rule_update
+AFTER UPDATE ON approval_rules
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_rule_delete
+AFTER DELETE ON approval_rules
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
 -- ── rc run log (the "checklist of what ran") ────────────────────────
 -- One row per rc-lifecycle invocation (create/fork/drift/…) for a
 -- context. This is what would have made a silently-inert startup rc
@@ -551,6 +644,7 @@ mod tests {
             "approval_signals",
             "approval_events",
             "approval_rules",
+            "ledger_generation",
             "rc_runs",
             "rc_run_scripts",
             "script_bodies",

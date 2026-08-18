@@ -222,6 +222,36 @@ impl SshServer {
     /// listener here. The listener stays bound during initialization, so
     /// incoming connections queue in the OS backlog instead of getting refused.
     pub async fn run_on_listener(&self, socket: TcpListener) -> Result<(), std::io::Error> {
+        self.run_on_listener_inner(socket, None).await
+    }
+
+    /// Like [`Self::run_on_listener`], but hands the constructed
+    /// `SharedKernel` back through `kernel_tx` right after it is built —
+    /// before the server starts accepting connections.
+    ///
+    /// Test-only hook. Most wire behaviors have a real RPC surface a test
+    /// can drive to produce a genuine event (e.g. `permission_ask_wire.rs`
+    /// uses `hook_add` + `call_mcp_tool`). `LedgerFlow` has no such surface
+    /// reachable without exercising the approval-ledger's rule/escalation
+    /// machinery, which is out of this crate's territory — so
+    /// `ledger_events_wire.rs` uses this to publish `LedgerFlow::Changed`
+    /// directly onto the live kernel's own bus, proving the
+    /// `subscribeLedgerEvents` bridge on the exact instance a connected
+    /// client is talking to.
+    #[doc(hidden)]
+    pub async fn run_on_listener_with_kernel_sink(
+        &self,
+        socket: TcpListener,
+        kernel_tx: tokio::sync::oneshot::Sender<crate::rpc::SharedKernel>,
+    ) -> Result<(), std::io::Error> {
+        self.run_on_listener_inner(socket, Some(kernel_tx)).await
+    }
+
+    async fn run_on_listener_inner(
+        &self,
+        socket: TcpListener,
+        kernel_tx: Option<tokio::sync::oneshot::Sender<crate::rpc::SharedKernel>>,
+    ) -> Result<(), std::io::Error> {
         // Load or generate the host key
         let host_key = self.config.key_source.load_or_generate()?;
         log::info!(
@@ -280,6 +310,12 @@ impl SshServer {
         )
         .await
         .map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
+
+        // Best-effort: a test that asked for the kernel handle but dropped
+        // its receiver (or never awaited it) must not abort server startup.
+        if let Some(kernel_tx) = kernel_tx {
+            let _ = kernel_tx.send(shared_kernel.clone());
+        }
 
         // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start HERE,
         // not inside `create_shared_kernel`: they need the kernel's VFS

@@ -477,6 +477,9 @@ pub struct KjExecutionResult {
     pub stderr: String,
     pub command_block_id: BlockId,
     pub latch: Option<KjLatch>,
+    /// `KjResult::Ok`'s structured data, always wired when the verb
+    /// produced one (no `--json` opt-in). `None` when it did not.
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1524,6 +1527,26 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Subscribe to the kernel-wide approval-ledger change notification.
+    ///
+    /// Kernel-wide for the same reason as `subscribe_permission_events` — a
+    /// ledger change can originate from any call path — but unlike that one
+    /// this delivers no decision and expects no answer: `onChanged` carries
+    /// only the ledger's generation after the change, coalesced server-side
+    /// (see `kaijutsu-server`'s `subscribe_ledger_events` handler). See
+    /// [`crate::subscriptions::ledger_events_channel`] for building the
+    /// callback client.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_ledger_events")]
+    pub async fn subscribe_ledger_events(
+        &self,
+        callback: crate::kaijutsu_capnp::ledger_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_ledger_events_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
+
     // =========================================================================
     // Timeline / Fork operations
     // =========================================================================
@@ -2275,12 +2298,30 @@ impl KernelHandle {
                 message: result.get_latch_message()?.to_string()?,
             })
         } else { None };
+        // "empty string = none", same convention as `richJson` in
+        // `parse_output_data` above — the server is the sole encoder, so
+        // malformed JSON here means corruption or version-skew, not a
+        // routine condition. Log loud, but don't fail the whole call over a
+        // sideband field.
+        let data_text = result.get_data()?.to_str()?;
+        let data = if data_text.is_empty() {
+            None
+        } else {
+            match serde_json::from_str::<serde_json::Value>(data_text) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::error!("execute_kj: data did not parse as JSON: {e}");
+                    None
+                }
+            }
+        };
         Ok(KjExecutionResult {
             exit_code: result.get_exit_code(),
             stdout: result.get_stdout()?.to_string()?,
             stderr: result.get_stderr()?.to_string()?,
             command_block_id: parse_block_id(&result.get_command_block_id()?)?,
             latch,
+            data,
         })
     }
 

@@ -559,7 +559,7 @@ real KSP / loft node in later.
     estimators keyed on ALSA `EventType`, not bytes): `F8` never enters the
     ring; Start/Stop/Continue/SPP feed the tap AND fall through as score
     capture. This resolved the filter-placement question the ear left open.
-  - **Wire = `reportClockEstimate @98`** — the reverse of the `BeatSync` push,
+  - **Wire = `reportClockEstimate @88`** — the reverse of the `BeatSync` push,
     third mirror in the set (RenderCue↔CaptureBatch, BeatSync↔ClockEstimate).
     ~2 Hz fire-and-forget from the app (`ClockSense` latest-wins shipping);
     ungated on purpose: an estimate is inert sensor data unless the track was

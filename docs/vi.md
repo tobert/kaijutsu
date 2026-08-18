@@ -10,8 +10,8 @@ third *driver* of it. Same surface for all three.
 
 **Slices 1–3 shipped.** The full stack exists and is runner-verified: path
 resolver → `kaijutsu-editor` `EditorCore` (pure modalkit vim) → kernel
-`EditorSessions` → capnp wire surface (`editorOpen/Keys/State/Save/Quit @84–88`
-+ push `subscribeEditor @89`) → `Screen::Editor` MSDF renderer with a real
+`EditorSessions` → capnp wire surface (`editorOpen/Keys/State/Save/Quit @74–78`
++ push `subscribeEditor @79`) → `Screen::Editor` MSDF renderer with a real
 cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin,
 `kj editor` verbs, and bare `kj rc edit <path>` — all funneling to one
 `Kernel::editor_open` and one `EditorState::to_json` shape. The `:` command
@@ -148,7 +148,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`) +
-`editorOpen/Keys/State/Save/Quit @84–88` + `subscribeEditor @89` with
+`editorOpen/Keys/State/Save/Quit @74–78` + `subscribeEditor @79` with
 `EditorEvents` callbacks. **The render channel is push, not poll** (decided
 2026-06-23): a remote write landing in an open block must reach every renderer
 the instant it lands — collaborative editing is the point, and poll would lag
@@ -413,7 +413,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |
-| Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @84` … `subscribeEditor @89`) |
+| Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @74` … `subscribeEditor @79`) |
 | Wire e2e | `kaijutsu-server/tests/editor_wire.rs` |
 | App renderer | `kaijutsu-app/src/view/editor/` (`mod.rs`, `render.rs`, `keys.rs`); screen FSM `ui/screen.rs` |
 | Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `sync_editor_cursor`) |

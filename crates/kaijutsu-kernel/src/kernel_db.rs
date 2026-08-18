@@ -44,6 +44,13 @@ pub enum KernelDbError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
+    /// An `approval-ledger` operation failed. The ledger is DB-injected into
+    /// this same connection, so its errors surface during kernel-DB work —
+    /// but they are not bare SQLite faults, and flattening them into [`Self::Db`]
+    /// would throw away which ledger invariant was actually violated.
+    #[error("approval ledger error: {0}")]
+    Ledger(#[from] approval_ledger::error::LedgerError),
+
     /// Entity not found.
     #[error("not found: {0}")]
     NotFound(String),
@@ -1941,6 +1948,32 @@ impl KernelDb {
     /// idempotent across every open.
     fn migrate_ledger(conn: &Connection) -> KernelDbResult<()> {
         approval_ledger::migrate(conn)?;
+        // Jump the ledger's change generation forward by a fixed gap, once
+        // per DB open — which for the live kernel is once per process start,
+        // i.e. exactly the restart boundary this is meant to mark.
+        //
+        // The counter is durable, so it is already monotonic without this;
+        // the gap is insurance for the cases that break that promise anyway
+        // (a crash mid-transaction, a database restored from a backup), where
+        // a client could otherwise be handed a generation it already held
+        // with different facts sitting behind it. It also makes a restart
+        // legible to a subscriber as a discontinuity rather than a silent
+        // resume.
+        //
+        // Deliberately here rather than inside `approval_ledger::migrate`:
+        // that function is idempotent and documented as safe to call on every
+        // process start, so folding the jump into it would make the jump size
+        // depend on how many times it happened to run. A second `KernelDb`
+        // open in one process would over-gap, and that is fine — an extra
+        // discontinuity costs a subscriber one poll, while a *missing* one
+        // could cost it a stale view it has no way to notice.
+        //
+        // Failing the open is the right response to a failure here, rather
+        // than logging and continuing: the counter is the only thing telling
+        // subscribers a restart happened, so a kernel that came up unable to
+        // advance it would hand out change notifications indistinguishable
+        // from the previous boot's.
+        approval_ledger::generation::bump_for_restart(conn)?;
         Ok(())
     }
 

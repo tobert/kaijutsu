@@ -106,7 +106,14 @@ impl KjDispatcher {
                 }
                 let wait = self.kernel.timeouts().gate_wait_timeout;
                 let spec = gate_spec_for_send(&target, &message, &sessions_dir);
-                let outcome = crate::kj::gate::run_gate(&self.kernel_db, caller, spec, wait).await;
+                let outcome = crate::kj::gate::run_gate(
+                    &self.kernel_db,
+                    caller,
+                    spec,
+                    wait,
+                    self.kernel.ledger_flows(),
+                )
+                .await;
                 if !outcome.allowed {
                     return KjResult::Err(format!(
                         "kj cc send: approval gate refused [ask {}] ({}): {}",

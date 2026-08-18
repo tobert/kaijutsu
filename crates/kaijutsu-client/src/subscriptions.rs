@@ -16,8 +16,8 @@ use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::kaijutsu_capnp::{
-    block_events, editor_events, kernel_output, permission_events, resource_events, turn_events,
-    vfs_activity_events,
+    block_events, editor_events, kernel_output, ledger_events, permission_events, resource_events,
+    turn_events, vfs_activity_events,
 };
 use crate::rpc::{
     EditorState, VfsActivityEntry, parse_block_id, parse_block_snapshot, parse_editor_state,
@@ -705,6 +705,68 @@ impl turn_events::Server for TurnEventsForwarder {
             .is_err()
         {
             tracing::warn!("Event channel closed, dropping TurnFailed event");
+        }
+        Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Approval-ledger change notification
+// ============================================================================
+
+/// Implements the Cap'n Proto `LedgerEvents::Server` trait, forwarding each
+/// `onChanged` push into a dedicated `broadcast::Sender<i64>`.
+///
+/// Deliberately its own tiny broadcast channel rather than a new
+/// `ServerEvent` variant riding the shared `event_tx`: the payload is one
+/// `i64` generation and nothing else (see `LedgerFlow`'s doc comment in
+/// `kaijutsu-kernel`'s `flows.rs` for why), and every consumer of this
+/// channel — the Bevy app's dirty-indicator, an ACP adapter deciding whether
+/// to re-render a pending prompt — wants exactly that number with no
+/// unrelated block/turn/editor traffic to filter out of.
+pub(crate) struct LedgerEventsForwarder {
+    pub tx: broadcast::Sender<i64>,
+}
+
+/// Build a `LedgerEvents` callback client plus the receiver its pushes land
+/// on. Pass the returned client to
+/// [`KernelHandle::subscribe_ledger_events`](crate::rpc::KernelHandle::subscribe_ledger_events);
+/// drain the receiver for the ledger's generation after each change.
+///
+/// Broadcast, not the take-once `mpsc` pattern
+/// [`permission_events_channel`] uses: `onChanged` expects no answer (unlike
+/// a `PermissionAskEnvelope`, which carries a one-shot reply channel only one
+/// drainer can honor), so any number of consumers can each subscribe and
+/// receive every notification. `ActorHandle::subscribe_ledger_events` calls
+/// `.subscribe()` on the actor's one persistent sender for exactly this
+/// reason.
+pub fn ledger_events_channel(
+    capacity: usize,
+) -> (crate::kaijutsu_capnp::ledger_events::Client, broadcast::Receiver<i64>) {
+    let (tx, rx) = broadcast::channel(capacity);
+    let client: crate::kaijutsu_capnp::ledger_events::Client =
+        capnp_rpc::new_client(LedgerEventsForwarder { tx });
+    (client, rx)
+}
+
+#[allow(refining_impl_trait)]
+impl ledger_events::Server for LedgerEventsForwarder {
+    fn on_changed(
+        self: Rc<Self>,
+        params: ledger_events::OnChangedParams,
+        _results: ledger_events::OnChangedResults,
+    ) -> Promise<(), capnp::Error> {
+        let generation = match params.get() {
+            Ok(p) => p.get_generation(),
+            Err(e) => return Promise::err(e),
+        };
+        // No-subscribers is not an error: a client that never called
+        // `subscribe_ledger_events()` just has nowhere for this hint to go.
+        // `send` returning `Err` only means the receiver count is currently
+        // zero (the persistent sender itself never gets torn down between
+        // reconnects), so this stays `debug!`, not `warn!`.
+        if self.tx.send(generation).is_err() {
+            tracing::debug!(generation, "ledger-changed hint dropped: no subscribers");
         }
         Promise::ok(())
     }

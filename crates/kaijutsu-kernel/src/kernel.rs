@@ -23,8 +23,8 @@ use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::execution::{ExecContext, ExecResult};
 use crate::flows::{
-    SharedBlockFlowBus, SharedEditorFlowBus, SharedTurnFlowBus, shared_block_flow_bus,
-    shared_editor_flow_bus, shared_turn_flow_bus,
+    SharedBlockFlowBus, SharedEditorFlowBus, SharedLedgerFlowBus, SharedTurnFlowBus,
+    shared_block_flow_bus, shared_editor_flow_bus, shared_ledger_flow_bus, shared_turn_flow_bus,
 };
 use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
@@ -134,6 +134,17 @@ pub struct Kernel {
     /// `editor_quit` publishes `Closed`; the server's `subscribe_editor` bridge
     /// serializes these onto the `EditorEvents` capnp callback.
     editor_flows: SharedEditorFlowBus,
+    /// FlowBus for approval-ledger change notifications — the push channel
+    /// that replaces polling `kj approve list` and hoping. Published by
+    /// [`Self::notify_ledger_changed`] after a ledger mutation commits;
+    /// the server's `subscribe_ledger_events` bridge coalesces and forwards
+    /// them onto the `LedgerEvents` capnp callback.
+    ///
+    /// Its own bus rather than a topic on `block_flows` because a ledger
+    /// change belongs to no context — the whole reason `subscribeLedgerEvents`
+    /// is kernel-wide — and the context feed's delivery filter drops anything
+    /// that cannot name one.
+    ledger_flows: SharedLedgerFlowBus,
     /// Background host-process registry (`background_exec.rs`,
     /// `docs/issues.md` "Background shell + process management"). Kernel-owned
     /// (not per-materialized-shell) so a process started by one `shell`
@@ -232,6 +243,7 @@ impl Kernel {
                 crate::editor::EditorSessions::new(),
             )),
             editor_flows: shared_editor_flow_bus(default_flow_capacity()),
+            ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
             // spawn_reaper: a lightweight periodic sweep so terminal
             // background-process entries are reaped even if nothing ever
             // polls the registry again (e.g. a context is removed —
@@ -307,6 +319,7 @@ impl Kernel {
                 crate::editor::EditorSessions::new(),
             )),
             editor_flows: shared_editor_flow_bus(default_flow_capacity()),
+            ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
             // spawn_reaper: a lightweight periodic sweep so terminal
             // background-process entries are reaped even if nothing ever
             // polls the registry again (e.g. a context is removed —
@@ -823,6 +836,14 @@ impl Kernel {
     /// Get the turn flows bus (autonomous turn requests).
     pub fn turn_flows(&self) -> &SharedTurnFlowBus {
         &self.turn_flows
+    }
+
+    /// Get the approval-ledger flows bus. The server's
+    /// `subscribe_ledger_events` bridge subscribes here; the publishing side
+    /// is [`crate::kj::gate::announce_ledger_change`], which lives with the
+    /// `KernelDb` handle it needs to read the committed generation back.
+    pub fn ledger_flows(&self) -> &SharedLedgerFlowBus {
+        &self.ledger_flows
     }
 
     /// Get the drift router.

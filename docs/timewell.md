@@ -46,7 +46,7 @@ What's actually built, so the staged plan below isn't mistaken for vaporware:
 - **Stages 2–6** — still the forward plan, mostly unbuilt (read them as
   designed against ring geometry, not the spiral this doc originally
   described) — with one exception: **Stage 3's wire slice shipped 2026-07-04**
-  (`TrackInfo` + `listTracks @92` + `ContextHandleInfo.trackId @16`, answered
+  (`TrackInfo` + `listTracks @82` + `ContextHandleInfo.trackId @16`, answered
   from the beat scheduler's in-memory state), ahead of its layout half.
 - **Ring membership** — rebuilt 2026-07-05 as **explicit placement** (see "Ring
   membership becomes explicit" below), then narrowed 2026-08-01 to **two rings
@@ -138,7 +138,7 @@ Ground truth from a code deep-dive, a wire/census inventory, and an external
   hard-filtered (`sync.rs:37`) — they vanish rather than fall in. At the throat,
   card width (88) exceeds inter-card spacing (~57): physical overlap.
 - ~~**Tracks have zero wire surface.**~~ RESOLVED 2026-07-04: `TrackInfo` +
-  `listTracks @92` + `ContextHandleInfo.trackId @16` shipped (the Stage 3 wire
+  `listTracks @82` + `ContextHandleInfo.trackId @16` shipped (the Stage 3 wire
   slice). The wire reads the scheduler's **in-memory** `TrackState` via a
   `BeatRequest::Snapshot` query — never the persisted row, whose playhead lags
   (written only on transport transitions). Still true: attachment *requires* a
@@ -339,8 +339,8 @@ running-forces-hot override, conclude-demotes-one-band, the
 
 Kernel/wire state (all additive): `contexts.promoted_at/demoted_at/paused_at`;
 `ContextHandleInfo` `promotedAt @17` / `demotedAt @18` / `pausedAt @19`;
-`promoteContext @93` / `demoteContext @94` / `setContextPaused @95` /
-`archiveContext @96`; `kj context promote|demote|pause|resume`;
+`promoteContext @83` / `demoteContext @84` / `setContextPaused @85` /
+`archiveContext @86`; `kj context promote|demote|pause|resume`;
 `ACTIVE_RING_CAPACITY = 10` enforced kernel-side (`RING_SLOTS = 10` is the
 app-side seat count — keep them in agreement).
 
@@ -508,7 +508,7 @@ The durable lane layer, per the ontology above.
 
 - **Wire** — ✅ SHIPPED 2026-07-04, leaner than drafted: `TrackInfo` (id,
   scoreContextId, playing, playheadTick, periodUs, beatsPerPhrase, beatCount,
-  lastEpochNs, clockKind, attached ids) + `listTracks @92`; `trackId @16` on
+  lastEpochNs, clockKind, attached ids) + `listTracks @82`; `trackId @16` on
   `ContextHandleInfo` (empty = unattached). No label/description/createdAt —
   the `tracks` table has no such columns; the TrackId name *is* the label
   (add columns + fields when a track needs prose). Answered from the

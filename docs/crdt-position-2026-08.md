@@ -385,7 +385,7 @@ slice 3 — landed as `af45445e` (`tiers::HOOK_PATH`, under `CC_HOOK_DEADLINE`).
 
 ## How slices 2 and 3 actually landed (2026-08-13)
 
-**Slice 2** is `authorBlock @106` / `completeBlock @107`, appended at the next
+**Slice 2** is `authorBlock @95` / `completeBlock @96`, appended at the next
 free ordinals with nothing renumbered. `authorBlock` carries `toolName`,
 `toolInput` and `toolKind` as first-class parameters — the fields
 `block_create` silently drops. It refuses two things rather than papering
