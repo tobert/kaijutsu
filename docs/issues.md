@@ -28,14 +28,30 @@ and the distinction is worth keeping straight because it is narrow:
 rc's `fleet_total="$(grep … \| sed … \| grep -c .)"` is the safe form. Keep it
 that way: assign first, then pipe the variable.
 
-Amy has held the kaish 0.15 release to fix it. Worth a canary that fails loudly
-if the broken behavior is still present when we next bump — the pattern from
-"Pin a divergence WITH instructions".
+**Our tree is NOT fixed.** The fix is kaish PR #367
+(`fix/pipeline-stage-stdout-loss`), unmerged as of 2026-08-18 and pending
+kaibo review plus Amy's call. `~/src/wt/kaish-integration` — the path-dep this
+repo builds against — is 62 commits behind main and does not contain it, so the
+embedded kernel is still losing that output today. "Zero occurrences" above
+means we do not *use* the broken form, not that the shell is fixed.
+
+Root cause, recorded because it may rhyme with something here: kaish's
+`exec_ctx` is **one shared slot**. A pipeline stage moves its `pipe_stdout`
+writer into that slot and leaves it there for the whole dispatch, so any
+dispatch that begins *while that command is still running* — a `$(…)` in its
+own argv, a function body — snapshots the same writer and drops it along with
+its own context. That is why a nested *pipeline* survives (it runs on its own
+stage contexts and never touches the shared slot) while a nested *single
+command* dispatches straight onto it.
+
+Worth a canary that fails loudly if the broken behavior is still present when
+we next bump — the pattern from "Pin a divergence WITH instructions".
 
 Two related notes from the same source: `~/src/wt/kaish-integration`, which
 this repo path-deps, is **62 commits behind kaish main**, so do not rebase onto
-it expecting 0.15. And kaish #366 moves the `[N]` background-job announcement
-from stdout to stderr — breaking for embedders that parse it off stdout.
+it expecting 0.15. And kaish #366 (merged to kaish main as `8c86c41d`, shipping in 0.15) moves
+the `[N]` background-job announcement from stdout to stderr — breaking for
+embedders that parse it off stdout.
 Kaijutsu is unaffected today because `background_exec.rs` runs its own
 `JobManager` rather than reading kaish's announcement, but that is exactly the
 code the open "Background exec → kaish's job system" item would replace. Check
