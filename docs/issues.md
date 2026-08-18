@@ -508,13 +508,20 @@ Both instances produced exactly the output the caller wanted:
   four rc verb directories came back as `Error:`.
 
 That is ~17% of the "failures" being successes wearing an error label, and it
-actively teaches a model that a working command didn't work. Worth deciding
+actively teaches a model that a working command didn't work.
+
+**Still live on 2026-08-18**, seen while diagnosing something else:
+`echo hi > /nonexistent-dir-xyz/file.txt; echo "exit=$?"` came back with
+`exit_code: 0` and a populated stderr — the redirect genuinely failed, and the
+chain reported success because `echo` was last. The bleed runs both
+directions: a real failure can read as success just as a real success can read
+as failure. Worth deciding
 what a multi-command chain's status should mean — kaish reports the last
 command's exit faithfully, so the question is whether the *tool* should be
 flagging `is_error` off it, or off something else (any nonzero? all nonzero?
 an explicit `set -e`?).
 
-### 3. `method_missing` would have caught ZERO of them
+### 3. `method_missing` would have caught ZERO of them — and we are building it anyway
 
 None of the twelve is an unknown or missing tool. The breakdown:
 
@@ -524,11 +531,31 @@ None of the twelve is an unknown or missing tool. The breakdown:
 | `;`-chain exit bleed (false failure) | 2 |
 | `old_string not found` on a file edit | 1 |
 
-So the immediate motivation doesn't hold up. The idea may still be worth
-having on its own merits — and the semantic-search-by-relevance angle is the
-interesting half, since `builtin.tool_search` already exists and could back it
-— but it should be justified by a case where a model actually reached for a
-tool that wasn't there, not by this.
+So the immediate motivation didn't hold up, and this entry originally parked
+the idea pending "a case where a model actually reached for a tool that wasn't
+there."
+
+**Amy ruled for it anyway on 2026-08-18, on its own merits rather than on this
+evidence:** *"I want at least failed tool calls for a non-existent tool to
+return a reasonable error, ideally with a list of tool names it could try.
+maybe later we'll add some search based on what was attempted but for now
+simple is fine."*
+
+The shape: name the failure, list what the caller could have called, no fuzzy
+matching and no semantic search in this slice. The
+semantic-search-by-relevance half stays parked, and `builtin.tool_search` is
+what would back it.
+
+Worth recording why this triage undercounted the value. It measured what
+`method_missing` would have *caught*, and got near-zero. It never measured
+what a caller *learns* when a call does fail — which is the actual argument,
+and applies to every failure rather than only unknown-tool ones. A count of
+prevented failures is the wrong yardstick for an affordance.
+
+One dependency that was easy to miss: until `82d585cf` the client decoder
+dropped the wire's `error` field, so every tool error reached the caller as an
+empty string. Shipped before that fix, a list of available tool names would
+have been invisible.
 
 ### 4. The parse errors are the model's fault, and the error messages are good
 
