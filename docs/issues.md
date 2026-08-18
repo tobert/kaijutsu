@@ -22,11 +22,30 @@ and the distinction is worth keeping straight because it is narrow:
 
 | form | result |
 |---|---|
-| `x="$(echo a \| cat)"` — pipeline *inside* the substitution | works |
-| `echo $(echo c) \| cat` — substitution in a non-last *stage* | **empty** |
+| `a="$(echo A)"`, then use `$a` — assignment | **works** |
+| `echo "x:[$(echo B)]"` — substitution, no pipe | **works** |
+| `echo "x:[$(echo C)]" \| cat` — quoted, piped | **empty** |
+| `echo $(echo C) \| cat` — unquoted, piped | **empty** |
+| `echo "plain" \| cat` — piped, no substitution | **works** |
 
-rc's `fleet_total="$(grep … \| sed … \| grep -c .)"` is the safe form. Keep it
-that way: assign first, then pipe the variable.
+**Quoting does not save it, and the whole stage's output is lost — not just the
+substituted part.** In row 3 the literal `x:[` disappears along with `C`. The
+rule is simply: a command substitution anywhere in a non-last pipeline stage
+destroys that stage's entire output.
+
+**Assign first, then pipe the variable.** rc's
+`fleet_total="$(grep … \| sed … \| grep -c .)"` is the safe form because it is
+an *assignment*, not a pipeline stage — the earlier framing of "pipeline inside
+the substitution" was the wrong distinction.
+
+**The exposure is not bounded by our source.** "Zero occurrences" covers rc
+scripts, Rust literals and `contrib/` — code we control. It does not cover
+shell that a *model writes at runtime* through `shell`/`shell_write`, which is
+unbounded and where `echo $(git rev-parse HEAD) \| cut -c1-8` is an entirely
+natural thing to type. Verified against the live kernel: that exact command
+returns nothing, and a model reasoning on the result sees an empty string with
+exit 0. Every model driving kaijutsu today is exposed to this, and no audit of
+our repo can close it — only the kaish fix can.
 
 **Our tree is NOT fixed.** The fix is kaish PR #367
 (`fix/pipeline-stage-stdout-loss`), unmerged as of 2026-08-18 and pending
