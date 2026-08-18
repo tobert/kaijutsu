@@ -299,8 +299,24 @@ impl RpcClient {
             trace.set_traceparent(&traceparent);
             trace.set_tracestate(&tracestate);
         }
+        request.get().set_wire_version(kaijutsu_types::WIRE_VERSION);
         let response = request.send().promise.await?;
         let reader = response.get()?;
+
+        // Symmetric check: the kernel already refuses a mismatched client
+        // (an old-client-vs-new-kernel bind fails at the server and surfaces
+        // as a Capnp error above). This covers the other direction — a new
+        // client against an old kernel that doesn't know the `wireVersion`
+        // field at all sends capnp's UInt32 default (0) in its results, so
+        // it reads as a mismatch here too.
+        let kernel_wire_version = reader.get_wire_version();
+        if kernel_wire_version != kaijutsu_types::WIRE_VERSION {
+            return Err(RpcError::Other(kaijutsu_types::wire_version_mismatch_message(
+                kaijutsu_types::WIRE_VERSION,
+                kernel_wire_version,
+            )));
+        }
+
         let kernel = reader.get_kernel()?;
         let kernel_id = parse_kernel_id(reader.get_kernel_id()?)?;
 
@@ -460,6 +476,11 @@ pub struct ContextInfo {
     /// once via `setContextOriginHost`; never overwritten by a later
     /// resume/attach from a different machine.
     pub origin_host: Option<String>,
+    /// Durable working directory (`context_shell.cwd`), or `None` when
+    /// nothing has ever set one (empty on the wire) — the same fact
+    /// `get_context_cwd` reads, carried here so a listing caller never has
+    /// to loop a per-context RPC just to learn it (`ContextHandleInfo.cwd`).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1504,36 +1525,15 @@ impl KernelHandle {
         Ok(())
     }
 
-    /// Subscribe to permission asks (`HookAction::Ask`, D-57, docs/acp.md
-    /// gap #2).
-    ///
-    /// Kernel-wide, following `subscribe_turn_events` rather than the
-    /// per-connection `subscribe_mcp_elicitations` model: an Ask can fire
-    /// from any call path, not just the connection that triggered it, so
-    /// there's no `instance` dedupe parameter — one subscription serves
-    /// every context. The server calls `onAsk` on this callback and blocks
-    /// the hooked call on the response, bounded by its own timeout
-    /// (`kaijutsu-kernel`'s `mcp::permission` module); no subscriber
-    /// attached (or no answer in time) fails the call closed on the
-    /// server side, never hangs the client.
-    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_permission_events")]
-    pub async fn subscribe_permission_events(
-        &self,
-        callback: crate::kaijutsu_capnp::permission_events::Client,
-    ) -> Result<(), RpcError> {
-        let mut request = self.kernel.subscribe_permission_events_request();
-        request.get().set_callback(callback);
-        request.send().promise.await?;
-        Ok(())
-    }
-
     /// Subscribe to the kernel-wide approval-ledger change notification.
     ///
-    /// Kernel-wide for the same reason as `subscribe_permission_events` — a
-    /// ledger change can originate from any call path — but unlike that one
-    /// this delivers no decision and expects no answer: `onChanged` carries
-    /// only the ledger's generation after the change, coalesced server-side
-    /// (see `kaijutsu-server`'s `subscribe_ledger_events` handler). See
+    /// Kernel-wide: a ledger change can originate from any call path — a
+    /// gated `shell_write` in one context, a `kj ledger` answer typed in a
+    /// shell, a rule learned by a sibling — so one subscription serves
+    /// every context. Delivers no decision and expects no answer:
+    /// `onChanged` carries only the ledger's generation after the change,
+    /// coalesced server-side (see `kaijutsu-server`'s
+    /// `subscribe_ledger_events` handler). See
     /// [`crate::subscriptions::ledger_events_channel`] for building the
     /// callback client.
     #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_ledger_events")]
@@ -3447,6 +3447,15 @@ fn parse_context_info(
         Some(origin_host_str.to_string())
     };
 
+    // Empty = no durable cwd recorded yet — same "absence is the wire
+    // sentinel" convention as `cast_label`/`origin_host` above.
+    let cwd_str = reader.get_cwd()?.to_str().unwrap_or("");
+    let cwd = if cwd_str.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(cwd_str))
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -3477,6 +3486,7 @@ fn parse_context_info(
         background_last_exit_code,
         cast_label,
         origin_host,
+        cwd,
     })
 }
 

@@ -299,7 +299,7 @@ merged:
   codec, frame codec, send client, inbox listener. 58 tests + 2 ignored live
   probes, golden fixtures from a real session (see the crate's `tests/`).
 - **`kj cc send` is ledger-gated** — the "Open decisions" question below is
-  answered (Amy, 2026-08-16). `kj approve` answers the gate from any shell.
+  answered (Amy, 2026-08-16). `kj ledger` answers the gate from any shell.
 
 Order from here: **kernel wiring of the inbox** (the listener exists; connect
 it as a drift/mailbox source, unlocks replies) → **truthful `from`** on the
@@ -315,7 +315,7 @@ on exists.
   yes** (Amy, 2026-08-16: *"yeah kj cc send should go through the ledger"*).
   Implemented as the first consumer of the approval-ledger gate
   (`crates/kaijutsu-kernel/src/kj/gate.rs`): durable ask row before any wait,
-  fail-closed on `gate_wait_timeout`, answered via `kj approve`. The message
+  fail-closed on `gate_wait_timeout`, answered via `kj ledger`. The message
   body is a free variable in the gated statement, so allow-always rules can
   never be learned for it (ledger guarantee 3) — every send stays
   human-approved until that policy changes deliberately.

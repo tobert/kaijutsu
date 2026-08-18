@@ -124,6 +124,77 @@ fn set_context_origin_host_on_unknown_context_fails() {
     });
 }
 
+/// `ContextHandleInfo.cwd` (added alongside this file's origin-host coverage
+/// as part of the same additive-wire-field pattern) must round-trip through
+/// BOTH surfaces this file already exercises for `origin_host`:
+/// `resolveContextLabel` (DB-driven, `write_context_row_to_handle_info`) and
+/// `listContexts` (registry-driven, the per-row loop in `list_contexts`).
+/// This is the regression guard for the ACP `session/list` fix
+/// (`crates/kaijutsu-acp`): `listContexts` used to carry no cwd at all,
+/// forcing a per-context `getContextCwd` RPC loop — one round trip per
+/// context.
+#[test]
+fn context_cwd_round_trips_through_resolve_context_label_and_list_contexts() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let context_id = kernel.create_context("cwd-wire-test").await.unwrap();
+
+        // Unset: honest absence on both surfaces, same convention as
+        // origin_host's "before" case above.
+        let before = kernel
+            .resolve_context_label("cwd-wire-test")
+            .await
+            .unwrap()
+            .expect("just-created label must resolve");
+        assert_eq!(
+            before.cwd, None,
+            "a context nobody has run a shell command against yet must resolve with cwd = None"
+        );
+        let before_list = kernel.list_contexts().await.unwrap();
+        let before_found = before_list
+            .iter()
+            .find(|c| c.id == context_id)
+            .expect("just-created context must appear in listContexts");
+        assert_eq!(before_found.cwd, None);
+
+        // setContextCwd validates against the real filesystem, so this
+        // needs a directory that genuinely exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().canonicalize().unwrap();
+        kernel
+            .set_context_cwd(context_id, real_dir.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let after = kernel
+            .resolve_context_label("cwd-wire-test")
+            .await
+            .unwrap()
+            .expect("label still resolves after the cwd is set");
+        assert_eq!(
+            after.cwd,
+            Some(real_dir.clone()),
+            "setContextCwd must be visible on the very next DB-driven read"
+        );
+
+        let after_list = kernel.list_contexts().await.unwrap();
+        let after_found = after_list
+            .iter()
+            .find(|c| c.id == context_id)
+            .expect("context must still appear in listContexts");
+        assert_eq!(
+            after_found.cwd,
+            Some(real_dir),
+            "listContexts must carry the same cwd resolveContextLabel does — \
+             a caller must never have to loop getContextCwd per context to \
+             learn what listContexts itself could have told it"
+        );
+    });
+}
+
 /// Durability: `origin_host` survives a simulated kernel restart just like
 /// every other `ContextRow` column — it's a plain persisted SQLite column,
 /// but this pins that fact against a regression the same way

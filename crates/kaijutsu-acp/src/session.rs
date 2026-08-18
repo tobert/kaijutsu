@@ -111,6 +111,15 @@ impl SessionRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// An arbitrary live session's context id, to run an admin `kj` command
+    /// in when it doesn't matter which one — e.g. `kj ledger list`, which
+    /// reads kernel-wide state and is not scoped to any particular context.
+    /// `None` when no session is bound (`permission::poll_ledger` skips its
+    /// tick in that case rather than picking nothing to run in).
+    pub fn any_context_id(&self) -> Option<ContextId> {
+        self.sessions.lock().values().next().map(|s| s.context_id)
+    }
 }
 
 /// Stream one context's blocks to an ACP client as `session/update`

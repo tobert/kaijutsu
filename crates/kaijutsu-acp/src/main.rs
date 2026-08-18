@@ -96,7 +96,24 @@ fn main() -> Result<()> {
     // LocalSet — and the LocalSet must outlive the whole session, not just the
     // connect. Same shape as kaijutsu-mcp's `run_serve`.
     let local = tokio::task::LocalSet::new();
-    runtime.block_on(local.run_until(async move { run(cli).await }))
+    runtime.block_on(async move {
+        let result = local.run_until(async move { run(cli).await }).await;
+        // `run_until` returns as soon as the inner future resolves — it does
+        // NOT wait for other tasks the LocalSet is still holding. A failed
+        // bind_kernel (e.g. a wire-version mismatch) drops the RpcClient,
+        // whose Drop only calls `AbortHandle::abort()` on the spawned capnp
+        // RpcSystem task: that requests cancellation but doesn't run the
+        // task's drop glue synchronously, so the task (and the SSH
+        // ChannelStream it owns) can still be alive right here. If that drop
+        // is deferred until `local` itself drops at the end of `main()` —
+        // by then outside any entered Tokio runtime — russh's ChannelStream
+        // teardown needs `Handle::current()` and panics with "there is no
+        // reactor running" instead of the clean error this handshake exists
+        // to produce. Dropping `local` here, still inside this block_on-
+        // driven future, keeps that teardown on a thread with a reactor.
+        drop(local);
+        result
+    })
 }
 
 async fn run(cli: Cli) -> Result<()> {

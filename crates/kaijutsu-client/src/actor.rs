@@ -89,8 +89,7 @@ use crate::rpc::{
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, LedgerEventsForwarder,
-    PermissionAskEnvelope, ResourceEventsForwarder, ServerEvent, TurnEventsForwarder,
-    VfsActivityEventsForwarder, permission_events_channel,
+    ResourceEventsForwarder, ServerEvent, TurnEventsForwarder, VfsActivityEventsForwarder,
 };
 use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 
@@ -108,14 +107,6 @@ const EVENT_BROADCAST_CAPACITY: usize = 256;
 
 /// Broadcast capacity for connection status events.
 const STATUS_BROADCAST_CAPACITY: usize = 16;
-
-/// Capacity of the kernel-wide permission-ask stream (D-57, docs/acp.md gap
-/// #2). Asks are rare and interactive — one hook firing mid-turn, a human
-/// answering it — so this is generous headroom, not a throughput budget. The
-/// kernel's own `DEFAULT_PERMISSION_ASK_TIMEOUT` (30s) is the real backstop
-/// against a saturated channel: a consumer that falls behind just means asks
-/// queue briefly before the kernel gives up and fails them closed on its own.
-const PERMISSION_ASK_CHANNEL_CAPACITY: usize = 16;
 
 /// Broadcast capacity for the approval-ledger change stream. The kernel
 /// already coalesces a burst to one notification per
@@ -155,7 +146,13 @@ pub enum CallError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
-    /// Per-call deadline (`RPC_CALL_TIMEOUT` or per-call override) exceeded.
+    /// Per-call deadline exceeded — `RPC_CALL_TIMEOUT` for most commands
+    /// (`dispatch!`), or a per-call override for the few dispatched through
+    /// `dispatch_deadline!` instead (today: `ExecuteTool`, `CallMcpTool`
+    /// and `ExecuteKj`, at `kaijutsu_types::timeout::gate::CLIENT_CALL`,
+    /// because each can reach a gate holding for a human answer). The carried
+    /// `Duration` is always the deadline that actually fired, so the
+    /// message names the right number either way.
     /// Connection is NOT torn down — the handler hung, not the pipe.
     #[error("call timed out after {0:?}")]
     Timeout(Duration),
@@ -856,15 +853,8 @@ pub struct ActorHandle {
     /// block-events forwarder this actor builds — including the ones a
     /// reconnect rebuilds — so installing once survives reconnects.
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    /// The kernel-wide permission-ask stream (D-57), handed out exactly
-    /// once via [`Self::take_permission_asks`]. `Some` until taken;
-    /// `std::sync::Mutex` (not `parking_lot`, matching nothing else in this
-    /// file — a plain `Option::take()` under a lock, never held across an
-    /// await) because this is the only mutex-shaped field on the struct.
-    permission_asks: Arc<std::sync::Mutex<Option<mpsc::Receiver<PermissionAskEnvelope>>>>,
-    /// The kernel-wide approval-ledger change stream. Unlike
-    /// `permission_asks`, this is a genuine `broadcast` fan-out, not a
-    /// take-once handout — see [`Self::subscribe_ledger_events`] for why.
+    /// The kernel-wide approval-ledger change stream — a `broadcast` fan-out
+    /// (see [`Self::subscribe_ledger_events`] for why).
     ledger_tx: broadcast::Sender<i64>,
 }
 
@@ -897,43 +887,21 @@ impl ActorHandle {
         self.event_tx.subscribe()
     }
 
-    /// Take ownership of this actor's kernel-wide permission-ask stream
-    /// (`HookAction::Ask`, D-57, docs/acp.md gap #2). At most one consumer:
-    /// unlike [`Self::subscribe_events`]'s broadcast fan-out, every envelope
-    /// carries a one-shot answer channel that only one drainer can honor, so
-    /// a second call — after the first already took it — returns `None`
-    /// rather than a second copy of the stream.
-    ///
-    /// The returned receiver stays valid across reconnects: `connect_handshake`
-    /// best-effort re-subscribes on every successful (re)connect (see there)
-    /// and forwards into the SAME channel this method hands out once, so a
-    /// kernel restart or network blip doesn't require the caller to notice
-    /// and re-subscribe.
-    pub fn take_permission_asks(&self) -> Option<mpsc::Receiver<PermissionAskEnvelope>> {
-        self.permission_asks.lock().unwrap().take()
-    }
-
     /// Subscribe to the kernel-wide approval-ledger change stream — each
     /// item is the ledger's generation after a change (`LedgerFlow::Changed`
     /// bridged over `LedgerEvents::onChanged`, coalesced server-side).
     ///
-    /// Broadcast, not [`Self::take_permission_asks`]'s take-once `mpsc`:
-    /// that method is take-once *because* every `PermissionAskEnvelope`
-    /// carries a one-shot answer channel only one drainer can honor — a
-    /// second consumer would either steal the first one's answer slot or
-    /// never see it. `onChanged` expects no answer at all, so that
-    /// constraint doesn't apply here: any number of callers can subscribe
-    /// and each receives every notification independently. Concretely, this
-    /// is what lets the Bevy app show a ledger-dirty indicator while an ACP
-    /// adapter, in the same process or a different one, separately decides
-    /// whether to re-render a pending prompt — neither has to coordinate
-    /// with or steal from the other.
+    /// A broadcast: `onChanged` expects no answer, so any number of callers
+    /// can subscribe and each receives every notification independently.
+    /// Concretely, this is what lets the Bevy app show a ledger-dirty
+    /// indicator while an ACP adapter, in the same process or a different
+    /// one, separately decides whether to re-render a pending prompt —
+    /// neither has to coordinate with or steal from the other.
     ///
     /// Stays valid across reconnects: `connect_handshake` best-effort
-    /// re-subscribes on every successful (re)connect (mirroring the
-    /// permission-ask re-subscribe) and forwards straight into this same
-    /// persistent sender, so a kernel restart doesn't require a caller to
-    /// notice and re-subscribe.
+    /// re-subscribes on every successful (re)connect and forwards straight
+    /// into this same persistent sender, so a kernel restart doesn't
+    /// require a caller to notice and re-subscribe.
     pub fn subscribe_ledger_events(&self) -> broadcast::Receiver<i64> {
         self.ledger_tx.subscribe()
     }
@@ -1876,18 +1844,26 @@ fn is_disconnect_error(msg: &str) -> bool {
     msg.contains("Disconnected") || msg.contains("disconnected")
 }
 
-/// Run a single RPC call with the global per-call deadline, mapping the
-/// outcome into `CallError`. On disconnect-class errors, signals `close_tx`
-/// so the actor can transition to Closing.
-async fn run_rpc_call<T, F, E>(
+/// Run a single RPC call against an EXPLICIT deadline, mapping the outcome
+/// into `CallError`. On disconnect-class errors, signals `close_tx` so the
+/// actor can transition to Closing.
+///
+/// [`run_rpc_call`] is the thin, common-case wrapper over this that supplies
+/// the global [`RPC_CALL_TIMEOUT`]. This function exists so a command whose
+/// RPC may reach a longer logical wait — today, a gated `shell_write` call
+/// blocking on `kj::gate::run_gate` — can override the deadline without
+/// touching every other command's behavior. See [`dispatch_deadline!`] and
+/// `kaijutsu_types::timeout::gate`.
+async fn run_rpc_call_with_deadline<T, F, E>(
     fut: F,
     close_tx: &mpsc::Sender<CloseCause>,
+    deadline: Duration,
 ) -> Result<T, CallError>
 where
     F: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
-    match tokio::time::timeout(RPC_CALL_TIMEOUT, fut).await {
+    match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(e)) => {
             let msg = e.to_string();
@@ -1898,8 +1874,22 @@ where
             }
             Err(CallError::Rpc(msg))
         }
-        Err(_) => Err(CallError::Timeout(RPC_CALL_TIMEOUT)),
+        Err(_) => Err(CallError::Timeout(deadline)),
     }
+}
+
+/// Run a single RPC call with the global per-call deadline ([`RPC_CALL_TIMEOUT`]),
+/// mapping the outcome into `CallError`. On disconnect-class errors, signals
+/// `close_tx` so the actor can transition to Closing.
+async fn run_rpc_call<T, F, E>(
+    fut: F,
+    close_tx: &mpsc::Sender<CloseCause>,
+) -> Result<T, CallError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    run_rpc_call_with_deadline(fut, close_tx, RPC_CALL_TIMEOUT).await
 }
 
 /// Dispatch macro that invokes `run_rpc_call` and forwards the result to the
@@ -1908,6 +1898,22 @@ macro_rules! dispatch {
     ($kernel:ident, $reply:ident, $close_tx:ident, $k:ident, $call:expr) => {{
         let $k = &$kernel;
         let result = run_rpc_call($call, &$close_tx).await;
+        let _ = $reply.send(result);
+    }};
+}
+
+/// Sibling of [`dispatch!`] for commands whose call may reach a gated tool —
+/// `kj::gate::run_gate` blocking on a human answering from another surface.
+/// The global [`RPC_CALL_TIMEOUT`] (request tier, 30s) is far shorter than
+/// that wait, so a command on this path uses an explicit, longer deadline
+/// instead — `kaijutsu_types::timeout::gate::CLIENT_CALL` is the one this
+/// crate hands to the gate-capable commands today. Every OTHER command keeps
+/// going through `dispatch!` unchanged: a genuinely wedged RPC must still
+/// report back in `RPC_CALL_TIMEOUT`, not silently wait longer everywhere.
+macro_rules! dispatch_deadline {
+    ($kernel:ident, $reply:ident, $close_tx:ident, $k:ident, $deadline:expr, $call:expr) => {{
+        let $k = &$kernel;
+        let result = run_rpc_call_with_deadline($call, &$close_tx, $deadline).await;
         let _ = $reply.send(result);
     }};
 }
@@ -1963,18 +1969,12 @@ struct RpcActor {
     /// Rebuilding the forwarder on reconnect therefore never loses the
     /// installed sink.
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    /// Sink for the permission-ask forwarding task `connect_handshake`
-    /// (re)builds on every connect (D-57). Cloned into that task, never into
-    /// `RpcActor` state that changes — unlike `vfs_activity_interval_ms`
-    /// there's no opt-in toggle to persist, this subscription is attempted
-    /// unconditionally every time.
-    permission_tx: mpsc::Sender<PermissionAskEnvelope>,
     /// Persistent sender behind `ActorHandle::subscribe_ledger_events`.
     /// `connect_handshake` builds a fresh `LedgerEventsForwarder` around a
-    /// clone of this on every (re)connect — unlike `permission_tx` there is
-    /// no intermediate per-connect channel + forwarding task needed, because
-    /// a `broadcast::Sender` clone can be handed straight to the forwarder
-    /// (the same shape `event_tx` uses for `EditorEventsForwarder` et al.).
+    /// clone of this on every (re)connect — a `broadcast::Sender` clone can
+    /// be handed straight to the forwarder (the same shape `event_tx` uses
+    /// for `EditorEventsForwarder` et al.), no intermediate per-connect
+    /// channel + forwarding task needed.
     ledger_tx: broadcast::Sender<i64>,
 
     /// Context change feeds this client wants, by context
@@ -2051,7 +2051,6 @@ impl RpcActor {
         status_tx: broadcast::Sender<ConnectionStatus>,
         status_watch_tx: watch::Sender<ConnectionStatus>,
         midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-        permission_tx: mpsc::Sender<PermissionAskEnvelope>,
         ledger_tx: broadcast::Sender<i64>,
     ) -> Self {
         let (close_tx, close_rx) = mpsc::channel(1);
@@ -2068,7 +2067,6 @@ impl RpcActor {
             peer_attach_pending: false,
             vfs_activity_interval_ms: None,
             midi_exchange,
-            permission_tx,
             ledger_tx,
             context_feeds: HashMap::new(),
             connection: None,
@@ -2147,7 +2145,6 @@ impl RpcActor {
             peer_registration,
             self.vfs_activity_interval_ms,
             self.midi_exchange.clone(),
-            self.permission_tx.clone(),
             self.ledger_tx.clone(),
         );
         self.connecting_task = Some(task);
@@ -2846,7 +2843,6 @@ fn spawn_handshake(
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    permission_tx: mpsc::Sender<PermissionAskEnvelope>,
     ledger_tx: broadcast::Sender<i64>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
@@ -2859,7 +2855,6 @@ fn spawn_handshake(
             peer_registration,
             vfs_activity_interval_ms,
             midi_exchange,
-            permission_tx,
             ledger_tx,
         )
         .await
@@ -2908,7 +2903,6 @@ async fn connect_handshake(
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    permission_tx: mpsc::Sender<PermissionAskEnvelope>,
     ledger_tx: broadcast::Sender<i64>,
 ) -> ConnectOutcome {
     // 1. SSH dial + auth + channel open (with per-phase deadline).
@@ -3026,58 +3020,10 @@ async fn connect_handshake(
         }
     }
 
-    // 3.7. Re-subscribe to the kernel-wide permission-ask stream (D-57,
-    //      docs/acp.md gap #2). Unconditional on every (re)connect — unlike
-    //      vfs_activity there is no opt-in toggle to persist across
-    //      reconnects; every client wants this armed from the start.
-    //      BEST-EFFORT, same reasoning as the peer re-attach and vfs
-    //      activity above, but for a different reason: `mcp::permission`'s
-    //      no-subscriber policy already fails an `Ask` closed (Deny, loud
-    //      `warn!`) when nobody answers, so a failed subscribe here just
-    //      widens that same fail-closed default rather than leaving a hole
-    //      — it must not abort an otherwise-healthy handshake.
-    //
-    //      `permission_events_channel` mints a fresh callback + receiver
-    //      pair every reconnect (the server dedupes by (principal, instance),
-    //      so a fresh callback client replaces rather than stacks); a small
-    //      forwarding task relays each envelope into the ONE persistent
-    //      `permission_tx` a caller took via `ActorHandle::take_permission_asks`
-    //      — so that receiver stays valid across the reconnect instead of
-    //      being invalidated by it.
-    {
-        let (perm_client, mut perm_rx) = permission_events_channel(PERMISSION_ASK_CHANNEL_CAPACITY);
-        match tokio::time::timeout(RPC_CALL_TIMEOUT, kernel.subscribe_permission_events(perm_client))
-            .await
-        {
-            Ok(Ok(())) => {
-                let sink = permission_tx.clone();
-                tokio::task::spawn_local(async move {
-                    while let Some(envelope) = perm_rx.recv().await {
-                        if sink.send(envelope).await.is_err() {
-                            // Nobody ever called `take_permission_asks()`, or
-                            // the caller dropped what it took. Either way
-                            // there's no one left to forward to; let this
-                            // reconnect's subscription die quietly. The
-                            // kernel-side `on_ask` still resolves the ask —
-                            // its own dropped-receiver handling
-                            // (`subscriptions.rs`'s `PermissionAskForwarder`)
-                            // is what actually denies it.
-                            break;
-                        }
-                    }
-                });
-                log::info!("Re-subscribed permission events on connect");
-            }
-            Ok(Err(e)) => log::warn!("permission events subscribe failed (non-fatal): {e}"),
-            Err(_) => log::warn!("permission events subscribe timed out (non-fatal)"),
-        }
-    }
-
-    // 3.8. Re-subscribe to the kernel-wide approval-ledger change stream.
-    //      Unconditional on every (re)connect, same as permission events
-    //      just above — there's no opt-in toggle to persist. Simpler wiring
-    //      than that one, though: `onChanged` expects no answer, so the
-    //      forwarder can write straight into the persistent `ledger_tx`
+    // 3.7. Re-subscribe to the kernel-wide approval-ledger change stream.
+    //      Unconditional on every (re)connect — no opt-in toggle to
+    //      persist. `onChanged` expects no answer, so the forwarder can
+    //      write straight into the persistent `ledger_tx`
     //      clone with no intermediate per-connect channel or forwarding
     //      task (the same shape `editor_fwd`/`vfs_activity_fwd` use with
     //      the shared `event_tx` below). BEST-EFFORT — a hint channel
@@ -3409,8 +3355,26 @@ async fn dispatch_kernel_command(
         RpcCommand::SetContextCwd { context_id, path, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_cwd(context_id, &path));
         }
+        // `executeKj` runs the verb SYNCHRONOUSLY on the server
+        // (`execute_kj_command` returns exit code and output, unlike
+        // `shellExecute`, which spawns and hands back a block id), and some
+        // `kj` verbs block on the approval gate — `kj cc send` today, plus
+        // the six `Latch` producers Slice 5 migrates. So this reaches the
+        // gate exactly the way `ExecuteTool` does, and needs the same
+        // deadline. It is also the path ACP drives `kj` through.
+        //
+        // Applied to the whole verb surface rather than just the gated
+        // ones: the client cannot tell a gated argv from an ungated one
+        // without duplicating `is_gated_verb` here, and a second copy of
+        // that policy would drift from the kernel's. The kernel is what
+        // bounds the wait (`effective_gate_wait()`); this side's only job
+        // is to not fire first.
         RpcCommand::ExecuteKj { context_id, argv, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.execute_kj(context_id, &argv));
+            dispatch_deadline!(
+                kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
+                k.execute_kj(context_id, &argv)
+            );
         }
         RpcCommand::GetKjCommandCatalog { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_kj_command_catalog(context_id));
@@ -3494,10 +3458,27 @@ async fn dispatch_kernel_command(
         }
 
         // ── Tool Execution ──
+        //
+        // `ExecuteTool` and `CallMcpTool` both route (server-side, through
+        // `dispatch_tool_via_broker` → `Broker::call_tool`) to whichever
+        // instance the resolved tool name lands on — including
+        // `builtin.shell_write`, the only BROKER instance that reaches
+        // `kj::gate::run_gate` (`ExecuteKj` below reaches the same gate by
+        // the other route, through kaish) (verified by reading
+        // `kaijutsu-server::rpc::{execute_tool, call_mcp_tool}`). Both need
+        // the gate ladder's client-side deadline instead of the generic
+        // `RPC_CALL_TIMEOUT`, or the client gives up on an answerable gate
+        // ask long before the gate itself would. `GetToolSchemas` and
+        // `ListMcpResources` never dispatch a tool call, so they stay on
+        // `dispatch!`.
         RpcCommand::ExecuteTool {
             tool, params, reply,
         } => {
-            dispatch!(kernel, reply, close_tx, k, k.execute_tool(&tool, &params));
+            dispatch_deadline!(
+                kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
+                k.execute_tool(&tool, &params)
+            );
         }
         RpcCommand::GetToolSchemas { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_tool_schemas());
@@ -3505,8 +3486,9 @@ async fn dispatch_kernel_command(
         RpcCommand::CallMcpTool {
             tool, arguments, reply,
         } => {
-            dispatch!(
+            dispatch_deadline!(
                 kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
                 k.call_mcp_tool(&tool, &arguments)
             );
         }
@@ -3742,18 +3724,11 @@ pub fn spawn_actor(
     // MIDI-capable client installs its worker).
     let midi_exchange = crate::midi_exchange::MidiExchangeSlot::new();
 
-    // Created once, outside the reconnect loop — `connect_handshake` rebuilds
-    // the kernel-side subscription (and the forwarding task feeding this
-    // sink) on every (re)connect, but `permission_rx` itself survives a
-    // reconnect untouched, same as `event_tx`/`status_tx`.
-    let (permission_tx, permission_rx) =
-        mpsc::channel::<PermissionAskEnvelope>(PERMISSION_ASK_CHANNEL_CAPACITY);
-
     // Created once, outside the reconnect loop, same as `event_tx`/
-    // `status_tx`/`permission_tx` above: `connect_handshake` rebuilds the
-    // kernel-side subscription on every (re)connect, but every receiver this
-    // sender ever hands out (via `ActorHandle::subscribe_ledger_events`)
-    // survives a reconnect untouched.
+    // `status_tx` above: `connect_handshake` rebuilds the kernel-side
+    // subscription on every (re)connect, but every receiver this sender
+    // ever hands out (via `ActorHandle::subscribe_ledger_events`) survives
+    // a reconnect untouched.
     let (ledger_tx, _) = broadcast::channel::<i64>(LEDGER_BROADCAST_CAPACITY);
 
     let actor = RpcActor::new(
@@ -3766,7 +3741,6 @@ pub fn spawn_actor(
         status_tx.clone(),
         status_watch_tx,
         midi_exchange.clone(),
-        permission_tx,
         ledger_tx.clone(),
     );
     tokio::task::spawn_local(actor.run());
@@ -3777,7 +3751,6 @@ pub fn spawn_actor(
         status_tx,
         status_watch_rx,
         midi_exchange,
-        permission_asks: Arc::new(std::sync::Mutex::new(Some(permission_rx))),
         ledger_tx,
     }
 }
@@ -3861,6 +3834,37 @@ mod tests {
         assert!(!is_disconnect_error("Overloaded: too many requests"));
     }
 
+    /// The deadline `dispatch_deadline!` hands the gate-reaching commands
+    /// must clear the broker's cap for the gate-capable instance, or the
+    /// client would give up before the broker even has a chance to cancel —
+    /// racing the broker's `Timeout` instead of reporting the gate's own
+    /// reason. Enforced here rather than left to the shared
+    /// `gate_ladder_fires_caller_first` test in `kaijutsu-types`, because
+    /// THIS crate is the one that could silently pass the wrong constant to
+    /// `dispatch_deadline!` at the call site — a typo'd `RPC_CALL_TIMEOUT`
+    /// or `gate::BROKER_CALL` would still compile.
+    #[test]
+    fn gated_command_deadline_clears_the_broker_call_cap() {
+        let deadline = kaijutsu_types::timeout::gate::CLIENT_CALL;
+        assert!(
+            deadline > kaijutsu_types::timeout::gate::BROKER_CALL,
+            "the client's per-call deadline for a gate-capable command must \
+             outlast the broker's cap ({:?}), or the client gives up first \
+             and destroys the broker's/gate's honest error \
+             (client deadline {:?})",
+            kaijutsu_types::timeout::gate::BROKER_CALL,
+            deadline
+        );
+        // A genuinely wedged RPC must still report far sooner than the gate
+        // deadline would ever be reached — this isn't a blanket raise of
+        // every command's timeout, just the two that can reach the gate.
+        assert!(
+            RPC_CALL_TIMEOUT < deadline,
+            "the gated deadline should be strictly longer than the default \
+             request-tier RPC_CALL_TIMEOUT, or there was no defect to fix"
+        );
+    }
+
     #[test]
     fn close_cause_terminal_distinguishes() {
         assert!(CloseCause::Shutdown.is_terminal());
@@ -3890,7 +3894,6 @@ mod tests {
         let (event_tx, _) = broadcast::channel(8);
         let (status_tx, _) = broadcast::channel(8);
         let (status_watch_tx, _) = watch::channel(ConnectionStatus::Idle);
-        let (permission_tx, _) = mpsc::channel(8);
         let (ledger_tx, _) = broadcast::channel(8);
         RpcActor::new(
             SshConfig::default(),
@@ -3902,7 +3905,6 @@ mod tests {
             status_tx,
             status_watch_tx,
             crate::midi_exchange::MidiExchangeSlot::new(),
-            permission_tx,
             ledger_tx,
         )
     }
@@ -4194,5 +4196,73 @@ mod tests {
         ));
         assert!(actor.peer_registration.is_none());
         assert!(!actor.peer_attach_pending);
+    }
+
+    /// A `bindKernel` wire-version mismatch (`kaijutsu_types::WIRE_VERSION`,
+    /// docs/issues.md "The ACP binary can silently outlive a wire change")
+    /// must stop the actor cold, not feed the reconnect FSM's Cooldown loop.
+    /// Three things have to hold together for that:
+    ///
+    /// 1. The mismatch error text (as `RpcClient::bind_kernel` actually
+    ///    formats it) doesn't accidentally look like a disconnect —
+    ///    `is_disconnect_error` is the real classifier `connect_handshake`
+    ///    uses to pick `ConnectOutcome::Transient` vs `Permanent`, and a
+    ///    false-positive there would silently route this into infinite
+    ///    backoff instead.
+    /// 2. `on_connect_outcome(Permanent(..))` from `Connecting` lands in
+    ///    `Terminal` directly — never `Cooldown` — so no retry is scheduled.
+    /// 3. A command against the resulting `Terminal` actor surfaces as
+    ///    `CallError::PermanentlyFailed`, naming both wire versions, which
+    ///    is the variant callers are told to surface loudly rather than spin
+    ///    on (see `CallError`'s doc comment).
+    #[test]
+    fn wire_version_mismatch_reaches_terminal_not_a_retry_loop() {
+        let msg = "bind_kernel: client wire version 1, kernel wire version 2 — rebuild the \
+                    client (target/debug/kaijutsu-acp is a build artifact and can outlive a \
+                    wire change)"
+            .to_string();
+
+        // 1. Must classify as non-disconnect, or connect_handshake would
+        //    treat it as Transient and retry forever.
+        assert!(
+            !is_disconnect_error(&msg),
+            "a wire-version mismatch must not be misclassified as a disconnect: {msg}"
+        );
+
+        // 2. Feeding it through the real outcome handler must land in
+        //    Terminal, not Cooldown.
+        let mut actor = test_actor();
+        actor.state = ActorState::Connecting {
+            attempt: 1,
+            started_at: Instant::now(),
+        };
+        actor.on_connect_outcome(ConnectOutcome::Permanent(msg.clone()));
+        match &actor.state {
+            ActorState::Terminal { reason } => assert_eq!(reason, &msg),
+            other => panic!(
+                "wire-version mismatch must reach Terminal (no retry), got {other:?}"
+            ),
+        }
+
+        // 3. A caller's command against that Terminal actor gets
+        //    PermanentlyFailed, naming both versions — not NotReady/Cooldown,
+        //    which a caller might reasonably wait out.
+        let (peer_tx, _peer_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor.reject_terminal(RpcCommand::AttachPeer {
+            config: PeerConfig {
+                nick: "acp/toad".into(),
+                instance: "toad-1".into(),
+            },
+            invocation_tx: peer_tx,
+            reply: reply_tx,
+        });
+        match reply_rx.blocking_recv() {
+            Ok(Err(CallError::PermanentlyFailed(reason))) => {
+                assert!(reason.contains('1'), "should name the client version: {reason}");
+                assert!(reason.contains('2'), "should name the kernel version: {reason}");
+            }
+            other => panic!("expected PermanentlyFailed naming both versions, got {other:?}"),
+        }
     }
 }

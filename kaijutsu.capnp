@@ -826,6 +826,15 @@ struct ContextHandleInfo {
   # mints a new context per MCP relaunch"). `kj context info`/`list` render
   # empty as "-".
   originHost @29 :Text;
+
+  # Durable working directory (`context_shell.cwd`, `kj/context_shell.rs`) —
+  # the same fact `getContextCwd`/`setContextCwd` read and write, carried
+  # here so a listing caller (ACP's `session/list`, `kj context list`) never
+  # has to loop a per-context RPC just to learn it. Empty = none recorded
+  # (a context nobody has run a shell command against yet), same
+  # absence-is-the-wire-sentinel convention as `castLabel`/`originHost`
+  # above.
+  cwd @30 :Text;
 }
 
 struct PresetInfo {
@@ -1471,88 +1480,22 @@ interface ElicitationEvents {
 }
 
 # ============================================================================
-# Permission asks (HookAction::Ask, D-57, docs/acp.md gap #2)
-# ============================================================================
-# Modeled on ElicitationEvents above: a blocking server->client call and
-# response. Deliberately NOT MCP-scoped like elicitation (no `server`/
-# `instance` field) — a permission Ask fires from the hook engine, which can
-# be triggered by any call path (an autonomous turn, a sibling context, a
-# kaish script), not just the connection driving the call. Subscribers are
-# kernel-wide (see `subscribePermissionEvents` below), mirroring
-# `subscribeTurnEvents` rather than the per-connection elicitation model.
-#
-# No-subscriber and timeout both fail closed on the kernel side (Deny, loud
-# log) — see `kaijutsu-kernel`'s `mcp::permission` module and
-# `Broker::run_permission_ask`. This interface only carries the round trip
-# for the case a subscriber IS attached and DOES answer in time.
-
-struct PermissionOption {
-  id @0 :Text;                # Caller-defined option id (e.g. "allow_always")
-  label @1 :Text;             # Human-readable label for display
-  # Free text, not a closed enum: ACP's request_permission offers option
-  # *kinds* like "allow_once"/"allow_always"/"reject_once"/"reject_always",
-  # but this wire shape isn't boxed into ACP's specific vocabulary.
-  kind @2 :Text;
-}
-
-struct PermissionAskRequest {
-  requestId @0 :Text;         # Unique id for this ask; correlates logs
-  contextId @1 :Data;         # The context the hooked call originated from (16 bytes)
-  description @2 :Text;       # Human-readable description of the action being asked about
-  instance @3 :Text;          # MCP instance name (e.g. "builtin.shell")
-  tool @4 :Text;               # Tool name being called
-  hookId @5 :Text;             # The HookEntry id that fired this Ask
-  options @6 :List(PermissionOption);  # Optional richer choices; empty = plain allow/deny
-}
-
-struct PermissionAskResponse {
-  allow @0 :Bool;                    # True = let the call proceed
-  selectedOptionId @1 :Text;         # Which `options` entry was picked, if any
-  hasSelectedOptionId @2 :Bool;
-  remember @3 :Text;                  # Optional remembered scope ("session" | "always" | ...)
-  hasRemember @4 :Bool;
-}
-
-interface PermissionEvents {
-  # Next free ordinal: 1. Ordinals are dense and permanent — never
-  # reuse one, and never renumber outside a flag day; retiring a method
-  # leaves a `retiredNN @NN ();` stub instead.
-
-  onAsk @0 (request :PermissionAskRequest) -> (response :PermissionAskResponse);
-}
-
-# ============================================================================
 # Approval-ledger change notification
 # ============================================================================
-# Deliberately the OPPOSITE shape from `PermissionEvents` above, and the
-# contrast is the design. `onAsk` is a blocking round trip whose *response*
-# is the decision. This one is fire-and-forget and carries no decision, no
-# ask id, no status, no content — only "the ledger moved, generation N."
+# Carries a generation and nothing else — no ask id, no status, no content.
+# Two properties depend on that emptiness:
 #
-# Amy's ruling (2026-08-17), which is why the ledger is a ledger: "all the
-# things around it can react to information-light events and then work with
-# the ledger to do safe changes from state to state... it gets informed
-# there is new information and it polls when it's ready." A client marks a
-# cache dirty, or renders a prompt, or does nothing at all because some
-# other view is showing. None of that policy is encoded here.
+# - Coalescing is lossless. N changes inside a delivery window collapse to
+#   one notification bearing the highest generation, and a client that polls
+#   afterwards still observes all N.
+# - A dropped notification cannot corrupt anything; the worst case is a late
+#   poll. The ledger is the authority, and answering is its claim/decide
+#   transaction (exactly one answerer wins), reached through `kj ledger`.
 #
-# Two properties follow from carrying only a generation:
-#
-# - **Coalescing is lossless.** N ledger changes inside a delivery window
-#   collapse to ONE notification bearing the highest generation, and a
-#   client that then polls still observes all N. A payload carrying ask
-#   content could not be collapsed that way without losing facts.
-# - **A dropped notification cannot corrupt anything.** The worst case is a
-#   late poll, never a wrong answer: the ledger, not this message, is the
-#   authority. Answering stays the ledger's `claim`/`decide` transaction
-#   (exactly one answerer wins) reached through `kj approve`.
-#
-# The generation is durable in the ledger's own SQLite and maintained by
-# triggers, so it cannot claim a fact that did not commit; the kernel jumps
-# it ahead by a small gap at boot so a restart reads as a discontinuity
-# rather than a silent resume. Int64 rather than UInt64 because SQLite's
-# INTEGER *is* i64 — unsigned would buy only a lossy conversion, and at
-# human answer rates 2^63 is not a concern.
+# The generation is durable in the ledger's SQLite and maintained by
+# triggers, so it cannot report a change that did not commit. The kernel
+# jumps it ahead by a gap at boot, so a restart reads as a discontinuity
+# rather than a silent resume. Int64 because SQLite's INTEGER is i64.
 
 interface LedgerEvents {
   # Next free ordinal: 1. Ordinals are dense and permanent — never
@@ -1613,7 +1556,15 @@ interface World {
 
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
-  bindKernel @2 (trace :TraceContext) -> (kernel :Kernel, kernelId :Data);
+  # `wireVersion` is the client's `kaijutsu_types::WIRE_VERSION`. An old
+  # client that predates this field sends capnp's struct default (0), which
+  # is below any real version and is refused — this is what makes the
+  # handshake a hard flag day rather than a silent downgrade. The kernel
+  # returns its own `wireVersion` in the results so a client can name both
+  # numbers in its error even when the kernel is the older side. See
+  # docs/issues.md, "The ACP binary can silently outlive a wire change".
+  bindKernel @2 (trace :TraceContext, wireVersion :UInt32)
+      -> (kernel :Kernel, kernelId :Data, wireVersion :UInt32);
 }
 
 interface Kernel {
@@ -2211,30 +2162,19 @@ interface Kernel {
   # trusted to identify itself honestly either. Empty from an older peer.
   reportMidiPresence @90 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
 
-  # ==========================================================================
-  # Permission asks (HookAction::Ask, D-57, docs/acp.md gap #2)
-  # ==========================================================================
+  # Retired: HookAction::Ask now runs through the approval ledger
+  # (docs/gate-and-shell-split.md) and announces via subscribeLedgerEvents.
+  retired93 @93 ();
 
-  # Kernel-wide, following `subscribeTurnEvents` rather than the per-
-  # connection `subscribeMcpElicitations` model: `HookAction::Ask` can fire
-  # from any call path, not just the connection that triggered it, so one
-  # subscription serves every context. No per-context filter parameter for
-  # the same reason `subscribeTurnEvents` has none — the request names its
-  # own `contextId`. See `PermissionEvents` above for the wire shape and
-  # `kaijutsu-kernel`'s `mcp::permission` module for the no-subscriber/
-  # timeout fail-closed policy this bridges to.
-  subscribePermissionEvents @93 (callback :PermissionEvents);
-
-  # Kernel-wide approval-ledger change notification. Kernel-wide for the
-  # same reason as `subscribePermissionEvents` — a ledger change can
-  # originate from any call path (a gated `shell_write` in one context, a
-  # `kj approve` answered from a shell, a rule learned by a sibling) — but
-  # unlike that one this delivers no decision and expects no answer. See
-  # `LedgerEvents` above for why the payload is only a generation.
+  # Kernel-wide: a ledger change can originate from any call path (a gated
+  # `shell_write` in one context, a `kj ledger` answer typed in a shell, a
+  # rule learned by a sibling), so one subscription serves every context.
+  # No per-context filter parameter — the notification carries no context
+  # to filter on.
   #
-  # Delivery coalesces on the server side within the change feed's latency
-  # budget (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`), which
-  # is sound here precisely because collapsing generations loses nothing.
+  # Delivery coalesces server-side within the change feed's latency budget
+  # (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`), which is sound
+  # because collapsing generations loses nothing.
   subscribeLedgerEvents @101 (callback :LedgerEvents);
 
   # ==========================================================================

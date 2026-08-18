@@ -666,16 +666,20 @@ impl Tool for KjBuiltin {
         //
         // Approval-gated verbs (`kj cc send` today) get the same treatment for
         // the same reason, one degree worse: they block on a HUMAN answering
-        // from another surface (`kj approve`), up to `gate_wait_timeout`. The
+        // from another surface (`kj ledger`), up to `gate_wait_timeout`. The
         // rc/hook kaish budgets are 10–30s, far shorter than that, so without
         // a patient hold the watchdog would kill the gate long before its own
         // deadline fired — "passes tests, dies in production" (docs/issues.md,
         // Gate slice 1a, finding #1). The hold and the gate's poll deadline
-        // read the SAME `gate_wait_timeout` so they cannot drift apart.
+        // now both route through `TimeoutPolicy::effective_gate_wait()`
+        // (`kaijutsu_types::timeout::gate`) instead of reading
+        // `gate_wait_timeout` raw, so they cannot drift apart — and neither
+        // can drift past what the outer MCP/RPC hops of the gate ladder can
+        // absorb.
         let budget = if is_distill_verb(&argv) {
             Some(self.dispatcher.kernel().timeouts().llm_request_timeout)
         } else if is_gated_verb(&argv) {
-            Some(self.dispatcher.kernel().timeouts().gate_wait_timeout)
+            Some(self.dispatcher.kernel().timeouts().effective_gate_wait())
         } else {
             None
         };
@@ -2080,7 +2084,7 @@ mod tests {
         assert!(!is_gated_verb(&argv("cc send --dry-run kaijutsu-chan hi")));
         assert!(!is_gated_verb(&argv("cc list")));
         assert!(!is_gated_verb(&argv("cc")));
-        assert!(!is_gated_verb(&argv("approve list")));
+        assert!(!is_gated_verb(&argv("ledger list")));
         assert!(!is_gated_verb(&argv("context list")));
         assert!(!is_gated_verb(&[]));
     }

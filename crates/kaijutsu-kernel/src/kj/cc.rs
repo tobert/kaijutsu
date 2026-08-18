@@ -19,7 +19,7 @@
 //! Amy, 2026-08-16: *"yeah kj cc send should go through the ledger."*
 //! Injecting a turn into another agent's session is exactly the action a
 //! human should authorize, so every real send first leaves a durable ask
-//! row ([`crate::kj::gate`]) and waits for an answer (`kj approve`) until
+//! row ([`crate::kj::gate`]) and waits for an answer (`kj ledger`) until
 //! `gate_wait_timeout` — fail-closed on elapse. `--dry-run` writes nothing
 //! and is exempt.
 
@@ -104,7 +104,7 @@ impl KjDispatcher {
                 if dry_run {
                     return cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, true);
                 }
-                let wait = self.kernel.timeouts().gate_wait_timeout;
+                let wait = self.kernel.timeouts().effective_gate_wait();
                 let spec = gate_spec_for_send(&target, &message, &sessions_dir);
                 let outcome = crate::kj::gate::run_gate(
                     &self.kernel_db,
@@ -114,10 +114,11 @@ impl KjDispatcher {
                     self.kernel.ledger_flows(),
                 )
                 .await;
-                if !outcome.allowed {
+                if !outcome.allowed() {
                     return KjResult::Err(format!(
-                        "kj cc send: approval gate refused [ask {}] ({}): {}",
-                        outcome.request_id, outcome.status, outcome.reason
+                        "kj cc send: approval gate refused [{}]: {}",
+                        outcome.ask_description(),
+                        outcome.reason
                     ));
                 }
                 cc_send_inner(&sessions_dir, FROM_NAME, &target, &message, false)
@@ -157,8 +158,9 @@ fn gate_spec_for_send(
     let preview: String = message.chars().take(200).collect();
     crate::kj::gate::GateSpec {
         origin: approval_ledger::types::Origin::KjVerb,
-        instance: "builtin.kj",
-        tool: "cc.send",
+        instance: "builtin.kj".into(),
+        tool: "cc.send".into(),
+        hook_id: None,
         description: format!(
             "send a cross-session message to Claude Code session {target:?}{resolution}: {preview}"
         ),

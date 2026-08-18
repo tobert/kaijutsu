@@ -44,7 +44,7 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/update` text/thought | `BlockKind::Text`/`Thinking` char deltas off the context mirror | built |
 | `session/update` tool_call / tool_call_update | `BlockKind::ToolCall` create, then patch; `ToolResult` patches the call it links to | built |
 | `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
-| `session/request_permission` | `ActorHandle::take_permission_asks` → `permission::run_permission_pump` → `contextId` → ACP session (`rank::session_id_of`) → real round trip; fail-closed on no session/client error/timeout | built |
+| `session/request_permission` | approval-ledger ask → `subscribeLedgerEvents` generation bump → `kj ledger list`/`show` poll → ACP session (`rank::session_id_of`) → real round trip → `kj ledger allow`/`deny` | built |
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the context mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `session/update` commands | curated, loadout-aware kj catalog; exact single-text `/name input` prompts execute addressed kj | built |
@@ -323,49 +323,15 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
    subscription set. Catch-up for late/reconnecting subscribers deliberately
    deferred (needs a catch-up story, not a journal — noted on the
    TurnFlow-durability issue).
-2. ~~**No Ask pathway for `session/request_permission`**~~ **SHIPPED, merged to
-   main** (branch `hook-ask`, 2026-08-05, Sonnet agent; 1949 kaijutsu-kernel +
-   304 kaijutsu-server + 139 kaijutsu-client tests green, `cargo build
-   --workspace` clean; merge commit `232c99c9`). `HookAction::Ask(AskSpec)`
-   joins Invoke/Deny/Log/ShortCircuit (`hook_table.rs`), with an
-   `HookActionWire::Ask { description }` admin-wire surface and DB
-   persistence (`hooks.action_ask_description`) alongside the others.
-   `PermissionEvents::onAsk` (`kaijutsu.capnp`, ordinal `@93` on `Kernel`
-   for `subscribePermissionEvents` — this doc said `@103` until 2026-08-17;
-   an ordinal cleanup moved it and the prose did not follow, so re-grep the
-   schema rather than trusting a number written here) is modeled on `ElicitationEvents::
-   onRequest`'s blocking call/response shape but is deliberately
-   **kernel-wide, not per-connection**: `HookAction::Ask` can fire from any
-   call path (autonomous turn, sibling context, kaish script), so there's no
-   "the connection that asked" the way MCP elicitation has. That forced a
-   real correction mid-implementation — a first pass tried to hold
-   `permission_events::Client`s directly in `SharedKernelState` and hit a
-   wall: capnp `Client`s are `Rc`-based (`!Send`), but `SharedKernelState`
-   must stay `Send + Sync` (each connection can run on its own OS thread).
-   Fixed by copying the `peers::InvokeRequest` cross-thread pattern: the
-   shared registry holds only `Send`-safe `mpsc::Sender`s; the actual
-   capability stays on its owning connection's `spawn_local` bridge task,
-   which drains the channel and drives `onAsk` locally, replying via a
-   paired `oneshot`. `Broker::run_permission_ask` wraps the whole ask in
-   `tokio::time::timeout` (30s default, `DEFAULT_PERMISSION_ASK_TIMEOUT`,
-   test-overridable) — **no subscriber attached, and timeout, both fail
-   closed** (`McpError::Denied`, logged at `warn!`, not the quieter `debug!`
-   other hook denials use — a stuck Ask usually means a misconfigured
-   session, worth an operator's attention). `kaijutsu-client` gained
-   `permission_events_channel()` (mirrors `turn_events_channel`, but
-   request/response instead of push-only) and `KernelHandle::
-   subscribe_permission_events`; an ACP adapter calls the former to build a
-   callback + envelope receiver, passes the callback to the latter, then
-   drains `PermissionAskEnvelope`s and answers each via its paired
-   `oneshot::Sender<PermissionAskAnswer>` — exactly `session/
-   request_permission`'s shape. Tests: kernel-side hook parse/dispatch +
-   allow/deny/no-subscriber/timeout round trips against a fake
-   `PermissionAsker` (`broker.rs`), DB round-trip (`kernel_db.rs`),
-   admin-wire install/reject (`hooks_builtin.rs`); client-side capnp
-   encode/decode round trips including a dropped-receiver failure mode
-   (`subscriptions.rs`); a real SSH+capnp e2e proving the cross-thread
-   bridge itself — not just each side's fakes — actually joins
-   (`kaijutsu-server/tests/permission_ask_wire.rs`).
+2. ~~**No Ask pathway for `session/request_permission`**~~ **SHIPPED**
+   (2026-08-05), then **melted into the approval ledger** (2026-08-18,
+   `docs/gate-and-shell-split.md` "The shared seam: one ledger, one
+   announcement, one write path"). `HookAction::Ask(AskSpec)` now runs
+   through `kj::gate::run_gate` with `Origin::Hook` — the same gate
+   `shell_write` uses — so an Ask is a durable `approval_ledger` row
+   answerable from any surface (`kj ledger allow|deny <id>`), not a
+   per-connection blocking round trip. See "Permission asks, ledger-driven"
+   below for the current mechanism.
 3. ~~**`register_session` reconnect/label-conflict**~~ **SHIPPED, merged to
    main** (branch `register-session-upsert`, 2026-08-04, Sonnet agent; 2440
    tests green; merge commit `7670d72e`). Upsert semantics: DB-driven `resolveContextLabel`
@@ -387,10 +353,9 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
 Suggested order: #1 (+#5 riding along) → #3 → #2 → adapter prototype can
 start with `request_permission` stubbed to auto-allow → #4 and real
 permissions before any untrusted frontend. #1–#3 are now all shipped and
-merged to main; #2's `HookAction::Ask` + `PermissionEvents` is real
-permission plumbing, not the stub the original order assumed — an adapter
-can wire `session/request_permission` straight to `subscribe_permission_events`
-/ `permission_events_channel` from day one instead of auto-allowing.
+merged to main; #2's `HookAction::Ask` is real permission plumbing, not the
+stub the original order assumed — an adapter polls the approval ledger
+(`subscribeLedgerEvents` + `kj ledger`) from day one instead of auto-allowing.
 
 ## The adapter, as built (2026-08-05)
 
@@ -446,28 +411,31 @@ sessions take `context_type=coder` (the model-facing stance bundle), not
   that into a message naming the likely cause. Found by the first live smoke
   test, against a kernel too old to serve `subscribeTurnEvents`.
 
-**Permission asks, wired live.** `permission.rs`'s Ask pathway is real: the
-`.with_spawned` task registered in `serve_stdio`
-(`permission::start_permission_pump`) drains
-`ActorHandle::take_permission_asks()` — a kernel-wide envelope stream
-`kaijutsu-client` re-arms best-effort on every reconnect
-(`actor.rs::connect_handshake` step 3.7) — resolves each envelope's
-`contextId` to an ACP session (`rank::session_id_of`, no side table), and
-drives a real `session/request_permission` round trip if (and only if) a
-session is live for that context. Every failure mode denies: no live
-session, a client error, a client timeout
-(`permission::PERMISSION_ASK_TIMEOUT`, mirrors the kernel's own 30s default
-as defense in depth — the kernel's own timeout is the actual authority), or
-a selected option this bridge can't place. `AutoAllow`/`PermissionPolicy`
-(the old always-allow stub) are gone — there is no configured opt-in bypass
-to keep. `PermissionOption.kind` is free text on the wire
-(`kaijutsu.capnp`); `permission::map_kind` places the four strings the
-kernel's doc comment promises (`allow_once`/`allow_always`/`reject_once`/
-`reject_always`) and treats anything else as `RejectOnce` — the safest
-reading, not the most permissive. `AskSpec` carries no options today (v1's
-rule syntax is a plain description), so the empty-options synthesis path
-(`build_options`, a plain Allow/Deny pair) is what every real ask exercises
-in practice.
+**Permission asks, ledger-driven.** `permission.rs`'s Ask pathway follows
+the approval ledger, not a bespoke wire — the old `PermissionEvents::onAsk`
+take-once channel is gone (`docs/gate-and-shell-split.md`, "The shared
+seam"). The `.with_spawned` task registered in `serve_stdio`
+(`permission::start_permission_pump`) subscribes to
+`ActorHandle::subscribe_ledger_events()` — a broadcast of bare generation
+numbers — and on each bump (or a `Lagged` warning) polls `kj ledger list`
+in an arbitrary live session's context, diffing the returned ids against a
+`seen` set. For every unseen id, `kj ledger show <id>` names the ask's
+`context_id`; that resolves to an ACP session (`rank::session_id_of`, no
+side table). If no session here is bound to that context, **the ask is
+skipped, not denied** — some other surface (a shell, another client) may be
+about to answer it; ACP is no longer the only possible answerer. Otherwise
+the round trip is spawned: `session/request_permission` to the client, then
+`kj ledger allow|deny <id>` to write the decision back. The kernel is the
+authority and the timeout — the gate expires the ask itself
+(`effective_gate_wait()`), so `permission::REQUEST_PERMISSION_TIMEOUT`
+bounds only the outgoing ACP call, not the ask. A human answering the same
+ask from a shell while the ACP prompt is still up is expected: the ledger's
+`claim`/`decide` transaction picks exactly one winner, and the loser's `kj
+ledger allow|deny` comes back `AlreadyDecided` — logged at `debug!`, not a
+failure. `PermissionOption.kind`, `AutoAllow`/`PermissionPolicy`, and
+per-ask kernel-supplied options are all gone with the old wire: the ledger
+sends no options, so every real ask gets the synthesized Allow/Deny pair
+(`build_options`).
 
 **Gaps found while building** (also in issues.md):
 
@@ -769,41 +737,9 @@ that remain genuinely open:
   live, or should the bridge warn/refuse when a turn is currently executing?
   Start with the deterministic reset rule above; revisit only after a real
   collision, not in anticipation.
-- Permission UX on mobile: ACP `session/request_permission` now works, but the
-  shared approval ledger will eventually need an inline ACP projection that
-  stays one system with kj/CLI/app approval management.
-
-  **Half of this is now built** (2026-08-17, `docs/gate-and-shell-split.md`
-  "Slice 4.5"). The ledger no longer notifies nobody: `subscribeLedgerEvents
-  @101` / `LedgerEvents::onChanged(generation)` is a kernel-wide,
-  fire-and-forget announcement that the ledger moved, carrying **only** a
-  durable generation number — no ask id, no status, no content. A client
-  polls the ledger when it feels like it, or marks a cache dirty and does
-  nothing; none of that policy is in the kernel. Reads come back over
-  `executeKj`'s `data` field (every `kj` verb's structured output is on the
-  wire now); answering stays `kj approve`, so the ledger's
-  exactly-one-answerer `claim`/`decide` transaction remains the single
-  decision path.
-
-  **What is left is the ACP consumer**: subscribe, poll on notification,
-  project pending asks into `session/request_permission`, and answer via
-  `executeKj` running `kj approve`. Note the contrast with the *other*
-  approval path — `PermissionEvents::onAsk @93` is a blocking round trip
-  whose response IS the decision, and its client channel is take-once
-  because each envelope carries a one-shot answer sender. `onChanged` has no
-  answer to honor, so its client side is a broadcast and the app can show an
-  indicator while ACP renders the prompt.
-
-  The end state is one approval system: `HookAction::Ask` becomes a ledger
-  ask too, and `@93` retires into a `retired93 @93 ();` stub.
-
-- **Live gap, unrelated to the above and worth fixing:** the Bevy app never
-  calls `ActorHandle::take_permission_asks()` (`kaijutsu-client/src/actor.rs`),
-  though the actor subscribes on every connect. With only the app attached,
-  the forwarding task's send finds no receiver, breaks, and the kernel's
-  forwarder answers dropped-receiver — so a `HookAction::Ask` **fails closed
-  with nothing shown to the human**. Silent by construction; found while
-  designing Slice 4.5.
+- ~~Permission UX on mobile~~ **SHIPPED 2026-08-18** — ACP now answers
+  through the shared approval ledger, the same system `kj`/CLI/app approval
+  management uses. See "Permission asks, ledger-driven" above.
 - Happy's relay architecture (E2E-encrypted sync server) vs. plain
   ACP-over-local-bridge: if we want push notifications to the phone, we may
   end up wanting a relay too. Study the clone before deciding.

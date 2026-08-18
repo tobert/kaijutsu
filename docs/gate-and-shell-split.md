@@ -35,10 +35,10 @@ both; it invents neither.
    already shipped, tested, and trigger-backed. What this doc adds is the
    forward-compatible shape for loosening it later (see "The ledger key,
    including the future predicate shape").
-2. **`kj cc send`** (`crates/kaijutsu-kernel/src/kj/{cc,gate,approve}.rs`) —
+2. **`kj cc send`** (`crates/kaijutsu-kernel/src/kj/{cc,gate,ledger}.rs`) —
    the first working consumer: a `GateSpec` (hand-authored, not
    `plan_program`-derived, because a `kj` verb isn't kaish source text),
-   `run_gate` (rules first → durable ask → wait-or-expire), and `kj approve
+   `run_gate` (rules first → durable ask → wait-or-expire), and `kj ledger
    list/show/allow/deny` as the answering CLI. This is the template Slice 5
    below extends to the six `Latch` producers, and Slice 4 generalizes to
    real kaish source.
@@ -114,7 +114,7 @@ kaish builtin that bypasses the broker `call_tool` / facade gates entirely
 facade gate"*). `kj` already had this property before this doc; `kj hook`
 just uses it for hooks specifically.
 
-**Shape**, following the `kj mcp` / `kj approve` precedent:
+**Shape**, following the `kj mcp` / `kj ledger` precedent:
 
 ```
 kj hook list                    # every persisted hook, phase + match + action
@@ -527,56 +527,87 @@ plan's own rendered text or an explicit caller-supplied label — never from
 a lookup that could resolve `${TARGET}` to something the caller didn't
 type. Confirming names what it authorizes.
 
-## The shared seam: one wire path for "ask a human," two ways to answer
+## The shared seam: one ledger, one announcement, one write path
 
-`docs/issues.md`: the replacement gate "should be ONE path shared with the
-permission-Ask seam (`HookAction::Ask`, `mcp/permission.rs`,
-`subscribePermissionEvents`) rather than a second bespoke confirmation."
-Concretely, today these are two disconnected mechanisms and this design
-merges the parts that should be one without merging the parts that
-shouldn't:
+`docs/issues.md` asked for "ONE path shared with the permission-Ask seam
+(`HookAction::Ask`, `mcp/permission.rs`, `subscribePermissionEvents`) rather
+than a second bespoke confirmation." This section is the answer. It changed
+shape twice before settling, and both earlier shapes are recorded below so
+nobody re-derives them.
 
-| | `HookAction::Ask` (D-57) today | `kj cc send` gate today |
+The two mechanisms as they stand before the melt:
+
+| | `HookAction::Ask` today | the ledger gate today |
 |---|---|---|
-| Durable record | **none** — `PermissionAskRequest` is thrown away after the phase resolves | `approval_ledger` row, survives a restart |
-| Who can answer | one connected client via `subscribePermissionEvents` | `kj approve` from any shell, polling `KernelDb` |
-| Rules / auto-decide | none | `rules::redeem` — an active rule can auto-allow/deny without asking |
-| Unavailable vs denied | collapses (Ruling 2 above) | already separate (`Expired`/`Abandoned` vs `Denied`) |
+| Durable record | **none** — the `PermissionAskRequest` is thrown away once the phase resolves | `approval_ledger` row, survives a restart |
+| Request id | `Uuid::new_v4()`, correlates logs only | ledger `request_id`, the thing a human types |
+| Who can answer | one connected client via `subscribePermissionEvents` | `kj ledger` from any shell |
+| Rules / auto-decide | none | `rules::redeem` can auto-allow/deny without asking |
+| Budget | `permission_ask_timeout`, 30s | `effective_gate_wait()` |
+| `remember` | carried on the wire, dropped on the floor | `remember_scope` on the decision |
 
-**What merges:** the *notification* leg. When `run_gate` (or its Slice 4/5
-callers) needs a human and nobody has answered via `kj approve` inside some
-short grace window, it fires the SAME `PermissionAskRequest` shape through
-the SAME `PermissionAsker`/`subscribePermissionEvents` bridge that
-`HookAction::Ask` already uses — so the Bevy app, an ACP session, or any
-future client that has ever bothered to subscribe sees ONE stream of "a
-human is needed here" prompts, regardless of whether the ask originated
-from a hook's `Ask` action, a gated `kj` verb, or a `shell_write` call.
-`PermissionOption` already carries free-text `id`/`label`/`kind`
-(`mcp/permission.rs:56-60`) — populate it from the ledger's own
-`NewOption`/`OptionRow` list (`approval_allow_once`/`deny`/eventually
-`allow_always`) instead of the empty `Vec::new()` `run_permission_ask`
-sends today, so the two option vocabularies converge instead of drifting.
+### Two superseded plans
 
-**What does NOT merge, and stays exactly as different as it is today:**
-whether there's a durable row. `HookAction::Ask` stays ephemeral for
-call-shaped hooks that don't want ledger bookkeeping (a `Log`-adjacent Ask
-used purely as a UI speed bump); anything that wants rules, auto-decide,
-`kj approve`-from-anywhere, or an audit trail goes through
-`approval_ledger` the way `kj cc send` does today. The unifying move is
-"one wire notification," not "one policy engine" — collapsing those would
-be exactly the kind of generalization CLAUDE.md says to prefer deleting
-over building.
+**First plan: merge the notification leg, keep the Ask ephemeral.** The
+original version of this section had `run_gate` fire a
+`PermissionAskRequest` through the same `PermissionAsker` /
+`subscribePermissionEvents` bridge `HookAction::Ask` already used, so every
+client saw one stream of "a human is needed here" — while deliberately
+*not* merging durability, on the reasoning that a UI-speed-bump Ask should
+not pay for ledger bookkeeping.
 
-**Answering converges on the ledger, both routes.** When a
-`PermissionAsker` answers a ledger-backed ask (its `request` carries the
-ledger's `request_id`), the answer becomes a `claim` + `decide` call against
-that SAME row — the identical two-step transaction `kj approve allow`
-already performs, just triggered by a wire event instead of a CLI
-invocation, and racing safely against a concurrent `kj approve` the same
-way two `kj approve` callers already race today (guarantee 5: exactly one
-answerer wins, the loser reads `AlreadyDecided`, never a silent no-op).
-There is exactly one place a ledger-backed ask gets decided, whichever
-surface a human used to decide it.
+**Slice 4.5 then picked the opposite bus, and that decided it.** A blocking
+round trip whose response *is* the decision cannot coalesce and cannot be
+consumed by more than one client: the answer channel is one-shot, so the
+client handle had to be a take-once handout. `LedgerEvents::onChanged @101`
+carries only a generation, so N changes collapse to one notification losing
+nothing, and it can be a broadcast. Shipping it left the system with **two**
+notification buses rather than the one this section set out to build.
+
+### The settled shape (Amy, 2026-08-18): retire the doorbell
+
+`Broker::run_permission_ask` becomes a caller of `kj::gate::run_gate` with
+`Origin::Hook` — the same function the shell gate uses, and an origin the
+ledger already defines and has never constructed. One durable record, one
+announcement, one write path:
+
+- **Record.** Every ask is an `approval_ledger` row before anyone is
+  notified, keyed by the ledger's own `request_id`. `AskSpec` gains options,
+  which land in `approval_options` and project outward, instead of being
+  invented at the far end because the kernel sent none.
+- **Announcement.** `LedgerEvents::onChanged @101` only. It is already a
+  broadcast, so the app, an ACP session, and anything else can all consume
+  it — the take-once handout existed solely because each envelope carried a
+  one-shot answer channel, and that channel is what dies here.
+- **Answer.** `kj ledger allow|deny <id>` from any surface, resolving to the
+  ledger's `claim` + `decide` transaction (exactly one answerer wins; the
+  loser reads `AlreadyDecided`, never a silent no-op). ACP answers by
+  calling it through `executeKj` rather than over a bespoke wire.
+- **Budget.** `permission_ask_timeout` retires in favour of
+  `TimeoutPolicy::effective_gate_wait()`, so the hook path sits on the same
+  ladder as every other hop.
+
+`subscribePermissionEvents @93` becomes `retired93 @93 ()`; the
+`PermissionEvents` interface, `PermissionAskRequest`/`Response`,
+`PermissionOption`, `Broker::permission_asker`, `PermissionAsker`,
+`ActorHandle::take_permission_asks()` and its envelope types all delete.
+
+**What this fixes on the way past.** The Bevy app never called
+`take_permission_asks()`, so an `Ask` fired with only the app attached was
+refused with nothing shown to a human. There is nothing to subscribe to
+now — the ask is a row `kj ledger list` prints from any shell. For the same
+reason "no subscriber attached" stops being an instant fail-closed refusal:
+the row is durable before anyone is notified, so nobody listening means
+nobody was *pushed*, not that nobody can answer.
+
+**A conflation this exposes, filed rather than fixed here.** `run_gate`
+returns `status: Denied` for its own internal failures (the rules read
+failed, `create_ask` failed, the ask row went missing) as well as for a real
+"no". `shell_write` renders both as one `McpError::Protocol`, so it has not
+mattered — but the hook path must map `Denied` and `Unavailable` to
+different `McpError`s under Ruling 2 above, which makes a DB fault
+indistinguishable from a human's refusal at exactly the seam that ruling
+exists to protect. `GateOutcome` needs to carry the distinction.
 
 ### A future advisory input: lfm2d risk scoring (hook point, not a slice)
 
@@ -715,8 +746,8 @@ refuses the whole call; an uncovered submission escalates and blocks on
 real `ShellServer` MCP wiring; a `literal: false` heredoc is rendered and
 gated normally, with an explicit assertion that the prompt never presents
 substituted text as final; the `Stmt::Empty` index-gap regression tests
-above; `kj approve` answers a `shell_write` ask like a `kj cc send` ask,
-through the real `kj approve list`/`allow` verbs, not the ledger API
+above; `kj ledger` answers a `shell_write` ask like a `kj cc send` ask,
+through the real `kj ledger list`/`allow` verbs, not the ledger API
 directly.
 
 **Slice 4.5 — the ledger announces.** Slice 4 shipped a gate that was
@@ -783,7 +814,7 @@ The pieces:
   `listPendingApprovals`/`getApproval` read RPCs: two permanent ordinals
   serving one subject, versus one additive field making *every* `kj` verb's
   structured output wire-reachable. Reads land on `executeKj`; **writes stay
-  `kj approve`**, so the ledger's exactly-one-answerer transaction remains
+  `kj ledger`**, so the ledger's exactly-one-answerer transaction remains
   the single decision path and no new write surface exists to drift from it.
 
 **Where the announcement fires is the whole point:** immediately after
@@ -795,7 +826,7 @@ while every other test still passed. Pinned by
 verified to fail when the announcement is moved.
 
 Auto-decisions and expiry announce too (both are durable transitions a
-client rendering the ask needs to see), and `kj approve` announces after
+client rendering the ask needs to see), and `kj ledger` announces after
 answering — with its `KernelDb` guard explicitly scoped so it is released
 first, since `announce_ledger_change` re-takes that same non-reentrant
 `parking_lot::Mutex` to read the committed generation.
@@ -810,6 +841,83 @@ records are actionable"* — but nothing polls the ledger until the ACP
 consumer exists, so building it now would mint a well-known context with no
 producers. That is exactly the bug `19e0c047` shipped and `66597891` fixed
 for the drift queue. It lands with the traffic it exists to absorb.
+
+**Slice 4.6 — the gate ladder — SHIPPED 2026-08-18** (`cb93cd57`), verified live: a gated `shell_write` held 81.2s and returned its output after `kj ledger allow` from another surface. Slice 4.5 made the gate discoverable and
+the first live test found it unusable anyway: a gated `shell_write` came
+back `call timed out after 30s`, not the gate's `nobody answered ask <id>,
+nothing was run`. The ask stayed pending and was answerable afterwards, so
+fail-closed held — what was lost was the reason, and the id a human needs.
+
+One logical wait was enforced at four hops, and the outermost had the
+shortest deadline:
+
+| hop | knob | value | fires |
+|---|---|---|---|
+| `run_gate` | `gate_wait_timeout` | 300s | 4th |
+| `shell_write` hand-clamp | `min(gate_wait, broker − 5s)` | 115s | 3rd |
+| `Broker::call_tool` | `InstancePolicy::call_timeout` | 120s | 2nd |
+| client `dispatch!` | `RPC_CALL_TIMEOUT` | 30s | **1st** |
+
+This is the third instance of one family. `kaijutsu-types::timeout` already
+carries the doctrine — a `tiers` table, and a `peer` ladder documenting the
+rule that *an inner deadline is strictly shorter than the outer budget
+containing it, so the inner one fires first and names the real culprit* —
+and the hand-clamp's own comment invited the fix: *"if a third caller ever
+needs this, lift it into one place rather than copying the arithmetic."*
+
+So: a `timeout::gate` module holding `MAX_KERNEL_WAIT(300) <
+BROKER_CALL(315) < CLIENT_CALL(330)` with an ordering test;
+`TimeoutPolicy::effective_gate_wait()` as the one clamp, read by all three
+sites that read `gate_wait_timeout` by hand today; the `saturating_sub`
+arithmetic deleted; the `builtin.shell_write` instance registered with the
+ladder's broker cap rather than the generic MCP default; and a real per-call
+deadline on the client for the commands that can reach the gate.
+`CallError::Timeout` documents a per-call override that does not exist —
+this makes that doc comment true.
+
+`CLIENT_CALL` is a fixed constant rather than derived, because the client is
+a separate process with no view of kernel config; `effective_gate_wait()`
+clamps the operator knob under what the outer hops can absorb.
+
+Two consequences worth stating out loud. Raising the `shell_write` instance
+cap from 120s to 315s also un-truncates *non-gated* slow foreground work —
+`kaish_request_timeout` is 1800s, so the broker had been quietly killing
+legitimate long commands at 120s. And the client override fixes a broader
+pre-existing bug: any tool call over 30s was reported as a client timeout
+while the kernel kept working for up to 120s.
+
+**Slice 4.7 — the Ask path melts into the ledger — SHIPPED 2026-08-18**
+(`29897e4a` rename, `ac9b1449` groundwork, `42a7147a` the melt, `17b0db6b` the
+wire retirement, `8ffa3773` the abandon guard).
+
+**Slice 4.8 — a killed caller abandons its ask — SHIPPED 2026-08-18**
+(`8ffa3773`). Amy: *"the harnesses will kill it on their own if they get
+impatient anyways, so we should maybe check the signal paths to accommodate
+that rather than trying to tune our way out of kills happening."*
+`decide::abandon` had existed with no production caller, so every killed
+gated call left its row `pending` — indistinguishable in `kj ledger list`
+from an ask someone was waiting on. `AbandonOnDrop` takes the signal from the
+drop rather than from any one cancellation path, because the ways to be
+killed are a moving target. The shape is in "The shared seam" above. Two notes on the
+rename, which rides along because the melt writes the model-facing strings
+that name this surface.
+
+Amy, 2026-08-18: *"'kj approve' doesn't sound right. are they mostly verbs?
+hmm. `kj ledger` even?"* The dispatch table answers it. Every `kj` command
+carrying a **subcommand tree** is a noun — `block`, `context`, `hook`, `rc`,
+`drift`, `config`, `model`, `cast`, `mcp`, `policy`, `vfs`, `workspace`,
+`doc`, `cas`, `db`, `binding`, `roster`, `transport`, `preset`, `alias`,
+`midi`, `audio`. Every **verb**-named command is a leaf taking arguments
+rather than subcommands — `fork`, `stage`, `attach`, `cp`, `play`, `drive`,
+`search`, `diff`, `cache`. `kj approve` was the sole verb with a subcommand
+tree, and read as a contradiction: `kj approve deny <id>`.
+
+`kj ledger list|show|allow|deny` fits the grammar and names the thing. It
+also leaves room for what is built and unwired: `kj ledger rules`,
+`kj ledger revoke <rule>`, and `kj ledger runs` for the `rc_runs` log.
+Renamed now, before Slice 5 migrates six `Latch` producers onto this surface
+and before the gate's own error strings copy the old name further — the same
+reasoning as retiring `latch`: rename once, into the vocabulary we keep.
 
 **Slice 5 — retire the six `Latch` producers, and retire the word with
 them.** `kj/workspace.rs`, `kj/doc.rs`, `kj/context.rs` (×2 —
@@ -831,7 +939,7 @@ slice:
   and a pending ask row exists, not that a specific enum variant came
   back).
 - The bare `--confirm` flag and its `${verb} --confirm` hint text are
-  deleted for these six verbs — confirmation now happens via `kj approve
+  deleted for these six verbs — confirmation now happens via `kj ledger
   allow <request-id>`, a different verb, answerable from any session, not a
   flag on the one that triggered the ask.
 - `is_gated_verb`'s distill-only special case goes away; it now covers all
@@ -895,7 +1003,7 @@ synchronous shape — a verb refuses immediately, prints "retype this with
 `--confirm`," and the SAME caller's next call executes it directly, no
 ledger, no other party. `run_gate` is a different shape entirely: it
 blocks the ONE call, in-process, up to `gate_wait_timeout`, while any
-session's `kj approve` (or a `subscribePermissionEvents` subscriber, once
+session's `kj ledger` (or a `subscribePermissionEvents` subscriber, once
 the shared seam lands) can decide it; by the time the call returns, the ask
 is already terminal. There is no "pending, resubmit" state in the new
 model for a `NeedsApproval`-shaped variant to name — the lead's suggested
@@ -916,7 +1024,7 @@ ledger's own facts, not a retyped command):
 
 | Old | New | Why this name |
 |---|---|---|
-| `kj.latch.command` / `kj.latch.target` baggage keys | `kj.approval.request_id` | The old pair told the caller what to retype. The new fact a caller needs is which ledger row to look up — `kj approve show <id>`, or hand it to a human — so one key replaces two. |
+| `kj.latch.command` / `kj.latch.target` baggage keys | `kj.approval.request_id` | The old pair told the caller what to retype. The new fact a caller needs is which ledger row to look up — `kj ledger show <id>`, or hand it to a human — so one key replaces two. |
 | (nothing — `hint` had no successor fact) | `kj.approval.status` | The terminal `ApprovalStatus` (`denied`/`expired`/`abandoned`), so a caller can tell "a human said no" from "nobody answered" (Ruling 2's distinction) without parsing the prose message. New, not renamed — the old shape never carried this because the old shape never waited for anyone. |
 | `latch_result(command, target, reason, hint) -> ExecResult` | `attach_approval_baggage(result: &mut ExecResult, request_id: &str, status: ApprovalStatus)` | Mutates in place rather than constructing a fresh `ExecResult`, because the caller (`run_gate`'s callers) already has one from `KjResult::Err` and is only attaching two facts to it, not building a result shape from scratch the way the old latch did. |
 | `latch_from_result(&ExecResult) -> Option<KjLatchInfo>` | `approval_from_result(&ExecResult) -> Option<KjApprovalInfo>` | Read-side mirror of the above; same rename logic. |
@@ -985,7 +1093,7 @@ Slice 5 needs to make here is behavioral, not lexical:
 {
   "reason": "kj command was refused by the approval gate (denied): <message>",
   "approval": { "request_id": "...", "status": "denied", "message": "..." },
-  "next_steps": "kj approve show <request_id> from any session; allow/deny it there"
+  "next_steps": "kj ledger show <request_id> from any session; allow/deny it there"
 }
 ```
 
@@ -1077,7 +1185,7 @@ exactly as they are.
   `docs/issues.md`'s entry for it suggests.** The entry ("Gate slice 1a —
   three findings from the research pass") reads as a stopped-mid-flight
   status ("stopped at the manifest wiring when the day ended"), but
-  `kj/gate.rs` and `kj/approve.rs` are complete, tested (rules-first
+  `kj/gate.rs` and `kj/ledger.rs` are complete, tested (rules-first
   short-circuit, patient-hold timeout coordination, an auto-decided path,
   a human-answers-from-elsewhere path, a deny path, and the guarantee-3
   free-variable end-to-end test), and already wired as `kj cc send`'s real

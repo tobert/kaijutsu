@@ -42,6 +42,18 @@ pub fn finish_run(conn: &Connection, run_id: &str, outcome: RcOutcome) -> Result
     }
 }
 
+/// List every run, most recently started first — the "checklist of what
+/// ran" a human or `kj ledger runs` reads to answer "did the rc lifecycle
+/// actually fire" without already knowing a `run_id` to look up.
+pub fn list_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
+         FROM rc_runs ORDER BY started_at DESC",
+    )?;
+    let rows = stmt.query_map([], row_to_run)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RcRunRow>> {
     conn.query_row(
         "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
@@ -179,6 +191,27 @@ mod tests {
         assert!(matches!(err, LedgerError::RunAlreadyFinished(_)));
         // Still `ok` — the second call's `Failed` must not have landed.
         assert_eq!(get_run(&conn, &run_id).unwrap().unwrap().outcome, Some(RcOutcome::Ok));
+    }
+
+    #[test]
+    fn list_runs_returns_every_run_newest_first() {
+        let conn = open_memory();
+        let first = start_run(&conn, b"ctx-a", "coder", "create").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2)); // distinct started_at
+        let second = start_run(&conn, b"ctx-b", "musician", "fork").unwrap();
+        finish_run(&conn, &first, RcOutcome::Ok).unwrap();
+
+        let runs = list_runs(&conn).unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(ids, vec![second.as_str(), first.as_str()], "newest first");
+        assert_eq!(runs[1].outcome, Some(RcOutcome::Ok));
+        assert!(runs[0].outcome.is_none(), "the unfinished run has no outcome yet");
+    }
+
+    #[test]
+    fn list_runs_on_an_empty_table_is_empty() {
+        let conn = open_memory();
+        assert!(list_runs(&conn).unwrap().is_empty());
     }
 
     #[test]

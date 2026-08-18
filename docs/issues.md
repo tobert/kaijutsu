@@ -34,6 +34,255 @@ Also noted while porting: legacy gives a bordered block `width: 100%` *plus* a
 overflows its own column and the pane's clip cuts the right border. The surface
 lays the box out symmetrically instead, which is a real (small) wrap-width
 difference between the two paths on bordered blocks.
+## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
+
+Found live on toad during the same ACP smoke-test session as the P1 entry
+below. The `grep` tool returned "No matches found" for `^## `, for the literal
+substring `## SFTP` (known to exist), and for bare `##` with no anchor at all
+— against `docs/issues.md`, a real file in the repo. In the same turn, shell
+`grep -c '## ' docs/issues.md` returned `31` and the `read`/`builtin_file__read`
+tool paged the file's contents (with hashline prefixes) without issue. Same
+file, three tools, two different answers about whether it has content.
+
+The agent's own working theory (block `2d25fb02#31` of context `4895806b`):
+*"maybe the grep tool is document-aware and treats the pattern differently...
+maybe the grep tool searches a different view (document blocks) than the
+filesystem backend the read/shell tools see."* Plausible, not confirmed — this
+needs the same treatment as the shell_write entry: reproduce against the
+`grep` tool's actual implementation rather than reasoning from behavior. Worth
+noting against `docs/issues.md`'s own 2026-07-29 "Day-job coding readiness"
+entry, which characterizes `grep` as "document-aware" and "ahead of Claude
+Code's equivalents" (line ~2829) — that claim and this blind spot are not
+obviously reconcilable, and whichever is true should be checked, not assumed.
+Full transcript: `docs/kaijutsu-feedback.md`.
+
+## `kj block read`/`inspect`/`append`/`history` have no `-c`/`--context` flag, so cross-context reads silently resolve against the wrong context (2026-08-18)
+
+`kj block list` (`crates/kaijutsu-kernel/src/kj/block.rs:78-94`) and `kj block
+cat --latest` (`:133-147`) both take `-c`/`--context`. `Read` (`:117-126`),
+`Inspect` (`:96-102`), `Append` (`:148-155`), and `History` (`:156-159`) take
+none — a short id like `2d25fb02#67` always resolves against
+`caller.context_id`, the currently-attached context
+(`resolve_block_id`, `:340-378`), with no flag to point it elsewhere. The
+fully-qualified `context_hex_principal_hex_seq` form (`BlockId::from_key`,
+`:345-347`) does route around this, but nothing in the CLI ever hands you
+that id — `block list`'s own display only ever shows the short
+`<principal8>#<seq>` form, so there's no way to discover the qualifying
+context/principal hex short of already having a raw JSON blob (e.g. a
+`task_create` result) that happens to contain one.
+
+Found independently, twice, on 2026-08-18: by a second ACP context
+(`0d9765f5`) trying to read a dead sibling context's blocks to recover its
+findings, and by the Sonnet subagent that wrote this entry, doing the same
+thing. Both burned several tool calls on `-c` on `read`, on quoting/unquoting
+the `#`, and on the wrong-context short form, before landing on "switch
+context first, then read" as the only reliable path. The fix is either wiring
+`-c` through the remaining four verbs the same way `list`/`cat` already have
+it, or making `block list`'s short-id display resolvable on its own (print or
+accept the qualifying context prefix). Full transcript:
+`docs/kaijutsu-feedback.md`.
+
+---
+
+## `load_rc_scripts` reads "directory absent" differently per backend (2026-08-18)
+
+`load_rc_scripts` treats a missing rc directory as "no scripts" — correct,
+since a context type with no scripts for a verb is ordinary. But the match
+only catches `VfsError::NotFound` and `VfsError::NoMountPoint`. A host-backed
+`LocalBackend` reports a genuinely absent directory as
+`VfsError::Io(io::ErrorKind::NotFound)`, which falls through to the error
+branch instead.
+
+Production is unaffected: `/etc/rc` is always mounted `ConfigDocFs`, which
+returns the typed variants. It bites the **test harness** — `test_dispatcher()`
+mounts `LocalBackend` — which means any test exercising the no-scripts path
+was quietly asserting something other than what it looked like.
+
+Found while wiring the rc run log (`0a3cc566`) and documented in that test
+rather than fixed, to keep the slice honest. The fix is either widening the
+match to include `Io(NotFound)` or making the backends agree on how absence
+is reported — the second is better and bigger: two backends disagreeing about
+"not there" will keep producing this shape of surprise.
+
+---
+
+## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18)
+
+**Live on toad, 11:00 today.** A turn died with the provider's own words:
+
+    invalid_request_error: An assistant message with 'tool_calls' must be
+    followed by tool messages responding to each 'tool_call_id'
+
+Three retries, then the ACP agent exited and toad reported "Agent failed to
+run" — which reads to a user as a toad/adapter install problem and is not.
+
+`llm::hydrate` already has a repair pass, and the logs show it running in
+**both** directions on the same call id:
+
+    synthesizing tool_results for orphaned tool_uses  msg_idx=52
+        missing=["call_00_MdNfTA3XnIhwOtlVFWuY4556"]
+    dropping orphaned tool_result (late arrival)      msg_idx=65
+        tool_use_id="call_00_MdNfTA3XnIhwOtlVFWuY4556"
+
+It synthesized a placeholder result at 52 and dropped the *real* result at
+65. Both halves are individually defensible; together they still shipped an
+invalid request.
+
+**The shape of the bug is the design, not the arithmetic.** Both passes are
+adjacent-window heuristics: synthesis looks only at `messages[i + 1]` for
+coverage, and the drop keeps only results whose `tool_use` is in the
+immediately preceding assistant message. A result that lands more than one
+message after its call (a slow tool, or a mailbox flush that interleaves an
+unrelated writer) falls outside both windows. Two heuristics that each
+"repair" independently can disagree, and nothing checks the result.
+
+What it should be: **one pass that establishes the invariant, plus a
+validation that refuses to send a message list violating it.** Today the
+violation is discovered by the provider, after three retries, and the error
+never names our own call id. We should detect it before the request leaves,
+and say which `tool_use_id` is unpaired.
+
+Related and worth keeping in view: `CLAUDE.md` says the mailbox is the
+atomicity gate that keeps tool_use+tool_result pairs from being split by
+unrelated writers. Either that gate is not covering this path, or the pairs
+are being split after it — worth finding out which before patching hydrate.
+
+**Remediation for a poisoned context today**: exclude the offending blocks,
+then fork (the documented path — exclusions land at the next hydrate
+boundary).
+
+---
+
+## The Claude Code Stop hook blocks a turn when the kernel is unreachable (2026-08-18)
+
+Hit within minutes of shipping the wire handshake. The hook is
+`target/debug/kaijutsu-mcp hook claude` (`~/.claude/settings.json`, five
+entries). With a version mismatch it failed hard, and Claude Code reported:
+
+    Stop hook feedback: [kaijutsu-mcp mirror error] failed to author text
+    block: permanently failed: bind_kernel: ... client wire version 0,
+    kernel wire version 1 ...
+
+    A hook blocked the turn from ending 9 consecutive times — overriding and
+    ending turn.
+
+**The diagnosis was perfect and the behaviour was wrong.** The block mirror
+is ambient observability: it records a session's turns into the kernel. It is
+not on the critical path of the user's work, and `kaijutsu-types::timeout`
+already says so in the doc for `tiers::HOOK_PATH` — *"if our budget expires
+first we return a permissive response with a note, which is the behaviour the
+hook path already commits to elsewhere — the mirror is ambient, and its
+slowness must not block the user's action any more than its failure does."*
+
+Slowness honours that. **Failure does not**: a `PermanentlyFailed` bind
+retried nine times and blocked the turn each time. The stated policy is
+already right; the failure path just does not implement it.
+
+Fix: any bind/connect failure in the hook path should emit its diagnosis once
+and return a permissive response. A permanent failure especially — retrying
+cannot help, and repeating it nine times converts one clear line into noise
+that buries it. Check `stop_hook_active` in the input as Claude Code's own
+message suggests.
+
+Related: **`target/debug/kaijutsu-mcp` is a fifth kernel-binding artifact**,
+distinct from the installed `~/bin/kaijutsu-mcp` that serves the MCP tools.
+Both must be rebuilt on a wire flag day. The full set is `kaijutsu-server`,
+`kaijutsu-acp`, `kaijutsu-app`, `target/debug/kaijutsu-mcp` (hooks) and
+`~/bin/kaijutsu-mcp` (MCP) — a `cargo build --workspace` covers the four in
+`target/`, the installed one needs its own copy.
+
+---
+
+## The ACP binary can silently outlive a wire change (2026-08-18)
+
+**This is what actually cost a morning**, and it is not a gate bug.
+
+Amy: *"I didn't see any gates in the ACP."* toad launches
+`target/debug/kaijutsu-acp` — a **build artifact**, not an installed binary.
+Hers was built 09:44; the wire retirement of `PermissionEvents` landed at
+09:46:45 and the kernel restarted onto it at 10:14. So the ACP process was
+still subscribing to a wire the kernel no longer served, its permission pump
+waiting on a channel nothing could feed. A gate could fire, post a real
+ledger row, and never reach the editor.
+
+Cap'n Proto made it quiet rather than loud: `subscribePermissionEvents @93`
+became `retired93 @93 ()`, and calling a retired method with extra params is
+tolerated. The feature just goes missing. Nothing logs "your client is
+older than this kernel."
+
+Worse, the resulting failure blamed the wrong component — toad reported
+*"Agent failed to run — check that the agent is installed... some agents
+require an ACP adapter"*, sending you to reinstall something that was fine.
+
+**Wanted: a version handshake at ACP connect that refuses a mismatched
+kernel, loudly, naming both sides.** We have the precedent — the kaish canary
+that fails loudly on a downgrade rather than letting silent-wrong behavior
+back in (`assets/defaults/rc/...`, and the `deps(kaish)` commits). One error
+line would have replaced a morning of ghost-hunting.
+
+Second-order: because it is a `target/debug` artifact, *any* `cargo build` in
+this checkout changes what toad launches next. Which ACP you get depends on
+when the editor last spawned versus what was last compiled. An installed
+binary with a version stamp would fix both halves.
+
+**Resolved on the way past — the gate DOES run from the LLM turn path.** The
+earlier worry that `shell_write` executed ungated was wrong. Reading the
+session's block log back found a real pending row for that exact canary
+(`origin: shell_gate`, `tool: builtin.shell_write.shell_write`) which Amy
+answered herself with `kj ledger allow`. The model's own `kj ledger list`
+probe came back empty moments earlier — run either before the ask posted or
+after she had answered it — and it wrote that silence down as *"verified no
+gate on the MCP write path"*, which the transcript does not support. Still
+unpinned: the exact ordering between the tool call returning and the ask
+appearing, since block sequence numbers order per-writer rather than by
+wall clock. Full reconstruction in `docs/kaijutsu-feedback.md`.
+
+---
+
+## The approval ledger's auto-allow branch is unreachable in production (2026-08-18)
+
+`run_gate`'s step 1 is `approval_ledger::rules::redeem` — the check that lets
+a remembered rule allow or deny without asking anyone. **Nothing can ever put
+a row in that table.** `rules::learn_from_approval` is called only from
+`kj/gate.rs` tests (lines 834 and 897; `#[cfg(test)]` starts at 493), and
+`kj ledger allow` passes `remember_scope: None`. So `redeem` always finds
+nothing, and the whole auto-decide branch — including the `AskCoverage`
+composition logic and its tests — describes a state production cannot reach.
+
+`rules::revoke` and `rules::get_rule` have no production caller either.
+
+The surface that would fix it is `kj ledger allow --remember <scope>`, which
+is exactly what Amy's 2026-08-18 ruling #4 governs: refuse when free
+variables exist, for now, and shape the key so a predicate-shaped allow can
+be added later without a migration. Note the melt makes this more valuable,
+not less — a hook `Ask` has no free variables at all
+(`kj/hook_gate.rs`), so every hook ask is eligible to be remembered, and
+without this surface none of them can be.
+
+Also unwired at the same seam: `PermissionAnswer::remember` was carried over
+the wire and dropped ("interpretation/storage of remembered scope is a
+follow-up"). The melt retires that field; the ledger's `remember_scope` is
+where it should have been going.
+
+---
+
+## `approval_ledger::rc_runs` is built, tested, and has zero callers (2026-08-18)
+
+The rc lifecycle run log — `start_run` / `finish_run` / `get_run`, plus its
+`rc_runs` and `rc_run_scripts` tables and an `approvals.rc_run_id` foreign
+key — has **no caller anywhere outside its own crate**. Verified by grep
+across `crates/`.
+
+Its own module doc names the incident it was written for: *"a morning where
+an assistant seat's startup rc scripts silently never ran, and nothing
+recorded that — a durable run log would have made it visible on run one
+instead of by review."* That incident is still uncovered, because the rc
+runner never calls it.
+
+The wiring point is `KjDispatcher::run_kai_script` / the rc lifecycle
+runner: `start_run` when a verb's script set begins, `finish_run` with the
+outcome when it ends. Cheap, and it turns "did rc actually run?" from a
+question you answer by reading logs into one you answer with a query.
 
 ---
 
@@ -6460,6 +6709,17 @@ kernel process env into exec-granted shells.
   unknown-command investigation.)
 - **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
   host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
+- **Command availability backlog (2026-08-18, acp smoke test).** Agent shell
+  can't reach `git` or `hostname` ("command not found", exit 127) and the
+  workspace is a git checkout, so agents can't self-orient with `git
+  log`/`git status`. Backlog:
+  - **`git`** — in progress as a kaish-extras plugin; git is a plugin story,
+    not a core builtin. Track landing here.
+  - **`hostname`** — candidate kaijutsu core builtin; kernel knows
+    platform/context identity but nothing exposes a hostname.
+  - **Inventory next:** `which` (above), `uname`, `date`, `sleep` — decide
+    core builtin vs. kaish-extras plugin per command, and document which
+    external-style commands core kaish provides.
 - **`kj context list` registry/DB divergence — narrowed and partly shipped
   (2026-08-04, `register_session` upsert work).** Re-investigated while
   building `register_session`'s upsert/attach fix (was going to "heal the

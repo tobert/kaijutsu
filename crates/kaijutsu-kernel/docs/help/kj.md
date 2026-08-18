@@ -56,8 +56,6 @@ binding         show, allow, revoke, reset — a context's tool-capability allow
                 operator, exec, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
 block           list, inspect, count, read, cat, append, history, diff, status, create,
                 edit (insert|delete|replace)
-approve         list, show, allow, deny — answer pending approval-ledger asks
-                left by gated verbs (e.g. `kj cc send`)
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
 cast            list, show, create, remove, set, slot set|remove — named model
@@ -91,6 +89,15 @@ hook            list, show, remove, add — broker hook tables, direct (never
                 PreCall Deny("*") lockout
 kaish           primer — composed kaish agent-onboarding guidance (kaish-help);
                 what S05-kaish.kai turns into a per-context system block
+ledger          list, show, allow, deny, rules, forget, runs — answer pending
+                approval-ledger asks left by gated verbs (e.g. `kj cc send`);
+                allow/deny take `--remember <session|always>` to generalize
+                the decision into a standing rule (refused for `allow` when
+                a statement has a free variable), `rules` lists standing
+                rules, `forget <rule-id>` revokes one; `runs` lists the rc
+                lifecycle run log (create/fork/attach/drift/tick/rotate —
+                the durable "did the rc lifecycle actually fire" checklist),
+                `runs <run-id>` shows one run's per-script detail
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
                 bevy_brp, …); configured-vs-actually-running visibility + reconcile
 midi            list, show — CRDT-owned MIDI device profiles at

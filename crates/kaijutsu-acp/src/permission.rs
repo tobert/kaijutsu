@@ -1,48 +1,63 @@
-//! `session/request_permission` — the kernel-side Ask pathway wired live.
+//! `session/request_permission` — driving the approval ledger from ACP.
 //!
-//! `HookAction::Ask` (D-57, docs/acp.md gap #2) is real: a hook can suspend a
-//! tool call and block on a `PermissionEvents::onAsk` round trip to whichever
-//! client subscribed. `kaijutsu-client::ActorHandle::take_permission_asks`
-//! hands out the kernel-wide envelope stream (re-armed on every reconnect —
-//! see `actor.rs`'s `connect_handshake`); this module turns each envelope
-//! into an ACP `session/request_permission` call against the matching live
-//! session and turns the client's answer back into a
-//! `kaijutsu_client::PermissionAskAnswer`.
+//! `HookAction::Ask` (and `shell_write`'s gate) leave a durable row in the
+//! approval ledger and wait; this module is the ACP side of answering one.
+//! It does not talk to a bespoke permission wire — that wire
+//! (`PermissionEvents::onAsk`, `ActorHandle::take_permission_asks`) is gone
+//! (`docs/gate-and-shell-split.md`, "The shared seam: one ledger, one
+//! announcement, one write path"). The ledger is the one durable record and
+//! `kj ledger` is the one write path, from any surface, ACP included.
 //!
-//! # Fail-closed, end to end
+//! # Shape
 //!
-//! The kernel already denies an `Ask` when nobody subscribed or nobody
-//! answered in time (`mcp::permission`'s no-subscriber/timeout policy,
-//! `warn!`-logged). This module extends the same posture to every failure
-//! mode ON THIS SIDE of the wire:
+//! 1. [`start_permission_pump`] subscribes to `LedgerEvents::onChanged` —
+//!    a broadcast of bare generation numbers, no ask id, no content
+//!    (`ActorHandle::subscribe_ledger_events`).
+//! 2. Each bump (or a `Lagged` warning that changes were missed) triggers
+//!    [`poll_ledger`], which runs `kj ledger list` in an arbitrary live
+//!    session's context — the verb reads kernel-wide state, so which
+//!    context it runs in doesn't matter — and diffs the returned ids
+//!    against a `seen` set so each ask is only offered to the client once.
+//! 3. For every unseen id, `kj ledger show <id>` names the ask's own
+//!    `context_id`. If no ACP session here is bound to that context, the
+//!    ask is **skipped, not denied** — see "Not ours to answer" below.
+//! 4. Otherwise the round trip is spawned (`cx.spawn`): a
+//!    `session/request_permission` call to the client, and on answer, `kj
+//!    ledger allow|deny <id>` to write the decision back.
 //!
-//! - no live ACP session for the ask's `contextId` → deny, `warn!`
-//! - the ACP client errors answering `session/request_permission` → deny, `warn!`
-//! - the ACP client never answers within [`PERMISSION_ASK_TIMEOUT`] → deny, `warn!`
-//! - a selected option whose kind we cannot place → deny (see [`map_response`])
+//! # The kernel is the authority and the timeout
 //!
-//! Nothing here ever runs a tool call because the surrounding machinery
-//! failed quietly. CLAUDE.md: "Silent fallbacks are often a mistake."
+//! There is no `PERMISSION_ASK_TIMEOUT` budget owned by this module anymore.
+//! The gate expires the ask itself at `effective_gate_wait()`
+//! (`kaijutsu-kernel`'s `kj::gate`) — if the ACP client never answers,
+//! the ask expires kernel-side and `kj ledger allow|deny` on it fails
+//! loudly on its own. [`REQUEST_PERMISSION_TIMEOUT`] below bounds only the
+//! outgoing `session/request_permission` call itself, so a wedged ACP
+//! client (stdio never reads the request) can't leave one of this pump's
+//! spawned tasks parked forever; it is not a substitute for the kernel's
+//! own budget and answering late (or not at all) here just means the
+//! kernel's own expiry wins instead.
 //!
-//! # The seam, now closed
+//! # Racing is fine and expected
 //!
-//! 1. [`run_permission_pump`] drains `ActorHandle::take_permission_asks()`
-//!    forever, as the bridge's `.with_spawned` task (`lib.rs::serve_stdio`) —
-//!    NOT inside the ACP dispatch loop, so blocking on
-//!    `cx.send_request(...).block_task()` per ask is safe here (the dispatch
-//!    loop this module used to warn about is a different task entirely).
-//! 2. `rank::session_id_of` resolves the envelope's `contextId` to an ACP
-//!    session id — no side table, same mapping `session/load` uses.
-//! 3. [`build_options`] shapes the outgoing options ([`permission_request`]),
-//!    [`map_response`] shapes the answer.
+//! A human can answer the same ask with `kj ledger allow` from a shell
+//! while this pump's `session/request_permission` prompt is still on the
+//! client's screen — the ledger's `claim`+`decide` transaction makes
+//! exactly one answerer win (`approval-ledger`'s guarantee 5). The loser's
+//! `kj ledger allow|deny` comes back `AlreadyDecided`; this is logged at
+//! `debug!` and otherwise ignored — it is not a failure, it is two players
+//! sharing one ledger.
 //!
-//! Asks are processed one at a time off the shared channel: a slow or
-//! unanswered prompt delays whatever queues up behind it rather than fanning
-//! out concurrent `session/request_permission` calls. Acceptable for a
-//! prototype — permission asks are rare and interactive — but worth revisiting
-//! if that stops being true (docs/issues.md).
+//! # Not ours to answer
+//!
+//! The old pump denied any ask whose context had no live ACP session,
+//! because ACP was the only possible answerer. That is no longer true: the
+//! ledger is answerable from any surface, so a context with no ACP session
+//! here may still have a human at a shell, or another connected client,
+//! about to answer it. This pump now **skips** such an ask rather than
+//! denying it — the single biggest behavioral change in this rewrite.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,196 +66,289 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionResponse, SessionId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use kaijutsu_client::{PermissionAskAnswer, PermissionAskEnvelope, PermissionOptionInfo};
-use tokio::sync::mpsc;
+use kaijutsu_types::ContextId;
+use tokio::sync::broadcast;
 
+use crate::bridge::KernelBridge;
 use crate::rank;
 use crate::session::SessionRegistry;
 use crate::AcpBridge;
 
-/// Round-trip budget for one `session/request_permission` call, mirrored
-/// from the kernel's own `DEFAULT_PERMISSION_ASK_TIMEOUT` (`kaijutsu-kernel`'s
-/// `mcp::permission`). Defense in depth, not the authority: the kernel's
-/// timeout is what actually bounds the hooked call; this one exists so a
-/// wedged ACP client (stdio never reads the request, say) doesn't leave this
-/// bridge's pump stuck past the point the kernel already gave up.
-pub const PERMISSION_ASK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on one outgoing `session/request_permission` call — NOT a budget
+/// for the ledger ask itself (see module docs, "The kernel is the authority
+/// and the timeout").
+pub const REQUEST_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Take the bridge's permission-ask stream and drive it for the life of the
-/// connection — the `.with_spawned` task `lib.rs::serve_stdio` registers.
-///
-/// `take_permission_asks()` returning `None` means either this is a second
-/// call on the same actor (shouldn't happen — `serve_stdio` calls it once)
-/// or the actor's own subscribe attempt never landed a working channel in
-/// the first place (it always creates the channel; only the kernel-side
-/// subscribe underneath can silently fail, best-effort, per `actor.rs`).
-/// Either way there is nothing to drain, so this logs loudly and returns
-/// rather than busy-looping — every `Ask` for this bridge's whole
-/// connection then falls through to the kernel's own no-subscriber
-/// fail-closed default (`mcp::permission`), same as before this seam
-/// existed at all.
+/// Subscribe to the kernel-wide ledger-change stream and drive the pump for
+/// the life of the connection — the `.with_spawned` task
+/// `lib.rs::serve_stdio` registers.
 pub async fn start_permission_pump(bridge: &Arc<AcpBridge>, cx: ConnectionTo<Client>) {
-    match bridge.kernel.actor().take_permission_asks() {
-        Some(asks) => run_permission_pump(asks, &bridge.sessions, cx).await,
-        None => tracing::error!(
-            "no permission-ask receiver available for this connection — every \
-             Ask will fail closed on the kernel's no-subscriber default"
-        ),
-    }
+    let generations = bridge.kernel.actor().subscribe_ledger_events();
+    run_permission_pump(generations, bridge, cx).await;
 }
 
-/// Drain the kernel's permission-ask stream forever, answering each one
-/// against the matching live ACP session (or denying — see the module docs).
-///
-/// Returns when the stream closes (the actor shut down, or nobody ever
-/// subscribed — `ActorHandle::take_permission_asks` returned `None`, which
-/// callers should log loudly since it means every Ask will fail closed for
-/// this bridge's whole life). Never itself an error: same reasoning as
-/// `session::run_pump` — a pump that failed should stop pumping, not hang up
-/// the ACP connection.
+/// Drain the ledger's generation-bump stream forever, polling `kj ledger
+/// list` after each bump and offering every newly-seen, ours-to-answer ask
+/// to the client. Never itself an error: a pump that failed should stop
+/// pumping, not hang up the ACP connection.
 pub async fn run_permission_pump(
-    asks: mpsc::Receiver<PermissionAskEnvelope>,
-    sessions: &SessionRegistry,
+    mut generations: broadcast::Receiver<i64>,
+    bridge: &Arc<AcpBridge>,
     cx: ConnectionTo<Client>,
 ) {
-    run_permission_pump_with_timeout(asks, sessions, cx, PERMISSION_ASK_TIMEOUT).await
-}
-
-/// [`run_permission_pump`] with an injectable timeout — test-overridable
-/// (mirrors the kernel's own `DEFAULT_PERMISSION_ASK_TIMEOUT`, docs/acp.md)
-/// so the timeout-denies path can be exercised without an actual 30s wait.
-pub async fn run_permission_pump_with_timeout(
-    mut asks: mpsc::Receiver<PermissionAskEnvelope>,
-    sessions: &SessionRegistry,
-    cx: ConnectionTo<Client>,
-    timeout: Duration,
-) {
-    while let Some(envelope) = asks.recv().await {
-        let answer = resolve_and_ask(sessions, &cx, &envelope, timeout).await;
-        // A dropped-without-sending answer channel resolves the kernel's ask
-        // as a denial too (`PermissionAskEnvelope`'s doc comment in
-        // kaijutsu-client) — so a failed send here (the kernel already gave
-        // up waiting) needs no special handling.
-        let _ = envelope.answer.send(answer);
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        match generations.recv().await {
+            Ok(_generation) => {}
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                // Not an error: the ledger is the authority, not this
+                // stream, and the poll below observes the current truth
+                // regardless of how many intermediate bumps were dropped.
+                tracing::debug!(
+                    missed,
+                    "ledger-changed stream lagged; polling current state anyway"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                tracing::info!("ledger-changed stream closed; permission pump exiting");
+                return;
+            }
+        }
+        poll_ledger(&bridge.kernel, &bridge.sessions, &cx, &mut seen).await;
     }
-    tracing::info!("permission-ask stream closed; pump exiting");
 }
 
-/// Resolve one envelope's session and, if live, run the ACP round trip.
-async fn resolve_and_ask(
+/// One poll: list pending asks, prune `seen`, and spawn a round trip for
+/// each unseen ask that belongs to a context this bridge has a live ACP
+/// session for.
+async fn poll_ledger(
+    kernel: &KernelBridge,
     sessions: &SessionRegistry,
     cx: &ConnectionTo<Client>,
-    envelope: &PermissionAskEnvelope,
-    timeout: Duration,
-) -> PermissionAskAnswer {
-    let session_id = rank::session_id_of(envelope.context_id);
-    if sessions.get(&session_id).is_none() {
-        tracing::warn!(
-            context = %envelope.context_id.short(),
-            request_id = %envelope.request_id,
-            tool = %envelope.tool,
-            hook = %envelope.hook_id,
-            "permission ask for a context with no live ACP session — denying"
-        );
-        return deny();
-    }
-
-    let (options, kinds) = build_options(&envelope.options);
-    // The kernel already falls back to "{instance}.{tool}" when a hook's
-    // `AskSpec::description` is `None` (`hook_table.rs`'s `AskSpec` doc), so
-    // `description` should never actually be empty by the time it reaches
-    // here — this is a defensive second line, not the primary fallback.
-    let title = if envelope.description.is_empty() {
-        format!("{}.{}", envelope.instance, envelope.tool)
-    } else {
-        envelope.description.clone()
+    seen: &mut HashSet<String>,
+) {
+    let Some(admin_ctx) = sessions.any_context_id() else {
+        // No live session anywhere — nowhere to run `kj` this tick. The
+        // next generation bump (typically arriving once a session exists)
+        // tries again.
+        return;
     };
-    // `request_id` is the one identifier the kernel guarantees is unique
-    // per-ask; there is no natural ACP tool-call id to reuse (the hook fires
-    // before any `BlockKind::ToolCall` exists for a PreCall Ask).
-    let request = permission_request(session_id, envelope.request_id.clone(), title, options);
 
-    match tokio::time::timeout(timeout, cx.send_request(request).block_task()).await {
+    let ids = match list_pending(kernel, admin_ctx).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "kj ledger list failed; skipping this poll");
+            return;
+        }
+    };
+
+    // Prune `seen` down to the ids still pending, so it doesn't grow
+    // forever as asks get answered and drop off the list.
+    let still_pending: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    seen.retain(|id| still_pending.contains(id.as_str()));
+
+    for id in ids {
+        if seen.contains(&id) {
+            continue;
+        }
+
+        let Some(ask) = show_ask(kernel, admin_ctx, &id).await else {
+            // A failed read is a slow read: leave the id UNSEEN so the next
+            // generation bump retries it. Marking it here would make one
+            // transient `kj ledger show` failure suppress the ask for as
+            // long as it stays pending.
+            continue;
+        };
+        let session_id = rank::session_id_of(ask.context_id);
+        if sessions.get(&session_id).is_none() {
+            // Not ours to answer (see module docs) — some other surface
+            // (a shell, another client) may be about to.
+            //
+            // Deliberately NOT marked seen. A session can attach to that
+            // context after the ask was raised — ACP sessions come and go
+            // while the ledger row waits out the whole gate budget — and an
+            // ask suppressed here would then never be offered to the client
+            // that just arrived to answer it. Re-showing a foreign ask on
+            // each bump is one cheap read; silently never offering it is a
+            // prompt the human never sees.
+            tracing::debug!(
+                request = %id,
+                context = %ask.context_id.short(),
+                "ledger ask belongs to a context with no live ACP session here; skipping"
+            );
+            continue;
+        }
+
+        // Ours, and about to be offered exactly once.
+        seen.insert(id.clone());
+
+        let kernel = kernel.clone();
+        let cx_task = cx.clone();
+        let id_task = id.clone();
+        if let Err(e) = cx.spawn(async move {
+            answer_ask(&kernel, &cx_task, session_id, id_task, ask).await;
+            Ok(())
+        }) {
+            tracing::warn!(request = %id, error = %e, "failed to spawn permission round trip");
+        }
+    }
+}
+
+/// One pending ask's `kj ledger show` fields, decoded once so the caller
+/// doesn't hand around a raw `serde_json::Value`.
+struct AskInfo {
+    context_id: ContextId,
+    description: String,
+}
+
+async fn list_pending(kernel: &KernelBridge, ctx: ContextId) -> anyhow::Result<Vec<String>> {
+    let result = kernel
+        .execute_kj(ctx, vec!["ledger".to_string(), "list".to_string()])
+        .await?;
+    if result.exit_code != 0 {
+        anyhow::bail!("kj ledger list exited {}: {}", result.exit_code, result.stderr);
+    }
+    let ids = match result.data {
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(ids)
+}
+
+async fn show_ask(kernel: &KernelBridge, ctx: ContextId, request_id: &str) -> Option<AskInfo> {
+    let result = match kernel
+        .execute_kj(
+            ctx,
+            vec!["ledger".to_string(), "show".to_string(), request_id.to_string()],
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(request = %request_id, error = %e, "kj ledger show errored");
+            return None;
+        }
+    };
+    if result.exit_code != 0 {
+        tracing::warn!(
+            request = %request_id,
+            exit_code = result.exit_code,
+            stderr = %result.stderr,
+            "kj ledger show failed"
+        );
+        return None;
+    }
+    let data = result.data?;
+    let context_id = match data
+        .get("context_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| ContextId::parse(s).ok())
+    {
+        Some(id) => id,
+        None => {
+            tracing::warn!(request = %request_id, "ledger ask has no parseable context_id; skipping");
+            return None;
+        }
+    };
+    let description = data
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_default();
+    Some(AskInfo {
+        context_id,
+        description,
+    })
+}
+
+/// Run one `session/request_permission` round trip and write the answer
+/// back through `kj ledger allow|deny`.
+async fn answer_ask(
+    kernel: &KernelBridge,
+    cx: &ConnectionTo<Client>,
+    session_id: SessionId,
+    request_id: String,
+    ask: AskInfo,
+) {
+    let (options, kinds) = build_options();
+    let title = if ask.description.is_empty() {
+        request_id.clone()
+    } else {
+        ask.description
+    };
+    let request = permission_request(session_id, request_id.clone(), title, options);
+
+    let allow = match tokio::time::timeout(
+        REQUEST_PERMISSION_TIMEOUT,
+        cx.send_request(request).block_task(),
+    )
+    .await
+    {
         Ok(Ok(response)) => map_response(&response, &kinds),
         Ok(Err(e)) => {
-            tracing::warn!(
-                request_id = %envelope.request_id,
-                error = %e,
-                "permission ask errored answering the client — denying"
-            );
-            deny()
+            tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; denying");
+            false
         }
         Err(_) => {
             tracing::warn!(
-                request_id = %envelope.request_id,
-                timeout = ?timeout,
-                "permission ask timed out waiting on the client — denying"
+                request = %request_id,
+                timeout = ?REQUEST_PERMISSION_TIMEOUT,
+                "permission ask timed out waiting on the client; denying"
             );
-            deny()
+            false
+        }
+    };
+
+    let verb = if allow { "allow" } else { "deny" };
+    // The decide verb doesn't care which context it runs in — the ask's
+    // own context is as good as any.
+    match kernel
+        .execute_kj(
+            ask.context_id,
+            vec!["ledger".to_string(), verb.to_string(), request_id.clone()],
+        )
+        .await
+    {
+        Ok(result) if result.exit_code == 0 => {
+            tracing::debug!(request = %request_id, verb, "ledger ask answered");
+        }
+        Ok(result) => {
+            // A race with another answerer (AlreadyDecided) lands here too
+            // — expected, not a failure (module docs, "Racing is fine").
+            tracing::debug!(
+                request = %request_id,
+                verb,
+                stderr = %result.stderr,
+                "kj ledger {verb} did not apply (already decided, or expired)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(request = %request_id, verb, error = %e, "kj ledger {verb} errored");
         }
     }
 }
 
-fn deny() -> PermissionAskAnswer {
-    PermissionAskAnswer {
-        allow: false,
-        selected_option_id: None,
-        remember: None,
-    }
-}
-
-/// Ids the bridge synthesizes when the kernel sends no options at all — v1's
-/// `AskSpec` carries a description only (`hook_table.rs`), so this is the
-/// path every real ask takes today. Stable strings only in the sense that
-/// they must round-trip through [`map_response`] within a single ask; they
-/// have no meaning to the kernel, which only sees `allow`/`remember`.
+/// Ids for the synthesized allow/deny pair this bridge always offers: the
+/// kernel's ledger asks carry no `options` of their own today (unlike the
+/// retired `HookAction::Ask` wire, which reserved a slot for them), so this
+/// is the only shape a client is ever offered.
 const OPT_ALLOW: &str = "allow";
 const OPT_DENY: &str = "deny";
 
-/// Kernel option kinds are free text shaped to fit ACP's four kinds
-/// (`kaijutsu.capnp`'s `PermissionOption.kind` doc: "allow_once" /
-/// "allow_always" / "reject_once" / "reject_always"). Unrecognised text maps
-/// to `RejectOnce` — the SAFEST reading, not the most permissive: if a hook
-/// author's option kind can't be placed, picking it must not look like
-/// consent to run something.
-fn map_kind(kind: &str) -> PermissionOptionKind {
-    match kind {
-        "allow_once" => PermissionOptionKind::AllowOnce,
-        "allow_always" => PermissionOptionKind::AllowAlways,
-        "reject_once" => PermissionOptionKind::RejectOnce,
-        "reject_always" => PermissionOptionKind::RejectAlways,
-        _ => PermissionOptionKind::RejectOnce,
-    }
-}
-
-/// Build the ACP option list for an ask, plus the id→kind map
-/// [`map_response`] needs to turn a selected id back into an allow/deny
-/// verdict. Empty kernel options (see [`OPT_ALLOW`]'s doc) synthesize a
-/// plain allow/deny pair instead of offering the client nothing to pick.
-fn build_options(
-    kernel_options: &[PermissionOptionInfo],
-) -> (Vec<PermissionOption>, HashMap<String, PermissionOptionKind>) {
-    if kernel_options.is_empty() {
-        let kinds = HashMap::from([
-            (OPT_ALLOW.to_string(), PermissionOptionKind::AllowOnce),
-            (OPT_DENY.to_string(), PermissionOptionKind::RejectOnce),
-        ]);
-        let options = vec![
-            PermissionOption::new(OPT_ALLOW, "Allow", PermissionOptionKind::AllowOnce),
-            PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
-        ];
-        return (options, kinds);
-    }
-
-    let mut kinds = HashMap::with_capacity(kernel_options.len());
-    let options = kernel_options
-        .iter()
-        .map(|o| {
-            let kind = map_kind(&o.kind);
-            kinds.insert(o.id.clone(), kind);
-            PermissionOption::new(o.id.clone(), o.label.clone(), kind)
-        })
-        .collect();
+/// Build the fixed ACP allow/deny option pair, plus the id→kind map
+/// [`map_response`] needs to turn a selected id back into a verdict.
+fn build_options() -> (Vec<PermissionOption>, [(&'static str, PermissionOptionKind); 2]) {
+    let kinds = [
+        (OPT_ALLOW, PermissionOptionKind::AllowOnce),
+        (OPT_DENY, PermissionOptionKind::RejectOnce),
+    ];
+    let options = vec![
+        PermissionOption::new(OPT_ALLOW, "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
+    ];
     (options, kinds)
 }
 
@@ -258,52 +366,26 @@ fn permission_request(
     )
 }
 
-/// Read a client's answer, using the id→kind map [`build_options`] built for
-/// this same ask to turn the selected option back into allow/remember.
-///
-/// Anything this function cannot place — a cancelled prompt, an unrecognised
-/// option id, or a future `PermissionOptionKind` variant the
-/// `#[non_exhaustive]` wire type gains later — is a **Deny** with no option
-/// credited. A permission prompt is the one place where failing open on an
-/// unparsed answer would be indefensible — the silent fallback that runs the
-/// command anyway is exactly the bug class we refuse to ship.
+/// Read a client's answer against the id→kind map [`build_options`] built
+/// for this ask. Anything this cannot place — a cancelled prompt, an
+/// unrecognised option id, or a future `PermissionOptionKind` variant the
+/// `#[non_exhaustive]` wire type gains later — is a **deny**. A permission
+/// prompt is the one place where failing open on an unparsed answer would
+/// be indefensible.
 fn map_response(
     response: &RequestPermissionResponse,
-    kinds: &HashMap<String, PermissionOptionKind>,
-) -> PermissionAskAnswer {
+    kinds: &[(&'static str, PermissionOptionKind); 2],
+) -> bool {
     let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
-        // `Cancelled`, plus any variant added later — the outcome enum is
-        // `#[non_exhaustive]`.
-        return deny();
+        return false;
     };
-    let id = selected.option_id.0.to_string();
-    match kinds.get(id.as_str()) {
-        Some(PermissionOptionKind::AllowOnce) => PermissionAskAnswer {
-            allow: true,
-            selected_option_id: Some(id),
-            remember: None,
-        },
-        Some(PermissionOptionKind::AllowAlways) => PermissionAskAnswer {
-            allow: true,
-            selected_option_id: Some(id),
-            remember: Some("always".to_string()),
-        },
-        Some(PermissionOptionKind::RejectAlways) => PermissionAskAnswer {
-            allow: false,
-            selected_option_id: Some(id),
-            remember: Some("always".to_string()),
-        },
-        // A recognised, explicit "no" — still worth echoing which option was
-        // picked, unlike the truly-unplaceable cases below.
-        Some(PermissionOptionKind::RejectOnce) => PermissionAskAnswer {
-            allow: false,
-            selected_option_id: Some(id),
-            remember: None,
-        },
-        // An id we never offered, or a future non_exhaustive kind we don't
-        // recognise — deny with no option to credit, since we can't say
-        // what was actually picked.
-        _ => deny(),
+    let id = selected.option_id.0.as_ref();
+    match kinds.iter().find(|(k, _)| *k == id).map(|(_, kind)| kind) {
+        Some(PermissionOptionKind::AllowOnce) | Some(PermissionOptionKind::AllowAlways) => true,
+        Some(PermissionOptionKind::RejectOnce) | Some(PermissionOptionKind::RejectAlways) => {
+            false
+        }
+        _ => false,
     }
 }
 
@@ -318,11 +400,9 @@ mod tests {
         ))
     }
 
-    // ── build_options / map_kind ────────────────────────────────────────
-
     #[test]
-    fn empty_kernel_options_synthesize_a_plain_allow_deny_pair() {
-        let (options, kinds) = build_options(&[]);
+    fn build_options_offers_exactly_allow_and_deny() {
+        let (options, kinds) = build_options();
         assert_eq!(options.len(), 2);
         assert_eq!(options[0].option_id, PermissionOptionId::new(OPT_ALLOW));
         assert_eq!(options[0].kind, PermissionOptionKind::AllowOnce);
@@ -332,39 +412,8 @@ mod tests {
     }
 
     #[test]
-    fn kernel_options_round_trip_ids_and_labels() {
-        let kernel = vec![PermissionOptionInfo {
-            id: "opt-1".into(),
-            label: "Allow forever".into(),
-            kind: "allow_always".into(),
-        }];
-        let (options, kinds) = build_options(&kernel);
-        assert_eq!(options.len(), 1);
-        assert_eq!(options[0].option_id, PermissionOptionId::new("opt-1"));
-        assert_eq!(options[0].name, "Allow forever");
-        assert_eq!(options[0].kind, PermissionOptionKind::AllowAlways);
-        assert_eq!(kinds.get("opt-1"), Some(&PermissionOptionKind::AllowAlways));
-    }
-
-    #[test]
-    fn all_four_kernel_kind_strings_map_onto_acp_kinds() {
-        assert_eq!(map_kind("allow_once"), PermissionOptionKind::AllowOnce);
-        assert_eq!(map_kind("allow_always"), PermissionOptionKind::AllowAlways);
-        assert_eq!(map_kind("reject_once"), PermissionOptionKind::RejectOnce);
-        assert_eq!(map_kind("reject_always"), PermissionOptionKind::RejectAlways);
-    }
-
-    #[test]
-    fn an_unrecognised_kernel_kind_maps_to_the_safest_reading() {
-        assert_eq!(map_kind("whatever a hook author typed"), PermissionOptionKind::RejectOnce);
-        assert_eq!(map_kind(""), PermissionOptionKind::RejectOnce);
-    }
-
-    // ── permission_request ──────────────────────────────────────────────
-
-    #[test]
-    fn the_request_names_the_session_and_carries_every_option() {
-        let (options, _) = build_options(&[]);
+    fn the_request_names_the_session_and_carries_both_options() {
+        let (options, _) = build_options();
         let req = permission_request(SessionId::new("s"), "req-1", "rm -rf /", options);
         assert_eq!(req.session_id, SessionId::new("s"));
         assert_eq!(req.tool_call.tool_call_id.0.as_ref(), "req-1");
@@ -372,84 +421,28 @@ mod tests {
         assert_eq!(req.options.len(), 2);
     }
 
-    // ── map_response ────────────────────────────────────────────────────
-
     #[test]
-    fn allow_once_allows_without_remembering() {
-        let (_, kinds) = build_options(&[]);
-        let answer = map_response(&selected(OPT_ALLOW), &kinds);
-        assert_eq!(
-            answer,
-            PermissionAskAnswer {
-                allow: true,
-                selected_option_id: Some(OPT_ALLOW.to_string()),
-                remember: None,
-            }
-        );
+    fn selecting_allow_maps_to_true() {
+        let (_, kinds) = build_options();
+        assert!(map_response(&selected(OPT_ALLOW), &kinds));
     }
 
     #[test]
-    fn allow_always_allows_and_remembers() {
-        let kernel = vec![PermissionOptionInfo {
-            id: "opt-1".into(),
-            label: "Always allow".into(),
-            kind: "allow_always".into(),
-        }];
-        let (_, kinds) = build_options(&kernel);
-        let answer = map_response(&selected("opt-1"), &kinds);
-        assert_eq!(
-            answer,
-            PermissionAskAnswer {
-                allow: true,
-                selected_option_id: Some("opt-1".to_string()),
-                remember: Some("always".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn reject_once_denies_and_credits_the_option_without_remembering() {
-        let (_, kinds) = build_options(&[]);
-        let answer = map_response(&selected(OPT_DENY), &kinds);
-        assert_eq!(
-            answer,
-            PermissionAskAnswer {
-                allow: false,
-                selected_option_id: Some(OPT_DENY.to_string()),
-                remember: None,
-            }
-        );
-    }
-
-    #[test]
-    fn reject_always_denies_and_remembers() {
-        let kernel = vec![PermissionOptionInfo {
-            id: "opt-1".into(),
-            label: "Always reject".into(),
-            kind: "reject_always".into(),
-        }];
-        let (_, kinds) = build_options(&kernel);
-        let answer = map_response(&selected("opt-1"), &kinds);
-        assert_eq!(
-            answer,
-            PermissionAskAnswer {
-                allow: false,
-                selected_option_id: Some("opt-1".to_string()),
-                remember: Some("always".to_string()),
-            }
-        );
+    fn selecting_deny_maps_to_false() {
+        let (_, kinds) = build_options();
+        assert!(!map_response(&selected(OPT_DENY), &kinds));
     }
 
     #[test]
     fn a_cancelled_prompt_denies() {
         let r = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
-        let (_, kinds) = build_options(&[]);
-        assert_eq!(map_response(&r, &kinds), deny());
+        let (_, kinds) = build_options();
+        assert!(!map_response(&r, &kinds));
     }
 
     #[test]
     fn an_option_id_we_never_offered_denies_rather_than_running_it() {
-        let (_, kinds) = build_options(&[]);
-        assert_eq!(map_response(&selected("some-future-option"), &kinds), deny());
+        let (_, kinds) = build_options();
+        assert!(!map_response(&selected("some-future-option"), &kinds));
     }
 }

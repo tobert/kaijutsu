@@ -126,6 +126,67 @@ pub mod peer {
     pub const KERNEL_WAIT: Duration = Duration::from_secs(30);
 }
 
+/// The gate ladder — one logical deadline enforced at FOUR hops.
+///
+/// A gated `shell_write` call is `run_gate` blocking on a human answering
+/// from another surface (`kj ledger`), wrapped inside a broker
+/// `Broker::call_tool`, wrapped inside a client RPC dispatch. Three hops
+/// deep, each with its own timeout, and — until this module existed — each
+/// with its own independently-chosen number:
+///
+/// | hop | knob | value |
+/// |---|---|---|
+/// | `kj::gate::run_gate` | `TimeoutPolicy::gate_wait_timeout` | 300s |
+/// | `mcp/servers/shell.rs` clamp | `min(gate_wait, mcp_call_timeout_default - 5s)` | 115s |
+/// | `Broker::call_tool` | `InstancePolicy::call_timeout` (= `mcp_call_timeout_default`) | 120s |
+/// | client `dispatch!` → `run_rpc_call` | `RPC_CALL_TIMEOUT` | **30s — wins** |
+///
+/// The outermost hop had the SHORTEST deadline, so it fired first and
+/// destroyed the honest error message: a model would see `call timed out
+/// after 30s` instead of the gate's `nobody answered ask <id>, nothing was
+/// run` — losing the ask id a human needs to go answer it, and the whole
+/// reason the wait existed in the first place. Fail-closed still held (the
+/// ask stayed pending and was answerable afterward); what was lost is
+/// purely the *diagnosis*.
+///
+/// This is the THIRD instance of the [`peer`]-ladder family in the gate
+/// work. The shell.rs clamp above was the second, and its own comment
+/// already said the quiet part: *"if a third caller ever needs this, lift
+/// it into one place rather than copying the arithmetic."* This module is
+/// that one place. Every hop reads from here; none computes its own
+/// arithmetic again.
+///
+/// Same contract as [`peer`]: **the hop closest to the caller fires
+/// first**, enforced by a test, not by four numbers agreeing to stay
+/// ordered by luck.
+pub mod gate {
+    use std::time::Duration;
+
+    /// Headroom between adjacent hops. Enough for the inner hop to write its
+    /// terminal ledger row and return before the outer hop's axe falls.
+    pub const MARGIN: Duration = Duration::from_secs(15);
+
+    /// The OUTERMOST budget: the client's per-call deadline for a tool call
+    /// that may reach the gate. A fixed constant, not derived from kernel
+    /// config, because the client is a separate process with no view of it
+    /// (`kaijutsu-client` cannot read the kernel's `TimeoutPolicy` — they
+    /// communicate only over the wire this deadline bounds).
+    pub const CLIENT_CALL: Duration = Duration::from_secs(330);
+
+    /// The broker's `call_tool` cap for the gate-capable instance
+    /// (`builtin.shell_write`). Strictly under [`CLIENT_CALL`] by
+    /// [`MARGIN`] so the broker's `Timeout` — if it ever fires — still beats
+    /// the client giving up and reporting a generic disconnect-shaped
+    /// failure instead of the gate's own reason.
+    pub const BROKER_CALL: Duration = Duration::from_secs(CLIENT_CALL.as_secs() - MARGIN.as_secs());
+
+    /// Ceiling on the configured `gate_wait_timeout`. The innermost hop:
+    /// fires first, names the real culprit — `run_gate`'s own honest
+    /// "nobody answered ask `<id>`, nothing was run" instead of a timeout
+    /// belonging to a hop further out that knows nothing about the gate.
+    pub const MAX_KERNEL_WAIT: Duration = Duration::from_secs(BROKER_CALL.as_secs() - MARGIN.as_secs());
+}
+
 /// Kernel-wide timeout policy for kaish, LLM, and MCP execution paths.
 ///
 /// All fields are `Duration` in memory; wire/persisted form uses millis.
@@ -171,15 +232,34 @@ pub struct TimeoutPolicy {
     /// server continue to work.
     pub mcp_call_timeout_default: Duration,
 
-    /// How long a gated `kj` verb holds for a human answer from the
-    /// approval ledger before expiring the ask and refusing (fail-closed).
-    /// One shared number by design: the gate's poll deadline and the
-    /// `ctx.patient(...)` hold that freezes the script clock around it
-    /// (see `kj_builtin`) must read the SAME value — two numbers here would
-    /// drift, and the drift is exactly the failure in docs/issues.md "Gate
-    /// slice 1a — three findings", finding #1 (kaish's own watchdog killing
-    /// a blocking gate long before the gate's timeout fires).
+    /// The OPERATOR KNOB: how long a gated `kj` verb holds for a human
+    /// answer from the approval ledger before expiring the ask and refusing
+    /// (fail-closed). One shared number by design: the gate's poll deadline
+    /// and the `ctx.patient(...)` hold that freezes the script clock around
+    /// it (see `kj_builtin`) must read the SAME value — two numbers here
+    /// would drift, and the drift is exactly the failure in docs/issues.md
+    /// "Gate slice 1a — three findings", finding #1 (kaish's own watchdog
+    /// killing a blocking gate long before the gate's timeout fires).
+    ///
+    /// This field is a raw operator setting, not the value a gate hop
+    /// should wait on directly — an operator can raise it past what the
+    /// outer hops (broker call, client RPC deadline) can absorb, which
+    /// would reopen the exact defect [`gate::MAX_KERNEL_WAIT`] exists to
+    /// close. Every consumer reads [`TimeoutPolicy::effective_gate_wait`]
+    /// instead of this field.
     pub gate_wait_timeout: Duration,
+}
+
+impl TimeoutPolicy {
+    /// The gate wait every hop must agree on: `gate_wait_timeout` clamped
+    /// under [`gate::MAX_KERNEL_WAIT`] so the [`gate`] ladder holds even if
+    /// an operator raises the config knob past what the outer hops can
+    /// absorb. THE one place this clamp lives — three call sites read
+    /// `gate_wait_timeout` today (`kj::cc`, `runtime::kj_builtin`,
+    /// `mcp::servers::shell`) and one of them used to clamp by hand.
+    pub fn effective_gate_wait(&self) -> Duration {
+        self.gate_wait_timeout.min(gate::MAX_KERNEL_WAIT)
+    }
 }
 
 impl Default for TimeoutPolicy {
@@ -432,6 +512,73 @@ mod tests {
             tiers::CODEX_HOOK_PATH < tiers::CODEX_SESSION_END_DEADLINE
         );
         assert!(margin >= tiers::PROBE);
+    }
+
+    /// The gate ladder's whole point: the hop closest to the caller fires
+    /// first, so the client reports the gate's own honest reason instead of
+    /// racing a broker or kernel timeout that knows nothing about it. This
+    /// previously held — barely — across four independently-tuned numbers
+    /// in three crates, and the outermost of them (`RPC_CALL_TIMEOUT`, 30s)
+    /// was actually the SHORTEST, so it fired first and destroyed the
+    /// message. One source, one test, ordering enforced rather than hoped.
+    #[test]
+    fn gate_ladder_fires_caller_first() {
+        assert!(
+            gate::MAX_KERNEL_WAIT < gate::BROKER_CALL,
+            "the gate must give up before the broker cancels the call, or its \
+             reason is lost to a generic broker timeout"
+        );
+        assert!(
+            gate::BROKER_CALL < gate::CLIENT_CALL,
+            "the broker must give up before the client does, for the same reason"
+        );
+        assert_eq!(gate::BROKER_CALL, gate::CLIENT_CALL - gate::MARGIN);
+        assert_eq!(gate::MAX_KERNEL_WAIT, gate::BROKER_CALL - gate::MARGIN);
+    }
+
+    /// The shipped default and the ladder ceiling must not drift apart
+    /// silently — if `TimeoutPolicy::default()` ever moved past
+    /// `gate::MAX_KERNEL_WAIT`, `effective_gate_wait()` would silently start
+    /// clamping the DEFAULT, and the doc claiming "300s by default" would be
+    /// describing a value nobody actually gets.
+    #[test]
+    fn default_gate_wait_matches_the_ladder_ceiling() {
+        assert_eq!(
+            TimeoutPolicy::default().gate_wait_timeout,
+            gate::MAX_KERNEL_WAIT
+        );
+    }
+
+    /// `effective_gate_wait()` is the one clamp site: a configured value
+    /// past the ceiling gets capped, and a smaller one passes through
+    /// unchanged (an operator legitimately shortening the wait must not be
+    /// silently overridden upward).
+    #[test]
+    fn effective_gate_wait_clamps_only_above_the_ceiling() {
+        let too_large = TimeoutPolicy {
+            gate_wait_timeout: gate::MAX_KERNEL_WAIT + Duration::from_secs(600),
+            ..TimeoutPolicy::default()
+        };
+        assert_eq!(too_large.effective_gate_wait(), gate::MAX_KERNEL_WAIT);
+
+        let smaller = TimeoutPolicy {
+            gate_wait_timeout: Duration::from_secs(30),
+            ..TimeoutPolicy::default()
+        };
+        assert_eq!(smaller.effective_gate_wait(), Duration::from_secs(30));
+    }
+
+    /// If the margin were ever tuned to zero, every assertion above would
+    /// still pass on `<` alone while the ladder lost all usable headroom —
+    /// this pins the margin itself so a retune can't silently hollow it out.
+    #[test]
+    fn gate_margin_is_not_a_no_op() {
+        assert!(
+            gate::MARGIN > Duration::ZERO,
+            "if this fails the margin became a no-op and the ladder stopped \
+             testing anything — it would still be \"ordered\" with zero \
+             usable headroom between hops"
+        );
     }
 
     #[test]

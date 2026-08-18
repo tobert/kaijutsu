@@ -72,13 +72,12 @@ pub enum HookActionWire {
         target: Option<String>,
         level: String,
     },
-    /// Block the phase on a `PermissionEvents::onAsk` round trip (D-57,
-    /// docs/acp.md gap #2). `description` overrides the auto-generated
-    /// `"{instance}.{tool}"` shown to the answering client. No subscriber
-    /// attached, or no answer within the timeout, both fail closed as
+    /// Block the phase on an approval-ledger ask (`docs/gate-and-shell-split.md`,
+    /// "The shared seam"). `description` overrides the auto-generated
+    /// `"{instance}.{tool}"` shown to whoever answers it. No `KjDispatcher`
+    /// wired, or no answer within the gate's timeout, both fail closed as
     /// `McpError::GateUnavailable` — not `McpError::Denied`, which is
-    /// reserved for a subscriber's actual "no" (Amy, 2026-08-17,
-    /// `docs/gate-and-shell-split.md`) — see `Broker::run_permission_ask`.
+    /// reserved for a real "no" — see `Broker::run_permission_ask`.
     Ask { description: Option<String> },
 }
 

@@ -85,8 +85,8 @@ pub enum McpError {
     #[error("denied by hook {by_hook}")]
     Denied { by_hook: HookId },
 
-    /// An `Ask` hook fired but never reached a verdict: no
-    /// `PermissionAsker` subscriber was attached, or nobody answered inside
+    /// An `Ask` hook fired but never reached a verdict: no `KjDispatcher`
+    /// was wired to run the gate, or nobody answered the ledger ask inside
     /// the timeout. Still fails closed — the call is refused exactly like
     /// `Denied` — but the reason is honest: this is a broken control, not a
     /// "no" (CLAUDE.md: "silent fallbacks are often a mistake"; there is no

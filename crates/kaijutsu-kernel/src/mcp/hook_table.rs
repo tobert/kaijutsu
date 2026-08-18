@@ -40,16 +40,14 @@
 //! `ListTools` phase still rejects kaish at `hook_add` (no coherent
 //! list-filter semantics).
 //!
-//! `HookAction::Ask(AskSpec)` (D-57, docs/acp.md gap #2) blocks the phase
-//! on a `PermissionEvents::onAsk` round trip to a subscribed client —
-//! see `super::permission` for the request/response/trait shape and
-//! `Broker::evaluate_phase` for the fail-closed no-subscriber/timeout
-//! policy. Like `Kaish`, `ListTools` rejects `Ask` at `hook_add` (D-56):
-//! a list-filter can't block-wait per tool. A subscriber's real "no"
-//! terminates as `McpError::Denied`; no subscriber attached or nobody
+//! `HookAction::Ask(AskSpec)` blocks the phase on an approval-ledger ask
+//! (`Broker::run_permission_ask` calling `kj::gate::run_gate` with
+//! `Origin::Hook`) — see `docs/gate-and-shell-split.md`, "The shared seam".
+//! Like `Kaish`, `ListTools` rejects `Ask` at `hook_add` (D-56): a
+//! list-filter can't block-wait per tool. A real "no" terminates as
+//! `McpError::Denied`; a gate with no `KjDispatcher` wired or nobody
 //! answering in time terminates as `McpError::GateUnavailable` instead — a
-//! broken control, not a verdict (Amy, 2026-08-17,
-//! `docs/gate-and-shell-split.md`). Both still fail closed.
+//! broken control, not a verdict. Both still fail closed.
 
 use std::sync::Arc;
 

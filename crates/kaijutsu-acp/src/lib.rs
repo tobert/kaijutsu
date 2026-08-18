@@ -30,6 +30,7 @@ pub mod rank;
 pub mod session;
 pub mod update;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
@@ -56,6 +57,16 @@ pub struct AcpBridge {
     pub kernel: KernelBridge,
     pub sessions: SessionRegistry,
     client_info: Mutex<Option<Implementation>>,
+    /// The most recent `cwd` an ACP client reported at session creation
+    /// (`session/new`/`session/load`/`session/resume`'s `req.cwd`) — the
+    /// bridge did not retain this anywhere before this change; it is
+    /// captured here solely to serve as `session/list`'s fallback for
+    /// contexts with no durable cwd of their own (`rank::ranked_sessions`).
+    /// A genuine client-reported value, not a fabricated one — see
+    /// `handle_list_sessions`, which prefers `ListSessionsRequest.cwd`
+    /// (ACP's own field for this) and falls back to this only when the
+    /// client left that unset.
+    last_client_cwd: Mutex<Option<PathBuf>>,
 }
 
 impl AcpBridge {
@@ -64,11 +75,27 @@ impl AcpBridge {
             kernel,
             sessions: SessionRegistry::default(),
             client_info: Mutex::new(None),
+            last_client_cwd: Mutex::new(None),
         }
     }
 
     pub fn client_info(&self) -> Option<Implementation> {
         self.client_info.lock().clone()
+    }
+
+    /// Remember an ACP client's self-reported cwd. Called at every
+    /// session-creating request (`new`/`load`/`resume`), each of which
+    /// carries its own `req.cwd` — the most recent one wins, which is fine:
+    /// a single ACP process talks to one editor in one cwd at a time in the
+    /// common case, and this is a display fallback, not durable state.
+    fn note_client_cwd(&self, cwd: &std::path::Path) {
+        *self.last_client_cwd.lock() = Some(cwd.to_path_buf());
+    }
+
+    /// The last cwd this ACP client reported at session creation, if any.
+    /// Second-choice fallback for `session/list` — see `handle_list_sessions`.
+    fn last_client_cwd(&self) -> Option<PathBuf> {
+        self.last_client_cwd.lock().clone()
     }
 }
 
@@ -256,6 +283,7 @@ async fn handle_new_session(
     if let Err(e) = validate_acp_cwd(&req.cwd) {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
+    bridge.note_client_cwd(&req.cwd);
     let label = new_session_label(&req.cwd);
     let opened = match bridge.kernel.open_or_create(&label).await {
         Ok(o) => o,
@@ -377,6 +405,7 @@ async fn handle_load_session(
     if let Err(e) = bridge.kernel.set_context_cwd(context_id, &req.cwd).await {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
+    bridge.note_client_cwd(&req.cwd);
     // Replay the transcript: `session/load` exists so a client can render the
     // conversation it is rejoining.
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, true).await {
@@ -410,6 +439,7 @@ async fn handle_resume_session(
     if let Err(e) = bridge.kernel.set_context_cwd(context_id, &req.cwd).await {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
+    bridge.note_client_cwd(&req.cwd);
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, false).await {
         Ok(()) => responder.respond(ResumeSessionResponse::new()),
         Err(e) => responder.respond_with_error(e),
@@ -535,26 +565,38 @@ async fn refresh_command_catalog(
     Ok(())
 }
 
+/// `session/list` — ONE kernel round trip, never a per-context loop.
+///
+/// Used to call `context_cwd(context_id)` once per ranked context (68 RPCs
+/// for a 67-context kernel) and drop any context with no durable cwd from
+/// the picker. `ContextHandleInfo.cwd` now rides `listContexts` itself, so
+/// this is a single call; and `rank::ranked_sessions` now defaults a
+/// cwd-less context's cwd rather than omitting the context (Amy,
+/// 2026-08-18 — see `rank::ranked_sessions`'s doc comment).
+///
+/// The fallback cwd, in priority order: `req.cwd` — ACP's own field for
+/// this on `ListSessionsRequest` ("filter by working directory", but a
+/// value the client bothered to send is exactly "the client's cwd" for
+/// this call) — then the cwd this bridge saw most recently at session
+/// creation (`AcpBridge::last_client_cwd`). If genuinely neither exists
+/// (a `session/list` before any session has ever been created on this
+/// bridge, from a client that also sends no `cwd`), the fallback is `.`
+/// — a relative, visibly-a-placeholder value, deliberately NOT
+/// `std::env::current_dir()` (that would silently name the ACP process's
+/// own directory as if it meant something about the client).
 async fn handle_list_sessions(
     bridge: Arc<AcpBridge>,
-    _req: ListSessionsRequest,
+    req: ListSessionsRequest,
     responder: Responder<ListSessionsResponse>,
 ) -> Result<(), Error> {
+    let fallback_cwd = req
+        .cwd
+        .clone()
+        .or_else(|| bridge.last_client_cwd())
+        .unwrap_or_else(|| PathBuf::from("."));
     match bridge.kernel.list_contexts().await {
         Ok(contexts) => {
-            let mut cwds = std::collections::HashMap::new();
-            for context_id in rank::ranked_context_ids(&contexts) {
-                match bridge.kernel.context_cwd(context_id).await {
-                    Ok(Some(cwd)) => {
-                        cwds.insert(context_id, cwd);
-                    }
-                    Ok(None) => {
-                        tracing::debug!(context = %context_id.short(), "omitting context without durable cwd from ACP session/list");
-                    }
-                    Err(e) => return responder.respond_with_error(internal(e)),
-                }
-            }
-            let sessions = rank::ranked_sessions(&contexts, &cwds);
+            let sessions = rank::ranked_sessions(&contexts, &fallback_cwd);
             responder.respond(ListSessionsResponse::new(sessions))
         }
         Err(e) => responder.respond_with_error(internal(e)),

@@ -58,4 +58,33 @@ impl InstancePolicy {
             max_concurrency: 16,
         }
     }
+
+    /// Production constructor for the ONE instance that can reach
+    /// `kj::gate::run_gate` through `Broker::call_tool` — `builtin.shell_write`
+    /// (the hot, mutating `ShellServer`; its read-only twin `builtin.shell`
+    /// never gates, and no other builtin server calls `run_gate`).
+    ///
+    /// A gate-capable instance holds for a HUMAN to answer from another
+    /// surface (`kj ledger`), not for a normal tool's own work, so it is
+    /// bounded by the gate ladder (`kaijutsu_types::timeout::gate`) rather
+    /// than the generic `mcp_call_timeout_default` every other instance
+    /// uses. Using the generic default here reopens the exact defect the
+    /// ladder exists to close: the broker would cancel the call out from
+    /// under `run_gate` before the gate's own (longer) wait could ever
+    /// resolve, silently truncating a human's answer window and replacing
+    /// the gate's honest refusal reason with a generic broker timeout.
+    ///
+    /// Takes `_kernel` (unused today — the gate ladder's broker cap is a
+    /// fixed constant, not derived from `TimeoutPolicy`; see the `gate`
+    /// module's docs for why) so the signature matches [`Self::for_kernel`]
+    /// and a future per-kernel override doesn't require touching every call
+    /// site again.
+    pub fn for_kernel_gated(_kernel: &crate::Kernel) -> Self {
+        Self {
+            call_timeout: kaijutsu_types::timeout::gate::BROKER_CALL,
+            // See the matching comment on `Default` above — 64 KiB, not 64 MiB.
+            max_result_bytes: 64 * 1024,
+            max_concurrency: 16,
+        }
+    }
 }

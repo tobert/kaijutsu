@@ -587,10 +587,25 @@ impl HydrationState {
             if msg.role == Role::User
                 && let MessageContent::Blocks(blocks) = &msg.content
             {
-                // Get tool_use IDs from the preceding assistant message
-                let preceding_tool_uses: std::collections::HashSet<&str> = idx
-                    .checked_sub(1)
-                    .and_then(|prev_idx| cleaned.get(prev_idx))
+                // Get tool_use IDs from the preceding assistant message —
+                // `cleaned.last()`, NOT `cleaned[idx - 1]`.
+                //
+                // `idx` counts `repaired`; `cleaned` is what we are building.
+                // They diverge the moment this loop skips a message (the
+                // fully-orphaned case below), and from then on `cleaned[idx -
+                // 1]` names some earlier message instead of the previous one.
+                // Every following user message then gets checked against the
+                // wrong assistant, so its legitimate tool_results read as
+                // orphans and are dropped — which orphans THEIR tool_uses and
+                // desyncs the index further. One skip cascaded into an
+                // invalid request; live on toad, 2026-08-18, and the provider
+                // was the thing that noticed.
+                //
+                // The previous kept message is the only correct answer here,
+                // and `cleaned.last()` is that by construction — it cannot
+                // drift no matter how many messages this loop drops.
+                let preceding_tool_uses: std::collections::HashSet<&str> = cleaned
+                    .last()
                     .and_then(|prev| {
                         if prev.role != Role::Assistant {
                             return None;
@@ -652,6 +667,7 @@ impl HydrationState {
             cleaned.push(msg.clone());
         }
 
+        report_unpaired_tool_uses(&cleaned);
         cleaned
     }
 
@@ -772,6 +788,220 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> u64 {
         .iter()
         .map(|m| PER_MESSAGE_TOKEN_OVERHEAD + estimate_message_content(&m.content))
         .sum()
+}
+
+/// Log any `tool_use` that no following message answers.
+///
+/// This is the invariant the provider enforces for us today, and badly: it
+/// answers `invalid_request_error: An assistant message with 'tool_calls'
+/// must be followed by tool messages responding to each 'tool_call_id'`,
+/// after three retries, without naming which id — so the operator learns
+/// only that a turn died somewhere. Checking it here turns that into one
+/// line naming the call.
+///
+/// Deliberately a log and not a panic. By the time hydration runs, the
+/// alternative to sending a flawed request is killing a live turn, and a
+/// turn that fails loudly at the provider is strictly better than a kernel
+/// that panics on a conversation shape we did not anticipate. The repair
+/// passes above are what should make this unreachable; this exists to tell
+/// us when they did not.
+fn report_unpaired_tool_uses(messages: &[Message]) {
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        let MessageContent::Blocks(blocks) = &msg.content else {
+            continue;
+        };
+        let uses: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if uses.is_empty() {
+            continue;
+        }
+        let answered: std::collections::HashSet<&str> = messages
+            .get(idx + 1)
+            .and_then(|next| match (&next.role, &next.content) {
+                (Role::User, MessageContent::Blocks(nblocks)) => Some(
+                    nblocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let unpaired: Vec<&str> = uses
+            .into_iter()
+            .filter(|id| !answered.contains(id))
+            .collect();
+        if !unpaired.is_empty() {
+            tracing::error!(
+                msg_idx = idx,
+                ?unpaired,
+                "hydration produced an assistant message whose tool_uses have no \
+                 matching tool_results — the provider will refuse this request. \
+                 This is a hydration-repair bug, not a model or provider fault."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pairing_repair_tests {
+    use super::*;
+
+    fn assistant_with_tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({}),
+            }]),
+        }
+    }
+
+    fn results(ids: &[&str]) -> Message {
+        Message {
+            role: Role::User,
+            content: MessageContent::Blocks(
+                ids.iter()
+                    .map(|id| ContentBlock::ToolResult {
+                        tool_use_id: (*id).to_string(),
+                        content: "ok".into(),
+                        is_error: false,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Every assistant tool_use is answered by the immediately following
+    /// message. This is the provider's rule, and the only thing hydration
+    /// output has to satisfy.
+    fn assert_well_paired(messages: &[Message]) {
+        for (idx, msg) in messages.iter().enumerate() {
+            if msg.role != Role::Assistant {
+                continue;
+            }
+            let MessageContent::Blocks(blocks) = &msg.content else {
+                continue;
+            };
+            let uses: Vec<&str> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if uses.is_empty() {
+                continue;
+            }
+            let next = messages.get(idx + 1).unwrap_or_else(|| {
+                panic!("message {idx} has tool_uses {uses:?} but nothing follows it")
+            });
+            let answered: std::collections::HashSet<&str> = match (&next.role, &next.content) {
+                (Role::User, MessageContent::Blocks(nblocks)) => nblocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => panic!("message {idx} has tool_uses {uses:?}; message {} is not a tool_result message", idx + 1),
+            };
+            for id in uses {
+                assert!(
+                    answered.contains(id),
+                    "message {idx}'s tool_use {id} is unanswered by message {}",
+                    idx + 1
+                );
+            }
+        }
+    }
+
+    /// The live failure from toad, 2026-08-18, reduced to its mechanism.
+    ///
+    /// One fully-orphaned tool_result message (a late arrival whose call
+    /// already got a synthetic answer) is dropped by the reverse pass. That
+    /// drop used to desync the reverse pass's index — it enumerated
+    /// `repaired` but looked the previous message up in `cleaned` — so every
+    /// later user message was checked against the WRONG assistant, its
+    /// legitimate results were dropped as orphans, and their tool_uses were
+    /// left unanswered. The provider caught it; we did not.
+    ///
+    /// The tell is that the damage is AFTER the drop, so a fixture needs a
+    /// perfectly ordinary exchange following the orphan to show it.
+    #[test]
+    fn a_dropped_orphan_does_not_desync_the_pairs_after_it() {
+        let mut state = HydrationState::new();
+        state.messages = vec![
+            Message::user("go"),
+            assistant_with_tool_use("call_a"),
+            results(&["call_a"]),
+            // A late result for a call that is nowhere in this conversation:
+            // the whole message is orphaned and gets dropped.
+            results(&["call_vanished"]),
+            // Everything after here was collateral damage.
+            assistant_with_tool_use("call_b"),
+            results(&["call_b"]),
+            assistant_with_tool_use("call_c"),
+            results(&["call_c"]),
+        ];
+
+        let out = state.into_messages();
+
+        assert_well_paired(&out);
+        let ids: Vec<&str> = out
+            .iter()
+            .flat_map(|m| match &m.content {
+                MessageContent::Blocks(bs) => bs
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        assert!(
+            ids.contains(&"call_b") && ids.contains(&"call_c"),
+            "results after a dropped orphan must survive; got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"call_vanished"),
+            "the genuinely orphaned result must still be dropped; got {ids:?}"
+        );
+    }
+
+    /// Two orphans in a row: the desync used to grow with each drop, so one
+    /// is not enough to prove the index is anchored rather than merely
+    /// off-by-one.
+    #[test]
+    fn several_dropped_orphans_still_leave_later_pairs_intact() {
+        let mut state = HydrationState::new();
+        state.messages = vec![
+            Message::user("go"),
+            results(&["ghost_one"]),
+            results(&["ghost_two"]),
+            assistant_with_tool_use("call_real"),
+            results(&["call_real"]),
+        ];
+
+        let out = state.into_messages();
+        assert_well_paired(&out);
+    }
 }
 
 #[cfg(test)]

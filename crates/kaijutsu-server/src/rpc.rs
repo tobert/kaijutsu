@@ -113,11 +113,6 @@ use kaijutsu_kernel::{
     flows::{TurnFlow, TurnOrigin, TurnStopReason},
     shared_block_flow_bus,
 };
-// D-57 (docs/acp.md gap #2): the `HookAction::Ask` <-> `PermissionEvents`
-// bridge. `kaijutsu-kernel` has no capnp dependency, so the trait + plain
-// request/answer/outcome types live there; the capnp `Client`s they get
-// bridged to live only here.
-use kaijutsu_kernel::mcp::{PermissionAnswer, PermissionAskRequest, PermissionAsker, PermissionOutcome};
 use kaijutsu_types::paths;
 use kaijutsu_types::{ContextId, KernelId, Principal, PrincipalId, SessionId};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
@@ -326,85 +321,6 @@ fn register_subscription(
     }
 }
 
-/// Cross-thread dispatch message for one permission ask, mirroring
-/// `peers::InvokeRequest`'s shape and for the same reason: capnp `Client`s
-/// are `Rc`-based hooks (`!Send`), but `SharedKernelState` (and the
-/// `PermissionAsker` trait object hung off the broker) must be `Send +
-/// Sync` — a connection runs on its own dedicated thread + `LocalSet`
-/// (`spawn_turn_driver`'s doc comment explains why). So the shared registry
-/// can only ever hold `Send`-safe channel handles; the actual
-/// `permission_events::Client` stays local to the connection thread that
-/// registered it, inside `subscribe_permission_events`'s bridge task.
-pub struct PermissionAskChannelMsg {
-    request: PermissionAskRequest,
-    reply: tokio::sync::oneshot::Sender<PermissionOutcome>,
-}
-
-/// Bridges `kaijutsu-kernel`'s `PermissionAsker` trait onto the kernel-wide
-/// registry of per-connection dispatch channels (D-57, docs/acp.md gap #2).
-/// Wired onto `Broker::set_permission_asker` in `create_shared_kernel`.
-///
-/// No internal timeout here: `Broker::run_permission_ask` already wraps the
-/// whole `ask()` call in `tokio::time::timeout` (the "generous" D-57
-/// budget). Dropping this future on timeout drops the oneshot receiver,
-/// which the bridge task's next `reply.send()` then just fails to reach —
-/// safe, no leak, same shape `subscribe_turn_events`'s per-callback timeout
-/// relies on. This type only decides who to ask and what they said.
-struct PermissionAskBridge {
-    subscribers: Arc<TokioRwLock<Vec<tokio::sync::mpsc::Sender<PermissionAskChannelMsg>>>>,
-}
-
-#[async_trait::async_trait]
-impl PermissionAsker for PermissionAskBridge {
-    async fn ask(&self, request: PermissionAskRequest) -> PermissionOutcome {
-        // Snapshot once, then walk it in subscribe order (oldest first).
-        // A dead channel (its connection's bridge task ended) is pruned
-        // from the shared registry via `same_channel` — `mpsc::Sender`
-        // has no other identity to prune by. A capnp-level failure inside
-        // a still-live bridge task answers `NoSubscriber` over its reply
-        // channel instead (see `subscribe_permission_events`) rather than
-        // closing the channel, so a live-but-momentarily-failing
-        // subscriber isn't torn out of the registry — just skipped for
-        // this one ask.
-        let snapshot = self.subscribers.read().await.clone();
-        if snapshot.is_empty() {
-            return PermissionOutcome::NoSubscriber;
-        }
-
-        for tx in &snapshot {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let msg = PermissionAskChannelMsg {
-                request: request.clone(),
-                reply: reply_tx,
-            };
-            if tx.send(msg).await.is_err() {
-                tracing::debug!(
-                    target: "kaijutsu::hooks",
-                    request_id = %request.request_id,
-                    "permission ask subscriber's bridge task is gone; pruning and trying the next one",
-                );
-                let mut subs = self.subscribers.write().await;
-                subs.retain(|s| !s.same_channel(tx));
-                continue;
-            }
-            match reply_rx.await {
-                Ok(PermissionOutcome::NoSubscriber) => continue,
-                Ok(outcome) => return outcome,
-                Err(_) => {
-                    tracing::warn!(
-                        target: "kaijutsu::hooks",
-                        request_id = %request.request_id,
-                        "permission ask bridge task dropped without answering; trying the next subscriber",
-                    );
-                    continue;
-                }
-            }
-        }
-        // Every attached subscriber was unreachable/declined to answer.
-        PermissionOutcome::NoSubscriber
-    }
-}
-
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
 pub struct SharedKernelState {
@@ -442,21 +358,6 @@ pub struct SharedKernelState {
     /// `parking_lot::Mutex` because all ops are insert/remove/replace and
     /// complete in microseconds.
     pub subscription_registry: Arc<parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>>>,
-    /// Kernel-wide `PermissionEvents` subscriber registry (D-57, docs/acp.md
-    /// gap #2): one dispatch channel per subscribed connection, drained by
-    /// `PermissionAskBridge::ask` (wired onto `Broker::set_permission_asker`
-    /// at bootstrap). The actual `permission_events::Client` capability
-    /// stays on its owning connection's thread — see `PermissionAskBridge`'s
-    /// doc comment for why (capnp `Client`s are `!Send`, this registry is
-    /// not).
-    ///
-    /// Kernel-wide, not per-connection like `elicitation_subscribers`:
-    /// `HookAction::Ask` can fire from any call path — an autonomous turn,
-    /// a sibling context's tool call, a kaish script — so there's no "the
-    /// connection that asked" to scope this to. A closed channel (its
-    /// connection's bridge task ended) is pruned reactively by the bridge.
-    pub permission_subscribers:
-        Arc<TokioRwLock<Vec<tokio::sync::mpsc::Sender<PermissionAskChannelMsg>>>>,
     /// The live roster's materialized view (`kaijutsu_kernel::roster`). The
     /// SAME instance the `/run/roster` mount and `KjDispatcher`'s `kj roster`
     /// verbs hold — three handles, one store, because a second store would
@@ -2266,22 +2167,9 @@ pub async fn create_shared_kernel(
         kj_dispatcher,
         session_contexts,
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        permission_subscribers: Arc::new(TokioRwLock::new(Vec::new())),
         roster: roster_store,
         shutdown,
     };
-
-    // Wire the permission-ask bridge (D-57) onto the broker so
-    // `HookAction::Ask` has somewhere to send its round trip. Same
-    // `permission_subscribers` Arc a `subscribePermissionEvents` RPC call
-    // pushes into — see `PermissionAskBridge`.
-    shared
-        .kernel
-        .broker()
-        .set_permission_asker(Arc::new(PermissionAskBridge {
-            subscribers: shared.permission_subscribers.clone(),
-        }))
-        .await;
 
     // ROOT bootstrap: a brand-new kernel (nothing recovered above) has no
     // contexts. Seed a single `director` context, `ROOT` — the binding-admin
@@ -2371,8 +2259,23 @@ impl world::Server for WorldImpl {
         params: world::BindKernelParams,
         mut results: world::BindKernelResults,
     ) -> Promise<(), capnp::Error> {
-        let _params_reader = pry!(params.get());
+        let params_reader = pry!(params.get());
         let _span = tracing::info_span!("rpc", method = "bind_kernel").entered();
+
+        // Wire-version handshake: refuse a mismatched client at connect,
+        // loudly, before it can do anything half-working. A client that
+        // predates this field sends capnp's UInt32 default (0), which is
+        // below any real version and is exactly the case we want refused.
+        // See kaijutsu_types::WIRE_VERSION for the flag-day rule.
+        let client_wire_version = params_reader.get_wire_version();
+        if client_wire_version != kaijutsu_types::WIRE_VERSION {
+            let msg = kaijutsu_types::wire_version_mismatch_message(
+                client_wire_version,
+                kaijutsu_types::WIRE_VERSION,
+            );
+            log::error!("bind_kernel refused: {msg}");
+            return Promise::err(capnp::Error::failed(msg));
+        }
 
         // No kernel creation — hand out the shared kernel capability.
         let kernel = self.registry.kernel.clone();
@@ -2382,6 +2285,7 @@ impl world::Server for WorldImpl {
         );
         results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
         results.get().set_kernel_id(kernel.id.as_bytes());
+        results.get().set_wire_version(kaijutsu_types::WIRE_VERSION);
         Promise::ok(())
     }
 }
@@ -2413,10 +2317,13 @@ impl KernelImpl {
 /// registry/runtime-only fields (`traceId`, `liveStatus`, `trackId`,
 /// synthesis keywords/preview, usage/background-process summaries) at their
 /// wire defaults: honest absence, not fabricated from data this path never
-/// had.
+/// had. `cwd` is an exception — it is durable (`context_shell`, not
+/// registry-only), so the caller reads it alongside the `ContextRow` and
+/// passes it in here rather than leaving it at the wire default.
 fn write_context_row_to_handle_info(
     mut info: context_handle_info::Builder<'_>,
     row: &ContextRow,
+    cwd: Option<&str>,
 ) {
     info.set_id(row.context_id.as_bytes());
     info.set_label(row.label.as_deref().unwrap_or(""));
@@ -2439,6 +2346,7 @@ fn write_context_row_to_handle_info(
     info.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
+    info.set_cwd(cwd.unwrap_or(""));
 }
 
 /// Verify a context can be joined, healing the DriftRouter registration from
@@ -3833,6 +3741,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = self.kernel.kernel.clone();
         let kernel_db_arc = self.kernel.kernel_db.clone();
+        let kernel_state = self.kernel.clone();
         let _kernel_id = self.kernel.id;
         let semantic_index = self.kernel.semantic_index.clone();
         let documents = self.kernel.documents.clone();
@@ -3979,6 +3888,18 @@ impl kernel::Server for KernelImpl {
                         c.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
                     }
 
+                    // Durable working directory (`context_shell.cwd`) — a
+                    // synchronous, sub-ms KernelDb read per row (same table
+                    // `getContextCwd`/`setContextCwd` hit), NOT a second RPC.
+                    // This is the whole point of carrying `cwd` on
+                    // `ContextHandleInfo`: a caller that used to loop
+                    // `getContextCwd` once per context over the wire (68
+                    // round trips for 67 contexts) now gets it for free on
+                    // the one `listContexts` call.
+                    if let Some(cwd) = context_cwd(&kernel_state, ctx.id) {
+                        c.set_cwd(cwd.to_string_lossy().as_ref());
+                    }
+
                     // Context-window usage — the bottom-dock gauge's wire spine
                     // (kaijutsu.capnp ContextHandleInfo doc comment). No usage
                     // row = never completed an LLM call: honest sentinels,
@@ -4071,20 +3992,30 @@ impl kernel::Server for KernelImpl {
         let kernel_db_arc = self.kernel.kernel_db.clone();
         Promise::from_future(
             async move {
-                let row = {
+                let (row, cwd) = {
                     let db = kernel_db_arc.lock();
-                    db.find_context_by_label(&label).map_err(|e| {
+                    let row = db.find_context_by_label(&label).map_err(|e| {
                         capnp::Error::failed(format!(
                             "resolve_context_label: KernelDb lookup for '{label}' failed: {e}"
                         ))
-                    })?
+                    })?;
+                    // Same lock scope as the row lookup — one round trip
+                    // through the DB guard for both, rather than dropping
+                    // and re-acquiring it.
+                    let cwd = row.as_ref().and_then(|r| {
+                        db.get_context_shell(r.context_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|shell| shell.cwd)
+                    });
+                    (row, cwd)
                 };
                 let mut res = results.get();
                 match row {
                     Some(row) => {
                         res.set_found(true);
                         let info = res.init_info();
-                        write_context_row_to_handle_info(info, &row);
+                        write_context_row_to_handle_info(info, &row, cwd.as_deref());
                     }
                     None => res.set_found(false),
                 }
@@ -4632,137 +4563,14 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    /// Register a `PermissionEvents` callback (D-57, docs/acp.md gap #2).
-    ///
-    /// Kernel-wide, unlike `subscribe_mcp_elicitations` above — but the
-    /// `callback` capability itself is `!Send` (an `Rc`-based capnp hook),
-    /// while `SharedKernelState::permission_subscribers` must be `Send +
-    /// Sync` (a connection can run on its own dedicated thread). So this
-    /// spawns a `spawn_local` bridge task, exactly like `subscribe_editor`/
-    /// `subscribe_turn_events`, that owns `callback` on THIS connection's
-    /// `LocalSet` and drains an `mpsc` channel of asks; only the channel's
-    /// `Sender` — which is `Send`-safe — goes into the shared registry.
-    /// `PermissionAskBridge::ask` (any thread) sends into that channel and
-    /// awaits the paired oneshot reply.
-    ///
-    /// Dies with the connection (`conn_cancel`); no explicit unsubscribe
-    /// RPC. A dead entry (channel closed) is pruned reactively by the
-    /// bridge on its next failed send — see `PermissionAskBridge`'s doc
-    /// comment.
-    fn subscribe_permission_events(
+    /// Retired: HookAction::Ask now runs through the approval ledger
+    /// (docs/gate-and-shell-split.md) and announces via subscribeLedgerEvents.
+    fn retired93(
         self: Rc<Self>,
-        params: kernel::SubscribePermissionEventsParams,
-        _results: kernel::SubscribePermissionEventsResults,
+        _params: kernel::Retired93Params,
+        _results: kernel::Retired93Results,
     ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let callback = pry!(p.get_callback());
-        let subscribers = self.kernel.permission_subscribers.clone();
-        let conn_cancel = self.connection.borrow().cancel_token();
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PermissionAskChannelMsg>(16);
-        tokio::task::spawn_local(async move {
-            loop {
-                let msg = tokio::select! {
-                    _ = conn_cancel.cancelled() => {
-                        log::debug!("permission-ask bridge cancelled with connection");
-                        break;
-                    }
-                    m = rx.recv() => match m {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let mut req = callback.on_ask_request();
-                {
-                    let mut p = req.get().init_request();
-                    p.set_request_id(&msg.request.request_id);
-                    p.set_context_id(msg.request.context_id.as_bytes());
-                    p.set_description(&msg.request.description);
-                    p.set_instance(&msg.request.instance);
-                    p.set_tool(&msg.request.tool);
-                    p.set_hook_id(&msg.request.hook_id);
-                    let mut options = p
-                        .reborrow()
-                        .init_options(msg.request.options.len() as u32);
-                    for (i, opt) in msg.request.options.iter().enumerate() {
-                        let mut o = options.reborrow().get(i as u32);
-                        o.set_id(&opt.id);
-                        o.set_label(&opt.label);
-                        o.set_kind(&opt.kind);
-                    }
-                }
-                let outcome = match req.send().promise.await {
-                    Ok(reply) => match reply.get().and_then(|r| r.get_response()) {
-                        Ok(response) => {
-                            let allow = response.get_allow();
-                            let selected_option_id = if response.get_has_selected_option_id() {
-                                match response.get_selected_option_id() {
-                                    Ok(t) => match t.to_str() {
-                                        Ok(s) => Some(s.to_string()),
-                                        Err(e) => {
-                                            log::warn!(
-                                                "permission ask selectedOptionId not valid UTF-8: {e}; dropping it"
-                                            );
-                                            None
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::warn!("permission ask selectedOptionId unreadable: {e}; dropping it");
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            let remember = if response.get_has_remember() {
-                                match response.get_remember() {
-                                    Ok(t) => match t.to_str() {
-                                        Ok(s) => Some(s.to_string()),
-                                        Err(e) => {
-                                            log::warn!(
-                                                "permission ask remember not valid UTF-8: {e}; dropping it"
-                                            );
-                                            None
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::warn!("permission ask remember unreadable: {e}; dropping it");
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            PermissionOutcome::Answered(PermissionAnswer {
-                                allow,
-                                selected_option_id,
-                                remember,
-                            })
-                        }
-                        Err(e) => {
-                            log::warn!("permission ask response malformed: {e}");
-                            PermissionOutcome::NoSubscriber
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            "permission ask subscriber callback failed (request_id={}): {e}",
-                            msg.request.request_id,
-                        );
-                        PermissionOutcome::NoSubscriber
-                    }
-                };
-                // Best-effort: the asker may have already timed out and
-                // dropped its receiver, which is not a bridge-task error.
-                let _ = msg.reply.send(outcome);
-            }
-            log::debug!("permission-ask bridge task ended");
-        });
-
-        Promise::from_future(async move {
-            subscribers.write().await.push(tx);
-            Ok(())
-        })
+        Promise::ok(())
     }
 
     /// Push channel: bridges the kernel's `LedgerFlow` bus (one topic,

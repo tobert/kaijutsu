@@ -28,9 +28,6 @@ use super::context::CallContext;
 use super::error::{HookId, McpError, McpResult, PolicyError};
 use super::hook_table::{AskSpec, HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
-use super::permission::{
-    PermissionAskOutcome, PermissionAskRequest, PermissionAsker, PermissionOutcome,
-};
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
@@ -188,18 +185,6 @@ pub struct Broker {
     /// `kj mcp list` instead of requiring a log grep — "loud, not silent"
     /// extends to *after* the boot log has scrolled by.
     external_mcp_failures: RwLock<Option<Vec<(String, String)>>>,
-    /// Bridge to the server's `PermissionEvents` subscriber registry (D-57).
-    /// `Arc<dyn PermissionAsker>` rather than `Weak` like `kernel`/
-    /// `kj_dispatcher`: the bridge is a small registry object owned by
-    /// kernel bootstrap alongside the broker itself, not something the
-    /// broker would otherwise keep alive — there's no ownership cycle to
-    /// break. Set via `set_permission_asker`; `None` → every `Ask` fires
-    /// the no-subscriber fail-closed default (see `evaluate_phase`).
-    permission_asker: RwLock<Option<Arc<dyn PermissionAsker>>>,
-    /// Round-trip budget for a permission ask (D-57). Defaults to
-    /// [`super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`]; shrunk by
-    /// `#[cfg(test)]` callers so timeout tests don't actually wait 30s.
-    permission_ask_timeout: RwLock<std::time::Duration>,
 }
 
 impl Default for Broker {
@@ -212,6 +197,24 @@ impl std::fmt::Debug for Broker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Broker").finish_non_exhaustive()
     }
+}
+
+/// What [`Broker::run_permission_ask`] decided, distinguishing a real
+/// verdict from a broken control (`docs/gate-and-shell-split.md`, "'Gate
+/// unavailable' and 'denied' must be distinguishable to a model"). One
+/// producer, one consumer, both in this file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PermissionAskOutcome {
+    /// The gate resolved `Allowed`. The call proceeds.
+    Proceed,
+    /// The gate resolved `Denied` — a real verdict. `reason` is
+    /// tracing/hook-visible prose, not shown to the model directly.
+    Denied(String),
+    /// The gate resolved `Unavailable`, or no `KjDispatcher` was wired at
+    /// all. Both mean "the gate could not do its job" to a caller deciding
+    /// what to do next, so they collapse to one variant here; `reason`
+    /// keeps the specific flavor for tracing.
+    Unavailable(String),
 }
 
 impl Broker {
@@ -237,10 +240,6 @@ impl Broker {
             kj_dispatcher: RwLock::new(None),
             enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
             external_mcp_failures: RwLock::new(None),
-            permission_asker: RwLock::new(None),
-            permission_ask_timeout: RwLock::new(
-                super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT,
-            ),
         }
     }
 
@@ -273,25 +272,6 @@ impl Broker {
     /// `kj` tool. Called at server bootstrap after `Arc::new(KjDispatcher::new(...))`.
     pub async fn set_kj_dispatcher(&self, dispatcher: &Arc<crate::kj::KjDispatcher>) {
         *self.kj_dispatcher.write().await = Some(Arc::downgrade(dispatcher));
-    }
-
-    /// Wire the `PermissionEvents` subscriber bridge (D-57) so
-    /// `HookAction::Ask` has somewhere to send its round trip. Called at
-    /// server bootstrap once the kernel-wide subscriber registry exists.
-    /// `None` (the default) means every `Ask` fires the no-subscriber
-    /// fail-closed default — a bare `Broker::new()` in tests is exactly
-    /// that case unless the test wires a fake asker.
-    pub async fn set_permission_asker(&self, asker: Arc<dyn PermissionAsker>) {
-        *self.permission_asker.write().await = Some(asker);
-    }
-
-    /// Override the permission-ask timeout. Test-only: production always
-    /// uses [`super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`] (30s,
-    /// "generous"); a timeout test shrinks this so it doesn't actually
-    /// block for 30 real seconds.
-    #[cfg(test)]
-    pub(crate) async fn set_permission_ask_timeout_for_test(&self, timeout: std::time::Duration) {
-        *self.permission_ask_timeout.write().await = timeout;
     }
 
     /// Upgrade the stashed `Weak<KjDispatcher>` (set via [`Self::set_kj_dispatcher`]).
@@ -1727,31 +1707,44 @@ impl Broker {
         Ok(PhaseOutcome::Continue)
     }
 
-    /// Run one `HookAction::Ask` round trip (D-57). Returns
-    /// `PermissionAskOutcome::Proceed` when the call should proceed (an
-    /// attached subscriber answered "allow"); `Denied(reason)` when a
-    /// subscriber actually answered "no" — a real verdict; and
-    /// `Unavailable(reason)` for either of the two fail-closed defaults
-    /// below, which still refuse the call but are NOT a verdict (Amy's
-    /// ruling, 2026-08-17, `docs/gate-and-shell-split.md`: "gate
-    /// unavailable" and "denied" must be distinguishable to a model — see
-    /// `McpError::GateUnavailable`):
+    /// Run one `HookAction::Ask` round trip (D-57), through the approval
+    /// ledger (`docs/gate-and-shell-split.md`, "The shared seam: one
+    /// ledger, one announcement, one write path"). This is now a thin
+    /// caller of [`crate::kj::gate::run_gate`] — the same function
+    /// `shell_write`'s gate uses (`mcp/servers/shell.rs`) — with
+    /// `Origin::Hook` and a [`crate::kj::hook_gate::build_hook_gate_spec`]
+    /// spec built from the firing hook and call params.
     ///
-    /// - **No subscriber attached** (`self.permission_asker` unset, or the
-    ///   bridge itself reports `PermissionOutcome::NoSubscriber` because its
-    ///   registry is empty) — nothing to ask, so the safe default is to
-    ///   refuse. An `Ask` hook with nobody to ask is a misconfiguration, not
-    ///   a quiet no-op (`CLAUDE.md`: "Silent fallbacks are often a
-    ///   mistake") — and not a considered "no" either.
-    /// - **Timeout** — a subscriber was attached but didn't answer within
-    ///   `permission_ask_timeout` (default 30s, "generous" — see
-    ///   `super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`). Same
-    ///   fail-closed refusal; a turn must not hang forever on an unanswered
-    ///   prompt.
+    /// One durable row before anyone is notified, keyed by the ledger's
+    /// own `request_id` — not a `Uuid::new_v4()` that correlated logs and
+    /// nothing else. The announcement is `LedgerEvents::onChanged @101`,
+    /// already a broadcast every connected client can subscribe to, so
+    /// there is no more per-ask subscriber handout to take once. The
+    /// answer is `kj ledger allow|deny <id>` from any surface — the
+    /// ledger's `claim` + `decide` transaction, exactly one answerer wins.
     ///
-    /// Both fail-closed paths log at `warn!` (not the plain `debug!` other
-    /// hook denials use) — a stuck Ask usually means the current session
-    /// has no client subscribed to answer it, which the operator needs to
+    /// Returns `PermissionAskOutcome::Proceed` when the gate resolves
+    /// `Allowed`; `Denied(reason)` when it resolves `Denied` — a real
+    /// verdict; and `Unavailable(reason)` when it resolves `Unavailable`
+    /// (Amy's ruling, 2026-08-17: "gate unavailable" and "denied" must be
+    /// distinguishable to a model — see `McpError::GateUnavailable`) or
+    /// when no `KjDispatcher` is wired at all (a bare `Broker::new()` in a
+    /// unit test, or a bootstrap ordering bug — there is nowhere to run
+    /// the gate, so this fails the same way an expired/faulted gate does).
+    ///
+    /// **"Nobody was notified" is no longer the same as "nobody can
+    /// answer."** The old no-subscriber fail-closed default refused
+    /// instantly because there was genuinely nothing durable to point at;
+    /// now the ask row exists before this function even returns, so
+    /// `kj ledger list` shows it from any shell even if every connected
+    /// client is looking the other way — only a missing dispatcher (this
+    /// function's own misconfiguration case) or the gate's own
+    /// `gate_wait_timeout` elapsing still refuse.
+    ///
+    /// Both refusal paths log at `warn!` (not the plain `debug!` other
+    /// hook denials use) — a stuck ask usually means either a
+    /// misconfigured bootstrap (no dispatcher) or nobody having looked at
+    /// `kj ledger list` in time, either of which an operator needs to
     /// notice, not just trace.
     async fn run_permission_ask(
         &self,
@@ -1764,102 +1757,85 @@ impl Broker {
             .description
             .clone()
             .unwrap_or_else(|| format!("{}.{}", params.instance, params.tool));
-        let request = PermissionAskRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            context_id: ctx.context_id,
-            description,
-            instance: params.instance.as_str().to_string(),
-            tool: params.tool.clone(),
-            hook_id: hook_id.0.clone(),
-            options: Vec::new(),
-        };
 
-        let asker = self.permission_asker.read().await.clone();
-        let Some(asker) = asker else {
+        let Some(dispatcher) = self.kj_dispatcher().await else {
             tracing::warn!(
                 target: "kaijutsu::hooks",
                 hook_id = %hook_id,
                 instance = %params.instance,
                 tool = %params.tool,
                 context_id = %ctx.context_id,
-                "permission ask fired with no PermissionEvents subscriber attached; refusing (fail-closed, gate unavailable)",
+                "permission ask fired with no KjDispatcher wired (Broker::set_kj_dispatcher never \
+                 called, or a bare Broker::new() in a test); refusing (fail-closed, gate unavailable)",
             );
             return PermissionAskOutcome::Unavailable(
-                "permission ask: no PermissionEvents subscriber attached (fail-closed)".into(),
+                "permission ask: no kj dispatcher wired (fail-closed, gate unavailable)".into(),
             );
         };
 
-        let timeout = *self.permission_ask_timeout.read().await;
-        let request_id = request.request_id.clone();
-        match tokio::time::timeout(timeout, asker.ask(request)).await {
-            Err(_elapsed) => {
-                tracing::warn!(
-                    target: "kaijutsu::hooks",
-                    hook_id = %hook_id,
-                    instance = %params.instance,
-                    tool = %params.tool,
-                    context_id = %ctx.context_id,
-                    request_id = %request_id,
-                    timeout_secs = timeout.as_secs_f64(),
-                    "permission ask timed out waiting for a response; refusing (fail-closed, gate unavailable)",
-                );
-                PermissionAskOutcome::Unavailable(format!(
-                    "permission ask: timed out after {:.1}s waiting for a response (fail-closed)",
-                    timeout.as_secs_f64()
-                ))
-            }
-            Ok(PermissionOutcome::NoSubscriber) => {
-                tracing::warn!(
-                    target: "kaijutsu::hooks",
-                    hook_id = %hook_id,
-                    instance = %params.instance,
-                    tool = %params.tool,
-                    context_id = %ctx.context_id,
-                    request_id = %request_id,
-                    "permission ask bridge reports no subscriber; refusing (fail-closed, gate unavailable)",
-                );
-                PermissionAskOutcome::Unavailable(
-                    "permission ask: no PermissionEvents subscriber attached (fail-closed)".into(),
-                )
-            }
-            Ok(PermissionOutcome::TimedOut) => {
-                tracing::warn!(
-                    target: "kaijutsu::hooks",
-                    hook_id = %hook_id,
-                    instance = %params.instance,
-                    tool = %params.tool,
-                    context_id = %ctx.context_id,
-                    request_id = %request_id,
-                    "permission ask bridge reports its own timeout; refusing (fail-closed, gate unavailable)",
-                );
-                PermissionAskOutcome::Unavailable(
-                    "permission ask: subscriber did not answer in time (fail-closed)".into(),
-                )
-            }
-            Ok(PermissionOutcome::Answered(answer)) => {
+        let caller = crate::kj::KjCaller {
+            principal_id: ctx.principal_id,
+            context_id: Some(ctx.context_id),
+            session_id: ctx.session_id,
+            confirmed: false,
+            rc_depth: 0,
+            privileged: false,
+        };
+        let gate_spec = crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params);
+        let outcome = crate::kj::gate::run_gate(
+            dispatcher.kernel_db(),
+            &caller,
+            gate_spec,
+            dispatcher.kernel().timeouts().effective_gate_wait(),
+            dispatcher.kernel().ledger_flows(),
+        )
+        .await;
+
+        match outcome.verdict {
+            crate::kj::gate::GateVerdict::Allowed => {
                 tracing::debug!(
                     target: "kaijutsu::hooks",
                     hook_id = %hook_id,
                     instance = %params.instance,
                     tool = %params.tool,
                     context_id = %ctx.context_id,
-                    request_id = %request_id,
-                    allow = answer.allow,
-                    remember = ?answer.remember,
-                    "permission ask answered",
+                    ask = %outcome.ask_description(),
+                    "permission ask allowed",
                 );
-                if answer.allow {
-                    PermissionAskOutcome::Proceed
-                } else {
-                    PermissionAskOutcome::Denied(format!(
-                        "permission ask: denied by subscriber{}",
-                        answer
-                            .remember
-                            .as_deref()
-                            .map(|r| format!(" (remember={r})"))
-                            .unwrap_or_default()
-                    ))
-                }
+                PermissionAskOutcome::Proceed
+            }
+            crate::kj::gate::GateVerdict::Denied => {
+                tracing::debug!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    ask = %outcome.ask_description(),
+                    "permission ask denied",
+                );
+                PermissionAskOutcome::Denied(format!(
+                    "permission ask: denied [{}]: {}",
+                    outcome.ask_description(),
+                    outcome.reason
+                ))
+            }
+            crate::kj::gate::GateVerdict::Unavailable => {
+                tracing::warn!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    ask = %outcome.ask_description(),
+                    reason = %outcome.reason,
+                    "permission ask gate unavailable; refusing (fail-closed)",
+                );
+                PermissionAskOutcome::Unavailable(format!(
+                    "permission ask: gate unavailable [{}]: {}",
+                    outcome.ask_description(),
+                    outcome.reason
+                ))
             }
         }
     }
@@ -3195,8 +3171,6 @@ mod tests {
     use std::future::Future;
     use std::time::Duration;
 
-    use super::super::permission::PermissionAnswer;
-
     use async_trait::async_trait;
     use futures::future::BoxFuture;
     use serde_json::json;
@@ -4158,8 +4132,6 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
-                permission_asker: RwLock::new(None),
-                permission_ask_timeout: RwLock::new(crate::mcp::permission::DEFAULT_PERMISSION_ASK_TIMEOUT),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -4335,8 +4307,6 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
-                permission_asker: RwLock::new(None),
-                permission_ask_timeout: RwLock::new(crate::mcp::permission::DEFAULT_PERMISSION_ASK_TIMEOUT),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -5722,8 +5692,6 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
-                permission_asker: RwLock::new(None),
-                permission_ask_timeout: RwLock::new(crate::mcp::permission::DEFAULT_PERMISSION_ASK_TIMEOUT),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -7132,47 +7100,13 @@ mod tests {
         }
     }
 
-    // ── D-57: HookAction::Ask ───────────────────────────────────────────
-
-    /// Test double for `PermissionAsker`. Records the last request it saw
-    /// (so tests can assert on the auto-generated description / hook_id /
-    /// context wiring) and answers with a scripted `PermissionOutcome`,
-    /// optionally after a delay — the delay is what exercises the timeout
-    /// path without a real client.
-    struct ScriptedAsker {
-        outcome: PermissionOutcome,
-        delay: Option<Duration>,
-        last_request: Mutex<Option<PermissionAskRequest>>,
-    }
-
-    impl ScriptedAsker {
-        fn new(outcome: PermissionOutcome) -> Arc<Self> {
-            Arc::new(Self {
-                outcome,
-                delay: None,
-                last_request: Mutex::new(None),
-            })
-        }
-
-        fn with_delay(outcome: PermissionOutcome, delay: Duration) -> Arc<Self> {
-            Arc::new(Self {
-                outcome,
-                delay: Some(delay),
-                last_request: Mutex::new(None),
-            })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl PermissionAsker for ScriptedAsker {
-        async fn ask(&self, request: PermissionAskRequest) -> PermissionOutcome {
-            *self.last_request.lock().await = Some(request);
-            if let Some(delay) = self.delay {
-                tokio::time::sleep(delay).await;
-            }
-            self.outcome.clone()
-        }
-    }
+    // ── D-57 / Slice 4.7: HookAction::Ask melted into the ledger ────────
+    // (`docs/gate-and-shell-split.md`, "The shared seam"). These tests
+    // replace the old `ScriptedAsker` double — there is nothing left to
+    // script; `run_permission_ask` now calls `kj::gate::run_gate` for
+    // real, so these tests wire a real `KjDispatcher` (mirroring
+    // `wired_kaish_broker` above) and answer/inspect the durable ledger
+    // row directly, the same way `mcp/servers/shell.rs`'s gate tests do.
 
     fn ask_entry(id: &str, description: Option<&str>) -> HookEntry {
         HookEntry {
@@ -7189,10 +7123,89 @@ mod tests {
         }
     }
 
-    /// A subscriber that answers "allow" lets the call through.
+    /// Wire a broker for hook-`Ask` tests: documents, kernel, and a real
+    /// `kj` dispatcher — `run_permission_ask` now needs one to reach
+    /// `run_gate` (mirrors `wired_kaish_broker` above, plus a caller-supplied
+    /// `TimeoutPolicy` so the unanswered-ask test can shrink `gate_wait_timeout`
+    /// instead of waiting the real default).
+    async fn wired_hook_ask_broker(
+        name: &str,
+        policy: kaijutsu_types::TimeoutPolicy,
+    ) -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
+        use crate::drift::shared_drift_router;
+        use crate::kernel_db::KernelDb;
+        use crate::kj::KjDispatcher;
+
+        let kernel = Arc::new(crate::Kernel::new_ephemeral(name).await.with_timeouts(policy));
+        let store = crate::block_store::shared_block_store(PrincipalId::system());
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        {
+            let db = kernel_db.lock();
+            db.get_or_create_default_workspace(PrincipalId::system())
+                .unwrap();
+        }
+        let kj_dispatcher = Arc::new(KjDispatcher::new(
+            shared_drift_router(),
+            store.clone(),
+            kernel_db,
+            kernel.clone(),
+        ));
+        kj_dispatcher.set_self_arc();
+
+        let broker = kernel.broker().clone();
+        broker.set_documents(store).await;
+        broker.set_kernel(&kernel).await;
+        broker.set_kj_dispatcher(&kj_dispatcher).await;
+        broker.relax_unbound_deny_for_test();
+        (broker, kj_dispatcher)
+    }
+
+    /// A hook `Ask` is gated (like `shell_write`) — a test that calls it
+    /// synchronously leaves a pending ledger ask and must answer its own
+    /// ask (the way `kj ledger allow/deny` would from another shell) or
+    /// the call blocks until `gate_wait_timeout`. Spawn this BEFORE the
+    /// call it answers. Mirrors `mcp/servers/shell.rs`'s
+    /// `spawn_gate_answerer`.
+    fn spawn_gate_answerer(
+        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+        allow: bool,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let pending = {
+                    let db = db.lock();
+                    approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap()
+                };
+                if let Some(row) = pending.into_iter().next() {
+                    let db = db.lock();
+                    let conn = db.conn_for_ledger();
+                    approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
+                    approval_ledger::decide::decide(
+                        conn,
+                        &row.request_id,
+                        approval_ledger::decide::DecideInput {
+                            allow,
+                            decided_by: Some(b"test-approver"),
+                            decided_option: Some(if allow { "allow_once" } else { "deny" }),
+                            remember_scope: None,
+                            auto_reason: None,
+                        },
+                    )
+                    .unwrap();
+                    return row.request_id;
+                }
+            }
+            panic!("no pending gate ask appeared within 4s");
+        })
+    }
+
+    /// A hook `Ask` answered **allow** through the ledger lets the call
+    /// proceed — the melt's happy path.
     #[tokio::test]
-    async fn permission_ask_allow_lets_call_proceed() {
-        let broker = Arc::new(Broker::new());
+    async fn a_hook_ask_answered_allow_lets_the_call_proceed() {
+        let (broker, d) =
+            wired_hook_ask_broker("ask-allow", kaijutsu_types::TimeoutPolicy::default()).await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
             .register_silently(server, InstancePolicy::default())
@@ -7206,34 +7219,21 @@ mod tests {
             .entries
             .push(ask_entry("ask-allow", None));
 
-        let asker = ScriptedAsker::new(PermissionOutcome::Answered(PermissionAnswer {
-            allow: true,
-            selected_option_id: None,
-            remember: None,
-        }));
-        broker.set_permission_asker(asker.clone()).await;
-
+        let answerer = spawn_gate_answerer(d.kernel_db().clone(), true);
         let ok = broker
             .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
             .await
             .unwrap();
+        answerer.await.unwrap();
         assert!(!ok.is_error);
-
-        // The request the bridge saw carries the auto-generated
-        // description (no override was set on the hook) and the firing
-        // hook's own id.
-        let seen = asker.last_request.lock().await.clone().unwrap();
-        assert_eq!(seen.description, "svc.t");
-        assert_eq!(seen.hook_id, "ask-allow");
-        assert_eq!(seen.instance, "svc");
-        assert_eq!(seen.tool, "t");
     }
 
-    /// A subscriber that answers "deny" blocks the call as
-    /// `McpError::Denied`, same channel as `HookAction::Deny`.
+    /// A hook `Ask` answered **deny** through the ledger blocks the call
+    /// as `McpError::Denied` — a real verdict, not `GateUnavailable`.
     #[tokio::test]
-    async fn permission_ask_deny_blocks_call() {
-        let broker = Arc::new(Broker::new());
+    async fn a_hook_ask_answered_deny_blocks_the_call_as_denied() {
+        let (broker, d) =
+            wired_hook_ask_broker("ask-deny", kaijutsu_types::TimeoutPolicy::default()).await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
             .register_silently(server, InstancePolicy::default())
@@ -7247,105 +7247,27 @@ mod tests {
             .entries
             .push(ask_entry("ask-deny", Some("about to do something risky")));
 
-        let asker = ScriptedAsker::new(PermissionOutcome::Answered(PermissionAnswer {
-            allow: false,
-            selected_option_id: None,
-            remember: Some("session".into()),
-        }));
-        broker.set_permission_asker(asker.clone()).await;
-
+        let answerer = spawn_gate_answerer(d.kernel_db().clone(), false);
         let err = broker
             .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
             .await
             .unwrap_err();
+        answerer.await.unwrap();
         assert!(matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "ask-deny"));
-
-        let seen = asker.last_request.lock().await.clone().unwrap();
-        assert_eq!(seen.description, "about to do something risky");
     }
 
-    /// D-57 fail-closed default #1: no `PermissionEvents` subscriber
-    /// attached at all (`set_permission_asker` never called) refuses the
-    /// call rather than silently letting it through — but as
-    /// `McpError::GateUnavailable`, not `McpError::Denied`. Nobody rendered
-    /// a verdict; the gate itself was missing (Amy's ruling, 2026-08-17,
-    /// `docs/gate-and-shell-split.md`). Renamed from
-    /// `permission_ask_no_subscriber_denies` and the assertion changed from
-    /// `Denied` to `GateUnavailable` — this is the honest reclassification
-    /// Slice 2 exists to make, not a weakened check: the call still fails
-    /// closed, only the *kind* of failure is now distinguishable.
+    /// Nobody answers, the (shrunk) `gate_wait_timeout` elapses, the ask
+    /// row expires — refused as `McpError::GateUnavailable`, distinguishably
+    /// from a human's `Denied` (Amy's ruling, 2026-08-17,
+    /// `docs/gate-and-shell-split.md`: "gate unavailable" and "denied"
+    /// must be distinguishable to a model).
     #[tokio::test]
-    async fn permission_ask_no_subscriber_is_gate_unavailable() {
-        let broker = Arc::new(Broker::new());
-        let server = Arc::new(MockServer::new("svc").with_tool("t"));
-        broker
-            .register_silently(server, InstancePolicy::default())
-            .await
-            .unwrap();
-        broker
-            .hooks()
-            .write()
-            .await
-            .pre_call
-            .entries
-            .push(ask_entry("ask-no-sub", None));
-
-        let err = broker
-            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
-            .await
-            .unwrap_err();
-        match err {
-            McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-no-sub"),
-            other => panic!("expected GateUnavailable, got {other:?}"),
-        }
-    }
-
-    /// D-57 fail-closed default #1, variant: a bridge IS attached but its
-    /// own registry is empty, so it reports `NoSubscriber` explicitly
-    /// rather than the kernel inferring it from an absent bridge. Same
-    /// fail-closed refusal either way, and same reclassification as above:
-    /// `GateUnavailable`, not `Denied` — nothing rendered a verdict here
-    /// either. Renamed from `permission_ask_bridge_reports_no_subscriber_denies`.
-    #[tokio::test]
-    async fn permission_ask_bridge_reports_no_subscriber_is_gate_unavailable() {
-        let broker = Arc::new(Broker::new());
-        let server = Arc::new(MockServer::new("svc").with_tool("t"));
-        broker
-            .register_silently(server, InstancePolicy::default())
-            .await
-            .unwrap();
-        broker
-            .hooks()
-            .write()
-            .await
-            .pre_call
-            .entries
-            .push(ask_entry("ask-empty-registry", None));
-        broker
-            .set_permission_asker(ScriptedAsker::new(PermissionOutcome::NoSubscriber))
-            .await;
-
-        let err = broker
-            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            McpError::GateUnavailable { ref by_hook, .. } if by_hook.0 == "ask-empty-registry"
-        ));
-    }
-
-    /// D-57 fail-closed default #2: a subscriber is attached but doesn't
-    /// answer within the timeout — must not hang the turn forever, and
-    /// must resolve to the same fail-closed refusal as no-subscriber. The
-    /// test shrinks the timeout (`set_permission_ask_timeout_for_test`) so
-    /// this doesn't block the suite for the real 30s production default.
-    /// Reclassified like the two tests above: a timeout is a broken
-    /// control, not a verdict, so the error is `GateUnavailable`, not
-    /// `Denied`. Renamed from `permission_ask_timeout_denies`.
-    #[tokio::test]
-    async fn permission_ask_timeout_is_gate_unavailable() {
-        let broker = Arc::new(Broker::new());
+    async fn an_unanswered_hook_ask_expires_as_gate_unavailable() {
+        let policy = kaijutsu_types::TimeoutPolicy {
+            gate_wait_timeout: Duration::from_millis(400),
+            ..kaijutsu_types::TimeoutPolicy::default()
+        };
+        let (broker, _d) = wired_hook_ask_broker("ask-timeout", policy).await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
             .register_silently(server, InstancePolicy::default())
@@ -7359,30 +7281,14 @@ mod tests {
             .entries
             .push(ask_entry("ask-timeout", None));
 
-        // Asker "answers allow" but only after 200ms — the 20ms test
-        // timeout must win, and the call must still be refused (a slow
-        // subscriber is not a substitute for a real one within budget).
-        let asker = ScriptedAsker::with_delay(
-            PermissionOutcome::Answered(PermissionAnswer {
-                allow: true,
-                selected_option_id: None,
-                remember: None,
-            }),
-            Duration::from_millis(200),
-        );
-        broker.set_permission_asker(asker).await;
-        broker
-            .set_permission_ask_timeout_for_test(Duration::from_millis(20))
-            .await;
-
         let started = std::time::Instant::now();
         let err = broker
             .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
             .await
             .unwrap_err();
         assert!(
-            started.elapsed() < Duration::from_millis(150),
-            "must resolve at the 20ms timeout, not wait for the 200ms answer",
+            started.elapsed() >= Duration::from_millis(400),
+            "must actually wait out the gate's own budget, not resolve early",
         );
         match err {
             McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-timeout"),
@@ -7390,11 +7296,101 @@ mod tests {
         }
     }
 
-    /// A `HookAction::Ask` with `match_context` set correctly threads the
-    /// firing context's id onto the wire request — needed so a future ACP
-    /// adapter can route the prompt to the right session.
+    /// **The most valuable new test.** `Origin::Hook` was defined,
+    /// documented, and never constructed until this melt; `NewAsk::hook_id`
+    /// was a nullable column nobody populated. This proves the ledger row
+    /// a hook `Ask` creates actually carries the columns that were always
+    /// there: `context_id`, `hook_id`, `instance`, `tool`, and
+    /// `origin = Hook` — read back straight from `approval_ledger::ask::get_approval`,
+    /// not inferred from the call's outcome.
     #[tokio::test]
-    async fn permission_ask_request_carries_context_id() {
+    async fn a_hook_ask_ledger_row_carries_context_hook_instance_and_tool() {
+        let (broker, d) =
+            wired_hook_ask_broker("ask-row", kaijutsu_types::TimeoutPolicy::default()).await;
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-row", Some("carries the row")));
+
+        let mut ctx = CallContext::test();
+        let target_ctx = ContextId::new();
+        ctx.context_id = target_ctx;
+
+        let broker2 = broker.clone();
+        let gate_call = tokio::spawn(async move {
+            broker2
+                .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
+                .await
+        });
+
+        let db = d.kernel_db().clone();
+        let mut request_id = String::new();
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let pending = {
+                let db = db.lock();
+                approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap()
+            };
+            if let Some(row) = pending.into_iter().next() {
+                request_id = row.request_id;
+                break;
+            }
+        }
+        assert!(!request_id.is_empty(), "no pending ask appeared within 4s");
+
+        let row = {
+            let db = db.lock();
+            approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                .unwrap()
+                .expect("the ask row must exist")
+        };
+        assert_eq!(row.context_id, target_ctx.as_bytes().to_vec());
+        assert_eq!(row.hook_id.as_deref(), Some("ask-row"));
+        assert_eq!(row.instance.as_deref(), Some("svc"));
+        assert_eq!(row.tool.as_deref(), Some("t"));
+        assert_eq!(row.description, "carries the row");
+        assert_eq!(row.origin, approval_ledger::types::Origin::Hook);
+
+        // Let the spawned call finish so the test doesn't leak the task.
+        {
+            let db = db.lock();
+            let conn = db.conn_for_ledger();
+            approval_ledger::claim::claim(conn, &request_id, b"test-approver").unwrap();
+            approval_ledger::decide::decide(
+                conn,
+                &request_id,
+                approval_ledger::decide::DecideInput {
+                    allow: true,
+                    decided_by: Some(b"test-approver"),
+                    decided_option: Some("allow_once"),
+                    remember_scope: None,
+                    auto_reason: None,
+                },
+            )
+            .unwrap();
+        }
+        let result = gate_call
+            .await
+            .unwrap()
+            .expect("an allowed call must proceed");
+        assert!(!result.is_error);
+    }
+
+    /// The misconfiguration case: no `KjDispatcher` wired at all (a bare
+    /// `Broker::new()`, same as every other broker.rs test in this file
+    /// that doesn't call `set_kj_dispatcher`) — there is nowhere to run
+    /// the gate. Refused as `GateUnavailable`, never `Denied`: nobody
+    /// rendered a verdict, the control itself was missing.
+    #[tokio::test]
+    async fn a_hook_ask_with_no_dispatcher_wired_is_gate_unavailable_not_denied() {
         let broker = Arc::new(Broker::new());
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -7407,24 +7403,15 @@ mod tests {
             .await
             .pre_call
             .entries
-            .push(ask_entry("ask-ctx", None));
+            .push(ask_entry("ask-no-dispatcher", None));
 
-        let asker = ScriptedAsker::new(PermissionOutcome::Answered(PermissionAnswer {
-            allow: true,
-            selected_option_id: None,
-            remember: None,
-        }));
-        broker.set_permission_asker(asker.clone()).await;
-
-        let mut ctx = CallContext::test();
-        let target_ctx = ContextId::new();
-        ctx.context_id = target_ctx;
-        broker
-            .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
+        let err = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
             .await
-            .unwrap();
-
-        let seen = asker.last_request.lock().await.clone().unwrap();
-        assert_eq!(seen.context_id, target_ctx);
+            .unwrap_err();
+        match err {
+            McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-no-dispatcher"),
+            other => panic!("expected GateUnavailable (misconfiguration), not Denied: {other:?}"),
+        }
     }
 }
