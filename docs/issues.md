@@ -6902,3 +6902,24 @@ ever sees the preview, and the engraver's output is the tune's. Nobody has
 measured a streamed diff on this path. If it bites, the fix is a debounce
 scoped to `RichKindInfo::is_drawn()` blocks in `Running` status — the one place
 the legacy rule was actually earning its keep — not a general one.
+
+## Text effects on the surface: the instance buffer IS the map (2026-08-18)
+
+Amy asked whether shader-driven colored text (the original reason for the
+MSDF route) can come back via "maps of text and positions". Answer: the
+glyph instance buffer already is that map — per-glyph doc position, quad,
+UV, color — so effects return as per-instance attributes + glyph-shader
+work, not texture post-processing:
+- Rainbow = flag bit + hue(doc pos, time); `time` is already a uniform.
+- Halo/glow/outline = widen the MSDF distance thresholds (a field op —
+  crisper than the legacy 9-tap blur over baked pixels).
+- Chase-through-caption = give caption glyph runs a perimeter-parameter
+  attribute synced with the chrome chase phase.
+- Semantic maps (glyph→word/span/block) are cheap to bake at assembly time
+  from the byte ranges shaping already knows.
+Neighborhood effects (cross-glyph blur, distortion) are the one class that
+wants a texture: if ever needed, draw the glyph lane to an intermediate
+viewport-sized layer and composite with a post shader — slots into the
+existing pass order, never per-block, so the tall-block trap stays dead.
+This is the intended route for restoring rainbow + the deferred
+chase-brightening/halo entries above.
