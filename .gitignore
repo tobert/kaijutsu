@@ -21,3 +21,8 @@ node_modules/
 # signoff.md — ephemeral, personal cross-session handoff; never commit.
 # Shared working notes live in docs/issues.md and docs/devlog.md.
 signoff.md
+
+# Per-context continuity files (kaijutsu-chan.md etc.) — the same ephemeral
+# handoff pattern as signoff.md, but written by a kernel context about itself
+# so it survives its own restarts. Never commit.
+*-chan.md

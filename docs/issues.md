@@ -6,6 +6,345 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Triage of a real context's 37 "failed tool calls" (2026-08-16)
+
+Amy noticed `kaijutsu-chan` (a `director` seat on deepseek-v4-flash) showing
+**37 failed tool calls** and asked whether that was model error or a tool
+problem — and whether a `method_missing` response listing available tools
+would help. Triaged against the live context. Four findings, in descending
+order of how much they matter.
+
+### 1. There were 12 failures, not 37 — the count triples every one
+
+Each failed call paints **three** error-status blocks: the `tool_call`, the
+`tool_result`, and the companion `BlockKind::Error`. 12 × 3 = 36, plus one
+orphan stream error = the 37 on screen. Whatever counts "failed tool calls"
+for the UI should count *calls*, not error-status blocks, or every failure
+reads as three.
+
+### 2. Two of the twelve are not failures at all — `;`-chain exit-code bleed
+
+A `;`-separated command chain is judged by the **last** command's exit status,
+and a nonzero one prefixes the *entire* accumulated stdout with `Error:`.
+Both instances produced exactly the output the caller wanted:
+
+- `... ; grep -n "signoff\|chan" .gitignore ; ls kaijutsu-chan.md` — the `ls`
+  found nothing (the file didn't exist yet), so a perfectly good `git status` +
+  `wc -l` + `grep` result came back labelled `Error:  M .gitignore`.
+- `for f in /etc/rc/musician/*; do echo "FILE: $f"; head -25 "$f"; done` —
+  `head` on a directory exits 1, so a listing that correctly enumerated all
+  four rc verb directories came back as `Error:`.
+
+That is ~17% of the "failures" being successes wearing an error label, and it
+actively teaches a model that a working command didn't work. Worth deciding
+what a multi-command chain's status should mean — kaish reports the last
+command's exit faithfully, so the question is whether the *tool* should be
+flagging `is_error` off it, or off something else (any nonzero? all nonzero?
+an explicit `set -e`?).
+
+### 3. `method_missing` would have caught ZERO of them
+
+None of the twelve is an unknown or missing tool. The breakdown:
+
+| cause | n |
+|---|---|
+| kaish parse error | 9 |
+| `;`-chain exit bleed (false failure) | 2 |
+| `old_string not found` on a file edit | 1 |
+
+So the immediate motivation doesn't hold up. The idea may still be worth
+having on its own merits — and the semantic-search-by-relevance angle is the
+interesting half, since `builtin.tool_search` already exists and could back it
+— but it should be justified by a case where a model actually reached for a
+tool that wasn't there, not by this.
+
+### 4. The parse errors are the model's fault, and the error messages are good
+
+This is the part worth being honest about. kaish's diagnostics are excellent —
+line:column, an explanation, and worked examples:
+
+```
+1:4 [parse]: an unquoted comma splits this into separate words — kaish
+reserves `,` (brace expansion, lists); quote a comma-bearing argument to keep
+it one word, e.g. cut -f "1,3", sort -k "2,2n", or echo "a,b"
+  | ps -o pid,pcpu,etime,stat,cmd -p 2286142; …
+```
+
+The model was told exactly what was wrong, where, and how to fix it — and made
+the same *class* of error nine times (`echo ===` word-pasting and unquoted
+commas, mostly). The full detail does reach the model: the `tool_result` block
+carries all of it. Only the companion `Error` block truncates to the first
+line, which is a display concern, not a model-facing one.
+
+**Conclusion: model error, well-diagnosed.** The lever is not better errors —
+it is getting these constructs into the kaish primer so they are avoided rather
+than diagnosed. The freehand-model trap list (bare `===`, bare `yes`/`no`, bare
+`,`, compound-into-pipe, `grep -e`) is uniform enough to be a short primer
+paragraph, and every one is a *lexer* error on a construct that is idiomatic
+in bash — which is precisely why a model reaches for all of them.
+
+**And most of that lever is already built upstream — it just isn't pulled.**
+Amy, 2026-08-16: *"the unquoted comma gets better after kaish upgrades I
+think."* Confirmed against `~/src/kaish` `CHANGELOG.md` `[Unreleased]`
+(a891cc5), i.e. past the 0.14.1 we have not yet bumped to:
+
+- **BREAKING: comma is significant only inside a `[...]`/`{...}` literal or
+  pattern** — `sed -n 1,3p`, `cut -f 1,3`, `sort -k 2,2n`, `echo a,b,c` all
+  work unquoted. That deletes an entire class of these failures rather than
+  diagnosing it.
+- **`kaish-help` gained three Foundations fragments** — *a compound statement
+  cannot feed a pipe*, *`[ … ]` is not a command*, and *bare `yes`/`no` are
+  lexer errors* — and they now reach `Recipe::agent_onboarding()` and
+  `tool_description()`.
+
+The second is the one that matters structurally: `S05-kaish.kai` composes
+`kj kaish primer` from the linked `kaish-help` crate at every context create,
+with **no static copy in the CRDT to rot**. So a kaish bump delivers those
+warnings into every new context's system prompt with zero kaijutsu edits —
+exactly the payoff that design was for.
+
+Scoring the five traps against a bump: comma **fixed outright**, `yes`/`no` and
+compound-into-pipe **now warned in the primer**, leaving only bare `===`
+(word-pasting) and `grep -e` unaddressed. That reframes the kaish 0.14 → 0.15
+bump (filed separately below) from a dependency chore into a **tool-call
+reliability fix** — it is worth re-weighting against other work on that basis.
+
+### 5. One real bug, unrelated to the rest
+
+```
+stream error: Failed after 3 attempts: invalid request: An assistant message
+with 'tool_calls' must be followed by tool messages responding to each
+'tool_call_id'. (insufficient tool messages following tool_calls message)
+```
+
+A hydrated conversation went to the provider with a `tool_call` whose
+`tool_result` was missing. Keeping those pairs together is the stated job of
+`ConversationMailbox` (the atomicity gate, per `CLAUDE.md`), so this is either
+a gap in that gate or a path that bypasses it. Retried 3× and failed 3×, so
+it was not transient. Needs its own investigation — file/line unknown.
+
+---
+
+## `kj block read` rejects the block id that `kj block list` prints (2026-08-16)
+
+`kj block list` renders ids in a short form:
+
+```
+2d25fb02#60  system/error  [error]  tool error: …
+```
+
+Feeding that straight back in fails:
+
+```
+$ kj block read 2d25fb02#60
+kj block read: malformed id '2d25fb02#60' (expected context_hex_principal_hex_seq)
+```
+
+The accepted form is the full `01a00bbc…2d1e2d3_5948b2…fb02_60`, which the
+listing never shows — so the only way to read a block you just listed is to
+reassemble its id by hand from `kj context info` plus the principal hex. Found
+while triaging the entry above; it cost several turns and is very likely a
+contributor to models thrashing in the block tools.
+
+**A tool's output should be accepted as that tool family's input.** Either
+`block read` accepts the short form (resolving `<principal8>#<seq>` against
+the `--context` already supplied, which is unambiguous), or `block list`
+prints the full id. The first is better — the short form is what makes the
+listing readable.
+
+Amy, on the same thread: *"I wonder if we should hide the block tools from
+most kinds of context. y'all seem to really like peeking around in them. or at
+least we need to give you better search tools."* Worth noting the lever
+already exists — block tools are a binding (`kj binding allow builtin.block`,
+granted by the `director`/`coder` rc, withheld from `musician`), so scoping is
+a per-context_type rc edit, not new machinery. But the thrashing this entry
+documents is an *addressing* failure, not an excess-of-capability one: the
+tool could not be used correctly even by someone who wanted it. Fix the
+addressing before deciding the tools are the problem.
+
+---
+
+## The file write/edit tools are not gated by the approval ledger (Amy, 2026-08-16)
+
+Amy, after a director context rewrote this file wholesale: *"not bad but I
+suppose we need to get the write tool hooked up to the approval ledger soon."*
+
+`builtin.file:write` and `builtin.file:edit` are granted as ordinary capability
+tokens — a context either holds them or does not, and once held every write is
+unreviewed and unlogged. The approval ledger already exists and is already
+migrated into `KernelDb` (`KernelDb::migrate_ledger`, which calls the
+`approval_ledger` crate's own `migrate`), so the missing piece is routing the
+write tools' call path through it, not building a ledger.
+
+**Today's receipt.** A `context_type=director` context (cast `house`,
+deepseek-v4-flash) was asked to compress `docs/chameleon.md` and to *append*
+findings to `docs/issues.md`. It compressed both: `issues.md` went 5859 → 1969
+lines in a single edit (`@@ -6,3504 +6,30 @@`, 5117 deletions). Nothing was
+lost — `HEAD` held the full file and the rewrite was archived first — but
+nothing stood between the model and the file either. A ledger entry would have
+made the write reviewable *before* it landed rather than forensically
+afterwards.
+
+Note what this is **not** an argument for. Per `docs/instrument-design.md`
+("Many hands, one trust boundary"), the ledger is not a security boundary
+between players and must not become one: every player is inside the trust
+boundary and crosstalk is a feature. This is the ergonomic-nudge case — a large
+destructive edit is a *footgun*, and the ledger's job is to make it visible and
+undoable, exactly as Amy framed `kj cc send`: *"gated to start with… I want to
+start with watching it and exercising the ledger while we refine it."* The
+ledger is a learning instrument, not a verdict.
+
+Design questions this inherits from the gate work already queued: whether a
+model should be able to distinguish "gate unavailable" from "denied" (D-28
+collapses both into `McpError::Denied`), and whether approvals are
+digest-keyed. Both are already awaiting Amy's ruling — see the gate entries
+below.
+
+A cheaper partial that is worth considering on its own: a **size-delta
+threshold**. An edit that removes more than N lines or more than X% of a file
+is categorically different from an edit that changes a function, and that
+distinction needs no ledger at all.
+
+---
+
+## A kaibo-like `kaish_ro` — the read-only twin exists, the scratch space doesn't (Amy, 2026-08-16)
+
+Amy: *"we may also end up offering a kaibo-like `kaish_ro` tool, with the
+mutating shell having (more) approvals in it — a kaijutsu variant of `kaish_ro`
+might have some scratch space and stuff mapped for text processing, not as
+strict as kaibo, but still constrained for fun and safety."*
+
+**Half of this is already built and it is worth knowing which half.** The
+read-only twin exists: `builtin.shell_readonly` exposes a `read_only_shell`
+tool (`kernel.rs:782-794`), it is what a `toolie` gets, and it pins
+`ExternalExec::Deny` (`kj/context_shell.rs:390`) over a structurally read-only
+mount backend. So the *tool* is not the gap.
+
+**The gap is that `Deny` means no host subprocess at all** — no `sed`, `awk`,
+`sort`, `rg`, `jq`. Only kaish builtins and `kj`. That is *stricter* than
+kaibo, which allows a curated read-only host toolset, and it is exactly why
+"text processing" doesn't work in the read-only shell today. Amy's "not as
+strict as kaibo" reads as being about writes; the honest comparison is that on
+the exec axis we are already stricter, and on the write axis we are all-or-
+nothing.
+
+What that suggests, concretely: a **third `ExternalExec` variant** — a curated
+allow-list of non-mutating binaries plus a per-context writable scratch dir
+mapped into the VFS, so `sort | uniq -c > /scratch/counts` works without
+opening the tree. Two constraints on how it gets built:
+
+- **It must be a variant of the existing enum, not a new exec site.** CLAUDE.md
+  is explicit: host exec has one owner, and `ExternalExec::Allow{path}|Deny`
+  (`runtime/embedded_kaish.rs:78-86`, set in `kj/context_shell.rs`) is the one
+  place exec authority, ignore config, output limits, and VFS cwd resolution
+  live. A second policy path re-derives what kaish already owns and drifts.
+- **A binary allow-list is a nudge, not a boundary.** `find -exec`, `awk`'s
+  `system()`, `sed -i`, and `sort -o` all mutate; a curated list is
+  mistake-prevention (footguns absent by construction), which is precisely the
+  capability doctrine in `docs/instrument-design.md`. Do not let it be
+  described as a security control — every player is inside the trust boundary
+  already.
+
+**Why this pairs with the approval-ledger entry above, and is arguably
+prerequisite to it: approval fatigue kills a gate.** If every `ls` and `grep`
+needs a ledger entry, the ledger becomes noise and gets clicked through, which
+is worse than no ledger — the record exists and means nothing. Splitting the
+surface is what keeps the mutating shell's approvals rare enough to actually be
+read. So the ordering is: widen the read-only shell until it is genuinely the
+comfortable default, *then* tighten approvals on the mutating one.
+
+Open: whether the scratch dir is per-context or per-session, and whether it is
+a real host tmpdir mapped in or a VFS-native surface (the latter keeps the
+"one owner" property but means host binaries can't see it, which defeats the
+purpose — probably a real dir, VFS-mounted).
+
+---
+
+## `kj rc render <context_type>` — let one context type assimilate another (Amy, 2026-08-16)
+
+Amy: *"some way to quickly assimilate another context type… one we have done a
+few times now is start with orchestrator but load musician expertise by reading
+its RC code so we can know how to talk to a musician."*
+
+The maneuver already works and costs no kernel code — `kj rc list` filtered by
+type, then `kj rc show` on each script, about eight calls. It has been done by
+hand several times. The verb is worth having for a reason other than call
+count.
+
+**Render, never run.** The `.kai` half has real side effects — `kj binding
+allow`, `kj block create`, `kj cache add`, and `musician/create/S20-arm.kai`
+does a `transport attach`. A "dry run" that executes either mutates the caller
+or needs a throwaway context, and the throwaway costs a document, a `contexts`
+row, and a pile of rc `Trace` blocks to clean up afterwards. Quoting the source
+is honest and, for the script that matters most, plenty readable:
+`S10-binding.kai` is literally a list of `kj binding allow` lines.
+
+**Reframe to third person — this is the whole value-add.** rc stance is
+second-person imperative: `musician/create/S00-stance.md` opens *"You're a
+musician here, playing on an internal beat."* A director that concatenates that
+into its own context has been handed **instructions, not information**, which
+is how an orchestrator starts playing bass instead of conducting. The render
+must emit *"a musician is told…", "a musician can…", "a musician is driven
+by…"*. That transformation is precisely what `cat` cannot do and a verb can.
+
+**Three parts, and the stance is only one of them:**
+
+| part | source | what it tells the orchestrator |
+|---|---|---|
+| stance | the `.md` files | how it thinks |
+| allow-set | `S10-binding.kai` | what you can actually *ask it for* |
+| verb set | `ls /etc/rc/<type>/` | the interaction protocol |
+
+The verb set is free and probably the most useful row. `musician` has
+`create / fork / rotate / tick`; `director` has `create / fork / drift`. So: a
+musician is driven by `tick` and page-turns on `rotate`; a director is reached
+by `drift`. That *is* the answer to "how do I talk to one," and it is a
+directory listing.
+
+**Prefer `kj rc render` over a `kj context assimilate`** that lands the briefing
+as a `Role::System` block on the caller. Keep the landing separate and let the
+model choose (`kj rc render musician | kj block create --role system`):
+
+- auto-injecting into the system prompt fights the `--target=system` cache
+  breakpoint that `S20-cache.kai` sets, so every assimilation silently costs a
+  cache write
+- there is no undo for a system block short of `block exclude` + fork, and
+  "I want to know how musicians work" should not be a one-way door
+
+Admin-shaped and occasional, so it is a `kj` verb and earns no wire method —
+the rule in `CLAUDE.md` ("kj is good enough for all admin-like stuff").
+
+Related, already shipped: type composition itself exists via rc symlinks —
+`bassist` is 100% symlinks into `musician`, all seven scripts. What is missing
+is composing knowledge *across* types at runtime, which is what this is.
+
+---
+
+## Did the modeled clock ever phase-lock to a real MIDI master? (2026-08-16)
+
+`kj transport list` shows an `ear` track with `clock=modeled` at **338 BPM**,
+playhead 399800, dormant, one attachment, and its score context is not live.
+338 BPM is not a tempo anyone dials in, which leaves two readings and they have
+opposite consequences:
+
+- a previous session fed the M3 edge estimator **real** clock-in references and
+  it converged on a wrong-but-derived number — in which case the wire worked
+  end-to-end at least once and the estimator has a bug worth finding
+- the value is synthetic (a test fixture, a default, a free-running phasor that
+  drifted) — in which case M3 has never seen a real master and "modeled clock
+  works" is unproven
+
+Find out which before a live jam trusts the modeled clock. The estimator is
+described in `docs/midi.md` M3; `kj transport clock <system|modeled>` is the
+switch.
+
+(Found by the `kaijutsu-chan` director context during a pre-jam sweep. Its two
+other observations were dropped on review: the "kaijutsu-server burns 92% CPU"
+finding is a **false positive** — `kj` executes in-process, so the server's
+cumulative CPU is every session's shell commands all day, and a clean 10-second
+idle sample measures 0%; the zorak audio-stack-down note is host ops state, not
+repo backlog.)
+
 ## Hi-res wheel (v120) blocked at winit/sctk — slow drags are a compositor dead zone (2026-08-16)
 
 Amy's MX Master free-spin wheel: slow drags produce NOTHING until ~a full
