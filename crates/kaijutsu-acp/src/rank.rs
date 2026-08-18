@@ -63,19 +63,36 @@ pub fn ranked_context_ids(contexts: &[ContextInfo]) -> Vec<ContextId> {
 
 /// The ACP session list: the rank, rendered as `SessionInfo`.
 ///
-/// ACP requires a cwd, so contexts without durable cwd state are deliberately
-/// omitted rather than assigned a process-wide directory they never owned.
-pub fn ranked_sessions(
-    contexts: &[ContextInfo],
-    cwds: &std::collections::HashMap<ContextId, PathBuf>,
-) -> Vec<SessionInfo> {
+/// ACP requires a cwd, and every ranked context gets an entry — a context
+/// with no durable cwd (one created by a hook, the app, or `kj context
+/// create` rather than an ACP session) is defaulted to `fallback_cwd`
+/// (the directory the ACP client itself connected from), never dropped.
+///
+/// Amy's ruling (2026-08-18): omitting a cwd-less context used to hide it
+/// from the picker entirely — on a live 67-context kernel, only the
+/// ACP-created ones (a third of the total) ever showed up. Resuming or
+/// loading a session sets its real cwd anyway (`start_session` calls
+/// `set_context_cwd`), so the fallback is a default a session outgrows on
+/// first use, not a fabrication left standing — and a defaulted directory
+/// is a smaller lie than an invisible session.
+pub fn ranked_sessions(contexts: &[ContextInfo], fallback_cwd: &Path) -> Vec<SessionInfo> {
     let by_id: std::collections::HashMap<ContextId, &ContextInfo> =
         contexts.iter().map(|c| (c.id, c)).collect();
     ranked_context_ids(contexts)
         .into_iter()
         .filter_map(|id| by_id.get(&id).copied())
-        .filter_map(|c| cwds.get(&c.id).map(|cwd| session_info(c, cwd)))
+        .map(|c| session_info(c, &effective_cwd(c, fallback_cwd)))
         .collect()
+}
+
+/// A context's display cwd: its own durable value if it has one, else the
+/// fallback. Named (not an inline `unwrap_or`) so a reader of
+/// `ranked_sessions` can see exactly which entries are defaulted.
+fn effective_cwd(context: &ContextInfo, fallback: &Path) -> PathBuf {
+    context
+        .cwd
+        .clone()
+        .unwrap_or_else(|| fallback.to_path_buf())
 }
 
 fn session_info(c: &ContextInfo, cwd: &Path) -> SessionInfo {
@@ -135,6 +152,7 @@ mod tests {
             background_last_exit_code: None,
             cast_label: None,
             origin_host: None,
+            cwd: None,
         }
     }
 
@@ -205,8 +223,8 @@ mod tests {
     fn session_info_carries_the_label_as_title() {
         let mut c = ctx("household-agent");
         c.last_activity_at = Some(1_700_000_000_000);
-        let cwds = std::collections::HashMap::from([(c.id, PathBuf::from("/tmp/work"))]);
-        let infos = ranked_sessions(&[c.clone()], &cwds);
+        c.cwd = Some(PathBuf::from("/tmp/work"));
+        let infos = ranked_sessions(&[c.clone()], Path::new("/fallback"));
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].session_id, session_id_of(c.id));
         assert_eq!(infos[0].title.as_deref(), Some("household-agent"));
@@ -216,35 +234,60 @@ mod tests {
 
     #[test]
     fn an_unlabelled_context_falls_back_to_its_short_id() {
-        let c = ctx("");
-        let cwds = std::collections::HashMap::from([(c.id, PathBuf::from("/tmp"))]);
-        let infos = ranked_sessions(std::slice::from_ref(&c), &cwds);
+        let mut c = ctx("");
+        c.cwd = Some(PathBuf::from("/tmp"));
+        let infos = ranked_sessions(std::slice::from_ref(&c), Path::new("/fallback"));
         assert_eq!(infos[0].title.as_deref(), Some(c.id.short().as_str()));
     }
 
+    /// The defect-2 regression guard: a context with no durable cwd used to
+    /// be silently dropped from the picker (`filter_map` over a lookup
+    /// miss). It must now appear, carrying the fallback cwd instead of the
+    /// context's own (absent) one.
     #[test]
-    fn context_without_a_durable_cwd_is_not_misrepresented() {
+    fn context_without_a_durable_cwd_gets_the_client_fallback() {
         let c = ctx("legacy");
-        assert!(ranked_sessions(&[c], &std::collections::HashMap::new()).is_empty());
+        assert!(c.cwd.is_none(), "fixture must start with no durable cwd");
+        let fallback = Path::new("/home/amy/src/kaijutsu");
+        let infos = ranked_sessions(&[c.clone()], fallback);
+        assert_eq!(infos.len(), 1, "a cwd-less context must still be listed");
+        assert_eq!(infos[0].cwd, fallback.to_path_buf());
+    }
+
+    /// The general form of the same guard: however many contexts the rank
+    /// produces, `ranked_sessions` must return exactly that many entries —
+    /// a `filter_map`/lookup-miss silently dropping one is exactly the bug
+    /// that made two thirds of a live kernel's contexts unbrowsable.
+    #[test]
+    fn returned_count_always_equals_the_ranked_context_count() {
+        let with_cwd = {
+            let mut c = ctx("has-cwd");
+            c.cwd = Some(PathBuf::from("/work/has-cwd"));
+            c
+        };
+        let without_cwd = ctx("no-cwd");
+        let contexts = [with_cwd, without_cwd];
+        let ranked_count = ranked_context_ids(&contexts).len();
+        let infos = ranked_sessions(&contexts, Path::new("/fallback"));
+        assert_eq!(infos.len(), ranked_count);
+        assert_eq!(infos.len(), 2);
     }
 
     #[test]
-    fn each_session_reports_its_own_context_cwd() {
+    fn each_session_reports_its_own_context_cwd_or_the_fallback() {
         let mut a = ctx("alpha");
         a.last_activity_at = Some(2_000);
+        a.cwd = Some(PathBuf::from("/work/alpha"));
         let mut b = ctx("beta");
         b.last_activity_at = Some(1_000);
-        let cwds = std::collections::HashMap::from([
-            (a.id, PathBuf::from("/work/alpha")),
-            (b.id, PathBuf::from("/work/beta")),
-        ]);
-        let infos = ranked_sessions(&[a.clone(), b.clone()], &cwds);
+        // beta has no durable cwd — it must get the fallback, not vanish.
+        let infos = ranked_sessions(&[a.clone(), b.clone()], Path::new("/fallback"));
         let by_id = infos
             .into_iter()
             .map(|info| (info.session_id, info.cwd))
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(by_id[&session_id_of(a.id)], PathBuf::from("/work/alpha"));
-        assert_eq!(by_id[&session_id_of(b.id)], PathBuf::from("/work/beta"));
+        assert_eq!(by_id[&session_id_of(b.id)], PathBuf::from("/fallback"));
     }
 
     #[test]

@@ -963,6 +963,7 @@ mod tests {
             background_last_exit_code: None,
             cast_label: None,
             origin_host: None,
+            cwd: None,
         }
     }
 

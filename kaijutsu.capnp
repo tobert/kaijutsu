@@ -826,6 +826,15 @@ struct ContextHandleInfo {
   # mints a new context per MCP relaunch"). `kj context info`/`list` render
   # empty as "-".
   originHost @29 :Text;
+
+  # Durable working directory (`context_shell.cwd`, `kj/context_shell.rs`) —
+  # the same fact `getContextCwd`/`setContextCwd` read and write, carried
+  # here so a listing caller (ACP's `session/list`, `kj context list`) never
+  # has to loop a per-context RPC just to learn it. Empty = none recorded
+  # (a context nobody has run a shell command against yet), same
+  # absence-is-the-wire-sentinel convention as `castLabel`/`originHost`
+  # above.
+  cwd @30 :Text;
 }
 
 struct PresetInfo {

@@ -460,6 +460,11 @@ pub struct ContextInfo {
     /// once via `setContextOriginHost`; never overwritten by a later
     /// resume/attach from a different machine.
     pub origin_host: Option<String>,
+    /// Durable working directory (`context_shell.cwd`), or `None` when
+    /// nothing has ever set one (empty on the wire) — the same fact
+    /// `get_context_cwd` reads, carried here so a listing caller never has
+    /// to loop a per-context RPC just to learn it (`ContextHandleInfo.cwd`).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3426,6 +3431,15 @@ fn parse_context_info(
         Some(origin_host_str.to_string())
     };
 
+    // Empty = no durable cwd recorded yet — same "absence is the wire
+    // sentinel" convention as `cast_label`/`origin_host` above.
+    let cwd_str = reader.get_cwd()?.to_str().unwrap_or("");
+    let cwd = if cwd_str.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(cwd_str))
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -3456,6 +3470,7 @@ fn parse_context_info(
         background_last_exit_code,
         cast_label,
         origin_host,
+        cwd,
     })
 }
 

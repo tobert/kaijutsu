@@ -2301,10 +2301,13 @@ impl KernelImpl {
 /// registry/runtime-only fields (`traceId`, `liveStatus`, `trackId`,
 /// synthesis keywords/preview, usage/background-process summaries) at their
 /// wire defaults: honest absence, not fabricated from data this path never
-/// had.
+/// had. `cwd` is an exception — it is durable (`context_shell`, not
+/// registry-only), so the caller reads it alongside the `ContextRow` and
+/// passes it in here rather than leaving it at the wire default.
 fn write_context_row_to_handle_info(
     mut info: context_handle_info::Builder<'_>,
     row: &ContextRow,
+    cwd: Option<&str>,
 ) {
     info.set_id(row.context_id.as_bytes());
     info.set_label(row.label.as_deref().unwrap_or(""));
@@ -2327,6 +2330,7 @@ fn write_context_row_to_handle_info(
     info.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
+    info.set_cwd(cwd.unwrap_or(""));
 }
 
 /// Verify a context can be joined, healing the DriftRouter registration from
@@ -3721,6 +3725,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = self.kernel.kernel.clone();
         let kernel_db_arc = self.kernel.kernel_db.clone();
+        let kernel_state = self.kernel.clone();
         let _kernel_id = self.kernel.id;
         let semantic_index = self.kernel.semantic_index.clone();
         let documents = self.kernel.documents.clone();
@@ -3867,6 +3872,18 @@ impl kernel::Server for KernelImpl {
                         c.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
                     }
 
+                    // Durable working directory (`context_shell.cwd`) — a
+                    // synchronous, sub-ms KernelDb read per row (same table
+                    // `getContextCwd`/`setContextCwd` hit), NOT a second RPC.
+                    // This is the whole point of carrying `cwd` on
+                    // `ContextHandleInfo`: a caller that used to loop
+                    // `getContextCwd` once per context over the wire (68
+                    // round trips for 67 contexts) now gets it for free on
+                    // the one `listContexts` call.
+                    if let Some(cwd) = context_cwd(&kernel_state, ctx.id) {
+                        c.set_cwd(cwd.to_string_lossy().as_ref());
+                    }
+
                     // Context-window usage — the bottom-dock gauge's wire spine
                     // (kaijutsu.capnp ContextHandleInfo doc comment). No usage
                     // row = never completed an LLM call: honest sentinels,
@@ -3959,20 +3976,30 @@ impl kernel::Server for KernelImpl {
         let kernel_db_arc = self.kernel.kernel_db.clone();
         Promise::from_future(
             async move {
-                let row = {
+                let (row, cwd) = {
                     let db = kernel_db_arc.lock();
-                    db.find_context_by_label(&label).map_err(|e| {
+                    let row = db.find_context_by_label(&label).map_err(|e| {
                         capnp::Error::failed(format!(
                             "resolve_context_label: KernelDb lookup for '{label}' failed: {e}"
                         ))
-                    })?
+                    })?;
+                    // Same lock scope as the row lookup — one round trip
+                    // through the DB guard for both, rather than dropping
+                    // and re-acquiring it.
+                    let cwd = row.as_ref().and_then(|r| {
+                        db.get_context_shell(r.context_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|shell| shell.cwd)
+                    });
+                    (row, cwd)
                 };
                 let mut res = results.get();
                 match row {
                     Some(row) => {
                         res.set_found(true);
                         let info = res.init_info();
-                        write_context_row_to_handle_info(info, &row);
+                        write_context_row_to_handle_info(info, &row, cwd.as_deref());
                     }
                     None => res.set_found(false),
                 }
