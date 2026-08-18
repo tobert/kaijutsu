@@ -28,7 +28,6 @@ use super::context::CallContext;
 use super::error::{HookId, McpError, McpResult, PolicyError};
 use super::hook_table::{AskSpec, HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
-use super::permission::{PermissionAskOutcome, PermissionAsker};
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
@@ -186,19 +185,6 @@ pub struct Broker {
     /// `kj mcp list` instead of requiring a log grep — "loud, not silent"
     /// extends to *after* the boot log has scrolled by.
     external_mcp_failures: RwLock<Option<Vec<(String, String)>>>,
-    /// **Retired wire, kept only so `kaijutsu-server` still builds.**
-    /// `HookAction::Ask` no longer reads this field — `run_permission_ask`
-    /// melted into `kj::gate::run_gate` (`docs/gate-and-shell-split.md`,
-    /// "The shared seam"), so an ask is a durable ledger row from the
-    /// start and needs no bridge to a connected client's subscription.
-    /// `set_permission_asker` still exists (and `create_shared_kernel`
-    /// still calls it) because deleting the method is a separate
-    /// demolition commit that also retires `PermissionEvents`,
-    /// `mcp/permission.rs`, and `kaijutsu.capnp`'s `subscribePermissionEvents`
-    /// — out of scope here. Whatever is set here is written and never
-    /// read.
-    #[allow(dead_code)] // written by set_permission_asker, never read; see that method's doc
-    permission_asker: RwLock<Option<Arc<dyn PermissionAsker>>>,
 }
 
 impl Default for Broker {
@@ -211,6 +197,24 @@ impl std::fmt::Debug for Broker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Broker").finish_non_exhaustive()
     }
+}
+
+/// What [`Broker::run_permission_ask`] decided, distinguishing a real
+/// verdict from a broken control (`docs/gate-and-shell-split.md`, "'Gate
+/// unavailable' and 'denied' must be distinguishable to a model"). One
+/// producer, one consumer, both in this file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PermissionAskOutcome {
+    /// The gate resolved `Allowed`. The call proceeds.
+    Proceed,
+    /// The gate resolved `Denied` — a real verdict. `reason` is
+    /// tracing/hook-visible prose, not shown to the model directly.
+    Denied(String),
+    /// The gate resolved `Unavailable`, or no `KjDispatcher` was wired at
+    /// all. Both mean "the gate could not do its job" to a caller deciding
+    /// what to do next, so they collapse to one variant here; `reason`
+    /// keeps the specific flavor for tracing.
+    Unavailable(String),
 }
 
 impl Broker {
@@ -236,7 +240,6 @@ impl Broker {
             kj_dispatcher: RwLock::new(None),
             enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
             external_mcp_failures: RwLock::new(None),
-            permission_asker: RwLock::new(None),
         }
     }
 
@@ -269,17 +272,6 @@ impl Broker {
     /// `kj` tool. Called at server bootstrap after `Arc::new(KjDispatcher::new(...))`.
     pub async fn set_kj_dispatcher(&self, dispatcher: &Arc<crate::kj::KjDispatcher>) {
         *self.kj_dispatcher.write().await = Some(Arc::downgrade(dispatcher));
-    }
-
-    /// **Retired wire** (`docs/gate-and-shell-split.md`, "The shared
-    /// seam"): `HookAction::Ask` now runs through `kj::gate::run_gate`
-    /// directly and never reads `self.permission_asker`. This setter is
-    /// kept only so `kaijutsu-server`'s `create_shared_kernel` still
-    /// builds without editing `kaijutsu-server` in this commit — the wire
-    /// this bridges (`PermissionEvents`, `mcp/permission.rs`) retires in a
-    /// follow-up demolition, and this method goes with it.
-    pub async fn set_permission_asker(&self, asker: Arc<dyn PermissionAsker>) {
-        *self.permission_asker.write().await = Some(asker);
     }
 
     /// Upgrade the stashed `Weak<KjDispatcher>` (set via [`Self::set_kj_dispatcher`]).
@@ -4140,7 +4132,6 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
-                permission_asker: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -4316,7 +4307,6 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
-                permission_asker: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -5702,7 +5692,6 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
-                permission_asker: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());

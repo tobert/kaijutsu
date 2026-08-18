@@ -230,8 +230,8 @@ impl SshServer {
     /// before the server starts accepting connections.
     ///
     /// Test-only hook. Most wire behaviors have a real RPC surface a test
-    /// can drive to produce a genuine event (e.g. `permission_ask_wire.rs`
-    /// uses `hook_add` + `call_mcp_tool`). `LedgerFlow` has no such surface
+    /// can drive to produce a genuine event (e.g. a test using `hook_add` +
+    /// `call_mcp_tool`). `LedgerFlow` has no such surface
     /// reachable without exercising the approval-ledger's rule/escalation
     /// machinery, which is out of this crate's territory — so
     /// `ledger_events_wire.rs` uses this to publish `LedgerFlow::Changed`
