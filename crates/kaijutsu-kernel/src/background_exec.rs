@@ -1853,7 +1853,7 @@ mod tests {
         use crate::block_store::shared_block_store_with_db;
         let principal = PrincipalId::new();
         let db = Arc::new(parking_lot::Mutex::new(
-            crate::kernel_db::KernelDb::in_memory().expect("in-memory KernelDb"),
+            crate::kernel_db::KernelDb::temporary().expect("temporary KernelDb"),
         ));
         let ws_id = db.lock().get_or_create_default_workspace(principal).expect("workspace");
         let blocks = shared_block_store_with_db(db.clone(), ws_id, principal);

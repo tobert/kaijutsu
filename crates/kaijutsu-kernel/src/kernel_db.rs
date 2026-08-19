@@ -11437,7 +11437,7 @@ mod tests {
     ///    must classify as `DuplicateDocument`, carrying the right id.
     #[test]
     fn block_provenance_roundtrip_and_cascade() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let doc_id = ContextId::new();
         db.insert_document(&DocumentRow {
