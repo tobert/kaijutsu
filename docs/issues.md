@@ -45,6 +45,41 @@ delete the KernelDb row from slice 2 if this lands.
 
 ---
 
+## The file cache's size limit is a suggestion when buffers are dirty (2026-08-19)
+
+`evict_if_needed` (`file_tools/cache.rs:726-748`) skips dirty entries, and when
+every resident entry is dirty it warns and `break`s. Both call sites then
+`cache.insert(...)` unconditionally, so the cache grows past `max_cached` (64)
+for as long as nothing flushes. It is a soft cap, not a limit.
+
+On its own that is a reasonable trade — evicting a dirty entry would drop
+unsaved work. It compounds with the fact next to it: **`flush_dirty` has no
+callers outside `cache.rs`**, so nothing routinely returns dirty entries to
+clean. Dirty buffers are neither bounded while the kernel runs nor flushed when
+it stops. Slice 2 gives them a durable home, which changes what the right
+answer is here — revisit after it lands.
+
+---
+
+## Does `invalidate_document` still earn its keep? (2026-08-19)
+
+`invalidate` drops the in-memory entry; `invalidate_document` also deletes the
+backing document. Since the cold-miss reconcile landed, dropping the in-memory
+entry is by itself enough to force a fresh VFS read on the next access — which
+is what the stronger call existed to guarantee.
+
+The config-shadow rationale was re-verified and the *hazard* is real: the editor
+and `kj rc` write config through `block_store.edit_text` directly, never through
+`ConfigDocFs::write_all`, so the per-path generation never advances and a
+resident shadow has no coherence signal. But that argues for invalidating the
+shadow, which plain `invalidate` already does. Whether deleting the document on
+top of that still buys anything is untested either way.
+
+Worth a test before a deletion: prove a config write followed by plain
+`invalidate` is picked up. If it is, prefer deleting the mechanism.
+
+---
+
 ## `edit` names two different things on two surfaces (2026-08-18)
 
 A coder has two editing surfaces, and the same word means opposite things on
