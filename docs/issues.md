@@ -6,20 +6,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## File buffers: slices 3-5 remain (2026-08-19)
+## File buffers: slices 4-5 remain (2026-08-19)
 
-Slices 1 and 2 of `docs/file-buffers.md` shipped (`11c21b69`, `38f77ae2`). The
-kernel no longer serves months-old content, and a dirty buffer survives a cold
-cache as a recovered swap instead of being reconciled away. The standing "do not
-edit through the kernel file tools" warning is lifted.
+Slices 1, 2 and 3 of `docs/file-buffers.md` shipped (`11c21b69`, `38f77ae2`,
+`997bcc1a`). The kernel no longer serves months-old content, a dirty buffer
+survives a cold cache as a recovered swap instead of being reconciled away, and
+`:w` now refuses when disk moved past the buffer's load generation (`:w!`
+overrides). The standing "do not edit through the kernel file tools" warning is
+lifted.
 
 What is left:
 
-- **Slice 3, the `:w` W12 guard.** `disk_changed_since_load` is recorded on the
-  cache entry and `dirty_file_buffers.loaded_generation` survives a restart, but
-  nothing consumes either yet: `:w` still does not refuse when disk moved under
-  the buffer, and `:w!` is still identical to `:w`. This is the guard that would
-  have stopped the original incident.
 - **Slice 4, the tool surface.** Remove `write` and `grep`, make `edit`
   hashline-only, add `create_file`. Note this now interacts with kaish's
   forthcoming `edit` builtin — decide whether the MCP tool is retired in favor of
@@ -27,12 +24,13 @@ What is left:
 - **Slice 5, the wire fields.** `swapRecovered` and `diskChangedSinceLoad` on
   `EditorState`, both additive, plus the renderer work.
 
-**No player can currently see a recovered swap.** The kernel enforces one — a
-flush refuses until `acknowledge_swap` — but nothing announces it:
-`list_dirty_file_buffers` has no consumer, there is no `kj` verb, and the wire
-fields are slice 5. That is half of rule 4. Amy has approved a **read-only VFS
-mount** as the answer, so swaps are discoverable with `ls` and `grep` the way
-vim's sidecar file is; model it on `runtime/docs_filesystem.rs`.
+**A recovered swap is discoverable but still not announced.** The read side
+shipped — `/v/swap/<kernel_id>/<real path>` (`runtime/swap_filesystem.rs`)
+serves the unsaved buffer to `ls`/`cat`/`grep` the way vim's sidecar file does.
+What is missing is the *push*: a player who does not go looking still learns
+nothing. `list_dirty_file_buffers` has no consumer, there is no `kj` verb, and
+the `EditorState` fields are slice 5. Rule 4's enforcement is real (a flush
+refuses until `acknowledge_swap`); its announcement is not.
 
 ## Opening a file that already has an editor session should announce it (2026-08-19)
 
