@@ -627,6 +627,9 @@ pub fn spawn_background(
         let registry = task_registry;
         let written = Arc::new(AtomicUsize::new(0));
         let capped = Arc::new(AtomicBool::new(false));
+        // One projection state for the block, shared by both pipes — see
+        // `AnsiDrain` for why it can't be per-task.
+        let ansi = Arc::new(parking_lot::Mutex::new(AnsiDrain::new()));
 
         let out_task = tokio::spawn(drain_to_block(
             stdout,
@@ -636,6 +639,7 @@ pub fn spawn_background(
             principal_id,
             written.clone(),
             capped.clone(),
+            ansi.clone(),
         ));
         let err_task = tokio::spawn(drain_to_block(
             stderr,
@@ -645,6 +649,7 @@ pub fn spawn_background(
             principal_id,
             written,
             capped,
+            ansi.clone(),
         ));
 
         enum WaitOutcome {
@@ -691,6 +696,12 @@ pub fn spawn_background(
         // Let the drains finish (they hit EOF once the child's pipes close).
         let _ = out_task.await;
         let _ = err_task.await;
+
+        // Buffer-until-done provenance (docs/ansi-and-beyond.md): the spans
+        // and the original bytes land once, after the final append, so oplog
+        // replay — which re-applies appends and would clear spans set early —
+        // reproduces exactly this state.
+        finalize_ansi(&blocks, ctx_id, block_id, ansi);
 
         match final_status {
             Ok(status) => {
@@ -764,11 +775,113 @@ fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
     }
 }
 
+/// The `ansi-strip` ingest state for ONE background block — shared by both
+/// drain tasks, because both of them append into that same block.
+///
+/// This is the streaming half of `docs/ansi-and-beyond.md`, and the only place
+/// in kaijutsu where escape sequences can straddle a read boundary. Three
+/// things live here, all of which have to agree:
+///
+/// - **One [`StripParser`], not one per stream.** The two drains interleave
+///   into a single block, so the block's content is the concatenation of both
+///   pipes in arrival order. Span offsets address *that* concatenation, and the
+///   CI invariant `strip(original) == (content, spans)` only holds if one
+///   parser saw one byte order. Two parsers would each produce offsets into
+///   their own stream and neither would fit the block. (It also means SGR state
+///   carries across the streams — which is what a terminal showing both on one
+///   tty does anyway.)
+/// - **A cursor into `parser.text()`.** The parser's text grows monotonically;
+///   each drain iteration appends only the slice past the cursor.
+/// - **`raw` and `raw_committed`.** `raw` is everything fed; `raw_committed` is
+///   the prefix whose projection actually reached the block. On completion the
+///   tail is dropped, so the stored original is exactly "what was ingested
+///   before the cap tripped" and `strip(original)` reproduces the block content
+///   verbatim.
+struct AnsiDrain {
+    parser: kaijutsu_ansi::StripParser,
+    /// Bytes of `parser.text()` already appended to the block.
+    cursor: usize,
+    /// Every raw byte fed to the parser.
+    raw: Vec<u8>,
+    /// Length of the `raw` prefix corresponding to `cursor`.
+    raw_committed: usize,
+    /// Whether any escape byte was ever seen. False ⇒ the whole fast path:
+    /// no tag, no row, no spans, and `raw` is dropped unread.
+    saw_escape: bool,
+}
+
+impl AnsiDrain {
+    fn new() -> Self {
+        Self {
+            parser: kaijutsu_ansi::StripParser::new(),
+            cursor: 0,
+            raw: Vec::new(),
+            raw_committed: 0,
+            saw_escape: false,
+        }
+    }
+
+    /// Feed one chunk; return the newly-projected text to append (may be
+    /// empty when the chunk was pure escape sequence, or ended mid-codepoint).
+    fn feed(&mut self, chunk: &[u8]) -> String {
+        if chunk.contains(&0x1b) {
+            self.saw_escape = true;
+        }
+        self.raw.extend_from_slice(chunk);
+        self.parser.feed(chunk);
+        self.parser.text()[self.cursor..].to_string()
+    }
+
+    /// Acknowledge that the text `feed` just returned reached the block.
+    /// Called only on a successful append, so a chunk dropped by the cap
+    /// leaves both cursors where they were.
+    fn commit(&mut self) {
+        self.cursor = self.parser.text().len();
+        self.raw_committed = self.raw.len();
+    }
+
+    /// The finished projection: the original bytes to store, and the spans
+    /// that describe the text actually in the block. `None` when no escape
+    /// byte was ever seen — the block is untouched by this transform.
+    fn finish(mut self) -> Option<(Vec<u8>, Vec<kaijutsu_ansi::StyleSpan>)> {
+        if !self.saw_escape {
+            return None;
+        }
+        let committed = self.cursor;
+        self.raw.truncate(self.raw_committed);
+        let (_, spans) = self.parser.finish();
+        let spans = spans
+            .into_iter()
+            .filter(|s| (s.start as usize) < committed)
+            .map(|mut s| {
+                s.end = s.end.min(committed as u32);
+                s
+            })
+            .collect();
+        Some((self.raw, spans))
+    }
+}
+
 /// Drain one pipe (stdout or stderr) into `block_id`, capping combined bytes
 /// (shared via `written`/`capped` with the sibling stream) at
 /// [`DEFAULT_OUTPUT_CAP`]. Keeps reading past the cap and discarding — never
 /// stops draining — so a runaway producer can't deadlock on a full pipe
 /// buffer once the cap trips.
+///
+/// Raw bytes go through the shared [`AnsiDrain`] before anything is appended,
+/// so what lands in the block is the clean projection. Two consequences worth
+/// stating:
+///
+/// - **The cap now counts clean bytes.** `DEFAULT_OUTPUT_CAP` bounds what the
+///   block actually holds, which is the cost we care about (persistent,
+///   replicated to every viewer). Escape sequences no longer eat a colorful
+///   command's output budget.
+/// - **Provenance is pre-cap in the sense that matters.** The stored original
+///   is the byte prefix whose projection reached the block; the trailing
+///   "output capped" marker is kaijutsu's own text and is deliberately NOT in
+///   the original. So for a capped block, `content == strip(original) +
+///   marker` rather than `== strip(original)`. Spans stay exact either way.
+#[allow(clippy::too_many_arguments)]
 async fn drain_to_block(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     blocks: SharedBlockStore,
@@ -777,6 +890,7 @@ async fn drain_to_block(
     principal_id: PrincipalId,
     written: Arc<AtomicUsize>,
     capped: Arc<AtomicBool>,
+    ansi: Arc<parking_lot::Mutex<AnsiDrain>>,
 ) {
     const CHUNK: usize = 8192;
     let mut buf = [0u8; CHUNK];
@@ -797,7 +911,15 @@ async fn drain_to_block(
             continue; // keep draining, discard — never re-enable
         }
 
-        let prev = written.fetch_add(n, Ordering::SeqCst);
+        // The lock spans feed-and-append so the byte order the parser saw is
+        // the byte order the block got. No `.await` inside it.
+        let mut ansi = ansi.lock();
+        let text = ansi.feed(&buf[..n]);
+        if text.is_empty() {
+            continue; // chunk was pure escape sequence, or a split codepoint
+        }
+
+        let prev = written.fetch_add(text.len(), Ordering::SeqCst);
         if prev >= DEFAULT_OUTPUT_CAP {
             if !capped.swap(true, Ordering::SeqCst) {
                 // Loud on failure, exactly like the normal-output append
@@ -824,12 +946,34 @@ async fn drain_to_block(
             continue;
         }
 
-        let text = String::from_utf8_lossy(&buf[..n]);
         if let Err(e) = blocks.append_text_as(context_id, &block_id, &text, Some(principal_id)) {
             tracing::warn!(error = %e, "background: append_text_as failed (document likely removed); dropping further output for this process");
             capped.store(true, Ordering::SeqCst);
+        } else {
+            ansi.commit();
         }
     }
+}
+
+/// Land the finished ANSI projection on a background block, once both drains
+/// have ended.
+///
+/// Ordering: this runs strictly after the last append. `append_text` keeps
+/// spans (offsets into earlier text stay valid), so the discipline is belt and
+/// braces here — but `edit_text` *clears* them, and "spans go last" is the one
+/// rule that survives someone later swapping an append for an edit.
+fn finalize_ansi(
+    blocks: &SharedBlockStore,
+    context_id: ContextId,
+    block_id: BlockId,
+    ansi: Arc<parking_lot::Mutex<AnsiDrain>>,
+) {
+    // Both drain tasks have joined, so this is the only remaining holder.
+    let state = std::mem::replace(&mut *ansi.lock(), AnsiDrain::new());
+    let Some((original, spans)) = state.finish() else {
+        return; // no escape bytes ever seen — the free path
+    };
+    crate::ansi_ingest::record(blocks, context_id, &block_id, spans, &original);
 }
 
 #[cfg(test)]
@@ -1653,5 +1797,177 @@ mod tests {
         wait_for(StdDuration::from_secs(5), || (!is_running(child_pid)).then_some(())).await;
 
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    // ---------------------------------------------------------------
+    // ANSI ingest (docs/ansi-and-beyond.md)
+    // ---------------------------------------------------------------
+
+    /// The chunk-boundary property, at the level that actually owns it.
+    ///
+    /// `AnsiDrain` is the thing that has to survive a sequence split across two
+    /// `read()`s: it appends only new text per chunk and has to end up with the
+    /// same total the one-shot transform would produce. Splitting at *every*
+    /// position proves it without depending on how a pipe happens to chunk.
+    #[test]
+    fn ansi_drain_is_split_invariant() {
+        let input = b"plain \x1b[1;31mbold red\x1b[0m tail \x1b[38;5;42mindexed\x1b[0m\n";
+        let (want_text, want_spans) = kaijutsu_ansi::strip(input);
+
+        for split in 0..=input.len() {
+            let mut drain = AnsiDrain::new();
+            let mut appended = String::new();
+            for chunk in [&input[..split], &input[split..]] {
+                if chunk.is_empty() {
+                    continue;
+                }
+                appended.push_str(&drain.feed(chunk));
+                drain.commit();
+            }
+            assert_eq!(appended, want_text, "text differs when split at {split}");
+            let (original, spans) = drain.finish().expect("input has escape bytes");
+            assert_eq!(original, input, "provenance must be byte-exact at split {split}");
+            assert_eq!(spans, want_spans, "spans differ when split at {split}");
+            assert_eq!(
+                kaijutsu_ansi::strip(&original),
+                (appended, spans),
+                "the standing invariant must hold at split {split}"
+            );
+        }
+    }
+
+    /// The fast path, at the same level: no escape byte anywhere means no
+    /// projection at all — no tag, no row, no spans.
+    #[test]
+    fn ansi_drain_without_escapes_projects_nothing() {
+        let mut drain = AnsiDrain::new();
+        assert_eq!(drain.feed(b"ordinary output\n"), "ordinary output\n");
+        drain.commit();
+        assert!(drain.finish().is_none(), "escape-free output must not project");
+    }
+
+    /// A block-store variant whose provenance rows are real. `setup()` builds a
+    /// db-less store (fine for output/status assertions), but a provenance row
+    /// only exists where a `KernelDb` does.
+    fn setup_with_db() -> (SharedBlockStore, ContextId, PrincipalId, crate::block_store::DbHandle) {
+        use crate::block_store::shared_block_store_with_db;
+        let principal = PrincipalId::new();
+        let db = Arc::new(parking_lot::Mutex::new(
+            crate::kernel_db::KernelDb::in_memory().expect("in-memory KernelDb"),
+        ));
+        let ws_id = db.lock().get_or_create_default_workspace(principal).expect("workspace");
+        let blocks = shared_block_store_with_db(db.clone(), ws_id, principal);
+        let ctx_id = ContextId::new();
+        blocks.create_document(ctx_id, DocKind::Conversation, None).expect("create doc");
+        (blocks, ctx_id, principal, db)
+    }
+
+    /// End-to-end through a real child process, with the SGR sequence
+    /// deliberately straddling the 8 KiB read boundary.
+    ///
+    /// `printf '%8190s\033[31m…'` emits 8190 spaces before the ESC, so the
+    /// first `read()` of the 8192-byte buffer ends *inside* `\x1b[31m` — the
+    /// exact case a per-chunk `String::from_utf8_lossy` (what this path used to
+    /// do) would smear into the block as visible garbage.
+    #[tokio::test]
+    async fn background_ansi_output_is_stripped_with_spans_and_provenance() {
+        let (blocks, ctx_id, principal, db) = setup_with_db();
+        let block_id = running_block(&blocks, ctx_id, principal);
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let id = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: r"printf '%8190s\033[31mRED\033[0m\n' ''".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .expect("spawn");
+
+        wait_for(StdDuration::from_secs(10), || {
+            let s = registry.get_for_context(id, ctx_id).unwrap();
+            (s.status == "exited").then_some(())
+        })
+        .await;
+
+        // `finalize_ansi` runs after the drains join, which is after the
+        // registry flips terminal — poll for the spans rather than assuming.
+        let snap = wait_for(StdDuration::from_secs(5), || {
+            let s = blocks.get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
+            (!s.style_spans.is_empty()).then_some(s)
+        })
+        .await;
+
+        assert!(
+            !snap.content.contains('\u{1b}'),
+            "no escape byte may survive the split-sequence boundary into block content"
+        );
+        assert!(snap.content.ends_with("RED\n"), "content tail: {:?}", &snap.content[8180..]);
+        let tag = snap.provenance.as_ref().expect("styled block must be tagged");
+        assert_eq!(tag.transform, kaijutsu_ansi::TRANSFORM_NAME);
+
+        let (_, original) = db
+            .lock()
+            .get_block_provenance(&block_id, kaijutsu_ansi::TRANSFORM_NAME)
+            .expect("provenance query")
+            .expect("a tagged block must have a row");
+        assert_eq!(
+            kaijutsu_ansi::strip(&original),
+            (snap.content.clone(), snap.style_spans.clone()),
+            "strip(original) must reproduce (content, style_spans) for a streamed block too"
+        );
+        // The span covers exactly "RED", after 8190 spaces.
+        assert_eq!(snap.style_spans.len(), 1);
+        assert_eq!(snap.style_spans[0].start, 8190);
+        assert_eq!(snap.style_spans[0].end, 8193);
+    }
+
+    /// The fast path end-to-end: an escape-free background command must leave
+    /// its block exactly as it was before this feature existed.
+    #[tokio::test]
+    async fn background_plain_output_stays_untagged() {
+        let (blocks, ctx_id, principal, db) = setup_with_db();
+        let block_id = running_block(&blocks, ctx_id, principal);
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let id = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "echo no-escapes-here".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .expect("spawn");
+
+        wait_for(StdDuration::from_secs(10), || {
+            let s = registry.get_for_context(id, ctx_id).unwrap();
+            (s.status == "exited").then_some(())
+        })
+        .await;
+        let snap = wait_for(StdDuration::from_secs(5), || {
+            let s = blocks.get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
+            (s.status == Status::Done).then_some(s)
+        })
+        .await;
+
+        assert_eq!(snap.content, "no-escapes-here\n");
+        assert!(snap.style_spans.is_empty());
+        assert!(snap.provenance.is_none());
+        assert_eq!(
+            db.lock()
+                .get_block_provenance(&block_id, kaijutsu_ansi::TRANSFORM_NAME)
+                .expect("provenance query"),
+            None,
+        );
     }
 }

@@ -1510,3 +1510,93 @@ fn test_get_blocks_returns_the_version_it_read_at() {
         );
     });
 }
+
+/// ANSI ingest over the wire (docs/ansi-and-beyond.md).
+///
+/// A shell command that emits SGR must reach every client as a *clean* block
+/// plus a span map plus a provenance tag — never as escape bytes in content.
+/// This is the server-side half of the hook: `shell_execute`'s stdout path
+/// strips before `edit_text_as` and lands the spans after it (an edit clears
+/// spans, so the reverse order would silently lose them).
+///
+/// The plain-output half of the assertion is the fast path: the *command*
+/// block, and any escape-free output, must stay exactly as they were —
+/// no tag, no spans.
+#[test]
+fn test_shell_ansi_output_arrives_stripped_with_spans_on_the_wire() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let context_id = kernel.create_context("ansi-ingest").await.unwrap();
+        kernel.join_context(context_id, "test-instance").await.unwrap();
+
+        // A literal ESC byte in the code — the `[ OK ]`-in-green boot line.
+        let cmd_block_id = kernel
+            .shell_execute("echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"", context_id, true)
+            .await
+            .expect("shell_execute");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let output = loop {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for shell output");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let blocks = kernel
+                .get_blocks(context_id, &kaijutsu_types::BlockQuery::All)
+                .await
+                .expect("get_blocks");
+            if let Some(b) = blocks.iter().find(|b| {
+                b.kind == kaijutsu_types::BlockKind::ToolResult
+                    && b.tool_call_id == Some(cmd_block_id)
+                    && matches!(
+                        b.status,
+                        kaijutsu_types::Status::Done | kaijutsu_types::Status::Error
+                    )
+            }) {
+                break b.clone();
+            }
+        };
+
+        assert!(
+            !output.content.contains('\u{1b}'),
+            "escape bytes must never reach a client: {:?}",
+            output.content
+        );
+        assert!(
+            output.content.contains("[ OK ] booted"),
+            "content must be the stripped projection: {:?}",
+            output.content
+        );
+        assert!(
+            !output.style_spans.is_empty(),
+            "the green OK must arrive as a span, not a color code"
+        );
+        let tag = output
+            .provenance
+            .as_ref()
+            .expect("a projected block must carry its provenance tag over the wire");
+        assert_eq!(tag.transform, "ansi-strip");
+
+        // Span offsets must address the content the client actually holds.
+        let span = &output.style_spans[0];
+        assert!(
+            output.content.is_char_boundary(span.start as usize)
+                && output.content.is_char_boundary(span.end as usize),
+            "span {span:?} must land on char boundaries of {:?}",
+            output.content
+        );
+        assert_eq!(&output.content[span.start as usize..span.end as usize], "OK");
+
+        // Fast path: the command block never went through the transform.
+        let blocks = kernel
+            .get_blocks(context_id, &kaijutsu_types::BlockQuery::All)
+            .await
+            .expect("get_blocks");
+        let cmd = blocks
+            .iter()
+            .find(|b| b.id == cmd_block_id)
+            .expect("command block");
+        assert!(cmd.style_spans.is_empty() && cmd.provenance.is_none());
+    });
+}

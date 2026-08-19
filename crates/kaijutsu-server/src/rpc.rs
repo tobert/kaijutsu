@@ -8380,7 +8380,18 @@ async fn execute_shell_command(
                 // (a successful-with-warnings command carries stderr + exit 0).
                 // The LLM still sees both: hydration merges stderr back into the
                 // tool_result content (see hydrate.rs).
-                let out_text = result.text_out().into_owned();
+                //
+                // ANSI ingest (docs/ansi-and-beyond.md): the raw bytes are the
+                // provenance, the projection is the block. `raw_stdout` reads
+                // `result.out` directly because `text_out()` is already lossy
+                // on the `Bytes` arm — storing a lossy "original" would defeat
+                // the whole point of keeping one.
+                let raw_out = kaijutsu_kernel::ansi_ingest::raw_stdout(&result);
+                let projection = kaijutsu_kernel::ansi_ingest::project(&raw_out);
+                let out_text = match projection {
+                    Some(ref p) => p.text.clone(),
+                    None => result.text_out().into_owned(),
+                };
                 if let Err(e) = documents_clone.edit_text_as(
                     context_id,
                     &output_block_id_clone,
@@ -8390,6 +8401,16 @@ async fn execute_shell_command(
                     Some(PrincipalId::system()),
                 ) {
                     log::error!("Failed to update shell output: {}", e);
+                }
+                // Strictly after the edit: `edit_text` clears style_spans.
+                if let Some(p) = projection {
+                    kaijutsu_kernel::ansi_ingest::record(
+                        &documents_clone,
+                        context_id,
+                        &output_block_id_clone,
+                        p.spans,
+                        &raw_out,
+                    );
                 }
 
                 if !result.err.is_empty()
@@ -8663,10 +8684,28 @@ async fn execute_kj_command(
                 message: latch.hint,
             }
         });
-    let stdout = result.text_out().into_owned();
+    // Same ANSI ingest as interactive shell stdout (docs/ansi-and-beyond.md):
+    // `kj` verbs colorize too, and the RPC caller gets the same clean
+    // projection the block does — one text, one set of byte offsets.
+    let raw_out = kaijutsu_kernel::ansi_ingest::raw_stdout(&result);
+    let projection = kaijutsu_kernel::ansi_ingest::project(&raw_out);
+    let stdout = match projection {
+        Some(ref p) => p.text.clone(),
+        None => result.text_out().into_owned(),
+    };
     let stderr = result.err.clone();
     documents.edit_text_as(context_id, &output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))
         .map_err(|e| capnp::Error::failed(format!("failed to persist kj output: {e}")))?;
+    // After the edit — `edit_text` clears style_spans.
+    if let Some(p) = projection {
+        kaijutsu_kernel::ansi_ingest::record(
+            &documents,
+            context_id,
+            &output_block_id,
+            p.spans,
+            &raw_out,
+        );
+    }
     if !stderr.is_empty() {
         documents.set_stderr(context_id, &output_block_id, Some(stderr.clone()))
             .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;

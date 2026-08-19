@@ -1838,6 +1838,37 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Record the pre-transform bytes for one (block, transform) in the
+    /// kernel's `block_provenance` table (docs/ansi-and-beyond.md).
+    ///
+    /// A thin delegate so ingest hook sites never reach for the raw
+    /// [`crate::kernel_db::KernelDb`]: they already hold the store, and the
+    /// store already owns the db handle. Deliberately NOT folded into
+    /// [`Self::set_style_spans`] — `journal_op` is not transactional today
+    /// (two autocommit statements under a mutex), so the provenance write is
+    /// its own statement either way, and hook sites order the two themselves
+    /// (row first, tag second: a crash between then leaves an orphan row,
+    /// never a tag pointing at bytes that were never stored).
+    ///
+    /// Returns `Ok(())` on a store with no db (replica/app/test stores):
+    /// provenance is a kernel-side durability concern, and a store that was
+    /// never asked to persist has nothing to lose. A *persistent* store with
+    /// no handle still errors, via `journaling_db`.
+    pub fn store_provenance(
+        &self,
+        block_id: &BlockId,
+        transform: &str,
+        version: u32,
+        original: &[u8],
+    ) -> BlockStoreResult<()> {
+        let Some(db) = self.journaling_db()? else {
+            return Ok(());
+        };
+        db.lock()
+            .insert_block_provenance(block_id, transform, version, original)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))
+    }
+
     /// Replace a block's styled spans and provenance tag together — the
     /// ingest projection landing late, or `kj block reproject` re-deriving it
     /// (docs/ansi-and-beyond.md).

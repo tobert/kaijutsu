@@ -761,21 +761,78 @@ fn insert_rc_failure_block(
             "rc {sort_key} failed: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\nexit_code: n/a\n\n{detail}"
         ),
     };
+    insert_rc_output_block(
+        dispatcher,
+        new_id,
+        BlockKind::Error,
+        summary,
+        Status::Error,
+        principal,
+        rc_path,
+        "failure",
+    );
+}
+
+/// Insert one rc capture block, projecting ANSI out of it first.
+///
+/// The RC boot aesthetic (docs/ansi-and-beyond.md) means these are the blocks
+/// most likely to be *deliberately* colorful — an rc script printing `[ OK ]`
+/// in green is the feature, not an accident. So the whole assembled `summary`
+/// (header lines plus the script's captured output) is what gets projected and
+/// what gets stored as the original: span offsets address block content, and
+/// the header prefix is part of that content. Projecting the detail alone
+/// would leave every offset short by the header's length.
+///
+/// The spans arrive as a follow-up `set_style_spans` rather than riding the
+/// inserted snapshot. That is one extra journal op on a path that runs once
+/// per context creation, and it buys the ordering rule stated in
+/// [`crate::ansi_ingest`] — text first, spans second — without every insert
+/// helper in the kernel needing to grow a spans argument.
+#[allow(clippy::too_many_arguments)]
+fn insert_rc_output_block(
+    dispatcher: &KjDispatcher,
+    new_id: ContextId,
+    kind: BlockKind,
+    summary: String,
+    status: Status,
+    principal: PrincipalId,
+    rc_path: &str,
+    what: &str,
+) {
+    let projection = crate::ansi_ingest::project(summary.as_bytes());
+    let original = projection.as_ref().map(|_| summary.clone());
+    let content = match projection {
+        Some(ref p) => p.text.clone(),
+        None => summary,
+    };
     let after = dispatcher.block_store().last_block_id(new_id);
-    if let Err(e) = dispatcher.block_store().insert_block_as(
+    match dispatcher.block_store().insert_block_as(
         new_id,
         None,
         after.as_ref(),
         Role::System,
-        BlockKind::Error,
-        summary,
-        Status::Error,
+        kind,
+        content,
+        status,
         ContentType::Plain,
         Some(principal),
     ) {
-        tracing::error!(
-            "rc lifecycle: could not insert failure block for {rc_path}: {e}"
-        );
+        Ok(block_id) => {
+            if let (Some(p), Some(original)) = (projection, original) {
+                crate::ansi_ingest::record(
+                    dispatcher.block_store(),
+                    new_id,
+                    &block_id,
+                    p.spans,
+                    original.as_bytes(),
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "rc lifecycle: could not insert {what} block for {rc_path}: {e}"
+            );
+        }
     }
 }
 
@@ -794,22 +851,16 @@ fn insert_rc_trace_block(
     let summary = format!(
         "rc {sort_key} trace: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\n\n{detail}"
     );
-    let after = dispatcher.block_store().last_block_id(new_id);
-    if let Err(e) = dispatcher.block_store().insert_block_as(
+    insert_rc_output_block(
+        dispatcher,
         new_id,
-        None,
-        after.as_ref(),
-        Role::System,
         BlockKind::Trace,
         summary,
         Status::Done,
-        ContentType::Plain,
-        Some(principal),
-    ) {
-        tracing::error!(
-            "rc lifecycle: could not insert trace block for {rc_path}: {e}"
-        );
-    }
+        principal,
+        rc_path,
+        "trace",
+    );
 }
 
 /// Stub `BlockSource` for `KjBuiltin`'s synthesis wiring. rc and hook
@@ -1079,6 +1130,98 @@ mod tests {
         assert!(
             body.contains("S00-echo.kai") || body.contains("S00"),
             "trace block must reference the script path or sort key, got: {body}"
+        );
+
+        // The fast path, asserted on the very block most likely to regress it:
+        // an rc script with no escape bytes must leave the block exactly as it
+        // was before ANSI ingest existed — no spans, no tag, no row.
+        assert!(trace_blocks[0].style_spans.is_empty(), "escape-free rc output must have no spans");
+        assert!(trace_blocks[0].provenance.is_none(), "escape-free rc output must stay untagged");
+        assert_eq!(
+            d.kernel_db()
+                .lock()
+                .get_block_provenance(&trace_blocks[0].id, kaijutsu_ansi::TRANSFORM_NAME)
+                .expect("provenance query"),
+            None,
+            "escape-free rc output must not write a provenance row"
+        );
+    }
+
+    /// The RC boot aesthetic (docs/ansi-and-beyond.md): an rc script that
+    /// prints SGR-colored output lands a *clean* Trace block plus the span map
+    /// and the original bytes. The standing invariant is asserted directly —
+    /// `strip(original) == (content, style_spans)` — because it is what
+    /// `kj block reproject` and the CI sweep both depend on.
+    ///
+    /// Note what the original is: the whole assembled block body, header lines
+    /// included, not just the script's stdout. Span offsets address block
+    /// content, so the transform has to run over the same string the block
+    /// stores.
+    #[tokio::test]
+    async fn rc_kai_ansi_output_lands_clean_text_spans_and_provenance() {
+        // `test_dispatcher_rc`, not `test_dispatcher`: provenance is a row in
+        // the kernel db, and only the rc dispatcher's block store is DB-backed.
+        // (A db-less store no-ops `store_provenance` — the same graceful
+        // degradation a replica store gets — which would make this test assert
+        // nothing about the row.)
+        let d = test_dispatcher_rc().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-color.kai",
+            "test",
+            "create",
+            "S00",
+            "color",
+            "kai",
+            // A literal ESC byte in the script source — the classic
+            // `[ OK ]`-in-green boot line, in miniature.
+            "echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"",
+        ).await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-color", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-color");
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let trace = snapshots
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+            .expect("colored script must still produce a trace block");
+
+        assert!(
+            trace.content.contains("[ OK ] booted"),
+            "block content must be the stripped projection, got: {:?}",
+            trace.content
+        );
+        assert!(
+            !trace.content.contains('\u{1b}'),
+            "no escape byte may survive into block content: {:?}",
+            trace.content
+        );
+        assert!(!trace.style_spans.is_empty(), "the green OK must produce at least one span");
+        let tag = trace.provenance.as_ref().expect("styled block must carry a provenance tag");
+        assert_eq!(tag.transform, kaijutsu_ansi::TRANSFORM_NAME);
+        assert_eq!(tag.version, kaijutsu_ansi::PARSER_VERSION);
+
+        let (version, original) = d
+            .kernel_db()
+            .lock()
+            .get_block_provenance(&trace.id, kaijutsu_ansi::TRANSFORM_NAME)
+            .expect("provenance query")
+            .expect("a tagged block must have a row — record() writes the row first");
+        assert_eq!(version, kaijutsu_ansi::PARSER_VERSION);
+        assert!(
+            original.contains(&0x1bu8),
+            "the stored original must be the pre-strip bytes, escapes and all"
+        );
+
+        // The standing invariant.
+        assert_eq!(
+            kaijutsu_ansi::strip(&original),
+            (trace.content.clone(), trace.style_spans.clone()),
+            "strip(original) must reproduce (content, style_spans) exactly"
         );
     }
 

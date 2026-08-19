@@ -128,6 +128,35 @@ the actual ingest paths, now load-bearing:
   warning), never corruption. Making journal_op transactional is a
   pre-existing issue, tracked separately.
 
+**Three more, from wiring the hooks (2026-08-19).**
+
+- **One policy function, six sites.** `kaijutsu-kernel/src/ansi_ingest.rs` owns
+  the whole decision: `project(raw) -> Option<AnsiProjection>` (a single
+  `memchr` for "no escape bytes" — the common case allocates nothing, sets no
+  tag, writes no row) and `record(...)`, which writes the **provenance row
+  before the tag** so durable state never claims an original that was not
+  stored. Every hook site is three lines: project, write the clean text where
+  the raw text went, record. `raw_stdout(&ExecResult)` is the matching
+  accessor for kaish results — `text_out()` is lossy on the `Bytes` arm and is
+  never the provenance source.
+- **`background_exec` needs ONE parser for the whole block, not one per
+  pipe.** Both drain tasks append into the same block, so block content is the
+  interleaving of stdout and stderr in arrival order. Span offsets address that
+  interleaving, and `strip(original) == (content, spans)` only holds if a
+  single parser saw a single byte order. The shared `AnsiDrain` (parser +
+  cursor into `parser.text()` + raw buffer + committed watermark) sits behind a
+  mutex the drains take across feed-and-append. Side effect worth having: the
+  old per-chunk `String::from_utf8_lossy` smeared any multi-byte codepoint that
+  straddled a read boundary; the parser doesn't.
+- **The background cap now counts clean bytes, and provenance stops where the
+  block does.** `DEFAULT_OUTPUT_CAP` bounds what the block actually holds (the
+  persistent, replicated thing), so escape sequences no longer eat a colorful
+  command's budget. The stored original is exactly the byte prefix whose
+  projection reached the block. Consequence to know when writing the CI sweep:
+  for a *capped* block, `content == strip(original) + the cap marker`, not
+  `== strip(original)` — kaijutsu's own marker is deliberately not in the
+  original. Spans are exact either way.
+
 One replay wrinkle to remember: oplog replay applies journaled semantic
 appends through `edit_text`, which clears spans (live end-appends via
 `append_text` keep them — offsets stay valid). Under buffer-until-done

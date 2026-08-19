@@ -1073,6 +1073,15 @@ async fn dispatch_inline_tool_result(
     )
     .await;
 
+    // ANSI ingest, same policy as the agentic path above: the projection is
+    // what the block stores AND what the model reads back.
+    let ansi = kaijutsu_kernel::ansi_ingest::project(content.as_bytes());
+    let raw_result = ansi.as_ref().map(|_| content.clone());
+    let content = match ansi {
+        Some(ref p) => p.text.clone(),
+        None => content,
+    };
+
     let final_status = if is_error { Status::Error } else { Status::Done };
     if let Some(result_block_id) = result_block_id {
         if !content.is_empty()
@@ -1086,6 +1095,16 @@ async fn dispatch_inline_tool_result(
             )
         {
             log::error!("Failed to write inline tool result text: {}", error);
+        }
+        // After the edit — `edit_text` clears style_spans.
+        if let (Some(p), Some(raw)) = (ansi, raw_result) {
+            kaijutsu_kernel::ansi_ingest::record(
+                documents,
+                context_id,
+                &result_block_id,
+                p.spans,
+                raw.as_bytes(),
+            );
         }
         let _ = documents.set_status(context_id, &result_block_id, final_status);
         if let Some(payload) = error_payload
@@ -2185,6 +2204,20 @@ async fn process_llm_stream(
                     )
                     .await;
 
+                    // Step 4b: ANSI ingest (docs/ansi-and-beyond.md). A tool
+                    // that shells out hands back escape codes; the model must
+                    // not see them (they burn tokens and, worse, poison the
+                    // byte-offset arithmetic every edit/exclusion range uses).
+                    // So the projection replaces the content for BOTH the
+                    // block and the conversation message below — one text, one
+                    // set of offsets, every player.
+                    let ansi = kaijutsu_kernel::ansi_ingest::project(result_content.as_bytes());
+                    let raw_result = ansi.as_ref().map(|_| result_content.clone());
+                    let result_content = match ansi {
+                        Some(ref p) => p.text.clone(),
+                        None => result_content,
+                    };
+
                     // Step 5: Write result content via a block edit
                     if let Some(ref rb_id) = result_block_id {
                         if !result_content.is_empty()
@@ -2198,6 +2231,16 @@ async fn process_llm_stream(
                             )
                         {
                             log::error!("Failed to write tool result text: {}", e);
+                        }
+                        // After the edit — `edit_text` clears style_spans.
+                        if let (Some(p), Some(raw)) = (ansi, raw_result) {
+                            kaijutsu_kernel::ansi_ingest::record(
+                                &documents,
+                                context_id,
+                                rb_id,
+                                p.spans,
+                                raw.as_bytes(),
+                            );
                         }
 
                         // Step 6: Set final status on result and call blocks

@@ -11,6 +11,7 @@
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 //! - Has a DriftRouter for cross-context communication (shared across fork/thread)
 
+pub mod ansi_ingest;
 pub mod background_exec;
 pub mod block_store;
 pub mod blocks;
