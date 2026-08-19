@@ -80,43 +80,17 @@ Worth a test before a deletion: prove a config write followed by plain
 
 ---
 
-## `KaijutsuBackend::patch` is not all-or-nothing (2026-08-19)
+## The swap marker and the content it marks are two writes (2026-08-19)
 
-`LocalBackend::patch` and `OverlayFs::patch` read the file, apply every
-`PatchOp` to an in-memory `String`, and write once — a compare-and-set failure
-on op 3 of 5 touches nothing. **Ours commits as it goes.**
-`KaijutsuBackend::patch` (`runtime/kaish_backend.rs:414-443`) loops
-`apply_patch_op`, and each call reaches `BlockStore::edit_text`, which journals
-to the durable oplog inside the call. A CAS failure mid-batch leaves the
-earlier ops durably committed with no rollback.
+`record_dirty_file_buffer` and `edit_text`'s oplog journal are separate
+statements in one database, not one transaction. A crash between them either
+loses the marker — and the cold path then reconciles the unsaved work away — or
+leaves a marker pointing at content never written.
 
-**This is now scheduled to become live, not hypothetical** (Amy, via
-kaish-lead, 2026-08-19): kaish's new `edit` "should not drop to whole file",
-and `patch` itself is to move off its whole-file `Replace`. Per-hunk `PatchOp`s
-with CAS are the direction, which makes batch atomicity load-bearing rather
-than incidental. A five-op batch failing on op 3 becomes a real partial write
-against our backend.
-
-Until then nothing exercises it: `patch` emits a single whole-file `Replace`,
-so every batch has one op.
-
-kaish's trait says only "Apply a sequence of patch operations to a file" and
-promises nothing about atomicity, so both sides built on behavior rather than a
-contract. **We are the non-conforming implementation and the fix is ours.**
-
-The shape is the one the sibling backends already use, and it needs no
-transaction: apply every op to an in-memory `String`, validating each CAS
-precondition as you go, and commit once with a single `edit_text` splice when
-the whole batch has succeeded. A failure then touches nothing.
-`reload_block_from_disk` in `file_tools/cache.rs` is the precedent for the
-single full-content splice. Today `apply_patch_op` both computes and commits,
-so separating those two jobs is the work.
-
-Related and worth deciding together: the swap marker and the content it marks
-are also written by two separate statements (`record_dirty_file_buffer` and
-`edit_text`'s journal). Same database, not the same transaction. A crash
-between them either loses the marker — and the cold path then reconciles the
-unsaved work away — or leaves a marker pointing at content never written.
+Surfaced alongside the `KaijutsuBackend::patch` atomicity bug, which shipped in
+`3cb3ed4f`; this half did not, and the fix shape is different (that one needed
+only to defer its single commit, this one needs two writes to share a
+boundary).
 
 ---
 
