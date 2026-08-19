@@ -6,6 +6,73 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## P1: the file cache serves months-old content and writes it back (2026-08-18)
+
+**Live, silent data corruption.** This is the root cause of today's
+`docs/issues.md` clobber, and it is not specific to that file.
+
+Measured against the running kernel, all on 2026-08-18:
+
+| path | kernel serves | disk truth |
+|---|---|---|
+| `crates/kaijutsu-kernel/src/mcp/servers/file.rs` | 1250 lines | 1798 |
+| `crates/kaijutsu-kernel/src/kj/ledger.rs` | 1221 | 2101 |
+| `crates/kaijutsu-kernel/src/kj/mod.rs` | 1084 | 1663 |
+| `crates/kaijutsu-kernel/src/mcp/error.rs` | 97 | 208 |
+| `AGENTS.md` | 102 | 422 |
+
+1250 lines is an exact match for `3321e597` — **2026-06-26**. The kernel is
+serving a file as it stood nearly two months ago, and a model reading it gets
+that content with no indication anything is wrong.
+
+The chain, all in `file_tools/cache.rs`:
+
+1. `file_context_id(path)` is `UUIDv5(NAMESPACE_URL, "kaijutsu:file:" + path)`
+   (`cache.rs:703`) — deterministic, so a path maps to the same document id
+   forever.
+2. File documents live in the **durable** block store, so they outlive a kernel
+   restart. Restarting does not clear this.
+3. On a cache miss, `try_get_or_load` reads the file from disk into `text` and
+   computes a fresh `loaded_generation` — then calls `create_document`.
+4. **`Err(_)` — "document already exists" — discards the freshly-read `text`
+   entirely** and returns `snapshots.first()`, the block from whenever the file
+   was first read (`cache.rs:339-365`).
+5. It then caches that ancient content stamped with the **current** disk
+   generation, so the `d > l` staleness check at `cache.rs:259` can never fire
+   afterwards. The path poisons its own freshness stamp.
+6. Any write flushes that content back to disk. That is the clobber.
+
+Two smaller defects in the same path. `dirty` short-circuits the staleness
+check before it is reached (`cache.rs:255`), so a stuck-dirty entry serves
+stale content indefinitely. And `Err(_)` swallows the error *kind*, so a real
+block-store failure is misread as "already exists" — the silent fallback
+CLAUDE.md warns about, in the same arm that causes the corruption.
+
+**This looks like a CRDT-era leftover.** Persisting a file as a durable
+document made sense when the document was the source of truth. Post-demolition
+disk is the source of truth, and a durable document keyed deterministically by
+path is a stale mirror guaranteed to collide with its future self.
+
+Two ways out, and Amy's instinct was to simplify the path:
+
+- **Stop persisting file documents.** Make the file cache in-memory only; on a
+  miss, read disk and build an ephemeral doc. Deletes the entire staleness
+  class rather than guarding it. Check what the editor needs first — `vi` opens
+  sessions on file blocks.
+- **Reconcile on miss.** Keep durable documents, but on
+  `DocumentAlreadyExists` replace the block content with the disk text just
+  read instead of discarding it. Smaller, keeps the bug class alive but closed
+  at the one door that matters.
+
+Either way `Err(_)` must match the specific `DocumentAlreadyExists` variant and
+surface anything else loudly.
+
+**Until this is fixed, do not edit files through the kernel's file tools or the
+`vi` editor** — read and write through host tools. Every file the kernel has
+ever read is a candidate.
+
+---
+
 ## `edit` names two different things on two surfaces (2026-08-18)
 
 A coder has two editing surfaces, and the same word means opposite things on
