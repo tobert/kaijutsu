@@ -80,6 +80,36 @@ Worth a test before a deletion: prove a config write followed by plain
 
 ---
 
+## `KaijutsuBackend::patch` is not all-or-nothing (2026-08-19)
+
+`LocalBackend::patch` and `OverlayFs::patch` read the file, apply every
+`PatchOp` to an in-memory `String`, and write once — a compare-and-set failure
+on op 3 of 5 touches nothing. **Ours commits as it goes.**
+`KaijutsuBackend::patch` (`runtime/kaish_backend.rs:414-443`) loops
+`apply_patch_op`, and each call reaches `BlockStore::edit_text`, which journals
+to the durable oplog inside the call. A CAS failure mid-batch leaves the
+earlier ops durably committed with no rollback.
+
+Nothing exercises this today: `patch` emits a single whole-file `Replace`, so
+every batch has one op. It becomes live the moment anything emits per-op
+batches, which is exactly what per-hunk CAS would do.
+
+kaish's trait says only "Apply a sequence of patch operations to a file" and
+promises nothing about atomicity, so both sides built on behavior rather than a
+contract. Kaish-lead is considering stating the guarantee on
+`KernelBackend::patch`; if they do, **we are the non-conforming implementation**
+and the fix is ours. Wrapping the op loop in one block-store transaction is the
+obvious shape — confirm `edit_text`'s journaling can participate in one before
+assuming it.
+
+Related and worth deciding together: the swap marker and the content it marks
+are also written by two separate statements (`record_dirty_file_buffer` and
+`edit_text`'s journal). Same database, not the same transaction. A crash
+between them either loses the marker — and the cold path then reconciles the
+unsaved work away — or leaves a marker pointing at content never written.
+
+---
+
 ## `edit` names two different things on two surfaces (2026-08-18)
 
 A coder has two editing surfaces, and the same word means opposite things on
@@ -154,9 +184,12 @@ returns nothing, and a model reasoning on the result sees an empty string with
 exit 0. Every model driving kaijutsu today is exposed to this, and no audit of
 our repo can close it — only the kaish fix can.
 
-**Our tree is NOT fixed.** The fix is kaish PR #367
-(`fix/pipeline-stage-stdout-loss`), unmerged as of 2026-08-18 and pending
-kaibo review plus Amy's call. `~/src/wt/kaish-integration` — the path-dep this
+**The fix is merged; our tree is stale.** Kaish #367
+(`fix/pipeline-stage-stdout-loss`) and #368 are on kaish `main` as of
+2026-08-19 (via kaish-lead). Our remaining exposure is entirely the pin —
+`~/src/wt/kaish-integration` sits at `cf106d62`, 62 commits back. This is no
+longer "wait for kaish"; it is "advance the pin", and it is ours to do.
+Historical framing follows. `~/src/wt/kaish-integration` — the path-dep this
 repo builds against — is 62 commits behind main and does not contain it, so the
 embedded kernel is still losing that output today. "Zero occurrences" above
 means we do not *use* the broken form, not that the shell is fixed.
