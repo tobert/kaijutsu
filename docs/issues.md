@@ -111,17 +111,27 @@ on op 3 of 5 touches nothing. **Ours commits as it goes.**
 to the durable oplog inside the call. A CAS failure mid-batch leaves the
 earlier ops durably committed with no rollback.
 
-Nothing exercises this today: `patch` emits a single whole-file `Replace`, so
-every batch has one op. It becomes live the moment anything emits per-op
-batches, which is exactly what per-hunk CAS would do.
+**This is now scheduled to become live, not hypothetical** (Amy, via
+kaish-lead, 2026-08-19): kaish's new `edit` "should not drop to whole file",
+and `patch` itself is to move off its whole-file `Replace`. Per-hunk `PatchOp`s
+with CAS are the direction, which makes batch atomicity load-bearing rather
+than incidental. A five-op batch failing on op 3 becomes a real partial write
+against our backend.
+
+Until then nothing exercises it: `patch` emits a single whole-file `Replace`,
+so every batch has one op.
 
 kaish's trait says only "Apply a sequence of patch operations to a file" and
 promises nothing about atomicity, so both sides built on behavior rather than a
-contract. Kaish-lead is considering stating the guarantee on
-`KernelBackend::patch`; if they do, **we are the non-conforming implementation**
-and the fix is ours. Wrapping the op loop in one block-store transaction is the
-obvious shape — confirm `edit_text`'s journaling can participate in one before
-assuming it.
+contract. **We are the non-conforming implementation and the fix is ours.**
+
+The shape is the one the sibling backends already use, and it needs no
+transaction: apply every op to an in-memory `String`, validating each CAS
+precondition as you go, and commit once with a single `edit_text` splice when
+the whole batch has succeeded. A failure then touches nothing.
+`reload_block_from_disk` in `file_tools/cache.rs` is the precedent for the
+single full-content splice. Today `apply_patch_op` both computes and commits,
+so separating those two jobs is the work.
 
 Related and worth deciding together: the swap marker and the content it marks
 are also written by two separate statements (`record_dirty_file_buffer` and
