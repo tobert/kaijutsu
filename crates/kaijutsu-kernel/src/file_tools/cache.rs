@@ -497,14 +497,24 @@ impl FileDocumentCache {
     /// document** so the next read fully reloads from the VFS.
     ///
     /// Plain `invalidate` only removes the in-memory entry; the shadow document
-    /// (at `file_context_id(path)`) survives, and the next `get_or_load`
-    /// re-registers that same — now stale — block (the `create_document` already
-    /// exists → snapshot-and-reuse path). That's correct for a self-contained
-    /// file (the doc *is* the truth), but wrong for a **config shadow**: the real
-    /// owner is the `config_context_id` block, and when *that* changed underneath
-    /// us (e.g. the vi editor wrote it directly), the shadow must be rebuilt from
-    /// the VFS, not re-served. Deleting the shadow doc forces the clean-reload
-    /// path. The shadow is a pure cache materialization, so dropping it is safe;
+    /// (at `file_context_id(path)`) survives in the block store. The next
+    /// `get_or_load` hits `create_document`'s `DocumentAlreadyExists` arm, which
+    /// reconciles that shadow's content against a fresh VFS read before serving
+    /// it — so for a **self-contained file** (the doc *is* the truth, and "VFS
+    /// read" means "read disk"), plain `invalidate` is already enough to pick up
+    /// a change.
+    ///
+    /// A **config shadow** still needs the stronger call. Its real owner is the
+    /// `config_context_id` block, and the vi editor / `kj rc` write it there via
+    /// `block_store.edit_text` directly — never through `ConfigDocFs::write_all`.
+    /// That write never advances `ConfigDocFs`'s per-path generation counter, so
+    /// a shadow entry still resident in memory (not yet invalidated) has no
+    /// coherence signal telling it the config changed underneath it, and would
+    /// go on serving pre-edit content indefinitely. Every direct config write
+    /// must invalidate the shadow explicitly rather than rely on disk-generation
+    /// staleness detection. `invalidate_document` drops both the in-memory entry
+    /// and the shadow document itself, so the next read reloads fresh from the
+    /// VFS. The shadow is a pure cache materialization, so dropping it is safe;
     /// a delete failure is surfaced (never a swallowed stale serve).
     pub fn invalidate_document(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
@@ -1163,6 +1173,57 @@ mod tests {
         assert!(
             cache.disk_changed_since_load("/tmp/dirty.md"),
             "disk moving under a dirty entry must be recorded for the W12 guard"
+        );
+    }
+
+    /// Characterizes a KNOWN DEFECT: a dirty (unsaved) buffer's content is
+    /// discarded, not recovered, across a cold cache. `docs/file-buffers.md`
+    /// rule 2 says a dirty buffer is a swap file — unsaved work "should survive
+    /// a kernel restart, which is a real property we have today and want to
+    /// keep" — but nothing flushes dirty buffers at shutdown (`flush_dirty` has
+    /// no callers outside this file), and the cold-miss reconcile path added for
+    /// the stale-document incident does not distinguish a dirty shadow from a
+    /// clean one: it unconditionally overwrites the block with whatever is on
+    /// disk. So a kernel restart with unflushed edits in flight loses them
+    /// exactly like the incident lost *stale* reads — just the opposite
+    /// direction.
+    ///
+    /// This test asserts *today's* (wrong) behavior on purpose, as a
+    /// placeholder: swap semantics (persist dirty entries as recoverable,
+    /// announce rather than silently serve) must REVERSE this assertion, not
+    /// delete it, when they land.
+    #[tokio::test]
+    async fn unsaved_edits_are_lost_across_a_cold_cache_pending_swap_semantics() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/swap.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/swap.md").await.unwrap(), "disk-v1");
+
+        // Local uncommitted edit — dirty, never flushed to disk.
+        cache
+            .create_or_replace("/tmp/swap.md", "unsaved-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/swap.md");
+        assert_eq!(
+            cache.read_content("/tmp/swap.md").await.unwrap(),
+            "unsaved-edit"
+        );
+
+        // Simulate a kernel restart: the in-memory entry (and its dirty flag)
+        // is gone. Nothing flushed it first — that's the real, not hypothetical,
+        // gap: flush_dirty has no callers outside this file.
+        cache.invalidate("/tmp/swap.md");
+
+        // KNOWN DEFECT: the edit IS still in the durable document at this
+        // point — the cold-cache reconcile overwrites the block with disk
+        // content, destroying work that was recoverable a moment earlier.
+        assert_eq!(
+            cache.read_content("/tmp/swap.md").await.unwrap(),
+            "disk-v1",
+            "known defect (docs/file-buffers.md rule 2): unsaved edit was lost \
+             across a cold cache; this assertion must be REVERSED, not deleted, \
+             once swap semantics land"
         );
     }
 }
