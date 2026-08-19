@@ -86,7 +86,6 @@ impl KjDispatcher {
         };
 
         let kernel = self.kernel();
-        let blocks = self.block_store();
         // Record the opener (principal + context) so `fg` and `:r !cmd` work;
         // a caller with no joined context degrades to a headless-style open.
         let opener = caller.context_id.map(|context_id| crate::editor::EditorOpener {
@@ -96,7 +95,7 @@ impl KjDispatcher {
         });
         match parsed.command {
             EditorCommand::Open { path } => match kernel
-                .editor_open_signaled(&path, blocks, opener)
+                .editor_open_signaled(&path, opener)
                 .await
             {
                 Ok((id, st)) => KjResult::ok_with_data(
@@ -107,7 +106,7 @@ impl KjDispatcher {
             },
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
-                match kernel.editor_keys(id, &keys, blocks).await {
+                match kernel.editor_keys(id, &keys).await {
                     Ok(st) => {
                         // A dialect-level failure (bad `:cmd`, dirty-`:q` refusal,
                         // failed `:r`) rides the status line, not the error path —
@@ -151,7 +150,7 @@ impl KjDispatcher {
             }
             EditorCommand::Quit { session } => {
                 let id = EditorSessionId::from_u64(session);
-                match kernel.editor_quit(id, blocks) {
+                match kernel.editor_quit(id) {
                     Ok(()) => KjResult::ok(format!(
                         "session {session}: closed (rolled back to checkpoint)"
                     )),

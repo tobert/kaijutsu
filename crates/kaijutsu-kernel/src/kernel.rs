@@ -1255,9 +1255,8 @@ impl Kernel {
     pub async fn editor_open(
         &self,
         path: &str,
-        blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
-        self.editor_open_as(path, blocks, None).await
+        self.editor_open_as(path, None).await
     }
 
     /// Open an editor recording the [`EditorOpener`](crate::editor::EditorOpener)
@@ -1267,9 +1266,9 @@ impl Kernel {
     pub async fn editor_open_as(
         &self,
         path: &str,
-        blocks: &crate::block_store::SharedBlockStore,
         opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let blocks = self.blocks();
         let file_cache = self.file_cache().clone();
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
         // `!Send` `EditorCore` never coexists with an await. The mount table is
@@ -1288,8 +1287,8 @@ impl Kernel {
         &self,
         id: crate::editor::EditorSessionId,
         keys: &str,
-        blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<crate::editor::EditorState, String> {
+        let blocks = self.blocks();
         // Capture the path and feed the keys under one lock — a ZZ/ZQ in the
         // batch drops the session, so the path must be read first. A `:r` read
         // intent is taken here too (only when the session is still open), then
@@ -1324,7 +1323,7 @@ impl Kernel {
         // infrastructure failures (no such session, a block mirror failure);
         // the app's session-lost detection keys on exactly that distinction.
         if let Some(io) = io {
-            let state = match self.fetch_editor_io(io, io_opener, blocks).await {
+            let state = match self.fetch_editor_io(io, io_opener).await {
                 Ok(content) => {
                     let at = io_cursor.unwrap_or(0);
                     let state = {
@@ -1380,7 +1379,6 @@ impl Kernel {
         &self,
         io: kaijutsu_editor::EditorIo,
         opener: Option<crate::editor::EditorOpener>,
-        blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<String, String> {
         match io {
             kaijutsu_editor::EditorIo::ReadFile(path) => {
@@ -1451,15 +1449,11 @@ impl Kernel {
 
     /// `ZQ` — roll the block back to the session's checkpoint and close it.
     /// Publishes `Closed` so renderers drop the session.
-    pub fn editor_quit(
-        &self,
-        id: crate::editor::EditorSessionId,
-        blocks: &crate::block_store::SharedBlockStore,
-    ) -> Result<(), String> {
+    pub fn editor_quit(&self, id: crate::editor::EditorSessionId) -> Result<(), String> {
         let path = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
-            sessions.0.quit(id, blocks)?;
+            sessions.0.quit(id, self.blocks())?;
             path
         };
         // The rollback wrote the block; drop the file cache's stale shadow.
@@ -1515,13 +1509,12 @@ impl Kernel {
         &self,
         context_id: kaijutsu_types::ContextId,
         block_id: kaijutsu_types::BlockId,
-        blocks: &crate::block_store::SharedBlockStore,
     ) {
         let changed = self
             .editor_sessions
             .lock()
             .0
-            .reconcile_block(context_id, block_id, blocks);
+            .reconcile_block(context_id, block_id, self.blocks());
         for (id, state) in &changed {
             self.publish_editor_state(*id, state);
         }
@@ -1818,14 +1811,13 @@ impl Kernel {
     pub async fn editor_open_signaled(
         &self,
         path: &str,
-        blocks: &crate::block_store::SharedBlockStore,
         opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         // Record the full opener so `fg` and `:r !cmd` can find the caller's
         // session + context later; the open_editor signal fans only to their
         // app windows, so it needs just the principal.
         let submitter = opener.map(|o| o.principal);
-        let (id, state) = self.editor_open_as(path, blocks, opener).await?;
+        let (id, state) = self.editor_open_as(path, opener).await?;
         self.signal_open_editor(id, path, &state, submitter).await;
         Ok((id, state))
     }
@@ -2012,16 +2004,16 @@ mod tests {
         let path = "/etc/rc/coder/create/S00.kai";
 
         // Open → type → state reflects, all through the kernel surface.
-        let (id, st) = kernel.editor_open(path, &blocks).await.unwrap();
+        let (id, st) = kernel.editor_open(path).await.unwrap();
         assert_eq!(st.text, "hello");
-        let st = kernel.editor_keys(id, "iX<Esc>", &blocks).await.unwrap();
+        let st = kernel.editor_keys(id, "iX<Esc>").await.unwrap();
         assert_eq!(st.text, "Xhello");
         assert!(st.dirty);
         assert_eq!(kernel.editor_state(id).unwrap().text, "Xhello");
 
         // ZQ rolls the block back and closes the session.
-        kernel.editor_quit(id, &blocks).unwrap();
-        let err = kernel.editor_keys(id, "x", &blocks).await.unwrap_err();
+        kernel.editor_quit(id).unwrap();
+        let err = kernel.editor_keys(id, "x").await.unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
     }
 
@@ -2075,8 +2067,8 @@ mod tests {
         );
 
         // Edit the config block through the editor (insert X at the front).
-        let (id, _) = kernel.editor_open(path, &blocks).await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>", &blocks).await.unwrap();
+        let (id, _) = kernel.editor_open(path).await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
 
         // The next read must reflect the edit — proving the shadow was dropped and
         // reloaded, not re-served stale. (With a plain cache-entry invalidate the
@@ -2115,13 +2107,13 @@ mod tests {
         let edit_path = "/etc/rc/coder/create/S00.kai";
         let read_path = "/etc/rc/coder/create/snippet.kai";
 
-        let (id, st) = kernel.editor_open(edit_path, &blocks).await.unwrap();
+        let (id, st) = kernel.editor_open(edit_path).await.unwrap();
         assert_eq!(st.text, "AB");
 
         // Move the cursor one char right (between A and B), then `:r` the file.
-        kernel.editor_keys(id, "l", &blocks).await.unwrap();
+        kernel.editor_keys(id, "l").await.unwrap();
         let after = kernel
-            .editor_keys(id, &format!(":r {read_path}<CR>"), &blocks)
+            .editor_keys(id, &format!(":r {read_path}<CR>"))
             .await
             .unwrap();
         assert_eq!(after.text, "AINSERTEDB", "file content spliced at the cursor");
@@ -2163,7 +2155,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(),
         };
         let (id, _) = kernel
-            .editor_open_as(path, &blocks, Some(me_opener))
+            .editor_open_as(path, Some(me_opener))
             .await
             .unwrap();
         let (resumed_id, st) = kernel.resume_editor(Some(me)).await.unwrap();
@@ -2193,7 +2185,6 @@ mod tests {
         d.set_self_arc();
         d.kernel().broker().set_kj_dispatcher(&d).await;
         let kernel = d.kernel();
-        let blocks = d.block_store();
 
         let path = "/etc/rc/vitest/create/S00-foo.kai";
         install_rc_script_file(&d, path, "hello").await;
@@ -2208,12 +2199,12 @@ mod tests {
         };
 
         let (id, _) = kernel
-            .editor_open_as(path, blocks, Some(opener))
+            .editor_open_as(path, Some(opener))
             .await
             .unwrap();
         // `:r !echo hi` splices the command's stdout at the cursor (buffer top).
         let state = kernel
-            .editor_keys(id, ":r !echo hi<CR>", blocks)
+            .editor_keys(id, ":r !echo hi<CR>")
             .await
             .unwrap();
         assert!(
@@ -2245,11 +2236,11 @@ mod tests {
 
         // `editor_open` records no opener.
         let (id, _) = kernel
-            .editor_open("/etc/rc/coder/create/S00.kai", &blocks)
+            .editor_open("/etc/rc/coder/create/S00.kai")
             .await
             .unwrap();
         let state = kernel
-            .editor_keys(id, ":r !date<CR>", &blocks)
+            .editor_keys(id, ":r !date<CR>")
             .await
             .expect("a failed :r does not error the RPC");
         let msg = state.message.as_deref().expect("the failure reports on the status line");
@@ -2281,11 +2272,11 @@ mod tests {
             .unwrap();
 
         let (id, _) = kernel
-            .editor_open("/etc/rc/coder/create/S00.kai", &blocks)
+            .editor_open("/etc/rc/coder/create/S00.kai")
             .await
             .unwrap();
         let state = kernel
-            .editor_keys(id, ":r /nope/missing.txt<CR>", &blocks)
+            .editor_keys(id, ":r /nope/missing.txt<CR>")
             .await
             .expect("a missing :r file does not error the RPC");
         assert!(
@@ -2294,7 +2285,7 @@ mod tests {
         );
         assert_eq!(state.text, "hi", "the buffer is untouched");
         // The session is alive and the message is transient.
-        let state = kernel.editor_keys(id, "l", &blocks).await.unwrap();
+        let state = kernel.editor_keys(id, "l").await.unwrap();
         assert!(state.message.is_none(), "message clears on the next batch");
     }
 

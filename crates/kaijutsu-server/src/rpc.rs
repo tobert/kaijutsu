@@ -671,9 +671,7 @@ pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
                         (context_id, block_id)
                     }
                 };
-                kernel
-                    .kernel
-                    .editor_reconcile_block(context_id, block_id, &kernel.documents);
+                kernel.kernel.editor_reconcile_block(context_id, block_id);
             }
         });
     }) {
@@ -3156,7 +3154,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         Promise::from_future(
             async move {
-                match kernel.kernel.editor_open(&path, &kernel.documents).await {
+                match kernel.kernel.editor_open(&path).await {
                     Ok((id, state)) => {
                         set_editor_state(results.get().init_state(), id.as_u64(), &state);
                         Ok(())
@@ -3182,7 +3180,7 @@ impl kernel::Server for KernelImpl {
         // `editor_keys` is async now (a `:r` read awaits a VFS/kaish fetch).
         Promise::from_future(
             async move {
-                match kernel.kernel.editor_keys(id, &keys, &kernel.documents).await {
+                match kernel.kernel.editor_keys(id, &keys).await {
                     Ok(state) => {
                         set_editor_state(results.get().init_state(), session_id, &state);
                         Ok(())
@@ -3239,7 +3237,7 @@ impl kernel::Server for KernelImpl {
         let _guard = extract_rpc_trace(p.get_trace(), "editor_quit").entered();
         let session_id = p.get_session_id();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
-        match self.kernel.kernel.editor_quit(id, &self.kernel.documents) {
+        match self.kernel.kernel.editor_quit(id) {
             Ok(()) => Promise::ok(()),
             Err(e) => Promise::err(capnp::Error::failed(format!("editor_quit failed: {e}"))),
         }

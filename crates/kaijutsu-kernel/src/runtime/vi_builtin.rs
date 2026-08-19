@@ -90,11 +90,10 @@ impl Tool for ViBuiltin {
         // renderer signal to, and whose context `:r !cmd` shells out in. A
         // headless instance (no opener) still opens a real session — it just
         // pops no window and can't `:r !cmd`.
-        let blocks = self.dispatcher.block_store();
         match self
             .dispatcher
             .kernel()
-            .editor_open_signaled(&path, blocks, self.opener)
+            .editor_open_signaled(&path, self.opener)
             .await
         {
             Ok((id, st)) => {

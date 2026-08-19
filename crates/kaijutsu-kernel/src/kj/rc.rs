@@ -592,7 +592,7 @@ impl KjDispatcher {
         let Some(content) = content else {
             return match self
                 .kernel()
-                .editor_open_signaled(path, self.block_store(), opener)
+                .editor_open_signaled(path, opener)
                 .await
             {
                 Ok((id, st)) => KjResult::ok_with_data(
