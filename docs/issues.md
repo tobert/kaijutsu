@@ -6949,3 +6949,27 @@ Build lanes, roughly in order:
 Renders SGR only; cursor/screen codes are preserved in provenance, never
 rendered (kills hidden-text-by-overwrite by construction). Standing safety
 invariants and the `\r`-progress-bar open question are in the doc.
+
+## journal_op is not a transaction (pre-existing, surfaced 2026-08-19)
+
+`BlockStore::journal_op` (block_store.rs:906) issues `append_op` and
+`touch_context_activity` as two autocommit statements under a mutex — no
+BEGIN/COMMIT. The "semantic op + materialized state commit atomically"
+doctrine is aspirational here. Surfaced while designing ANSI provenance
+(which writes its row as a third separate statement for the same reason).
+Fix shape: a real `KernelDb` method wrapping `self.conn.transaction()` like
+`write_snapshot_and_truncate` (kernel_db.rs:2463). Not urgent — the mutex
+serializes and a crash gap is detectable — but every new hook-site write
+inherits the pattern until this is paid down.
+
+## Oplog replay clears spans that live appends keep (2026-08-19)
+
+`BlockContent::append_text` (end-append) keeps `style_spans` — earlier byte
+offsets stay valid. But `merge_ops` replay applies journaled appends through
+`edit_text`, which clears spans unconditionally. Harmless under
+buffer-until-done ordering (spans land after all appends), wrong the day
+spans land before later appends (reproject-then-append). Fix shape: teach
+the replay path to recognize `pos == None` / end-position edits as appends,
+or re-emit spans after replay from the journaled updated_snapshots (check
+whether replay order already does this — updated_snapshots may replay last
+and repair it; verify before building anything).

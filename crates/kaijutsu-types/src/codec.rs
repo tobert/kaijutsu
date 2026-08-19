@@ -184,6 +184,78 @@ mod tests {
         assert_eq!(old.tick, Some(crate::Tick::new(42)));
     }
 
+    // ── style_spans/provenance CBOR evolution (2026-08-19) ──────────────────
+    //
+    // Same additive contract as T16, for the ANSI-ingest fields
+    // (docs/ansi-and-beyond.md). The frozen pre-track blob above genuinely
+    // predates these fields too, so it doubles as the pre-spans fixture — no
+    // second literal to maintain.
+
+    /// A pre-spans payload decodes with `style_spans` empty and
+    /// `provenance == None` (the `#[serde(default)]`s). Permanent net against
+    /// the task_status-style boot flood (block.rs T15 regression story).
+    #[test]
+    fn frozen_pre_spans_snapshot_decodes_with_defaults() {
+        let snap: BlockSnapshot =
+            decode(FROZEN_PRE_TRACK_SNAPSHOT).expect("frozen old-shape blob must still decode");
+        assert!(snap.style_spans.is_empty(), "pre-spans payload has no spans");
+        assert_eq!(snap.provenance, None, "pre-spans payload has no provenance");
+    }
+
+    /// New→old direction: a spans-bearing snapshot decodes under the old-shape
+    /// reader (unknown keys tolerated and dropped).
+    #[test]
+    fn new_spans_snapshot_decodes_under_old_shape_reader() {
+        let snap = BlockSnapshotBuilder::new(fixture_id(), BlockKind::Text)
+            .content("hello")
+            .tick(crate::Tick::new(42))
+            .style_spans(vec![crate::StyleSpan {
+                start: 0,
+                end: 5,
+                fg: Some(crate::StyleColor::Indexed(2)),
+                bg: None,
+                attrs: crate::StyleAttrs::BOLD,
+            }])
+            .provenance(crate::ProvenanceTag { transform: "ansi-strip".into(), version: 1 })
+            .build();
+        let bytes = encode(&snap).expect("encode spans-bearing snapshot");
+        let old: OldBlockSnapshotMimic =
+            decode(&bytes).expect("old reader must tolerate the unknown spans keys");
+        assert_eq!(old.content, "hello");
+    }
+
+    /// Full-fidelity round trip: every StyleColor variant and the attr bits
+    /// survive encode/decode exactly.
+    #[test]
+    fn spans_snapshot_round_trips_exactly() {
+        let spans = vec![
+            crate::StyleSpan {
+                start: 0,
+                end: 3,
+                fg: Some(crate::StyleColor::Indexed(196)),
+                bg: Some(crate::StyleColor::Rgb(18, 18, 24)),
+                attrs: crate::StyleAttrs::BOLD | crate::StyleAttrs::UNDERLINE,
+            },
+            crate::StyleSpan {
+                start: 3,
+                end: 9,
+                fg: None,
+                bg: None,
+                attrs: crate::StyleAttrs::default(),
+            },
+        ];
+        let snap = BlockSnapshotBuilder::new(fixture_id(), BlockKind::Text)
+            .content("colorful!")
+            .style_spans(spans.clone())
+            .provenance(crate::ProvenanceTag { transform: "ansi-strip".into(), version: 7 })
+            .build();
+        let bytes = encode(&snap).expect("encode");
+        let back: BlockSnapshot = decode(&bytes).expect("decode");
+        assert_eq!(back.style_spans, spans);
+        assert_eq!(back.provenance, snap.provenance);
+        assert_eq!(back, snap);
+    }
+
     // ── Compacted-flag removal (2026-08-02) ─────────────────────────────────
     //
     // The same additive-evolution contract, for fields that came OUT rather

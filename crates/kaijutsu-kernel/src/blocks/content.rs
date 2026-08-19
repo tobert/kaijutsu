@@ -254,6 +254,13 @@ pub struct BlockContent {
     /// Structured resource payload (for resource blocks).
     resource: Option<kaijutsu_types::ResourcePayload>,
 
+    /// Styled ranges over `text`, byte-addressed. See `edit_text` for the
+    /// invalidation rule.
+    style_spans: Vec<kaijutsu_types::StyleSpan>,
+    /// Set when `text` is an ingest-transform projection and the kernel
+    /// holds the byte-exact original.
+    provenance: Option<kaijutsu_types::ProvenanceTag>,
+
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
 }
@@ -286,6 +293,8 @@ impl BlockContent {
             error: None,
             notification: None,
             resource: None,
+            style_spans: Vec::new(),
+            provenance: None,
             deleted: false,
         }
     }
@@ -335,6 +344,8 @@ impl BlockContent {
         block.error = snap.error.clone();
         block.notification = snap.notification.clone();
         block.resource = snap.resource.clone();
+        block.style_spans = snap.style_spans.clone();
+        block.provenance = snap.provenance.clone();
         block
     }
 
@@ -370,12 +381,26 @@ impl BlockContent {
         let byte_end = Self::char_to_byte(&self.text, pos + delete);
         self.text.replace_range(byte_start..byte_end, insert);
         self.char_len = self.char_len - delete + insert.chars().count();
+        // `style_spans` are byte offsets into the PRE-edit content; any edit
+        // through this char-addressed path can shift or invalidate them, so
+        // they're dropped rather than left to lie. `provenance` is untouched —
+        // the byte-exact original still exists and reprojection
+        // (`kj block reproject`) can regenerate spans from it. See
+        // docs/ansi-and-beyond.md "Span edits".
+        if !self.style_spans.is_empty() {
+            self.style_spans.clear();
+        }
     }
 
     /// Append text to the end. `String::push_str` is amortized O(1) and
     /// `char_len`'s update is O(the token's own length), never O(the whole
     /// block) — no re-materialization, since this runs once per streamed
     /// token.
+    ///
+    /// `style_spans` are left untouched: this is always a true end-append
+    /// (`push_str`), and a span's byte offsets index into a prefix of `text`
+    /// that this call never touches — unlike `edit_text`, there is nothing
+    /// stale to drop.
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
         self.char_len += text.chars().count();
@@ -494,6 +519,28 @@ impl BlockContent {
         self.signature = signature;
     }
 
+    pub fn style_spans(&self) -> &[kaijutsu_types::StyleSpan] {
+        &self.style_spans
+    }
+
+    pub fn provenance(&self) -> Option<&kaijutsu_types::ProvenanceTag> {
+        self.provenance.as_ref()
+    }
+
+    /// Replace the styled spans and the provenance tag together (ingest
+    /// projection at insert, or `kj block reproject` later). Always a
+    /// whole-projection replace — spans are re-derived from the stored
+    /// original, never patched in place — and the tag travels with them so a
+    /// tag can never outlive the spans it describes.
+    pub fn set_style_spans(
+        &mut self,
+        spans: Vec<kaijutsu_types::StyleSpan>,
+        provenance: Option<kaijutsu_types::ProvenanceTag>,
+    ) {
+        self.style_spans = spans;
+        self.provenance = provenance;
+    }
+
     pub fn source_context(&self) -> Option<kaijutsu_types::ContextId> {
         self.source_context
     }
@@ -600,6 +647,8 @@ impl BlockContent {
             error: self.error.clone(),
             notification: self.notification.clone(),
             resource: self.resource.clone(),
+            style_spans: self.style_spans.clone(),
+            provenance: self.provenance.clone(),
             task_status: self.header.task_status,
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
@@ -757,7 +806,10 @@ mod successor_tests {
 #[cfg(test)]
 mod snapshot_threading_tests {
     use super::*;
-    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContextId, Role, Status, TrackId};
+    use kaijutsu_types::{
+        BlockKind, BlockSnapshotBuilder, ContextId, ProvenanceTag, Role, Status, StyleAttrs,
+        StyleColor, StyleSpan, TrackId,
+    };
 
     fn block_id() -> BlockId {
         BlockId::new(ContextId::new(), PrincipalId::new(), 1)
@@ -786,6 +838,17 @@ mod snapshot_threading_tests {
             .tool_input("ls")
             .signature("sig")
             .order_key("V00000000010".to_string())
+            .style_spans(vec![StyleSpan {
+                start: 0,
+                end: 5,
+                fg: Some(StyleColor::Indexed(1)),
+                bg: None,
+                attrs: StyleAttrs::BOLD,
+            }])
+            .provenance(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
             .build();
 
         let principal = snap.id.principal_id;
@@ -804,6 +867,9 @@ mod snapshot_threading_tests {
         // Explicit spot-checks for the timeline pair (tick + track travel together).
         assert_eq!(round.tick, Some(Tick::new(10)));
         assert_eq!(round.content_type, ContentType::Markdown);
+        // And for the fields this task adds.
+        assert_eq!(round.style_spans, snap.style_spans);
+        assert_eq!(round.provenance, snap.provenance);
     }
 
     /// T16(c) (design §8 Phase 5) — a track-bearing snapshot survives the central
@@ -826,7 +892,9 @@ mod snapshot_threading_tests {
 #[cfg(test)]
 mod text_edit_tests {
     use super::*;
-    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContextId};
+    use kaijutsu_types::{
+        BlockKind, BlockSnapshotBuilder, ContextId, ProvenanceTag, StyleAttrs, StyleSpan,
+    };
 
     fn block() -> BlockContent {
         let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
@@ -886,5 +954,70 @@ mod text_edit_tests {
         b.append_text("日本語"); // 3 chars, 9 bytes
         assert_eq!(b.content_len(), 3);
         assert_eq!(b.text().len(), 9, "sanity: the fixture really is multibyte");
+    }
+
+    // edit_text is char-addressed; style_spans are byte offsets into the
+    // pre-edit content. Any edit through edit_text must drop the spans
+    // (stale offsets would lie) while leaving provenance alone (the
+    // byte-exact original still exists; reprojection can restore spans).
+    // See docs/ansi-and-beyond.md "Span edits".
+    #[test]
+    fn edit_text_clears_style_spans_but_keeps_provenance() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello world")
+            .style_spans(vec![StyleSpan {
+                start: 0,
+                end: 5,
+                fg: None,
+                bg: None,
+                attrs: StyleAttrs::BOLD,
+            }])
+            .provenance(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+        assert!(!b.snapshot().style_spans.is_empty(), "fixture must start with spans");
+
+        b.edit_text(5, "!", 0);
+
+        let after = b.snapshot();
+        assert_eq!(after.content, "hello! world");
+        assert!(after.style_spans.is_empty(), "edit must drop stale spans");
+        assert_eq!(
+            after.provenance,
+            Some(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            }),
+            "provenance is untouched — the original still exists for reprojection"
+        );
+    }
+
+    // append_text is always a true end-append (push_str); earlier spans'
+    // byte offsets index into a prefix of `text` this call never touches,
+    // so — unlike edit_text — there is nothing stale to drop.
+    #[test]
+    fn append_text_keeps_style_spans() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello")
+            .style_spans(vec![StyleSpan {
+                start: 0,
+                end: 5,
+                fg: None,
+                bg: None,
+                attrs: StyleAttrs::BOLD,
+            }])
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+
+        b.append_text(" world");
+
+        let after = b.snapshot();
+        assert_eq!(after.content, "hello world");
+        assert_eq!(after.style_spans, snap.style_spans, "end-append never invalidates earlier spans");
     }
 }

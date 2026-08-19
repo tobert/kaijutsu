@@ -3067,6 +3067,9 @@ fn set_block_event_filter_builder(
                     kaijutsu_types::BlockFlowKind::MetadataChanged => {
                         crate::kaijutsu_capnp::BlockFlowKind::MetadataChanged
                     }
+                    kaijutsu_types::BlockFlowKind::SpansChanged => {
+                        crate::kaijutsu_capnp::BlockFlowKind::SpansChanged
+                    }
                     kaijutsu_types::BlockFlowKind::ContextSwitched => {
                         crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched
                     }
@@ -3560,6 +3563,65 @@ pub(crate) fn parse_block_id(
     Ok(BlockId::new(context_id, principal_id, reader.get_seq()))
 }
 
+/// The wire's `(kind, value)` color pair → [`kaijutsu_types::StyleColor`]:
+/// 0 = none, 1 = indexed (value is the palette slot), 2 = rgb (value is
+/// `0x00RRGGBB`). The encoder lives in `kaijutsu-server`'s `set_style_spans`.
+///
+/// A kind this build does not know, or an indexed slot that does not fit a
+/// `u8`, is corruption or a newer writer: warn and fall back to "no color"
+/// rather than fabricate one — the same choice `track` makes above.
+fn style_color_from_wire(kind: u8, value: u32) -> Option<kaijutsu_types::StyleColor> {
+    match kind {
+        0 => None,
+        1 => match u8::try_from(value) {
+            Ok(slot) => Some(kaijutsu_types::StyleColor::Indexed(slot)),
+            Err(_) => {
+                log::warn!("parse_style_spans: indexed color {value} out of palette range");
+                None
+            }
+        },
+        2 => Some(kaijutsu_types::StyleColor::Rgb(
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        )),
+        other => {
+            log::warn!("parse_style_spans: unknown color kind {other} on wire");
+            None
+        }
+    }
+}
+
+/// Decode a `List(StyleSpan)` (docs/ansi-and-beyond.md). Shared by the
+/// snapshot decoder and the change feed's `spansChanged` arm.
+pub(crate) fn parse_style_spans(
+    list: capnp::struct_list::Reader<'_, crate::kaijutsu_capnp::style_span::Owned>,
+) -> Vec<kaijutsu_types::StyleSpan> {
+    list.iter()
+        .map(|s| kaijutsu_types::StyleSpan {
+            start: s.get_start(),
+            end: s.get_end(),
+            fg: style_color_from_wire(s.get_fg_kind(), s.get_fg_value()),
+            bg: style_color_from_wire(s.get_bg_kind(), s.get_bg_value()),
+            // Unknown attribute bits from a newer writer round-trip as-is:
+            // the field is a raw u16 on both sides on purpose.
+            attrs: kaijutsu_types::StyleAttrs(s.get_attrs()),
+        })
+        .collect()
+}
+
+/// Decode the provenance pair. Empty transform = no tag (the same
+/// "empty = unset" convention as content_type/task_status).
+pub(crate) fn parse_provenance(
+    transform: &str,
+    version: u32,
+) -> Option<kaijutsu_types::ProvenanceTag> {
+    (!transform.is_empty()).then(|| kaijutsu_types::ProvenanceTag {
+        transform: transform.to_string(),
+        version,
+    })
+}
+
 /// Helper to parse a flat BlockSnapshot from Cap'n Proto using BlockSnapshotBuilder.
 pub(crate) fn parse_block_snapshot(
     reader: &crate::kaijutsu_capnp::block_snapshot::Reader<'_>,
@@ -3760,6 +3822,25 @@ pub(crate) fn parse_block_snapshot(
         && let Some(status) = kaijutsu_types::TaskStatus::from_str(s)
     {
         builder = builder.task_status(status);
+    }
+
+    // Styled spans + ingest provenance (docs/ansi-and-beyond.md). A writer
+    // that never set either leaves an absent list and an empty transform,
+    // which decode to "no spans" / "no tag" — the builder's own defaults.
+    if reader.has_style_spans()
+        && let Ok(spans) = reader.get_style_spans()
+    {
+        let spans = parse_style_spans(spans);
+        if !spans.is_empty() {
+            builder = builder.style_spans(spans);
+        }
+    }
+    if reader.has_provenance_transform()
+        && let Ok(t) = reader.get_provenance_transform()
+        && let Ok(s) = t.to_str()
+        && let Some(tag) = parse_provenance(s, reader.get_provenance_version())
+    {
+        builder = builder.provenance(tag);
     }
 
     // Ephemeral flag (human-only, excluded from LLM hydration)
@@ -4364,6 +4445,20 @@ mod tests {
 
     /// Helper: build a BlockSnapshot capnp message, set fields, then parse it back
     /// through `parse_block_snapshot` to verify roundtrip fidelity.
+    /// The encoder's half of the color mapping, written out here rather than
+    /// reused from `style_color_from_wire`'s inverse: a test that shares the
+    /// decoder's own table would agree with it even if both were wrong.
+    fn wire_color(color: Option<kaijutsu_types::StyleColor>) -> (u8, u32) {
+        match color {
+            None => (0, 0),
+            Some(kaijutsu_types::StyleColor::Indexed(n)) => (1, u32::from(n)),
+            Some(kaijutsu_types::StyleColor::Rgb(r, g, b)) => (
+                2,
+                (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+            ),
+        }
+    }
+
     fn roundtrip_snapshot(snap: &BlockSnapshot) -> BlockSnapshot {
         let mut message = MessageBuilder::new_default();
         let mut builder = message.init_root::<crate::kaijutsu_capnp::block_snapshot::Builder>();
@@ -4544,6 +4639,31 @@ mod tests {
             builder.set_task_status(snap.task_status.as_str());
         }
 
+        // Styled spans + provenance, encoded exactly the way the server's
+        // `set_block_snapshot` does (0 = none, 1 = indexed, 2 = packed rgb);
+        // a snapshot carrying neither writes neither field.
+        if !snap.style_spans.is_empty() {
+            let mut list = builder
+                .reborrow()
+                .init_style_spans(snap.style_spans.len() as u32);
+            for (i, span) in snap.style_spans.iter().enumerate() {
+                let mut b = list.reborrow().get(i as u32);
+                b.set_start(span.start);
+                b.set_end(span.end);
+                let (fg_kind, fg_value) = wire_color(span.fg);
+                b.set_fg_kind(fg_kind);
+                b.set_fg_value(fg_value);
+                let (bg_kind, bg_value) = wire_color(span.bg);
+                b.set_bg_kind(bg_kind);
+                b.set_bg_value(bg_value);
+                b.set_attrs(span.attrs.0);
+            }
+        }
+        if let Some(ref tag) = snap.provenance {
+            builder.set_provenance_transform(&tag.transform);
+            builder.set_provenance_version(tag.version);
+        }
+
         // Parse back
         let reader = message
             .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
@@ -4703,8 +4823,10 @@ mod tests {
     /// from `kaijutsu.capnp` — internal bookkeeping, not conversation-visible
     /// state, and `parse_block_snapshot` has no wire field to read it from.
     /// That is by design, not a gap to "fix" the way `excluded` above was.
-    /// Wire-carried flags (`excluded`, `ephemeral`, `tick`) must still
-    /// survive the same round trip that drops the internal one.
+    /// Wire-carried flags (`excluded`, `ephemeral`, `tick`) and the styled
+    /// spans / provenance tag must still survive the same round trip that
+    /// drops the internal one — spans are conversation-visible state, not
+    /// bookkeeping.
     #[test]
     fn test_parse_block_snapshot_drops_internal_fields_by_design() {
         let id = BlockId {
@@ -4716,6 +4838,17 @@ mod tests {
             .excluded(true)
             .ephemeral(true)
             .tick(Tick::new(7))
+            .style_spans(vec![kaijutsu_types::StyleSpan {
+                start: 0,
+                end: 2,
+                fg: Some(kaijutsu_types::StyleColor::Indexed(4)),
+                bg: None,
+                attrs: kaijutsu_types::StyleAttrs::BOLD,
+            }])
+            .provenance(kaijutsu_types::ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
             .build();
         // Internal bookkeeping — never on the wire.
         snap.order_key = Some("a0".to_string());
@@ -4726,6 +4859,14 @@ mod tests {
         assert!(round_tripped.excluded, "excluded is on the wire");
         assert!(round_tripped.ephemeral, "ephemeral is on the wire");
         assert_eq!(round_tripped.tick, Some(Tick::new(7)), "tick is on the wire");
+        assert_eq!(
+            round_tripped.style_spans, snap.style_spans,
+            "style_spans are on the wire"
+        );
+        assert_eq!(
+            round_tripped.provenance, snap.provenance,
+            "provenance is on the wire"
+        );
 
         // The internal field is intentionally absent from the wire and must
         // decode to its default, not silently carry the sender's in-memory
@@ -4851,6 +4992,103 @@ mod tests {
         assert_eq!(
             roundtrip_snapshot(&plain).task_status,
             kaijutsu_types::TaskStatus::Open
+        );
+    }
+
+    /// Styled spans + provenance survive the wire intact (Stage 2C of the
+    /// ANSI arc, docs/ansi-and-beyond.md). Both color encodings are covered
+    /// deliberately: `Indexed` and `Rgb` share one `(kind, value)` pair on
+    /// the wire, so a mapping that dropped the kind byte would still look
+    /// right for one of them.
+    #[test]
+    fn test_style_spans_capnp_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        let spans = vec![
+            // Indexed fg, no bg, two attribute bits.
+            kaijutsu_types::StyleSpan {
+                start: 0,
+                end: 5,
+                fg: Some(kaijutsu_types::StyleColor::Indexed(9)),
+                bg: None,
+                attrs: kaijutsu_types::StyleAttrs::BOLD
+                    | kaijutsu_types::StyleAttrs::UNDERLINE,
+            },
+            // Truecolor fg with a byte-distinct r/g/b (a packing that swapped
+            // two components would survive 0x808080), indexed bg, no attrs.
+            kaijutsu_types::StyleSpan {
+                start: 5,
+                end: 11,
+                fg: Some(kaijutsu_types::StyleColor::Rgb(0x12, 0x34, 0x56)),
+                bg: Some(kaijutsu_types::StyleColor::Indexed(255)),
+                attrs: kaijutsu_types::StyleAttrs::default(),
+            },
+            // Attributes with no color at all — the "kind 0" path.
+            kaijutsu_types::StyleSpan {
+                start: 11,
+                end: 12,
+                fg: None,
+                bg: None,
+                attrs: kaijutsu_types::StyleAttrs::ITALIC
+                    | kaijutsu_types::StyleAttrs::STRIKETHROUGH
+                    | kaijutsu_types::StyleAttrs::BLINK,
+            },
+        ];
+
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolResult)
+            .role(Role::Tool)
+            .content("hello world!")
+            .style_spans(spans.clone())
+            .provenance(kaijutsu_types::ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 3,
+            })
+            .build();
+
+        let round_tripped = roundtrip_snapshot(&snap);
+        assert_eq!(
+            round_tripped.style_spans, spans,
+            "every span field must survive the capnp round trip"
+        );
+        assert_eq!(
+            round_tripped.provenance,
+            Some(kaijutsu_types::ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 3,
+            }),
+            "the provenance tag must survive the capnp round trip"
+        );
+        // The content is the projection; the spans never edit it.
+        assert_eq!(round_tripped.content, "hello world!");
+    }
+
+    /// A writer that never set the fields (every block before the ANSI arc,
+    /// and every ordinary block after it) must decode as "no spans, no tag" —
+    /// the "empty = unset" convention `content_type` and `task_status`
+    /// already use, not a decode error and not a fabricated tag.
+    #[test]
+    fn test_style_spans_absent_decodes_as_empty() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("no styling here")
+            .build();
+        let round_tripped = roundtrip_snapshot(&plain);
+        assert!(
+            round_tripped.style_spans.is_empty(),
+            "an unstyled block must decode with no spans"
+        );
+        assert_eq!(
+            round_tripped.provenance, None,
+            "an empty provenanceTransform means no tag, not a tag with an empty name"
         );
     }
 

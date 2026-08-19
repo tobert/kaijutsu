@@ -8772,6 +8772,40 @@ fn turn_origin_to_capnp(origin: TurnOrigin) -> crate::kaijutsu_capnp::TurnOrigin
     }
 }
 
+/// Kernel [`kaijutsu_types::StyleColor`] → the wire's `(kind, value)` pair:
+/// 0 = none, 1 = indexed (value is the palette slot), 2 = rgb (value is
+/// `0x00RRGGBB`). The inverse lives in `kaijutsu-client`'s `parse_style_spans`.
+fn style_color_to_wire(color: Option<kaijutsu_types::StyleColor>) -> (u8, u32) {
+    match color {
+        None => (0, 0),
+        Some(kaijutsu_types::StyleColor::Indexed(n)) => (1, u32::from(n)),
+        Some(kaijutsu_types::StyleColor::Rgb(r, g, b)) => (
+            2,
+            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+        ),
+    }
+}
+
+/// Write styled spans into an already-sized `List(StyleSpan)` builder —
+/// shared by the snapshot encoder and the change feed's `spansChanged` arm.
+pub(crate) fn set_style_spans(
+    mut list: capnp::struct_list::Builder<'_, crate::kaijutsu_capnp::style_span::Owned>,
+    spans: &[kaijutsu_types::StyleSpan],
+) {
+    for (i, span) in spans.iter().enumerate() {
+        let mut b = list.reborrow().get(i as u32);
+        b.set_start(span.start);
+        b.set_end(span.end);
+        let (fg_kind, fg_value) = style_color_to_wire(span.fg);
+        b.set_fg_kind(fg_kind);
+        b.set_fg_value(fg_value);
+        let (bg_kind, bg_value) = style_color_to_wire(span.bg);
+        b.set_bg_kind(bg_kind);
+        b.set_bg_value(bg_value);
+        b.set_attrs(span.attrs.0);
+    }
+}
+
 /// Set BlockSnapshot fields on a Cap'n Proto builder.
 pub(crate) fn set_block_snapshot(
     builder: &mut crate::kaijutsu_capnp::block_snapshot::Builder,
@@ -8879,6 +8913,22 @@ pub(crate) fn set_block_snapshot(
     // the wire falls back to Open, same convention as content_type/Plain)
     if block.task_status != TaskStatus::default() {
         builder.set_task_status(block.task_status.as_str());
+    }
+
+    // Styled spans + ingest provenance (docs/ansi-and-beyond.md). Both are
+    // skipped when unset — an ordinary block pays nothing for them, and the
+    // decoder's "empty = none" convention restores the same value.
+    if !block.style_spans.is_empty() {
+        set_style_spans(
+            builder
+                .reborrow()
+                .init_style_spans(block.style_spans.len() as u32),
+            &block.style_spans,
+        );
+    }
+    if let Some(ref tag) = block.provenance {
+        builder.set_provenance_transform(&tag.transform);
+        builder.set_provenance_version(tag.version);
     }
 
     // Set ephemeral flag
@@ -9333,6 +9383,9 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockFlowKind::MetadataChanged => {
                                 kaijutsu_types::BlockFlowKind::MetadataChanged
                             }
+                            crate::kaijutsu_capnp::BlockFlowKind::SpansChanged => {
+                                kaijutsu_types::BlockFlowKind::SpansChanged
+                            }
                             crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched => {
                                 kaijutsu_types::BlockFlowKind::ContextSwitched
                             }
@@ -9650,16 +9703,20 @@ async fn send_block_event(
             await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
         }
         // Unreachable by contract: `bridge_carries` drops the classified text
-        // changes before they ever enter the bridge queue, because this wire
-        // has no method for them (docs/change-feed.md). Reported as accepted
+        // changes and `SpansChanged` before they ever enter the bridge queue,
+        // because this wire has no method for them (docs/change-feed.md —
+        // spans reach clients on the change feed and in snapshots, never on
+        // the legacy per-event interface). Reported as accepted
         // rather than panicking — `false` here would tear down a live
         // subscription over an event nobody was owed — and asserted in debug so
         // a future path that reaches this arm is found in tests, not in the
         // field.
-        BlockFlow::TextAppended { .. } | BlockFlow::TextReplaced { .. } => {
+        BlockFlow::TextAppended { .. }
+        | BlockFlow::TextReplaced { .. }
+        | BlockFlow::SpansChanged { .. } => {
             debug_assert!(
                 false,
-                "classified text change reached the BlockEvents bridge; \
+                "an event with no BlockEvents method reached the bridge; \
                  bridge_carries should have dropped it at ingress"
             );
             true
@@ -9744,7 +9801,9 @@ async fn run_block_bridge(
     fn bridge_carries(m: &FlowMessage<BlockFlow>) -> bool {
         !matches!(
             m.payload,
-            BlockFlow::TextAppended { .. } | BlockFlow::TextReplaced { .. }
+            BlockFlow::TextAppended { .. }
+                | BlockFlow::TextReplaced { .. }
+                | BlockFlow::SpansChanged { .. }
         )
     }
 

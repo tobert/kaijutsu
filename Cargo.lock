@@ -6165,6 +6165,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-ansi"
+version = "0.1.0"
+dependencies = [
+ "kaijutsu-types",
+ "vte",
+]
+
+[[package]]
 name = "kaijutsu-app"
 version = "0.1.0"
 dependencies = [
@@ -12104,6 +12112,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07d8e6fe4b9b3b443f2e4ada327cf4b08ab5cdd27a42cd5c9f38dd29092c10ee"
 dependencies = [
  "maybe_parallel_iterator",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
 ]
 
 [[package]]

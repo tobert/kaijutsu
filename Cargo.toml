@@ -14,6 +14,7 @@ members = [
     "crates/kaijutsu-agent-tools",
     "crates/kaijutsu-index",
     "crates/kaijutsu-abc",
+    "crates/kaijutsu-ansi",
     "crates/kaijutsu-cas",
     "crates/kaijutsu-audio",
     "crates/kaijutsu-hyoushigi",
@@ -44,6 +45,7 @@ correctness = { level = "deny", priority = 0 }
 [workspace.dependencies]
 # Internal crates
 kaijutsu-abc = { path = "crates/kaijutsu-abc" }
+kaijutsu-ansi = { path = "crates/kaijutsu-ansi" }
 kaijutsu-cas = { path = "crates/kaijutsu-cas" }
 kaijutsu-audio = { path = "crates/kaijutsu-audio" }
 kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
@@ -171,6 +173,14 @@ kurbo = "0.13"
 
 # Text rendering
 pulldown-cmark = "0.13"
+
+# ANSI escape parsing — alacritty's `vte`, the canonical DEC state machine
+# (vt100.net) with *no* execution semantics: it hands back callbacks and
+# already bounds parameter counts. kaijutsu-ansi writes only the boring part
+# (SGR integer → style enum, span assembly). See docs/ansi-and-beyond.md
+# "Parsing: vte, scope, safety invariants" — and note the `ansi` feature
+# (a full terminal-semantics layer) is deliberately NOT enabled.
+vte = "0.15"
 
 # Diff engine (Apache-2.0) — the engine inside gitoxide and Helix. Histogram +
 # Myers over *arbitrary* token streams, so word-level refinement is the same

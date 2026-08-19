@@ -101,6 +101,8 @@ mod tests {
             notification: None,
             resource: None,
             task_status: kaijutsu_types::TaskStatus::default(),
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 

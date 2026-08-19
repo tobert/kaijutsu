@@ -1838,6 +1838,53 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Replace a block's styled spans and provenance tag together — the
+    /// ingest projection landing late, or `kj block reproject` re-deriving it
+    /// (docs/ansi-and-beyond.md).
+    ///
+    /// Journalled as a full snapshot for the same reason `set_stderr` is (the
+    /// fields are snapshot-only, invisible to `BlockHeader`), and — unlike
+    /// `set_signature`, which the LLM path reads back out of the kernel's own
+    /// store — emitted as a live event, because the players who care about
+    /// spans are *clients* and they only learn about them over the feed.
+    pub fn set_style_spans(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        style_spans: Vec<kaijutsu_types::StyleSpan>,
+        provenance: Option<kaijutsu_types::ProvenanceTag>,
+    ) -> BlockStoreResult<()> {
+        let (ops, version) = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let principal_id = self.principal_id();
+            entry
+                .doc
+                .set_style_spans(block_id, style_spans.clone(), provenance.clone())?;
+            entry.touch(principal_id);
+            let version = entry.version();
+            // Snapshot-only fields, not part of `BlockHeader` — see the same
+            // note on `set_stderr` above and docs/issues.md.
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_snapshot(snapshot), version)
+        };
+        // Commit first, publish second: the journal write is the acceptance.
+        self.journal_op(context_id, ops)?;
+        self.emit(BlockFlow::SpansChanged {
+            context_id,
+            block_id: *block_id,
+            style_spans,
+            provenance,
+            version,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
     /// Set structured output data on a block.
     ///
     /// Output data provides formatting information (tables, trees) for richer output.
@@ -4180,6 +4227,79 @@ mod tests {
         }
     }
 
+    /// `set_style_spans` must publish `SpansChanged` carrying the whole
+    /// projection. Unlike `set_signature` — which the LLM path reads back out
+    /// of the kernel's own store — spans exist for *clients*, and a client
+    /// only learns about them from this event or a fresh snapshot. A silent
+    /// mutator would leave every attached surface drawing the old styling.
+    #[tokio::test]
+    async fn test_set_style_spans_emits_spans_changed() {
+        use kaijutsu_types::{ProvenanceTag, StyleAttrs, StyleColor, StyleSpan};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        while sub.try_recv().is_some() {}
+
+        let spans = vec![StyleSpan {
+            start: 0,
+            end: 5,
+            fg: Some(StyleColor::Indexed(3)),
+            bg: Some(StyleColor::Rgb(1, 2, 3)),
+            attrs: StyleAttrs::BOLD,
+        }];
+        let tag = ProvenanceTag {
+            transform: "ansi-strip".to_string(),
+            version: 1,
+        };
+        store
+            .set_style_spans(ctx, &block_id, spans.clone(), Some(tag.clone()))
+            .unwrap();
+
+        let msg = sub
+            .try_recv()
+            .expect("set_style_spans should emit a flow event");
+        match msg.payload {
+            BlockFlow::SpansChanged {
+                block_id: got_id,
+                style_spans,
+                provenance,
+                version,
+                ..
+            } => {
+                assert_eq!(got_id, block_id);
+                assert_eq!(style_spans, spans);
+                assert_eq!(provenance, Some(tag));
+                assert!(version > 0, "the event must carry the post-mutation version");
+            }
+            other => panic!("expected SpansChanged, got: {other:?}"),
+        }
+
+        // The store itself holds the same projection the event announced.
+        let snapshot = store
+            .get_block_snapshot(ctx, &block_id)
+            .unwrap()
+            .expect("block exists");
+        assert_eq!(snapshot.style_spans, spans);
+        assert_eq!(snapshot.content, "hello", "styling never edits the text");
+    }
+
     /// `insert_block` journals a `SyncPayload` that replays into a fresh
     /// document — the restart path, not a client sync path.
     #[tokio::test]
@@ -4377,6 +4497,65 @@ mod tests {
             snapshot.stderr.as_deref(),
             Some("boom on stderr"),
             "stderr set before the next compaction must survive a restart replay"
+        );
+    }
+
+    /// Spans are snapshot-only fields like `stderr`, so they need the same
+    /// full-snapshot journal payload: a header-only op would replay a block
+    /// whose styling silently vanished at the next restart.
+    #[tokio::test]
+    async fn test_set_style_spans_survives_oplog_replay_without_compaction() {
+        use kaijutsu_types::{ProvenanceTag, StyleAttrs, StyleColor, StyleSpan};
+
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "stdout",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let spans = vec![StyleSpan {
+            start: 0,
+            end: 6,
+            fg: Some(StyleColor::Rgb(0x12, 0x34, 0x56)),
+            bg: None,
+            attrs: StyleAttrs::ITALIC,
+        }];
+        store
+            .set_style_spans(
+                ctx,
+                &block_id,
+                spans.clone(),
+                Some(ProvenanceTag {
+                    transform: "ansi-strip".to_string(),
+                    version: 2,
+                }),
+            )
+            .unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&block_id)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.style_spans, spans,
+            "spans set before the next compaction must survive a restart replay"
+        );
+        assert_eq!(
+            snapshot.provenance.map(|p| p.version),
+            Some(2),
+            "the provenance tag replays with its spans"
         );
     }
 

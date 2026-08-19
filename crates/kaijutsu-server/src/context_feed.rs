@@ -316,6 +316,7 @@ fn carries(flow: &BlockFlow) -> bool {
             | BlockFlow::ExcludedChanged { .. }
             | BlockFlow::MetadataChanged { .. }
             | BlockFlow::OutputChanged { .. }
+            | BlockFlow::SpansChanged { .. }
     )
 }
 
@@ -401,6 +402,23 @@ fn write_event(builder: context_event::Builder<'_>, flow: &BlockFlow) {
                 crate::rpc::build_output_data(b.reborrow().init_output(), data);
             }
         }
+        BlockFlow::SpansChanged {
+            block_id,
+            style_spans,
+            provenance,
+            ..
+        } => {
+            let mut b = builder.init_spans_changed();
+            crate::rpc::set_block_id_builder(&mut b.reborrow().init_block_id(), block_id);
+            if let Some(tag) = provenance {
+                b.set_provenance_transform(&tag.transform);
+                b.set_provenance_version(tag.version);
+            }
+            crate::rpc::set_style_spans(
+                b.reborrow().init_style_spans(style_spans.len() as u32),
+                style_spans,
+            );
+        }
         // Unreachable by contract: `carries` filtered these out before the
         // batch was built. Asserted in debug so a future arm added to
         // `carries` without an arm here is found in tests; in release the
@@ -409,5 +427,117 @@ fn write_event(builder: context_event::Builder<'_>, flow: &BlockFlow) {
             false,
             "context feed tried to write an event it does not carry: {other:?}"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_types::{BlockId, ContextId, PrincipalId, ProvenanceTag, StyleAttrs, StyleColor,
+        StyleSpan};
+
+    /// The encoder half of the span wire mapping (docs/ansi-and-beyond.md).
+    ///
+    /// `Indexed` and `Rgb` share one `(kind, value)` pair, so a mapping that
+    /// forgot the kind byte — or packed the components in the wrong order —
+    /// would still look plausible for one of them. Read back through the
+    /// generated reader rather than through the client's decoder, so this
+    /// pins what the SERVER put on the wire.
+    #[test]
+    fn spans_changed_writes_the_wire_color_encoding() {
+        let context_id = ContextId::new();
+        let block_id = BlockId::new(context_id, PrincipalId::new(), 1);
+        let flow = BlockFlow::SpansChanged {
+            context_id,
+            block_id,
+            style_spans: vec![
+                StyleSpan {
+                    start: 0,
+                    end: 4,
+                    fg: Some(StyleColor::Indexed(9)),
+                    bg: None,
+                    attrs: StyleAttrs::BOLD | StyleAttrs::UNDERLINE,
+                },
+                StyleSpan {
+                    start: 4,
+                    end: 9,
+                    fg: Some(StyleColor::Rgb(0x12, 0x34, 0x56)),
+                    bg: Some(StyleColor::Indexed(0)),
+                    attrs: StyleAttrs::default(),
+                },
+            ],
+            provenance: Some(ProvenanceTag {
+                transform: "ansi-strip".into(),
+                version: 7,
+            }),
+            version: 42,
+            source: kaijutsu_kernel::flows::OpSource::Local,
+        };
+        assert!(carries(&flow), "spans must ride the change feed");
+
+        let mut message = capnp::message::Builder::new_default();
+        write_event(message.init_root::<context_event::Builder>(), &flow);
+        let reader = message
+            .get_root_as_reader::<context_event::Reader>()
+            .expect("root reads back");
+
+        let context_event::SpansChanged(r) = reader.which().expect("known union arm") else {
+            panic!("SpansChanged must land in its own union arm");
+        };
+        let r = r.expect("spansChanged payload");
+        assert_eq!(
+            r.get_provenance_transform().unwrap().to_str().unwrap(),
+            "ansi-strip"
+        );
+        assert_eq!(r.get_provenance_version(), 7);
+
+        let spans = r.get_style_spans().expect("span list");
+        assert_eq!(spans.len(), 2);
+
+        let indexed = spans.get(0);
+        assert_eq!((indexed.get_start(), indexed.get_end()), (0, 4));
+        assert_eq!((indexed.get_fg_kind(), indexed.get_fg_value()), (1, 9));
+        assert_eq!((indexed.get_bg_kind(), indexed.get_bg_value()), (0, 0));
+        assert_eq!(indexed.get_attrs(), (StyleAttrs::BOLD | StyleAttrs::UNDERLINE).0);
+
+        let rgb = spans.get(1);
+        assert_eq!(
+            (rgb.get_fg_kind(), rgb.get_fg_value()),
+            (2, 0x0012_3456),
+            "truecolor packs as 0x00RRGGBB"
+        );
+        assert_eq!((rgb.get_bg_kind(), rgb.get_bg_value()), (1, 0));
+        assert_eq!(rgb.get_attrs(), 0);
+    }
+
+    /// An untagged, unstyled reprojection is a real event: it says the block
+    /// has no styling any more. It must ride the feed as an empty list and an
+    /// empty transform, not be skipped.
+    #[test]
+    fn spans_changed_carries_an_empty_projection() {
+        let context_id = ContextId::new();
+        let block_id = BlockId::new(context_id, PrincipalId::new(), 1);
+        let flow = BlockFlow::SpansChanged {
+            context_id,
+            block_id,
+            style_spans: Vec::new(),
+            provenance: None,
+            version: 2,
+            source: kaijutsu_kernel::flows::OpSource::Local,
+        };
+
+        let mut message = capnp::message::Builder::new_default();
+        write_event(message.init_root::<context_event::Builder>(), &flow);
+        let reader = message
+            .get_root_as_reader::<context_event::Reader>()
+            .expect("root reads back");
+
+        let context_event::SpansChanged(r) = reader.which().expect("known union arm") else {
+            panic!("SpansChanged must land in its own union arm");
+        };
+        let r = r.expect("spansChanged payload");
+        assert_eq!(r.get_style_spans().unwrap().len(), 0);
+        assert!(r.get_provenance_transform().unwrap().is_empty());
+        assert_eq!(r.get_provenance_version(), 0);
     }
 }

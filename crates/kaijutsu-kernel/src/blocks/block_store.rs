@@ -1112,6 +1112,26 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Replace a block's styled spans and provenance tag (ingest projection
+    /// or reprojection; docs/ansi-and-beyond.md). Snapshot-only fields —
+    /// replicated via the `SpansChanged` flow event and the full snapshot,
+    /// never on `BlockHeader`.
+    pub fn set_style_spans(
+        &mut self,
+        id: &BlockId,
+        spans: Vec<kaijutsu_types::StyleSpan>,
+        provenance: Option<kaijutsu_types::ProvenanceTag>,
+    ) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        block.set_style_spans(spans, provenance);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the content type on a block.
     pub fn set_content_type(&mut self, id: &BlockId, content_type: ContentType) -> Result<()> {
         let block = self
@@ -1908,6 +1928,71 @@ mod tests {
             restored.updated_snapshots.is_empty(),
             "a missing key must default, never fabricate data"
         );
+
+        // And the whole point: replaying an old-shape row into a fresh
+        // document must still work end to end, not just decode.
+        let mut doc = test_store();
+        doc.merge_ops(restored).expect("replay old-shape payload");
+        assert_eq!(doc.get_block_snapshot(&id).map(|s| s.content), Some("hello".to_string()));
+    }
+
+    /// The pre-`style_spans`/`provenance` shape of `BlockSnapshot`
+    /// (docs/ansi-and-beyond.md), nested inside a `SyncPayload` — every
+    /// journaled `new_blocks`/`updated_snapshots` row written by a
+    /// currently-running kernel before those fields existed. Same required
+    /// fields as `kaijutsu_types::codec`'s own `OldBlockSnapshotMimic` (the
+    /// codec crate's home for the BlockSnapshot-level version of this
+    /// contract); this is the SyncPayload-level companion.
+    #[derive(serde::Serialize)]
+    struct OldBlockSnapshotMimic {
+        id: BlockId,
+        role: kaijutsu_types::Role,
+        status: kaijutsu_types::Status,
+        kind: BlockKind,
+        content: String,
+        created_at: u64,
+        tick: Option<kaijutsu_types::Tick>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct OldSpansSyncPayloadMimic {
+        block_ops: Vec<(BlockId, TextEdit)>,
+        new_blocks: Vec<OldBlockSnapshotMimic>,
+        updated_headers: Vec<BlockHeader>,
+        deleted_blocks: Vec<BlockId>,
+        updated_snapshots: Vec<OldBlockSnapshotMimic>,
+    }
+
+    #[test]
+    fn old_shape_sync_payload_without_spans_fields_still_decodes() {
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 0);
+        let old_snap = OldBlockSnapshotMimic {
+            id,
+            role: kaijutsu_types::Role::Model,
+            status: kaijutsu_types::Status::Done,
+            kind: BlockKind::Text,
+            content: "hello".to_string(),
+            created_at: 0,
+            tick: None,
+        };
+        let old = OldSpansSyncPayloadMimic {
+            block_ops: Vec::new(),
+            new_blocks: vec![old_snap],
+            updated_headers: Vec::new(),
+            deleted_blocks: Vec::new(),
+            updated_snapshots: Vec::new(),
+        };
+        let bytes = kaijutsu_types::codec::encode(&old).expect("encode old-shape mimic");
+        let restored: SyncPayload =
+            kaijutsu_types::codec::decode(&bytes).expect("old-shape row must still decode");
+        assert_eq!(restored.new_blocks.len(), 1);
+        assert_eq!(restored.new_blocks[0].content, "hello");
+        assert!(
+            restored.new_blocks[0].style_spans.is_empty(),
+            "a missing key must default, never fabricate data"
+        );
+        assert_eq!(restored.new_blocks[0].provenance, None);
 
         // And the whole point: replaying an old-shape row into a fresh
         // document must still work end to end, not just decode.

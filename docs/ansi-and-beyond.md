@@ -102,10 +102,38 @@ kj block reproject <block-id>    # run the CURRENT parser over the original;
                                  # re-emit spans as a normal sequenced edit
 ```
 
-**Ingestion atomicity**: clean text, spans, and the provenance row commit in
-the same transaction — commit first, publish second. Streaming starts with
-buffer-until-done for the provenance bytes (text still commits per flush);
-upgrade to append-per-flush only if crash-loss of provenance ever bites.
+**Ingestion atomicity**: clean text, spans, and the provenance row commit
+together at the hook site — commit first, publish second. Streaming starts
+with buffer-until-done for the provenance bytes (text still commits per
+flush); upgrade to append-per-flush only if crash-loss of provenance ever
+bites.
+
+**Reality checks from the build (2026-08-19).** Three findings from reading
+the actual ingest paths, now load-bearing:
+
+- **Foreground output arrives whole, not streaming.** kaish's
+  `ExecuteOptions` has no output sink; `ExecResult` returns one buffer. The
+  only streaming path is `background_exec.rs` (8 KiB chunks) — the one place
+  the incremental parser and its chunk-boundary state matter. Read
+  `result.out` (`OutputPayload`) directly; `text_out()` is already lossy on
+  the `Bytes` arm.
+- **kaish truncates upstream** (head+tail spill, Agent profile 8 KB), so
+  foreground provenance is *post-cap* bytes — "what kaish handed us" is the
+  honest original. `background_exec`'s cap is kaijutsu-side, so pre-cap
+  capture is possible there.
+- **`journal_op` is not a transaction today** (two autocommit statements
+  under a mutex). The provenance row is therefore its own statement at the
+  hook site: a crash between leaves a detectable gap (tag without row —
+  `kj block original` fails gracefully, the CI invariant skips with a
+  warning), never corruption. Making journal_op transactional is a
+  pre-existing issue, tracked separately.
+
+One replay wrinkle to remember: oplog replay applies journaled semantic
+appends through `edit_text`, which clears spans (live end-appends via
+`append_text` keep them — offsets stay valid). Under buffer-until-done
+ordering (spans land at completion, after all appends) replay is correct;
+if spans ever land *before* later appends (reproject-then-append), replay
+would drop them where live execution kept them. Tracked in issues.md.
 
 ## Parsing: vte, scope, safety invariants
 
