@@ -24,5 +24,6 @@ pub mod kaish_backend;
 pub mod kj_builtin;
 pub mod mount_backend;
 pub mod read_only_fs;
+pub mod swap_filesystem;
 pub mod synthesis;
 pub mod vi_builtin;

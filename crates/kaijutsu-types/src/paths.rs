@@ -84,6 +84,13 @@ pub const DOCS_ROOT: &str = "/v/docs";
 /// Root of the input-document view mount.
 pub const INPUT_ROOT: &str = "/v/input";
 
+/// Root of the read-only dirty-file-buffer ("swap") view mount
+/// (docs/file-buffers.md). Mirrors each unsaved buffer's real path under
+/// `/v/swap/<kernel_id>/...` — the kernel-id segment (`KernelId::to_hex()`)
+/// says whose disk a swap belongs to, so a swap stays findable in a backup,
+/// a copied data dir, or a view spanning more than one kernel.
+pub const SWAP_ROOT: &str = "/v/swap";
+
 /// Root of the client-shares namespace (`docs/slash-r.md`) — the reverse of
 /// `/v`: a sibling top-level tree (not under `/v`) because it names remote
 /// *clients*, not kernel-local virtual filesystems. Layout:

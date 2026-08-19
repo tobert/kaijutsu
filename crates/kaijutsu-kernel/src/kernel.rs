@@ -105,6 +105,13 @@ pub struct Kernel {
     /// single kernel document regardless of surface — there is exactly one
     /// `FileDocumentCache` per kernel, never a lazily-built second one.
     file_cache: Arc<crate::file_tools::FileDocumentCache>,
+    /// Direct handle to the same `KernelDb` that `blocks` and `file_cache`
+    /// are built over — a clone of the one `Arc<Mutex<>>` passed to
+    /// `new`/`with_flows`, not a second store. Exposed so a mount like
+    /// `/v/swap` (docs/file-buffers.md) that needs a durable-table query
+    /// neither `blocks()` nor `file_cache()` surface (`list_dirty_file_buffers`)
+    /// can reach it without opening its own connection.
+    db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
     /// Per-context hyoushigi timelines — the live open future for contexts that
     /// own a beat (musician, audio). A context is **armed** by inserting it here;
     /// a context with no entry (every coder) has no timeline and costs nothing.
@@ -234,7 +241,7 @@ impl Kernel {
         let file_cache = Arc::new(crate::file_tools::FileDocumentCache::new(
             blocks.clone(),
             vfs.clone(),
-            db,
+            db.clone(),
         ));
 
         Self {
@@ -260,6 +267,7 @@ impl Kernel {
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             blocks,
             file_cache,
+            db,
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -337,7 +345,7 @@ impl Kernel {
         let file_cache = Arc::new(crate::file_tools::FileDocumentCache::new(
             blocks.clone(),
             vfs.clone(),
-            db,
+            db.clone(),
         ));
 
         Self {
@@ -363,6 +371,7 @@ impl Kernel {
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             blocks,
             file_cache,
+            db,
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -1244,6 +1253,15 @@ impl Kernel {
     /// There is exactly one instance for the kernel's lifetime.
     pub fn file_cache(&self) -> &Arc<crate::file_tools::FileDocumentCache> {
         &self.file_cache
+    }
+
+    /// The kernel's `KernelDb` handle — the same instance `blocks()` and
+    /// `file_cache()` are built over, not a second connection. Callers that
+    /// need a durable-table query neither of those surfaces exposes (e.g.
+    /// `list_dirty_file_buffers` for `/v/swap`, docs/file-buffers.md) take
+    /// this rather than opening their own `KernelDb`.
+    pub fn kernel_db(&self) -> &Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>> {
+        &self.db
     }
 
     // ── Editor sessions ───────────────────────────────────────────────────

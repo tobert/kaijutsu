@@ -14,6 +14,7 @@
 //!             ├── kaish::Kernel (in-process)
 //!             │       │
 //!             │       ├── /v/docs → KaijutsuFilesystem (kernel blocks)
+//!             │       ├── /v/swap → SwapFilesystem (dirty file buffers, read-only)
 //!             │       ├── /v/jobs, /v/cas → kaish builtins
 //!             │       └── everything else → MountBackend
 //!             │               │
@@ -40,7 +41,7 @@ use kaish_kernel::{
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::kernel_db::KernelDb;
-use kaijutsu_types::paths::{DOCS_ROOT, INPUT_ROOT};
+use kaijutsu_types::paths::{DOCS_ROOT, INPUT_ROOT, SWAP_ROOT};
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use super::docs_filesystem::KaijutsuFilesystem;
@@ -48,6 +49,7 @@ use super::input_filesystem::InputFilesystem;
 use super::kaish_backend::KaijutsuBackend;
 use super::mount_backend::MountBackend;
 use super::read_only_fs::ReadOnlyFs;
+use super::swap_filesystem::SwapFilesystem;
 use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Embedded kaish executor backed by kernel blocks.
@@ -317,6 +319,17 @@ impl EmbeddedKaish {
 
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
 
+        // `/v/swap` (docs/file-buffers.md): a read-only view over unflushed
+        // file buffers, mirrored by real path under this kernel's identity
+        // segment. Read-only by construction (`SwapFilesystem` refuses every
+        // mutation itself), so — unlike `docs_fs`/`input_fs` — it needs no
+        // conditional `ReadOnlyFs` wrap for the read-only shell mode.
+        let swap_fs = Arc::new(SwapFilesystem::new(
+            kernel.kernel_db().clone(),
+            kernel.file_cache().clone(),
+            kernel.id(),
+        ));
+
         // KaishConfig primarily sets the cwd and kernel name. The VFS mode
         // in the config is secondary to kaijutsu's MountTable — real filesystem
         // access is routed through MountBackend → MountTable → LocalBackend,
@@ -415,6 +428,7 @@ impl EmbeddedKaish {
             |vfs| {
                 vfs.mount_arc(DOCS_ROOT, docs_mount);
                 vfs.mount_arc(INPUT_ROOT, input_mount);
+                vfs.mount_arc(SWAP_ROOT, swap_fs);
             },
             |tools| {
                 configure_tools(ctx_for_tools, sid_for_tools, tools);
