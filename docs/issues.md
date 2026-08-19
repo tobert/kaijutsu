@@ -6950,6 +6950,34 @@ Renders SGR only; cursor/screen codes are preserved in provenance, never
 rendered (kills hidden-text-by-overwrite by construction). Standing safety
 invariants and the `\r`-progress-bar open question are in the doc.
 
+## ANSI rendering, pass 1: four corners left open (2026-08-19)
+
+Stage 3.2/3.3 shipped — `StyleSpan` → `text::ansi::StyledSpan`/`StyledBrush`
+→ parley ranged brushes → `PositionedGlyph.style_index`/`importance`, plus
+backgrounds and underline/strikethrough in the geometry lane. What it does
+not do yet:
+
+- **Italic (SGR 3) is parsed and fingerprinted but never rendered.** It is
+  the one attribute that would change *shaping* (a `StyleProperty::FontStyle`
+  range), so it needs a decision about column alignment for terminal output
+  before it goes in. Blink is the same shape and is already on the design
+  doc's deferred list.
+- **ANSI spans are dropped on a block that detects as a drawn rich kind**
+  (ABC, SVG, sparkline, diff, image). Those shape through
+  `view::surface::rich::RichShaper`, which builds its own geometry and never
+  sees the styled-span list. Does not arise from today's ingest hooks (shell
+  output is plain); the fix is teaching the rich shaper the second currency.
+- **`INVERSE` is resolved CPU-side and is stale until the block re-shapes.**
+  Swapping fg/bg means the glyph color comes from a background, which cannot
+  be expressed as a palette slot for the GPU table, so an inverted span bakes
+  both colors and carries `style_index = 0`. The theme epoch in `ShapeKey`
+  makes the re-shape happen, so the window is a frame or two — accepted, not
+  invisible.
+- **Backgrounds and underlines bake their color into vertices**, which is why
+  ANSI-spanned blocks now join the drawn rich kinds in taking
+  `ShapeKey::baked_theme_epoch` (renamed from `rich_theme_epoch`). If a
+  future geometry lane learns the style table, that key field can shrink back.
+
 ## journal_op is not a transaction (pre-existing, surfaced 2026-08-19)
 
 `BlockStore::journal_op` (block_store.rs:906) issues `append_op` and

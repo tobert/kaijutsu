@@ -41,6 +41,7 @@
 
 use std::ops::Range;
 
+use crate::text::ansi::StyledSpan;
 use crate::text::rich::SpanBrush;
 
 /// Target hard lines per chunk.
@@ -163,6 +164,30 @@ pub fn slice_spans(spans: &[SpanBrush], range: Range<usize>) -> Vec<SpanBrush> {
                 start: start - range.start,
                 end: end - range.start,
                 brush: span.brush.clone(),
+            })
+        })
+        .collect()
+}
+
+/// [`slice_spans`] for the ANSI currency — same clamp-and-rebase, same
+/// drop-what-clips-to-nothing rule.
+///
+/// A separate function rather than a generic one because the two span types
+/// share no trait and inventing one to hold two five-line loops together would
+/// be more machinery than the duplication costs.
+pub fn slice_styled_spans(spans: &[StyledSpan], range: Range<usize>) -> Vec<StyledSpan> {
+    spans
+        .iter()
+        .filter_map(|span| {
+            let start = span.start.max(range.start);
+            let end = span.end.min(range.end);
+            if start >= end {
+                return None;
+            }
+            Some(StyledSpan {
+                start: start - range.start,
+                end: end - range.start,
+                ..*span
             })
         })
         .collect()
@@ -415,6 +440,49 @@ mod tests {
         );
         assert_eq!(sliced[0].brush, brush(WHITE));
         assert_eq!(sliced[1].brush, brush(BLUE));
+    }
+
+    // ---- slice_styled_spans ----------------------------------------------
+
+    fn styled(start: usize, end: usize) -> StyledSpan {
+        StyledSpan {
+            start,
+            end,
+            brush: crate::text::ansi::StyledBrush {
+                color: BLUE,
+                style_index: 7,
+                importance: 0.75,
+            },
+            bg: Some(WHITE),
+            ink: BLUE,
+            underline: true,
+            strikethrough: false,
+        }
+    }
+
+    /// Same clamp-and-rebase contract as [`slice_spans`], and — the part that
+    /// matters for ANSI — everything that is not a byte offset survives it. A
+    /// slice that dropped the style index or the underline would draw the
+    /// right glyphs in the wrong style, silently.
+    #[test]
+    fn styled_spans_clamp_rebase_and_keep_their_style() {
+        let spans = [styled(0, 12), styled(12, 30)];
+        let sliced = slice_styled_spans(&spans, 8..20);
+        assert_eq!(
+            sliced.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(),
+            vec![(0, 4), (4, 12)],
+        );
+        for span in &sliced {
+            assert_eq!(span.brush, spans[0].brush);
+            assert_eq!(span.bg, Some(WHITE));
+            assert!(span.underline);
+        }
+    }
+
+    #[test]
+    fn a_styled_span_that_clips_to_nothing_is_dropped() {
+        let spans = [styled(0, 10), styled(20, 25)];
+        assert!(slice_styled_spans(&spans, 10..20).is_empty());
     }
 
     // ---- the equivalence property ----------------------------------------

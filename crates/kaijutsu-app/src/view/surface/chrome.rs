@@ -1108,7 +1108,7 @@ mod tests {
                 collapsed: false,
                 indent_level: 0,
                 metrics_epoch: 0,
-                rich_theme_epoch: 0,
+                baked_theme_epoch: 0,
             },
             chunks: Vec::new(),
             height: 40.0,

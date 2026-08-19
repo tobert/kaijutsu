@@ -63,6 +63,54 @@ impl Default for AnsiColors {
     }
 }
 
+impl AnsiColors {
+    /// The full 256-slot terminal palette as straight sRGB-space RGBA floats —
+    /// the encoding glyph instance colors already use (`brush_to_rgba8`
+    /// clamps sRGB components to Unorm bytes; this skips the byte round-trip).
+    ///
+    /// Slots 0–15 are the themed fields above; 16–231 the standard xterm
+    /// 6×6×6 cube; 232–255 the grayscale ramp. Cube and ramp are computed,
+    /// not themed — the theme file speaks 16 colors (docs/ansi-and-beyond.md
+    /// defers 256-cube theming).
+    pub fn palette_256(&self) -> [[f32; 4]; 256] {
+        let named = [
+            self.black,
+            self.red,
+            self.green,
+            self.yellow,
+            self.blue,
+            self.magenta,
+            self.cyan,
+            self.white,
+            self.bright_black,
+            self.bright_red,
+            self.bright_green,
+            self.bright_yellow,
+            self.bright_blue,
+            self.bright_magenta,
+            self.bright_cyan,
+            self.bright_white,
+        ];
+        let mut palette = [[0.0f32; 4]; 256];
+        for (slot, color) in palette.iter_mut().zip(named) {
+            let c = color.to_srgba();
+            *slot = [c.red, c.green, c.blue, 1.0];
+        }
+        // 6×6×6 cube: component levels 0,95,135,175,215,255 (xterm's table).
+        const CUBE: [f32; 6] = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
+        for i in 0..216 {
+            let (r, g, b) = (i / 36, (i / 6) % 6, i % 6);
+            palette[16 + i] = [CUBE[r] / 255.0, CUBE[g] / 255.0, CUBE[b] / 255.0, 1.0];
+        }
+        // Grayscale ramp: 8, 18, …, 238.
+        for i in 0..24 {
+            let v = (8 + 10 * i) as f32 / 255.0;
+            palette[232 + i] = [v, v, v, 1.0];
+        }
+        palette
+    }
+}
+
 /// Syntax highlighting colors for kaish shell input.
 ///
 /// Defaults are derived from the ANSI palette (Tokyo Night).

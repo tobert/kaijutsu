@@ -11,6 +11,7 @@
 //! the Parley shaping / `Brush` source behind the MSDF path.
 
 pub mod abc;
+pub mod ansi;
 pub mod components;
 pub mod diff;
 pub mod markdown;

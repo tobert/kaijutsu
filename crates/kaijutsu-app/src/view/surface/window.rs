@@ -493,6 +493,7 @@ mod tests {
             font_size: 16.0,
             color: [255, 255, 255, 255],
             importance: 0.5,
+            style_index: 0,
         }
     }
 
@@ -517,7 +518,7 @@ mod tests {
                 collapsed: false,
                 indent_level: 0,
                 metrics_epoch: 1,
-                rich_theme_epoch: 0,
+                baked_theme_epoch: 0,
             },
             height: chunk_heights.iter().sum(),
             text_height: chunk_heights.iter().sum(),

@@ -503,6 +503,7 @@ mod tests {
             font_size: 16.0,
             color: [255, 255, 255, 255],
             importance: 0.5,
+            style_index: 0,
         };
 
         let scale_factor = 1.25;
@@ -553,6 +554,7 @@ mod tests {
             font_size: 20.0,
             color: [10, 20, 30, 255],
             importance: 0.5,
+            style_index: 0,
         };
 
         let tex_w = 500.0;
@@ -610,6 +612,7 @@ mod tests {
             font_size: 16.0,
             color: [0; 4],
             importance: 0.5,
+            style_index: 0,
         };
         let glyph_b = PositionedGlyph {
             x: 5.4,

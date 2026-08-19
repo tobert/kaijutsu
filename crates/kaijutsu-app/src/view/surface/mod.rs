@@ -298,6 +298,7 @@ impl Plugin for ConversationSurfacePlugin {
         };
         render_app
             .init_resource::<extract::ExtractedConversationSurfaces>()
+            .init_resource::<extract::ExtractedStyleTable>()
             .init_resource::<extract::SurfaceGpuBuffers>()
             .add_systems(ExtractSchedule, extract::extract_conversation_surfaces)
             .add_systems(

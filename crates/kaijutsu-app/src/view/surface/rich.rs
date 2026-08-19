@@ -29,7 +29,7 @@
 //! - **Theme colors are a shaping input, for these kinds only.** A diff band
 //!   is `theme.diff_insert_bg`, not the block's text color, so a theme swap
 //!   must re-build the geometry — which is why [`super::shape_cache::ShapeKey`]
-//!   carries `rich_theme_epoch`, and why it is zero for everything else (a
+//!   carries `baked_theme_epoch`, and why it is zero for everything else (a
 //!   theme swap must never re-shape the whole conversation; that is the
 //!   full-document rebake this rewrite deletes).
 //!

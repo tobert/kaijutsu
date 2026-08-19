@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use peniko::Brush;
 
 use super::atlas::MsdfAtlas;
-use super::glyph::{FontId, GlyphKey, PositionedGlyph};
+use super::glyph::{FontId, GlyphKey, IMPORTANCE_NORMAL, PositionedGlyph};
+use crate::text::ansi::StyledBrush;
 use crate::text::rich::SpanBrush;
 
 /// Extract positioned glyphs from a Parley layout for MSDF rendering.
@@ -64,7 +65,7 @@ pub fn collect_msdf_glyphs_deferred(
         let text_range = glyph_run.run().text_range();
         let run_brush = crate::text::rich::brush_at_offset(span_brushes, text_range.start)
             .unwrap_or(fallback_brush);
-        brush_to_rgba8(run_brush)
+        GlyphPaint::plain(brush_to_rgba8(run_brush))
     })
 }
 
@@ -101,18 +102,69 @@ pub fn collect_msdf_glyphs_styled_deferred(
     offset: (f64, f64),
 ) -> (Vec<PositionedGlyph>, Vec<GlyphKey>) {
     collect_with(layout, offset, |glyph_run| {
-        brush_to_rgba8(&glyph_run.style().brush)
+        GlyphPaint::plain(brush_to_rgba8(&glyph_run.style().brush))
     })
 }
 
-/// The glyph walk both deferred collectors share; they differ only in where
-/// the color comes from. Returns the glyphs plus the deduplicated,
+/// [`collect_msdf_glyphs_styled_deferred`] in the conversation surface's ANSI
+/// currency ([`StyledBrush`], pushed by `VelloFont::layout_styled`).
+///
+/// The pair that makes the whole ANSI path work: the brush parley resolved for
+/// each glyph run carries the style-table index and the MSDF weight as well as
+/// the color, so a run boundary that exists only because two spans differ in
+/// *bold* arrives here with the bold still attached.
+pub fn collect_msdf_glyphs_ansi_deferred(
+    layout: &parley::Layout<StyledBrush>,
+    offset: (f64, f64),
+) -> (Vec<PositionedGlyph>, Vec<GlyphKey>) {
+    collect_with(layout, offset, |glyph_run| {
+        let brush = &glyph_run.style().brush;
+        GlyphPaint {
+            color: brush.color,
+            style_index: brush.style_index,
+            importance: brush.importance,
+        }
+    })
+}
+
+/// Everything a glyph run contributes to the glyphs it produces, beyond where
+/// they sit: the color, the style-table index that may override it on the GPU,
+/// and the MSDF stem weight.
+///
+/// One struct rather than three closure returns because the three always move
+/// together — a collector that set the color from a brush and left the weight
+/// at the default would be a silent half-styled glyph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GlyphPaint {
+    color: [u8; 4],
+    style_index: u32,
+    importance: f32,
+}
+
+impl GlyphPaint {
+    /// Unstyled paint: a color and nothing else — what every collector that
+    /// predates the style table produces.
+    fn plain(color: [u8; 4]) -> Self {
+        Self {
+            color,
+            style_index: 0,
+            importance: IMPORTANCE_NORMAL,
+        }
+    }
+}
+
+/// The glyph walk every deferred collector shares; they differ only in where
+/// the paint comes from. Returns the glyphs plus the deduplicated,
 /// first-occurrence-ordered list of keys an atlas `request()` pass would
 /// need to see to reproduce the non-deferred collectors' effect.
-fn collect_with(
-    layout: &parley::Layout<Brush>,
+///
+/// Generic over parley's brush currency: the surface's ANSI path shapes into
+/// [`StyledBrush`] while everything else shapes into `peniko::Brush`, and the
+/// walk itself never looks at a brush — `paint_of` does.
+fn collect_with<B: parley::Brush>(
+    layout: &parley::Layout<B>,
     offset: (f64, f64),
-    color_of: impl Fn(&parley::GlyphRun<'_, Brush>) -> [u8; 4],
+    paint_of: impl Fn(&parley::GlyphRun<'_, B>) -> GlyphPaint,
 ) -> (Vec<PositionedGlyph>, Vec<GlyphKey>) {
     let mut glyphs = Vec::new();
     let mut keys = Vec::new();
@@ -130,7 +182,7 @@ fn collect_with(
             let font = run.font();
             let font_size = run.font_size();
             let font_id = FontId::from_parley(font);
-            let color = color_of(&glyph_run);
+            let paint = paint_of(&glyph_run);
 
             for glyph in glyph_run.glyphs() {
                 let gx = x + glyph.x;
@@ -151,8 +203,9 @@ fn collect_with(
                     x: gx + offset.0 as f32,
                     y: gy + offset.1 as f32,
                     font_size,
-                    color,
-                    importance: 0.5,
+                    color: paint.color,
+                    importance: paint.importance,
+                    style_index: paint.style_index,
                 });
             }
         }
@@ -189,7 +242,10 @@ mod tests {
         VelloFont, VelloTextAlign, VelloTextStyle, load_into_font_context,
     };
     use bevy::prelude::{Assets, Image};
+    use kaijutsu_types::{StyleAttrs, StyleColor, StyleSpan};
     use peniko::Color;
+
+    use super::super::glyph::{IMPORTANCE_BOLD, IMPORTANCE_DIM};
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
@@ -327,6 +383,7 @@ mod tests {
             assert_eq!(a.font_size, b.font_size);
             assert_eq!(a.color, b.color);
             assert_eq!(a.importance, b.importance);
+            assert_eq!(a.style_index, b.style_index);
         }
     }
 
@@ -389,6 +446,142 @@ mod tests {
             replayed_atlas.request(*key);
         }
         assert_eq!(replayed_atlas.pending, wrapper_atlas.pending);
+    }
+
+    // ---- the ANSI currency ------------------------------------------------
+
+    /// Resolve `spans` over `text` against the default text color `base`, the
+    /// way `shape_cache` does, and hand back the glyphs.
+    fn ansi_glyphs(text: &str, base: [u8; 4], spans: &[StyleSpan]) -> Vec<PositionedGlyph> {
+        use crate::ui::theme::AnsiColors;
+        let font = mono();
+        let resolved = crate::text::ansi::resolve_style_spans(
+            spans,
+            base,
+            [0, 0, 0, 255],
+            &AnsiColors::default().palette_256(),
+        );
+        let layout =
+            font.layout_styled(text, &style(base), VelloTextAlign::Left, None, &resolved);
+        collect_msdf_glyphs_ansi_deferred(&layout, (0.0, 0.0)).0
+    }
+
+    fn ansi_span(start: u32, end: u32) -> StyleSpan {
+        StyleSpan {
+            start,
+            end,
+            fg: None,
+            bg: None,
+            attrs: StyleAttrs::default(),
+        }
+    }
+
+    /// **The granularity contract.** Two adjacent spans that are the same ANSI
+    /// color and differ only in bold have identical resolved *colors* — the
+    /// palette slot lives in the style index, not the color — so if the brush
+    /// carried a color alone, parley would merge them into one run and the
+    /// boundary would be gone before any collector ran. Shaping for real is
+    /// the point of this test.
+    #[test]
+    fn same_color_different_bold_shapes_as_two_weights() {
+        let glyphs = ansi_glyphs(
+            "aaabbb",
+            RED,
+            &[
+                StyleSpan { fg: Some(StyleColor::Indexed(2)), ..ansi_span(0, 3) },
+                StyleSpan {
+                    fg: Some(StyleColor::Indexed(2)),
+                    attrs: StyleAttrs::BOLD,
+                    ..ansi_span(3, 6)
+                },
+            ],
+        );
+        assert_eq!(
+            glyphs.iter().map(|g| g.importance).collect::<Vec<_>>(),
+            vec![
+                IMPORTANCE_NORMAL,
+                IMPORTANCE_NORMAL,
+                IMPORTANCE_NORMAL,
+                IMPORTANCE_BOLD,
+                IMPORTANCE_BOLD,
+                IMPORTANCE_BOLD,
+            ],
+        );
+        assert!(
+            glyphs.iter().all(|g| g.style_index == 3),
+            "both halves are ANSI slot 2, so both defer to table index 3",
+        );
+    }
+
+    /// An indexed foreground stays semantic all the way to the glyph: the
+    /// color is still the block's default (the shader replaces it from the
+    /// style table), and the boundary shows up in `style_index` alone.
+    #[test]
+    fn an_indexed_span_sets_style_index_on_exactly_its_own_glyphs() {
+        let glyphs = ansi_glyphs(
+            "aaabbbccc",
+            RED,
+            &[StyleSpan { fg: Some(StyleColor::Indexed(4)), ..ansi_span(3, 6) }],
+        );
+        assert_eq!(
+            glyphs.iter().map(|g| g.style_index).collect::<Vec<_>>(),
+            vec![0, 0, 0, 5, 5, 5, 0, 0, 0],
+        );
+        assert!(
+            glyphs.iter().all(|g| g.color == RED),
+            "an indexed color never reaches the glyph; the default stands",
+        );
+    }
+
+    /// Truecolor is the other half of the split: an absolute color cannot
+    /// retheme, so it is resolved at shape time and rides the glyph color with
+    /// no table index at all.
+    #[test]
+    fn a_truecolor_span_rides_the_glyph_color_with_index_zero() {
+        let glyphs = ansi_glyphs(
+            "aaabbb",
+            RED,
+            &[StyleSpan { fg: Some(StyleColor::Rgb(0, 0, 255)), ..ansi_span(3, 6) }],
+        );
+        assert_eq!(
+            glyphs.iter().map(|g| g.color).collect::<Vec<_>>(),
+            vec![RED, RED, RED, BLUE, BLUE, BLUE],
+        );
+        assert!(glyphs.iter().all(|g| g.style_index == 0));
+    }
+
+    /// Dim is a weight, not a fade — and it must not leak past its own span.
+    #[test]
+    fn dim_thins_exactly_its_own_glyphs() {
+        let glyphs = ansi_glyphs(
+            "aabb",
+            RED,
+            &[StyleSpan { attrs: StyleAttrs::DIM, ..ansi_span(2, 4) }],
+        );
+        assert_eq!(
+            glyphs.iter().map(|g| g.importance).collect::<Vec<_>>(),
+            vec![
+                IMPORTANCE_NORMAL,
+                IMPORTANCE_NORMAL,
+                IMPORTANCE_DIM,
+                IMPORTANCE_DIM,
+            ],
+        );
+    }
+
+    /// The `style_index = 0` regression guard: text with no ANSI spans at all
+    /// shapes to exactly the same glyphs through the ANSI path as through the
+    /// plain one, so an unspanned block renders pixel-identically.
+    #[test]
+    fn unspanned_text_through_the_ansi_path_matches_the_plain_path() {
+        let font = mono();
+        let text = "the quick brown fox";
+        let plain = font.layout(text, &style(RED), VelloTextAlign::Left, None);
+        let (plain_glyphs, _) = collect_msdf_glyphs_deferred(&plain, &[], &brush(RED), (0.0, 0.0));
+        let ansi = ansi_glyphs(text, RED, &[]);
+
+        assert_glyphs_eq(&plain_glyphs, &ansi);
+        assert!(ansi.iter().all(|g| g.style_index == 0));
     }
 
     /// The deferred key list is the deduplicated, first-occurrence-ordered

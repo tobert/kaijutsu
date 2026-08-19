@@ -312,6 +312,7 @@ mod tests {
             font_size: 16.0,
             color: [255, 255, 255, 255],
             importance: 0.5,
+            style_index: 0,
         }
     }
 

@@ -39,7 +39,9 @@ use bevy::prelude::*;
 use bevy::render::{
     render_asset::RenderAssets,
     render_resource::{
-        binding_types::{sampler as sampler_binding, texture_2d, uniform_buffer},
+        binding_types::{
+            sampler as sampler_binding, storage_buffer_read_only, texture_2d, uniform_buffer,
+        },
         *,
     },
     renderer::RenderDevice,
@@ -58,8 +60,8 @@ pub const SURFACE_QUAD_VERTICES: u32 = 6;
 ///
 /// Field order is the vertex-attribute order; see
 /// [`ConversationSurfaceRenderer::instance_layout`]. `#[repr(C)]` with no
-/// padding (8+8+8+16+4+4 = 48 bytes) so `bytemuck` can cast a slice of these
-/// straight into the buffer.
+/// padding (8+8+8+16+4+4+4 = 52 bytes) so `bytemuck` can cast a slice of
+/// these straight into the buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct GlyphInstance {
@@ -83,6 +85,11 @@ pub struct GlyphInstance {
     /// Semantic weight — 0.5 normal, higher bolder. Same meaning as
     /// `PositionedGlyph::importance`.
     pub importance: f32,
+    /// Index into the style table storage buffer (`@binding(3)`). 0 = use
+    /// `color` as-is; 1..=256 = ANSI palette slot `index - 1`, whose fg the
+    /// shader takes from the table instead (retheme = table rewrite, no
+    /// instance rebuild). Same meaning as `PositionedGlyph::style_index`.
+    pub style_index: u32,
 }
 
 /// Per-surface uniforms.
@@ -155,6 +162,65 @@ impl Default for SurfaceUniforms {
             origin_logical: [0.0, 0.0],
         }
     }
+}
+
+/// One entry in the glyph style table — the storage buffer at `@binding(3)`
+/// of the glyph pipeline (docs/ansi-and-beyond.md "the instance buffer IS
+/// the map", extended: dynamic parameters live HERE, structure lives in the
+/// instance buffer; the split is what keeps a retheme a buffer write).
+///
+/// Layout is mirrored by `StyleEntry` in `msdf_surface.wgsl` — 32 bytes,
+/// vec4-aligned. Entry 0 is the identity (no flags, no effect); entries
+/// 1..=256 are the ANSI palette (slot `i - 1`), fg-override entries rebuilt
+/// from the theme whenever it changes. Effect kinds are reserved for the
+/// rainbow/blink/CRT revival: nothing reads `effect`/`param` yet, but the
+/// slots shipping now is what makes those a table write later.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable, ShaderType)]
+pub struct StyleEntry {
+    /// Straight (non-premultiplied) RGBA, same encoding as
+    /// `GlyphInstance::color` after Unorm expansion. Used when
+    /// `STYLE_FLAG_USE_FG` is set.
+    pub fg: [f32; 4],
+    /// Bit 0 (`STYLE_FLAG_USE_FG`): replace the instance color with `fg`.
+    pub flags: u32,
+    /// Effect kind — 0 none. Reserved (rainbow/blink/CRT phosphor).
+    pub effect: u32,
+    /// Effect parameter. Reserved.
+    pub param: f32,
+    pub _pad: f32,
+}
+
+/// `StyleEntry::flags` bit: take fg from the table instead of the instance.
+pub const STYLE_FLAG_USE_FG: u32 = 1;
+
+/// Number of entries in the fixed head of the style table: identity + 256
+/// ANSI palette slots. A glyph's `style_index` for ANSI palette slot `n` is
+/// `n + 1`.
+pub const STYLE_TABLE_FIXED_LEN: usize = 257;
+
+/// Build the fixed style table from a resolved 256-color palette (straight
+/// RGBA, 0.0–1.0). Entry 0 is identity; entry `n + 1` overrides fg with
+/// palette slot `n`.
+pub fn build_style_table(palette: &[[f32; 4]; 256]) -> Vec<StyleEntry> {
+    let mut table = Vec::with_capacity(STYLE_TABLE_FIXED_LEN);
+    table.push(StyleEntry {
+        fg: [0.0; 4],
+        flags: 0,
+        effect: 0,
+        param: 0.0,
+        _pad: 0.0,
+    });
+    for fg in palette.iter() {
+        table.push(StyleEntry {
+            fg: *fg,
+            flags: STYLE_FLAG_USE_FG,
+            effect: 0,
+            param: 0.0,
+            _pad: 0.0,
+        });
+    }
+    table
 }
 
 /// The color target every surface pipeline writes: premultiplied-alpha over,
@@ -317,6 +383,11 @@ impl ConversationSurfaceRenderer {
                     offset: 44,
                     shader_location: 5,
                 },
+                VertexAttribute {
+                    format: VertexFormat::Uint32,
+                    offset: 48,
+                    shader_location: 6,
+                },
             ],
         }
     }
@@ -433,6 +504,9 @@ impl ConversationSurfaceRenderer {
                 uniform_buffer::<SurfaceUniforms>(false),
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler_binding(SamplerBindingType::Filtering),
+                // The style table (docs/ansi-and-beyond.md) — glyph pipeline
+                // only; chrome/geometry/quads keep their uniform-only layouts.
+                storage_buffer_read_only::<StyleEntry>(false),
             ),
         );
 
@@ -672,6 +746,7 @@ impl ConversationSurfaceRenderer {
         atlas_image: &Handle<Image>,
         target_image: &Handle<Image>,
         instances: Option<(&Buffer, u32)>,
+        style_table: Option<&Buffer>,
         chrome: Option<(&Buffer, u32)>,
         geometry: Option<(&Buffer, u32)>,
         quads: Option<(&Buffer, &[Handle<Image>])>,
@@ -685,14 +760,18 @@ impl ConversationSurfaceRenderer {
             return SurfacePassResult::default();
         };
 
-        // Everything the draw needs, or nothing: a missing pipeline/atlas
-        // still clears (background paints; text appears when ready).
+        // Everything the draw needs, or nothing: a missing pipeline/atlas/
+        // style-table still clears (background paints; text appears when
+        // ready). The style table is created on the first prepared frame and
+        // then only rewritten, so its absence is the same one-or-two-frame
+        // startup window the atlas has.
         let draw = instances
             .filter(|(_, count)| *count > 0)
             .and_then(|(buffer, count)| {
                 let pipeline = pipeline_cache.get_render_pipeline(self.pipeline)?;
                 let atlas_gpu = gpu_images.get(atlas_image)?;
-                Some((pipeline, atlas_gpu, buffer, count))
+                let style_table = style_table?;
+                Some((pipeline, atlas_gpu, style_table, buffer, count))
             });
 
         let chrome_draw = chrome
@@ -733,7 +812,7 @@ impl ConversationSurfaceRenderer {
         });
 
         let bind_group = draw.zip(uniform_buffer.as_ref()).map(
-            |((_, atlas_gpu, _, _), uniform_buffer)| {
+            |((_, atlas_gpu, style_table, _, _), uniform_buffer)| {
                 device.create_bind_group(
                     "msdf_surface_bind_group",
                     &self.bind_group_layout,
@@ -741,6 +820,7 @@ impl ConversationSurfaceRenderer {
                         uniform_buffer.as_entire_binding(),
                         &atlas_gpu.texture_view,
                         &self.sampler,
+                        style_table.as_entire_binding(),
                     )),
                 )
             },
@@ -840,7 +920,7 @@ impl ConversationSurfaceRenderer {
                 }
             }
 
-            if let (Some((pipeline, _, buffer, count)), Some(bind_group)) = (draw, &bind_group) {
+            if let (Some((pipeline, _, _, buffer, count)), Some(bind_group)) = (draw, &bind_group) {
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, bind_group, &[]);
                 render_pass.set_vertex_buffer(0, *buffer.slice(..));
@@ -892,6 +972,7 @@ pub fn build_instances(
                 uv_rect: region.uv_rect(atlas.width, atlas.height),
                 color: glyph.color,
                 importance: glyph.importance,
+                style_index: glyph.style_index,
             });
         }
     }
@@ -1026,6 +1107,7 @@ mod tests {
             font_size,
             color: [200, 210, 220, 255],
             importance: 0.5,
+            style_index: 0,
         }
     }
 
@@ -1207,17 +1289,37 @@ mod tests {
 
     // ---- layout contract -------------------------------------------------
 
+    /// `StyleEntry` is a contract with the WGSL struct of the same name
+    /// (32 bytes, vec4-aligned) and `build_style_table` with the shader's
+    /// index convention: 0 identity, `n + 1` = ANSI palette slot `n`.
+    #[test]
+    fn style_table_matches_the_contract() {
+        assert_eq!(std::mem::size_of::<StyleEntry>(), 32);
+
+        let mut palette = [[0.0f32; 4]; 256];
+        palette[196] = [1.0, 0.25, 0.25, 1.0];
+        let table = build_style_table(&palette);
+        assert_eq!(table.len(), STYLE_TABLE_FIXED_LEN);
+        assert_eq!(table[0].flags, 0, "entry 0 is the identity");
+        assert_eq!(table[0].effect, 0);
+        assert_eq!(table[197].fg, [1.0, 0.25, 0.25, 1.0], "slot n lives at n + 1");
+        assert!(table[1..].iter().all(|e| e.flags == STYLE_FLAG_USE_FG));
+        assert!(table.iter().all(|e| e.effect == 0), "effects are reserved");
+    }
+
     /// The instance stride and attribute offsets are a contract with the
     /// WGSL `@location`s; a field reorder that doesn't update
     /// `instance_layout` would silently read the wrong bytes on the GPU.
     #[test]
     fn instance_layout_matches_the_struct() {
         let layout = ConversationSurfaceRenderer::instance_layout();
-        assert_eq!(layout.array_stride, 48);
+        // Re-pinned 2026-08-19: +4 for `style_index` (Uint32 @location(6),
+        // offset 48) — the style-table indirection, docs/ansi-and-beyond.md.
+        assert_eq!(layout.array_stride, 52);
         assert_eq!(layout.step_mode, VertexStepMode::Instance);
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
-        assert_eq!(offsets, vec![0, 8, 16, 24, 40, 44]);
-        assert_eq!(std::mem::size_of::<GlyphInstance>(), 48);
+        assert_eq!(offsets, vec![0, 8, 16, 24, 40, 44, 48]);
+        assert_eq!(std::mem::size_of::<GlyphInstance>(), 52);
         // The uniform block must stay a multiple of 16 bytes, and the size
         // `encase` reports (which becomes the bind group layout's
         // `min_binding_size`) must equal what we actually upload with
