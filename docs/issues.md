@@ -34,40 +34,6 @@ fields are slice 5. That is half of rule 4. Amy has approved a **read-only VFS
 mount** as the answer, so swaps are discoverable with `ls` and `grep` the way
 vim's sidecar file is; model it on `runtime/docs_filesystem.rs`.
 
-## A failed `:w` reports clean, and retrying it hits the wrong error (2026-08-19)
-
-Two rough edges left by the editor/cache wiring in `e28028c2`. Neither loses
-work — the edit is in the block, `mark_dirty` wrote the swap row, and the row is
-only cleared by a *successful* flush, so a cold load recovers it as a swap.
-
-**1. The buffer reads clean after a write that failed.**
-`EditorSessions::save` advances the checkpoint synchronously, and only then does
-the kernel attempt the async flush. So on failure `state.dirty` is already
-`false`: the status line says E212 while the buffer claims it is saved, and a
-following `:q` will not refuse.
-
-The fix is ordering, not a new primitive: flush first, advance the checkpoint
-only on success. The block already holds the edited text when the kernel runs,
-so nothing needs to be reverted. It requires `run_commands` to report "a write
-was requested" rather than performing the checkpoint itself, which is a small
-extension of the `KeysUpdate` shape that change already introduced.
-
-**2. Retrying `:w` after a failure gives a swap-acknowledgement error.**
-The failure path calls `file_cache.invalidate(path)`. The next read is then a
-cold miss, finds the dirty row, and recovers the buffer as a swap — so
-`flush_one` refuses with "recovered from a swap … call acknowledge_swap before
-flushing". For a player whose disk write just failed and who pressed `:w` again,
-that is the wrong error entirely.
-
-The `invalidate` was copied from `mount_backend.rs`'s write rollback, where it
-is correct: that path had just done `create_or_replace` from an *external*
-write, so dropping the speculative entry is right. The editor case is not the
-same — the block content is the player's live buffer, not a speculative write,
-and the entry is legitimately dirty. **Do not invalidate on an editor flush
-failure**; leave the entry dirty and let the retry be a retry.
-
----
-
 ## Opening a file that already has an editor session should announce it (2026-08-19)
 
 Vim's E325. Amy, 2026-08-19: *"we'll also have ctrl-z like behavior so editors
