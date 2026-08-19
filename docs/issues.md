@@ -6973,3 +6973,45 @@ the replay path to recognize `pos == None` / end-position edits as appends,
 or re-emit spans after replay from the journaled updated_snapshots (check
 whether replay order already does this — updated_snapshots may replay last
 and repair it; verify before building anything).
+
+## vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
+
+`cargo fuzz run chunked_equivalence` (`crates/kaijutsu-ansi/fuzz/`) found a
+counterexample to "chunk anywhere, same result" inside its first minute, no
+seed corpus needed: `strip(&[0xCD, 0xAE, 0x1B, 0xFF])` == `"\u{36E}"`, but
+feeding the same four bytes as `feed(&data[..1]); feed(&data[1..]);` yields
+`"\u{36E}\u{FFFD}"` — an extra replacement character leaks in.
+
+Root cause is upstream, in `vte` 0.15.0's `Parser::advance_partial_utf8`
+(`vte-0.15.0/src/lib.rs:668-718`), not in `kaijutsu-ansi`. To resume a
+codepoint left pending at a chunk boundary it speculatively copies up to 3
+more bytes from the new chunk into a 4-byte buffer and validates the whole
+thing with `str::from_utf8`. Since ASCII control bytes (ESC included) are
+valid one-byte UTF-8 on their own, the validated run can extend past the
+first real codepoint into a following control byte. The code's own comment
+says "we only care about the first character... we just ignore the rest" —
+but it still reports the whole validated span as consumed, so the ignored
+control byte is dropped silently: never printed, never dispatched to
+`execute`/the escape state machine, never seen again. One-shot processing
+never enters this function for the same bytes (`advance_ground` finds the
+ESC via `memchr` directly), so only the chunked path loses the byte.
+
+Narrow trigger: needs an incomplete multi-byte UTF-8 lead byte as the very
+last byte of one `feed` call, with the continuation byte(s) immediately
+followed by a control byte in the next call. Byte-at-a-time chunking does
+not trigger it (each call only ever has 1 byte to copy). This is why
+`crates/kaijutsu-ansi/tests/properties.rs`'s fixed `nasty_inputs` corpus,
+despite exhaustively splitting at every position and pair of positions,
+never happened to hit this shape — it needed fuzzing to find.
+
+Pinned as a regression test:
+`crates/kaijutsu-ansi/tests/vte_partial_utf8_regression.rs` — asserts the
+*current* (buggy) divergence, so a `vte` upgrade that fixes it fails the
+test loudly instead of the fix passing unnoticed. Not worked around in
+`kaijutsu-ansi` itself: a workaround would mean reimplementing part of
+`vte`'s partial-UTF-8 resumption, the kind of ad-hoc parser surface
+`docs/ansi-and-beyond.md` says to avoid. Fix shape when picked up: file
+upstream against `alacritty/vte`, or vendor-patch if a fix lands slowly and
+kaijutsu needs it sooner (chunked kaish output is exactly the profile that
+can hit this — a poorly-timed flush boundary during multibyte + escape
+mixed output).

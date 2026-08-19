@@ -1,0 +1,5 @@
+[33m84505811[m feat(ansi): styled spans + provenance — types, wire, kernel plumbing, parser
+[33m1f20eda6[m docs(ansi): CRT green is a style-table entry, not a new system
+[33m1461740f[m docs: ANSI ingest design — provenance, not round-trip
+[33mf21126d3[m docs(issues): the flick-burst frame cost shipped with the surface
+[33m4b162856[m docs(issues): text effects return as glyph-instance attributes, not texture post

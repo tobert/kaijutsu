@@ -1,0 +1,28 @@
+---
+source: crates/kaijutsu-ansi/tests/goldens.rs
+expression: rendering
+---
+=== text (610 bytes) ===
+total 12
+drwxr-xr-x 4 atobey wheel 220 Aug 19 11:31 .
+drwx------ 3 atobey wheel 100 Aug 19 11:31 ..
+drwxr-xr-x 2 atobey wheel  40 Aug 19 11:31 a_directory
+lrwxrwxrwx 1 atobey wheel  16 Aug 19 11:31 a_symlink -> regular_file.txt
+-rw-r--r-- 1 atobey wheel   0 Aug 19 11:31 archive.tar.gz
+-rw-r--r-- 1 atobey wheel   0 Aug 19 11:31 image.png
+-rw-r--r-- 1 atobey wheel  13 Aug 19 11:31 readme.md
+-rw-r--r-- 1 atobey wheel   0 Aug 19 11:31 regular_file.txt
+-rwxr-xr-x 1 atobey wheel  10 Aug 19 11:31 script.sh
+-rw------- 1 atobey wheel   8 Aug 19 11:31 secret_file
+drwxr-xr-x 2 atobey wheel  40 Aug 19 11:31 subdir
+=== end text ===
+
+=== spans (8) ===
+   52..53    fg=indexed(4) bg=default attrs=bold
+   97..99    fg=indexed(4) bg=default attrs=bold
+  143..154   fg=indexed(4) bg=default attrs=bold
+  198..207   fg=indexed(6) bg=default attrs=bold
+  271..285   fg=indexed(1) bg=default attrs=bold
+  329..338   fg=indexed(5) bg=default attrs=bold
+  495..504   fg=indexed(2) bg=default attrs=bold
+  603..609   fg=indexed(4) bg=default attrs=bold

@@ -1,0 +1,18 @@
+---
+source: crates/kaijutsu-ansi/tests/goldens.rs
+expression: rendering
+---
+=== text (390 bytes) ===
+84505811 feat(ansi): styled spans + provenance — types, wire, kernel plumbing, parser
+1f20eda6 docs(ansi): CRT green is a style-table entry, not a new system
+1461740f docs: ANSI ingest design — provenance, not round-trip
+f21126d3 docs(issues): the flick-burst frame cost shipped with the surface
+4b162856 docs(issues): text effects return as glyph-instance attributes, not texture post
+=== end text ===
+
+=== spans (5) ===
+    0..8     fg=indexed(3) bg=default attrs=-
+   88..96    fg=indexed(3) bg=default attrs=-
+  160..168   fg=indexed(3) bg=default attrs=-
+  225..233   fg=indexed(3) bg=default attrs=-
+  300..308   fg=indexed(3) bg=default attrs=-
