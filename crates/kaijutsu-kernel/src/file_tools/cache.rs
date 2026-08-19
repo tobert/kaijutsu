@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::block_store::SharedBlockStore;
+use crate::kernel_db::KernelDb;
 use crate::vfs::{MountTable, VfsOps};
 use kaijutsu_types::DocKind;
 
@@ -71,6 +72,13 @@ struct CachedFileDoc {
     /// Consumed by the vi editor's W12 `:w` guard and swap-recovery
     /// announcement (docs/file-buffers.md).
     disk_changed_since_load: bool,
+    /// This entry was restored from a `dirty_file_buffers` row on a cold
+    /// cache instead of being reconciled against disk — it holds unsaved
+    /// work from before a kernel restart. Set by `try_get_or_load`'s
+    /// `DocumentAlreadyExists` arm; cleared by `acknowledge_swap`. While
+    /// true, `flush_one` refuses (rule 4, docs/file-buffers.md: not served
+    /// as authoritative until acknowledged).
+    swap_recovered: bool,
 }
 
 /// Cache that maps VFS files to kernel documents.
@@ -82,16 +90,28 @@ pub struct FileDocumentCache {
     block_store: SharedBlockStore,
     vfs: Arc<MountTable>,
     max_cached: usize,
+    /// Durable swap-file marker table (`dirty_file_buffers`,
+    /// docs/file-buffers.md). Required, not optional: a `FileDocumentCache`
+    /// with nowhere to durably record "this path has unsaved work" cannot
+    /// tell a swap from a stale cache on a cold restart, which is the exact
+    /// failure this table exists to prevent. Every caller — production and
+    /// test alike — must supply a real `KernelDb` (`KernelDb::in_memory()`
+    /// is public and ungated for tests) so the code path under test is the
+    /// one that ships.
+    db: Arc<Mutex<KernelDb>>,
 }
 
 impl FileDocumentCache {
-    /// Create a new file document cache.
-    pub fn new(block_store: SharedBlockStore, vfs: Arc<MountTable>) -> Self {
+    /// Create a new file document cache. `db` backs the durable swap-file
+    /// marker (`dirty_file_buffers`); see the field doc on `db` for why it
+    /// is required rather than optional.
+    pub fn new(block_store: SharedBlockStore, vfs: Arc<MountTable>, db: Arc<Mutex<KernelDb>>) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             block_store,
             vfs,
             max_cached: DEFAULT_MAX_CACHED,
+            db,
         }
     }
 
@@ -183,6 +203,12 @@ impl FileDocumentCache {
             entry.loaded_generation = generation;
             entry.dirty = false;
             entry.disk_changed_since_load = false;
+            // A reconciled entry is disk, plain and simple — never a pending
+            // swap. (Unreachable with `swap_recovered: true` today, since a
+            // recovered swap is inserted `dirty: true` and this branch only
+            // runs on a clean entry, but stated explicitly rather than left
+            // to that invariant holding forever.)
+            entry.swap_recovered = false;
         }
         Ok(())
     }
@@ -196,6 +222,20 @@ impl FileDocumentCache {
             .read()
             .get(&ctx_id)
             .map(|e| e.disk_changed_since_load)
+            .unwrap_or(false)
+    }
+
+    /// Whether a cached entry is an unacknowledged recovered swap — restored
+    /// from a `dirty_file_buffers` row on a cold cache instead of reconciled
+    /// against disk. False for a path that isn't cached, or that was never a
+    /// swap. See `docs/file-buffers.md` rule 4; cleared by
+    /// [`acknowledge_swap`](Self::acknowledge_swap).
+    pub fn swap_recovered(&self, path: &str) -> bool {
+        let ctx_id = file_context_id(path);
+        self.cache
+            .read()
+            .get(&ctx_id)
+            .map(|e| e.swap_recovered)
             .unwrap_or(false)
     }
 
@@ -403,10 +443,42 @@ impl FileDocumentCache {
                             path
                         ))
                     })?;
-                // Reuses the vetted char-indexed splice from the stale-reload
-                // path instead of duplicating it here; it re-reads disk (we
-                // already hold `text`), which is a known redundant read, not
-                // a correctness gap.
+
+                // A `dirty_file_buffers` row means this document is a swap —
+                // unsaved work still in flight when the kernel went down —
+                // not a stale mirror of disk. Reconciling it (like the branch
+                // below) would silently discard that work, which is the exact
+                // failure this table exists to prevent. See docs/file-buffers.md.
+                let dirty_row = self.db.lock().get_dirty_file_buffer(path).map_err(|e| {
+                    CacheReadError::Backend(format!(
+                        "failed to check swap marker for {}: {}",
+                        path, e
+                    ))
+                })?;
+                if let Some(row) = dirty_row {
+                    let mut cache = self.cache.write();
+                    self.evict_if_needed(&mut cache);
+                    cache.insert(
+                        ctx_id,
+                        CachedFileDoc {
+                            context_id: ctx_id,
+                            path: path.to_string(),
+                            block_id: existing_block_id,
+                            dirty: true,
+                            last_access: Instant::now(),
+                            loaded_generation: row.loaded_generation,
+                            disk_changed_since_load: false,
+                            swap_recovered: true,
+                        },
+                    );
+                    return Ok((ctx_id, existing_block_id));
+                }
+
+                // No row: an ordinary stale mirror. Reuses the vetted
+                // char-indexed splice from the stale-reload path instead of
+                // duplicating it here; it re-reads disk (we already hold
+                // `text`), which is a known redundant read, not a
+                // correctness gap.
                 self.reload_block_from_disk(ctx_id, &existing_block_id, path)
                     .await?;
                 existing_block_id
@@ -432,6 +504,7 @@ impl FileDocumentCache {
                     last_access: Instant::now(),
                     loaded_generation,
                     disk_changed_since_load: false,
+                    swap_recovered: false,
                 },
             );
         }
@@ -524,13 +597,31 @@ impl FileDocumentCache {
             .map_err(|e| format!("invalidate_document({path}): {e}"))
     }
 
-    /// Mark a file as dirty (needs flush to VFS).
-    pub fn mark_dirty(&self, path: &str) {
+    /// Mark a file as dirty (needs flush to VFS). Also records the durable
+    /// swap-file marker (`dirty_file_buffers`, docs/file-buffers.md) so the
+    /// edit survives a cold cache — a swallowed failure here means unsaved
+    /// work silently stops being recoverable, so the DB error bubbles rather
+    /// than being logged and dropped.
+    pub fn mark_dirty(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
-        let mut cache = self.cache.write();
-        if let Some(entry) = cache.get_mut(&ctx_id) {
-            entry.dirty = true;
+        // Set the flag and read back what the DB row needs under one lock
+        // acquisition, then release it before taking the DB lock — mirrors
+        // the sequential (never nested) lock order used elsewhere in this
+        // file.
+        let entry_info = {
+            let mut cache = self.cache.write();
+            cache.get_mut(&ctx_id).map(|entry| {
+                entry.dirty = true;
+                (entry.context_id, entry.loaded_generation)
+            })
+        };
+        if let Some((entry_ctx_id, loaded_generation)) = entry_info {
+            self.db
+                .lock()
+                .record_dirty_file_buffer(path, entry_ctx_id, loaded_generation)
+                .map_err(|e| format!("mark_dirty({path}): failed to record swap marker: {e}"))?;
         }
+        Ok(())
     }
 
     /// Flush all dirty files back to the VFS.
@@ -566,6 +657,16 @@ impl FileDocumentCache {
                 Ok(()) => {
                     flushed += 1;
                     let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
+                    // Disk holds the content now — the swap marker's job is
+                    // done. A failure clearing it is surfaced (never
+                    // swallowed), but the write to disk genuinely succeeded,
+                    // so the in-memory entry below is still marked clean.
+                    if let Err(e) = self.db.lock().clear_dirty_file_buffer(path) {
+                        errors.push(format!(
+                            "flushed {} to disk but failed to clear its swap marker: {}",
+                            path, e
+                        ));
+                    }
                     succeeded.push((*ctx_id, generation));
                 }
                 Err(e) => {
@@ -574,9 +675,11 @@ impl FileDocumentCache {
             }
         }
 
-        // Only clear dirty flags for files that were successfully flushed, and
-        // stamp the post-flush generation so they aren't seen as externally
-        // changed.
+        // Only clear dirty flags for files that were successfully flushed to
+        // disk, and stamp the post-flush generation so they aren't seen as
+        // externally changed. Runs regardless of a swap-marker clear failure
+        // above — disk already holds the content, so the in-memory entry is
+        // genuinely clean.
         {
             let mut cache = self.cache.write();
             for (ctx_id, generation) in &succeeded {
@@ -601,11 +704,24 @@ impl FileDocumentCache {
     }
 
     /// Flush a single file back to the VFS.
+    ///
+    /// Refuses while the entry is an unacknowledged recovered swap (rule 4,
+    /// docs/file-buffers.md): a swap is not served as authoritative until a
+    /// player has been told, and writing it over disk is exactly "serving it
+    /// as authoritative." Call [`acknowledge_swap`](Self::acknowledge_swap)
+    /// first. Reads are unaffected — only the flush path is gated.
     pub async fn flush_one(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
         let block_id = {
             let cache = self.cache.read();
             match cache.get(&ctx_id) {
+                Some(entry) if entry.swap_recovered => {
+                    return Err(format!(
+                        "{path}: recovered from a swap after a cold cache and not yet \
+                         acknowledged — call acknowledge_swap before flushing \
+                         (docs/file-buffers.md)"
+                    ));
+                }
                 Some(entry) if entry.dirty => entry.block_id,
                 Some(_) => return Ok(()), // not dirty
                 None => return Ok(()),    // not cached
@@ -630,6 +746,17 @@ impl FileDocumentCache {
             .await
             .map_err(|e| format!("failed to flush {}: {}", path, e))?;
 
+        // Disk holds the content now — the swap marker's job is done. Clear
+        // it before touching the in-memory entry so a crash in between still
+        // leaves nothing behind that would announce a swap that no longer
+        // exists. Bubbled, not swallowed: mark_dirty bubbles the same class
+        // of error, and a lingering row here would misreport this path as an
+        // unacknowledged swap on the next cold start.
+        self.db
+            .lock()
+            .clear_dirty_file_buffer(path)
+            .map_err(|e| format!("flush_one({path}): flushed to disk but failed to clear the swap marker: {e}"))?;
+
         // Stamp the post-flush generation so our own write isn't later mistaken
         // for an external change and needlessly reloaded.
         let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
@@ -643,6 +770,17 @@ impl FileDocumentCache {
         }
 
         Ok(())
+    }
+
+    /// Acknowledge a recovered swap, clearing `swap_recovered` so the entry
+    /// can be flushed. A no-op for a path that isn't cached or wasn't a
+    /// recovered swap. See docs/file-buffers.md rule 4.
+    pub fn acknowledge_swap(&self, path: &str) {
+        let ctx_id = file_context_id(path);
+        let mut cache = self.cache.write();
+        if let Some(entry) = cache.get_mut(&ctx_id) {
+            entry.swap_recovered = false;
+        }
     }
 
     /// Get the SharedBlockStore (for engines that need direct store access).
@@ -724,6 +862,7 @@ impl FileDocumentCache {
                     // Not yet on disk; the next flush stamps the real generation.
                     loaded_generation: None,
                     disk_changed_since_load: false,
+                    swap_recovered: false,
                 },
             );
         }
@@ -831,12 +970,23 @@ mod tests {
     use crate::vfs::VfsOps;
     use kaijutsu_types::PrincipalId;
 
-    /// Build a cache over a MemoryBackend mounted at /tmp.
+    /// A fresh in-memory `KernelDb` for tests — `FileDocumentCache` requires
+    /// one to back its durable swap-file marker (docs/file-buffers.md).
+    /// Factored out so `tmp_cache` (and anything else that needs its own
+    /// handle) doesn't repeat the construction.
+    fn tmp_db() -> Arc<Mutex<KernelDb>> {
+        Arc::new(Mutex::new(KernelDb::in_memory().unwrap()))
+    }
+
+    /// Build a cache over a MemoryBackend mounted at /tmp, backed by a fresh
+    /// in-memory KernelDb (see `tmp_db`) — the same durable path production
+    /// runs, so a swap survives `invalidate` the way it survives a real
+    /// restart.
     async fn tmp_cache() -> (Arc<MountTable>, FileDocumentCache) {
         let blocks = shared_block_store(PrincipalId::system());
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/tmp", MemoryBackend::new()).await;
-        let cache = FileDocumentCache::new(blocks, vfs.clone());
+        let cache = FileDocumentCache::new(blocks, vfs.clone(), tmp_db());
         (vfs, cache)
     }
 
@@ -916,7 +1066,7 @@ mod tests {
 
         // Local uncommitted edit (dirty, not flushed).
         cache.create_or_replace("/tmp/g.txt", "local-edit").await.unwrap();
-        cache.mark_dirty("/tmp/g.txt");
+        cache.mark_dirty("/tmp/g.txt").unwrap();
 
         // External writer also changes the file (bumps the backend generation).
         vfs.write_all(p("/tmp/g.txt"), b"disk-v2").await.unwrap();
@@ -1156,7 +1306,7 @@ mod tests {
             .create_or_replace("/tmp/dirty.md", "local-edit")
             .await
             .unwrap();
-        cache.mark_dirty("/tmp/dirty.md");
+        cache.mark_dirty("/tmp/dirty.md").unwrap();
 
         assert!(
             !cache.disk_changed_since_load("/tmp/dirty.md"),
@@ -1176,24 +1326,14 @@ mod tests {
         );
     }
 
-    /// Characterizes a KNOWN DEFECT: a dirty (unsaved) buffer's content is
-    /// discarded, not recovered, across a cold cache. `docs/file-buffers.md`
-    /// rule 2 says a dirty buffer is a swap file — unsaved work "should survive
-    /// a kernel restart, which is a real property we have today and want to
-    /// keep" — but nothing flushes dirty buffers at shutdown (`flush_dirty` has
-    /// no callers outside this file), and the cold-miss reconcile path added for
-    /// the stale-document incident does not distinguish a dirty shadow from a
-    /// clean one: it unconditionally overwrites the block with whatever is on
-    /// disk. So a kernel restart with unflushed edits in flight loses them
-    /// exactly like the incident lost *stale* reads — just the opposite
-    /// direction.
-    ///
-    /// This test asserts *today's* (wrong) behavior on purpose, as a
-    /// placeholder: swap semantics (persist dirty entries as recoverable,
-    /// announce rather than silently serve) must REVERSE this assertion, not
-    /// delete it, when they land.
+    /// `docs/file-buffers.md` rule 2: a dirty (unsaved) buffer is a swap file
+    /// and must survive a kernel restart. `mark_dirty` records a durable
+    /// `dirty_file_buffers` row; on a cold cache, `try_get_or_load`'s
+    /// `DocumentAlreadyExists` arm consults that row *before* reconciling —
+    /// a row present means "swap, not stale mirror," and the block is served
+    /// as-is instead of being overwritten with disk content.
     #[tokio::test]
-    async fn unsaved_edits_are_lost_across_a_cold_cache_pending_swap_semantics() {
+    async fn unsaved_edits_survive_a_cold_cache_as_a_recovered_swap() {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/swap.md"), b"disk-v1").await.unwrap();
@@ -1204,26 +1344,133 @@ mod tests {
             .create_or_replace("/tmp/swap.md", "unsaved-edit")
             .await
             .unwrap();
-        cache.mark_dirty("/tmp/swap.md");
+        cache.mark_dirty("/tmp/swap.md").unwrap();
         assert_eq!(
             cache.read_content("/tmp/swap.md").await.unwrap(),
             "unsaved-edit"
         );
 
         // Simulate a kernel restart: the in-memory entry (and its dirty flag)
-        // is gone. Nothing flushed it first — that's the real, not hypothetical,
-        // gap: flush_dirty has no callers outside this file.
+        // is gone. Nothing flushed it first — the `dirty_file_buffers` row
+        // (in the same `KernelDb` the cache holds) is what survives instead.
         cache.invalidate("/tmp/swap.md");
 
-        // KNOWN DEFECT: the edit IS still in the durable document at this
-        // point — the cold-cache reconcile overwrites the block with disk
-        // content, destroying work that was recoverable a moment earlier.
+        // The unsaved edit comes back, not disk content — recovered as a
+        // swap, not silently discarded.
         assert_eq!(
             cache.read_content("/tmp/swap.md").await.unwrap(),
-            "disk-v1",
-            "known defect (docs/file-buffers.md rule 2): unsaved edit was lost \
-             across a cold cache; this assertion must be REVERSED, not deleted, \
-             once swap semantics land"
+            "unsaved-edit",
+            "unsaved edit must survive a cold cache as a recovered swap"
+        );
+        assert!(
+            cache.swap_recovered("/tmp/swap.md"),
+            "a recovered swap must be flagged, not served as silently authoritative"
+        );
+    }
+
+    /// Proves the swap-recovery check (above) does not break slice 1's
+    /// incident fix: a document that is genuinely just a stale mirror (never
+    /// dirty, no `dirty_file_buffers` row) must still reconcile against
+    /// newer disk content on a cold cache — everything here is set up to
+    /// *look* like the swap case (a document already in the store, a cold
+    /// cache) except the one thing that actually marks a swap.
+    #[tokio::test]
+    async fn clean_document_still_reconciles_with_newer_disk_on_cold_cache() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/clean.md"), b"v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/clean.md").await.unwrap(), "v1");
+        // Never dirtied — no dirty_file_buffers row.
+
+        cache.invalidate("/tmp/clean.md");
+        vfs.write_all(p("/tmp/clean.md"), b"v2").await.unwrap();
+
+        assert_eq!(
+            cache.read_content("/tmp/clean.md").await.unwrap(),
+            "v2",
+            "a clean document with no swap marker must still reconcile against disk"
+        );
+        assert!(
+            !cache.swap_recovered("/tmp/clean.md"),
+            "a reconciled document is not a recovered swap"
+        );
+    }
+
+    /// Flushing a dirty buffer clears its `dirty_file_buffers` row, so a
+    /// later cold load sees no swap marker and reconciles against disk
+    /// instead of recovering stale-and-already-flushed content.
+    #[tokio::test]
+    async fn flush_clears_the_swap_marker_so_a_later_cold_load_reconciles() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/flushed.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/flushed.md").await.unwrap(), "disk-v1");
+
+        cache
+            .create_or_replace("/tmp/flushed.md", "saved-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/flushed.md").unwrap();
+        cache.flush_one("/tmp/flushed.md").await.unwrap();
+
+        // Simulate a restart after the flush. If the marker weren't cleared,
+        // this would be (wrongly) treated as a recovered swap.
+        cache.invalidate("/tmp/flushed.md");
+        vfs.write_all(p("/tmp/flushed.md"), b"disk-v2-external")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.read_content("/tmp/flushed.md").await.unwrap(),
+            "disk-v2-external",
+            "a flushed buffer's marker must be cleared, so a later cold load reconciles"
+        );
+        assert!(!cache.swap_recovered("/tmp/flushed.md"));
+    }
+
+    /// `flush_one` must refuse an unacknowledged recovered swap (rule 4,
+    /// docs/file-buffers.md) and succeed once `acknowledge_swap` clears it.
+    #[tokio::test]
+    async fn flush_one_refuses_an_unacknowledged_swap_then_succeeds_after_ack() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/ack.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/ack.md").await.unwrap(), "disk-v1");
+
+        cache
+            .create_or_replace("/tmp/ack.md", "unsaved-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/ack.md").unwrap();
+        cache.invalidate("/tmp/ack.md");
+
+        // Reload recovers the swap.
+        assert_eq!(cache.read_content("/tmp/ack.md").await.unwrap(), "unsaved-edit");
+        assert!(cache.swap_recovered("/tmp/ack.md"));
+
+        let err = cache
+            .flush_one("/tmp/ack.md")
+            .await
+            .expect_err("flush_one must refuse an unacknowledged recovered swap");
+        assert!(
+            err.contains("acknowledge"),
+            "refusal must point at acknowledge_swap, got: {err}"
+        );
+        // Disk must be untouched by the refused flush.
+        assert_eq!(
+            String::from_utf8(vfs.read_all(p("/tmp/ack.md")).await.unwrap()).unwrap(),
+            "disk-v1"
+        );
+
+        cache.acknowledge_swap("/tmp/ack.md");
+        assert!(!cache.swap_recovered("/tmp/ack.md"));
+        cache
+            .flush_one("/tmp/ack.md")
+            .await
+            .expect("flush_one must succeed once the swap is acknowledged");
+        assert_eq!(
+            String::from_utf8(vfs.read_all(p("/tmp/ack.md")).await.unwrap()).unwrap(),
+            "unsaved-edit"
         );
     }
 }

@@ -725,12 +725,13 @@ mod tests {
 
     /// A block store backed by an in-memory KernelDb, so config docs created via
     /// `create_document_with_path` land in the `documents` manifest (mirrors the
-    /// ConfigDocFs test fixture).
-    fn blocks_with_db() -> SharedBlockStore {
+    /// ConfigDocFs test fixture). Returns the db handle too, since
+    /// `FileDocumentCache::new` also requires one.
+    fn blocks_with_db() -> (SharedBlockStore, Arc<parking_lot::Mutex<KernelDb>>) {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
-        shared_block_store_with_db(db, ws_id, creator)
+        (shared_block_store_with_db(db.clone(), ws_id, creator), db)
     }
 
     /// A mount table with the rc `ConfigDocFs` mounted at `/etc/rc` — the
@@ -757,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_rc_path_to_its_configdocfs_owner_block() {
-        let blocks = blocks_with_db();
+        let (blocks, db) = blocks_with_db();
         // Seed an rc script through the owning backend, exactly as `kj rc` does.
         let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(Path::new("coder/create/S00-stance.kai"), b"be kind")
@@ -767,7 +768,7 @@ mod tests {
         // The mount table owns the answer: it routes the path to the rc
         // ConfigDocFs (config-owned), so the file cache is never consulted.
         let mounts = mounts_with_rc(&blocks).await;
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
 
         let full = "/etc/rc/coder/create/S00-stance.kai";
         let target = resolve_editor_target(full, &blocks, &file_cache, &mounts)
@@ -793,7 +794,7 @@ mod tests {
         // shared `lib/*` source. The editor must bind the TARGET's block — the
         // one the executor reads — not the symlink's own block, or saved edits
         // land on a doc nothing else reads (docs/issues.md, fixed here).
-        let blocks = blocks_with_db();
+        let (blocks, db) = blocks_with_db();
         let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         // The real source lives under lib/.
         rc.write_all(Path::new("lib/create/S10-binding.kai"), b"kj binding allow \"*\"")
@@ -808,7 +809,7 @@ mod tests {
         .unwrap();
 
         let mounts = mounts_with_rc(&blocks).await;
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
 
         let link_path = "/etc/rc/coder/create/S10-binding.kai";
         let target = resolve_editor_target(link_path, &blocks, &file_cache, &mounts)
@@ -836,9 +837,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_config_doc_fails_loud_not_empty() {
-        let blocks = blocks_with_db();
+        let (blocks, db) = blocks_with_db();
         let mounts = mounts_with_rc(&blocks).await;
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
 
         // No document was ever seeded at this path, but the mount table still
         // routes it to the config backend → fail loud (not a file-cache miss).
@@ -874,7 +875,7 @@ mod session_tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
         let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(Path::new("coder/create/S00.kai"), initial)
             .await
@@ -885,7 +886,7 @@ mod session_tests {
                 .await;
             mt
         });
-        let fc = FileDocumentCache::new(blocks.clone(), mounts.clone());
+        let fc = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
         let target = resolve_editor_target(RC_PATH, &blocks, &fc, &mounts)
             .await
             .unwrap();

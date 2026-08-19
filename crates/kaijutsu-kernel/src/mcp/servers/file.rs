@@ -507,7 +507,12 @@ impl FileToolsServer {
         let existed = self.cache.exists(&path).await;
         match self.cache.create_or_replace(&path, &content).await {
             Ok(_) => {
-                self.cache.mark_dirty(&path);
+                if let Err(e) = self.cache.mark_dirty(&path) {
+                    return ExecResult::failure(
+                        1,
+                        format!("wrote the document but failed to record it dirty: {}", e),
+                    );
+                }
                 if let Err(e) = self.cache.flush_one(&path).await {
                     // Roll all the way back: a plain `invalidate` only drops
                     // the in-memory map entry, but the persisted shadow
@@ -606,7 +611,12 @@ impl FileToolsServer {
             }
         }
 
-        self.cache.mark_dirty(&path);
+        if let Err(e) = self.cache.mark_dirty(&path) {
+            return ExecResult::failure(
+                1,
+                format!("edited the document but failed to record it dirty: {}", e),
+            );
+        }
         if let Err(e) = self.cache.flush_one(&path).await {
             // See `write_file`'s matching rollback: a plain `invalidate`
             // leaves the persisted shadow doc holding the phantom edit,
@@ -1062,11 +1072,18 @@ mod tests {
     use crate::vfs::MountTable;
     use kaijutsu_types::PrincipalId;
 
+    /// A fresh in-memory `KernelDb` for tests that don't otherwise need one —
+    /// `FileDocumentCache` requires a handle to back its durable swap-file
+    /// marker (docs/file-buffers.md), even when the test never exercises it.
+    fn test_kernel_db() -> Arc<parking_lot::Mutex<KernelDb>> {
+        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()))
+    }
+
     async fn broker_with_file(path: &str, content: &str) -> (Arc<Broker>, Arc<FileDocumentCache>) {
         let blocks = shared_block_store(PrincipalId::system());
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/tmp", MemoryBackend::new()).await;
-        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
         cache.create_or_replace(path, content).await.unwrap();
 
         let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
@@ -1396,11 +1413,11 @@ mod tests {
             .lock()
             .get_or_create_default_workspace(creator)
             .unwrap();
-        let store = shared_block_store_with_db(db, ws_id, creator);
+        let store = shared_block_store_with_db(db.clone(), ws_id, creator);
         let _ = (&store, DocumentKind::File);
 
         let vfs = Arc::new(MountTable::new());
-        let cache = Arc::new(FileDocumentCache::new(store, vfs.clone()));
+        let cache = Arc::new(FileDocumentCache::new(store, vfs.clone(), db));
 
         let server = Arc::new(FileToolsServer::new(cache, vfs, None));
         let broker = Arc::new(Broker::new());
@@ -1680,7 +1697,7 @@ mod tests {
         let vfs = Arc::new(MountTable::new());
         vfs.mount(tmp.path().to_str().unwrap(), LocalBackend::read_only(tmp.path()))
             .await;
-        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
         let server = Arc::new(FileToolsServer::new(cache, vfs, None));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();

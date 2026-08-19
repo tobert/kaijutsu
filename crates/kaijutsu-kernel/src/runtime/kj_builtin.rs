@@ -2433,7 +2433,7 @@ mod tests {
             blocks
                 .edit_text(ctx, &block, 0, "after\n", "before\n".chars().count())
                 .expect("edit");
-            cache.mark_dirty("/mnt/wire/w.txt");
+            cache.mark_dirty("/mnt/wire/w.txt").unwrap();
         }
 
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;

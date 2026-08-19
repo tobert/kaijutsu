@@ -496,7 +496,7 @@ mod tests {
         blocks
             .edit_text(ctx, &block, 4, "TWO\n", 4)
             .expect("edit the document copy");
-        cache.mark_dirty("/mnt/diff/a.txt");
+        cache.mark_dirty("/mnt/diff/a.txt").unwrap();
 
         let result = dispatcher
             .dispatch_diff(&argv(&["/mnt/diff/a.txt"]), &test_caller())
@@ -624,7 +624,7 @@ mod tests {
         blocks
             .edit_text(ctx, &block, 0, "second\n", "first\n".chars().count())
             .expect("edit");
-        cache.mark_dirty("/mnt/hist/h.txt");
+        cache.mark_dirty("/mnt/hist/h.txt").unwrap();
 
         let result = dispatcher
             .dispatch_diff(

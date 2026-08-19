@@ -920,6 +920,7 @@ mod tests {
         let cache = Arc::new(FileDocumentCache::new(
             d.block_store().clone(),
             d.kernel().vfs().clone(),
+            d.kernel_db().clone(),
         ));
         assert!(d.kernel().set_file_cache(cache.clone()), "cache installs");
 

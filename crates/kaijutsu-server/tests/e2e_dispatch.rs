@@ -66,6 +66,12 @@ impl TestFs {
 /// against the tempdir, not the host system.
 async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) -> EmbeddedKaish {
     let kernel = Arc::new(Kernel::new_ephemeral("e2e-shell").await);
+    // The file-document cache needs a KernelDb to mark unsaved buffers, and
+    // this fixture builds a kernel directly instead of booting through the
+    // server path that installs one. See docs/file-buffers.md.
+    kernel.set_kernel_db(std::sync::Arc::new(parking_lot::Mutex::new(
+        kaijutsu_kernel::kernel_db::KernelDb::in_memory().expect("test kernel db"),
+    )));
     let documents = shared_block_store(PrincipalId::system());
 
     documents

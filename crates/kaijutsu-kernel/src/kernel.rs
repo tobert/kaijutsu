@@ -97,6 +97,15 @@ pub struct Kernel {
     /// explicitly by the server at startup; lazily initialized from a block
     /// store otherwise (tests, embedded callers).
     file_cache: OnceLock<Arc<crate::file_tools::FileDocumentCache>>,
+    /// The kernel's `KernelDb` handle. `OnceLock` like `file_cache`/
+    /// `beat_ingress`/`cc_inbox`: the server installs the real handle once at
+    /// startup. `Kernel` otherwise has no notion of `KernelDb` — this exists
+    /// solely so `file_cache()`'s lazy-init fallback can build a
+    /// `FileDocumentCache`, which requires one. No fallback: a kernel reached
+    /// through `file_cache()` before this is set has a wiring bug, and
+    /// `file_cache()` panics rather than handing out a cache with nowhere
+    /// durable to record unsaved work (docs/file-buffers.md).
+    kernel_db: OnceLock<Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>>,
     /// Per-context hyoushigi timelines — the live open future for contexts that
     /// own a beat (musician, audio). A context is **armed** by inserting it here;
     /// a context with no entry (every coder) has no timeline and costs nothing.
@@ -235,6 +244,7 @@ impl Kernel {
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             file_cache: OnceLock::new(),
+            kernel_db: OnceLock::new(),
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -311,6 +321,7 @@ impl Kernel {
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             file_cache: OnceLock::new(),
+            kernel_db: OnceLock::new(),
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -1191,20 +1202,46 @@ impl Kernel {
         self.file_cache.set(cache).is_ok()
     }
 
+    /// Install the kernel's `KernelDb` handle. Called once by the server at
+    /// startup, before anything can reach `file_cache()`'s lazy-init
+    /// fallback. Returns whether it was set (false if already initialized).
+    pub fn set_kernel_db(
+        &self,
+        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+    ) -> bool {
+        self.kernel_db.set(db).is_ok()
+    }
+
     /// Get the shared file-document cache, lazily building one from
     /// `blocks` + the kernel VFS if the server never installed one (tests,
     /// embedded callers). The lazy instance is backed by the same block store
     /// and mount table, so it stays coherent with any other instance over the
     /// shared kernel documents.
+    ///
+    /// Panics if [`set_kernel_db`](Self::set_kernel_db) was never called: a
+    /// `FileDocumentCache` requires a `KernelDb` to durably mark unsaved
+    /// buffers (docs/file-buffers.md), and a kernel with no db wired in has a
+    /// setup bug, not a legitimate db-less mode — fail loud here rather than
+    /// hand out a cache that silently can't recover a swap across a restart.
     pub fn file_cache(
         &self,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Arc<crate::file_tools::FileDocumentCache> {
         self.file_cache
             .get_or_init(|| {
+                let db = self.kernel_db.get().unwrap_or_else(|| {
+                    panic!(
+                        "Kernel::file_cache: set_kernel_db() was never called — a \
+                         FileDocumentCache cannot be built without a KernelDb \
+                         to durably mark unsaved buffers (docs/file-buffers.md). \
+                         The server (or embedded caller) must call \
+                         kernel.set_kernel_db(..) before anything can reach file_cache()."
+                    )
+                });
                 Arc::new(crate::file_tools::FileDocumentCache::new(
                     blocks.clone(),
                     self.vfs.clone(),
+                    db.clone(),
                 ))
             })
             .clone()
@@ -1970,7 +2007,11 @@ mod tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+        // This test never installs a FileDocumentCache directly, so
+        // `editor_open` below reaches `Kernel::file_cache`'s lazy-init
+        // fallback — which now requires a KernelDb to be wired in first.
+        kernel.set_kernel_db(db);
         ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
@@ -2025,7 +2066,7 @@ mod tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
 
         // Mount the rc backend on the kernel VFS (so the cache reads through it),
         // then seed a config script over the same store.
@@ -2040,7 +2081,7 @@ mod tests {
 
         // One shared file cache over the same store + kernel VFS — the editor's
         // invalidation and our reads must hit the same instance.
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
         assert!(kernel.set_file_cache(cache.clone()), "cache installs");
 
         // Populate the shadow from the source.
@@ -2083,7 +2124,7 @@ mod tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
 
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
@@ -2099,7 +2140,7 @@ mod tests {
         let edit_path = "/etc/rc/coder/create/S00.kai";
         let read_path = "/etc/rc/coder/create/snippet.kai";
 
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
         assert!(kernel.set_file_cache(cache.clone()));
 
         let (id, st) = kernel.editor_open(edit_path, &blocks).await.unwrap();
@@ -2131,7 +2172,7 @@ mod tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
@@ -2139,7 +2180,7 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
         kernel.set_file_cache(cache);
         let path = "/etc/rc/coder/create/S00.kai";
 
@@ -2236,7 +2277,7 @@ mod tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
@@ -2244,7 +2285,7 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
         kernel.set_file_cache(cache);
 
         // `editor_open` records no opener.
@@ -2282,7 +2323,7 @@ mod tests {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db, ws, creator);
+        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
@@ -2290,7 +2331,7 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
         kernel.set_file_cache(cache);
 
         let (id, _) = kernel

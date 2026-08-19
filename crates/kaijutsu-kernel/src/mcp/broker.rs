@@ -6059,6 +6059,8 @@ mod tests {
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
+        // See wired_kaish_broker: file_cache()'s lazy fallback needs this.
+        kernel.set_kernel_db(kernel_db.clone());
         let drift = shared_drift_router();
         let kj_dispatcher = Arc::new(KjDispatcher::new(
             drift,
@@ -6851,6 +6853,9 @@ mod tests {
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
+        // `Kernel::file_cache`'s lazy-init fallback (reached via kaish hook
+        // materialization) requires this to be wired in first.
+        kernel.set_kernel_db(kernel_db.clone());
         let kj_dispatcher = Arc::new(KjDispatcher::new(
             shared_drift_router(),
             store.clone(),

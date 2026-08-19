@@ -54,7 +54,12 @@ async fn harness() -> Harness {
         .mount("/etc/rc", kaijutsu_kernel::vfs::LocalBackend::new(&rc_dir))
         .await;
 
-    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
+    // Needed before anything reaches `Kernel::file_cache`'s lazy-init
+    // fallback (kaish's MountBackend, `kj diff`, `kj rc`, …) — the rc
+    // lifecycle scripts these tests run materialize kaish, which does.
+    kernel.set_kernel_db(db.clone());
+
+    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone(), db.clone()));
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await

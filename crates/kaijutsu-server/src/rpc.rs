@@ -1762,6 +1762,9 @@ pub async fn create_shared_kernel(
     kernel.freeze_mounts();
 
     let kernel_arc = Arc::new(kernel);
+    // Install the KernelDb handle as early as possible: `Kernel::file_cache`'s
+    // lazy-init fallback requires it, and it panics if reached first.
+    kernel_arc.set_kernel_db(kernel_db_arc.clone());
 
     // Bind the Claude Code peer inbox (`docs/cc-peer.md` "Order from here":
     // kernel wiring of the inbox; `kaijutsu_kernel::cc_inbox` module docs).
@@ -1802,6 +1805,7 @@ pub async fn create_shared_kernel(
     let file_cache_for_broker = Arc::new(kaijutsu_kernel::file_tools::FileDocumentCache::new(
         documents.clone(),
         kernel_arc.vfs().clone(),
+        kernel_db_arc.clone(),
     ));
     // Share this exact instance with the kaish MountBackend so both surfaces
     // map a real file to the same kernel document.

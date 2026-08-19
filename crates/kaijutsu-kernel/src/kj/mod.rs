@@ -978,6 +978,10 @@ pub(crate) mod test_helpers {
                 .with_timeouts(policy)
                 .with_temp_cleanup(root),
         );
+        // `Kernel::file_cache`'s lazy-init fallback (reached via `kj diff`,
+        // `kj rc`, the editor, kaish's MountBackend, …) requires a KernelDb
+        // to be wired in before anything can reach it.
+        kernel.set_kernel_db(kernel_db.clone());
         // Mount a host-backed /etc/rc tree (LocalBackend). `kj rc` is now
         // VFS-direct, so it works over either backend; this keeps the broadly-
         // used dispatcher db-less (a DB-backed block store deadlocks unrelated
@@ -1024,6 +1028,9 @@ pub(crate) mod test_helpers {
                 .await
                 .with_temp_cleanup(root),
         );
+        // See test_dispatcher_with_timeouts: file_cache()'s lazy fallback
+        // needs this wired in before anything can reach it.
+        kernel.set_kernel_db(kernel_db.clone());
         let rc_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc_fs.seed_from_embedded().expect("seed rc into the kernel");
         kernel.mount(RC_ROOT, rc_fs).await;

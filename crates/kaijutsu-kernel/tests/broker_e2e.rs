@@ -69,7 +69,7 @@ async fn setup() -> Fixture {
     }
     store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
-    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
+    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone(), db.clone()));
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await
@@ -1393,7 +1393,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
     }
     store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
-    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
+    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone(), db.clone()));
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await
@@ -1451,7 +1451,7 @@ async fn binding_persists_across_kernel_restart() {
     };
     let store2: SharedBlockStore =
         shared_block_store_with_db(db.clone(), ws_id2, creator2);
-    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
+    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone(), db.clone()));
     kernel2
         .register_builtin_mcp_servers(store2.clone(), file_cache2, None, db.clone())
         .await
@@ -1742,7 +1742,7 @@ async fn hooks_persist_across_kernel_restart() {
     };
     let store2: SharedBlockStore =
         shared_block_store_with_db(db.clone(), ws_id2, creator2);
-    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
+    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone(), db.clone()));
     kernel2
         .register_builtin_mcp_servers(store2.clone(), file_cache2, None, db.clone())
         .await

@@ -335,7 +335,7 @@ impl KernelBackend for MountBackend {
             .create_or_replace(&key, text)
             .await
             .map_err(BackendError::Io)?;
-        self.file_cache.mark_dirty(&key);
+        self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
         // Write-through: external tools (cargo, git) read the real filesystem.
         // If the flush fails, roll the edit back out of the cache so a later
         // read can't serve content that never reached disk — crash, don't
@@ -382,7 +382,7 @@ impl KernelBackend for MountBackend {
             .create_or_replace(&key, &combined)
             .await
             .map_err(BackendError::Io)?;
-        self.file_cache.mark_dirty(&key);
+        self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
         if let Err(e) = self.file_cache.flush_one(&key).await {
             self.file_cache.invalidate(&key);
             return Err(BackendError::Io(e));
@@ -550,7 +550,7 @@ impl KernelBackend for MountBackend {
                 .create_or_replace(&key, &text)
                 .await
                 .map_err(BackendError::Io)?;
-            self.file_cache.mark_dirty(&key);
+            self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
             if let Err(e) = self.file_cache.flush_one(&key).await {
                 self.file_cache.invalidate(&key);
                 return Err(BackendError::Io(e));
@@ -747,8 +747,16 @@ mod tests {
     use crate::Kernel as KaijutsuKernel;
     use crate::block_store::shared_block_store;
     use crate::file_tools::FileDocumentCache;
+    use crate::kernel_db::KernelDb;
     use crate::vfs::backends::{LocalBackend, MemoryBackend};
     use kaijutsu_types::PrincipalId;
+
+    /// A fresh in-memory `KernelDb` for tests that don't otherwise need one —
+    /// `FileDocumentCache` requires a handle to back its durable swap-file
+    /// marker (docs/file-buffers.md), even when the test never exercises it.
+    fn test_kernel_db() -> Arc<parking_lot::Mutex<KernelDb>> {
+        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()))
+    }
 
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
     async fn test_mount_backend() -> MountBackend {
@@ -760,7 +768,7 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;
 
-        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
 
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
@@ -886,7 +894,7 @@ mod tests {
 
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;
-        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
@@ -952,7 +960,7 @@ mod tests {
         mount_table
             .mount(dir.to_str().unwrap(), LocalBackend::read_only(dir))
             .await;
-        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
@@ -1000,7 +1008,7 @@ mod tests {
         // the backend mode, NOT from the mount being read-only.
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;
-        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
@@ -1080,7 +1088,7 @@ mod tests {
 
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;
-        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
@@ -1157,7 +1165,7 @@ mod tests {
 
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;
-        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
