@@ -66,6 +66,11 @@ struct CachedFileDoc {
     /// tick and never steps backward (see `FileAttr::generation`). `None` means
     /// we couldn't read an attr, so we trust the cache.
     loaded_generation: Option<u64>,
+    /// Disk moved past `loaded_generation` while this entry was dirty, so the
+    /// staleness check could not reload without discarding unsaved work.
+    /// Consumed by the vi editor's W12 `:w` guard and swap-recovery
+    /// announcement (docs/file-buffers.md).
+    disk_changed_since_load: bool,
 }
 
 /// Cache that maps VFS files to kernel documents.
@@ -177,8 +182,21 @@ impl FileDocumentCache {
         if let Some(entry) = cache.get_mut(&ctx_id) {
             entry.loaded_generation = generation;
             entry.dirty = false;
+            entry.disk_changed_since_load = false;
         }
         Ok(())
+    }
+
+    /// Whether disk moved under a cached entry since it was loaded (or last
+    /// reconciled) while dirty — the W12 condition. False for a path that
+    /// isn't cached. See `docs/file-buffers.md`.
+    pub fn disk_changed_since_load(&self, path: &str) -> bool {
+        let ctx_id = file_context_id(path);
+        self.cache
+            .read()
+            .get(&ctx_id)
+            .map(|e| e.disk_changed_since_load)
+            .unwrap_or(false)
     }
 
     /// Whether a file already exists — cached as a kernel document or present
@@ -252,12 +270,23 @@ impl FileDocumentCache {
             })
         };
         if let Some((cid, bid, dirty, loaded_generation)) = cached {
-            if dirty {
-                return Ok((cid, bid));
-            }
             let disk_generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
             let stale =
                 matches!((disk_generation, loaded_generation), (Some(d), Some(l)) if d > l);
+            if dirty {
+                // A dirty buffer is unsaved work and is still served as-is —
+                // never silently clobbered by disk. The staleness check still
+                // runs and records its result: the W12 `:w` guard needs to
+                // know disk moved, and returning before the check computed it
+                // discarded that permanently. See docs/file-buffers.md.
+                if stale {
+                    let mut cache = self.cache.write();
+                    if let Some(entry) = cache.get_mut(&ctx_id) {
+                        entry.disk_changed_since_load = true;
+                    }
+                }
+                return Ok((cid, bid));
+            }
             if !stale {
                 return Ok((cid, bid));
             }
@@ -337,10 +366,21 @@ impl FileDocumentCache {
                         path, e
                     ))
                 })?,
-            Err(_) => {
+            Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
+                // The block store persists file documents across restarts
+                // while this in-memory cache starts cold, so a miss does not
+                // mean the document is new — the existing block may hold
+                // content arbitrarily older than disk. Reconcile it against
+                // disk; discarding the `text` just read and serving the block
+                // unreconciled is how a months-old copy reaches a writer and
+                // gets flushed back. See docs/file-buffers.md.
                 {
                     let mut cache = self.cache.write();
                     if let Some(entry) = cache.get_mut(&ctx_id) {
+                        // Another task loaded this path between our miss and
+                        // now. That load ran the same reconcile against disk,
+                        // so the entry it left behind is already fresh — safe
+                        // to reuse without reconciling a second time.
                         entry.last_access = Instant::now();
                         return Ok((entry.context_id, entry.block_id));
                     }
@@ -354,7 +394,7 @@ impl FileDocumentCache {
                             path, e
                         ))
                     })?;
-                snapshots
+                let existing_block_id = snapshots
                     .first()
                     .map(|s| s.id)
                     .ok_or_else(|| {
@@ -362,7 +402,20 @@ impl FileDocumentCache {
                             "document {} exists but has no blocks",
                             path
                         ))
-                    })?
+                    })?;
+                // Reuses the vetted char-indexed splice from the stale-reload
+                // path instead of duplicating it here; it re-reads disk (we
+                // already hold `text`), which is a known redundant read, not
+                // a correctness gap.
+                self.reload_block_from_disk(ctx_id, &existing_block_id, path)
+                    .await?;
+                existing_block_id
+            }
+            Err(e) => {
+                return Err(CacheReadError::Backend(format!(
+                    "failed to create document for {}: {}",
+                    path, e
+                )));
             }
         };
 
@@ -378,6 +431,7 @@ impl FileDocumentCache {
                     dirty: false,
                     last_access: Instant::now(),
                     loaded_generation,
+                    disk_changed_since_load: false,
                 },
             );
         }
@@ -519,6 +573,7 @@ impl FileDocumentCache {
                 if let Some(entry) = cache.get_mut(ctx_id) {
                     entry.dirty = false;
                     entry.loaded_generation = *generation;
+                    entry.disk_changed_since_load = false;
                 }
             }
         }
@@ -573,6 +628,7 @@ impl FileDocumentCache {
             if let Some(entry) = cache.get_mut(&ctx_id) {
                 entry.dirty = false;
                 entry.loaded_generation = generation;
+                entry.disk_changed_since_load = false;
             }
         }
 
@@ -657,6 +713,7 @@ impl FileDocumentCache {
                     last_access: Instant::now(),
                     // Not yet on disk; the next flush stamps the real generation.
                     loaded_generation: None,
+                    disk_changed_since_load: false,
                 },
             );
         }
@@ -1011,6 +1068,101 @@ mod tests {
             "stale-reload backend failure must be Backend, got NotCached — \
              old code swallowed the error and would silently wipe the file: {:?}",
             err
+        );
+    }
+
+    /// A document already exists in the block store with stale content while
+    /// disk holds something newer. A cold cache (post-restart) must serve the
+    /// DISK content, not the pre-existing document — the case the old `Err(_)`
+    /// arm got backward, discarding the freshly-read disk text and serving the
+    /// stale block instead. See docs/file-buffers.md.
+    #[tokio::test]
+    async fn stale_document_reconciles_with_newer_disk_on_cold_cache() {
+        let (vfs, cache) = tmp_cache().await;
+
+        // Load the document once so it exists in the block store.
+        vfs.write_all(p("/tmp/incident.md"), b"stale content")
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.read_content("/tmp/incident.md").await.unwrap(),
+            "stale content"
+        );
+
+        // Simulate a kernel restart: drop the in-memory entry, leave the
+        // document (and its stale content) in the block store.
+        cache.invalidate("/tmp/incident.md");
+
+        // A writer that bypasses the cache changes disk directly — exactly
+        // what happens while the kernel is down or a sibling process edits
+        // the file.
+        vfs.write_all(p("/tmp/incident.md"), b"newer content on disk")
+            .await
+            .unwrap();
+
+        // Cold cache + doc-already-exists must reconcile against disk, not
+        // serve the stale pre-existing block.
+        assert_eq!(
+            cache.read_content("/tmp/incident.md").await.unwrap(),
+            "newer content on disk",
+            "must serve disk content, not the stale pre-existing document"
+        );
+    }
+
+    /// A reconcile that stamps `loaded_generation` from the wrong read (or
+    /// from "current disk gen" without confirming the block was actually
+    /// updated) poisons the freshness stamp exactly like the original bug —
+    /// the entry looks clean forever after. A *second* external write, after
+    /// the reconcile in the test above, must still be visible.
+    #[tokio::test]
+    async fn reconcile_does_not_poison_loaded_generation() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/incident2.md"), b"v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v1");
+
+        cache.invalidate("/tmp/incident2.md");
+        vfs.write_all(p("/tmp/incident2.md"), b"v2").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v2");
+
+        // A further external write after the reconcile must still be
+        // observed — proves loaded_generation tracks real disk state, not a
+        // value poisoned during reconcile.
+        vfs.write_all(p("/tmp/incident2.md"), b"v3").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v3");
+    }
+
+    /// A dirty buffer is unsaved work and must still be served as-is (rule 2,
+    /// `docs/file-buffers.md`) — but the fact that disk moved under it must
+    /// not be thrown away, since the W12 `:w` guard needs it.
+    #[tokio::test]
+    async fn dirty_entry_still_served_but_disk_change_is_recorded() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/dirty.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/dirty.md").await.unwrap(), "disk-v1");
+
+        cache
+            .create_or_replace("/tmp/dirty.md", "local-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/dirty.md");
+
+        assert!(
+            !cache.disk_changed_since_load("/tmp/dirty.md"),
+            "nothing has observed a disk move yet"
+        );
+
+        vfs.write_all(p("/tmp/dirty.md"), b"disk-v2").await.unwrap();
+
+        assert_eq!(
+            cache.read_content("/tmp/dirty.md").await.unwrap(),
+            "local-edit",
+            "a dirty buffer is unsaved work and must still be served"
+        );
+        assert!(
+            cache.disk_changed_since_load("/tmp/dirty.md"),
+            "disk moving under a dirty entry must be recorded for the W12 guard"
         );
     }
 }

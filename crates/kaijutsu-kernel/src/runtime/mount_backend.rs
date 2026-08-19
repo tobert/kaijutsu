@@ -44,8 +44,9 @@ pub struct MountBackend {
     /// Kaijutsu kernel's VFS mount table — directory/metadata ops and the
     /// binary-file fallback path.
     mount_table: Arc<MountTable>,
-    /// Shared file-document cache — the source of truth for text file
-    /// content across both the kaish and MCP surfaces.
+    /// Shared file-document cache — one cached view of text file content
+    /// across both the kaish and MCP surfaces. Disk is the source of truth;
+    /// the cache reconciles against it. See `docs/file-buffers.md`.
     file_cache: Arc<FileDocumentCache>,
     /// document backend for document tool dispatch.
     docs_tools: Arc<KaijutsuBackend>,
