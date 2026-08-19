@@ -342,7 +342,7 @@ impl KernelBackend for MountBackend {
         // corrupt.
         if let Err(e) = self.file_cache.flush_one(&key).await {
             self.file_cache.invalidate(&key);
-            return Err(BackendError::Io(e));
+            return Err(BackendError::Io(e.to_string()));
         }
         Ok(())
     }
@@ -385,7 +385,7 @@ impl KernelBackend for MountBackend {
         self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
         if let Err(e) = self.file_cache.flush_one(&key).await {
             self.file_cache.invalidate(&key);
-            return Err(BackendError::Io(e));
+            return Err(BackendError::Io(e.to_string()));
         }
         Ok(())
     }
@@ -553,7 +553,7 @@ impl KernelBackend for MountBackend {
             self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
             if let Err(e) = self.file_cache.flush_one(&key).await {
                 self.file_cache.invalidate(&key);
-                return Err(BackendError::Io(e));
+                return Err(BackendError::Io(e.to_string()));
             }
             Ok(())
         } else {

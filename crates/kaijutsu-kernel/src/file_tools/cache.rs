@@ -47,6 +47,45 @@ impl std::fmt::Display for CacheReadError {
     }
 }
 
+/// Why a flush to disk did not happen. Typed because the editor layer picks a
+/// different vi message for each, and because a caller matching on a message
+/// substring is a test that passes for the wrong reason.
+#[derive(Debug)]
+pub enum FlushError {
+    /// The disk generation moved past this buffer's `loaded_generation` — the
+    /// W12 condition. Only produced by [`FileDocumentCache::flush_one_guarded`]
+    /// with `force: false`. See `docs/file-buffers.md`.
+    DiskChanged {
+        path: String,
+        loaded: Option<u64>,
+        disk: Option<u64>,
+    },
+    /// An unacknowledged recovered swap (rule 4, `docs/file-buffers.md`).
+    UnacknowledgedSwap { path: String },
+    /// A VFS write, a block-store read, or a swap-marker clear failed.
+    Backend(String),
+}
+
+impl std::fmt::Display for FlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlushError::DiskChanged { path, .. } => write!(
+                f,
+                "{path}: the file changed on disk since it was read (add ! to override)"
+            ),
+            FlushError::UnacknowledgedSwap { path } => write!(
+                f,
+                "{path}: recovered from a swap after a cold cache and not yet \
+                 acknowledged — call acknowledge_swap before flushing \
+                 (docs/file-buffers.md)"
+            ),
+            FlushError::Backend(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::error::Error for FlushError {}
+
 /// A cached file backed by a kernel document.
 struct CachedFileDoc {
     /// Deterministic ContextId derived from the file path.
@@ -710,17 +749,20 @@ impl FileDocumentCache {
     /// player has been told, and writing it over disk is exactly "serving it
     /// as authoritative." Call [`acknowledge_swap`](Self::acknowledge_swap)
     /// first. Reads are unaffected — only the flush path is gated.
-    pub async fn flush_one(&self, path: &str) -> Result<(), String> {
+    ///
+    /// Does **not** perform the W12 changed-under-us check — that is
+    /// [`flush_one_guarded`](Self::flush_one_guarded). This is the unguarded
+    /// primitive every non-editor writer (`create_or_replace`'s callers) uses,
+    /// where "flush whatever the buffer holds" is the intended meaning.
+    pub async fn flush_one(&self, path: &str) -> Result<(), FlushError> {
         let ctx_id = file_context_id(path);
         let block_id = {
             let cache = self.cache.read();
             match cache.get(&ctx_id) {
                 Some(entry) if entry.swap_recovered => {
-                    return Err(format!(
-                        "{path}: recovered from a swap after a cold cache and not yet \
-                         acknowledged — call acknowledge_swap before flushing \
-                         (docs/file-buffers.md)"
-                    ));
+                    return Err(FlushError::UnacknowledgedSwap {
+                        path: path.to_string(),
+                    });
                 }
                 Some(entry) if entry.dirty => entry.block_id,
                 Some(_) => return Ok(()), // not dirty
@@ -744,7 +786,7 @@ impl FileDocumentCache {
         self.vfs
             .write_all(vfs_path, content.as_bytes())
             .await
-            .map_err(|e| format!("failed to flush {}: {}", path, e))?;
+            .map_err(|e| FlushError::Backend(format!("failed to flush {}: {}", path, e)))?;
 
         // Disk holds the content now — the swap marker's job is done. Clear
         // it before touching the in-memory entry so a crash in between still
@@ -752,10 +794,11 @@ impl FileDocumentCache {
         // exists. Bubbled, not swallowed: mark_dirty bubbles the same class
         // of error, and a lingering row here would misreport this path as an
         // unacknowledged swap on the next cold start.
-        self.db
-            .lock()
-            .clear_dirty_file_buffer(path)
-            .map_err(|e| format!("flush_one({path}): flushed to disk but failed to clear the swap marker: {e}"))?;
+        self.db.lock().clear_dirty_file_buffer(path).map_err(|e| {
+            FlushError::Backend(format!(
+                "flush_one({path}): flushed to disk but failed to clear the swap marker: {e}"
+            ))
+        })?;
 
         // Stamp the post-flush generation so our own write isn't later mistaken
         // for an external change and needlessly reloaded.
@@ -770,6 +813,65 @@ impl FileDocumentCache {
         }
 
         Ok(())
+    }
+
+    /// Flush a single file, refusing when disk moved under the buffer since it
+    /// was loaded — vim's W12 "changed since reading it". `force` (`:w!`)
+    /// overrides.
+    ///
+    /// Separate from [`flush_one`](Self::flush_one) rather than a parameter on
+    /// it because the two have genuinely different semantics: a whole-file
+    /// overwrite through the VFS (`echo x > file`, `mount_backend`'s
+    /// `write_all`) *means* "I do not care what is there," and
+    /// `create_or_replace` does not re-stamp `loaded_generation`, so guarding
+    /// that path would refuse every redirect onto an externally-edited file.
+    /// The editor is the surface with a `!` to say otherwise. See
+    /// `docs/file-buffers.md`.
+    ///
+    /// Even with `force: true`, [`flush_one`](Self::flush_one)'s own
+    /// `UnacknowledgedSwap` refusal still applies — `:w!` overrides "disk
+    /// changed," not "you have not been told about a recovered swap" (rule 4).
+    pub async fn flush_one_guarded(&self, path: &str, force: bool) -> Result<(), FlushError> {
+        if force {
+            return self.flush_one(path).await;
+        }
+
+        let ctx_id = file_context_id(path);
+        let entry_info = {
+            let cache = self.cache.read();
+            cache
+                .get(&ctx_id)
+                .map(|entry| (entry.loaded_generation, entry.disk_changed_since_load))
+        };
+        let (loaded_generation, already_flagged) = match entry_info {
+            Some(info) => info,
+            None => return self.flush_one(path).await,
+        };
+
+        let vfs_path = std::path::Path::new(path);
+        let disk_generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
+        // Same predicate `try_get_or_load`'s `stale` binding uses, OR'd with
+        // the sticky flag: the flag records an observation the read path
+        // already made, and `FileAttr::generation`'s own doc says a
+        // `LocalBackend` generation can step *backward* (an mtime moved
+        // backward), so a live check alone can lose a change the read path
+        // already saw.
+        let disk_moved = already_flagged
+            || matches!((disk_generation, loaded_generation), (Some(d), Some(l)) if d > l);
+
+        if disk_moved {
+            let mut cache = self.cache.write();
+            if let Some(entry) = cache.get_mut(&ctx_id) {
+                entry.disk_changed_since_load = true;
+            }
+            return Err(FlushError::DiskChanged {
+                path: path.to_string(),
+                loaded: loaded_generation,
+                disk: disk_generation,
+            });
+        }
+
+        self.flush_one(path).await
     }
 
     /// Acknowledge a recovered swap, clearing `swap_recovered` so the entry
@@ -1453,8 +1555,8 @@ mod tests {
             .await
             .expect_err("flush_one must refuse an unacknowledged recovered swap");
         assert!(
-            err.contains("acknowledge"),
-            "refusal must point at acknowledge_swap, got: {err}"
+            matches!(err, FlushError::UnacknowledgedSwap { .. }),
+            "refusal must point at acknowledge_swap, got: {err:?}"
         );
         // Disk must be untouched by the refused flush.
         assert_eq!(
@@ -1471,6 +1573,127 @@ mod tests {
         assert_eq!(
             String::from_utf8(vfs.read_all(p("/tmp/ack.md")).await.unwrap()).unwrap(),
             "unsaved-edit"
+        );
+    }
+
+    /// The W12 guard (`docs/file-buffers.md` rule 3, slice 3): a plain flush
+    /// refuses once disk has moved under the buffer, and `force` (`:w!`)
+    /// overrides it.
+    #[tokio::test]
+    async fn flush_one_guarded_refuses_when_disk_moved_then_force_overrides() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/w12.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/w12.md").await.unwrap(), "disk-v1");
+
+        cache
+            .create_or_replace("/tmp/w12.md", "local-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/w12.md").unwrap();
+
+        // External writer moves disk out from under the buffer.
+        vfs.write_all(p("/tmp/w12.md"), b"external-edit")
+            .await
+            .unwrap();
+
+        let err = cache
+            .flush_one_guarded("/tmp/w12.md", false)
+            .await
+            .expect_err("a plain flush must refuse once disk moved under the buffer");
+        assert!(
+            matches!(err, FlushError::DiskChanged { .. }),
+            "expected DiskChanged, got: {err:?}"
+        );
+        // The refusal must not touch disk.
+        assert_eq!(
+            String::from_utf8(vfs.read_all(p("/tmp/w12.md")).await.unwrap()).unwrap(),
+            "external-edit"
+        );
+
+        // `:w!` overrides.
+        cache
+            .flush_one_guarded("/tmp/w12.md", true)
+            .await
+            .expect("force must override the W12 refusal");
+        assert_eq!(
+            String::from_utf8(vfs.read_all(p("/tmp/w12.md")).await.unwrap()).unwrap(),
+            "local-edit"
+        );
+    }
+
+    /// The non-refusal case: a flush proceeds normally when disk did not move
+    /// under the buffer, and clears the swap marker exactly like `flush_one`.
+    #[tokio::test]
+    async fn flush_one_guarded_allows_a_flush_when_disk_did_not_move() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/w12_ok.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/w12_ok.md").await.unwrap(), "disk-v1");
+
+        cache
+            .create_or_replace("/tmp/w12_ok.md", "local-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/w12_ok.md").unwrap();
+
+        cache
+            .flush_one_guarded("/tmp/w12_ok.md", false)
+            .await
+            .expect("flush must succeed when disk did not move");
+        assert_eq!(
+            String::from_utf8(vfs.read_all(p("/tmp/w12_ok.md")).await.unwrap()).unwrap(),
+            "local-edit"
+        );
+
+        // Swap marker cleared: a later cold load reconciles against disk
+        // instead of recovering a (nonexistent) unacknowledged swap.
+        cache.invalidate("/tmp/w12_ok.md");
+        vfs.write_all(p("/tmp/w12_ok.md"), b"disk-v2-external")
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.read_content("/tmp/w12_ok.md").await.unwrap(),
+            "disk-v2-external"
+        );
+        assert!(!cache.swap_recovered("/tmp/w12_ok.md"));
+    }
+
+    /// Force is not a bypass for rule 4: `:w!` overrides "disk changed," not
+    /// "you have not been told about a recovered swap."
+    #[tokio::test]
+    async fn flush_one_guarded_still_refuses_an_unacknowledged_swap_even_when_forced() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/w12_swap.md"), b"disk-v1")
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.read_content("/tmp/w12_swap.md").await.unwrap(),
+            "disk-v1"
+        );
+
+        cache
+            .create_or_replace("/tmp/w12_swap.md", "unsaved-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/w12_swap.md").unwrap();
+        cache.invalidate("/tmp/w12_swap.md");
+
+        // Reload recovers the swap.
+        assert_eq!(
+            cache.read_content("/tmp/w12_swap.md").await.unwrap(),
+            "unsaved-edit"
+        );
+        assert!(cache.swap_recovered("/tmp/w12_swap.md"));
+
+        let err = cache
+            .flush_one_guarded("/tmp/w12_swap.md", true)
+            .await
+            .expect_err("force must not bypass the unacknowledged-swap refusal");
+        assert!(
+            matches!(err, FlushError::UnacknowledgedSwap { .. }),
+            "expected UnacknowledgedSwap even when forced, got: {err:?}"
         );
     }
 }

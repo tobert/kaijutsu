@@ -212,6 +212,22 @@ fn default_flow_capacity() -> usize {
     crate::flows::configured_queue_depth()
 }
 
+/// The vi status-line text for a failed editor flush. One source for all three
+/// editor flush sites (`editor_keys`' `Updated` and `Closed` arms,
+/// `editor_save`) — the strings are published text a model and a human both
+/// read, and three hand-copied versions drift.
+///
+/// W12 is vim's "changed since reading it": disk moved past the buffer's load
+/// generation, so a plain `:w` refuses and `:w!` overrides. Everything else is
+/// a genuine write failure and reads as E212. See `docs/file-buffers.md`.
+fn flush_error_message(path: &str, err: &crate::file_tools::cache::FlushError) -> String {
+    match err {
+        crate::file_tools::cache::FlushError::DiskChanged { .. } => {
+            format!("W12: {path} changed on disk since it was read (add ! to override)")
+        }
+        other => format!("E212: Can't open file for writing: {path}: {other}"),
+    }
+}
 impl Kernel {
     /// Resolve the CAS base path from a data_dir.
     fn cas_for_data_dir(data_dir: &Path) -> Arc<FileStore> {
@@ -1307,8 +1323,10 @@ impl Kernel {
     /// leaves the buffer dirty records the durable swap marker
     /// (`file_cache.mark_dirty`) so unsaved work survives a restart; a batch
     /// that executed a checkpoint (`:w`/`:wq`/`:x`/`ZZ`) flushes to disk
-    /// (`file_cache.flush_one`) instead. A config/rc session has no host file
-    /// and never touches the file cache (`EditorSessions::file_backed_path`).
+    /// (`file_cache.flush_one_guarded`) instead — refusing on the W12
+    /// changed-under-us condition unless `:w!` set `update.forced`. A
+    /// config/rc session has no host file and never touches the file cache
+    /// (`EditorSessions::file_backed_path`).
     pub async fn editor_keys(
         &self,
         id: crate::editor::EditorSessionId,
@@ -1399,8 +1417,13 @@ impl Kernel {
                             // `EditorSessions` deferred the checkpoint (see
                             // `KeysUpdate`). Flush to disk FIRST; the
                             // checkpoint must not advance unless the bytes
-                            // actually landed.
-                            if let Err(e) = self.file_cache.flush_one(fp).await {
+                            // actually landed. Guarded (docs/file-buffers.md
+                            // rule 3, W12): a plain `:w` refuses when disk
+                            // moved under the buffer, `:w!` overrides via
+                            // `update.forced`.
+                            if let Err(e) =
+                                self.file_cache.flush_one_guarded(fp, update.forced).await
+                            {
                                 // Leave the swap row and the cache entry alone
                                 // — the entry is legitimately dirty and the
                                 // block IS the player's live buffer, not a
@@ -1411,9 +1434,7 @@ impl Kernel {
                                 // that recovers as an unacknowledged swap —
                                 // the wrong error for a player retrying a
                                 // write that just failed.
-                                state.message = Some(format!(
-                                    "E212: Can't open file for writing: {fp}: {e}"
-                                ));
+                                state.message = Some(flush_error_message(fp, &e));
                             } else {
                                 state = self.editor_sessions.lock().0.save(id)?;
                             }
@@ -1449,9 +1470,10 @@ impl Kernel {
                 // instead of losing it.
                 let flush_err = if update.saved
                     && let Some(fp) = file_path.as_deref()
-                    && let Err(e) = self.file_cache.flush_one(fp).await
+                    && let Err(e) =
+                        self.file_cache.flush_one_guarded(fp, update.forced).await
                 {
-                    Some(format!("E212: Can't open file for writing: {fp}: {e}"))
+                    Some(flush_error_message(fp, &e))
                 } else {
                     None
                 };
@@ -1539,8 +1561,10 @@ impl Kernel {
     /// `ZZ` (direct call) — for a file-backed session (`docs/file-buffers.md`),
     /// flush to disk FIRST and only advance the checkpoint once the bytes
     /// land; a config/rc session has no flush step, so its checkpoint
-    /// advances immediately. Publishes the resulting state so renderers
-    /// reflect it — clean on success, still dirty on failure.
+    /// advances immediately. The flush is W12-guarded and unforced (this call
+    /// carries no `:w!` bang), so it refuses if disk moved under the buffer.
+    /// Publishes the resulting state so renderers reflect it — clean on
+    /// success, still dirty on failure.
     ///
     /// The session stays open on a flush failure: this is the direct-call
     /// path (the wire `editorSave`, `kj editor save`), not a `ZZ`/`:wq` that
@@ -1562,8 +1586,12 @@ impl Kernel {
         };
         match file_path.as_deref() {
             Some(fp) => {
-                if let Err(e) = self.file_cache.flush_one(fp).await {
-                    state.message = Some(format!("E212: Can't open file for writing: {fp}: {e}"));
+                // Guarded, unforced: this direct-call path (the wire
+                // `editorSave`, `kj editor save`) carries no bang, so it is a
+                // plain `:w` and refuses on the W12 changed-under-us
+                // condition (docs/file-buffers.md rule 3).
+                if let Err(e) = self.file_cache.flush_one_guarded(fp, false).await {
+                    state.message = Some(flush_error_message(fp, &e));
                 } else {
                     state = self.editor_sessions.lock().0.save(id)?;
                 }
@@ -2613,6 +2641,64 @@ mod tests {
         assert_eq!(
             disk, "X改善—work",
             "multi-byte content must round-trip through :w intact"
+        );
+    }
+
+    /// W12 (`docs/file-buffers.md` rule 3, slice 3): a plain `:w` refuses
+    /// once disk has moved under the buffer since it was loaded, keeps the
+    /// session open and dirty, and never touches disk; `:w!` overrides.
+    #[tokio::test]
+    async fn colon_w_refuses_when_disk_moved_then_colon_w_bang_overrides() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/note.txt");
+        kernel.vfs().write_all(path, b"hello").await.unwrap();
+
+        let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+
+        // An external writer moves disk out from under the open buffer.
+        kernel
+            .vfs()
+            .write_all(path, b"external-edit")
+            .await
+            .unwrap();
+
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert!(
+            st.dirty,
+            "a refused :w must leave the buffer dirty — the checkpoint must not advance"
+        );
+        let msg = st.message.expect("a refused :w must report on the status line");
+        assert!(
+            msg.starts_with("W12:") && msg.contains("add ! to override"),
+            "expected a W12 message naming the override, got: {msg}"
+        );
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
+            "external-edit",
+            "a refused :w must not touch disk"
+        );
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "a refused :w must not clear the swap row"
+        );
+
+        // `:w!` overrides the refusal.
+        let st = kernel.editor_keys(id, ":w!<CR>").await.unwrap();
+        assert!(!st.dirty, ":w! must clear the editor's dirty flag once it lands");
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
+            "Xhello",
+            ":w! must overwrite disk with the buffer's content"
         );
     }
 

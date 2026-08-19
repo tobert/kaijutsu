@@ -12,8 +12,8 @@ The editor sits on the file-buffer layer — how kaijutsu holds file content, an
 where `:w` actually lands. **`docs/file-buffers.md` is canonical for that**, and
 it carries decisions that change this document: `write` and `grep` are being
 removed, `edit` becomes hashline-only, and the `:w!` changed-under-us guard
-below (recorded here as "`:w!` == `:w` today") is being implemented rather than
-deferred — a 2026-08-18 incident proved the hazard real.
+below (the W12 guard, slice 3) shipped — a 2026-08-18 incident proved the
+hazard real.
 
 ## Status
 
@@ -32,7 +32,10 @@ durable swap row, and `:w`/`:wq`/`:x`/`ZZ` flush to disk through the same
 `FileDocumentCache` every other writer uses — previously the editor mirrored
 edits onto the kernel block and never touched the cache at all, so `:w` on a
 file never reached disk and an unsaved edit had no swap row to survive a
-restart.
+restart. The W12 changed-under-us guard shipped too
+(`FileDocumentCache::flush_one_guarded`): a plain `:w` refuses when the disk
+generation has moved past the buffer's load generation, reporting on the
+status line and leaving the session open and dirty; `:w!` overrides.
 
 **Open** (only in this doc; the backlog proper is `docs/issues.md`):
 
@@ -63,13 +66,6 @@ restart.
   last-edit-sequence machinery.
 - **`:s` refinements** — bare `:s` (repeat-last) errors; `.`/`$` symbolic
   ranges, `&`/`~` repeat, and finer-than-`set_text` undo granularity deferred.
-- **`:w!` changed-under-us guard.** `:w!` == `:w` today (decided 2026-06-27):
-  both checkpoint and flush identically — force changes nothing yet.
-  `CommandRequest::Write{force}` carries the bang through
-  `KeysUpdate::forced` for a future guard: when the kernel detects the block
-  moved since open (a concurrent writer), a plain `:w` refuses and `:w!`
-  overrides — vim's "file has changed since editing started". Not a
-  permission gate.
 - **Exact-window peer targeting.** The `open_editor` signal fans out to the
   submitter *principal's* windows; targeting the submitter's exact `instance`
   needs the instance threaded onto the execute path
@@ -330,9 +326,11 @@ session `ZQ`/`:q!` mean "quit *me* out of the doc, leave the others playing" —
 never "undo everyone back to my checkpoint". Your own unsaved keystrokes stay in
 the shared score; they were already part of the ensemble the moment they
 mirrored. Residual race: a peer who writes and closes within the reconciler's
-bus latency (flag not yet set, no sibling left to see) can still be clobbered —
-the complete guard is the frontier-based changed-under-us detection that `:w!`'s
-`force` is reserved for.
+bus latency (flag not yet set, no sibling left to see) can still be clobbered.
+`:w!`'s `force` is now spent on the disk-level W12 guard
+(`docs/file-buffers.md`), which checks the VFS generation, not this
+block-level peer-write race — closing this residual race still needs its own
+detection.
 
 The session also keeps the block's trailing terminator aside
 (`EditorSession.terminator`), so a newline-terminated block opens clean and
@@ -373,9 +371,11 @@ push channel; the app renders it read-only.
   and rolls the block back (when provably alone — see Rollback's entanglement
   guard); `:wq`/`:x` save-then-close; `:w` saves and stays. For a file-backed
   session "saves" means both the kernel checkpoint *and* a
-  `FileDocumentCache::flush_one` to disk (`docs/file-buffers.md`); a
-  config/rc session has no host file, so only the checkpoint applies. `:w!`
-  == `:w` (force is reserved — see Open).
+  `FileDocumentCache::flush_one_guarded` to disk (`docs/file-buffers.md`); a
+  config/rc session has no host file, so only the checkpoint applies. The
+  guard is W12: a plain `:w` refuses when disk moved past the buffer's load
+  generation, reporting on the status line and leaving the session open and
+  dirty; `:w!` sets `force` and overrides it.
 - **Substitute:** `:s/old/new/`, `:%s/…/…/`, `:N,Ms/…/…/`. Hand-rolled
   (modalkit's `vim_cmd_substitute` is an explicit stub). **The dialect is Rust
   regex + Rust replacement syntax** (`$1` capture refs) — a deliberate choice

@@ -168,9 +168,12 @@ pub enum KeysOutcome {
 /// kernel layer must flush to disk first and only then checkpoint, or the
 /// buffer would read clean before the bytes land (docs/file-buffers.md).
 ///
-/// `forced` carries `:w!`'s bang through for the future W12 changed-under-us
-/// guard (docs/file-buffers.md); nothing consumes it yet, so a forced save
-/// behaves exactly like a plain one until that guard exists.
+/// `forced` carries `:w!`'s bang through to the kernel layer's W12
+/// changed-under-us guard (`FileDocumentCache::flush_one_guarded`,
+/// docs/file-buffers.md): a plain `:w` (`forced: false`) refuses when disk
+/// moved under the buffer since it was loaded; `:w!` (`forced: true`)
+/// overrides that refusal. This pure registry has no file cache to check
+/// against, so it only carries the bit — the kernel layer is what acts on it.
 #[derive(Debug)]
 pub struct KeysUpdate {
     pub state: EditorState,
@@ -512,13 +515,13 @@ impl EditorSessions {
         let mut forced = false;
         for cmd in commands {
             match cmd {
-                // `:w!` behaves exactly like `:w` today: both request a write
-                // unconditionally. `force` rides through to the returned
-                // `KeysUpdate` so the future W12 changed-under-us guard has it
-                // to gate on — once a plain `:w` refuses when the block moved
-                // since open (a concurrent writer), `:w!` will override that
-                // refusal. No such detection exists yet, so a forced write
-                // changes nothing.
+                // `force` rides through to the returned `KeysUpdate` for the
+                // kernel layer's W12 changed-under-us guard
+                // (`FileDocumentCache::flush_one_guarded`,
+                // docs/file-buffers.md): a plain `:w` refuses when disk moved
+                // under the buffer since it was loaded, and `:w!` overrides
+                // that refusal. This pure registry has no file cache to check
+                // against — it only carries the bit.
                 CommandRequest::Write { force } => {
                     write_requested = true;
                     forced = force;
