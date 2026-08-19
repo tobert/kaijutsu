@@ -40,6 +40,20 @@ and git as a skill reachable through rc or the help system rather than something
 the kernel performs. Prefer deleting a mechanism to generalizing it. This is
 explicit permission to reduce scope, not merely to avoid adding to it.
 
+**Kaijutsu is the learning space; delete and rewrite freely** (Amy,
+2026-08-19). There are no outside users to strand, so a mechanism that turned
+out wrong gets removed rather than deprecated, and a shape that fights us gets
+rewritten rather than wrapped. Deleting code you just wrote is a normal outcome
+here, not waste — a guard written to make a bad path fail loudly has done its
+job when the path itself goes away.
+
+**kaish and kaibo are not this.** They hope to have outside users, so they are
+conservative by comparison: a public surface there is a promise, breaking
+changes get declared and explained to an audience, and "we'll just change it"
+is not available. When work spans kaijutsu and one of them, the conservative
+rules govern the shared surface even though the kaijutsu side may be rewritten
+around it freely.
+
 **Shared trust, crosstalk-as-feature.** Every player — human, model, connected
 app, sibling context — is *inside* the trust boundary; the kernel runs as one
 unix user and the real boundaries live outside it. We design for resilience to
