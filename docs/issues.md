@@ -6,6 +6,39 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `edit` names two different things on two surfaces (2026-08-18)
+
+A coder has two editing surfaces, and the same word means opposite things on
+each:
+
+- **kaish builtin `edit <path>`** — opens a kernel-owned *interactive vi
+  session* (`runtime/vi_builtin.rs`, registered alongside `vi` in
+  `kj/context_shell.rs:209-218`). Verified live: `edit /tmp/x.txt` answers
+  `edit: open editor: cannot open ...`.
+- **MCP tool `edit`** — a *surgical, non-interactive* file edit with
+  string and hashline modes (`mcp/servers/file.rs:163`).
+
+Same name, same coder, different mechanism and different ergonomics. A model
+that reaches for "edit" gets whichever surface it happened to be on. This is
+the "one term, one meaning" rule in AGENTS.md "Writing style" broken inside the
+tool surface rather than in prose, and prose cannot fix it — one of them wants
+a different name, or `edit` should mean one thing and the other should be
+reached only as `vi`.
+
+Note `vi` is already the documented ergonomic front door (`docs/vi.md`), so
+dropping the `edit` alias is the cheap end of the fix. Check for callers first
+— rc scripts and help text may use it.
+
+Found while answering "what are the available editing tools for kaijutsu
+coders?", which is itself the evidence: the question was not answerable without
+reading the registration code.
+
+Also seen in the same probe: that failure returned **exit 0** with the error on
+stdout. An editor that cannot open the requested file has not succeeded, and a
+script testing `$?` would believe it had.
+
+---
+
 ## kaish loses a command substitution in a non-last pipeline stage (2026-08-18, via kaish-lead)
 
 **Silent zero bytes at exit 0.** Confirmed against the kernel's embedded kaish
