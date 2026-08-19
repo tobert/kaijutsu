@@ -6535,7 +6535,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4143424801cde2f8f2d67bb25e8cff4270e605f603614d938e4dcae05d7885b0"
 dependencies = [
  "async-trait",
  "ignore",
@@ -6545,14 +6547,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b311a053ef8f72f0e0d4ec07cc9aa225ba9c866adf78901dc6447774e15884"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc5c505e74477b7b226d8a039ddd0d364776bc135a4726543fa6dae7eda4ddc4"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -6595,12 +6601,16 @@ dependencies = [
  "tracing-opentelemetry",
  "unicode-ident",
  "unicode-normalization",
+ "unicode-script",
+ "unicode-security",
  "unicode-width 0.2.2",
 ]
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27be4db990705aaaa913e59c25726f7050aca23ad0d024df2335fae2fff12f74"
 dependencies = [
  "async-trait",
  "clap",
@@ -6609,7 +6619,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1deae928d8cd283d7265054d0b5aac35100cdc3217a90e373c0698d2aaa7641e"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -6621,7 +6633,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d152d256a212dc0056ff4dd5936fd5e3633d1e94482deb2db77303d9a2a2c50b"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -11877,6 +11891,16 @@ name = "unicode-script"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
+
+[[package]]
+name = "unicode-security"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e4ddba1535dd35ed8b61c52166b7155d7f4e4b8847cec6f48e71dc66d8b5e50"
+dependencies = [
+ "unicode-normalization",
+ "unicode-script",
+]
 
 [[package]]
 name = "unicode-segmentation"

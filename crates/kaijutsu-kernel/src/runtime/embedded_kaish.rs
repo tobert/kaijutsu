@@ -762,6 +762,47 @@ mod tests {
         assert_eq!(kaish.name(), "test-kernel");
     }
 
+    /// Canary for kaish #367/#368. A command substitution in a NON-LAST
+    /// pipeline stage used to destroy that stage's entire output — silently,
+    /// at exit 0 — so `echo $(git rev-parse HEAD) | cut -c1-8` handed a model
+    /// an empty string it then reasoned on. Fixed in kaish 0.15.0.
+    ///
+    /// **If this test fails, the kaish dependency has gone backward.** Check
+    /// the `kaish-*` versions in the workspace `Cargo.toml`: they must be
+    /// 0.15 or later, and a `path` dep pointing at a pre-0.15 worktree
+    /// reintroduces the bug with nothing else to signal it. Do not delete or
+    /// weaken this assertion to make a downgrade build.
+    #[tokio::test]
+    async fn command_substitution_survives_a_non_last_pipeline_stage() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = test_kernel("test-subst-pipe").await;
+        let kaish = EmbeddedKaish::new("test-subst-pipe", blocks, kernel, None).unwrap();
+
+        let result = kaish
+            .execute_with_options("echo $(echo sub) | cat", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "sub",
+            "a command substitution in a non-last pipeline stage must survive; \
+             empty output here means the kaish dependency regressed below 0.15",
+        );
+
+        // Quoting did not save it either, and the literal text around the
+        // substitution was lost with it — so assert the whole stage survives,
+        // not just the substituted part.
+        let quoted = kaish
+            .execute_with_options("echo \"x:[$(echo C)]\" | cat", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            quoted.text_out().trim(),
+            "x:[C]",
+            "the whole stage's output must survive, not only the substitution",
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_with_options_feeds_stdin() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());

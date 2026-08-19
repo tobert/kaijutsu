@@ -58,49 +58,31 @@ kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 approval-ledger = { path = "crates/approval-ledger" }
 claude-code-peer = { path = "crates/claude-code-peer" }
 
-# Kaish (execution engine + client) — pinned to published 0.14.
+# Kaish (execution engine + client) — published 0.15.
 # `subprocess` compiles in host external-command execution; whether a given
 # shell may actually use it is decided per-context at materialization
 # (ExternalExec, gated on the `exec` loadout authority — deny by default).
-# TEMPORARY `path` DEPS — Amy, 2026-08-17: *"let's link against local kaish for
-# now, we'll switch back when 0.15 ships."*
 #
-# Pointing at the kaish lead's integration worktree, which merges `main` plus
-# six queued branches (#350 frame-stack, #352 parser-properties, #349
-# unicode-names, #351 name-class-xid, #348 error-presentation, docs/voice-guidance)
-# plus the mid-word-`#` comment fix. Built for exactly this while GitHub's API is
-# down and `main` cannot be merged to.
+# Back on crates.io as of 0.15.0. The `path` deps on the kaish lead's
+# integration worktree existed because the confirmation gate needs
+# `plan_program` plus the heredoc surface (`expand_fragment` /
+# `PlannedHeredoc`) to render an honest prompt, and 0.14.1 could not render a
+# heredoc body. 0.15.0 ships all of it.
 #
-# **Developed against kaish rev `cf106d62a15163d8809d46615baff8662394984c`**
-# (branch `integration/kaijutsu-preview`). Recorded here because a `path` dep
-# pins NOTHING — it follows whatever the working tree holds. The kaish lead has
-# committed to append-only history on that branch while we are linked, and to
-# message before retiring it; `21642871…` (the rev we first linked at) is
-# verified an ancestor of this one.
+# What the path deps cost, recorded so nobody re-adds one casually: a git rev
+# resolves for anyone who clones, a path resolves only on a machine holding
+# that worktree, so the workspace was unbuildable on moltar and the MacBook for
+# the duration. A path dep also pins nothing — it follows whatever the working
+# tree holds, and ours moved under us once with nothing in the build to signal
+# it.
 #
-# **This line has already gone stale once, which is the point of having it.** We
-# linked at `21642871…`, the lead appended a merge on top, and the worktree moved
-# under us with nothing in the build to signal it — exactly the failure mode a
-# `path` dep invites. Re-read `git -C /home/atobey/src/wt/kaish-integration
-# rev-parse HEAD` and re-run the suite whenever you touch this; do not assume
-# the rev above is what you just built.
-#
-# Why this over the crates.io pin: the confirmation gate (docs/gate-and-shell-split.md
-# Slice 4) needs `plan_program` *and* the heredoc surface (`expand_fragment` /
-# `PlannedHeredoc`) to render an honest prompt. On 0.14.1 a heredoc body is
-# unrenderable, so a crates.io pin would have meant writing a throwaway
-# heredoc-refusal path and then deleting it.
-#
-# **What this costs, so it gets undone.** `6ebb0a8b` deliberately removed the
-# last git source from `Cargo.lock`. A `path` dep is worse than a git rev in one
-# way: a git rev resolves for anyone who clones, a path resolves only on a
-# machine holding that worktree. **This makes the workspace unbuildable on
-# moltar and the MacBook.** Revert to a crates.io pin when 0.15 ships — that is
-# a standing trigger, not a nice-to-have.
-kaish-kernel = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-kernel", features = ["subprocess"] }
-kaish-glob = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-glob" }
-kaish-types = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-types" }
-kaish-help = { path = "/home/atobey/src/wt/kaish-integration/crates/kaish-help" }
+# Re-linking to a worktree is legitimate when we need to consume kaish work
+# before it releases. If you do it, treat it as temporary, record the rev, and
+# put the crates.io line back the moment the release lands.
+kaish-kernel = { version = "0.15", features = ["subprocess"] }
+kaish-glob = { version = "0.15" }
+kaish-types = { version = "0.15" }
+kaish-help = { version = "0.15" }
 
 # Cap'n Proto
 capnp = "0.25"
