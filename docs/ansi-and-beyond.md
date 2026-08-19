@@ -234,6 +234,25 @@ A kaish palette/formatting helper for rc scripts (named colors, OK/FAIL
 markers, column alignment) is the eventual ergonomic layer; not needed for
 slice 1.
 
+And not just green text — **CRT green, at the glyph level** (Amy,
+2026-08-19). The style-table design decomposes a CRT stance into slots that
+already exist:
+
+- The green is a palette variant: "ANSI green" resolving to phosphor P1 —
+  a context or rc theme flips into CRT mode with a palette write, no rebuild.
+- Phosphor glow is the MSDF distance-threshold widening from the effects
+  note — a field op keyed off the same style index, so one table entry
+  carries color *and* glow.
+- Phosphor persistence: a per-glyph birth-time attribute + decay in the
+  shader (time is already a uniform) — streaming rc output strikes hot-white
+  and cools to settled green, like a beam.
+- Scanlines/bloom are the one neighborhood effect, and take the already-
+  sanctioned route: glyph lane → intermediate layer → post shader,
+  viewport-sized, never per-block.
+
+A CRT mode is a style-table entry plus one optional post pass, not a new
+system.
+
 ## Open questions
 
 - **`\r`-overwrite progress bars** (cargo, pip): not ANSI but same family.
