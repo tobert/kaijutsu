@@ -6,6 +6,15 @@ session** driven through a small tool-shaped surface; the Bevy app is one
 *renderer* of it, a model is another *player* of it, and a headless test is a
 third *driver* of it. Same surface for all three.
 
+## Underneath: file buffers
+
+The editor sits on the file-buffer layer — how kaijutsu holds file content, and
+where `:w` actually lands. **`docs/file-buffers.md` is canonical for that**, and
+it carries decisions that change this document: `write` and `grep` are being
+removed, `edit` becomes hashline-only, and the `:w!` changed-under-us guard
+below (recorded here as "`:w!` == `:w` today") is being implemented rather than
+deferred — a 2026-08-18 incident proved the hazard real.
+
 ## Status
 
 **Slices 1–3 shipped.** The full stack exists and is runner-verified: path

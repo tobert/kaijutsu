@@ -53,19 +53,22 @@ document made sense when the document was the source of truth. Post-demolition
 disk is the source of truth, and a durable document keyed deterministically by
 path is a stale mirror guaranteed to collide with its future self.
 
-Two ways out, and Amy's instinct was to simplify the path:
+**Decided 2026-08-18 — the design is `docs/file-buffers.md`, which is
+canonical.** In-memory-only was proposed and rejected: the durable document is
+load-bearing, because unsaved editor edits live in the block and that is what
+makes them survive a restart (`docs/vi.md` calls it "restart-safe"). The answer
+is vim's, faithfully — a clean buffer is a cache and is always re-read from
+disk; a dirty buffer is a swap file, persisted and **announced** on reopen
+rather than served silently; `:w` refuses when disk moved and `:w!` overrides.
 
-- **Stop persisting file documents.** Make the file cache in-memory only; on a
-  miss, read disk and build an ephemeral doc. Deletes the entire staleness
-  class rather than guarding it. Check what the editor needs first — `vi` opens
-  sessions on file blocks.
-- **Reconcile on miss.** Keep durable documents, but on
-  `DocumentAlreadyExists` replace the block content with the disk text just
-  read instead of discarding it. Smaller, keeps the bug class alive but closed
-  at the one door that matters.
+Also decided: `write` and `grep` are removed, `edit` becomes hashline-only
+(the anchor hash is a per-line changed-under-us check), and `create_file` may
+replace `write` since a create has no prior state to clobber. Removing `write`
+also closes a standing gate bypass — `shell_write` is ledger-gated and the file
+tools are not.
 
-Either way `Err(_)` must match the specific `DocumentAlreadyExists` variant and
-surface anything else loudly.
+Slice order and the two non-negotiable tests are in `docs/file-buffers.md`.
+Slice 1 (load path) is the containment and lands alone, first.
 
 **Until this is fixed, do not edit files through the kernel's file tools or the
 `vi` editor** — read and write through host tools. Every file the kernel has
