@@ -17,7 +17,6 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use kaijutsu_kernel::block_store::{DocumentKind, SharedBlockStore, shared_block_store_with_db};
 use kaijutsu_kernel::execution::ExecContext;
-use kaijutsu_kernel::file_tools::FileDocumentCache;
 use kaijutsu_kernel::kernel_db::{DocumentRow, KernelDb};
 use kaijutsu_kernel::llm::hydrate_from_blocks;
 use kaijutsu_kernel::mcp::{
@@ -43,7 +42,6 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let kernel = Arc::new(Kernel::new("broker-e2e", tmp.path()).await);
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
     let creator = PrincipalId::system();
@@ -52,6 +50,8 @@ async fn setup() -> Fixture {
         g.get_or_create_default_workspace(creator).unwrap()
     };
     let store: SharedBlockStore = shared_block_store_with_db(db.clone(), ws_id, creator);
+
+    let kernel = Arc::new(Kernel::new("broker-e2e", tmp.path(), store.clone(), db.clone()).await);
 
     let ctx_id = ContextId::new();
     {
@@ -69,7 +69,7 @@ async fn setup() -> Fixture {
     }
     store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
-    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone(), db.clone()));
+    let file_cache = kernel.file_cache().clone();
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await
@@ -1339,7 +1339,6 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
     use kaijutsu_types::{ConsentMode, ContextState};
 
     let tmp = tempfile::tempdir().unwrap();
-    let kernel = Arc::new(Kernel::new("phase5-m5", tmp.path()).await);
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
     let creator = PrincipalId::system();
@@ -1349,6 +1348,8 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
     };
     let store: SharedBlockStore =
         shared_block_store_with_db(db.clone(), ws_id, creator);
+
+    let kernel = Arc::new(Kernel::new("phase5-m5", tmp.path(), store.clone(), db.clone()).await);
 
     let ctx_id = ContextId::new();
     {
@@ -1393,7 +1394,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
     }
     store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
-    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone(), db.clone()));
+    let file_cache = kernel.file_cache().clone();
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await
@@ -1442,7 +1443,6 @@ async fn binding_persists_across_kernel_restart() {
     // Stand up a second kernel pointing at the same DB. No call to
     // `set_binding` here — it must hydrate from `KernelDb` on first touch.
     let tmp2 = tempfile::tempdir().unwrap();
-    let kernel2 = Arc::new(Kernel::new("phase5-m5-restart", tmp2.path()).await);
     let creator2 = PrincipalId::system();
     let _kernel_id2 = KernelId::new();
     let ws_id2 = {
@@ -1451,7 +1451,10 @@ async fn binding_persists_across_kernel_restart() {
     };
     let store2: SharedBlockStore =
         shared_block_store_with_db(db.clone(), ws_id2, creator2);
-    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone(), db.clone()));
+    let kernel2 = Arc::new(
+        Kernel::new("phase5-m5-restart", tmp2.path(), store2.clone(), db.clone()).await,
+    );
+    let file_cache2 = kernel2.file_cache().clone();
     kernel2
         .register_builtin_mcp_servers(store2.clone(), file_cache2, None, db.clone())
         .await
@@ -1733,7 +1736,6 @@ async fn hooks_persist_across_kernel_restart() {
 
     // --- Kernel B: fresh kernel, same DB. ---
     let tmp2 = tempfile::tempdir().unwrap();
-    let kernel2 = Arc::new(Kernel::new("hook-persist-restart", tmp2.path()).await);
     let creator2 = PrincipalId::system();
     let _kernel_id2 = KernelId::new();
     let ws_id2 = {
@@ -1742,7 +1744,10 @@ async fn hooks_persist_across_kernel_restart() {
     };
     let store2: SharedBlockStore =
         shared_block_store_with_db(db.clone(), ws_id2, creator2);
-    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone(), db.clone()));
+    let kernel2 = Arc::new(
+        Kernel::new("hook-persist-restart", tmp2.path(), store2.clone(), db.clone()).await,
+    );
+    let file_cache2 = kernel2.file_cache().clone();
     kernel2
         .register_builtin_mcp_servers(store2.clone(), file_cache2, None, db.clone())
         .await

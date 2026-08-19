@@ -279,7 +279,7 @@ impl KjDispatcher {
     /// through it so neither can drift from the editor's notion of ownership.
     async fn editor_target(&self, path: &str) -> Result<crate::editor::EditorTarget, String> {
         let blocks = self.block_store();
-        let file_cache = self.kernel().file_cache(blocks);
+        let file_cache = self.kernel().file_cache().clone();
         crate::editor::resolve_editor_target(path, blocks, &file_cache, self.kernel().vfs()).await
     }
 
@@ -491,7 +491,7 @@ mod tests {
         // Load the file into a kernel document, then edit it there — the state
         // `kj diff <path>` exists to reveal: an edit disk has not seen.
         let blocks = dispatcher.block_store();
-        let cache = dispatcher.kernel().file_cache(blocks);
+        let cache = dispatcher.kernel().file_cache().clone();
         let (ctx, block) = cache.get_or_load("/mnt/diff/a.txt").await.expect("load");
         blocks
             .edit_text(ctx, &block, 4, "TWO\n", 4)
@@ -580,8 +580,7 @@ mod tests {
     async fn a_missing_pre_image_diffs_as_an_addition() {
         let (dispatcher, _dir) = dispatcher_with_mount().await;
         // Never written to disk; created directly as a kernel document.
-        let blocks = dispatcher.block_store();
-        let cache = dispatcher.kernel().file_cache(blocks);
+        let cache = dispatcher.kernel().file_cache().clone();
         cache
             .create_or_replace("/mnt/diff/new.txt", "fresh\n")
             .await
@@ -615,7 +614,7 @@ mod tests {
             .await;
 
         let blocks = dispatcher.block_store();
-        let cache = dispatcher.kernel().file_cache(blocks);
+        let cache = dispatcher.kernel().file_cache().clone();
         let (ctx, block) = cache.get_or_load("/mnt/hist/h.txt").await.expect("load");
 
         // The point in history we will diff back to.

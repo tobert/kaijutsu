@@ -6045,22 +6045,20 @@ mod tests {
     /// non-empty.
     #[tokio::test]
     async fn kaish_hook_can_call_kj() {
-        use crate::block_store::shared_block_store;
         use crate::drift::shared_drift_router;
-        use crate::kernel_db::KernelDb;
         use crate::kj::KjDispatcher;
 
         let kernel = Arc::new(crate::Kernel::new_ephemeral("kaish-hook-kj-test").await);
-        let store = shared_block_store(PrincipalId::system());
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        // Reuse the kernel's own block store + db — new_ephemeral already
+        // built them (and kernel.file_cache() over them), so a separately
+        // built pair here would be a second, incoherent instance.
+        let store = kernel.blocks().clone();
+        let kernel_db = kernel
+            .blocks()
+            .db()
+            .expect("new_ephemeral wires a persistent KernelDb")
+            .clone();
         let _kernel_id = kaijutsu_types::KernelId::new();
-        {
-            let db = kernel_db.lock();
-            db.get_or_create_default_workspace(PrincipalId::system())
-                .unwrap();
-        }
-        // See wired_kaish_broker: file_cache()'s lazy fallback needs this.
-        kernel.set_kernel_db(kernel_db.clone());
         let drift = shared_drift_router();
         let kj_dispatcher = Arc::new(KjDispatcher::new(
             drift,
@@ -6842,20 +6840,17 @@ mod tests {
         Arc<crate::kj::KjDispatcher>,
     ) {
         use crate::drift::shared_drift_router;
-        use crate::kernel_db::KernelDb;
         use crate::kj::KjDispatcher;
 
         let kernel = Arc::new(crate::Kernel::new_ephemeral(name).await);
-        let store = crate::block_store::shared_block_store(PrincipalId::system());
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        {
-            let db = kernel_db.lock();
-            db.get_or_create_default_workspace(PrincipalId::system())
-                .unwrap();
-        }
-        // `Kernel::file_cache`'s lazy-init fallback (reached via kaish hook
-        // materialization) requires this to be wired in first.
-        kernel.set_kernel_db(kernel_db.clone());
+        // Reuse the kernel's own block store + db (see kaish_hook_can_call_kj)
+        // rather than building a second, incoherent pair.
+        let store = kernel.blocks().clone();
+        let kernel_db = kernel
+            .blocks()
+            .db()
+            .expect("new_ephemeral wires a persistent KernelDb")
+            .clone();
         let kj_dispatcher = Arc::new(KjDispatcher::new(
             shared_drift_router(),
             store.clone(),

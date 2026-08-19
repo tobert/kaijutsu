@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use kaijutsu_kernel::block_store::shared_block_store_with_db;
 use kaijutsu_kernel::drift::shared_drift_router;
-use kaijutsu_kernel::file_tools::FileDocumentCache;
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::mcp::{Capability, CallContext, InstanceId, KernelCallParams, McpError};
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher, KjResult};
@@ -40,7 +39,7 @@ async fn harness() -> Harness {
     let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
     let store = shared_block_store_with_db(db.clone(), ws_id, creator);
 
-    let kernel = Arc::new(Kernel::new("rc-role-test", tmp.path()).await);
+    let kernel = Arc::new(Kernel::new("rc-role-test", tmp.path(), store.clone(), db.clone()).await);
 
     // Seed and mount a private `/etc/rc` tree — the same setup the server RPC
     // boot path (kaijutsu-server/src/rpc.rs) and the unit-test helper
@@ -54,12 +53,7 @@ async fn harness() -> Harness {
         .mount("/etc/rc", kaijutsu_kernel::vfs::LocalBackend::new(&rc_dir))
         .await;
 
-    // Needed before anything reaches `Kernel::file_cache`'s lazy-init
-    // fallback (kaish's MountBackend, `kj diff`, `kj rc`, …) — the rc
-    // lifecycle scripts these tests run materialize kaish, which does.
-    kernel.set_kernel_db(db.clone());
-
-    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone(), db.clone()));
+    let file_cache = kernel.file_cache().clone();
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await

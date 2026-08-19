@@ -283,11 +283,11 @@ impl EmbeddedKaish {
             session_id,
             principal_id,
         ));
-        // The shared file cache: same instance the MCP file tools use
-        // (installed at server startup), or lazily built from this block store
-        // in embedded/test paths. Routing MountBackend through it is the whole
-        // point of kaish — shell scripting on the same documents.
-        let file_cache = kernel.file_cache(&blocks);
+        // The kernel's own file cache — the same instance the MCP file tools
+        // use, built once at kernel construction. Routing MountBackend
+        // through it is the whole point of kaish — shell scripting on the
+        // same documents.
+        let file_cache = kernel.file_cache().clone();
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel.clone(),
@@ -667,17 +667,11 @@ mod tests {
     use crate::block_store::shared_block_store;
     use kaijutsu_types::paths::{CAS_ROOT, RC_ROOT};
 
-    /// A `Kernel::new_ephemeral` wired with a fresh in-memory `KernelDb`,
-    /// matching production's `set_kernel_db` wiring (`kaijutsu-server/src/rpc.rs`
-    /// wires the real one right after constructing its `kernel_arc`).
-    /// Required because `Kernel::file_cache`'s lazy-init fallback — reached
-    /// by `EmbeddedKaish::new`'s `MountBackend` — panics without one.
+    /// `Kernel::new_ephemeral` already opens its own `KernelDb` and builds
+    /// `file_cache()` over it, so `EmbeddedKaish::new`'s `MountBackend` has
+    /// somewhere durable to mark unsaved buffers with no further wiring.
     async fn test_kernel(name: &str) -> Arc<KaijutsuKernel> {
-        let kernel = Arc::new(KaijutsuKernel::new_ephemeral(name).await);
-        kernel.set_kernel_db(Arc::new(parking_lot::Mutex::new(
-            KernelDb::in_memory().unwrap(),
-        )));
-        kernel
+        Arc::new(KaijutsuKernel::new_ephemeral(name).await)
     }
 
     const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";

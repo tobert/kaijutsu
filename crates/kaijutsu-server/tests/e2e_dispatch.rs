@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use kaijutsu_types::{ContextId, PrincipalId};
-use kaijutsu_kernel::{Kernel, LocalBackend, shared_block_store};
+use kaijutsu_types::ContextId;
+use kaijutsu_kernel::{Kernel, LocalBackend};
 use kaish_kernel::ExecuteOptions;
 use kaijutsu_server::EmbeddedKaish;
 use kaijutsu_types::DocKind;
@@ -66,13 +66,10 @@ impl TestFs {
 /// against the tempdir, not the host system.
 async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) -> EmbeddedKaish {
     let kernel = Arc::new(Kernel::new_ephemeral("e2e-shell").await);
-    // The file-document cache needs a KernelDb to mark unsaved buffers, and
-    // this fixture builds a kernel directly instead of booting through the
-    // server path that installs one. See docs/file-buffers.md.
-    kernel.set_kernel_db(std::sync::Arc::new(parking_lot::Mutex::new(
-        kaijutsu_kernel::kernel_db::KernelDb::in_memory().expect("test kernel db"),
-    )));
-    let documents = shared_block_store(PrincipalId::system());
+    // new_ephemeral already opened its own KernelDb and built its own block
+    // store (+ file_cache() over them) — reuse that store rather than
+    // building a second, incoherent one.
+    let documents = kernel.blocks().clone();
 
     documents
         .create_document(ContextId::new(), DocKind::Conversation, None)

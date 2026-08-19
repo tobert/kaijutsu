@@ -2428,7 +2428,7 @@ mod tests {
         // Diverge the document copy from disk so there is something to show.
         {
             let blocks = dispatcher.block_store();
-            let cache = dispatcher.kernel().file_cache(blocks);
+            let cache = dispatcher.kernel().file_cache().clone();
             let (ctx, block) = cache.get_or_load("/mnt/wire/w.txt").await.expect("load");
             blocks
                 .edit_text(ctx, &block, 0, "after\n", "before\n".chars().count())

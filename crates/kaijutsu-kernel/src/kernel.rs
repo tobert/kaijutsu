@@ -91,21 +91,20 @@ pub struct Kernel {
     /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
     /// on `InstancePolicy`.
     timeouts: kaijutsu_types::TimeoutPolicy,
-    /// Shared file-document cache. Both the MCP `builtin.file` tools and
-    /// the kaish `MountBackend` resolve through this one instance so a single
-    /// real file maps to a single kernel document regardless of surface. Set
-    /// explicitly by the server at startup; lazily initialized from a block
-    /// store otherwise (tests, embedded callers).
-    file_cache: OnceLock<Arc<crate::file_tools::FileDocumentCache>>,
-    /// The kernel's `KernelDb` handle. `OnceLock` like `file_cache`/
-    /// `beat_ingress`/`cc_inbox`: the server installs the real handle once at
-    /// startup. `Kernel` otherwise has no notion of `KernelDb` — this exists
-    /// solely so `file_cache()`'s lazy-init fallback can build a
-    /// `FileDocumentCache`, which requires one. No fallback: a kernel reached
-    /// through `file_cache()` before this is set has a wiring bug, and
-    /// `file_cache()` panics rather than handing out a cache with nowhere
-    /// durable to record unsaved work (docs/file-buffers.md).
-    kernel_db: OnceLock<Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>>,
+    /// The kernel's block store. Owned at construction (`new`/`with_flows`
+    /// take it as a parameter) rather than wired in after the fact — a
+    /// `Kernel` that hands out `file_cache()` before anything else can reach
+    /// it is structurally impossible, since both are built together in the
+    /// constructor. `blocks()` exposes it so callers take the kernel's
+    /// instance instead of building a second one.
+    blocks: crate::block_store::SharedBlockStore,
+    /// Shared file-document cache, built at construction over `blocks` +
+    /// the kernel VFS + the `KernelDb` handle passed to `new`/`with_flows`.
+    /// Both the MCP `builtin.file` tools and the kaish `MountBackend`
+    /// resolve through this one instance so a single real file maps to a
+    /// single kernel document regardless of surface — there is exactly one
+    /// `FileDocumentCache` per kernel, never a lazily-built second one.
+    file_cache: Arc<crate::file_tools::FileDocumentCache>,
     /// Per-context hyoushigi timelines — the live open future for contexts that
     /// own a beat (musician, audio). A context is **armed** by inserting it here;
     /// a context with no entry (every coder) has no timeline and costs nothing.
@@ -218,9 +217,25 @@ impl Kernel {
     /// resolving it (XDG, config flag, etc.) — the kernel never defaults it,
     /// so a process can't accidentally write into the user's real store. CAS
     /// lives at `{data_dir}/cas/` and creates directories lazily on first write.
-    pub async fn new(name: impl Into<String>, data_dir: &Path) -> Self {
+    ///
+    /// `blocks` and `db` are the kernel's block store and `KernelDb` handle —
+    /// the caller builds them (so `blocks` can share a `FlowBus` with other
+    /// components; see [`Self::with_flows`]) and `Kernel` owns them from this
+    /// point on, using them to build the one [`FileDocumentCache`](crate::file_tools::FileDocumentCache)
+    /// every surface shares (`file_cache()`).
+    pub async fn new(
+        name: impl Into<String>,
+        data_dir: &Path,
+        blocks: crate::block_store::SharedBlockStore,
+        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+    ) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
+        let file_cache = Arc::new(crate::file_tools::FileDocumentCache::new(
+            blocks.clone(),
+            vfs.clone(),
+            db,
+        ));
 
         Self {
             id: kaijutsu_types::KernelId::new(),
@@ -243,8 +258,8 @@ impl Kernel {
                 b
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
-            file_cache: OnceLock::new(),
-            kernel_db: OnceLock::new(),
+            blocks,
+            file_cache,
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -277,11 +292,28 @@ impl Kernel {
     /// temp dir, isolating every kernel from every other. The dir is removed
     /// when the kernel drops (a `TempDirGuard` on `temp_cleanup`), so repeated
     /// test runs don't accumulate `kj-eph-*` dirs in `/tmp`.
+    ///
+    /// Opens a real file-backed `KernelDb` under that same temp dir (never
+    /// `KernelDb::in_memory()` — the temp dir already gives isolation, and a
+    /// real file is what production opens) and builds its own block store
+    /// over it, so callers that just want a working kernel need no db
+    /// plumbing of their own. `blocks()`/`file_cache()` expose them for
+    /// callers that need to share the same instances.
     pub async fn new_ephemeral(name: impl Into<String>) -> Self {
         let dir = std::env::temp_dir()
             .join(format!("kj-eph-{}", kaijutsu_types::KernelId::new().to_hex()));
         std::fs::create_dir_all(&dir).expect("create ephemeral kernel data dir");
-        let mut kernel = Self::new(name, &dir).await;
+        let db = Arc::new(parking_lot::Mutex::new(
+            crate::kernel_db::KernelDb::open(dir.join("kernel.db"))
+                .expect("open ephemeral kernel db"),
+        ));
+        let principal = PrincipalId::system();
+        let ws = db
+            .lock()
+            .get_or_create_default_workspace(principal)
+            .expect("create ephemeral kernel default workspace");
+        let blocks = crate::block_store::shared_block_store_with_db(db.clone(), ws, principal);
+        let mut kernel = Self::new(name, &dir, blocks, db).await;
         kernel.temp_cleanup = Some(std::sync::Arc::new(TempDirGuard(dir)));
         kernel
     }
@@ -289,15 +321,24 @@ impl Kernel {
     /// Create a new kernel with a shared FlowBus.
     ///
     /// Use this when you need to share the flow bus with other components
-    /// (like BlockStore) before creating the kernel.
+    /// (like BlockStore) before creating the kernel. `blocks` and `db` are the
+    /// same pair `new` takes — the caller builds the block store (sharing
+    /// `block_flows` with it), then builds the kernel with it.
     pub async fn with_flows(
         id: kaijutsu_types::KernelId,
         name: impl Into<String>,
         block_flows: SharedBlockFlowBus,
         data_dir: &Path,
+        blocks: crate::block_store::SharedBlockStore,
+        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
     ) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
+        let file_cache = Arc::new(crate::file_tools::FileDocumentCache::new(
+            blocks.clone(),
+            vfs.clone(),
+            db,
+        ));
 
         Self {
             id,
@@ -320,8 +361,8 @@ impl Kernel {
                 b
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
-            file_cache: OnceLock::new(),
-            kernel_db: OnceLock::new(),
+            blocks,
+            file_cache,
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -1031,7 +1072,7 @@ impl Kernel {
     /// Install the bound Claude Code peer inbox. Called once by the server at
     /// startup, after a successful [`crate::cc_inbox::CcInboxHandle::bind`].
     /// Returns whether it was set (`false` if already installed) — same
-    /// once-only shape as [`Self::set_beat_ingress`]/[`Self::set_file_cache`].
+    /// once-only shape as [`Self::set_beat_ingress`].
     pub fn set_cc_inbox(&self, handle: Arc<crate::cc_inbox::CcInboxHandle>) -> bool {
         self.cc_inbox.set(handle).is_ok()
     }
@@ -1191,60 +1232,18 @@ impl Kernel {
         self.vfs.snapshot(path, depth, max_entries).await
     }
 
-    /// Install the shared file-document cache. Called once by the server
-    /// at startup with the same instance handed to the MCP `builtin.file`
-    /// tools, so the kaish `MountBackend` and the tools share one cache.
-    /// Returns whether it was set (false if already initialized).
-    pub fn set_file_cache(
-        &self,
-        cache: Arc<crate::file_tools::FileDocumentCache>,
-    ) -> bool {
-        self.file_cache.set(cache).is_ok()
+    /// The kernel's block store, built at construction. Callers that need a
+    /// `SharedBlockStore` paired with this kernel should take this one rather
+    /// than building a second instance over the same documents.
+    pub fn blocks(&self) -> &crate::block_store::SharedBlockStore {
+        &self.blocks
     }
 
-    /// Install the kernel's `KernelDb` handle. Called once by the server at
-    /// startup, before anything can reach `file_cache()`'s lazy-init
-    /// fallback. Returns whether it was set (false if already initialized).
-    pub fn set_kernel_db(
-        &self,
-        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
-    ) -> bool {
-        self.kernel_db.set(db).is_ok()
-    }
-
-    /// Get the shared file-document cache, lazily building one from
-    /// `blocks` + the kernel VFS if the server never installed one (tests,
-    /// embedded callers). The lazy instance is backed by the same block store
-    /// and mount table, so it stays coherent with any other instance over the
-    /// shared kernel documents.
-    ///
-    /// Panics if [`set_kernel_db`](Self::set_kernel_db) was never called: a
-    /// `FileDocumentCache` requires a `KernelDb` to durably mark unsaved
-    /// buffers (docs/file-buffers.md), and a kernel with no db wired in has a
-    /// setup bug, not a legitimate db-less mode — fail loud here rather than
-    /// hand out a cache that silently can't recover a swap across a restart.
-    pub fn file_cache(
-        &self,
-        blocks: &crate::block_store::SharedBlockStore,
-    ) -> Arc<crate::file_tools::FileDocumentCache> {
-        self.file_cache
-            .get_or_init(|| {
-                let db = self.kernel_db.get().unwrap_or_else(|| {
-                    panic!(
-                        "Kernel::file_cache: set_kernel_db() was never called — a \
-                         FileDocumentCache cannot be built without a KernelDb \
-                         to durably mark unsaved buffers (docs/file-buffers.md). \
-                         The server (or embedded caller) must call \
-                         kernel.set_kernel_db(..) before anything can reach file_cache()."
-                    )
-                });
-                Arc::new(crate::file_tools::FileDocumentCache::new(
-                    blocks.clone(),
-                    self.vfs.clone(),
-                    db.clone(),
-                ))
-            })
-            .clone()
+    /// The shared file-document cache, built at construction over `blocks()`
+    /// + the kernel VFS + the `KernelDb` handle passed to `new`/`with_flows`.
+    /// There is exactly one instance for the kernel's lifetime.
+    pub fn file_cache(&self) -> &Arc<crate::file_tools::FileDocumentCache> {
+        &self.file_cache
     }
 
     // ── Editor sessions ───────────────────────────────────────────────────
@@ -1271,7 +1270,7 @@ impl Kernel {
         blocks: &crate::block_store::SharedBlockStore,
         opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
-        let file_cache = self.file_cache(blocks);
+        let file_cache = self.file_cache().clone();
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
         // `!Send` `EditorCore` never coexists with an await. The mount table is
         // the authority on what owns the path (config-doc backend vs. file).
@@ -1385,7 +1384,7 @@ impl Kernel {
     ) -> Result<String, String> {
         match io {
             kaijutsu_editor::EditorIo::ReadFile(path) => {
-                self.file_cache(blocks).read_content(&path).await
+                self.file_cache().read_content(&path).await
             }
             kaijutsu_editor::EditorIo::ReadShell(cmd) => {
                 // No opener (a headless driver / wire open) → no context to run
@@ -1480,13 +1479,10 @@ impl Kernel {
     /// Config paths get a separate `file_context_id` shadow doc that backs the
     /// kaish `cat`/file-tool read path; a direct config-block write leaves it
     /// stale (and the symlink-lstat mtime can't self-heal it). Every such writer
-    /// calls this so the next read reloads. A no-op for non-config paths and
-    /// before the cache is installed (tests/embedded). Uses the *installed*
-    /// cache, so callers don't need a block-store handle.
+    /// calls this so the next read reloads. A no-op for non-config paths.
     pub fn invalidate_config_file_cache(&self, path: &str) {
         if crate::editor::config_owned(path)
-            && let Some(cache) = self.file_cache.get()
-            && let Err(e) = cache.invalidate_document(path)
+            && let Err(e) = self.file_cache.invalidate_document(path)
         {
             // The cache shadow is now inconsistent with the written config block;
             // a later kaish `cat` could serve stale text. Loud, not swallowed.
@@ -1994,24 +1990,16 @@ mod tests {
     /// integration work through the shared kernel.
     #[tokio::test]
     async fn editor_session_roundtrip_through_kernel() {
-        use crate::block_store::shared_block_store_with_db;
-        use crate::kernel_db::KernelDb;
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
 
-        // Seed an rc script through its owning ConfigDocFs backend.
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
-        // This test never installs a FileDocumentCache directly, so
-        // `editor_open` below reaches `Kernel::file_cache`'s lazy-init
-        // fallback — which now requires a KernelDb to be wired in first.
-        kernel.set_kernel_db(db);
+        // Seed an rc script through its owning ConfigDocFs backend, over the
+        // kernel's own block store — the same one its file_cache() is built
+        // over, so editor_open below resolves through one coherent instance.
+        let blocks = kernel.blocks().clone();
         ConfigDocFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
@@ -2044,12 +2032,10 @@ mod tests {
         // (config_context_id). A direct editor block write would leave that shadow
         // stale — so a kaish `cat` after an in-app edit would serve old bytes.
         // Kernel::editor_keys must invalidate the shadow so the next read reloads.
-        use crate::block_store::{shared_block_store_with_db, SharedBlockStore};
-        use crate::file_tools::FileDocumentCache;
-        use crate::kernel_db::KernelDb;
+        use crate::block_store::SharedBlockStore;
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_types::{BlockId, ContextId, PrincipalId};
+        use kaijutsu_types::{BlockId, ContextId};
         use std::path::Path;
 
         fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {
@@ -2063,10 +2049,7 @@ mod tests {
         }
 
         let kernel = Kernel::new_ephemeral("test").await;
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+        let blocks = kernel.blocks().clone();
 
         // Mount the rc backend on the kernel VFS (so the cache reads through it),
         // then seed a config script over the same store.
@@ -2079,10 +2062,9 @@ mod tests {
             .unwrap();
         let path = "/etc/rc/coder/create/S00.kai";
 
-        // One shared file cache over the same store + kernel VFS — the editor's
-        // invalidation and our reads must hit the same instance.
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
-        assert!(kernel.set_file_cache(cache.clone()), "cache installs");
+        // The kernel's own file cache, over the same store + kernel VFS —
+        // the editor's invalidation and our reads must hit the same instance.
+        let cache = kernel.file_cache().clone();
 
         // Populate the shadow from the source.
         let (sctx, sblock) = cache.get_or_load(path).await.unwrap();
@@ -2112,19 +2094,12 @@ mod tests {
         // `:r <file>` slurps a file's contents at the cursor — the async fetch
         // (read_content via the FileDocumentCache) happens inside Kernel::editor_keys
         // *outside* the session lock; the result mirrors onto the editor's block.
-        use crate::block_store::shared_block_store_with_db;
-        use crate::file_tools::FileDocumentCache;
-        use crate::kernel_db::KernelDb;
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+        let blocks = kernel.blocks().clone();
 
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
@@ -2139,9 +2114,6 @@ mod tests {
             .unwrap();
         let edit_path = "/etc/rc/coder/create/S00.kai";
         let read_path = "/etc/rc/coder/create/snippet.kai";
-
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
-        assert!(kernel.set_file_cache(cache.clone()));
 
         let (id, st) = kernel.editor_open(edit_path, &blocks).await.unwrap();
         assert_eq!(st.text, "AB");
@@ -2160,19 +2132,13 @@ mod tests {
     async fn resume_editor_finds_the_opener_session_or_fails_loud() {
         // `fg`: with nothing suspended → fail loud; after a signaled open for a
         // principal → resume_editor returns that session's current state.
-        use crate::block_store::shared_block_store_with_db;
-        use crate::file_tools::FileDocumentCache;
-        use crate::kernel_db::KernelDb;
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
         use kaijutsu_types::{ContextId, PrincipalId};
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+        let blocks = kernel.blocks().clone();
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
@@ -2180,8 +2146,6 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
-        kernel.set_file_cache(cache);
         let path = "/etc/rc/coder/create/S00.kai";
 
         // Nothing open at all → fail loud (no session to foreground).
@@ -2265,19 +2229,12 @@ mod tests {
         // must fail loud pointing at the interactive shell, never silently no-op.
         // "Loud" means the `:` status line (the dialect-level channel), NOT an
         // RPC error: the session stays open and the message rides the state.
-        use crate::block_store::shared_block_store_with_db;
-        use crate::file_tools::FileDocumentCache;
-        use crate::kernel_db::KernelDb;
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+        let blocks = kernel.blocks().clone();
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
@@ -2285,8 +2242,6 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
-        kernel.set_file_cache(cache);
 
         // `editor_open` records no opener.
         let (id, _) = kernel
@@ -2311,19 +2266,12 @@ mod tests {
         // `:r <missing>` is a dialect-level failure: the fetch error rides the
         // `:` status line and the session stays open — never a silent no-op,
         // never an RPC error the GUI can't display.
-        use crate::block_store::shared_block_store_with_db;
-        use crate::file_tools::FileDocumentCache;
-        use crate::kernel_db::KernelDb;
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_types::PrincipalId;
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
-        let blocks = shared_block_store_with_db(db.clone(), ws, creator);
+        let blocks = kernel.blocks().clone();
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
@@ -2331,8 +2279,6 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone(), db.clone()));
-        kernel.set_file_cache(cache);
 
         let (id, _) = kernel
             .editor_open("/etc/rc/coder/create/S00.kai", &blocks)

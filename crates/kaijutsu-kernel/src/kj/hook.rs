@@ -525,7 +525,7 @@ mod tests {
     async fn dispatcher_with_hooks_server() -> Arc<crate::kj::KjDispatcher> {
         let d = Arc::new(test_helpers::test_dispatcher().await);
         let store = d.block_store().clone();
-        let file_cache = d.kernel().file_cache(&store);
+        let file_cache = d.kernel().file_cache().clone();
         d.kernel()
             .register_builtin_mcp_servers(store, file_cache, None, d.kernel_db().clone())
             .await

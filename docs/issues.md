@@ -80,27 +80,6 @@ Worth a test before a deletion: prove a config write followed by plain
 
 ---
 
-## Two file caches can exist over the same documents (2026-08-19)
-
-`Kernel::set_file_cache` returns "false if already initialized" and the one
-production caller ignores it (`kaijutsu-server/src/rpc.rs:1812`). `file_cache()`
-lazily builds a cache when none was installed. So anything that reaches
-`file_cache()` before startup installs the real one wins the `OnceLock`, the
-install silently fails, and the broker holds `file_cache_for_broker` while kaish
-and the kernel hold a different instance — two caches over the same durable
-documents, each with independent dirty flags and `loaded_generation`.
-
-Same divergence class as the stale-content incident, one level up, and silent.
-
-**Fix is approved and scoped** (Amy, 2026-08-19): `Kernel` takes its `KernelDb`
-at construction and builds its `FileDocumentCache` there, so `file_cache()`
-becomes a plain getter with no lazy path and `set_file_cache` is deleted along
-with the hazard. 64 `Kernel::new`/`new_ephemeral` construction sites across 11
-files; none of them cross a method signature into `kaijutsu-client` or
-`kaijutsu-app`. Delete this entry when it lands.
-
----
-
 ## `KaijutsuBackend::patch` is not all-or-nothing (2026-08-19)
 
 `LocalBackend::patch` and `OverlayFs::patch` read the file, apply every

@@ -895,11 +895,9 @@ mod tests {
     #[tokio::test]
     async fn rc_edit_invalidates_the_file_cache_shadow() {
         use crate::block_store::SharedBlockStore;
-        use crate::file_tools::FileDocumentCache;
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
         use kaijutsu_types::{BlockId, ContextId};
-        use std::sync::Arc;
 
         fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {
             blocks
@@ -916,13 +914,8 @@ mod tests {
         let s = |v: &str| v.to_string();
         let path = "/etc/rc/cachetest/create/S00-foo.kai";
 
-        // Install the shared file cache over the dispatcher's store + kernel VFS.
-        let cache = Arc::new(FileDocumentCache::new(
-            d.block_store().clone(),
-            d.kernel().vfs().clone(),
-            d.kernel_db().clone(),
-        ));
-        assert!(d.kernel().set_file_cache(cache.clone()), "cache installs");
+        // The kernel's own file cache, over the dispatcher's store + kernel VFS.
+        let cache = d.kernel().file_cache().clone();
 
         // Create the script, then read it through the cache to populate a shadow.
         d.dispatch(&[s("rc"), s("add"), s(path), s("--content"), s("echo old")], &c)
@@ -1203,7 +1196,7 @@ mod tests {
         // Warm the cache with a multi-byte stance, as a create lifecycle would.
         let _ = d
             .kernel()
-            .file_cache(d.block_store())
+            .file_cache()
             .read_content("/etc/rc/mcp/create/S00-stance.md")
             .await
             .expect("seeded stance is readable");

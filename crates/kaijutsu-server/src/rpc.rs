@@ -1543,9 +1543,55 @@ pub async fn create_shared_kernel(
     log::info!("Kernel ID: {}", id.to_hex());
     let id_str = id.to_hex();
 
-    // Create the kaijutsu kernel with shared FlowBus
-    let kernel =
-        Kernel::with_flows(id, &id_str, block_flows.clone(), &resolved_data_dir).await;
+    // Wrap KernelDb in Arc<Mutex> and create auto-workspaces. Built here,
+    // before the kernel, because `Kernel::with_flows` now takes the block
+    // store + db it owns as parameters rather than having them installed
+    // after the fact.
+    let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
+    let default_ws_id = {
+        let mut db = kernel_db_arc.lock();
+        let ws = db
+            .get_or_create_default_workspace(PrincipalId::system())
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        // Seed the reserved factory fork presets (full/window/spawn) — the
+        // floor pattern (insert only if absent). Fail loud on error rather than
+        // ship a kernel where `kj fork --preset` has nothing to recall.
+        kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        // Seed the LLM configuration floor — backends, their known context
+        // windows, the `--model` aliases, the defaults, and the embedding
+        // model. Same absent-only floor pattern as the presets above, and the
+        // successor to seeding `models.toml` into the kernel. Fail loud: a
+        // kernel with no backends hangs its first turn on "no provider
+        // configured", which is a far worse diagnostic than this error.
+        kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        ws
+    };
+
+    // Create block store backed by unified KernelDb
+    let block_flows_for_index = block_flows.clone();
+    let block_flows_for_kernel = block_flows.clone();
+    let documents = create_block_store_with_kernel_db(
+        kernel_db_arc.clone(),
+        default_ws_id,
+        PrincipalId::system(),
+        block_flows,
+    )
+    .map_err(capnp::Error::failed)?;
+
+    // Create the kaijutsu kernel with shared FlowBus + the block store/db it
+    // owns — builds its one `FileDocumentCache` (`file_cache()`) right here,
+    // so nothing can reach the kernel before that cache exists.
+    let kernel = Kernel::with_flows(
+        id,
+        &id_str,
+        block_flows_for_kernel,
+        &resolved_data_dir,
+        documents.clone(),
+        kernel_db_arc.clone(),
+    )
+    .await;
 
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;
@@ -1580,39 +1626,6 @@ pub async fn create_shared_kernel(
     // host mount, no host-disk seeding. It is mounted below, once the block
     // store exists (the kernel-owned backend maps onto it) — and the mount table
     // is frozen there, after every mount is in place.
-
-    // Wrap KernelDb in Arc<Mutex> and create auto-workspaces
-    let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
-    let default_ws_id = {
-        let mut db = kernel_db_arc.lock();
-        let ws = db
-            .get_or_create_default_workspace(PrincipalId::system())
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        // Seed the reserved factory fork presets (full/window/spawn) — the
-        // floor pattern (insert only if absent). Fail loud on error rather than
-        // ship a kernel where `kj fork --preset` has nothing to recall.
-        kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        // Seed the LLM configuration floor — backends, their known context
-        // windows, the `--model` aliases, the defaults, and the embedding
-        // model. Same absent-only floor pattern as the presets above, and the
-        // successor to seeding `models.toml` into the kernel. Fail loud: a
-        // kernel with no backends hangs its first turn on "no provider
-        // configured", which is a far worse diagnostic than this error.
-        kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        ws
-    };
-
-    // Create block store backed by unified KernelDb
-    let block_flows_for_index = block_flows.clone();
-    let documents = create_block_store_with_kernel_db(
-        kernel_db_arc.clone(),
-        default_ws_id,
-        PrincipalId::system(),
-        block_flows,
-    )
-    .map_err(capnp::Error::failed)?;
 
     // Mount the kernel-owned rc backend at /etc/rc (longest-prefix wins over the
     // read-only `/`; the host's real /etc is never touched). The block store's
@@ -1762,9 +1775,6 @@ pub async fn create_shared_kernel(
     kernel.freeze_mounts();
 
     let kernel_arc = Arc::new(kernel);
-    // Install the KernelDb handle as early as possible: `Kernel::file_cache`'s
-    // lazy-init fallback requires it, and it panics if reached first.
-    kernel_arc.set_kernel_db(kernel_db_arc.clone());
 
     // Bind the Claude Code peer inbox (`docs/cc-peer.md` "Order from here":
     // kernel wiring of the inbox; `kaijutsu_kernel::cc_inbox` module docs).
@@ -1802,14 +1812,12 @@ pub async fn create_shared_kernel(
     // Phase 1 M4: register virtual MCP servers on the broker so
     // dispatch_tool_via_broker has something to route to. This runs
     // alongside the legacy registry until M5 deletes it.
-    let file_cache_for_broker = Arc::new(kaijutsu_kernel::file_tools::FileDocumentCache::new(
-        documents.clone(),
-        kernel_arc.vfs().clone(),
-        kernel_db_arc.clone(),
-    ));
-    // Share this exact instance with the kaish MountBackend so both surfaces
-    // map a real file to the same kernel document.
-    kernel_arc.set_file_cache(file_cache_for_broker.clone());
+    //
+    // The kernel's own file_cache() — built at construction over `documents` —
+    // is the shared instance; sharing it here (rather than building a second
+    // one) is what keeps the kaish MountBackend and the broker's file tools
+    // mapping a real file to the same kernel document.
+    let file_cache_for_broker = kernel_arc.file_cache().clone();
 
     if let Err(e) = kernel_arc
         .register_builtin_mcp_servers(
