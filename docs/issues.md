@@ -6,28 +6,33 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## File buffers: unsaved work is discarded on a cold cache (2026-08-19)
+## File buffers: slices 3-5 remain (2026-08-19)
 
-**The months-old-content corruption is fixed** in `11c21b69` (slice 1 of
-`docs/file-buffers.md`): a cold cache miss now reconciles the pre-existing
-document against disk instead of serving it. The standing "do not edit through
-the kernel file tools" warning is lifted.
+Slices 1 and 2 of `docs/file-buffers.md` shipped (`11c21b69`, `38f77ae2`). The
+kernel no longer serves months-old content, and a dirty buffer survives a cold
+cache as a recovered swap instead of being reconciled away. The standing "do not
+edit through the kernel file tools" warning is lifted.
 
-That fix has a consequence the design doc anticipates in rule 2, and slice 2
-must close it. A buffer that was **dirty** when the kernel went down now has
-its unsaved content replaced by disk content on the next read — the cold path
-cannot tell a swap file from a stale cache, so it reconciles both. Nothing
-flushes dirty buffers at shutdown; `flush_dirty` has no callers outside
-`file_tools/cache.rs`. The trade is deliberate and the right direction (loud
-loss beats silent corruption), but it is still loss.
+What is left:
 
-**Decided (Amy, 2026-08-19): a KernelDb row now, lazy document creation
-later.** Slice 2 records dirty state and `loaded_generation` durably, one
-normalized row per path; a cold load consults it, and a dirty row means
-announce a swap rather than reconcile. Slice 3's W12 guard needs a
-restart-surviving generation anyway, so the row earns its place twice.
+- **Slice 3, the `:w` W12 guard.** `disk_changed_since_load` is recorded on the
+  cache entry and `dirty_file_buffers.loaded_generation` survives a restart, but
+  nothing consumes either yet: `:w` still does not refuse when disk moved under
+  the buffer, and `:w!` is still identical to `:w`. This is the guard that would
+  have stopped the original incident.
+- **Slice 4, the tool surface.** Remove `write` and `grep`, make `edit`
+  hashline-only, add `create_file`. Note this now interacts with kaish's
+  forthcoming `edit` builtin — decide whether the MCP tool is retired in favor of
+  it rather than trimmed, so we do not keep two CAS mechanisms.
+- **Slice 5, the wire fields.** `swapRecovered` and `diskChangedSinceLoad` on
+  `EditorState`, both additive, plus the renderer work.
 
----
+**No player can currently see a recovered swap.** The kernel enforces one — a
+flush refuses until `acknowledge_swap` — but nothing announces it:
+`list_dirty_file_buffers` has no consumer, there is no `kj` verb, and the wire
+fields are slice 5. That is half of rule 4. Amy has approved a **read-only VFS
+mount** as the answer, so swaps are discoverable with `ls` and `grep` the way
+vim's sidecar file is; model it on `runtime/docs_filesystem.rs`.
 
 ## File documents should be created lazily, not on every read (2026-08-19)
 
