@@ -31,6 +31,7 @@ clap = { workspace = true }
 
 # Block store
 kaijutsu-types.workspace = true
+kaijutsu-ansi.workspace = true
 kaijutsu-editor.workspace = true
 kaijutsu-cas.workspace = true
 

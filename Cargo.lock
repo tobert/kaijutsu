@@ -2990,6 +2990,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "console"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "console_error_panic_hook"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3968,6 +3979,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "encoding_rs"
@@ -5848,6 +5865,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "insta"
+version = "1.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
+dependencies = [
+ "console",
+ "once_cell",
+ "similar",
+ "tempfile",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6168,7 +6197,9 @@ dependencies = [
 name = "kaijutsu-ansi"
 version = "0.1.0"
 dependencies = [
+ "insta",
  "kaijutsu-types",
+ "vt100",
  "vte",
 ]
 
@@ -6395,6 +6426,7 @@ dependencies = [
  "ignore",
  "include_dir",
  "kaijutsu-abc",
+ "kaijutsu-ansi",
  "kaijutsu-audio",
  "kaijutsu-cas",
  "kaijutsu-diff",
@@ -6474,6 +6506,7 @@ dependencies = [
  "futures",
  "hostname",
  "kaijutsu-abc",
+ "kaijutsu-ansi",
  "kaijutsu-audio",
  "kaijutsu-cas",
  "kaijutsu-client",
@@ -12112,6 +12145,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07d8e6fe4b9b3b443f2e4ada327cf4b08ab5cdd27a42cd5c9f38dd29092c10ee"
 dependencies = [
  "maybe_parallel_iterator",
+]
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width 0.2.2",
+ "vte",
 ]
 
 [[package]]
