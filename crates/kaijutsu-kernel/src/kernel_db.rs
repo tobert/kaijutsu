@@ -1206,6 +1206,35 @@ CREATE TABLE IF NOT EXISTS roster_status (
     FOREIGN KEY (entity_kind, entity_id)
         REFERENCES roster_entity(entity_kind, entity_id) ON DELETE CASCADE
 );
+
+-- ── Dirty File Buffers (docs/file-buffers.md) ────────────────────
+-- Swap-file marker for the file document cache. A row's PRESENCE is the
+-- flag: a path with a row has unsaved edits not yet flushed to disk, and
+-- there is no separate boolean to drift out of sync with it. A row is
+-- written when a buffer goes dirty and deleted when it flushes (`:w`) or
+-- the edit is discarded. On cold start, a path with a row is a swap to
+-- announce and preserve; a path with no row is a clean cache, safe to
+-- reconcile against disk.
+--   context_id         file_context_id(path) — the deterministic UUIDv5,
+--                       stored so a reader can locate the document
+--                       without recomputing it.
+--   loaded_generation   the VFS generation the buffer was loaded at, or
+--                       NULL if the attribute read failed at load time.
+--                       Compared against the current disk generation at
+--                       flush time to refuse a write that would clobber a
+--                       disk change made since load.
+--   dirtied_at          when this path's current dirty spell began. Not
+--                       advanced by a later edit within the same spell —
+--                       only a clear followed by a fresh dirty write
+--                       resets it.
+CREATE TABLE IF NOT EXISTS dirty_file_buffers (
+    path              TEXT    NOT NULL PRIMARY KEY,
+    context_id        BLOB    NOT NULL,
+    loaded_generation INTEGER
+        CHECK (loaded_generation IS NULL OR loaded_generation >= 0),
+    dirtied_at        INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
 "#;
 
 // ============================================================================
@@ -1280,6 +1309,31 @@ fn read_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<ContextI
             rusqlite::types::Type::Blob,
             "invalid ContextId bytes".into(),
         )
+    })
+}
+
+/// One row of `dirty_file_buffers`: an unflushed edit's swap-file marker.
+/// See `docs/file-buffers.md` for what a row means and who clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyFileBuffer {
+    pub path: String,
+    pub context_id: ContextId,
+    pub loaded_generation: Option<u64>,
+    pub dirtied_at: i64,
+}
+
+fn read_dirty_file_buffer(row: &rusqlite::Row<'_>) -> SqliteResult<DirtyFileBuffer> {
+    let path: String = row.get(0)?;
+    let context_id = read_context_id(row, 1)?;
+    // The CHECK constraint on `loaded_generation` rejects a negative value at
+    // write time, so this cast is safe for any row that made it into the table.
+    let loaded_generation: Option<i64> = row.get(2)?;
+    let dirtied_at: i64 = row.get(3)?;
+    Ok(DirtyFileBuffer {
+        path,
+        context_id,
+        loaded_generation: loaded_generation.map(|g| g as u64),
+        dirtied_at,
     })
 }
 
@@ -5415,6 +5469,74 @@ impl KernelDb {
             None => Ok(None),
         }
     }
+
+    // ========================================================================
+    // Dirty File Buffers (docs/file-buffers.md — swap-file marker)
+    // ========================================================================
+
+    /// Record `path` as dirty (upsert) — called every time a buffer edit
+    /// makes it dirty, including a re-edit while it is already dirty. A
+    /// re-edit updates `context_id`/`loaded_generation` in place but leaves
+    /// `dirtied_at` alone: the row remembers when this dirty spell began,
+    /// not the timestamp of the latest edit inside it.
+    pub fn record_dirty_file_buffer(
+        &self,
+        path: &str,
+        context_id: ContextId,
+        loaded_generation: Option<u64>,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO dirty_file_buffers (path, context_id, loaded_generation)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET
+                context_id = excluded.context_id,
+                loaded_generation = excluded.loaded_generation",
+            params![
+                path,
+                blob_param(context_id.as_bytes()),
+                loaded_generation.map(|g| g as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Clear `path`'s dirty-buffer row — called when the buffer is flushed
+    /// (`:w`) or the edit is discarded. Returns whether a row existed to
+    /// clear, so a caller can tell a real flush from a no-op on a clean path.
+    pub fn clear_dirty_file_buffer(&self, path: &str) -> KernelDbResult<bool> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM dirty_file_buffers WHERE path = ?1", params![path])?;
+        Ok(deleted > 0)
+    }
+
+    /// Fetch `path`'s dirty-buffer row, or `None` if the path has no unsaved
+    /// work. This is the cold-start "is this a swap or a stale cache?" check.
+    pub fn get_dirty_file_buffer(&self, path: &str) -> KernelDbResult<Option<DirtyFileBuffer>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, context_id, loaded_generation, dirtied_at
+             FROM dirty_file_buffers WHERE path = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![path], read_dirty_file_buffer)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List every recovered swap, for the cold-start sweep that must
+    /// announce each one. Ordered by path so the announcement a player sees
+    /// is stable across restarts.
+    pub fn list_dirty_file_buffers(&self) -> KernelDbResult<Vec<DirtyFileBuffer>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, context_id, loaded_generation, dirtied_at
+             FROM dirty_file_buffers ORDER BY path",
+        )?;
+        let rows = stmt
+            .query_map([], read_dirty_file_buffer)?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 // ============================================================================
@@ -9370,6 +9492,88 @@ mod tests {
         db.set_client_view("client-b", ctx_b).unwrap();
         assert_eq!(db.get_client_view("client-a").unwrap(), Some(ctx_a));
         assert_eq!(db.get_client_view("client-b").unwrap(), Some(ctx_b));
+    }
+
+    // ── Dirty File Buffers (docs/file-buffers.md) ───────────────────────
+
+    #[test]
+    fn dirty_file_buffer_unset_is_none() {
+        let db = KernelDb::in_memory().unwrap();
+        assert!(db.get_dirty_file_buffer("/tmp/never-touched.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn dirty_file_buffer_round_trips_with_generation() {
+        let db = KernelDb::in_memory().unwrap();
+        let ctx = ContextId::new();
+        db.record_dirty_file_buffer("/tmp/a.txt", ctx, Some(7)).unwrap();
+        let row = db.get_dirty_file_buffer("/tmp/a.txt").unwrap().expect("row recorded");
+        assert_eq!(row.path, "/tmp/a.txt");
+        assert_eq!(row.context_id, ctx);
+        assert_eq!(row.loaded_generation, Some(7));
+    }
+
+    #[test]
+    fn dirty_file_buffer_round_trips_with_none_generation() {
+        // Nullable because the cache already models "couldn't read the VFS
+        // attr" as None — the row must preserve that, not coerce to 0.
+        let db = KernelDb::in_memory().unwrap();
+        let ctx = ContextId::new();
+        db.record_dirty_file_buffer("/tmp/b.txt", ctx, None).unwrap();
+        let row = db.get_dirty_file_buffer("/tmp/b.txt").unwrap().expect("row recorded");
+        assert_eq!(row.context_id, ctx);
+        assert_eq!(row.loaded_generation, None);
+    }
+
+    #[test]
+    fn dirty_file_buffer_upsert_replaces_not_duplicates() {
+        let db = KernelDb::in_memory().unwrap();
+        let first_ctx = ContextId::new();
+        let second_ctx = ContextId::new();
+        db.record_dirty_file_buffer("/tmp/c.txt", first_ctx, Some(1)).unwrap();
+        let first_dirtied_at = db.get_dirty_file_buffer("/tmp/c.txt").unwrap().unwrap().dirtied_at;
+
+        db.record_dirty_file_buffer("/tmp/c.txt", second_ctx, Some(2)).unwrap();
+        let row = db.get_dirty_file_buffer("/tmp/c.txt").unwrap().expect("row still present");
+        assert_eq!(row.context_id, second_ctx, "second record wins on context_id/generation");
+        assert_eq!(row.loaded_generation, Some(2));
+        assert_eq!(
+            row.dirtied_at, first_dirtied_at,
+            "a re-edit within the same dirty spell must not reset dirtied_at"
+        );
+
+        let all = db.list_dirty_file_buffers().unwrap();
+        assert_eq!(all.len(), 1, "upsert must not create a second row for the same path");
+    }
+
+    #[test]
+    fn dirty_file_buffer_clear_removes_it() {
+        let db = KernelDb::in_memory().unwrap();
+        let ctx = ContextId::new();
+        db.record_dirty_file_buffer("/tmp/d.txt", ctx, Some(1)).unwrap();
+        assert!(db.clear_dirty_file_buffer("/tmp/d.txt").unwrap(), "a row existed to clear");
+        assert!(db.get_dirty_file_buffer("/tmp/d.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn dirty_file_buffer_clear_unrecorded_path_is_noop() {
+        let db = KernelDb::in_memory().unwrap();
+        assert!(
+            !db.clear_dirty_file_buffer("/tmp/never-recorded.txt").unwrap(),
+            "clearing a path with no row is a no-op, not an error"
+        );
+    }
+
+    #[test]
+    fn dirty_file_buffer_list_returns_multiple_paths() {
+        let db = KernelDb::in_memory().unwrap();
+        db.record_dirty_file_buffer("/tmp/e1.txt", ContextId::new(), Some(1)).unwrap();
+        db.record_dirty_file_buffer("/tmp/e2.txt", ContextId::new(), None).unwrap();
+        db.record_dirty_file_buffer("/tmp/e3.txt", ContextId::new(), Some(3)).unwrap();
+
+        let mut paths: Vec<String> = db.list_dirty_file_buffers().unwrap().into_iter().map(|r| r.path).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/tmp/e1.txt", "/tmp/e2.txt", "/tmp/e3.txt"]);
     }
 
     // ── Tracks CRUD ───────────────────────────────────────────────────
