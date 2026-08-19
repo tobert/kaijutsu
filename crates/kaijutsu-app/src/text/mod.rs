@@ -11,6 +11,7 @@
 //! the Parley shaping / `Brush` source behind the MSDF path.
 
 pub mod abc;
+pub mod ansi;
 pub mod components;
 pub mod diff;
 pub mod markdown;
@@ -22,10 +23,9 @@ pub mod shaping;
 pub mod sparkline;
 pub mod svg_raster;
 
-pub use components::{KjTextEffects, bevy_color_to_brush, color_to_rgba8};
+pub use components::{bevy_color_to_brush, color_to_rgba8};
 pub use plugin::KjTextPlugin;
 pub use resources::{ShapingFonts, SvgFontDb, TextMetrics};
-pub use rich::RichContent;
 
 /// Char-aware truncation (safe for multi-byte UTF-8).
 ///

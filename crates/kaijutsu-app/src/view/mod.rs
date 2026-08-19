@@ -4,12 +4,14 @@
 //! Owns all component types for the conversation view; `cell/mod.rs`
 //! re-exports from here so existing `crate::cell::X` imports keep resolving.
 //! Rough groupings of the modules below:
-//! - Conversation block pipeline: `lifecycle` (spawn/despawn block cell
-//!   entities), `render`/`block_render` (buffer sync, MSDF/SVG/scene
-//!   content build), `format` (pure formatting helpers), `geometry` (row
-//!   layout readback), `sync`/`submit`/`document`/`editor`/`role_divider`
-//!   (server sync, prompt submission, the CellEditor buffer, role-divider
-//!   layout math).
+//! - Conversation block pipeline: `lifecycle` (the MainCell + focused-pane
+//!   singleton bookkeeping), `surface` (the conversation renderer —
+//!   entity-free content/shape/measure/window spine), `block_render` (the
+//!   shared MSDF/SVG render plumbing every text surface, including
+//!   `surface`, draws through), `format` (pure formatting helpers),
+//!   `geometry` (row layout model), `sync`/`submit`/`document`/`editor`/
+//!   `role_divider` (server sync, prompt submission, the CellEditor buffer,
+//!   role-divider layout math).
 //! - Chat-adjacent surfaces: `overlay` (the input overlay), `shell_dock`,
 //!   `scroll`.
 //! - Room-level scenes reached from the shell: `room` (station carousel),
@@ -34,7 +36,6 @@ pub mod geometry;
 pub mod lifecycle;
 pub mod overlay;
 pub mod patch_bay;
-pub mod render;
 pub mod render_store;
 pub mod role_divider;
 pub mod room;

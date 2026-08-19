@@ -1,9 +1,11 @@
 # The conversation surface
 
 *2026-08-16 — direction agreed (Amy + Fable, gemini-pro deliberation concurring).
-Status: design; slice 0 (defect relief) and the error-render policy are in flight
-on branches `scroll-relief` and `error-render`. This doc is the target the
-rewrite walks toward.*
+Status: shipped. All slices (0 through 5, decapitation) landed 2026-08-18 —
+the conversation surface (`view::surface`) is the sole conversation renderer;
+the legacy Bevy-UI per-block-cell path and its `ConversationRenderPath` flag
+are deleted. See `docs/devlog.md` for the arc; the "Migration slices" section
+below is the original plan and no longer describes live branches.*
 
 ## The goal, stated as an invariant
 

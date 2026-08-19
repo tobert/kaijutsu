@@ -16,8 +16,11 @@ use parley::{
 use parley::setting::Tag;
 use peniko::Brush;
 
-use super::context::{LOCAL_FONT_CONTEXT, LOCAL_LAYOUT_CONTEXT, get_global_font_context};
+use super::context::{
+    LOCAL_FONT_CONTEXT, LOCAL_LAYOUT_CONTEXT, LOCAL_STYLED_LAYOUT_CONTEXT, get_global_font_context,
+};
 use super::types::{VelloFontAxes, VelloTextAlign, VelloTextStyle};
+use crate::text::ansi::{StyledBrush, StyledSpan};
 use crate::text::rich::SpanBrush;
 
 /// A loaded font, identified by the family name the loader registered into the
@@ -71,48 +74,121 @@ impl VelloFont {
         max_advance: Option<f32>,
         spans: &[SpanBrush],
     ) -> Layout<Brush> {
-        LOCAL_FONT_CONTEXT.with_borrow_mut(|font_context| {
-            if font_context.is_none() {
-                *font_context = Some(get_global_font_context().clone());
-            }
-            let font_context = font_context.as_mut().unwrap();
-
+        with_font_context(|font_context| {
             LOCAL_LAYOUT_CONTEXT.with_borrow_mut(|layout_context| {
-                let mut builder = layout_context.ranged_builder(font_context, value, 1.0, true);
-
-                apply_font_styles(&mut builder, style);
-                apply_variable_axes(&mut builder, &style.font_axes);
-
-                // parley 0.9 renamed the pair: the old `FontStack` (a list of
-                // families) is now `FontFamily`, and the old `FontFamily` (one
-                // family) is now `FontFamilyName`. Same single-family meaning.
-                builder.push_default(StyleProperty::FontFamily(FontFamily::Single(
-                    FontFamilyName::Named(Cow::Owned(self.family_name.clone())),
-                )));
-                builder.push_default(StyleProperty::Brush(style.brush.clone()));
-                for span in spans {
-                    if span.start >= span.end {
-                        continue;
-                    }
-                    builder.push(
-                        StyleProperty::Brush(span.brush.clone()),
-                        span.start..span.end,
-                    );
-                }
-
-                let mut layout = builder.build(value);
-                layout.break_all_lines(max_advance);
-                // 0.9 drops `align`'s `max_advance`: it aligns against the width
-                // `break_all_lines` already laid the lines out to.
-                layout.align(text_align.into(), parley::AlignmentOptions::default());
-                layout
+                self.layout_ranged(
+                    font_context,
+                    layout_context,
+                    value,
+                    style,
+                    text_align,
+                    max_advance,
+                    style.brush.clone(),
+                    spans.iter().map(|s| (s.start..s.end, s.brush.clone())),
+                )
             })
         })
     }
+
+    /// [`layout_spanned`](Self::layout_spanned) in the surface's **ANSI brush
+    /// currency**.
+    ///
+    /// Same shaping, different color type: [`StyledBrush`] carries the style
+    /// table index and the MSDF weight alongside the color, and parley splits
+    /// glyph runs on brush *identity* — which is the only reason two adjacent
+    /// spans that are the same red but differ in bold survive as two runs.
+    /// Read it back with `text::msdf::collect_msdf_glyphs_ansi_deferred`.
+    pub fn layout_styled(
+        &self,
+        value: &str,
+        style: &VelloTextStyle,
+        text_align: VelloTextAlign,
+        max_advance: Option<f32>,
+        spans: &[StyledSpan],
+    ) -> Layout<StyledBrush> {
+        let default = StyledBrush {
+            color: crate::text::msdf::layout_bridge::brush_to_rgba8(&style.brush),
+            style_index: 0,
+            importance: crate::text::msdf::glyph::IMPORTANCE_NORMAL,
+        };
+        with_font_context(|font_context| {
+            LOCAL_STYLED_LAYOUT_CONTEXT.with_borrow_mut(|layout_context| {
+                self.layout_ranged(
+                    font_context,
+                    layout_context,
+                    value,
+                    style,
+                    text_align,
+                    max_advance,
+                    default,
+                    spans.iter().map(|s| (s.start..s.end, s.brush)),
+                )
+            })
+        })
+    }
+
+    /// The one shaping body both spanned entry points use, generic over the
+    /// brush currency parley resolves runs with.
+    ///
+    /// `default_brush` goes under the whole text; `spans` are byte ranges into
+    /// `value` and **later spans win** where they overlap (parley applies
+    /// ranged properties in push order). Parley's `LayoutContext` is itself
+    /// brush-typed, which is why the caller hands one in rather than this
+    /// reaching for a thread-local: there is one cache per currency.
+    #[allow(clippy::too_many_arguments)]
+    fn layout_ranged<B: parley::Brush>(
+        &self,
+        font_context: &mut parley::FontContext,
+        layout_context: &mut parley::LayoutContext<B>,
+        value: &str,
+        style: &VelloTextStyle,
+        text_align: VelloTextAlign,
+        max_advance: Option<f32>,
+        default_brush: B,
+        spans: impl Iterator<Item = (std::ops::Range<usize>, B)>,
+    ) -> Layout<B> {
+        let mut builder = layout_context.ranged_builder(font_context, value, 1.0, true);
+
+        apply_font_styles(&mut builder, style);
+        apply_variable_axes(&mut builder, &style.font_axes);
+
+        // parley 0.9 renamed the pair: the old `FontStack` (a list of
+        // families) is now `FontFamily`, and the old `FontFamily` (one
+        // family) is now `FontFamilyName`. Same single-family meaning.
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Single(
+            FontFamilyName::Named(Cow::Owned(self.family_name.clone())),
+        )));
+        builder.push_default(StyleProperty::Brush(default_brush));
+        for (range, brush) in spans {
+            if range.start >= range.end {
+                continue;
+            }
+            builder.push(StyleProperty::Brush(brush), range);
+        }
+
+        let mut layout = builder.build(value);
+        layout.break_all_lines(max_advance);
+        // 0.9 drops `align`'s `max_advance`: it aligns against the width
+        // `break_all_lines` already laid the lines out to.
+        layout.align(text_align.into(), parley::AlignmentOptions::default());
+        layout
+    }
+}
+
+/// Run `f` against this thread's clone of the shared font collection, seeding
+/// it on first use — the step every shaping entry point owes before it can
+/// build anything.
+fn with_font_context<R>(f: impl FnOnce(&mut parley::FontContext) -> R) -> R {
+    LOCAL_FONT_CONTEXT.with_borrow_mut(|font_context| {
+        if font_context.is_none() {
+            *font_context = Some(get_global_font_context().clone());
+        }
+        f(font_context.as_mut().unwrap())
+    })
 }
 
 /// Applies size, line-height and spacing styles to the run builder.
-fn apply_font_styles(builder: &mut RangedBuilder<'_, Brush>, style: &VelloTextStyle) {
+fn apply_font_styles<B: parley::Brush>(builder: &mut RangedBuilder<'_, B>, style: &VelloTextStyle) {
     builder.push_default(StyleProperty::FontSize(style.font_size));
     builder.push_default(StyleProperty::LineHeight(parley::LineHeight::MetricsRelative(
         style.line_height,
@@ -123,7 +199,7 @@ fn apply_font_styles(builder: &mut RangedBuilder<'_, Brush>, style: &VelloTextSt
 }
 
 /// Applies the variable-font axes (and italic/slant) to the run builder.
-fn apply_variable_axes(builder: &mut RangedBuilder<'_, Brush>, axes: &VelloFontAxes) {
+fn apply_variable_axes<B: parley::Brush>(builder: &mut RangedBuilder<'_, B>, axes: &VelloFontAxes) {
     let mut variable_axes: Vec<FontVariation> = vec![];
 
     // 0.9 stopped re-exporting swash and owns its own settings types. Tags are

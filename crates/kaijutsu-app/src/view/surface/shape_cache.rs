@@ -56,11 +56,13 @@ use kaijutsu_types::{BlockId, Role, Status};
 use peniko::Brush;
 
 use crate::cell::{ConversationScrollState, EditorEntities};
+use crate::text::ansi::{StyledBrush, StyledSpan};
 use crate::text::components::{bevy_color_to_brush, color_to_rgba8};
-use crate::text::msdf::geometry::GeometryVertex;
+use crate::text::msdf::geometry::{GeometryVertex, rect_quad, stroke_line_quad};
 use crate::text::msdf::glyph::GlyphKey;
 use crate::text::msdf::layout_bridge::{
-    collect_msdf_glyphs_deferred, collect_msdf_glyphs_styled_deferred,
+    collect_msdf_glyphs_ansi_deferred, collect_msdf_glyphs_deferred,
+    collect_msdf_glyphs_styled_deferred,
 };
 use crate::text::msdf::{FontDataMap, MsdfAtlas, PositionedGlyph};
 use crate::text::rich::SpanBrush;
@@ -71,7 +73,10 @@ use crate::view::geometry::{ConversationGeometry, DESPAWN_MARGIN_SCREENS, RowKey
 use crate::view::role_divider;
 
 use super::chrome::BlockLayout;
-use super::chunk::{CHUNK_LINES, chunk_ranges, chunk_shaping_text, frozen_chunk_count, slice_spans};
+use super::chunk::{
+    CHUNK_LINES, chunk_ranges, chunk_shaping_text, frozen_chunk_count, slice_spans,
+    slice_styled_spans,
+};
 use super::content::RichKindInfo;
 
 /// How many screens of slack, on each side of the viewport, get shaped.
@@ -225,21 +230,26 @@ pub struct ShapeKey {
     pub indent_level: u32,
     /// [`SurfaceMetricsEpoch::get`].
     pub metrics_epoch: u64,
-    /// [`SurfaceThemeEpoch::get`] — **but only for the drawn rich kinds**
-    /// ([`super::content::RichKindInfo::is_drawn`]); zero for everything
-    /// else.
+    /// [`SurfaceThemeEpoch::get`] — **but only for blocks that bake a theme
+    /// color into a vertex**: the drawn rich kinds
+    /// ([`super::content::RichKindInfo::is_drawn`]) and any block carrying
+    /// ANSI style spans. Zero for everything else.
     ///
     /// A diff band is `theme.diff_insert_bg` and a sparkline stroke is
     /// `theme.sparkline_line_color`: colors that belong to the theme, not to
     /// the block, and that are baked into vertices no recolor pass can find
     /// (`recolor_block` knows about glyphs, and a band is not a glyph). So
-    /// for those kinds a theme swap genuinely invalidates the shaping.
+    /// for those kinds a theme swap genuinely invalidates the shaping. An
+    /// ANSI block is the same story from the other direction: its *glyphs*
+    /// retheme for free through the GPU style table, but its background quads
+    /// and its underlines are geometry with baked colors, and its inverse
+    /// spans are resolved CPU-side.
     ///
     /// It is zero for plain text on purpose, and that zero is load-bearing:
     /// putting the theme epoch in every block's key would re-shape the whole
     /// conversation on a theme swap, which is the full-document rebake this
     /// rewrite exists to delete.
-    pub rich_theme_epoch: u64,
+    pub baked_theme_epoch: u64,
 }
 
 /// One chunk's shaped glyphs, in **chunk-local** coordinates: x from 0 at the
@@ -338,6 +348,40 @@ pub struct ShapedBlock {
     /// stream, which is exactly the final Running→Done reconcile the plan
     /// calls for.
     pub streaming: bool,
+    /// The block's fieldset captions and its gutter checkbox, shaped and
+    /// shared ([`super::labels`]).
+    ///
+    /// # Why they live here and not in a cache of their own
+    ///
+    /// Labels are *glyphs*, so they ride the glyph buffer and a change to one
+    /// must reach the GPU the way any other glyph change does — through
+    /// `ShapedBlockCache::generation`, which `WindowKey` already folds in. Two
+    /// alternatives were rejected:
+    ///
+    /// - **A generation on `BlockChromeCache`.** That cache is rebuilt from
+    ///   the *content band* every frame, so its membership churns with the
+    ///   scroll: putting its generation in `WindowKey` would re-upload the
+    ///   whole window's glyphs on every frame of a drag, which is precisely
+    ///   the cost this rewrite exists to delete. This cache does not churn —
+    ///   it is written on a real re-shape and evicted on an LRU budget.
+    /// - **Folding the label text into [`ShapeKey`].** A tool call finishing
+    ///   would then re-shape its entire body to drop the word "running".
+    ///
+    /// So the shape pass compares the label runs itself
+    /// ([`super::labels::BlockLabels::same_runs`]) and calls
+    /// [`ShapedBlockCache::touch`] when they moved — the same in-place
+    /// mutation path a recolor takes.
+    ///
+    /// **Focus is deliberately not an input.** These are shaped from the
+    /// *unfocused* border style (`chrome::BlockChrome::style`), so moving the
+    /// j/k focus ring recolors the stroke and leaves the captions alone. The
+    /// alternative — re-shaping every label in the focus color — would put
+    /// focus back on the glyph path and re-upload a screenful of glyphs per
+    /// keystroke. Legacy behaves the same way for a different reason: its
+    /// labels are baked into the block texture, which only rebuilds when the
+    /// block's *content* version moves, so a focus change never repaints them
+    /// there either.
+    pub labels: super::labels::BlockLabels,
 }
 
 impl ShapedBlock {
@@ -603,10 +647,12 @@ impl ShapeOutput {
 /// Pure: no atlas, no font map, no ECS — so it runs identically on the main
 /// thread and on `AsyncComputeTaskPool` (the parley context is per-thread,
 /// `text/shaping/context.rs`).
+#[allow(clippy::too_many_arguments)]
 pub fn shape_chunk(
     font: &VelloFont,
     text: &str,
     spans: &[SpanBrush],
+    style_spans: &[StyledSpan],
     style: &VelloTextStyle,
     max_advance: Option<f32>,
     range: Range<usize>,
@@ -614,29 +660,46 @@ pub fn shape_chunk(
     out: &mut ShapeOutput,
 ) {
     let chunk_text = chunk_shaping_text(text, &range);
-    let chunk_spans = slice_spans(spans, range.clone());
+    let chunk_styled = slice_styled_spans(style_spans, range.clone());
 
-    // Ranged styles (`layout_spanned` + the styled collector) are the only
-    // path that colors a span starting mid-run; the plain path is kept for
-    // the span-free majority because it skips parley's run splitting
-    // entirely.
-    let (glyphs, keys, layout_height) = if chunk_spans.is_empty() {
-        let layout = font.layout(chunk_text, style, VelloTextAlign::Left, max_advance);
-        collect_fonts(&layout, &mut out.fonts);
-        let (glyphs, keys) =
-            collect_msdf_glyphs_deferred(&layout, &[], &style.brush, (0.0, 0.0));
-        (glyphs, keys, layout.height())
-    } else {
-        let layout = font.layout_spanned(
+    // Three shaping currencies, cheapest first. The plain path skips parley's
+    // run splitting entirely and is what nearly every chunk takes; the
+    // `SpanBrush` path colors a span starting mid-run (markdown, diff); the
+    // ANSI path does that *and* carries the style-table index and MSDF weight
+    // through the brush, which is the only way two spans that differ solely in
+    // bold survive as two runs.
+    let (glyphs, keys, layout_height, geometry) = if !chunk_styled.is_empty() {
+        let layout = font.layout_styled(
             chunk_text,
             style,
             VelloTextAlign::Left,
             max_advance,
-            &chunk_spans,
+            &chunk_styled,
         );
         collect_fonts(&layout, &mut out.fonts);
-        let (glyphs, keys) = collect_msdf_glyphs_styled_deferred(&layout, (0.0, 0.0));
-        (glyphs, keys, layout.height())
+        let geometry = ansi_geometry(&layout, &chunk_styled, style.font_size);
+        let (glyphs, keys) = collect_msdf_glyphs_ansi_deferred(&layout, (0.0, 0.0));
+        (glyphs, keys, layout.height(), geometry)
+    } else {
+        let chunk_spans = slice_spans(spans, range.clone());
+        if chunk_spans.is_empty() {
+            let layout = font.layout(chunk_text, style, VelloTextAlign::Left, max_advance);
+            collect_fonts(&layout, &mut out.fonts);
+            let (glyphs, keys) =
+                collect_msdf_glyphs_deferred(&layout, &[], &style.brush, (0.0, 0.0));
+            (glyphs, keys, layout.height(), Vec::new())
+        } else {
+            let layout = font.layout_spanned(
+                chunk_text,
+                style,
+                VelloTextAlign::Left,
+                max_advance,
+                &chunk_spans,
+            );
+            collect_fonts(&layout, &mut out.fonts);
+            let (glyphs, keys) = collect_msdf_glyphs_styled_deferred(&layout, (0.0, 0.0));
+            (glyphs, keys, layout.height(), Vec::new())
+        }
     };
 
     out.glyph_keys.extend(keys);
@@ -644,20 +707,104 @@ pub fn shape_chunk(
     out.chunks.push(ShapedChunk {
         byte_range: range,
         glyphs: Arc::new(glyphs),
-        geometry: empty_geometry(),
+        geometry: if geometry.is_empty() {
+            empty_geometry()
+        } else {
+            Arc::new(geometry)
+        },
         height: layout_height,
         frozen,
     });
+}
+
+/// Underline / strikethrough stroke width as a fraction of the font size,
+/// floored at one logical pixel so a decoration never thins to nothing.
+const DECORATION_THICKNESS: f32 = 0.06;
+
+/// Where a strikethrough sits, as a fraction of the line's ascent above the
+/// baseline — roughly half the x-height for the text faces the surface ships.
+/// Parley reports ascent per line but not x-height, and a metrics lookup for
+/// one horizontal rule is more machinery than the approximation costs.
+const STRIKETHROUGH_ASCENT_FRACTION: f32 = 0.30;
+
+/// The non-glyph half of an ANSI chunk: background quads, underlines and
+/// strikethroughs, in chunk-local coordinates and in draw order (fills first,
+/// so a decoration is never buried under the next span's background).
+///
+/// Colors here are **baked into vertices** — there is no style table for a
+/// quad to read — which is why an ANSI-spanned block carries the theme epoch
+/// in its [`ShapeKey`]. Getting that wrong is invisible until a retheme leaves
+/// the backgrounds behind.
+fn ansi_geometry(
+    layout: &parley::Layout<StyledBrush>,
+    spans: &[StyledSpan],
+    font_size: f32,
+) -> Vec<GeometryVertex> {
+    let thickness = (font_size * DECORATION_THICKNESS).max(1.0) as f64;
+    let mut fills = Vec::new();
+    let mut strokes = Vec::new();
+
+    for span in spans {
+        if !span.has_geometry() {
+            continue;
+        }
+        for (rect, line_index) in
+            crate::text::diff::layout_rects_with_lines(layout, span.start..span.end)
+        {
+            if !rect.is_visible() {
+                continue;
+            }
+            if let Some(bg) = span.bg {
+                fills.extend(rect_quad(
+                    rect.x as f64,
+                    rect.y as f64,
+                    rect.width as f64,
+                    rect.height as f64,
+                    bg,
+                ));
+            }
+            if !span.underline && !span.strikethrough {
+                continue;
+            }
+            // The baseline is a per-line property and parley reports it in the
+            // layout's own coordinate space, the same space the rect is in.
+            let Some(line) = layout.get(line_index) else {
+                continue;
+            };
+            let metrics = line.metrics();
+            let baseline = metrics.baseline as f64;
+            let (x1, x2) = (rect.x as f64, rect.right() as f64);
+            if span.underline {
+                strokes.extend(stroke_line_quad(
+                    x1,
+                    baseline + thickness,
+                    x2,
+                    baseline + thickness,
+                    thickness,
+                    span.ink,
+                ));
+            }
+            if span.strikethrough {
+                let y = baseline - (metrics.ascent * STRIKETHROUGH_ASCENT_FRACTION) as f64;
+                strokes.extend(stroke_line_quad(x1, y, x2, y, thickness, span.ink));
+            }
+        }
+    }
+
+    fills.extend(strokes);
+    fills
 }
 
 /// Shape one block's text into chunked, chunk-local glyph runs.
 ///
 /// Pure for the same reason [`shape_chunk`] is — this is what the backlog
 /// tasks call.
+#[allow(clippy::too_many_arguments)]
 pub fn shape_block(
     font: &VelloFont,
     text: &str,
     spans: &[SpanBrush],
+    style_spans: &[StyledSpan],
     style: &VelloTextStyle,
     wrap_width: f32,
     chunk_lines: usize,
@@ -672,6 +819,7 @@ pub fn shape_block(
             font,
             text,
             spans,
+            style_spans,
             style,
             max_advance,
             range,
@@ -687,7 +835,10 @@ pub fn shape_block(
 /// Deduplicated on [`FontId`] (a pointer, so the comparison is free) because
 /// a chunk is dozens of glyph runs over the same one or two fonts, and the
 /// list is carried across a thread boundary.
-pub(crate) fn collect_fonts(layout: &parley::Layout<Brush>, fonts: &mut Vec<parley::FontData>) {
+pub(crate) fn collect_fonts<B: parley::Brush>(
+    layout: &parley::Layout<B>,
+    fonts: &mut Vec<parley::FontData>,
+) {
     for line in layout.lines() {
         for item in line.items() {
             if let parley::PositionedLayoutItem::GlyphRun(run) = item {
@@ -886,6 +1037,10 @@ pub struct ShapeJob {
     pub font: VelloFont,
     pub text: String,
     pub spans: Vec<SpanBrush>,
+    /// The block's ANSI spans, resolved for the current theme
+    /// (`text::ansi::resolve_style_spans`). Empty for everything that did not
+    /// come through an ingest transform, which is nearly every block.
+    pub style_spans: Vec<StyledSpan>,
     pub style: VelloTextStyle,
     pub wrap_width: f32,
     pub chunk_lines: usize,
@@ -921,6 +1076,7 @@ pub fn run_shape_job(job: ShapeJob) -> ShapedResult {
         &job.font,
         &job.text,
         &job.spans,
+        &job.style_spans,
         &job.style,
         job.wrap_width,
         job.chunk_lines,
@@ -1083,6 +1239,13 @@ pub fn apply_shape_results(
                 // Backlog shaping is never used for a streaming block, so
                 // this shaping can never license the incremental tail path.
                 streaming: false,
+                // Captions are not shaped on the task thread (they need the
+                // atlas and the theme, neither of which crosses). The pass
+                // that runs immediately after this one fills them in on the
+                // same frame — this system is chained before
+                // `shape_visible_blocks` precisely so a landed block is
+                // complete before anything looks at it.
+                labels: super::labels::BlockLabels::default(),
             },
         );
     }
@@ -1097,6 +1260,7 @@ pub struct ShapeCaches<'w> {
     pub chrome: Res<'w, super::chrome::BlockChromeCache>,
     pub shaped: ResMut<'w, ShapedBlockCache>,
     pub headers: ResMut<'w, HeaderLabelCache>,
+    pub labels: ResMut<'w, super::labels::LabelRunCache>,
     pub tasks: ResMut<'w, ShapeTasks>,
 }
 
@@ -1186,6 +1350,10 @@ pub fn shape_visible_blocks(
     // them — dropping the lot on a theme swap is cheaper than teaching every
     // consumer a wider cache key.
     caches.headers.sync_theme(theme_epoch);
+    // Block captions and the gutter checkbox bake colors the same way, and
+    // their advance widths move with `label_font_size` — so both epochs clear
+    // them. Dropped runs are re-shaped by the walk below, in the same pass.
+    caches.labels.sync_epochs(metrics_epoch, theme_epoch);
 
     caches.shaped.tick = caches.shaped.tick.wrapping_add(1);
     let tick = caches.shaped.tick;
@@ -1223,17 +1391,41 @@ pub fn shape_visible_blocks(
                         .chrome
                         .layout(&id, container_width, row.indent_level, theme.indent_width);
                 let wrap_width = layout.wrap_width;
-                // A drawn rich kind bakes theme colors into vertices, so the
-                // theme epoch is part of its key and of nobody else's — see
-                // `ShapeKey::rich_theme_epoch`.
+                // Captions and the gutter checkbox, shaped from the block's
+                // *unfocused* border style and shared by `(text, color)`. This
+                // happens before the key comparison below because it is
+                // independent of it: a tool call that finishes changes its
+                // captions without changing a byte of its body, and a body
+                // that re-wraps changes no caption at all. See
+                // `ShapedBlock::labels` for why they live on the shaped block.
+                let label_spec = super::labels::block_label_spec(
+                    caches.chrome.get(&id).and_then(|c| c.style.as_ref()),
+                    formatted.border.excluded,
+                );
+                let labels = caches.labels.shape_block(
+                    font,
+                    &label_spec,
+                    theme.label_font_size,
+                    &mut atlas,
+                    &mut font_data,
+                );
+                // A drawn rich kind bakes theme colors into vertices, and so
+                // does an ANSI-spanned block (its background quads and its
+                // underlines), so both take the theme epoch in their key and
+                // nobody else does — see `ShapeKey::baked_theme_epoch`.
                 let rich_drawn = formatted.rich.is_some_and(RichKindInfo::is_drawn);
+                let ansi_spanned = !formatted.style_spans.is_empty();
                 let key = ShapeKey {
                     content_version: formatted.version,
                     wrap_width_bits: wrap_width.to_bits(),
                     collapsed: row.collapsed,
                     indent_level: row.indent_level,
                     metrics_epoch,
-                    rich_theme_epoch: if rich_drawn { theme_epoch } else { 0 },
+                    baked_theme_epoch: if rich_drawn || ansi_spanned {
+                        theme_epoch
+                    } else {
+                        0
+                    },
                 };
                 let streaming = formatted.status == Status::Running;
                 let color = formatted.color;
@@ -1241,7 +1433,7 @@ pub fn shape_visible_blocks(
                 // can't inherit a frozen prefix: one because parley resolved
                 // its span→glyph mapping and threw it away, the other because
                 // its drawing is geometry a glyph recolor cannot reach.
-                let complex = !formatted.spans.is_empty() || rich_drawn;
+                let complex = !formatted.spans.is_empty() || rich_drawn || ansi_spanned;
 
                 let mut key_match_settled = false;
                 if let Some(existing) = caches.shaped.blocks.get_mut(&id)
@@ -1262,6 +1454,14 @@ pub fn shape_visible_blocks(
                     existing.x_offset = layout.text_x;
                     existing.y_offset = layout.text_y;
                     existing.height = height;
+                    // A caption that appeared, vanished, or changed shade is
+                    // a glyph change like any other: it has to bump the
+                    // generation or the window never re-assembles and the
+                    // GPU keeps drawing "running" on a finished call.
+                    if !existing.labels.same_runs(&labels) {
+                        existing.labels = labels.clone();
+                        mutated = true;
+                    }
 
                     if existing.color == color || !complex {
                         if existing.color != color {
@@ -1319,6 +1519,7 @@ pub fn shape_visible_blocks(
                                 font: font.clone(),
                                 text: formatted.text.clone(),
                                 spans: formatted.spans.clone(),
+                                style_spans: formatted.style_spans.clone(),
                                 style,
                                 wrap_width,
                                 chunk_lines: CHUNK_LINES,
@@ -1362,6 +1563,7 @@ pub fn shape_visible_blocks(
                             inherited,
                             &formatted.text,
                             &formatted.spans,
+                            &formatted.style_spans,
                             &style,
                             wrap_width,
                             &ranges,
@@ -1371,6 +1573,7 @@ pub fn shape_visible_blocks(
                         font,
                         &formatted.text,
                         &formatted.spans,
+                        &formatted.style_spans,
                         &style,
                         wrap_width,
                         CHUNK_LINES,
@@ -1394,6 +1597,7 @@ pub fn shape_visible_blocks(
                         color,
                         text_len: formatted.text.len(),
                         streaming,
+                        labels,
                     },
                 );
             }
@@ -1444,11 +1648,13 @@ fn spawn_backlog(tasks: &mut ShapeTasks, mut backlog: Vec<(f32, ShapeJob)>) {
 /// `inherited` is the frozen prefix [`incremental_prefix`] approved, already
 /// `Arc`-cloned; `ranges` is the new chunk plan, whose first `inherited.len()`
 /// entries are byte-for-byte the ranges those chunks were shaped from.
+#[allow(clippy::too_many_arguments)]
 fn shape_tail(
     font: &VelloFont,
     inherited: Vec<ShapedChunk>,
     text: &str,
     spans: &[SpanBrush],
+    style_spans: &[StyledSpan],
     style: &VelloTextStyle,
     wrap_width: f32,
     ranges: &[Range<usize>],
@@ -1467,6 +1673,7 @@ fn shape_tail(
             font,
             text,
             spans,
+            style_spans,
             style,
             max_advance,
             range.clone(),
@@ -1635,11 +1842,12 @@ fn row_extent(geom: &ConversationGeometry, key: RowKey) -> Option<(f32, f32)> {
 
 /// Feed shaped heights into the geometry and anchor-compensate the scroll.
 ///
-/// The surface path's replacement for `readback_block_heights`, and it runs
-/// **before `smooth_scroll`** rather than in `PostUpdate` — see the module
-/// docs on `view::surface`. The `new_blocks_added` / `pending_scroll_anchor`
-/// / `content_height` bookkeeping moves here verbatim, because
-/// `smooth_scroll` consumes it in the same frame.
+/// The surface path's owner of measurement (the legacy taffy readback is
+/// gone). It runs **after `smooth_scroll`** — see the module docs on
+/// `view::surface` for why the whole chain sits after the ease — so the
+/// `new_blocks_added` / `pending_scroll_anchor` / `content_height`
+/// bookkeeping it maintains is consumed by `smooth_scroll` on the NEXT
+/// frame, the same phase relationship the legacy PostUpdate readback had.
 ///
 /// **Margins come from the geometry's own model**, not from a mirror of
 /// `update_block_cell_nodes`: `reconcile` already decides them (block
@@ -1827,7 +2035,7 @@ mod tests {
             collapsed: false,
             indent_level: 0,
             metrics_epoch: 3,
-            rich_theme_epoch: 0,
+            baked_theme_epoch: 0,
         }
     }
 
@@ -1844,7 +2052,7 @@ mod tests {
             ShapeKey { collapsed: true, ..base },
             ShapeKey { indent_level: 1, ..base },
             ShapeKey { metrics_epoch: 4, ..base },
-            ShapeKey { rich_theme_epoch: 1, ..base },
+            ShapeKey { baked_theme_epoch: 1, ..base },
         ];
         for (i, variant) in variants.iter().enumerate() {
             assert_ne!(*variant, base, "ShapeKey field {i} does not affect equality");
@@ -1877,13 +2085,13 @@ mod tests {
     #[test]
     fn shaped_height_is_line_height_times_lines() {
         let font = mono();
-        let one_line = shape_block(&font, "one", &[], &style(), 10_000.0, CHUNK_LINES).text_height;
+        let one_line = shape_block(&font, "one", &[], &[], &style(), 10_000.0, CHUNK_LINES).text_height;
         assert!(one_line > 0.0, "a single line must have a height");
 
         for lines in [2_usize, 5, 40] {
             let text = vec!["one"; lines].join("\n");
             let height =
-                shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES).text_height;
+                shape_block(&font, &text, &[], &[], &style(), 10_000.0, CHUNK_LINES).text_height;
             assert!(
                 (height - one_line * lines as f32).abs() < 0.05,
                 "{lines} lines measured {height}, expected {}",
@@ -1902,7 +2110,7 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        let out = shape_block(&font, &text, &[], &[], &style(), 10_000.0, CHUNK_LINES);
         let chunks = &out.chunks;
         assert!(chunks.len() > 1, "test premise: 200 lines must chunk");
         let stacked: f32 = chunks.iter().map(|c| c.height).sum();
@@ -1931,7 +2139,7 @@ mod tests {
         let (expected, _) =
             collect_msdf_glyphs_deferred(&whole, &[], &style().brush, (0.0, 0.0));
 
-        let chunks = shape_block(&font, &text, &[], &style(), wrap, CHUNK_LINES).chunks;
+        let chunks = shape_block(&font, &text, &[], &[], &style(), wrap, CHUNK_LINES).chunks;
         assert!(chunks.len() > 1, "test premise: the text must chunk");
 
         let mut actual = Vec::new();
@@ -1956,10 +2164,191 @@ mod tests {
         }
     }
 
+    // ---- ANSI spans: glyphs + the geometry lane --------------------------
+
+    /// Resolve kernel spans the way `content::sync_block_content` does, then
+    /// shape them the way the surface does. White default text, black
+    /// background, the shipped ANSI palette.
+    fn ansi_shape(text: &str, spans: &[kaijutsu_types::StyleSpan]) -> ShapeOutput {
+        let resolved = crate::text::ansi::resolve_style_spans(
+            spans,
+            [255, 255, 255, 255],
+            [0, 0, 0, 255],
+            &crate::ui::theme::AnsiColors::default().palette_256(),
+        );
+        shape_block(
+            &mono(),
+            text,
+            &[],
+            &resolved,
+            &style(),
+            10_000.0,
+            CHUNK_LINES,
+        )
+    }
+
+    fn ansi_span(start: u32, end: u32) -> kaijutsu_types::StyleSpan {
+        kaijutsu_types::StyleSpan {
+            start,
+            end,
+            fg: None,
+            bg: None,
+            attrs: kaijutsu_types::StyleAttrs::default(),
+        }
+    }
+
+    /// The plain-text path emits geometry for the first time. A background
+    /// span becomes one filled quad — six vertices, all of them the resolved
+    /// palette color — drawn under the glyphs.
+    #[test]
+    fn a_background_span_emits_a_quad_under_the_glyphs() {
+        let out = ansi_shape(
+            "hello world",
+            &[kaijutsu_types::StyleSpan {
+                bg: Some(kaijutsu_types::StyleColor::Indexed(4)),
+                ..ansi_span(0, 5)
+            }],
+        );
+        let geometry = &out.chunks[0].geometry;
+        assert_eq!(geometry.len(), 6, "one rect is two triangles");
+
+        let palette = crate::ui::theme::AnsiColors::default().palette_256();
+        let expected = [
+            (palette[4][0] * 255.0) as u8,
+            (palette[4][1] * 255.0) as u8,
+            (palette[4][2] * 255.0) as u8,
+            255,
+        ];
+        assert!(
+            geometry.iter().all(|v| v.color == expected),
+            "the quad must carry the *resolved* palette color: {:?}",
+            geometry[0].color,
+        );
+        // The quad covers "hello" and stops there, not the whole line.
+        let right = geometry.iter().map(|v| v.x).fold(f32::MIN, f32::max);
+        let width = out.chunks[0].glyphs[0].font_size;
+        assert!(right > 0.0 && right < width * 11.0, "quad right edge {right}");
+    }
+
+    /// Underline and strikethrough are two strokes, not one: a span carrying
+    /// both must emit both, and neither may be swallowed by the other.
+    #[test]
+    fn underline_and_strikethrough_are_separate_strokes() {
+        let none = ansi_shape("abcdef", &[]);
+        assert!(none.chunks[0].geometry.is_empty(), "no spans, no geometry");
+
+        let under = ansi_shape(
+            "abcdef",
+            &[kaijutsu_types::StyleSpan {
+                attrs: kaijutsu_types::StyleAttrs::UNDERLINE,
+                ..ansi_span(0, 6)
+            }],
+        );
+        assert_eq!(under.chunks[0].geometry.len(), 6);
+
+        let both = ansi_shape(
+            "abcdef",
+            &[kaijutsu_types::StyleSpan {
+                attrs: kaijutsu_types::StyleAttrs::UNDERLINE
+                    | kaijutsu_types::StyleAttrs::STRIKETHROUGH,
+                ..ansi_span(0, 6)
+            }],
+        );
+        assert_eq!(both.chunks[0].geometry.len(), 12);
+
+        // A strikethrough sits above the baseline and an underline below it,
+        // so the two strokes cannot share a y.
+        let ys: Vec<f32> = both.chunks[0].geometry.iter().map(|v| v.y).collect();
+        let (lo, hi) = ys.iter().fold((f32::MAX, f32::MIN), |(lo, hi), y| {
+            (lo.min(*y), hi.max(*y))
+        });
+        assert!(hi - lo > 2.0, "strokes at {lo}..{hi} are on top of each other");
+    }
+
+    /// A decoration's color is **baked**, and it is baked from the palette
+    /// rather than from the glyph color — an indexed foreground defers its
+    /// glyph color to the GPU table, and a quad has no table to defer to.
+    #[test]
+    fn a_decoration_bakes_the_indexed_color_the_glyph_defers() {
+        let out = ansi_shape(
+            "abc",
+            &[kaijutsu_types::StyleSpan {
+                fg: Some(kaijutsu_types::StyleColor::Indexed(2)),
+                attrs: kaijutsu_types::StyleAttrs::UNDERLINE,
+                ..ansi_span(0, 3)
+            }],
+        );
+        assert!(
+            out.chunks[0].glyphs.iter().all(|g| g.style_index == 3
+                && g.color == [255, 255, 255, 255]),
+            "the glyph keeps the default color and defers to table index 3",
+        );
+        let ink = out.chunks[0].geometry[0].color;
+        assert_ne!(
+            ink,
+            [255, 255, 255, 255],
+            "the underline must carry slot 2, not the default text color",
+        );
+    }
+
+    /// Spans are authored against the whole block and sliced per chunk. A span
+    /// that straddles a boundary has to draw in *both* chunks, clipped to each
+    /// — the same property `slice_spans` guarantees for brush spans.
+    #[test]
+    fn a_span_straddling_a_chunk_boundary_draws_in_both_chunks() {
+        let text = (0..CHUNK_LINES * 2)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = ansi_shape(
+            &text,
+            &[kaijutsu_types::StyleSpan {
+                bg: Some(kaijutsu_types::StyleColor::Rgb(9, 9, 9)),
+                ..ansi_span(0, text.len() as u32)
+            }],
+        );
+        assert!(out.chunks.len() > 1, "test premise: the text must chunk");
+        for (i, chunk) in out.chunks.iter().enumerate() {
+            assert!(
+                !chunk.geometry.is_empty(),
+                "chunk {i} lost the span that covers it",
+            );
+        }
+    }
+
+    /// An ANSI block still chunks, still stacks, and still measures the same
+    /// height as the plain path — styling is not allowed to move a glyph.
+    #[test]
+    fn ansi_spans_do_not_move_glyphs_or_change_the_height() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        let plain = ansi_shape(text, &[]);
+        let styled = ansi_shape(
+            text,
+            &[kaijutsu_types::StyleSpan {
+                fg: Some(kaijutsu_types::StyleColor::Indexed(1)),
+                bg: Some(kaijutsu_types::StyleColor::Indexed(4)),
+                attrs: kaijutsu_types::StyleAttrs::BOLD
+                    | kaijutsu_types::StyleAttrs::UNDERLINE,
+                ..ansi_span(4, 9)
+            }],
+        );
+        assert_eq!(plain.text_height, styled.text_height);
+        assert_eq!(plain.chunks[0].glyphs.len(), styled.chunks[0].glyphs.len());
+        for (a, b) in plain.chunks[0]
+            .glyphs
+            .iter()
+            .zip(styled.chunks[0].glyphs.iter())
+        {
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.x, b.x);
+            assert_eq!(a.y, b.y);
+        }
+    }
+
     #[test]
     fn empty_text_still_shapes_one_chunk() {
         let font = mono();
-        let out = shape_block(&font, "", &[], &style(), 400.0, CHUNK_LINES);
+        let out = shape_block(&font, "", &[], &[], &style(), 400.0, CHUNK_LINES);
         assert_eq!(out.chunks.len(), 1);
         assert!(out.chunks[0].glyphs.is_empty());
         assert!(out.glyph_keys.is_empty());
@@ -1985,6 +2374,7 @@ mod tests {
             color: Color::WHITE,
             text_len: text.len(),
             streaming,
+            labels: crate::view::surface::labels::BlockLabels::default(),
         }
     }
 
@@ -2010,7 +2400,7 @@ mod tests {
         let text = streamed_text(5);
         let key = key();
 
-        let first = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        let first = shape_block(&font, &text, &[], &[], &style(), 10_000.0, CHUNK_LINES);
         assert!(first.chunks.len() >= 2, "test premise: the text must chunk");
         assert!(first.chunks[0].frozen, "a full chunk must freeze");
         assert!(
@@ -2035,6 +2425,7 @@ mod tests {
             existing.chunks[..inherit].to_vec(),
             &grown,
             &[],
+            &[],
             &style(),
             10_000.0,
             &ranges,
@@ -2053,7 +2444,7 @@ mod tests {
         );
 
         // The cheap answer and the expensive answer must be the same answer.
-        let whole = shape_block(&font, &grown, &[], &style(), 10_000.0, CHUNK_LINES);
+        let whole = shape_block(&font, &grown, &[], &[], &style(), 10_000.0, CHUNK_LINES);
         assert_eq!(out.chunks.len(), whole.chunks.len());
         assert!(
             (out.text_height - whole.text_height).abs() < 0.01,
@@ -2076,7 +2467,7 @@ mod tests {
     fn a_chunk_freezes_as_soon_as_it_fills() {
         let font = mono();
         let text = streamed_text(5);
-        let mut block = shaped_from(shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES), key(), &text, true);
+        let mut block = shaped_from(shape_block(&font, &text, &[], &[], &style(), 10_000.0, CHUNK_LINES), key(), &text, true);
         let mut text = text;
 
         // Push past the second chunk boundary one line at a time.
@@ -2094,6 +2485,7 @@ mod tests {
                 block.chunks[..inherit].to_vec(),
                 &text,
                 &[],
+                &[],
                 &style(),
                 10_000.0,
                 &ranges,
@@ -2106,7 +2498,7 @@ mod tests {
             block.chunks[1].frozen,
             "the second chunk must have frozen once it filled",
         );
-        let whole = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        let whole = shape_block(&font, &text, &[], &[], &style(), 10_000.0, CHUNK_LINES);
         assert!(
             (block.text_height - whole.text_height).abs() < 0.05,
             "{} incremental appends drifted: {} vs {}",
@@ -2123,7 +2515,7 @@ mod tests {
     fn the_incremental_gate_rejects_everything_it_should() {
         let font = mono();
         let text = streamed_text(5);
-        let out = shape_block(&font, &text, &[], &style(), 10_000.0, CHUNK_LINES);
+        let out = shape_block(&font, &text, &[], &[], &style(), 10_000.0, CHUNK_LINES);
         let base = key();
         let streaming = shaped_from(out, base, &text, true);
         let grown = format!("{text}\nline extra");
@@ -2218,7 +2610,7 @@ mod tests {
         // there is nothing to inherit.
         let short = "one\ntwo";
         let short_block = shaped_from(
-            shape_block(&font, short, &[], &style(), 10_000.0, CHUNK_LINES),
+            shape_block(&font, short, &[], &[], &style(), 10_000.0, CHUNK_LINES),
             base,
             short,
             true,
@@ -2327,13 +2719,14 @@ mod tests {
             font: font.clone(),
             text: text.clone(),
             spans: Vec::new(),
+            style_spans: Vec::new(),
             style: style(),
             wrap_width: layout.wrap_width,
             chunk_lines: CHUNK_LINES,
             color: Color::WHITE,
             layout,
         });
-        let direct = shape_block(&font, &text, &[], &style(), layout.wrap_width, CHUNK_LINES);
+        let direct = shape_block(&font, &text, &[], &[], &style(), layout.wrap_width, CHUNK_LINES);
 
         assert_eq!(result.block, bid(1));
         assert_eq!(result.text_len, text.len());
@@ -2366,6 +2759,7 @@ mod tests {
             color: Color::WHITE,
             text_len: 0,
             streaming,
+            labels: crate::view::surface::labels::BlockLabels::default(),
         }
     }
 
@@ -2461,7 +2855,7 @@ mod tests {
     fn recolor_repaints_without_moving_a_single_glyph() {
         let font = mono();
         let text = "the quick brown fox\njumps over the lazy dog";
-        let out = shape_block(&font, text, &[], &style(), 200.0, CHUNK_LINES);
+        let out = shape_block(&font, text, &[], &[], &style(), 200.0, CHUNK_LINES);
         let before: Vec<PositionedGlyph> =
             out.chunks.iter().flat_map(|c| c.glyphs.iter().cloned()).collect();
         assert!(!before.is_empty(), "test premise: the text must have glyphs");
@@ -2495,7 +2889,7 @@ mod tests {
     fn recoloring_to_the_same_color_keeps_the_allocation() {
         let font = mono();
         let text = "unchanged";
-        let out = shape_block(&font, text, &[], &style(), 200.0, CHUNK_LINES);
+        let out = shape_block(&font, text, &[], &[], &style(), 200.0, CHUNK_LINES);
         let mut block = shaped_from(out, key(), text, false);
         // `style()` paints white, so this is genuinely a no-op.
         let held: Vec<Arc<Vec<PositionedGlyph>>> =
@@ -2700,7 +3094,7 @@ mod tests {
                 collapsed: false,
                 indent_level: 0,
                 metrics_epoch: 1,
-                rich_theme_epoch: 0,
+                baked_theme_epoch: 0,
             },
             chunks: Vec::new(),
             height,
@@ -2712,6 +3106,7 @@ mod tests {
             color: Color::WHITE,
             text_len: 0,
             streaming: false,
+            labels: crate::view::surface::labels::BlockLabels::default(),
         }
     }
 

@@ -104,6 +104,7 @@ pub fn collect_music_glyphs(
             font_size: font_size as f32,
             color: rgba,
             importance: 0.5,
+            style_index: 0,
         });
     }
 

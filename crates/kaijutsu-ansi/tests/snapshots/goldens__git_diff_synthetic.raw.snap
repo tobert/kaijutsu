@@ -1,0 +1,41 @@
+---
+source: crates/kaijutsu-ansi/tests/goldens.rs
+expression: rendering
+---
+=== text (332 bytes) ===
+diff --git a/example.py b/example.py
+index f0b5f59..b0c0fc1 100644
+--- a/example.py
++++ b/example.py
+@@ -1,7 +1,12 @@
+ def greet(name):
+-    print("Hello, " + name)
++    print(f"Hello, {name}!")
+     return None
+ 
+ 
+ def add(a, b):
+-    return a + b
++    result = a + b
++    return result
++
++
++def subtract(a, b):
++    return a - b
+=== end text ===
+
+=== spans (14) ===
+    0..36    fg=default bg=default attrs=bold
+   37..66    fg=default bg=default attrs=bold
+   67..83    fg=default bg=default attrs=bold
+   84..100   fg=default bg=default attrs=bold
+  101..117   fg=indexed(6) bg=default attrs=-
+  136..164   fg=indexed(1) bg=default attrs=-
+  165..194   fg=indexed(2) bg=default attrs=-
+  232..249   fg=indexed(1) bg=default attrs=-
+  250..269   fg=indexed(2) bg=default attrs=-
+  270..288   fg=indexed(2) bg=default attrs=-
+  289..290   fg=indexed(2) bg=default attrs=-
+  291..292   fg=indexed(2) bg=default attrs=-
+  293..313   fg=indexed(2) bg=default attrs=-
+  314..331   fg=indexed(2) bg=default attrs=-

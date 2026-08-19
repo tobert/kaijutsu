@@ -1,0 +1,19 @@
+[1mdiff --git a/example.py b/example.py[m
+[1mindex f0b5f59..b0c0fc1 100644[m
+[1m--- a/example.py[m
+[1m+++ b/example.py[m
+[36m@@ -1,7 +1,12 @@[m
+ def greet(name):[m
+[31m-    print("Hello, " + name)[m
+[32m+[m[32m    print(f"Hello, {name}!")[m
+     return None[m
+ [m
+ [m
+ def add(a, b):[m
+[31m-    return a + b[m
+[32m+[m[32m    result = a + b[m
+[32m+[m[32m    return result[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef subtract(a, b):[m
+[32m+[m[32m    return a - b[m

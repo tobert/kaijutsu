@@ -1,0 +1,12 @@
+total 12
+drwxr-xr-x 4 atobey wheel 220 Aug 19 11:31 [0m[01;34m.[0m
+drwx------ 3 atobey wheel 100 Aug 19 11:31 [01;34m..[0m
+drwxr-xr-x 2 atobey wheel  40 Aug 19 11:31 [01;34ma_directory[0m
+lrwxrwxrwx 1 atobey wheel  16 Aug 19 11:31 [01;36ma_symlink[0m -> regular_file.txt
+-rw-r--r-- 1 atobey wheel   0 Aug 19 11:31 [01;31marchive.tar.gz[0m
+-rw-r--r-- 1 atobey wheel   0 Aug 19 11:31 [01;35mimage.png[0m
+-rw-r--r-- 1 atobey wheel  13 Aug 19 11:31 readme.md
+-rw-r--r-- 1 atobey wheel   0 Aug 19 11:31 regular_file.txt
+-rwxr-xr-x 1 atobey wheel  10 Aug 19 11:31 [01;32mscript.sh[0m
+-rw------- 1 atobey wheel   8 Aug 19 11:31 secret_file
+drwxr-xr-x 2 atobey wheel  40 Aug 19 11:31 [01;34msubdir[0m

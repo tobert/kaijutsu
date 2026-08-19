@@ -30,8 +30,8 @@ use bevy::render::{
     Extract,
     render_asset::RenderAssets,
     render_resource::{
-        Buffer, BufferDescriptor, BufferUsages, CommandEncoder, CommandEncoderDescriptor,
-        PipelineCache,
+        Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages, CommandEncoder,
+        CommandEncoderDescriptor, PipelineCache,
     },
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
@@ -41,10 +41,11 @@ use crate::cell::{ConversationScrollState, EditorEntities};
 use crate::text::msdf::MsdfAtlas;
 use crate::text::msdf::renderer::ExtractedMsdfAtlas;
 use crate::text::msdf::surface_renderer::{
-    ConversationSurfaceRenderer, GlyphInstance, QuadInstance, SurfaceGeometryVertex,
+    ConversationSurfaceRenderer, GlyphInstance, QuadInstance, StyleEntry, SurfaceGeometryVertex,
     SurfaceUniforms, build_geometry_vertices, build_instances, build_quad_instances,
+    build_style_table,
 };
-use crate::view::surface::chrome::{ChromeInstance, ChromeInstances};
+use crate::view::surface::chrome::{BlockChromeCache, ChromeInstance, ChromeInstances};
 use crate::ui::theme::Theme;
 use crate::view::block_render::ExtractedMsdfRenderParams;
 use crate::view::geometry::ConversationGeometry;
@@ -55,7 +56,7 @@ use super::shape_cache::{HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch
 use super::window::{
     SurfaceGeometryRun, SurfaceQuad, SurfaceRun, assemble_geometry, assemble_quads, assemble_runs,
 };
-use super::{ConversationRenderPath, ConversationSurface};
+use super::ConversationSurface;
 
 /// Instances a fresh buffer starts at (≈48 KB) — enough for a screenful of
 /// text without a single growth step, small enough to be uninteresting when a
@@ -382,13 +383,22 @@ pub struct ExtractedConversationSurfaces {
     pub items: Vec<ExtractedSurface>,
 }
 
+/// The glyph style table, rebuilt in extract whenever the theme changes and
+/// consumed (uploaded) by [`render_conversation_surfaces`]. `Some` means
+/// "rewrite the GPU table"; the render side `take()`s it, so a retheme costs
+/// exactly one buffer write and no instance rebuild — the point of the table
+/// (docs/ansi-and-beyond.md).
+#[derive(Resource, Default)]
+pub struct ExtractedStyleTable {
+    pub entries: Option<Vec<StyleEntry>>,
+}
+
 /// Extract each pane's surface: target, viewport, scroll offset, and (only
 /// when the window changed) the document-space runs to upload.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_conversation_surfaces(
     mut extracted: ResMut<ExtractedConversationSurfaces>,
     buffers: Res<SurfaceGpuBuffers>,
-    path: Extract<Res<ConversationRenderPath>>,
     surfaces: Extract<Query<(Entity, &ConversationSurface, &ChromeInstances, &UiRttTexture)>>,
     computed_nodes: Extract<Query<&ComputedNode>>,
     geometries: Extract<Query<&ConversationGeometry>>,
@@ -396,15 +406,23 @@ pub fn extract_conversation_surfaces(
     shaped: Extract<Res<ShapedBlockCache>>,
     rasters: Extract<Res<SvgRasterCache>>,
     headers: Extract<Res<HeaderLabelCache>>,
+    // Border captions are placed against the border box, so assembly needs
+    // the layouts chrome computed. Read-only here — it is `sync_block_chrome`
+    // that writes them, a whole schedule earlier.
+    chrome_cache: Extract<Res<BlockChromeCache>>,
     metrics_epoch: Extract<Res<SurfaceMetricsEpoch>>,
     scroll: Extract<Res<ConversationScrollState>>,
     atlas: Extract<Option<Res<MsdfAtlas>>>,
     theme: Extract<Res<Theme>>,
+    mut style_table: ResMut<ExtractedStyleTable>,
 ) {
     extracted.items.clear();
 
-    if **path != ConversationRenderPath::Surface {
-        return;
+    // Rebuild the style table on any theme write (is_changed is also true on
+    // startup). Before the early returns below: the table must exist even on
+    // frames with nothing else to extract, or the first drawn frame races it.
+    if theme.is_changed() {
+        style_table.entries = Some(build_style_table(&theme.ansi.palette_256()));
     }
 
     let Some(main_ent) = entities.main_cell else {
@@ -449,6 +467,8 @@ pub fn extract_conversation_surfaces(
                     geom,
                     &shaped,
                     &headers,
+                    &chrome_cache,
+                    &theme,
                     metrics_epoch,
                     surface.window.row_range.clone(),
                 )),
@@ -520,6 +540,8 @@ pub fn render_conversation_surfaces(
     mut quad_instances: Local<Vec<QuadInstance>>,
     mut quad_images: Local<Vec<Handle<Image>>>,
     mut skips: Local<HashMap<Entity, u32>>,
+    mut style_table: ResMut<ExtractedStyleTable>,
+    mut style_buffer: Local<Option<Buffer>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     gpu_images: Res<RenderAssets<GpuImage>>,
@@ -530,6 +552,21 @@ pub fn render_conversation_surfaces(
     };
     if extracted.items.is_empty() {
         return;
+    }
+
+    // Style table upload: fixed-size, so the buffer is created once and every
+    // later theme change is a single write_buffer. `take()` marks it consumed.
+    if let Some(entries) = style_table.entries.take() {
+        match style_buffer.as_ref() {
+            Some(buffer) => queue.write_buffer(buffer, 0, bytemuck::cast_slice(&entries)),
+            None => {
+                *style_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("surface_style_table"),
+                    contents: bytemuck::cast_slice(&entries),
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                }));
+            }
+        }
     }
 
     let live: HashSet<Entity> = extracted.items.iter().map(|item| item.surface).collect();
@@ -580,6 +617,7 @@ pub fn render_conversation_surfaces(
             &atlas.texture,
             &item.target,
             buffers.draw_range(item.surface),
+            style_buffer.as_ref(),
             buffers.chrome_draw_range(item.surface),
             buffers.geometry_draw_range(item.surface),
             buffers

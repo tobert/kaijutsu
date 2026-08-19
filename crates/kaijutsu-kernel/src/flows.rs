@@ -232,6 +232,7 @@ impl FlowTopics for BlockFlow {
         "block.moved",
         "block.output",
         "block.metadata",
+        "block.spans",
         "block.context_switched",
         "block.render_cue",
         "block.beat_sync",
@@ -461,6 +462,34 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
+    /// A block's styled spans (and/or provenance tag) changed after insert —
+    /// reprojection (`kj block reproject`) or a late-arriving ingest
+    /// projection (docs/ansi-and-beyond.md).
+    ///
+    /// Snapshot-only fields: they are not on `BlockHeader` and not on
+    /// `BlockMetadata` (scalar-only by charter), so they get their own event
+    /// rather than riding `MetadataChanged`. Carries the block's full current
+    /// span set — spans are a projection, never a delta.
+    SpansChanged {
+        /// The context ID.
+        context_id: ContextId,
+        /// The block whose spans changed.
+        block_id: BlockId,
+        /// The block's complete current span set (empty = no styling).
+        style_spans: Vec<kaijutsu_types::StyleSpan>,
+        /// The block's current provenance tag, if its content is an ingest
+        /// projection with a stored original.
+        provenance: Option<kaijutsu_types::ProvenanceTag>,
+        /// The context's mutation version **after** this change, captured
+        /// inside the mutation lock. Lets the server bridge order concurrent
+        /// writers' events before delivery.
+        #[serde(default)]
+        version: u64,
+        /// Origin of this operation (Local or Remote).
+        #[serde(default)]
+        source: OpSource,
+    },
+
     /// Session context switched (server → client control).
     ContextSwitched {
         /// The new active context ID.
@@ -509,6 +538,7 @@ impl BlockFlow {
             Self::Moved { .. } => "block.moved",
             Self::OutputChanged { .. } => "block.output",
             Self::MetadataChanged { .. } => "block.metadata",
+            Self::SpansChanged { .. } => "block.spans",
             Self::ContextSwitched { .. } => "block.context_switched",
             Self::RenderCue { .. } => "block.render_cue",
             Self::BeatSync { .. } => "block.beat_sync",
@@ -528,6 +558,7 @@ impl BlockFlow {
             | Self::Moved { context_id, .. }
             | Self::OutputChanged { context_id, .. }
             | Self::MetadataChanged { context_id, .. }
+            | Self::SpansChanged { context_id, .. }
             | Self::ContextSwitched { context_id, .. }
             | Self::RenderCue { context_id, .. }
             | Self::BeatSync { context_id, .. } => *context_id,
@@ -546,7 +577,8 @@ impl BlockFlow {
             | Self::ExcludedChanged { block_id, .. }
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
-            | Self::MetadataChanged { block_id, .. } => Some(block_id),
+            | Self::MetadataChanged { block_id, .. }
+            | Self::SpansChanged { block_id, .. } => Some(block_id),
             Self::ContextSwitched { .. } | Self::RenderCue { .. } | Self::BeatSync { .. } => None,
         }
     }
@@ -568,7 +600,8 @@ impl BlockFlow {
             | Self::ExcludedChanged { version, .. }
             | Self::Moved { version, .. }
             | Self::OutputChanged { version, .. }
-            | Self::MetadataChanged { version, .. } => Some(*version),
+            | Self::MetadataChanged { version, .. }
+            | Self::SpansChanged { version, .. } => Some(*version),
             Self::ContextSwitched { .. } | Self::RenderCue { .. } | Self::BeatSync { .. } => None,
         }
     }
@@ -595,7 +628,8 @@ impl BlockFlow {
             | Self::ExcludedChanged { source, .. }
             | Self::Moved { source, .. }
             | Self::OutputChanged { source, .. }
-            | Self::MetadataChanged { source, .. } => *source,
+            | Self::MetadataChanged { source, .. }
+            | Self::SpansChanged { source, .. } => *source,
             Self::ContextSwitched { .. } | Self::RenderCue { .. } | Self::BeatSync { .. } => {
                 OpSource::Local
             }
@@ -624,6 +658,7 @@ impl BlockFlow {
             Self::Moved { .. } => BlockFlowKind::Moved,
             Self::OutputChanged { .. } => BlockFlowKind::OutputChanged,
             Self::MetadataChanged { .. } => BlockFlowKind::MetadataChanged,
+            Self::SpansChanged { .. } => BlockFlowKind::SpansChanged,
             Self::ContextSwitched { .. } => BlockFlowKind::ContextSwitched,
             Self::RenderCue { .. } => BlockFlowKind::RenderCue,
             Self::BeatSync { .. } => BlockFlowKind::BeatSync,
@@ -2526,6 +2561,14 @@ mod tests {
                 version: 1,
                 source: OpSource::Local,
             },
+            BlockFlow::SpansChanged {
+                context_id: ctx,
+                block_id: id,
+                style_spans: Vec::new(),
+                provenance: None,
+                version: 1,
+                source: OpSource::Local,
+            },
             BlockFlow::TextAppended {
                 context_id: ctx,
                 block_id: id,
@@ -2565,6 +2608,7 @@ mod tests {
                 | BlockFlow::Moved { .. }
                 | BlockFlow::OutputChanged { .. }
                 | BlockFlow::MetadataChanged { .. }
+                | BlockFlow::SpansChanged { .. }
                 | BlockFlow::ContextSwitched { .. }
                 | BlockFlow::RenderCue { .. }
                 | BlockFlow::BeatSync { .. } => {}

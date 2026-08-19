@@ -1,27 +1,21 @@
-//! Per-block texture rendering (MSDF + shader decoration; no vello).
+//! Shared MSDF render plumbing (GPU texture sizing + the render-world
+//! draw pass) every text surface rides — the conversation surface
+//! (`view::surface`), the compose overlay, the shell dock, the editor, and
+//! the diff viewer. No vello: MSDF glyphs (`text::msdf`) + flat-colored
+//! geometry (ABC engraving, diff bands — `music_geometry_renderer`) render
+//! into each surface's own render-to-texture; the conversation view touches
+//! vello solely for Parley text SHAPING (`VelloFont` layout, `Brush`
+//! colors), never for rasterization.
 //!
-//! Each conversation block renders its own texture. Text blocks (Markdown,
-//! Output, PlainText) use MSDF (shader-quality text). ABC renders through
-//! MSDF (glyphs) + flat-colored geometry (staff lines, beams, slurs, ties,
-//! repeat dots); see `text::msdf::geometry` and
-//! `text::msdf::music_geometry_renderer`. SVG rasterizes on the CPU
-//! (`text::svg_raster`: usvg + resvg + tiny-skia into a straight-alpha RGBA8
-//! buffer, uploaded as a child `Image`/`ImageNode`, sized and re-rasterized
-//! from the block's PHYSICAL pixel box — see the `Svg` arm of
-//! `build_block_scenes`). Sparklines and the image placeholder are plain Bevy
-//! UI geometry (child `Node`+`BackgroundColor` rects), not vello, not a
-//! shader. Block cells use `MaterialNode<BlockFxMaterial>` for
-//! border/glow/label decoration — role-group dividers ride the same material
-//! now (see `sync_role_group_headers`). Bevy's UI system handles scroll,
-//! clip, z-order. `BackgroundColor` works again. No coordinate space
-//! mismatches.
-//!
-//! ABC and SVG were the last two vello content producers here, and they came
-//! off vello on separate branches; this module's block cell textures no
-//! longer touch vello at all — not even a `UiVectorScene`/`vello::Scene`
-//! plumbed through and left empty. The conversation view touches vello
-//! solely for Parley text SHAPING (`VelloFont` layout, `Brush` colors),
-//! never for rasterization.
+//! Content itself — deciding what glyphs/geometry a surface needs — is each
+//! surface's own job (`view::surface::{content,shape_cache,chrome}` for the
+//! conversation; `overlay`/`shell_dock`/`editor`/`diff_view` for the rest).
+//! This module owns only what's common past that point: [`GpuTextureLimits`]
+//! + [`resize_block_textures`] (sizing every [`MsdfSurface`]'s render
+//! target), and the render-world extract/draw pair
+//! ([`extract_msdf_blocks`]/[`render_msdf_block_textures`]) that composites
+//! whatever glyphs/geometry landed in [`MsdfBlockGlyphs`]/[`MsdfBlockGeometry`]
+//! this frame.
 
 use std::collections::HashMap;
 
@@ -36,60 +30,41 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
-use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
-use crate::cell::block_border::{
-    BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
-    BorderPadding,
-};
-use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
-    BlockRenderMethod, FontDataMap, GeometryVertex, MsdfBlockGeometry, MsdfBlockGlyphs,
-    collect_msdf_glyphs, collect_music_geometry, collect_music_glyphs, collect_music_text_glyphs,
+    BlockRenderMethod, GeometryVertex, MsdfBlockGeometry, MsdfBlockGlyphs,
     music_geometry_renderer::MusicGeometryRenderer,
     renderer::{ExtractedMsdfAtlas, MsdfBlockRenderer, MsdfBlockUniforms},
 };
-use crate::text::rich::{RichContent, RichContentKind, SVG_MAX_HEIGHT};
-use crate::text::{
-    ShapingFonts, KjTextEffects, TextMetrics, bevy_color_to_brush, color_to_rgba8,
-};
-use crate::text::components::rainbow_brush;
-use crate::text::markdown::MarkdownColors;
-use crate::text::sparkline::{SparklineColors, build_sparkline_vertices};
-use crate::text::svg_raster::{fit_svg_to_box, rasterize_svg};
+use crate::text::TextMetrics;
 use crate::ui::theme::Theme;
-use crate::view::role_divider;
-use crate::view::ui_rtt::{UiRttTexture, ui_rtt_texture_dims};
+use crate::view::ui_rtt::UiRttTexture;
 
 // ============================================================================
 // COMPONENTS
 // ============================================================================
 
-/// Per-block content + bookkeeping (the build-decision side of a block cell).
+/// Per-surface content + bookkeeping (the build-decision side of an
+/// MSDF-drawn text surface).
 ///
-/// Block cells carry no rasterizable scene at all any more — this component
-/// carries what the *build* systems need to decide when to rebuild (content
-/// versions, formatted text, color). The name is historical; rename to
-/// `BlockContent` is a tracked follow-up.
+/// Carries no rasterizable scene of its own — this component carries what
+/// each surface's own build system needs to decide when to rebuild (content
+/// version, formatted text, color). Shared by the overlay, shell dock,
+/// editor, and diff-view surfaces, each with its own sync system; the
+/// conversation surface (`view::surface`) is entity-free and keeps the
+/// equivalent state in `content::BlockContentCache` instead. The name is
+/// historical; rename to `BlockContent` is a tracked follow-up.
 #[derive(Component)]
 pub struct BlockScene {
-    /// Content version from sync_block_cell_buffers.
+    /// Content version from the owning surface's sync system.
     pub content_version: u64,
     /// Content version that was last built into a scene.
     pub last_built_version: u64,
-    /// Formatted text content (set by sync_block_cell_buffers).
+    /// Formatted text content (set by the owning surface's sync system).
     pub text: String,
-    /// Text color (set by sync_block_cell_buffers).
+    /// Text color (set by the owning surface's sync system).
     pub color: Color,
-    /// Physical pixel dimensions the `Svg` content-geometry child was last
-    /// rasterized at, `(0, 0)` meaning never. Only meaningful while
-    /// `RichContent` is `RichContentKind::Svg` — unused (and left stale, but
-    /// harmless) otherwise. Lets `build_block_scenes` detect a DPI-only
-    /// change (no content edit, no logical-width change) that still leaves
-    /// the raster stale, since a CPU raster — unlike vello/MSDF — is only
-    /// crisp at the physical size it was rendered for. See `text::svg_raster`.
-    pub svg_raster_physical_size: (u32, u32),
 }
 
 impl Default for BlockScene {
@@ -99,7 +74,6 @@ impl Default for BlockScene {
             last_built_version: 0,
             text: String::new(),
             color: Color::WHITE,
-            svg_raster_physical_size: (0, 0),
         }
     }
 }
@@ -143,91 +117,6 @@ pub fn msdf_surface_bundle(material: Handle<BlockFxMaterial>) -> impl Bundle {
     )
 }
 
-/// Child entities a block's content-drawing arm spawned (image placeholder
-/// background, or the rasterized `Svg` bitmap) that must be despawned before
-/// the arm rebuilds them for new content. Image children are a plain Bevy UI
-/// `Node` + `BackgroundColor`; the `Svg` child is a `Node` + `ImageNode`
-/// sampling a CPU-rasterized `Image` (`text::svg_raster`). No vello, no
-/// custom shader in any case — Bevy's own UI rasterizer draws every pixel.
-/// (Sparklines used to live here too; they draw as flat triangles in the
-/// block's texture now — `MsdfBlockGeometry`.)
-#[derive(Component, Default)]
-pub struct ContentGeometryChildren(pub Vec<Entity>);
-
-/// Despawn any content-geometry children left over from a previous build.
-/// Called unconditionally at the top of each rebuilt block cell — arms that
-/// draw children (image placeholder, Svg) respawn fresh ones right after;
-/// arms that don't just leave the component removed.
-fn clear_content_geometry_children(
-    commands: &mut Commands,
-    entity: Entity,
-    existing: Option<&ContentGeometryChildren>,
-) {
-    let Some(children) = existing else {
-        return;
-    };
-    for &child in &children.0 {
-        commands.entity(child).try_despawn();
-    }
-    commands.entity(entity).remove::<ContentGeometryChildren>();
-}
-
-/// Spawn one axis-aligned rectangle child (a plain background panel) at
-/// `offset`-relative local content-space coordinates.
-fn spawn_rect_child(
-    commands: &mut Commands,
-    parent: Entity,
-    rect: (f32, f32, f32, f32), // x, y, width, height
-    offset: (f32, f32),
-    color: Color,
-) -> Entity {
-    let (x, y, w, h) = rect;
-    let child = commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(x + offset.0),
-                top: Val::Px(y + offset.1),
-                width: Val::Px(w),
-                height: Val::Px(h),
-                ..default()
-            },
-            BackgroundColor(color),
-        ))
-        .id();
-    commands.entity(parent).add_child(child);
-    child
-}
-
-/// Spawn a child `Node` + `ImageNode` displaying `image` at `rect` (local
-/// content-space coordinates, LOGICAL px — the `Image` asset itself may hold
-/// more physical pixels than `rect`'s size implies, on a HiDPI display; that
-/// mismatch is exactly what makes it crisp instead of blurry).
-fn spawn_image_child(
-    commands: &mut Commands,
-    parent: Entity,
-    image: Handle<Image>,
-    rect: (f32, f32, f32, f32), // x, y, width, height
-    offset: (f32, f32),
-) -> Entity {
-    let (x, y, w, h) = rect;
-    let child = commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(x + offset.0),
-                top: Val::Px(y + offset.1),
-                width: Val::Px(w),
-                height: Val::Px(h),
-                ..default()
-            },
-            ImageNode::new(image),
-        ))
-        .id();
-    commands.entity(parent).add_child(child);
-    child
-}
-
 /// Upload a straight-alpha RGBA8 buffer (see
 /// `text::svg_raster::unpremultiply_to_straight_rgba`) as a static sampled
 /// `Image` — `Rgba8UnormSrgb` so the GPU treats the bytes as sRGB-encoded
@@ -258,53 +147,13 @@ pub(crate) fn create_svg_raster_image(
 }
 
 /// Dark background for the image placeholder rect (no real CAS→decode
-/// pipeline yet — see the `RichContentKind::Image` arm in `build_block_scenes`).
+/// pipeline yet — see the `RichContentKind::Image` arm in
+/// `view::surface::rich`).
 ///
 /// `pub(crate)` so the conversation surface draws the identical placeholder
 /// (`view::surface::rich`) instead of picking its own shade of "not an image
 /// yet".
 pub(crate) const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
-
-/// One full repaint per theme arrival, so raster-time knobs reach blocks
-/// that are already on screen. Raster inputs sit behind TWO doc-version
-/// gates that a theme change does not advance: `sync_block_cell_buffers`
-/// derives `BlockScene.color` from the theme (skipped while
-/// `last_render_version` is current), and `build_block_scenes` bakes
-/// glyphs (skipped while `last_built_version` is current;
-/// gamma/stem-darkening then apply when the texture renders). So a theme
-/// pushed over RPC (`kj config set`) only reached blocks that happened to
-/// re-render for another reason, while material-side knobs (glow,
-/// borders) applied live via `sync_block_fx` — making the staleness read
-/// as a broken theme push (2026-08-12 gamma session).
-///
-/// Reopens BOTH gates — live verification of a rewind-only version
-/// repainted plain text with its STALE baked color. Ordering makes the
-/// repaint a single frame: this runs in `Update` ahead of
-/// `CellPhase::Buffer`, so the same frame re-derives color (sync,
-/// Update) and then re-bakes glyphs (build, PostUpdate).
-///
-/// Rewinds `last_built_version` instead of bumping `content_version`:
-/// `content_version` is assigned from `doc_version` by
-/// `sync_block_cell_buffers`, so advancing it here could land exactly on
-/// the next doc version and silently swallow a real content rebuild.
-pub fn repaint_block_scenes_on_theme_change(
-    theme: Res<Theme>,
-    mut blocks: Query<(&mut BlockCell, &mut BlockScene)>,
-) {
-    if !theme.is_changed() || theme.is_added() {
-        return;
-    }
-    for (mut cell, mut scene) in blocks.iter_mut() {
-        // A never-built block bakes the new theme on its first build;
-        // rewinding it would only disturb the `never_built` semantics in
-        // `build_block_scenes`' rebuild gate.
-        if scene.last_built_version == 0 {
-            continue;
-        }
-        cell.last_render_version = None;
-        scene.last_built_version = scene.content_version.wrapping_sub(1);
-    }
-}
 
 // ============================================================================
 // PLUGIN
@@ -322,18 +171,16 @@ impl Plugin for BlockRenderPlugin {
         // Initialize MSDF atlas in main world (needs Assets<Image>)
         app.add_systems(Startup, init_msdf_atlas);
 
-        // Main world: build scenes and resize textures in PostUpdate
-        // after Taffy layout so ComputedNode.size() is available.
+        // Main world: resize textures in PostUpdate after Taffy layout so
+        // ComputedNode.size() is available. Content itself is built by each
+        // surface's own systems (view::surface, overlay, shell_dock,
+        // editor, diff_view) — this plugin owns only the shared texture
+        // sizing + render-world extraction/draw every one of them rides.
         app.add_systems(
             PostUpdate,
-            (
-                build_block_scenes.after(bevy::ui::UiSystems::Layout),
-                sync_role_group_headers.after(bevy::ui::UiSystems::Layout),
-                resize_block_textures
-                    .after(build_block_scenes)
-                    .after(sync_role_group_headers)
-                    .after(crate::view::overlay::build_overlay_glyphs),
-            ),
+            resize_block_textures
+                .after(bevy::ui::UiSystems::Layout)
+                .after(crate::view::overlay::build_overlay_glyphs),
         );
 
         // Render world: extract and render
@@ -472,939 +319,14 @@ pub(crate) fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
     (logical * scale).round() / scale
 }
 
-/// Build each block cell's content: MSDF glyphs for text, MSDF glyphs +
-/// flat-colored geometry for ABC notation and diff previews, a CPU raster
-/// child for SVG, or plain UI rectangle children for sparkline/image content.
-///
-/// Runs in PostUpdate after UiSystems::Layout. For each block with changed
-/// content or width, rebuilds whichever of those its `RichContent` calls for.
-/// Border/glow/label decoration is a separate `BlockFxMaterial` post-process
-/// (`shaders::sync_block_fx`), not built here.
-pub fn build_block_scenes(
-    mut commands: Commands,
-    mut block_cells: Query<
-        (
-            Entity,
-            &mut BlockScene,
-            &mut UiRttTexture,
-            &ComputedNode,
-            &mut Node,
-            Option<&RichContent>,
-            Option<&BlockBorderStyle>,
-            &Visibility,
-            Option<&KjTextEffects>,
-            &mut MsdfBlockGlyphs,
-            &mut MsdfBlockGeometry,
-            &mut BlockRenderMethod,
-            Option<&BlockExcludedState>,
-            Option<&ContentGeometryChildren>,
-        ),
-        With<BlockCell>,
-    >,
-    fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<ShapingFonts>,
-    theme: Res<Theme>,
-    text_metrics: Res<TextMetrics>,
-    time: Res<Time>,
-    mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
-    mut font_data_map: ResMut<FontDataMap>,
-    gpu_limits: Res<GpuTextureLimits>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let font = fonts.get(&font_handles.mono);
-
-    let md_colors = MarkdownColors {
-        heading: theme.md_heading_color,
-        code: theme.md_code_fg,
-        strong: theme.md_strong_color,
-        code_block: theme.md_code_block_fg,
-    };
-
-    let sparkline_colors = SparklineColors {
-        line: theme.sparkline_line_color,
-        fill: theme.sparkline_fill_color,
-    };
-
-    // Rainbow phase (cycles 0→1 over ~4 seconds)
-    let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
-
-    for (
-        entity, mut block_scene, mut rtt, computed, mut node, rich, border, vis, effects,
-        mut msdf_glyphs, mut msdf_geometry, mut render_method, excluded_state,
-        existing_geometry_children,
-    ) in block_cells.iter_mut()
-    {
-        // Skip hidden blocks
-        if *vis == Visibility::Hidden {
-            continue;
-        }
-
-        // Virtualized-out blocks (`virtualize_conversation`) are
-        // `Display::None`, which also zeros `ComputedNode.size()` — but
-        // check the source (`Node.display`) explicitly rather than relying
-        // on the width==0 side effect, so this early-out stays correct even
-        // for a legitimately zero-width-but-laid-out node.
-        if node.display == Display::None {
-            continue;
-        }
-
-        // ComputedNode is physical px; all layout below is logical.
-        let width = crate::view::ui_rtt::logical_size(computed).x;
-        if width <= 0.0 {
-            continue;
-        }
-
-        // Compute border padding offsets. Moved ahead of the needs_rebuild
-        // gate below so `content_width` is available for the `Svg`
-        // DPI-staleness check — everything here is cheap and independent of
-        // whether a rebuild actually happens.
-        let (pad_top, pad_bottom, pad_left, pad_right) = if let Some(style) = border {
-            (
-                style.padding.top,
-                style.padding.bottom,
-                style.padding.left,
-                style.padding.right,
-            )
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
-        };
-        let content_width = (width - pad_left - pad_right).max(0.0);
-
-        // Check if rebuild is needed.
-        // Rainbow/animation effects are shader-driven (globals.time / uniforms.time)
-        // and don't need CPU-side scene rebuilds AFTER the first build. But we must
-        // rebuild once when the flag first becomes true so msdf_glyphs.rainbow is set.
-        let version_changed = block_scene.content_version != block_scene.last_built_version;
-        let width_changed = (rtt.built_width - width).abs() > 1.0;
-        let is_rainbow = effects.is_some_and(|e| e.rainbow);
-        let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
-        let never_built = block_scene.last_built_version == 0;
-
-        // An `Svg` block's CPU raster (`text::svg_raster`) is only crisp at
-        // the PHYSICAL pixel size it was rendered for — unlike vello/MSDF
-        // content, which the GPU rescales cheaply at render time, a raster
-        // bitmap does not adapt on its own. A DPI-only change (window
-        // dragged to a different-scale monitor) can leave `width` (logical)
-        // and `content_version` both unchanged while still invalidating the
-        // raster, so neither `version_changed` nor `width_changed` catches
-        // it — check the physical target size directly against what was
-        // last rasterized.
-        //
-        // Capped additionally by `SVG_RASTER_MAX_DIM`, not just the GPU's
-        // texture limit: `gpu_limits.max_texture_dim` bounds a GPU texture,
-        // but this raster is a plain CPU-side `Vec<u8>` — some GPUs report
-        // texture limits (16k+) that would make a straight RGBA8 buffer at
-        // that size a multi-hundred-megabyte allocation for a single block.
-        let svg_max_dim = gpu_limits
-            .max_texture_dim
-            .min(crate::text::svg_raster::SVG_RASTER_MAX_DIM);
-        let svg_dpi_stale = match rich.map(|r| &r.kind) {
-            Some(RichContentKind::Svg { width: svg_w, height: svg_h, .. }) => {
-                fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT)
-                    .map(|(_, draw_w, draw_h)| {
-                        let target = ui_rtt_texture_dims(
-                            draw_w,
-                            draw_h,
-                            text_metrics.scale_factor,
-                            svg_max_dim,
-                        );
-                        target != block_scene.svg_raster_physical_size
-                    })
-                    .unwrap_or(false)
-            }
-            _ => false,
-        };
-
-        let needs_rebuild = version_changed
-            || width_changed
-            || svg_dpi_stale
-            || (never_built && (is_rainbow || has_animation));
-
-        if !needs_rebuild {
-            continue;
-        }
-
-        // Font required for text rendering
-        let Some(font) = font else {
-            continue;
-        };
-
-        let max_advance = if content_width > 0.0 {
-            Some(content_width)
-        } else {
-            None
-        };
-
-        // Shed any content-geometry children (image placeholder rect / Svg
-        // bitmap) from a previous build — the arms below respawn fresh ones
-        // if this build is still one of those kinds.
-        clear_content_geometry_children(&mut commands, entity, existing_geometry_children);
-
-        // Shed any flat-colored geometry from a previous build. Three arms
-        // populate `MsdfBlockGeometry` (ABC engraving, Diff bands, Sparkline
-        // triangles) and all refill it below; every other arm must not
-        // inherit it. Geometry has no version of its own — it rides
-        // `MsdfBlockGlyphs.version`, which the arms bump — so a stale
-        // `vertices` from a block that used to be a diff and is now plain
-        // text would keep compositing bands behind the new content. Cheap: a
-        // `clear()` on an already-empty Vec.
-        msdf_geometry.vertices.clear();
-
-        let content_height: f32;
-
-        // Determine the brush for plain text
-        let text_brush = if is_rainbow {
-            let alpha = block_scene.color.alpha();
-            rainbow_brush(rainbow_phase, alpha)
-        } else {
-            bevy_color_to_brush(block_scene.color)
-        };
-
-        // Build text style
-        let style = VelloTextStyle {
-            brush: text_brush.clone(),
-            font_size: text_metrics.cell_font_size,
-            font_axes: VelloFontAxes {
-                weight: Some(200.0),
-                ..default()
-            },
-            ..default()
-        };
-
-        let text_offset = (pad_left as f64, pad_top as f64);
-
-        match rich.map(|r| &r.kind) {
-            Some(RichContentKind::Markdown { spans, plain_text }) => {
-                let layout = font.layout(
-                    plain_text,
-                    &style,
-                    VelloTextAlign::Left,
-                    max_advance,
-                );
-                content_height = layout.height();
-
-                let span_brushes = crate::text::rich::build_span_brushes(
-                    spans,
-                    theme.block_assistant,
-                    &md_colors,
-                );
-                let fallback_brush = bevy_color_to_brush(theme.block_assistant);
-
-                // MSDF renders text; no vello scene of any kind here.
-                if let Some(ref mut atlas) = atlas {
-                    for line in layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let glyphs = collect_msdf_glyphs(
-                        &layout, &span_brushes, &fallback_brush, text_offset, atlas,
-                    );
-                    msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = is_rainbow;
-                    *render_method = BlockRenderMethod::Msdf;
-                }
-            }
-            Some(RichContentKind::Sparkline(data)) => {
-                // Flat triangles in the block's own texture — the same
-                // `MsdfBlockGeometry` lane ABC engraving and Diff bands use
-                // (the dock's HUD sparklines moved here first; the old
-                // UI-node-children path is retired).
-                *render_method = BlockRenderMethod::Msdf;
-
-                // A sparkline has NO text of its own, which makes it the one
-                // arm that must clear glyphs explicitly. Every text-bearing
-                // arm ASSIGNS `msdf_glyphs.glyphs = glyphs`, and that
-                // assignment is what drops the previous content's glyphs; an
-                // arm that never assigns silently inherits them. The
-                // transition is the ordinary streaming path, not an edge
-                // case: a block arrives as text, and only when its closing
-                // fence lands does `detect_rich_content_typed` reclassify it
-                // as a sparkline — so without this the partially-streamed
-                // source text stays composited behind the plot.
-                msdf_glyphs.glyphs.clear();
-                msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-
-                let h = theme.sparkline_height;
-                content_height = h;
-
-                if content_width > 0.0 && h > 0.0 {
-                    msdf_geometry.vertices = build_sparkline_vertices(
-                        data,
-                        content_width,
-                        h,
-                        4.0,
-                        (pad_left, pad_top),
-                        color_to_rgba8(sparkline_colors.line),
-                        sparkline_colors.fill.map(color_to_rgba8),
-                    );
-                }
-            }
-            Some(RichContentKind::Svg {
-                tree,
-                width: svg_w,
-                height: svg_h,
-                ..
-            }) => {
-                // CPU-rasterized (text::svg_raster), not vello: no scene to
-                // build, so this is always an Msdf block — the rasterized
-                // bitmap is a plain child ImageNode (below), same shape as
-                // the Sparkline/Image arms.
-                *render_method = BlockRenderMethod::Msdf;
-
-                // Like the Sparkline arm, Svg has no text of its own — every
-                // text-bearing arm ASSIGNS `msdf_glyphs.glyphs`, and it's
-                // that assignment (not any explicit cleanup) that drops the
-                // previous content's glyphs. Without this, a block that
-                // arrives as plain text and is only reclassified as Svg once
-                // its closing fence lands would silently inherit the
-                // partially-streamed source text, which then composites
-                // behind the raster in any transparent/semi-transparent
-                // region.
-                msdf_glyphs.glyphs.clear();
-                msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-
-                match fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT) {
-                    None => {
-                        // `text::rich::try_parse_svg` already rejects a
-                        // non-positive intrinsic SVG size at detection time
-                        // (falling through to the plain-text path instead of
-                        // ever constructing `RichContentKind::Svg`), so
-                        // `svg_w`/`svg_h` are always positive here — the only
-                        // way this fires is a degenerate content BOX
-                        // (`content_width <= 0`, e.g. a block whose layout
-                        // hasn't settled yet). That's a transient, benign
-                        // "no room to draw it this frame" — width_changed
-                        // will trigger a rebuild once real width lands — not
-                        // a content problem, so rendering as empty content
-                        // here is correct, not a silent-blank regression.
-                        content_height = 0.0;
-                        block_scene.svg_raster_physical_size = (0, 0);
-                    }
-                    Some((fit_scale, draw_w, draw_h)) => {
-                        content_height = draw_h;
-
-                        let dpi_scale = text_metrics.scale_factor;
-                        let target = ui_rtt_texture_dims(draw_w, draw_h, dpi_scale, svg_max_dim);
-                        // `fit_scale` maps SVG user units to LOGICAL px;
-                        // chaining the DPI scale on top maps them straight to
-                        // PHYSICAL px in one pass, so the raster is sized and
-                        // scaled for its actual on-screen resolution rather
-                        // than an intermediate logical-res bitmap that then
-                        // gets upscaled blurrily.
-                        let content_scale = fit_scale * dpi_scale as f64;
-
-                        match rasterize_svg(tree, target.0, target.1, content_scale) {
-                            Some(rgba) => {
-                                let handle = create_svg_raster_image(
-                                    &mut images, target.0, target.1, rgba,
-                                );
-                                let child = spawn_image_child(
-                                    &mut commands,
-                                    entity,
-                                    handle,
-                                    (0.0, 0.0, draw_w, draw_h),
-                                    (pad_left, pad_top),
-                                );
-                                commands
-                                    .entity(entity)
-                                    .insert(ContentGeometryChildren(vec![child]));
-                            }
-                            None => {
-                                // Defensive only: `target` is clamped to >= 1
-                                // by `ui_rtt_texture_dims`, so tiny-skia's
-                                // pixmap allocation should never actually
-                                // fail here — see `rasterize_svg`'s doc
-                                // comment. `svg_raster_physical_size` still
-                                // gets updated below so a persistent failure
-                                // at a stable size can't force a rebuild
-                                // every frame.
-                                error!(
-                                    "SVG rasterize failed at {}x{} physical px \
-                                     (should be unreachable)",
-                                    target.0, target.1,
-                                );
-                            }
-                        }
-
-                        block_scene.svg_raster_physical_size = target;
-                    }
-                }
-            }
-            Some(RichContentKind::Abc { tune, .. }) => {
-                // ABC renders entirely through MSDF + geometry now — no
-                // vello scene content at all, same as Markdown/Output/
-                // PlainText below. `render_method` stays `Msdf` (the
-                // default), exactly like every other MSDF-rendered block
-                // kind.
-                let default_opts = kaijutsu_abc::engrave::EngravingOptions::default();
-                let elements =
-                    kaijutsu_abc::engrave::layout::engrave(tune, &default_opts);
-
-                let notation_brush = bevy_color_to_brush(theme.block_assistant);
-                let bounds =
-                    crate::text::abc::compute_engraving_bounds(&elements, default_opts.margin);
-
-                let w_scale = content_width as f64 / bounds.width;
-                let h_scale = SVG_MAX_HEIGHT as f64 / bounds.height;
-                let scale = w_scale.min(h_scale);
-                content_height = (bounds.height * scale) as f32;
-
-                if let Some(ref mut atlas) = atlas {
-                    let origin = (bounds.origin_x, bounds.origin_y);
-
-                    let geometry_vertices = collect_music_geometry(
-                        &elements,
-                        text_offset,
-                        origin,
-                        scale,
-                        &notation_brush,
-                    );
-                    msdf_geometry.vertices = geometry_vertices;
-
-                    let mut glyphs = collect_music_glyphs(
-                        &elements,
-                        text_offset,
-                        origin,
-                        scale,
-                        &notation_brush,
-                        atlas,
-                    );
-                    let text_glyphs = collect_music_text_glyphs(
-                        &elements,
-                        text_offset,
-                        origin,
-                        scale,
-                        &notation_brush,
-                        Some(font),
-                        atlas,
-                        &mut font_data_map,
-                    );
-                    glyphs.extend(text_glyphs);
-
-                    msdf_glyphs.glyphs = glyphs;
-                    // Single shared version gate for BOTH glyphs and
-                    // geometry — see `MsdfBlockGeometry`'s doc comment on
-                    // why it deliberately carries no version of its own.
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = is_rainbow;
-                }
-                // No atlas yet (startup ordering): skip this rebuild, same
-                // as every other MSDF block kind below — retried on the
-                // next content/width change or, in practice, the next
-                // frame (the atlas is inserted in `Startup`, before this
-                // system ever runs).
-            }
-            Some(RichContentKind::Diff(preview)) => {
-                // Modeled on the Markdown arm — Parley layout + `SpanBrush`
-                // coloring — plus ABC's second half: flat-colored geometry
-                // for the per-line background bands, built from the same
-                // layout and published under the same shared version gate.
-                // `text::diff` already spent the render byte budget and the
-                // preview line budget before this point; what reaches Parley
-                // here is bounded by construction.
-                // Context is the quietest class, so it is the right default
-                // for any byte a span somehow misses.
-                let fallback_brush = bevy_color_to_brush(theme.diff_context_fg);
-                let span_brushes = crate::text::rich::build_diff_span_brushes(preview, &theme);
-                // Spanned, not plain: word-level highlights start *inside* a
-                // line, and only parley's own ranged brushes split a shaping
-                // run there (`layout_spanned`'s doc comment has the why).
-                let layout = font.layout_spanned(
-                    &preview.plain_text,
-                    &VelloTextStyle {
-                        brush: fallback_brush.clone(),
-                        ..style.clone()
-                    },
-                    VelloTextAlign::Left,
-                    max_advance,
-                    &span_brushes,
-                );
-                content_height = layout.height();
-
-                if let Some(ref mut atlas) = atlas {
-                    for line in layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-
-                    // One row per WRAPPED visual line, addressed by its start
-                    // byte — a long `+` line that wraps must be tinted across
-                    // every row it occupies. The conversation surface's rich
-                    // shaper builds the same rows from the same helper, so
-                    // the two paths cannot disagree about where a band goes.
-                    let rows = crate::text::diff::preview_rows(&layout);
-                    msdf_geometry.vertices = crate::text::diff::build_diff_band_geometry(
-                        preview,
-                        &rows,
-                        content_width,
-                        (pad_left, pad_top),
-                        &crate::text::rich::diff_band_colors(&theme),
-                    );
-                    // ...then the word washes on top of them, from the same
-                    // layout. The inline preview and the full viewer draw the
-                    // same shapes through the same builders, which is the only
-                    // way the two stay agreed on what a diff looks like.
-                    msdf_geometry.vertices.extend(
-                        crate::text::diff::build_word_wash_geometry(
-                            preview,
-                            &layout,
-                            (pad_left, pad_top),
-                            &crate::text::rich::diff_word_colors(&theme),
-                        ),
-                    );
-
-                    let glyphs =
-                        crate::text::msdf::collect_msdf_glyphs_styled(&layout, text_offset, atlas);
-                    msdf_glyphs.glyphs = glyphs;
-                    // Bump from the field's OWN previous value, never from
-                    // another counter — see `MsdfBlockGlyphs::version`.
-                    // Geometry and glyphs ride this single gate together.
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = is_rainbow;
-                    *render_method = BlockRenderMethod::Msdf;
-                }
-            }
-            Some(RichContentKind::Output { layout, plain_text }) => {
-                let parley_layout = font.layout(
-                    plain_text,
-                    &style,
-                    VelloTextAlign::Left,
-                    max_advance,
-                );
-                content_height = parley_layout.height();
-
-                let span_brushes =
-                    crate::text::rich::build_output_span_brushes(layout, &theme);
-                let fallback_brush = bevy_color_to_brush(theme.block_tool_result);
-
-                if let Some(ref mut atlas) = atlas {
-                    for line in parley_layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let glyphs = collect_msdf_glyphs(
-                        &parley_layout, &span_brushes, &fallback_brush, text_offset, atlas,
-                    );
-                    msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = is_rainbow;
-                    *render_method = BlockRenderMethod::Msdf;
-                }
-            }
-            Some(RichContentKind::Image { hash }) => {
-                // Placeholder: dark rectangle (plain UI geometry, not vello)
-                // with an MSDF hash label. Full CAS→decode→ImageNode pipeline
-                // requires RpcCommand::CasRead and async image loading, which
-                // lands in a follow-up — this only drops vello, the
-                // placeholder itself is unchanged.
-                *render_method = BlockRenderMethod::Msdf;
-                let placeholder_h = 120.0_f32;
-                content_height = placeholder_h;
-
-                let rect_child = spawn_rect_child(
-                    &mut commands,
-                    entity,
-                    (0.0, 0.0, content_width, placeholder_h),
-                    (pad_left, pad_top),
-                    IMAGE_PLACEHOLDER_COLOR,
-                );
-                commands
-                    .entity(entity)
-                    .insert(ContentGeometryChildren(vec![rect_child]));
-
-                let label = format!("[image: {}]", &hash[..8.min(hash.len())]);
-                let label_layout =
-                    font.layout(&label, &style, VelloTextAlign::Left, max_advance);
-                let label_y = pad_top + placeholder_h / 2.0 - label_layout.height() / 2.0;
-                let label_brush = bevy_color_to_brush(theme.block_tool_result);
-
-                if let Some(ref mut atlas) = atlas {
-                    for line in label_layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let glyphs = collect_msdf_glyphs(
-                        &label_layout,
-                        &[],
-                        &label_brush,
-                        (pad_left as f64, label_y as f64),
-                        atlas,
-                    );
-                    msdf_glyphs.glyphs = glyphs;
-                    // Derive from the field's OWN previous value, never
-                    // another counter — see `MsdfBlockGlyphs::version`'s doc
-                    // comment for the bug this reintroduces otherwise
-                    // (staff-without-glyphs, msdf-music live verify
-                    // 2026-07-16). This arm didn't exist when that fix
-                    // landed; the devello rewrite of the Image placeholder
-                    // re-added the same anti-pattern independently.
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = is_rainbow;
-                    *render_method = BlockRenderMethod::Msdf;
-                }
-            }
-            None => {
-                // Plain text block
-                let layout = font.layout(
-                    &block_scene.text,
-                    &style,
-                    VelloTextAlign::Left,
-                    max_advance,
-                );
-                content_height = layout.height();
-
-                if let Some(ref mut atlas) = atlas {
-                    for line in layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let glyphs = collect_msdf_glyphs(
-                        &layout, &[], &text_brush, text_offset, atlas,
-                    );
-                    msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = is_rainbow;
-                    *render_method = BlockRenderMethod::Msdf;
-                }
-            }
-        }
-
-        // Round to physical pixel boundary so built_height matches what Taffy
-        // renders. Height is computed by us — without rounding, the MSDF
-        // texture NDC has a different aspect ratio than the displayed node,
-        // causing subtle vertical stretch on HiDPI displays. `width` itself
-        // stays raw here (it still drives `max_advance`/layout above, and
-        // label positions below) — only the *stored* `rtt.built_width` gets
-        // the same treatment, at the bottom of this function.
-        let scale = text_metrics.scale_factor;
-        let total_height = round_to_physical_px(content_height + pad_top + pad_bottom, scale);
-
-        // Collect label glyphs for shader-drawn border labels.
-        // Labels are baked into the MSDF texture at positions in the border padding zone.
-        // This works for both MSDF and Vello blocks — the MSDF pass composites label
-        // glyphs on top of whatever content the block has.
-        {
-            if let (Some(border_style), Some(atlas)) = (border, &mut atlas) {
-                let label_font_size = theme.label_font_size;
-                let label_inset = theme.label_inset;
-                let label_pad = theme.label_pad;
-
-                let label_brush = bevy_color_to_brush(border_style.color);
-                let label_style = VelloTextStyle {
-                    brush: label_brush.clone(),
-                    font_size: label_font_size,
-                    ..default()
-                };
-
-                let mut metrics = BorderLabelMetrics::default();
-
-                if let Some(ref top_text) = border_style.top_label {
-                    let label_layout = font.layout(
-                        top_text,
-                        &label_style,
-                        VelloTextAlign::Left,
-                        None,
-                    );
-                    let label_w = label_layout.width();
-                    let label_h = label_layout.height();
-
-                    // Fieldset/legend: move the border inward so the label
-                    // straddles it. The inset = ascent/2 + AA clearance puts the
-                    // stroke center at exactly ascent/2 from the top edge.
-                    let ascent = label_layout
-                        .lines()
-                        .next()
-                        .map(|l| l.metrics().ascent)
-                        .unwrap_or(label_h);
-                    let inset = (ascent * 0.5 + 1.0).max(2.0);
-                    metrics.border_inset_top = inset;
-                    // Stroke center is at `inset` from top edge → label_y centers on it
-                    let label_x = label_inset + label_pad;
-                    let label_y = (inset - ascent * 0.5).max(0.0);
-                    let label_offset = (label_x as f64, label_y as f64);
-
-                    for line in label_layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let label_glyphs = collect_msdf_glyphs(
-                        &label_layout, &[], &label_brush, label_offset, atlas,
-                    );
-                    msdf_glyphs.glyphs.extend(label_glyphs);
-
-                    metrics.top_gap_x0 = label_inset;
-                    metrics.top_gap_x1 = label_inset + label_pad + label_w + label_pad;
-                }
-
-                if let Some(ref bottom_text) = border_style.bottom_label {
-                    let label_layout = font.layout(
-                        bottom_text,
-                        &label_style,
-                        VelloTextAlign::Left,
-                        None,
-                    );
-                    let label_w = label_layout.width();
-                    let label_h = label_layout.height();
-
-                    // Fieldset/legend: move the bottom border inward too.
-                    let ascent = label_layout
-                        .lines()
-                        .next()
-                        .map(|l| l.metrics().ascent)
-                        .unwrap_or(label_h);
-                    let inset = (ascent * 0.5 + 1.0).max(2.0);
-                    metrics.border_inset_bottom = inset;
-                    // Stroke center at `total_height - inset`
-                    let label_x = (width - label_inset - label_pad - label_w).max(0.0);
-                    let label_y = (total_height - inset - ascent * 0.5).max(0.0);
-                    let label_offset = (label_x as f64, label_y as f64);
-
-                    for line in label_layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let label_glyphs = collect_msdf_glyphs(
-                        &label_layout, &[], &label_brush, label_offset, atlas,
-                    );
-                    msdf_glyphs.glyphs.extend(label_glyphs);
-
-                    metrics.bottom_gap_x0 = width - label_inset - label_pad - label_w - label_pad;
-                    metrics.bottom_gap_x1 = width - label_inset;
-                }
-
-                if border_style.top_label.is_some() || border_style.bottom_label.is_some() {
-                    commands.entity(entity).insert(metrics);
-                }
-            }
-        }
-
-        // Gutter checkbox: ☑ (included) or ☐ (excluded) in right padding zone.
-        // Rendered as an MSDF glyph so it's crisp at any size.
-        if let Some(ref mut atlas) = atlas {
-            let is_excluded = excluded_state.is_some_and(|e| e.0);
-            let checkbox = if is_excluded { "☐" } else { "☑" };
-            let cb_font_size = theme.label_font_size;
-            let cb_alpha = if is_excluded { 0.5 } else { 0.3 };
-            let cb_color = border
-                .map(|b| b.color.with_alpha(cb_alpha))
-                .unwrap_or(Color::srgba(0.5, 0.55, 0.65, cb_alpha));
-            let cb_brush = bevy_color_to_brush(cb_color);
-            let cb_style = VelloTextStyle {
-                brush: cb_brush.clone(),
-                font_size: cb_font_size,
-                ..default()
-            };
-            let cb_layout = font.layout(
-                checkbox,
-                &cb_style,
-                VelloTextAlign::Left,
-                None,
-            );
-            let cb_w = cb_layout.width();
-            let cb_h = cb_layout.height();
-            // Position: right edge, vertically centered
-            let cb_x = (width - cb_w - 4.0).max(0.0);
-            let cb_y = ((total_height - cb_h) * 0.5).max(0.0);
-            let cb_offset = (cb_x as f64, cb_y as f64);
-            for line in cb_layout.lines() {
-                for item in line.items() {
-                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                        font_data_map.register(gr.run().font());
-                    }
-                }
-            }
-            let cb_glyphs = collect_msdf_glyphs(
-                &cb_layout, &[], &cb_brush, cb_offset, atlas,
-            );
-            msdf_glyphs.glyphs.extend(cb_glyphs);
-        }
-
-        // Set explicit height on the node
-        let target_height = Val::Px(total_height);
-        if node.height != target_height {
-            node.height = target_height;
-        }
-
-        // `width` itself (used above for max_advance/layout and label
-        // positions) stays the raw Taffy value — only what we store for the
-        // RTT texture mapping gets rounded, same reasoning as `total_height`
-        // above.
-        rtt.built_width = round_to_physical_px(width, scale);
-        rtt.built_height = total_height;
-        block_scene.last_built_version = block_scene.content_version;
-    }
-}
-
-/// Sync role-group divider entities: an SDF center-line border (shader) plus
-/// an MSDF-rendered role label straddling a gap in it.
-///
-/// Replaces the old `build_role_group_scenes`, which drew both the line and
-/// the label into a per-entity `vello::Scene`. Role headers now carry the
-/// same `BlockBorderStyle` + `MsdfBlockGlyphs` + `MaterialNode<BlockFxMaterial>`
-/// bundle as an ordinary block cell — `BorderKind::CenterLine` draws the rule
-/// (`assets/shaders/block_fx.wgsl`, `sync_block_fx`), and the label glyphs go
-/// through the same `collect_msdf_glyphs` path as every other border label.
-/// No vello scene is ever built for a role header.
-pub fn sync_role_group_headers(
-    mut commands: Commands,
-    mut role_borders: Query<
-        (
-            Entity,
-            &RoleGroupBorder,
-            &mut UiRttTexture,
-            &ComputedNode,
-            &Node,
-            &mut MsdfBlockGlyphs,
-            &mut BlockRenderMethod,
-            Option<&BlockBorderStyle>,
-        ),
-        Changed<ComputedNode>,
-    >,
-    fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<ShapingFonts>,
-    theme: Res<Theme>,
-    text_metrics: Res<TextMetrics>,
-    mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
-    mut font_data_map: ResMut<FontDataMap>,
-) {
-    let Some(font) = fonts.get(&font_handles.mono) else {
-        return;
-    };
-    let scale = text_metrics.scale_factor;
-
-    for (
-        entity, border, mut rtt, computed, node, mut msdf_glyphs, mut render_method, existing_style,
-    ) in role_borders.iter_mut()
-    {
-        // Virtualized-out headers are Display::None; skip explicitly rather
-        // than relying on the incidental size.x==0 side effect.
-        if node.display == Display::None {
-            continue;
-        }
-        // ComputedNode is physical px; everything below builds in logical.
-        let size = crate::view::ui_rtt::logical_size(computed);
-        if size.x < 1.0 {
-            continue;
-        }
-
-        let color = match border.role {
-            kaijutsu_types::Role::User => theme.block_user,
-            kaijutsu_types::Role::Model => theme.block_assistant,
-            kaijutsu_types::Role::System => theme.fg_dim,
-            kaijutsu_types::Role::Tool | kaijutsu_types::Role::Asset => theme.block_tool_call,
-        };
-
-        let label = match border.role {
-            kaijutsu_types::Role::User => "USER",
-            kaijutsu_types::Role::Model => "ASSISTANT",
-            kaijutsu_types::Role::System => "SYSTEM",
-            kaijutsu_types::Role::Tool => "TOOL",
-            kaijutsu_types::Role::Asset => "ASSET",
-        };
-
-        let height = size.y.max(crate::view::lifecycle::ROLE_HEADER_HEIGHT);
-
-        let brush = bevy_color_to_brush(color);
-        let label_style = VelloTextStyle {
-            brush: brush.clone(),
-            font_size: role_divider::ROLE_LABEL_FONT_SIZE,
-            ..default()
-        };
-        let label_layout = font.layout(label, &label_style, VelloTextAlign::Left, None);
-        let label_w = label_layout.width() as f64;
-        let label_h = label_layout.height();
-
-        let div_layout = role_divider::compute_role_divider_layout(
-            label_w,
-            theme.label_inset as f64,
-            theme.label_pad as f64,
-        );
-        // Vertically centered on the line, matching the pre-shader Vello
-        // role_divider's `text_y = y - line_height / 2`.
-        let label_y = ((height as f64 - label_h as f64) * 0.5).max(0.0);
-
-        if let Some(ref mut atlas) = atlas {
-            for line in label_layout.lines() {
-                for item in line.items() {
-                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                        font_data_map.register(gr.run().font());
-                    }
-                }
-            }
-            let glyphs = collect_msdf_glyphs(
-                &label_layout,
-                &[],
-                &brush,
-                (div_layout.label_x, label_y),
-                atlas,
-            );
-            msdf_glyphs.glyphs = glyphs;
-            msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1).max(1);
-            *render_method = BlockRenderMethod::Msdf;
-        }
-
-        let new_style = BlockBorderStyle {
-            kind: BorderKind::CenterLine,
-            color,
-            thickness: role_divider::ROLE_DIVIDER_THICKNESS,
-            corner_radius: 0.0,
-            padding: BorderPadding {
-                top: 0.0,
-                bottom: 0.0,
-                left: 0.0,
-                right: 0.0,
-            },
-            animation: BorderAnimation::None,
-            top_label: Some(label.to_string()),
-            bottom_label: None,
-        };
-        if existing_style != Some(&new_style) {
-            commands.entity(entity).insert(new_style);
-        }
-        commands.entity(entity).insert(BorderLabelMetrics {
-            top_gap_x0: div_layout.gap_x0 as f32,
-            top_gap_x1: div_layout.gap_x1 as f32,
-            bottom_gap_x0: 0.0,
-            bottom_gap_x1: 0.0,
-            border_inset_top: 0.0,
-            border_inset_bottom: 0.0,
-        });
-
-        rtt.built_width = round_to_physical_px(size.x, scale);
-        rtt.built_height = round_to_physical_px(height, scale);
-    }
-}
-
 /// Resize block textures to match physical pixel dimensions.
 ///
-/// Runs after build_block_scenes / sync_role_group_headers so
-/// built_width/built_height are up to date. Every consumer — block cells,
-/// the MSDF overlay/shell-dock/editor/diff text surfaces, and role-group
-/// divider headers — carries [`MsdfSurface`] (via [`msdf_surface_bundle`]),
-/// so one filter covers all of them by construction; see that marker's docs
-/// for why this is no longer a hand-maintained `Or<With<...>>` list.
+/// Runs after each surface's own content build (the conversation surface,
+/// the MSDF overlay/shell-dock/editor/diff text surfaces) so
+/// `built_width`/`built_height` are up to date. Every one of those carries
+/// [`MsdfSurface`] (via [`msdf_surface_bundle`]), so one filter covers all
+/// of them by construction; see that marker's docs for why this is no
+/// longer a hand-maintained `Or<With<...>>` list.
 pub fn resize_block_textures(
     mut block_query: Query<
         (&mut UiRttTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
@@ -1871,9 +793,9 @@ mod tests {
         world.insert_resource(materials);
 
         let surface = world.spawn((marker, msdf_surface_bundle(material))).id();
-        // Simulate the post-layout state: a real build pass (build_block_scenes,
-        // sync_editor_text, ...) stamps a nonzero built size onto the surface
-        // spawned above before resize ever runs.
+        // Simulate the post-layout state: a real build pass (sync_editor_text,
+        // sync_block_content, ...) stamps a nonzero built size onto the
+        // surface spawned above before resize ever runs.
         world.get_mut::<crate::view::ui_rtt::UiRttTexture>(surface).unwrap().built_width = 640.0;
         world.get_mut::<crate::view::ui_rtt::UiRttTexture>(surface).unwrap().built_height = 480.0;
 
@@ -1919,117 +841,6 @@ mod tests {
     #[test]
     fn shell_dock_surface_gets_renderable_texture() {
         assert_surface_gets_renderable_texture(crate::view::shell_dock::MsdfShellDockText);
-    }
-
-    /// Test-only `BlockId` — the value is never inspected, only carried.
-    fn test_block_id() -> kaijutsu_types::BlockId {
-        kaijutsu_types::BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::new(), 0)
-    }
-
-    // -- repaint_block_scenes_on_theme_change -------------------------------
-
-    /// A theme pushed over RPC must reopen the version gate on every
-    /// already-built block (raster-time knobs — glyph colors, gamma — are
-    /// baked at build/render time), without touching `content_version`
-    /// (doc-owned) and without disturbing never-built blocks. Fails against
-    /// pre-fix code where nothing reacted to `Theme` changing: stale blocks
-    /// kept their old raster until an unrelated rebuild (issues.md
-    /// 2026-08-12, found live-tuning gamma).
-    #[test]
-    fn theme_change_rewinds_built_blocks_so_they_rebuild() {
-        let mut app = App::new();
-        app.insert_resource(Theme::default());
-        app.add_systems(Update, repaint_block_scenes_on_theme_change);
-
-        let built = app
-            .world_mut()
-            .spawn((
-                {
-                    let mut cell = BlockCell::new(test_block_id());
-                    cell.last_render_version = Some(7);
-                    cell
-                },
-                BlockScene {
-                    content_version: 7,
-                    last_built_version: 7,
-                    ..Default::default()
-                },
-            ))
-            .id();
-        let never_built = app
-            .world_mut()
-            .spawn((
-                {
-                    let mut cell = BlockCell::new(test_block_id());
-                    cell.last_render_version = Some(3);
-                    cell
-                },
-                BlockScene::default(),
-            ))
-            .id();
-
-        // Frame 1: Theme is freshly added — startup must not force a repaint.
-        app.update();
-        assert_eq!(
-            app.world().get::<BlockScene>(built).unwrap().last_built_version,
-            7,
-            "theme insertion at startup must not count as a theme change"
-        );
-
-        // A theme actually arriving (kj config set → ThemeReceived) reopens
-        // build_block_scenes' version gate on the built block...
-        app.world_mut()
-            .resource_mut::<Theme>()
-            .msdf_gamma_correction += 1.0;
-        app.update();
-        let scene = app.world().get::<BlockScene>(built).unwrap();
-        assert_ne!(
-            scene.content_version, scene.last_built_version,
-            "built block must be marked for rebuild after a theme change"
-        );
-        assert_eq!(
-            scene.content_version, 7,
-            "content_version is doc-owned and must not move"
-        );
-        assert_eq!(
-            app.world().get::<BlockCell>(built).unwrap().last_render_version,
-            None,
-            "sync_block_cell_buffers' gate must reopen too — a rebuild alone \
-             re-bakes the STALE BlockScene.color (caught live 2026-08-13)"
-        );
-
-        // ...while a never-built block stays pristine — it bakes the new
-        // theme on its first build anyway.
-        let scene = app.world().get::<BlockScene>(never_built).unwrap();
-        assert_eq!(scene.last_built_version, 0);
-        assert_eq!(scene.content_version, 0);
-        assert_eq!(
-            app.world().get::<BlockCell>(never_built).unwrap().last_render_version,
-            Some(3),
-            "never-built blocks are left entirely alone"
-        );
-
-        // Quiet frames leave everything alone.
-        let before = app.world().get::<BlockScene>(built).unwrap().last_built_version;
-        app.update();
-        assert_eq!(
-            app.world().get::<BlockScene>(built).unwrap().last_built_version,
-            before,
-            "no theme change → no writes"
-        );
-    }
-
-    #[test]
-    fn role_group_border_surface_gets_renderable_texture() {
-        assert_surface_gets_renderable_texture(RoleGroupBorder {
-            role: kaijutsu_types::Role::User,
-            block_id: test_block_id(),
-        });
-    }
-
-    #[test]
-    fn block_cell_surface_gets_renderable_texture() {
-        assert_surface_gets_renderable_texture(BlockCell::new(test_block_id()));
     }
 
     // -- round_to_physical_px (Fix 2: built_width physical-pixel rounding) -

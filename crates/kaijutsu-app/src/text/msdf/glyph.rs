@@ -71,6 +71,24 @@ impl GlyphKey {
     }
 }
 
+/// MSDF stem weight for ordinary text — what every glyph the surface has ever
+/// drawn carries, and therefore the value any new producer must default to or
+/// the whole document changes weight.
+pub const IMPORTANCE_NORMAL: f32 = 0.5;
+
+/// ANSI SGR 1 (bold). Half the distance from normal to fully-on: the MSDF
+/// weight modulation in `msdf_surface.wgsl` is a distance-threshold shift, so
+/// it reads as a heavier stem at every size without the double-strike look a
+/// larger step gives at 14px. Chosen with [`IMPORTANCE_DIM`] as a symmetric
+/// pair around [`IMPORTANCE_NORMAL`] (+0.25 / −0.15, deliberately asymmetric:
+/// thinning a stem loses legibility faster than thickening one).
+pub const IMPORTANCE_BOLD: f32 = 0.75;
+
+/// ANSI SGR 2 (dim/faint). Thins the stem rather than fading the color —
+/// alpha-fading would fight the theme's own contrast budget, and a terminal's
+/// "faint" is a weight, not a transparency.
+pub const IMPORTANCE_DIM: f32 = 0.35;
+
 /// A glyph positioned within a block's local coordinate space.
 ///
 /// Produced by `collect_msdf_glyphs()` from Parley layout data.
@@ -87,7 +105,12 @@ pub struct PositionedGlyph {
     pub font_size: f32,
     /// Color (RGBA8) from span brush mapping.
     pub color: [u8; 4],
-    /// Semantic importance for weight adjustment.
-    /// 0.5 = normal, modulated for effects (bold=thicker, dim=thinner).
+    /// Semantic importance for weight adjustment — see [`IMPORTANCE_NORMAL`]
+    /// and its bold/dim siblings.
     pub importance: f32,
+    /// Index into the surface style table (docs/ansi-and-beyond.md).
+    /// 0 = unstyled (the glyph's own `color` stands); 1..=256 = ANSI palette
+    /// slot `index - 1`, resolved through the theme on the GPU so a retheme
+    /// is a buffer write, not a rebuild. Truecolor spans stay in `color`.
+    pub style_index: u32,
 }

@@ -26,7 +26,6 @@ pub use well_rings_material::WellRingsMaterial;
 use crate::cell::block_border::{
     BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
 };
-use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::input::FocusArea;
 use crate::ui::theme::Theme;
 use crate::view::ui_rtt::UiRttTexture;
@@ -58,10 +57,8 @@ fn sync_block_fx(
             Option<&BlockExcludedState>,
         ),
         Or<(
-            With<BlockCell>,
             With<MsdfOverlayText>,
             With<crate::view::shell_dock::MsdfShellDockText>,
-            With<RoleGroupBorder>,
         )>,
     >,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,

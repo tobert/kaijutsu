@@ -1356,6 +1356,110 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
+// ============================================================================
+// Styled spans + ingest provenance (docs/ansi-and-beyond.md)
+// ============================================================================
+
+/// A semantic text color for a [`StyleSpan`] — deliberately *unresolved*.
+///
+/// `Indexed(n)` is a terminal palette slot (0–15 themed via the app's
+/// `AnsiColors`, 16–231 the 6×6×6 cube, 232–255 the grayscale ramp), resolved
+/// to RGB at draw time so themes apply to terminal output. `Rgb` is a
+/// truecolor SGR (38;2 / 48;2) carried verbatim. Integer-only on purpose:
+/// `BlockSnapshot` derives `Eq`, and resolved float colors would also freeze
+/// the theme into durable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StyleColor {
+    /// Terminal palette index (SGR 30–37/90–97 map to 0–15; 38;5;n is n).
+    Indexed(u8),
+    /// Truecolor (SGR 38;2;r;g;b / 48;2;r;g;b).
+    Rgb(u8, u8, u8),
+}
+
+/// Text attribute bits for a [`StyleSpan`] — a plain `u16` bitset rather than
+/// a `bitflags` dependency. Serialized as the raw integer; unknown bits from
+/// a newer writer are preserved by older readers (they round-trip the u16).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StyleAttrs(pub u16);
+
+impl StyleAttrs {
+    pub const BOLD: StyleAttrs = StyleAttrs(1 << 0);
+    pub const DIM: StyleAttrs = StyleAttrs(1 << 1);
+    pub const ITALIC: StyleAttrs = StyleAttrs(1 << 2);
+    pub const UNDERLINE: StyleAttrs = StyleAttrs(1 << 3);
+    pub const INVERSE: StyleAttrs = StyleAttrs(1 << 4);
+    pub const STRIKETHROUGH: StyleAttrs = StyleAttrs(1 << 5);
+    pub const BLINK: StyleAttrs = StyleAttrs(1 << 6);
+
+    /// No attributes set.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Test whether every bit in `other` is set in `self`.
+    pub fn contains(self, other: StyleAttrs) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Set the bits in `other`.
+    pub fn insert(&mut self, other: StyleAttrs) {
+        self.0 |= other.0;
+    }
+
+    /// Clear the bits in `other`.
+    pub fn remove(&mut self, other: StyleAttrs) {
+        self.0 &= !other.0;
+    }
+}
+
+impl std::ops::BitOr for StyleAttrs {
+    type Output = StyleAttrs;
+    fn bitor(self, rhs: StyleAttrs) -> StyleAttrs {
+        StyleAttrs(self.0 | rhs.0)
+    }
+}
+
+/// One styled range over a block's **stripped** content, produced by an
+/// ingest transform (today: `ansi-strip`). Offsets are **bytes** into
+/// `BlockSnapshot::content`, always on UTF-8 char boundaries.
+///
+/// Spans carry no round-trip duty — the byte-exact original lives in the
+/// kernel's `block_provenance` table and spans are a re-derivable projection
+/// (`kj block reproject`). An edit to a spanned block *drops* its spans
+/// (offsets past the edit would lie); content stays correct, styling goes,
+/// reprojection can restore it. See docs/ansi-and-beyond.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleSpan {
+    /// Byte offset of span start in `content`.
+    pub start: u32,
+    /// Byte offset of span end (exclusive).
+    pub end: u32,
+    /// Foreground color; `None` = the surface's default text color.
+    #[serde(default)]
+    pub fg: Option<StyleColor>,
+    /// Background color; `None` = no background quad.
+    #[serde(default)]
+    pub bg: Option<StyleColor>,
+    /// Attribute bits (bold, underline, …).
+    #[serde(default)]
+    pub attrs: StyleAttrs,
+}
+
+/// Marks a block whose content is the *projection* of an ingest transform —
+/// the affordance that says "a byte-exact original exists, ask the kernel"
+/// (`kj block original`). Deliberately tiny: the original itself never rides
+/// the wire, the oplog, or hydration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceTag {
+    /// Transform name, e.g. `"ansi-strip"`. Keys the kernel's
+    /// `block_provenance` row together with the block id.
+    pub transform: String,
+    /// Version of the transform that produced `content` + `style_spans`.
+    /// The CI invariant `strip(original) == (content, spans)` only holds
+    /// when this matches the current parser version.
+    pub version: u32,
+}
+
 /// Serializable snapshot of a block (plain data; no live document behind it).
 ///
 /// All identity fields use typed IDs: `PrincipalId` for the author,
@@ -1546,6 +1650,18 @@ pub struct BlockSnapshot {
     /// Defaults to 0 for snapshots from persistence or older wire formats.
     #[serde(default)]
     pub updated_at: u64,
+
+    // Styled spans + ingest provenance (docs/ansi-and-beyond.md)
+    /// Styled ranges over `content`, byte-addressed, produced at ingestion
+    /// (ANSI strip) or reprojection. Empty for ordinary blocks. Travels in
+    /// snapshots (`new_blocks`/`updated_snapshots`), never on `BlockHeader`;
+    /// late updates ride `BlockFlow::SpansChanged`. Invisible to hydration.
+    #[serde(default)]
+    pub style_spans: Vec<StyleSpan>,
+    /// Set when `content` is an ingest-transform projection and the kernel
+    /// holds the byte-exact original (`block_provenance` table).
+    #[serde(default)]
+    pub provenance: Option<ProvenanceTag>,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1653,6 +1769,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -1696,6 +1814,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -1751,6 +1871,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -1806,6 +1928,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -1868,6 +1992,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -1918,6 +2044,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -1966,6 +2094,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -2014,6 +2144,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -2058,6 +2190,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -2113,6 +2247,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -2167,6 +2303,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -2220,6 +2358,8 @@ impl BlockSnapshot {
             tick: None,
             track: None,
             updated_at: 0,
+            style_spans: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -2276,6 +2416,11 @@ impl BlockSnapshot {
             && self.task_status == other.task_status
             && self.order_key == other.order_key
             && self.track == other.track
+        // style_spans and provenance deliberately do NOT participate:
+        // content identity stays text-only. A spans-only change is signaled
+        // explicitly by `BlockFlow::SpansChanged` and must not make two
+        // otherwise-identical blocks read as different content
+        // (docs/ansi-and-beyond.md; decided 2026-08-19).
     }
 }
 
@@ -2341,6 +2486,8 @@ impl BlockSnapshotBuilder {
                 tick: None,
                 track: None,
                 updated_at: 0,
+                style_spans: Vec::new(),
+                provenance: None,
             },
         }
     }
@@ -2531,6 +2678,18 @@ impl BlockSnapshotBuilder {
         self
     }
 
+    /// Set styled spans over the content (byte-addressed; ingest transforms).
+    pub fn style_spans(mut self, spans: Vec<StyleSpan>) -> Self {
+        self.snap.style_spans = spans;
+        self
+    }
+
+    /// Mark the content as an ingest-transform projection with a stored original.
+    pub fn provenance(mut self, tag: ProvenanceTag) -> Self {
+        self.snap.provenance = Some(tag);
+        self
+    }
+
     /// Consume the builder and return the snapshot.
     pub fn build(self) -> BlockSnapshot {
         self.snap
@@ -2642,6 +2801,11 @@ pub enum BlockFlowKind {
     Moved,
     OutputChanged,
     MetadataChanged,
+    /// The block's `style_spans` (and/or `provenance`) changed after insert —
+    /// reprojection (`kj block reproject`) or a late-arriving ingest
+    /// projection. Carries the full updated snapshot semantics of
+    /// `updated_snapshots` (snapshot-only fields, not header fields).
+    SpansChanged,
     ContextSwitched,
     /// A render directive (`kj play`; the track render seam), not a
     /// block-level event. Never meaningfully filterable by context/kind —

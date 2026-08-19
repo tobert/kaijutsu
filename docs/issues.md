@@ -347,37 +347,76 @@ up in real prose. Add to it when you hit one.
 ---
 
 ## The conversation surface draws no block border labels or gutter checkbox (2026-08-18)
+## Two features silently lost when the legacy conversation path was deleted (2026-08-18, found during slice 5)
 
-Slice 2 of the conversation-surface rewrite ports the chrome that is *quads* —
-block borders (every `BorderKind`), the focus ring, breathe/pulse/chase, the
-edge glow, and the role-group divider — into `assets/shaders/surface_chrome.wgsl`
-as instanced SDF rects (`view/surface/chrome.rs`). What it does **not** port is
-the chrome that is *glyphs*:
+Slice 5 (decapitation, `docs/conversation-surface.md`) deleted the legacy
+per-block-cell path. Deleting its dead code turned two already-broken
+features into compiler-provable dead code — meaning both actually broke back
+in slice 4, when `Surface` became the default renderer, not today. Neither
+regression was caught because nothing failed loudly: the theme knob and the
+component still exist, they just reach no live system.
 
-- the fieldset **top/bottom labels** ("TOOL CALL <model>", "COMMAND @amy",
-  "thinking", "drift: pull", "running"/"error") that legacy bakes into each
-  block's MSDF texture (`view/block_render.rs:1107-1207`), together with the
-  `border_inset_top/bottom` that lets a label straddle the stroke and the
-  top/bottom `label_gaps` that break the stroke behind it;
-- the **gutter inclusion checkbox** (☑/☐) and the excluded text halo
-  (`text_glow_params.y`).
+- **Rainbow user-text effect** (`Theme::font_rainbow`, default **on**).
+  `text::components::{KjTextEffects, rainbow_brush}` were the legacy path's
+  plumbing for it (`view/block_render.rs`'s old `build_block_scenes`); the
+  conversation surface (`view::surface::content`) never grew an equivalent.
+  Kept `#[allow(dead_code)]` (not deleted) as the reference implementation.
+- **Timeline dimming** (`ui::timeline`, "blocks created after the viewing
+  position are hidden or dimmed"). `TimelineVisibility` was spawned and its
+  opacity applied by the legacy path; `ui::timeline::systems::update_block_visibility`
+  still runs and still updates the component, but nothing spawns
+  `TimelineVisibility` on anything any more and nothing reads its opacity
+  into a color — the system is a no-op over an empty query.
 
-Both need a label shaping cache keyed by label text — the divider's role label
-is the only one the surface shapes today — plus the per-instance gap fields
-(the mechanism exists: `ChromeInstance::label_gap`, used for the divider). The
-border *color* still dims for an excluded block, so exclusion is visible; the
-checkbox is not.
+Both need genuine design work to port (theme-driven color derivation and a
+visibility/opacity input both live at the wrong layer for the surface's
+entity-free content pipeline), not a one-line fix — noted here rather than
+built speculatively.
 
-**Now shipped-visible.** Slice 4 flipped the default to `Surface` without
-these, so "labels disappeared" and "no gutter checkbox" are what a default
-build shows today — the highest-priority remaining gap on the surface path,
-not a pre-flip chore any more. `KAIJUTSU_CONV_SURFACE=0` is the comparison.
+## Two visual-parity remainders on the conversation surface (2026-08-18)
 
-Also noted while porting: legacy gives a bordered block `width: 100%` *plus* a
-`glow_radius * 0.5` margin per side (`view/render.rs:352-359`), so the node
-overflows its own column and the pane's clip cuts the right border. The surface
-lays the box out symmetrically instead, which is a real (small) wrap-width
-difference between the two paths on bordered blocks.
+Slice 5 landed the chrome that is *glyphs* — the fieldset top/bottom captions
+and the gutter inclusion checkbox (`view/surface/labels.rs`, the `label_gap`
+/`insets` pair on `ChromeInstance`, the ported gap + inset math in
+`assets/shaders/surface_chrome.wgsl`). What is still missing:
+
+- **Chase-through-label brightening.** `block_fx.wgsl` boosts a running tool
+  call's caption glyphs as the chase wave passes over them, because those
+  glyphs are *in the texture it is shading*. On the surface, chrome is a pass
+  the glyphs are drawn **over**, so the chrome shader cannot reach them. Doing
+  it properly means the glyph pass learning the chase phase (a per-glyph or
+  per-run animation field), which is a real design step, not a port.
+- **The excluded text halo** (`text_glow_params.y` → the 9-tap glow
+  `block_fx.wgsl` puts behind an excluded block's text). Same reason: it reads
+  a per-block texture the surface does not have. Exclusion is still legible on
+  the surface — dimmed border, dimmed caption, hollow ☐ checkbox — so this is
+  a nicety, not a hole.
+- **Focus does not recolor the captions.** Deliberate, and documented on
+  `ShapedBlock::labels`: captions derive from the *unfocused* border style so
+  a j/k move never re-uploads a screenful of glyphs.
+
+## The gutter checkbox is a tofu box (2026-08-18)
+
+`☑` (U+2611) and `☐` (U+2610) are **not in NotoMono-Regular**, and nothing in
+the shaping stack falls back for them: both shape to `glyph_id: 0` — the
+`.notdef` box — at the same 6.6px advance. Measured against the shipped font
+through `collect_msdf_glyphs_deferred` while eyeballing slice 5 live on
+moltar, and visible in a screenshot as a small hollow rectangle in the right
+gutter of every block.
+
+So the inclusion indicator is currently distinguishable **only by alpha**
+(0.3 included / 0.5 excluded) — the two states draw the identical mark. This
+predates the surface port (the same two characters through the same font
+produced the same tofu on the old per-block-cell path too, before it was
+deleted); the port preserved it deliberately rather than diverging on a font
+question.
+
+Three ways out, none of them obviously right: substitute ASCII (`[x]`/`[ ]`)
+in `view::surface::labels::checkbox_char`; ship a symbol font and teach the
+fallback chain about it; or draw the checkbox as an SDF quad in the chrome
+pass (`block_fx.wgsl` already has a gutter-indicator flag that draws a
+dot/ring — `text_glow_params.y` — which the surface did not port). Amy's
+call.
 ## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
 
 Found live on toad during the same ACP smoke-test session as the P1 entry
@@ -1242,9 +1281,9 @@ Polish backlog:
   nothing is active; fine for power, but if unfocused reading feels
   laggy on first wheel touch, consider reactive(100ms) unfocused while
   the conversation screen is showing.
-- Flick event bursts each pay a full ~26ms frame on a 205k-px document
-  (heats a core) — that cost is the surface renderer's to kill
-  (docs/conversation-surface.md), not a scroll-tuning knob.
+- ~~Flick-burst frame cost~~ SHIPPED 2026-08-18: the surface renderer
+  landed (scroll = one uniform inside the window band); frame cost no
+  longer scales with document or block size.
 - App window came back 960x600@scale1 after restarts (was ~1920@2x that
   morning) — window geometry restore may be broken or KWin-side; check
   whether kaijutsu should remember size/position itself.
@@ -7147,9 +7186,6 @@ class of ungated per-frame work the slice was killing:
   ids.to_vec()` records the skipped id as present, so no gate (old ids-walk
   or new store-generation) ever sees a change — the block gets no row until
   the doc version moves for some other reason.
-- **`sync_block_cell_buffers`' `needs_update` pre-check** walks every
-  container entity (`block_cells.get(e)`) each frame before deciding to do
-  nothing.
 - **`sync_conversation_geometry` calls `recompute_offsets()` through
   `Mut<_>` unconditionally**, marking `ConversationGeometry` changed every
   frame. Nothing consumes `Changed<ConversationGeometry>` today (verified),
@@ -7187,3 +7223,144 @@ ever sees the preview, and the engraver's output is the tune's. Nobody has
 measured a streamed diff on this path. If it bites, the fix is a debounce
 scoped to `RichKindInfo::is_drawn()` blocks in `Running` status — the one place
 the legacy rule was actually earning its keep — not a general one.
+
+## Text effects on the surface: the instance buffer IS the map (2026-08-18)
+
+Amy asked whether shader-driven colored text (the original reason for the
+MSDF route) can come back via "maps of text and positions". Answer: the
+glyph instance buffer already is that map — per-glyph doc position, quad,
+UV, color — so effects return as per-instance attributes + glyph-shader
+work, not texture post-processing:
+- Rainbow = flag bit + hue(doc pos, time); `time` is already a uniform.
+- Halo/glow/outline = widen the MSDF distance thresholds (a field op —
+  crisper than the legacy 9-tap blur over baked pixels).
+- Chase-through-caption = give caption glyph runs a perimeter-parameter
+  attribute synced with the chrome chase phase.
+- Semantic maps (glyph→word/span/block) are cheap to bake at assembly time
+  from the byte ranges shaping already knows.
+Neighborhood effects (cross-glyph blur, distortion) are the one class that
+wants a texture: if ever needed, draw the glyph lane to an intermediate
+viewport-sized layer and composite with a post shader — slots into the
+existing pass order, never per-block, so the tall-block trap stays dead.
+This is the intended route for restoring rainbow + the deferred
+chase-brightening/halo entries above.
+
+## ANSI ingest + styled spans: design settled, build unstarted (2026-08-19)
+
+Design lives in `docs/ansi-and-beyond.md` (living doc, checked in) — strip
+ANSI at ingestion via `vte`, block content is the clean text, semantic
+`style_spans` + a tiny `provenance` tag ride the block, original bytes go to
+a kernel-side `block_provenance` sqlite table (map-shaped: one row per
+block × transform). Round-trip comes from the stored copy, never the span
+map. Policy in rc (which flows get which transforms), mechanism in the
+kernel (versioned `ansi-strip@N`), plus a kaish verb for ad-hoc pipelines.
+Build lanes, roughly in order:
+
+1. Parser crate lane: vte + SGR mapping + span assembly, with the test
+   ladder (fuzz totality, chunk-boundary ≡ one-shot, projection properties,
+   real-world goldens, differential vs termwiz/vt100).
+2. Kernel lane: `block_provenance` table, ingest hook at kaish output
+   capture (same-transaction commit), `style_spans`/`provenance` fields on
+   BlockSnapshot (`#[serde(default)]`), `kj block original|reproject`.
+3. App lane: spans → glyph instance styling; then the style-table
+   indirection (semantic ANSI index resolved through a GPU palette — retheme
+   = buffer write) which is the same slot the rainbow/effects revival uses
+   (see "the instance buffer IS the map" above).
+
+Renders SGR only; cursor/screen codes are preserved in provenance, never
+rendered (kills hidden-text-by-overwrite by construction). Standing safety
+invariants and the `\r`-progress-bar open question are in the doc.
+
+## ANSI rendering, pass 1: four corners left open (2026-08-19)
+
+Stage 3.2/3.3 shipped — `StyleSpan` → `text::ansi::StyledSpan`/`StyledBrush`
+→ parley ranged brushes → `PositionedGlyph.style_index`/`importance`, plus
+backgrounds and underline/strikethrough in the geometry lane. What it does
+not do yet:
+
+- **Italic (SGR 3) is parsed and fingerprinted but never rendered.** It is
+  the one attribute that would change *shaping* (a `StyleProperty::FontStyle`
+  range), so it needs a decision about column alignment for terminal output
+  before it goes in. Blink is the same shape and is already on the design
+  doc's deferred list.
+- **ANSI spans are dropped on a block that detects as a drawn rich kind**
+  (ABC, SVG, sparkline, diff, image). Those shape through
+  `view::surface::rich::RichShaper`, which builds its own geometry and never
+  sees the styled-span list. Does not arise from today's ingest hooks (shell
+  output is plain); the fix is teaching the rich shaper the second currency.
+- **`INVERSE` is resolved CPU-side and is stale until the block re-shapes.**
+  Swapping fg/bg means the glyph color comes from a background, which cannot
+  be expressed as a palette slot for the GPU table, so an inverted span bakes
+  both colors and carries `style_index = 0`. The theme epoch in `ShapeKey`
+  makes the re-shape happen, so the window is a frame or two — accepted, not
+  invisible.
+- **Backgrounds and underlines bake their color into vertices**, which is why
+  ANSI-spanned blocks now join the drawn rich kinds in taking
+  `ShapeKey::baked_theme_epoch` (renamed from `rich_theme_epoch`). If a
+  future geometry lane learns the style table, that key field can shrink back.
+
+## journal_op is not a transaction (pre-existing, surfaced 2026-08-19)
+
+`BlockStore::journal_op` (block_store.rs:906) issues `append_op` and
+`touch_context_activity` as two autocommit statements under a mutex — no
+BEGIN/COMMIT. The "semantic op + materialized state commit atomically"
+doctrine is aspirational here. Surfaced while designing ANSI provenance
+(which writes its row as a third separate statement for the same reason).
+Fix shape: a real `KernelDb` method wrapping `self.conn.transaction()` like
+`write_snapshot_and_truncate` (kernel_db.rs:2463). Not urgent — the mutex
+serializes and a crash gap is detectable — but every new hook-site write
+inherits the pattern until this is paid down.
+
+## Oplog replay clears spans that live appends keep (2026-08-19)
+
+`BlockContent::append_text` (end-append) keeps `style_spans` — earlier byte
+offsets stay valid. But `merge_ops` replay applies journaled appends through
+`edit_text`, which clears spans unconditionally. Harmless under
+buffer-until-done ordering (spans land after all appends), wrong the day
+spans land before later appends (reproject-then-append). Fix shape: teach
+the replay path to recognize `pos == None` / end-position edits as appends,
+or re-emit spans after replay from the journaled updated_snapshots (check
+whether replay order already does this — updated_snapshots may replay last
+and repair it; verify before building anything).
+
+## vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
+
+`cargo fuzz run chunked_equivalence` (`crates/kaijutsu-ansi/fuzz/`) found a
+counterexample to "chunk anywhere, same result" inside its first minute, no
+seed corpus needed: `strip(&[0xCD, 0xAE, 0x1B, 0xFF])` == `"\u{36E}"`, but
+feeding the same four bytes as `feed(&data[..1]); feed(&data[1..]);` yields
+`"\u{36E}\u{FFFD}"` — an extra replacement character leaks in.
+
+Root cause is upstream, in `vte` 0.15.0's `Parser::advance_partial_utf8`
+(`vte-0.15.0/src/lib.rs:668-718`), not in `kaijutsu-ansi`. To resume a
+codepoint left pending at a chunk boundary it speculatively copies up to 3
+more bytes from the new chunk into a 4-byte buffer and validates the whole
+thing with `str::from_utf8`. Since ASCII control bytes (ESC included) are
+valid one-byte UTF-8 on their own, the validated run can extend past the
+first real codepoint into a following control byte. The code's own comment
+says "we only care about the first character... we just ignore the rest" —
+but it still reports the whole validated span as consumed, so the ignored
+control byte is dropped silently: never printed, never dispatched to
+`execute`/the escape state machine, never seen again. One-shot processing
+never enters this function for the same bytes (`advance_ground` finds the
+ESC via `memchr` directly), so only the chunked path loses the byte.
+
+Narrow trigger: needs an incomplete multi-byte UTF-8 lead byte as the very
+last byte of one `feed` call, with the continuation byte(s) immediately
+followed by a control byte in the next call. Byte-at-a-time chunking does
+not trigger it (each call only ever has 1 byte to copy). This is why
+`crates/kaijutsu-ansi/tests/properties.rs`'s fixed `nasty_inputs` corpus,
+despite exhaustively splitting at every position and pair of positions,
+never happened to hit this shape — it needed fuzzing to find.
+
+Pinned as a regression test:
+`crates/kaijutsu-ansi/tests/vte_partial_utf8_regression.rs` — asserts the
+*current* (buggy) divergence, so a `vte` upgrade that fixes it fails the
+test loudly instead of the fix passing unnoticed. Not worked around in
+`kaijutsu-ansi` itself: a workaround would mean reimplementing part of
+`vte`'s partial-UTF-8 resumption, the kind of ad-hoc parser surface
+`docs/ansi-and-beyond.md` says to avoid. Fix shape when picked up: file
+upstream against `alacritty/vte`, or vendor-patch if a fix lands slowly and
+kaijutsu needs it sooner (chunked kaish output is exactly the profile that
+can hit this — a poorly-timed flush boundary during multibyte + escape
+mixed output).

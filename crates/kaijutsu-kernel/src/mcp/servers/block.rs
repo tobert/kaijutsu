@@ -273,6 +273,26 @@ impl McpServerLike for BlockToolsServer {
         &self.instance_id
     }
 
+    /// The tools this instance actually offers.
+    ///
+    /// **Not the capability registry.** `kj block`'s write gate
+    /// (`kj/block.rs`) builds a `Capability::Tool { instance: "builtin.block",
+    /// tool }` and hands it to `require_cap`, which resolves it through
+    /// `ContextToolBinding::allows` — a pure name match against the grants in
+    /// the loadout. Neither that path nor `kj binding allow`'s
+    /// `parse_capability` ever consults this list, so a gated kj verb needs
+    /// its tool *name*, not a tool.
+    ///
+    /// `kj block reproject` is the deliberate case: it is gated on
+    /// `builtin.block:block_reproject` and there is **no** `block_reproject`
+    /// entry below. Reprojection re-derives a block's style spans from stored
+    /// provenance (docs/ansi-and-beyond.md) — occasional, deliberate, done
+    /// after a parser upgrade — which is the "kj is good enough for admin-like
+    /// stuff" side of the line in CLAUDE.md, not a chatty path a model drives.
+    /// Adding a tool here would mean a second implementation of the
+    /// content-diverged guard, and two copies of a rule is how it drifts. If a
+    /// model surface for it is ever wanted, factor the kj implementation into
+    /// a shared helper first; do not re-derive it.
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
         Ok(vec![
             tool_def::<BlockCreateParams>(&self.instance_id, "block_create", "Create a new block with role, kind, and optional content")?,

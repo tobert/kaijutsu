@@ -21,11 +21,16 @@ use std::rc::Rc;
 
 use capnp::capability::Promise;
 use kaijutsu_types::ContextId;
-use kaijutsu_types::{BlockId, BlockMetadata, BlockSnapshot, OutputData, Status};
+use kaijutsu_types::{
+    BlockId, BlockMetadata, BlockSnapshot, OutputData, ProvenanceTag, Status, StyleSpan,
+};
 use tokio::sync::mpsc;
 
 use crate::kaijutsu_capnp::{context_event, context_observer};
-use crate::rpc::{parse_block_id, parse_block_metadata, parse_block_snapshot, parse_output_data};
+use crate::rpc::{
+    parse_block_id, parse_block_metadata, parse_block_snapshot, parse_output_data,
+    parse_provenance, parse_style_spans,
+};
 use crate::subscriptions::SubscriptionEndReason;
 
 // ============================================================================
@@ -79,6 +84,15 @@ pub enum ContextChange {
     OutputChanged {
         block_id: BlockId,
         output: Option<Box<OutputData>>,
+    },
+    /// A block's styled spans (and/or provenance tag) changed after it was
+    /// authored — reprojection or a late-arriving ingest projection
+    /// (docs/ansi-and-beyond.md). Carries the block's complete current span
+    /// set, never a delta: replace what you hold, an empty list included.
+    SpansChanged {
+        block_id: BlockId,
+        style_spans: Vec<StyleSpan>,
+        provenance: Option<ProvenanceTag>,
     },
 }
 
@@ -329,6 +343,17 @@ fn parse_change(reader: context_event::Reader<'_>) -> Result<ContextChange, capn
             ContextChange::OutputChanged {
                 block_id: parse_block_id(&r.get_block_id()?).map_err(to_capnp)?,
                 output: Some(Box::new(parse_output_data(r.get_output()?)?)),
+            }
+        }
+        context_event::SpansChanged(r) => {
+            let r = r?;
+            ContextChange::SpansChanged {
+                block_id: parse_block_id(&r.get_block_id()?).map_err(to_capnp)?,
+                style_spans: parse_style_spans(r.get_style_spans()?),
+                provenance: parse_provenance(
+                    r.get_provenance_transform()?.to_str()?,
+                    r.get_provenance_version(),
+                ),
             }
         }
     })
@@ -622,6 +647,19 @@ impl ContextMirror {
                 let i = self.require(&block_id)?;
                 self.blocks[i].output = output.map(|o| *o);
             }
+            ContextChange::SpansChanged {
+                block_id,
+                style_spans,
+                provenance,
+            } => {
+                let i = self.require(&block_id)?;
+                // Whole-projection replace, both fields together: a
+                // reprojection that clears styling must clear it here too,
+                // and a tag that outlived its spans would claim an original
+                // the spans no longer describe.
+                self.blocks[i].style_spans = style_spans;
+                self.blocks[i].provenance = provenance;
+            }
         }
         Ok(())
     }
@@ -749,6 +787,87 @@ mod tests {
 
         assert_eq!(mirror.block(&id).unwrap().content, "はい、世界");
         assert_eq!(mirror.version(), 13);
+    }
+
+    /// Spans arrive as a whole projection, not a patch: the fold replaces
+    /// both fields together, and a reprojection that produced nothing must
+    /// leave the block genuinely unstyled — a stale span set outliving the
+    /// event that cleared it would draw colors over text that no longer has
+    /// them (docs/ansi-and-beyond.md).
+    #[test]
+    fn spans_changed_replaces_the_whole_projection() {
+        let c = ctx();
+        let b = block(c, 1, "hello world");
+        let id = b.id;
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![b], 10).unwrap();
+        assert!(mirror.block(&id).unwrap().style_spans.is_empty());
+
+        let spans = vec![StyleSpan {
+            start: 0,
+            end: 5,
+            fg: Some(kaijutsu_types::StyleColor::Indexed(2)),
+            bg: None,
+            attrs: kaijutsu_types::StyleAttrs::BOLD,
+        }];
+        mirror
+            .receive(delivery(
+                c,
+                11,
+                vec![ContextChange::SpansChanged {
+                    block_id: id,
+                    style_spans: spans.clone(),
+                    provenance: Some(ProvenanceTag {
+                        transform: "ansi-strip".into(),
+                        version: 1,
+                    }),
+                }],
+            ))
+            .unwrap();
+        let held = mirror.block(&id).unwrap();
+        assert_eq!(held.style_spans, spans);
+        assert_eq!(held.provenance.as_ref().map(|p| p.transform.as_str()), Some("ansi-strip"));
+
+        // A reprojection that yields nothing clears both fields.
+        mirror
+            .receive(delivery(
+                c,
+                12,
+                vec![ContextChange::SpansChanged {
+                    block_id: id,
+                    style_spans: Vec::new(),
+                    provenance: None,
+                }],
+            ))
+            .unwrap();
+        let held = mirror.block(&id).unwrap();
+        assert!(held.style_spans.is_empty(), "an empty projection must clear the spans");
+        assert_eq!(held.provenance, None, "the tag never outlives the spans it describes");
+        // Styling never touches the text.
+        assert_eq!(held.content, "hello world");
+    }
+
+    /// A block the mirror does not hold is a lost delivery, not something to
+    /// absorb — spans follow the same rule as every other block-addressed
+    /// change.
+    #[test]
+    fn spans_changed_for_an_unknown_block_is_an_error() {
+        let c = ctx();
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![], 10).unwrap();
+        let stranger = BlockId::new(c, PrincipalId::new(), 99);
+        let err = mirror
+            .receive(delivery(
+                c,
+                11,
+                vec![ContextChange::SpansChanged {
+                    block_id: stranger,
+                    style_spans: Vec::new(),
+                    provenance: None,
+                }],
+            ))
+            .unwrap_err();
+        assert_eq!(err, MirrorError::UnknownBlock(stranger));
     }
 
     /// Rule 21-26. The client subscribes first, so deliveries can arrive while

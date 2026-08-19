@@ -1,0 +1,18 @@
+---
+source: crates/kaijutsu-ansi/tests/goldens.rs
+expression: rendering
+---
+=== text (137 bytes) ===
+a4b2121 note change 3
+0390508 note change 2
+4e0807c note change 1
+d280fd9 improve greet, extend add, add subtract
+05c8601 add example.py
+=== end text ===
+
+=== spans (5) ===
+    0..7     fg=indexed(3) bg=default attrs=-
+   22..29    fg=indexed(3) bg=default attrs=-
+   44..51    fg=indexed(3) bg=default attrs=-
+   66..73    fg=indexed(3) bg=default attrs=-
+  114..121   fg=indexed(3) bg=default attrs=-

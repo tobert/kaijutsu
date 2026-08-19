@@ -1,0 +1,22 @@
+[package]
+name = "kaijutsu-ansi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ANSI ingest transform — strip escape sequences to clean text plus semantic style spans"
+
+[lints]
+workspace = true
+
+[dependencies]
+vte = { workspace = true }
+kaijutsu-types = { workspace = true }
+
+[dev-dependencies]
+# Snapshot testing for the golden corpus (tests/goldens.rs).
+insta = "1"
+# Independent terminal emulator, for the differential SGR-attribution test
+# (tests/differential.rs) — a second implementation of "what does this
+# escape sequence mean" to check our span assembly against.
+vt100 = "0.16"

@@ -20,8 +20,14 @@
 // The fragment half is ported from msdf_block.wgsl (median / screen_px_range
 // / hinting / stem darkening / gamma), deliberately verbatim so both surfaces
 // shade text identically. The duplication is accepted for now and tracked as
-// a follow-up (plan §Risks); the rainbow effect is NOT ported — the surface
-// path has no per-glyph effect flags in slice 1.
+// a follow-up (plan §Risks).
+//
+// A fourth mirrored item joined the contract on 2026-08-19: `StyleEntry`
+// mirrors the Rust struct in surface_renderer.rs, and the style table at
+// @binding(3) is how per-glyph styling stays dynamic without instance
+// rebuilds — ANSI palette colors resolve here (retheme = table rewrite), and
+// the reserved effect/param fields are the landing site for the rainbow/
+// blink/CRT revival (docs/ansi-and-beyond.md).
 
 struct Uniforms {
     viewport_phys: vec2<f32>,   // render target size, PHYSICAL px
@@ -42,9 +48,23 @@ struct Uniforms {
     origin_logical: vec2<f32>,
 }
 
+// One entry in the glyph style table — mirrors `StyleEntry` in
+// surface_renderer.rs (32 bytes, vec4-aligned). Entry 0 is identity; entries
+// 1..=256 are ANSI palette slots (index - 1), rewritten on retheme so themed
+// terminal colors never require an instance rebuild. `effect`/`param` are
+// reserved for the rainbow/blink/CRT revival.
+struct StyleEntry {
+    fg: vec4<f32>,
+    flags: u32,     // bit 0: replace instance color with fg
+    effect: u32,    // reserved, 0 = none
+    param: f32,     // reserved
+    _pad: f32,
+}
+
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var atlas_texture: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+@group(0) @binding(3) var<storage, read> style_table: array<StyleEntry>;
 
 struct InstanceInput {
     // Pen position in DOCUMENT space, logical px: (x, baseline_y).
@@ -57,6 +77,8 @@ struct InstanceInput {
     @location(3) uv_rect: vec4<f32>,
     @location(4) color: vec4<f32>,
     @location(5) importance: f32,
+    // Style table index; 0 = unstyled (color above stands).
+    @location(6) style_index: u32,
 }
 
 struct VertexOutput {
@@ -114,7 +136,15 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, inst: InstanceInput) -> Vert
         mix(inst.uv_rect.x, inst.uv_rect.z, corner.x),
         mix(inst.uv_rect.w, inst.uv_rect.y, corner.y),
     );
-    out.color = inst.color;
+    // Resolve the style table: a themed entry replaces the instance color
+    // (index 0 is the identity entry, flags == 0). The alpha channel stays
+    // the instance's — spans style color, not visibility.
+    let style = style_table[min(inst.style_index, arrayLength(&style_table) - 1u)];
+    let use_fg = (style.flags & 1u) != 0u;
+    out.color = vec4<f32>(
+        select(inst.color.rgb, style.fg.rgb, use_fg),
+        inst.color.a,
+    );
     out.importance = inst.importance;
     return out;
 }

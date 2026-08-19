@@ -31,4 +31,14 @@ thread_local! {
     pub(crate) static LOCAL_FONT_CONTEXT: RefCell<Option<FontContext>> = const { RefCell::new(None) };
     pub(crate) static LOCAL_LAYOUT_CONTEXT: RefCell<LayoutContext<Brush>> =
         RefCell::new(LayoutContext::new());
+    /// The conversation surface's ANSI currency (`text::ansi::StyledBrush`).
+    ///
+    /// A second context rather than a second *font* context: `LayoutContext`
+    /// is brush-typed, so a layout in one currency cannot be built from the
+    /// other's cache. The shared `FontContext` above — which holds the actual
+    /// font collection — is still the one source both shape against, so
+    /// metrics stay identical across the two.
+    pub(crate) static LOCAL_STYLED_LAYOUT_CONTEXT:
+        RefCell<LayoutContext<crate::text::ansi::StyledBrush>> =
+        RefCell::new(LayoutContext::new());
 }

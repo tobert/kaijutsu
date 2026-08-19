@@ -80,8 +80,6 @@ pub fn reconcile_tiling_tree(
     tiling_root: Query<Entity, With<TilingRoot>>,
     conversation_root: Query<(Entity, Option<&Children>), With<super::state::ConversationRoot>>,
     existing_panes: Query<Entity, With<PaneMarker>>,
-    editor_entities: Res<crate::cell::EditorEntities>,
-    block_containers: Query<&crate::cell::BlockCellContainer>,
 ) {
     let needs_rebuild = !state.initialized || tree.structural_gen != state.last_structural_gen;
     if !needs_rebuild {
@@ -97,26 +95,13 @@ pub fn reconcile_tiling_tree(
     };
 
     if state.initialized {
-        // Detach block cells from ConversationContainer before despawning panes.
-        // Without this, despawn() recursively kills block cell children.
-        if let Some(main_ent) = editor_entities.main_cell
-            && let Ok(container) = block_containers.get(main_ent)
-        {
-            for &entity in container
-                .block_cells
-                .values()
-                .chain(container.role_headers.iter())
-            {
-                commands.entity(entity).remove_parent_in_place();
-            }
-            info!(
-                "Detached {} block cells + {} role headers before pane rebuild",
-                container.block_cells.len(),
-                container.role_headers.len()
-            );
-        }
-
-        // Despawn all existing pane-managed entities for rebuild
+        // Despawn all existing pane-managed entities for rebuild. Each
+        // pane's content is a self-contained composited surface
+        // (`view::surface`) — nothing outside the pane subtree references
+        // its entities, so a recursive despawn needs no detach step first
+        // (contrast the old per-block-cell `BlockCellContainer`, which had
+        // to be unparented before despawn or it would take live block
+        // entities down with it).
         for entity in existing_panes.iter() {
             commands.entity(entity).despawn();
         }
@@ -249,12 +234,18 @@ fn spawn_content_subtree(
                         Val::Auto
                     },
                     flex_direction: FlexDirection::Column,
-                    overflow: Overflow::scroll_y(),
+                    // The surface path draws one composited image filling
+                    // this node (`view::surface::target`) rather than a
+                    // scrollable column of children — clip, don't scroll, so
+                    // nothing (e.g. a focus-ring glow) bleeds past the pane's
+                    // border. Scrolling itself is `ConversationScrollState`
+                    // driving the surface's document-space offset, not a
+                    // taffy `ScrollPosition`.
+                    overflow: Overflow::clip(),
                     padding: UiRect::axes(Val::Px(4.0), Val::Px(4.0)),
                     border: UiRect::all(Val::Px(2.0)),
                     ..default()
                 },
-                ScrollPosition::default(),
                 BorderColor::all(border_color),
             ));
             if is_focused {

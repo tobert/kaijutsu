@@ -1113,3 +1113,78 @@ mod estimate_tokens_tests {
         );
     }
 }
+
+/// Hydration is blind to styling, by construction (docs/ansi-and-beyond.md).
+///
+/// `style_spans` and `provenance` describe how a block LOOKS and where its
+/// content came from; the model reads the stripped content and nothing else.
+/// The blindness is currently a property of `translate_block` reading only
+/// `content` / `stderr` / the `format_*` helpers — nothing forbids a future
+/// edit from reaching for a span, so this pins the contract rather than
+/// trusting the omission to stay.
+#[cfg(test)]
+mod hydration_blindness_tests {
+    use super::*;
+    use kaijutsu_types::{
+        BlockSnapshotBuilder, ProvenanceTag, StyleAttrs, StyleColor, StyleSpan,
+    };
+
+    fn spans() -> Vec<StyleSpan> {
+        vec![
+            StyleSpan {
+                start: 0,
+                end: 5,
+                fg: Some(StyleColor::Indexed(9)),
+                bg: None,
+                attrs: StyleAttrs::BOLD | StyleAttrs::UNDERLINE,
+            },
+            StyleSpan {
+                start: 5,
+                end: 11,
+                fg: Some(StyleColor::Rgb(0x33, 0xFF, 0x99)),
+                bg: Some(StyleColor::Indexed(0)),
+                attrs: StyleAttrs::default(),
+            },
+        ]
+    }
+
+    fn hydrate(block: &BlockSnapshot) -> String {
+        let mut state = HydrationState::new();
+        state.translate_block(block, None);
+        serde_json::to_string(&state.into_messages()).expect("messages serialize")
+    }
+
+    #[test]
+    fn spans_and_provenance_never_reach_the_model() {
+        let ctx = kaijutsu_types::ContextId::new();
+        let principal = kaijutsu_types::PrincipalId::new();
+        let id = BlockId {
+            context_id: ctx,
+            principal_id: principal,
+            seq: 1,
+        };
+
+        for kind in [BlockKind::Text, BlockKind::ToolResult] {
+            let plain = BlockSnapshotBuilder::new(id, kind)
+                .role(BlockRole::User)
+                .content("hello world")
+                .build();
+            let styled = BlockSnapshotBuilder::new(id, kind)
+                .role(BlockRole::User)
+                .content("hello world")
+                .style_spans(spans())
+                .provenance(ProvenanceTag {
+                    transform: "ansi-strip".into(),
+                    version: 1,
+                })
+                .build();
+
+            assert_eq!(
+                hydrate(&styled),
+                hydrate(&plain),
+                "{kind:?}: a spanned block must hydrate to exactly the same \
+                 messages as the same block without spans"
+            );
+        }
+    }
+}

@@ -321,6 +321,10 @@ fn deliver_updates(
             | ContextChange::ExcludedChanged { block_id, .. }
             | ContextChange::MetadataChanged { block_id, .. }
             | ContextChange::OutputChanged { block_id, .. } => touched.push(*block_id),
+            // Styling only. ACP sends plain text, so a span reprojection
+            // changes nothing this client would emit — the mirror still
+            // folds it in below, we just owe the peer no update for it.
+            ContextChange::SpansChanged { .. } => {}
         }
     }
 

@@ -145,6 +145,32 @@ enum BlockCommand {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Read back the byte-exact original an ingest transform consumed for
+    /// this block (docs/ansi-and-beyond.md). The stored bytes are escape
+    /// sequences by definition, so the terminal path renders ESC visibly and
+    /// only `--out <file>` writes the exact bytes.
+    Original {
+        /// Block id
+        block_id: String,
+        /// Which ingest transform's original to read (default: ansi-strip)
+        #[arg(long, default_value = kaijutsu_ansi::TRANSFORM_NAME)]
+        transform: String,
+        /// Write the original bytes to this path instead of stdout
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Re-run the CURRENT ingest parser over this block's stored original and
+    /// re-emit its style spans (docs/ansi-and-beyond.md). Updates *styling*
+    /// only: if the projection's text no longer matches the block's content
+    /// (the block was edited since ingest), this refuses rather than
+    /// overwriting the edit.
+    Reproject {
+        /// Block id
+        block_id: String,
+        /// Which ingest transform to re-run (default: ansi-strip)
+        #[arg(long, default_value = kaijutsu_ansi::TRANSFORM_NAME)]
+        transform: String,
+    },
     /// Append text to a block (streaming-friendly). Mirrors MCP `block_append`.
     Append {
         /// Block id to append to
@@ -240,6 +266,14 @@ impl KjDispatcher {
             BlockCommand::Edit { .. } => Some("block_edit"),
             BlockCommand::Create { .. } => Some("block_create"),
             BlockCommand::Status { .. } => Some("block_status"),
+            // `reproject` rewrites a block's spans through the ordinary
+            // sequenced mutation path, so it is gated exactly like the other
+            // writers. The name matches the `block_reproject` MCP tool on
+            // `builtin.block` — the gate itself is name-based against the
+            // loadout, but keeping the two surfaces on one name is what makes
+            // `kj binding allow "builtin.block:block_reproject"` mean the same
+            // thing wherever it is written.
+            BlockCommand::Reproject { .. } => Some("block_reproject"),
             _ => None,
         };
         if let Some(tool) = block_write_tool {
@@ -284,6 +318,15 @@ impl KjDispatcher {
                 out.as_deref(),
                 caller,
             ),
+            BlockCommand::Original {
+                block_id,
+                transform,
+                out,
+            } => self.block_original(&block_id, &transform, out.as_deref(), caller),
+            BlockCommand::Reproject {
+                block_id,
+                transform,
+            } => self.block_reproject(&block_id, &transform, caller),
             BlockCommand::Append { block_id, text } => {
                 self.block_append(&block_id, &text, caller)
             }
@@ -852,6 +895,238 @@ impl KjDispatcher {
         });
         let text = String::from_utf8_lossy(&bytes).into_owned();
         KjResult::ok_typed_with_data(text, ContentType::from_mime(&mime), record)
+    }
+
+    /// Render provenance bytes for a terminal with the escapes made *visible*.
+    ///
+    /// The bytes an ingest transform consumed are escape sequences by
+    /// definition, so dumping them raw would replay control codes into
+    /// whatever tty is watching — the exact thing docs/ansi-and-beyond.md
+    /// names as "an explicit deliberate act, never a default path" (safety
+    /// invariant 3). `block_cat` answers this shape by refusing binary
+    /// outright; refusing here would make the verb useless without `--out`,
+    /// so instead ESC becomes U+241B ␛ and every other control character
+    /// (except the layout-carrying `\n` and `\t`) renders as its Rust debug
+    /// escape. What you read is a *transcription*: byte-exactness lives
+    /// behind `--out`, never on the terminal path.
+    fn visible_escapes(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() + bytes.len() / 8);
+        for ch in String::from_utf8_lossy(bytes).chars() {
+            match ch {
+                '\x1b' => out.push('␛'),
+                '\n' | '\t' => out.push(ch),
+                c if c.is_control() => out.extend(c.escape_debug()),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// `kj block original` — read back the byte-exact original an ingest
+    /// transform consumed for this block (docs/ansi-and-beyond.md). Ungated:
+    /// this is a read, and the bytes never left the kernel's own store.
+    ///
+    /// A block with no row for the named transform is reported with whatever
+    /// rows it *does* have, because the two failures are different questions:
+    /// "this block was never projected" versus "you asked for the wrong
+    /// transform". A tagged block whose row is missing entirely is the
+    /// crash-gap this verb is supposed to make visible — it errors, it never
+    /// invents bytes.
+    fn block_original(
+        &self,
+        id_str: &str,
+        transform: &str,
+        out: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block original: {e}")),
+        };
+        let ctx_id = block_id.context_id;
+
+        let (found, available) = {
+            let db = self.kernel_db().lock();
+            let found = match db.get_block_provenance(&block_id, transform) {
+                Ok(row) => row,
+                Err(e) => return KjResult::Err(format!("kj block original: {e}")),
+            };
+            let available = match db.list_block_provenance(&block_id) {
+                Ok(rows) => rows,
+                Err(e) => return KjResult::Err(format!("kj block original: {e}")),
+            };
+            (found, available)
+        };
+
+        let (version, bytes) = match found {
+            Some(row) => row,
+            None if available.is_empty() => {
+                return KjResult::Err(format!(
+                    "kj block original: block '{id_str}' has no stored originals \
+                     (nothing in this context was projected through an ingest transform, \
+                     or the row was lost to a crash between the block write and the \
+                     provenance write — see docs/ansi-and-beyond.md)"
+                ));
+            }
+            None => {
+                let listed = available
+                    .iter()
+                    .map(|(t, v, len)| format!("{t}@{v} ({len} bytes)"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return KjResult::Err(format!(
+                    "kj block original: block '{id_str}' has no original for transform \
+                     '{transform}'; it does have: {listed}"
+                ));
+            }
+        };
+
+        let block_key = block_id.to_key();
+        if let Some(out_path) = out {
+            return match std::fs::write(out_path, &bytes) {
+                Ok(()) => {
+                    let record = serde_json::json!({
+                        "block_id": block_key,
+                        "context_id": ctx_id.to_hex(),
+                        "transform": transform,
+                        "version": version,
+                        "bytes": bytes.len(),
+                        "out": out_path,
+                        "exact": true,
+                    });
+                    // Mirrors `kj block cat --out`: the confirmation is a human
+                    // status line, not content the model needs hydrated.
+                    KjResult::ok_ephemeral_with_data(
+                        format!(
+                            "wrote {} bytes ({transform}@{version}) to {out_path}",
+                            bytes.len()
+                        ),
+                        ContentType::Plain,
+                        record,
+                    )
+                }
+                Err(e) => KjResult::Err(format!("kj block original --out: {e}")),
+            };
+        }
+
+        let record = serde_json::json!({
+            "block_id": block_key,
+            "context_id": ctx_id.to_hex(),
+            "transform": transform,
+            "version": version,
+            "bytes": bytes.len(),
+            "exact": false,
+        });
+        let body = format!(
+            "{transform}@{version}, {} bytes — ESC shown as ␛, other control bytes escaped; \
+             use --out <file> for the exact bytes\n{}\n",
+            bytes.len(),
+            Self::visible_escapes(&bytes),
+        );
+        KjResult::ok_typed_with_data(body, ContentType::Plain, record)
+    }
+
+    /// `kj block reproject` — run the *current* parser over the stored
+    /// original and re-emit this block's style spans through the ordinary
+    /// sequenced mutation path (docs/ansi-and-beyond.md).
+    ///
+    /// **Styling only.** The block's content is the one live document that
+    /// edits, exclusions, search and hydration share, and reprojection is not
+    /// allowed to become a back door that rewrites it. So the freshly stripped
+    /// text is compared against the current content first: a mismatch means
+    /// the block was edited since ingest (its provenance row records what
+    /// *arrived*, not what the document *is*) and the verb refuses rather than
+    /// clobbering the edit. Only when the text still matches byte-for-byte are
+    /// the new spans — which are addressed by offsets into exactly that text —
+    /// safe to install.
+    fn block_reproject(&self, id_str: &str, transform: &str, caller: &KjCaller) -> KjResult {
+        if transform != kaijutsu_ansi::TRANSFORM_NAME {
+            return KjResult::Err(format!(
+                "kj block reproject: no parser registered for transform '{transform}' \
+                 (this kernel implements '{}' only — `kj block original --transform \
+                 {transform}` can still read the bytes back)",
+                kaijutsu_ansi::TRANSFORM_NAME
+            ));
+        }
+        let block_id = match self.resolve_block_id(id_str, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block reproject: {e}")),
+        };
+        let ctx_id = block_id.context_id;
+
+        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block reproject: {e}")),
+        };
+        let snap = match snapshots.into_iter().find(|b| b.id == block_id) {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block reproject: block '{id_str}' not found in {}",
+                    ctx_id.to_hex()
+                ));
+            }
+        };
+
+        let stored = {
+            let db = self.kernel_db().lock();
+            match db.get_block_provenance(&block_id, transform) {
+                Ok(row) => row,
+                Err(e) => return KjResult::Err(format!("kj block reproject: {e}")),
+            }
+        };
+        let (old_version, original) = match stored {
+            Some(row) => row,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block reproject: block '{id_str}' has no stored original for \
+                     transform '{transform}' — nothing to reproject from \
+                     (`kj block original {id_str}` reports what it does have)"
+                ));
+            }
+        };
+
+        let (text, spans) = kaijutsu_ansi::strip(&original);
+        if text != snap.content {
+            return KjResult::Err(format!(
+                "kj block reproject: content has diverged from the original (edited since \
+                 ingest); reproject would overwrite edits. Reprojection updates styling \
+                 only — refusing. (original projects to {} bytes of text, block holds {})",
+                text.len(),
+                snap.content.len(),
+            ));
+        }
+
+        let span_count = spans.len();
+        let new_version = kaijutsu_ansi::PARSER_VERSION;
+        if let Err(e) = self.blocks.set_style_spans(
+            ctx_id,
+            &block_id,
+            spans,
+            Some(kaijutsu_ansi::provenance_tag()),
+        ) {
+            return KjResult::Err(format!("kj block reproject: {e}"));
+        }
+
+        let block_key = block_id.to_key();
+        let record = serde_json::json!({
+            "block_id": block_key,
+            "context_id": ctx_id.to_hex(),
+            "transform": transform,
+            "old_version": old_version,
+            "new_version": new_version,
+            "spans": span_count,
+            "original_bytes": original.len(),
+            "content_length": snap.content.len(),
+        });
+        KjResult::ok_with_data(
+            format!(
+                "reprojected {block_key}: {span_count} spans from {} bytes \
+                 ({transform} {old_version}→{new_version})\n",
+                original.len()
+            ),
+            record,
+        )
     }
 
     /// Append text to an existing block. Mirrors MCP `block_append`. Returns
@@ -3229,5 +3504,276 @@ mod tests {
     fn parse_range_spec_rejects_non_numeric() {
         assert!(parse_range_spec("a:5").is_err());
         assert!(parse_range_spec("0:b").is_err());
+    }
+
+    // ── New: block original / reproject (docs/ansi-and-beyond.md) ──────
+
+    /// The bytes an ingest hook would have captured: SGR red, some text, reset.
+    /// Deliberately includes a control byte that is *not* ESC (`\r`) so the
+    /// terminal-transcription path has something besides ESC to escape.
+    const ANSI_ORIGINAL: &[u8] = b"\x1b[31mred\x1b[0m plain\r\n";
+
+    /// Write a provenance row the way an ingest hook would, and insert the
+    /// block holding the *projection* of those bytes — the paired state
+    /// `strip(original) == (content, spans)` describes.
+    fn insert_projected_block(
+        d: &crate::kj::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        original: &[u8],
+        content_override: Option<&str>,
+    ) -> kaijutsu_types::BlockId {
+        let (text, _spans) = kaijutsu_ansi::strip(original);
+        let bid = insert_text_block(d, ctx, content_override.unwrap_or(&text));
+        d.kernel_db()
+            .lock()
+            .insert_block_provenance(
+                &bid,
+                kaijutsu_ansi::TRANSFORM_NAME,
+                kaijutsu_ansi::PARSER_VERSION,
+                original,
+            )
+            .expect("insert_block_provenance");
+        bid
+    }
+
+    /// `--out` is the byte-exactness contract: what lands on disk must be the
+    /// stored original, byte for byte, escapes and all.
+    #[tokio::test]
+    async fn block_original_out_writes_byte_exact_original() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_projected_block(&d, ctx, ANSI_ORIGINAL, None);
+
+        let path = std::env::temp_dir()
+            .join(format!("kj-original-{}.bin", kaijutsu_types::ContextId::new().to_hex()));
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("original"),
+                    bid.to_key(),
+                    s("--out"),
+                    s(path.to_str().unwrap()),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "original --out failed: {}", result.message());
+
+        let written = std::fs::read(&path).expect("output file");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            written, ANSI_ORIGINAL,
+            "--out must round-trip the stored bytes exactly"
+        );
+    }
+
+    /// Without `--out` the bytes are transcribed, never replayed: ESC becomes
+    /// ␛ so no escape sequence reaches a real tty (docs/ansi-and-beyond.md
+    /// safety invariant 3), and the output says where the exact bytes live.
+    #[tokio::test]
+    async fn block_original_terminal_path_makes_escapes_visible() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_projected_block(&d, ctx, ANSI_ORIGINAL, None);
+
+        let result = d
+            .dispatch(&[s("block"), s("original"), bid.to_key()], &c)
+            .await;
+        assert!(result.is_ok(), "original failed: {}", result.message());
+        let body = result.message();
+        assert!(
+            !body.contains('\x1b'),
+            "raw ESC must never reach the terminal path: {body:?}"
+        );
+        assert!(body.contains("␛[31m"), "expected visible ESC, got: {body:?}");
+        assert!(body.contains("\\r"), "expected escaped CR, got: {body:?}");
+        assert!(
+            body.contains("--out"),
+            "terminal output must point at --out for exact bytes: {body:?}"
+        );
+    }
+
+    /// A block nothing ever projected: the error says so plainly rather than
+    /// inventing bytes or reporting an empty original.
+    #[tokio::test]
+    async fn block_original_without_any_row_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "no provenance here");
+
+        let result = d
+            .dispatch(&[s("block"), s("original"), bid.to_key()], &c)
+            .await;
+        assert!(!result.is_ok(), "expected an error, got: {}", result.message());
+        assert!(
+            result.message().contains("no stored originals"),
+            "unexpected message: {}",
+            result.message()
+        );
+    }
+
+    /// Asking for a transform the block doesn't have is a different question
+    /// from "never projected" — the error lists what IS there.
+    #[tokio::test]
+    async fn block_original_unknown_transform_lists_available() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_projected_block(&d, ctx, ANSI_ORIGINAL, None);
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("original"),
+                    bid.to_key(),
+                    s("--transform"),
+                    s("nonesuch"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "expected an error, got: {}", result.message());
+        let msg = result.message();
+        assert!(msg.contains("nonesuch"), "must name the missing transform: {msg}");
+        assert!(
+            msg.contains(kaijutsu_ansi::TRANSFORM_NAME),
+            "must list the transform that IS stored: {msg}"
+        );
+    }
+
+    /// The happy path: an unedited block re-derives its spans from provenance
+    /// and lands them on the snapshot with the current parser's tag.
+    #[tokio::test]
+    async fn block_reproject_unedited_block_sets_spans() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // Stored at version 0 — a stale parser — so the report has a real
+        // old→new transition to show.
+        let (text, _) = kaijutsu_ansi::strip(ANSI_ORIGINAL);
+        let bid = insert_text_block(&d, ctx, &text);
+        d.kernel_db()
+            .lock()
+            .insert_block_provenance(&bid, kaijutsu_ansi::TRANSFORM_NAME, 0, ANSI_ORIGINAL)
+            .expect("insert_block_provenance");
+
+        let before = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert!(before.style_spans.is_empty(), "fixture must start unstyled");
+
+        let result = d
+            .dispatch(&[s("block"), s("reproject"), bid.to_key()], &c)
+            .await;
+        assert!(result.is_ok(), "reproject failed: {}", result.message());
+
+        let after = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert!(
+            !after.style_spans.is_empty(),
+            "reproject must install the re-derived spans"
+        );
+        assert_eq!(after.content, text, "reproject must not touch content");
+        let tag = after.provenance.expect("provenance tag must be stamped");
+        assert_eq!(tag.transform, kaijutsu_ansi::TRANSFORM_NAME);
+        assert_eq!(tag.version, kaijutsu_ansi::PARSER_VERSION);
+
+        match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["old_version"], 0);
+                assert_eq!(v["new_version"], kaijutsu_ansi::PARSER_VERSION);
+                assert_eq!(v["spans"], after.style_spans.len());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The guard that keeps reproject a *styling* operation: a block edited
+    /// since ingest no longer matches its original, and reproject refuses
+    /// rather than overwriting the edit.
+    #[tokio::test]
+    async fn block_reproject_refuses_edited_block() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_projected_block(
+            &d,
+            ctx,
+            ANSI_ORIGINAL,
+            Some("someone edited this after ingest"),
+        );
+
+        let result = d
+            .dispatch(&[s("block"), s("reproject"), bid.to_key()], &c)
+            .await;
+        assert!(!result.is_ok(), "expected a refusal, got: {}", result.message());
+        let msg = result.message();
+        assert!(msg.contains("diverged"), "unexpected message: {msg}");
+        assert!(msg.contains("overwrite edits"), "unexpected message: {msg}");
+
+        let after = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(after.content, "someone edited this after ingest");
+        assert!(
+            after.style_spans.is_empty(),
+            "a refused reproject must leave spans untouched"
+        );
+    }
+
+    /// Reproject only knows `ansi-strip`; any other transform is refused by
+    /// name rather than silently reprojecting with the wrong parser.
+    #[tokio::test]
+    async fn block_reproject_unknown_transform_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_projected_block(&d, ctx, ANSI_ORIGINAL, None);
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("reproject"),
+                    bid.to_key(),
+                    s("--transform"),
+                    s("nonesuch"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "expected an error, got: {}", result.message());
+        assert!(
+            result.message().contains("no parser registered"),
+            "unexpected message: {}",
+            result.message()
+        );
     }
 }

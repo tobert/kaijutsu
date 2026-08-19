@@ -915,10 +915,31 @@ pub fn selection_rect_geometry(
 /// and the word-level background washes — the "walk clusters in the cached
 /// layout" step `docs/diff.md` recorded as the cost of word backgrounds turns
 /// out to be a library call we already had.
-pub fn layout_rects(
-    layout: &parley::Layout<peniko::Brush>,
+pub fn layout_rects<B: parley::Brush>(
+    layout: &parley::Layout<B>,
     bytes: std::ops::Range<usize>,
 ) -> Vec<crate::shaders::SelectionRect> {
+    layout_rects_with_lines(layout, bytes)
+        .into_iter()
+        .map(|(rect, _)| rect)
+        .collect()
+}
+
+/// [`layout_rects`] keeping each rect's **visual line index**.
+///
+/// The rect alone says where a range sits; it does not say where that line's
+/// *baseline* is, and an underline drawn from the box bottom instead of the
+/// baseline drifts with the line height. Callers that draw a decoration ask
+/// for the line and read `Layout::get(line).metrics()`; callers that draw a
+/// fill (selection, word wash) do not care and use the wrapper above.
+///
+/// Generic over parley's brush currency for the same reason the collectors
+/// are: the conversation surface's ANSI path lays out in `text::ansi::
+/// StyledBrush`, and nothing in a selection walk looks at a color.
+pub fn layout_rects_with_lines<B: parley::Brush>(
+    layout: &parley::Layout<B>,
+    bytes: std::ops::Range<usize>,
+) -> Vec<(crate::shaders::SelectionRect, usize)> {
     use crate::shaders::SelectionRect;
     use parley::editing::{Cursor, Selection};
     use parley::layout::Affinity;
@@ -946,7 +967,7 @@ pub fn layout_rects(
             _ => out.push((next, line)),
         }
     });
-    out.into_iter().map(|(rect, _)| rect).collect()
+    out
 }
 
 /// Background washes behind the words the refinement marked changed.

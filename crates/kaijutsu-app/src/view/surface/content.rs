@@ -142,8 +142,27 @@ pub struct FormattedBlock {
     /// Base text color (`block_color`).
     pub color: Color,
     /// Per-byte-range brushes for the text above. Empty for everything but
-    /// markdown today.
+    /// markdown, Output and diff.
     pub spans: Vec<SpanBrush>,
+    /// The block's ANSI style spans, resolved against this theme
+    /// (`text::ansi::resolve_style_spans`).
+    ///
+    /// A separate list from `spans` and not a merge of the two, because they
+    /// are different currencies: `spans` is a `peniko::Brush` per range, and
+    /// these carry a style-table index, an MSDF weight and their own geometry
+    /// (backgrounds, underlines). Nothing produces both today — ANSI spans
+    /// come from shell output that rich detection leaves alone — and where
+    /// they do meet, `shape_cache::shape_chunk` prefers these, because they
+    /// are the currency that can express the other's coloring and not the
+    /// reverse.
+    ///
+    /// **Not honoured by the drawn rich kinds.** A block that detects as ABC,
+    /// SVG, a sparkline, a diff or an image shapes through
+    /// `super::rich::RichShaper`, which builds its own geometry and never sees
+    /// this list — ANSI on such a block is dropped. That combination does not
+    /// arise from the ingest hooks today (shell output is plain), and giving
+    /// the rich shaper a second span currency is deferred until it does.
+    pub style_spans: Vec<crate::text::ansi::StyledSpan>,
     /// Which rich renderer this block wants.
     pub rich: Option<RichKindInfo>,
     /// The detected payload the renderer draws from — the parsed diff, the
@@ -186,12 +205,23 @@ pub struct FormattedBlock {
     spans_fingerprint: u64,
 }
 
-/// Order-sensitive fingerprint of a span list: its ranges and its colors.
+/// Order-sensitive fingerprint of a block's two span lists.
 ///
 /// `SpanBrush` has no `PartialEq` (peniko brushes carry gradients and images),
 /// and the only question asked of it here is "did the coloring move", so a
 /// hash of the resolved RGBA is both sufficient and cheap.
-fn spans_fingerprint(spans: &[SpanBrush]) -> u64 {
+///
+/// The styled half is hashed field-by-field
+/// (`text::ansi::styled_spans_fingerprint`) rather than by color alone,
+/// because an ANSI span carries things a color cannot express: which palette
+/// slot the GPU will resolve, how heavy the stem is, whether there is a
+/// background quad or an underline under it. An attribute that moves without
+/// moving this hash is a block that keeps its old shaping — silently, since
+/// nothing downstream re-checks.
+fn spans_fingerprint(
+    spans: &[SpanBrush],
+    style_spans: &[crate::text::ansi::StyledSpan],
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     spans.len().hash(&mut hasher);
@@ -200,6 +230,7 @@ fn spans_fingerprint(spans: &[SpanBrush]) -> u64 {
         span.end.hash(&mut hasher);
         crate::text::msdf::layout_bridge::brush_to_rgba8(&span.brush).hash(&mut hasher);
     }
+    crate::text::ansi::styled_spans_fingerprint(style_spans, &mut hasher);
     hasher.finish()
 }
 
@@ -261,6 +292,7 @@ impl BlockContentCache {
                 text: String::new(),
                 color: Color::WHITE,
                 spans: Vec::new(),
+                style_spans: Vec::new(),
                 rich: None,
                 rich_content: None,
                 status: border.status,
@@ -327,6 +359,14 @@ pub fn sync_block_content(
 
     let local_ctx = doc_cache.active_id();
     let epoch = theme_epoch.get();
+    // Built once per sweep, not once per block: the 6×6×6 cube and the
+    // grayscale ramp are arithmetic, and re-deriving them per block would be
+    // 256 slots of it for every styled row on screen.
+    let palette = theme.ansi.palette_256();
+    // What an inverted span's glyphs are painted with when the span itself
+    // names no background — the surface behind the text, which is what a
+    // terminal reverses against.
+    let default_bg = crate::text::color_to_rgba8(theme.bg);
 
     for id in wanted {
         let Some(block) = editor.block_snapshot(&id) else {
@@ -373,7 +413,22 @@ pub fn sync_block_content(
             rich,
             content: rich_content,
         } = detected;
-        let spans_fp = spans_fingerprint(&spans);
+
+        // Deliberately **outside** the detection reuse gate above. ANSI spans
+        // are not something detection derives — they arrive on the snapshot,
+        // already parsed by the kernel — so `rich_input_fingerprint` (which
+        // documents itself as exactly `detect_rich_content_typed`'s input set)
+        // stays honest about its own inputs, and staleness is prevented by
+        // simply re-resolving these every sweep. Cheap: the list is empty for
+        // every block that did not come through an ingest transform, and a
+        // resolved span is a handful of integer moves.
+        let style_spans = crate::text::ansi::resolve_style_spans(
+            &block.style_spans,
+            crate::text::color_to_rgba8(color),
+            default_bg,
+            &palette,
+        );
+        let spans_fp = spans_fingerprint(&spans, &style_spans);
 
         // Only shaping-relevant movement restamps the version — colors are the
         // shaper's fast path, not its trigger (see `FormattedBlock::version`).
@@ -404,6 +459,7 @@ pub fn sync_block_content(
                 text,
                 color,
                 spans,
+                style_spans,
                 rich,
                 rich_content,
                 status: block.status,
@@ -844,6 +900,143 @@ mod tests {
         ] {
             assert!(kind.is_drawn(), "{kind:?} draws something parley cannot");
         }
+    }
+
+    // ---- ANSI style spans ------------------------------------------------
+
+    /// Replace one block's ANSI style spans and advance the document version —
+    /// the shape a `SpansChanged` fold (or a `kj block reproject`) takes once
+    /// it reaches the app's mirror.
+    fn set_style_spans(app: &mut App, id: BlockId, spans: Vec<kaijutsu_types::StyleSpan>) {
+        let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
+        let mut editor = app.world_mut().get_mut::<CellEditor>(main_ent).unwrap();
+        let version = editor.version();
+        let principal = editor.store.principal_id();
+        let mut snapshots = editor.blocks();
+        for snapshot in &mut snapshots {
+            if snapshot.id == id {
+                snapshot.style_spans = spans.clone();
+            }
+        }
+        let mut store = editor
+            .store
+            .rebuild(id.context_id, principal, snapshots.iter(), |_| false)
+            .expect("rebuild");
+        store.set_version(version + 1);
+        editor.store = store;
+    }
+
+    fn ansi_span(start: u32, end: u32) -> kaijutsu_types::StyleSpan {
+        kaijutsu_types::StyleSpan {
+            start,
+            end,
+            fg: None,
+            bg: None,
+            attrs: kaijutsu_types::StyleAttrs::default(),
+        }
+    }
+
+    /// A block with no ingest transform behind it carries no styled spans, and
+    /// that emptiness is what keeps it on the plain shaping path (and out of
+    /// the theme-epoch `ShapeKey`).
+    #[test]
+    fn an_ordinary_block_has_no_style_spans() {
+        let mut app = content_app();
+        let ids = seed(&mut app, &["hello"]);
+        app.update();
+        assert!(cache(&app).get(&ids[0]).unwrap().style_spans.is_empty());
+    }
+
+    /// Spans arriving on a block whose text never changed must restamp its
+    /// version — the whole point of `SpansChanged` and of `kj block reproject`
+    /// is that the colors show up without an edit.
+    #[test]
+    fn spans_arriving_on_unchanged_text_restamp_the_version() {
+        let mut app = content_app();
+        let ids = seed(&mut app, &["hello"]);
+        app.update();
+        let before = cache(&app).get(&ids[0]).unwrap().version;
+
+        set_style_spans(
+            &mut app,
+            ids[0],
+            vec![kaijutsu_types::StyleSpan {
+                fg: Some(kaijutsu_types::StyleColor::Indexed(1)),
+                ..ansi_span(0, 5)
+            }],
+        );
+        app.update();
+
+        let after = cache(&app).get(&ids[0]).unwrap();
+        assert_eq!(after.text, "hello", "test premise: the text did not move");
+        assert_eq!(after.style_spans.len(), 1);
+        assert!(
+            after.version > before,
+            "a span-only change must invalidate the shaped glyphs",
+        );
+    }
+
+    /// The trap this closes: an attribute change that leaves every *color*
+    /// alone. Underline is drawn in the geometry lane, so a fingerprint that
+    /// hashed colors only would leave the block shaped without it, forever.
+    #[test]
+    fn an_underline_only_span_change_restamps_the_version() {
+        let mut app = content_app();
+        let ids = seed(&mut app, &["hello"]);
+        let red = kaijutsu_types::StyleSpan {
+            fg: Some(kaijutsu_types::StyleColor::Indexed(1)),
+            ..ansi_span(0, 5)
+        };
+        set_style_spans(&mut app, ids[0], vec![red]);
+        app.update();
+        let before = cache(&app).get(&ids[0]).unwrap().version;
+
+        set_style_spans(
+            &mut app,
+            ids[0],
+            vec![kaijutsu_types::StyleSpan {
+                attrs: kaijutsu_types::StyleAttrs::UNDERLINE,
+                ..red
+            }],
+        );
+        app.update();
+
+        let after = cache(&app).get(&ids[0]).unwrap();
+        assert!(after.style_spans[0].underline, "test premise: underline is on");
+        assert!(
+            after.version > before,
+            "an attribute-only span change must restamp the version",
+        );
+    }
+
+    /// Same trap, the weight axis: bold changes no color at all — it is an
+    /// `importance` on the glyph — so the fingerprint has to see it too.
+    #[test]
+    fn a_bold_only_span_change_restamps_the_version() {
+        let mut app = content_app();
+        let ids = seed(&mut app, &["hello"]);
+        let red = kaijutsu_types::StyleSpan {
+            fg: Some(kaijutsu_types::StyleColor::Indexed(1)),
+            ..ansi_span(0, 5)
+        };
+        set_style_spans(&mut app, ids[0], vec![red]);
+        app.update();
+        let before = cache(&app).get(&ids[0]).unwrap().version;
+
+        set_style_spans(
+            &mut app,
+            ids[0],
+            vec![kaijutsu_types::StyleSpan {
+                attrs: kaijutsu_types::StyleAttrs::BOLD,
+                ..red
+            }],
+        );
+        app.update();
+
+        assert!(
+            cache(&app).get(&ids[0]).unwrap().version > before,
+            "a weight-only span change must restamp the version",
+        );
     }
 
     /// A color-only change must NOT restamp the content version: colors are

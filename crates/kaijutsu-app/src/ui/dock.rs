@@ -247,8 +247,8 @@ pub struct SouthDock;
 /// same job the old `Affine::translate((x, y))` transform did, since a glyph
 /// run's own `offset()`/`baseline()` are already relative to that top-left
 /// origin. Single-color text — no span brushes, `brush` is the fallback for
-/// every glyph — same as a block cell's checkbox glyphs
-/// (`view::block_render::build_block_scenes`).
+/// every glyph — same as the conversation surface's gutter checkbox glyphs
+/// (`view::surface::chrome`).
 pub(crate) fn collect_dock_text_glyphs(
     glyphs: &mut Vec<PositionedGlyph>,
     text: &str,

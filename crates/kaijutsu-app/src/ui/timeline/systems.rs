@@ -37,8 +37,14 @@ pub fn sync_timeline_version(
 /// This creates the visual "time travel" effect.
 ///
 /// Note: This system only updates the TimelineVisibility component.
-/// The actual opacity application happens in sync_block_cell_buffers
-/// which reads the opacity and applies it to the text color.
+///
+/// **Currently unconsumed**: the legacy per-block-cell path (deleted in
+/// slice 5, docs/conversation-surface.md) applied this opacity to text
+/// color from `sync_block_cell_buffers`; the conversation surface
+/// (`view::surface`) never grew an equivalent, and nothing spawns
+/// `TimelineVisibility` any more either. Timeline dimming has had no live
+/// effect since `Surface` became the default renderer (slice 4). Tracked in
+/// `docs/issues.md`.
 pub fn update_block_visibility(
     timeline: Res<TimelineState>,
     mut block_query: Query<&mut TimelineVisibility>,

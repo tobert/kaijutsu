@@ -105,6 +105,24 @@ enum InputMode {
   shell @1;
 }
 
+# One styled range over a block's STRIPPED content (docs/ansi-and-beyond.md).
+# Byte-addressed into `content`, always on UTF-8 char boundaries. Colors are
+# semantic (palette index or raw truecolor), resolved at draw time — themes
+# apply to terminal output.
+struct StyleSpan {
+  start @0 :UInt32;              # Byte offset of span start in content
+  end @1 :UInt32;                # Byte offset of span end (exclusive)
+  # fg/bg color kind: 0 = none, 1 = indexed (value = palette slot 0-255),
+  # 2 = rgb (value = 0x00RRGGBB).
+  fgKind @2 :UInt8;
+  fgValue @3 :UInt32;
+  bgKind @4 :UInt8;
+  bgValue @5 :UInt32;
+  # Attribute bitset, mirrors Rust StyleAttrs: 1=bold 2=dim 4=italic
+  # 8=underline 16=inverse 32=strikethrough 64=blink.
+  attrs @6 :UInt16;
+}
+
 # Flat block snapshot — all fields present, some unused depending on kind.
 struct BlockSnapshot {
   # Identity. Author (who PLAYED) is derived from id.principalId — there is no
@@ -192,6 +210,14 @@ struct BlockSnapshot {
   # Task lifecycle status (task blocks). "" falls back to "open" — same
   # "empty = default" convention as contentType (no dedicated capnp enum).
   taskStatus @41 :Text;
+
+  # Styled spans + ingest provenance (docs/ansi-and-beyond.md). Empty list =
+  # no spans; empty provenanceTransform = no provenance tag (the "empty =
+  # unset" convention, like contentType/taskStatus). The byte-exact original
+  # never rides the wire — `kj block original` reads it from the kernel.
+  styleSpans @42 :List(StyleSpan);
+  provenanceTransform @43 :Text;
+  provenanceVersion @44 :UInt32;
 }
 
 # Scalar block metadata carried by onBlockMetadataChanged.
@@ -278,6 +304,9 @@ enum BlockFlowKind {
   # in the 2026-08-15 flag day). Filterable like any other block-level event.
   textAppended @11;
   textReplaced @12;
+  # style_spans/provenance changed after insert — reprojection
+  # (`kj block reproject`) or a late-arriving ingest projection.
+  spansChanged @13;
 }
 
 # ============================================================================
@@ -408,6 +437,17 @@ struct BlockInsert {
   hasAfterId @2 :Bool;
 }
 
+# A block's styled spans (and/or provenance tag) changed after insert —
+# reprojection or a late-arriving ingest projection. Snapshot-only fields:
+# never on BlockHeader, never in metadataChanged (that struct is scalar-only
+# by charter).
+struct BlockSpansChange {
+  blockId @0 :BlockId;
+  styleSpans @1 :List(StyleSpan);
+  provenanceTransform @2 :Text;   # "" = no provenance tag
+  provenanceVersion @3 :UInt32;
+}
+
 # A block moved. `hasAfterId` false means "to the beginning".
 struct BlockMove {
   blockId @0 :BlockId;
@@ -464,6 +504,7 @@ struct ContextEvent {
     excludedChanged @8 :BlockFlagChange;
     metadataChanged @9 :BlockMetadataChange;
     outputChanged @10 :BlockOutputChange;
+    spansChanged @11 :BlockSpansChange;
   }
 }
 

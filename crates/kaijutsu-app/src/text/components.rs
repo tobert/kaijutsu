@@ -5,7 +5,16 @@ use bevy::prelude::*;
 /// Rainbow color cycling effect marker.
 ///
 /// When present, the text brush uses a gradient instead of a solid color.
+///
+/// Unused as of slice 5 (conversation-surface decapitation, 2026-08-18):
+/// this and [`rainbow_brush`] were the legacy per-block-cell path's plumbing
+/// for `Theme::font_rainbow` (default **on**), and that path is gone. The
+/// conversation surface (`view::surface::content`) never grew an equivalent
+/// — `font_rainbow` is now a theme knob with no renderer behind it. Kept
+/// (not deleted) as the reference implementation for whoever ports it;
+/// tracked in `docs/issues.md`.
 #[derive(Component, Default, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct KjTextEffects {
     pub rainbow: bool,
 }
@@ -48,6 +57,9 @@ pub fn color_to_rgba8(color: Color) -> [u8; 4] {
 /// the gradient start point over time, creating a smooth scrolling effect.
 ///
 /// Uses `Extend::Repeat` so the palette tiles seamlessly across any text width.
+///
+/// Unused as of slice 5 — see [`KjTextEffects`]'s doc comment.
+#[allow(dead_code)]
 pub fn rainbow_brush(offset: f32, alpha: f32) -> peniko::Brush {
     use peniko::color::DynamicColor;
     use peniko::{Extend, Gradient};

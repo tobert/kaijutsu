@@ -37,14 +37,15 @@
 //! and there is no chrome-front pass in this slice. Add one when a selection
 //! or cursor lands on the conversation — not before.
 //!
-//! # What is deliberately NOT here
+//! # Where the words are
 //!
-//! Block border **labels** ("TOOL CALL claude", "running") and the gutter
-//! inclusion checkbox are glyph runs, not quads: they need shaping, a cache
-//! keyed by label text, and the fieldset inset that lets a label straddle the
-//! stroke. They are the visible gap between this slice and legacy, tracked in
-//! `docs/issues.md`. The label-gap *mechanism* is here — the role divider
-//! needs it — but only for the one label the surface does shape.
+//! Block border **labels** ("TOOL CALL kaish", "running") and the gutter
+//! inclusion checkbox are glyph runs, not quads, so they live in
+//! [`super::labels`] and are drawn by the glyph pass. What this module owns of
+//! them is the *hole*: [`border_label_gaps`] turns a block's shaped captions
+//! into the stroke-suppressed ranges and fieldset insets its
+//! [`ChromeInstance`] carries, using `labels`' own placement arithmetic so the
+//! gap and the letters in it are never computed twice.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,7 +71,10 @@ use crate::view::role_divider;
 
 use super::ConversationSurface;
 use super::content::BlockContentCache;
-use super::shape_cache::{HeaderLabelCache, SurfaceMetricsEpoch, surface_wrap_width};
+use super::labels::{self, BlockLabels};
+use super::shape_cache::{
+    HeaderLabelCache, ShapedBlockCache, SurfaceMetricsEpoch, surface_wrap_width,
+};
 
 // ============================================================================
 // LAYOUT
@@ -237,11 +241,10 @@ impl BlockChromeCache {
 ///
 /// Per-row cost is a match on the block's
 /// [`BorderInputs`](crate::cell::block_border::BorderInputs) plus, for the
-/// bordered kinds, the label strings `compute_border_style` builds — which
-/// this path does not draw yet. Those allocations stay rather than being
-/// forked into a second, label-free copy of the border rules: sharing the
-/// rules is the point, and they disappear on their own when the labels land
-/// (see `docs/issues.md`).
+/// bordered kinds, the label strings `compute_border_style` builds. Those
+/// allocations are now *used* — the shape pass reads them straight off this
+/// cache ([`super::labels::block_label_spec`]) and probes its run cache with
+/// them, allocating nothing further.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_block_chrome(
     entities: Res<EditorEntities>,
@@ -375,7 +378,8 @@ pub const CHROME_ANIM_CHASE: f32 = 3.0;
 ///
 /// Field order is the vertex-attribute order — see
 /// `ConversationSurfaceRenderer::chrome_instance_layout`, whose offsets are
-/// pinned by a test. `#[repr(C)]` with no padding (16+16+8+8+4+4 = 56 bytes).
+/// pinned by a test. `#[repr(C)]` with no padding
+/// (16+16+16+8+8+4+4 = 72 bytes).
 ///
 /// There is deliberately **no fill color**: `block_fx.wgsl` paints no block
 /// background (the block texture's transparent pixels show the pane behind),
@@ -388,9 +392,20 @@ pub struct ChromeInstance {
     /// `[corner_radius, thickness, glow_radius, glow_intensity]`, logical px
     /// for the two radii.
     pub params: [f32; 4],
-    /// Stroke-suppressed gap `[x0, x1]`, **rect-local** logical px. Both zero
-    /// = no gap. The role divider's label straddles the line through this.
-    pub label_gap: [f32; 2],
+    /// Stroke-suppressed gaps in **rect-local** logical px:
+    /// `[top_x0, top_x1, bottom_x0, bottom_x1]`. All zero = no gap. Same
+    /// packing as `block_fx.wgsl`'s `label_gaps` uniform, so the two shaders
+    /// read alike.
+    ///
+    /// `CENTER_LINE` uses only `xy` — a rule through the vertical center has
+    /// no top/bottom distinction, and the role divider's label breaks it
+    /// there.
+    pub label_gap: [f32; 4],
+    /// Fieldset insets `[top, bottom]`, logical px: how far the stroke moves
+    /// inward from the box edge so a label can straddle it. Zero = the
+    /// default 1px AA inset, exactly as `border_stroke.zw` means it on the
+    /// legacy path.
+    pub insets: [f32; 2],
     /// `[anim_mode, phase]`. Phase is added to the time uniform, so two
     /// instances with the same mode can breathe out of step; every instance
     /// built today passes `0.0`, which is legacy's behavior (one global
@@ -428,6 +443,56 @@ impl ChromeInstance {
     }
 }
 
+/// What a block's captions demand of its border stroke: where to stop
+/// drawing, and how far to move inward so the letters straddle the line.
+///
+/// [`Default`] is "no labels" — an unbroken stroke at the default AA inset,
+/// which is what a block with no captions wants and also what a block whose
+/// captions have not been shaped yet must get. Guessing a gap for a label
+/// that isn't on screen would draw a notch with nothing in it; the role
+/// divider already takes exactly that fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BorderLabelGaps {
+    /// `[top_x0, top_x1, bottom_x0, bottom_x1]`, rect-local logical px.
+    pub gap: [f32; 4],
+    /// `[top, bottom]` fieldset insets, logical px. Zero = default.
+    pub insets: [f32; 2],
+}
+
+/// Derive the stroke gaps from a block's shaped captions.
+///
+/// The arithmetic is `labels`', not restated here — the same functions the
+/// glyph assembly calls, so the hole in the stroke and the letters in it can
+/// never be computed two different ways.
+pub fn border_label_gaps(
+    labels: &BlockLabels,
+    rect_width: f32,
+    rect_height: f32,
+    theme: &Theme,
+) -> BorderLabelGaps {
+    let mut out = BorderLabelGaps::default();
+    if let Some(top) = labels.top.as_ref() {
+        let p = labels::top_label_placement(top.width, top.ascent, theme.label_inset, theme.label_pad);
+        out.gap[0] = p.gap_x0;
+        out.gap[1] = p.gap_x1;
+        out.insets[0] = p.border_inset;
+    }
+    if let Some(bottom) = labels.bottom.as_ref() {
+        let p = labels::bottom_label_placement(
+            bottom.width,
+            bottom.ascent,
+            rect_width,
+            rect_height,
+            theme.label_inset,
+            theme.label_pad,
+        );
+        out.gap[2] = p.gap_x0;
+        out.gap[3] = p.gap_x1;
+        out.insets[1] = p.border_inset;
+    }
+    out
+}
+
 /// Turn one block's border style into its instance.
 ///
 /// `rect` is the block's border box in document space. The glow is taken from
@@ -438,6 +503,7 @@ pub fn block_chrome_instance(
     style: &BlockBorderStyle,
     rect: [f32; 4],
     theme: &Theme,
+    gaps: BorderLabelGaps,
 ) -> ChromeInstance {
     let (glow_radius, glow_intensity) = if style.kind == BorderKind::CenterLine {
         (0.0, 0.0)
@@ -455,7 +521,8 @@ pub fn block_chrome_instance(
             glow_radius,
             glow_intensity,
         ],
-        label_gap: [0.0, 0.0],
+        label_gap: gaps.gap,
+        insets: gaps.insets,
         anim: [ChromeInstance::anim_of(style.animation), 0.0],
         color: color_to_rgba8(style.color),
         kind: ChromeInstance::kind_of(style.kind),
@@ -491,14 +558,16 @@ pub fn divider_instance(
                 theme.label_inset as f64,
                 theme.label_pad as f64,
             );
-            [div.gap_x0 as f32, div.gap_x1 as f32]
+            // Only `xy`: a center line has no top/bottom edge to break.
+            [div.gap_x0 as f32, div.gap_x1 as f32, 0.0, 0.0]
         }
-        None => [0.0, 0.0],
+        None => [0.0; 4],
     };
     ChromeInstance {
         rect_doc: rect,
         params: [0.0, role_divider::ROLE_DIVIDER_THICKNESS, 0.0, 0.0],
         label_gap,
+        insets: [0.0, 0.0],
         anim: [CHROME_ANIM_NONE, 0.0],
         color: color_to_rgba8(color),
         kind: CHROME_KIND_CENTER_LINE,
@@ -543,6 +612,7 @@ pub fn build_chrome_instances(
     geometries: Query<&ConversationGeometry>,
     chrome: Res<BlockChromeCache>,
     headers: Res<HeaderLabelCache>,
+    shaped: Res<ShapedBlockCache>,
     metrics_epoch: Res<SurfaceMetricsEpoch>,
     focus: Res<FocusTarget>,
     theme: Res<Theme>,
@@ -564,6 +634,7 @@ pub fn build_chrome_instances(
             geom,
             &chrome,
             &headers,
+            &shaped,
             metrics_epoch,
             &focus,
             &theme,
@@ -595,6 +666,7 @@ pub fn collect_chrome_instances(
     geom: &ConversationGeometry,
     chrome: &BlockChromeCache,
     headers: &HeaderLabelCache,
+    shaped: &ShapedBlockCache,
     metrics_epoch: u64,
     focus: &FocusTarget,
     theme: &Theme,
@@ -612,14 +684,14 @@ pub fn collect_chrome_instances(
                 let Some(entry) = chrome.get(&id) else {
                     continue;
                 };
-                // Focus keys off `FocusTarget.block_id`, never the
-                // `FocusedBlockCell` marker: that marker lives on a legacy
-                // block-cell entity, and there are none on this path.
+                // Focus keys off `FocusTarget.block_id` — the conversation
+                // is entity-free, so there is no per-block marker component
+                // to key off instead.
                 //
                 // Only the focused block pays a clone — `apply_focus_style`
-                // takes ownership because the legacy path inserts what it
-                // returns, and this runs over every in-window row every
-                // frame.
+                // takes ownership (its other caller, before slice 5, was an
+                // entity `insert`, which also wanted ownership), and this
+                // runs over every in-window row every frame.
                 let focused_style;
                 let style = if focus.is_block_focused(&id) {
                     focused_style = apply_focus_style(entry.style.clone(), true, theme);
@@ -636,7 +708,22 @@ pub fn collect_chrome_instances(
                     entry.layout.rect_width,
                     row.height,
                 ];
-                out.push(block_chrome_instance(style, rect, theme));
+                // Gaps come from the *shaped* captions, so a block whose
+                // labels haven't landed yet draws an unbroken stroke rather
+                // than a notch with nothing in it — the same fallback the
+                // role divider takes.
+                let gaps = shaped
+                    .get(&id)
+                    .map(|block| {
+                        border_label_gaps(
+                            &block.labels,
+                            entry.layout.rect_width,
+                            row.height,
+                            theme,
+                        )
+                    })
+                    .unwrap_or_default();
+                out.push(block_chrome_instance(style, rect, theme, gaps));
             }
             RowKey::Header(_) => {
                 if container_width <= 0.0 {
@@ -716,6 +803,11 @@ mod tests {
             drift_kind: None,
             error: None,
         }
+    }
+
+    /// "No captions shaped" — an unbroken stroke at the default AA inset.
+    fn no_gaps() -> BorderLabelGaps {
+        BorderLabelGaps::default()
     }
 
     fn style_of(inputs: &BorderInputs, theme: &Theme, has_result: bool) -> BlockBorderStyle {
@@ -815,7 +907,8 @@ mod tests {
             top_label: Some("thinking".into()),
             bottom_label: None,
         };
-        let inst = block_chrome_instance(&style, [10.0, 200.0, 400.0, 60.0], &theme);
+        let inst =
+            block_chrome_instance(&style, [10.0, 200.0, 400.0, 60.0], &theme, no_gaps());
 
         assert_eq!(inst.rect_doc, [10.0, 200.0, 400.0, 60.0]);
         assert_eq!(inst.params[0], 7.0, "corner radius");
@@ -825,7 +918,8 @@ mod tests {
         assert_eq!(inst.kind, CHROME_KIND_DASHED);
         assert_eq!(inst.anim, [CHROME_ANIM_BREATHE, 0.0]);
         assert_eq!(inst.color, color_to_rgba8(style.color));
-        assert_eq!(inst.label_gap, [0.0, 0.0]);
+        assert_eq!(inst.label_gap, [0.0; 4]);
+        assert_eq!(inst.insets, [0.0, 0.0]);
     }
 
     /// The `BorderKind`/`BorderAnimation` mappings are a contract with
@@ -854,7 +948,7 @@ mod tests {
         let theme = Theme::default();
         let mut style = style_of(&inputs(BlockKind::Thinking), &theme, false);
         style.kind = BorderKind::CenterLine;
-        let inst = block_chrome_instance(&style, [0.0, 0.0, 100.0, 20.0], &theme);
+        let inst = block_chrome_instance(&style, [0.0, 0.0, 100.0, 20.0], &theme, no_gaps());
         assert_eq!(inst.params[2], 0.0);
         assert_eq!(inst.params[3], 0.0);
     }
@@ -870,6 +964,7 @@ mod tests {
             &style_of(&running, &theme, false),
             [0.0, 0.0, 10.0, 10.0],
             &theme,
+            no_gaps(),
         );
         assert_eq!(inst.anim[0], CHROME_ANIM_CHASE);
 
@@ -879,6 +974,7 @@ mod tests {
             &style_of(&failed, &theme, false),
             [0.0, 0.0, 10.0, 10.0],
             &theme,
+            no_gaps(),
         );
         assert_eq!(inst.anim[0], CHROME_ANIM_PULSE);
     }
@@ -894,6 +990,7 @@ mod tests {
             &style_of(&running, &theme, false),
             [0.0, 0.0, 10.0, 10.0],
             &theme,
+            no_gaps(),
         );
 
         running.excluded = true;
@@ -901,9 +998,144 @@ mod tests {
             &style_of(&running, &theme, false),
             [0.0, 0.0, 10.0, 10.0],
             &theme,
+            no_gaps(),
         );
         assert_eq!(dim.anim[0], CHROME_ANIM_NONE);
         assert!(dim.color[3] < lit.color[3], "excluded must dim the stroke");
+    }
+
+    // ---- label gaps ------------------------------------------------------
+
+    /// A hand-built caption run, so the gap arithmetic can be checked without
+    /// a font context.
+    fn label_run(width: f32, ascent: f32) -> super::labels::LabelRun {
+        super::labels::LabelRun {
+            glyphs: Arc::new(Vec::new()),
+            width,
+            height: ascent + 3.0,
+            ascent,
+        }
+    }
+
+    /// The gap the shader cuts is exactly the caption's width plus a pad each
+    /// side, and the stroke moves inward by the fieldset inset so the letters
+    /// straddle it. This is the whole contract between `labels` and the
+    /// shader — get it wrong and the border draws through the words.
+    #[test]
+    fn a_caption_cuts_a_gap_of_its_own_width_in_the_stroke() {
+        let theme = Theme::default();
+        let (w, ascent) = (60.0_f32, 9.0_f32);
+        let gaps = border_label_gaps(
+            &BlockLabels {
+                top: Some(label_run(w, ascent)),
+                bottom: None,
+                checkbox: Some(label_run(11.0, 11.0)),
+            },
+            400.0,
+            80.0,
+            &theme,
+        );
+        // Top pair set, bottom pair untouched.
+        assert_eq!(gaps.gap[0], theme.label_inset);
+        assert_eq!(gaps.gap[1] - gaps.gap[0], w + 2.0 * theme.label_pad);
+        assert_eq!([gaps.gap[2], gaps.gap[3]], [0.0, 0.0]);
+        assert_eq!(gaps.insets, [labels::fieldset_inset(ascent), 0.0]);
+
+        // The checkbox lives inside the box and must never cut the stroke.
+        let checkbox_only = border_label_gaps(
+            &BlockLabels {
+                top: None,
+                bottom: None,
+                checkbox: Some(label_run(11.0, 11.0)),
+            },
+            400.0,
+            80.0,
+            &theme,
+        );
+        assert_eq!(checkbox_only, BorderLabelGaps::default());
+
+        // A bottom caption fills the other pair and the other inset.
+        let both = border_label_gaps(
+            &BlockLabels {
+                top: Some(label_run(w, ascent)),
+                bottom: Some(label_run(30.0, ascent)),
+                checkbox: None,
+            },
+            400.0,
+            80.0,
+            &theme,
+        );
+        assert_eq!(both.gap[3], 400.0 - theme.label_inset);
+        assert_eq!(both.gap[3] - both.gap[2], 30.0 + 2.0 * theme.label_pad);
+        assert_eq!(both.insets[1], labels::fieldset_inset(ascent));
+    }
+
+    /// The gap has to *reach the instance*, and only from a block whose
+    /// captions are actually shaped: an unshaped one draws an unbroken box
+    /// rather than a notch with nothing in it.
+    #[test]
+    fn the_instance_carries_the_gap_only_once_the_caption_is_shaped() {
+        let theme = Theme::default();
+        let geom = strip(3);
+        let cache = chrome_cache(&theme, &[(bid(2), BlockKind::Thinking)]);
+        let headers = HeaderLabelCache::default();
+        let focus = FocusTarget::default();
+
+        // Nothing shaped: the box is whole.
+        let mut out = Vec::new();
+        collect_chrome_instances(
+            &geom,
+            &cache,
+            &headers,
+            &ShapedBlockCache::default(),
+            0,
+            &focus,
+            &theme,
+            800.0,
+            2..3,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label_gap, [0.0; 4]);
+        assert_eq!(out[0].insets, [0.0, 0.0]);
+
+        // Shape the "thinking" caption and the gap appears, sized to it.
+        let mut shaped = ShapedBlockCache::default();
+        let mut block = super::super::shape_cache::ShapedBlock {
+            key: super::super::shape_cache::ShapeKey {
+                content_version: 1,
+                wrap_width_bits: 800.0_f32.to_bits(),
+                collapsed: false,
+                indent_level: 0,
+                metrics_epoch: 0,
+                baked_theme_epoch: 0,
+            },
+            chunks: Vec::new(),
+            height: 40.0,
+            text_height: 40.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            glyph_count: 0,
+            last_used: 0,
+            color: Color::WHITE,
+            text_len: 0,
+            streaming: false,
+            labels: BlockLabels::default(),
+        };
+        block.labels.top = Some(label_run(52.0, 9.0));
+        shaped.insert_for_test(bid(2), block);
+
+        out.clear();
+        collect_chrome_instances(
+            &geom, &cache, &headers, &shaped, 0, &focus, &theme, 800.0, 2..3, &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label_gap[0], theme.label_inset);
+        assert_eq!(
+            out[0].label_gap[1] - out[0].label_gap[0],
+            52.0 + 2.0 * theme.label_pad,
+        );
+        assert_eq!(out[0].insets[0], labels::fieldset_inset(9.0));
     }
 
     // ---- divider ---------------------------------------------------------
@@ -921,7 +1153,8 @@ mod tests {
         );
         assert_eq!(
             inst.label_gap,
-            [expected.gap_x0 as f32, expected.gap_x1 as f32],
+            [expected.gap_x0 as f32, expected.gap_x1 as f32, 0.0, 0.0],
+            "a center line breaks only on the xy pair — it has no bottom edge",
         );
         assert_eq!(inst.kind, CHROME_KIND_CENTER_LINE);
         assert_eq!(inst.params[1], role_divider::ROLE_DIVIDER_THICKNESS);
@@ -932,7 +1165,7 @@ mod tests {
     fn an_unshaped_label_leaves_the_rule_unbroken() {
         let theme = Theme::default();
         let inst = divider_instance(Role::Model, [0.0, 0.0, 800.0, 20.0], None, &theme);
-        assert_eq!(inst.label_gap, [0.0, 0.0]);
+        assert_eq!(inst.label_gap, [0.0; 4]);
     }
 
     #[test]
@@ -992,13 +1225,31 @@ mod tests {
         let mut focus = FocusTarget::default();
         let mut out = Vec::new();
         collect_chrome_instances(
-            &geom, &cache, &headers, 0, &focus, &theme, 800.0, 2..3, &mut out,
+            &geom,
+            &cache,
+            &headers,
+            &ShapedBlockCache::default(),
+            0,
+            &focus,
+            &theme,
+            800.0,
+            2..3,
+            &mut out,
         );
         assert!(out.is_empty(), "an unfocused plain block draws no chrome");
 
         focus.focus_block(bid(2));
         collect_chrome_instances(
-            &geom, &cache, &headers, 0, &focus, &theme, 800.0, 2..3, &mut out,
+            &geom,
+            &cache,
+            &headers,
+            &ShapedBlockCache::default(),
+            0,
+            &focus,
+            &theme,
+            800.0,
+            2..3,
+            &mut out,
         );
         assert_eq!(out.len(), 1);
         let row = geom.block_row(&bid(2)).unwrap();
@@ -1017,6 +1268,7 @@ mod tests {
             &geom,
             &cache,
             &HeaderLabelCache::default(),
+            &ShapedBlockCache::default(),
             0,
             &FocusTarget::default(),
             &theme,
@@ -1038,6 +1290,7 @@ mod tests {
             &geom,
             &chrome_cache(&theme, &[]),
             &HeaderLabelCache::default(),
+            &ShapedBlockCache::default(),
             0,
             &FocusTarget::default(),
             &theme,
@@ -1131,6 +1384,7 @@ mod tests {
         app.init_resource::<HeaderLabelCache>();
         app.init_resource::<SurfaceMetricsEpoch>();
         app.init_resource::<BlockChromeCache>();
+        app.init_resource::<ShapedBlockCache>();
         app.add_systems(Update, build_chrome_instances);
         app
     }

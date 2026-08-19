@@ -11,16 +11,20 @@
 // verbatim: sd_rounded_box, perimeter_param, border_stroke_alpha (every
 // BK_* kind), the breathe/pulse/chase animation modes, and the edge glow.
 //
+// Also ported: the fieldset label insets (border_stroke.zw on the legacy
+// side) and the TOP/BOTTOM label gaps, so a block's captions straddle their
+// own stroke. The surface shapes those glyphs in view/surface/labels.rs and
+// draws them in the glyph pass; this shader only cuts the hole.
+//
 // NOT ported, because the surface path has no such content (yet):
 //   * the block texture composite, the 9-tap text halo, and the gutter
 //     indicator flag — those all read a per-block texture that does not exist
 //     here (glyphs are drawn as instances into the same target instead);
 //   * the cursor beam and the selection wash — compose/editor surfaces, not
 //     the conversation;
-//   * the TOP/BOTTOM label gaps and the fieldset label insets — the surface
-//     does not shape block border labels yet. The CENTER_LINE label gap IS
-//     ported: the role divider's USER/ASSISTANT label is shaped and drawn, so
-//     the rule must break for it.
+//   * the chase-through-label brightening. block_fx can boost a label glyph
+//     because the glyph is IN the texture it is shading; here the glyphs are a
+//     later pass this one cannot reach. See docs/issues.md.
 //
 // Because block_fx composites its border and glow BEHIND the text (both are
 // masked by `1 - result.a`), the surface draws this pass FIRST and the glyph
@@ -52,12 +56,17 @@ struct InstanceInput {
     @location(0) rect_doc: vec4<f32>,
     // [corner_radius, thickness, glow_radius, glow_intensity]
     @location(1) params: vec4<f32>,
-    // Stroke-suppressed gap [x0, x1], rect-local logical px (0,0 = none).
-    @location(2) label_gap: vec2<f32>,
+    // Stroke-suppressed gaps, rect-local logical px:
+    // [top_x0, top_x1, bottom_x0, bottom_x1]. All zero = none. CENTER_LINE
+    // uses only .xy. Same packing as block_fx.wgsl's label_gaps uniform.
+    @location(2) label_gap: vec4<f32>,
+    // Fieldset insets [top, bottom]: how far the stroke moves inward so a
+    // label can straddle it. 0 = the default 1px AA inset.
+    @location(3) insets: vec2<f32>,
     // [anim_mode, phase]
-    @location(3) anim: vec2<f32>,
-    @location(4) color: vec4<f32>,
-    @location(5) kind: u32,
+    @location(4) anim: vec2<f32>,
+    @location(5) color: vec4<f32>,
+    @location(6) kind: u32,
 }
 
 struct VertexOutput {
@@ -67,9 +76,10 @@ struct VertexOutput {
     @location(1) half_size: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) params: vec4<f32>,
-    @location(4) label_gap: vec2<f32>,
+    @location(4) label_gap: vec4<f32>,
     @location(5) anim: vec2<f32>,
     @location(6) @interpolate(flat) kind: u32,
+    @location(7) insets: vec2<f32>,
 }
 
 // Border kinds — the same numbering as block_fx.wgsl's BK_* and
@@ -133,6 +143,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, inst: InstanceInput) -> Vert
     out.color = inst.color;
     out.params = inst.params;
     out.label_gap = inst.label_gap;
+    out.insets = inst.insets;
     out.anim = inst.anim;
     out.kind = inst.kind;
     return out;
@@ -174,20 +185,28 @@ fn perimeter_param(p: vec2<f32>, half: vec2<f32>) -> f32 {
 
 // Border stroke alpha at the box edge. `p` is centered on the rect.
 //
-// The label insets block_fx carries on border_stroke.zw are pinned to their
-// default (1px, symmetric) here — they exist to let a fieldset label straddle
-// the stroke, and the surface draws no block labels yet.
+// `insets` is block_fx's border_stroke.zw: the fieldset straddle, which moves
+// the top and/or bottom stroke inward by half a label's ascent so the letters
+// sit ON the line. Zero on either side means the default 1px AA inset. The box
+// becomes ASYMMETRIC when only one edge is inset, so the SDF is evaluated
+// against a re-centered point (`bp`) — same construction as block_fx.
 fn border_stroke_alpha(
     p: vec2<f32>,
     half_size: vec2<f32>,
+    insets: vec2<f32>,
     thickness: f32,
     corner_r: f32,
     kind: u32,
 ) -> f32 {
-    let inset = 1.0;
-    let border_half = vec2<f32>(half_size.x - inset, half_size.y - inset);
+    let inset_top = select(1.0, insets.x, insets.x > 0.0);
+    let inset_bottom = select(1.0, insets.y, insets.y > 0.0);
+    let center_y = (inset_top - inset_bottom) * 0.5;
+    let border_half = vec2<f32>(
+        half_size.x - 1.0,
+        half_size.y - (inset_top + inset_bottom) * 0.5,
+    );
     let aa = 1.0;
-    let bp = p;
+    let bp = vec2<f32>(p.x, p.y - center_y);
 
     if kind == BK_TOP_ACCENT {
         // Just the top edge: horizontal line near the top of the box.
@@ -303,14 +322,33 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // --- Border stroke ---
-    var stroke_a = border_stroke_alpha(p, half_size, thickness, corner_r, in.kind) * anim;
+    var stroke_a = border_stroke_alpha(p, half_size, in.insets, thickness, corner_r, in.kind) * anim;
 
-    // Label gap: the role divider's rule breaks where its label sits. Block
-    // labels (and their top/bottom gaps) are not drawn on this path yet.
-    if in.kind == BK_CENTER_LINE && (in.label_gap.x > 0.0 || in.label_gap.y > 0.0) {
-        let px_x = p.x + half_size.x;
-        if px_x >= in.label_gap.x && px_x <= in.label_gap.y {
+    // Label gaps: the stroke stops where a caption sits. Ported from
+    // block_fx.wgsl's gap block, including the near_top/near_bottom bands that
+    // keep a top caption from punching a hole in the bottom edge underneath it.
+    let px_x = p.x + half_size.x;
+    if in.kind == BK_CENTER_LINE {
+        // A rule through the vertical center has no top/bottom distinction —
+        // the line itself already limits y, so mask on x alone.
+        if (in.label_gap.x > 0.0 || in.label_gap.y > 0.0)
+            && px_x >= in.label_gap.x && px_x <= in.label_gap.y {
             stroke_a = 0.0;
+        }
+    } else {
+        let eff_inset_top = select(1.0, in.insets.x, in.insets.x > 0.0);
+        let eff_inset_bottom = select(1.0, in.insets.y, in.insets.y > 0.0);
+        if in.label_gap.x > 0.0 || in.label_gap.y > 0.0 {
+            let near_top = p.y < -half_size.y + eff_inset_top + thickness;
+            if near_top && px_x >= in.label_gap.x && px_x <= in.label_gap.y {
+                stroke_a = 0.0;
+            }
+        }
+        if in.label_gap.z > 0.0 || in.label_gap.w > 0.0 {
+            let near_bottom = p.y > half_size.y - eff_inset_bottom - thickness;
+            if near_bottom && px_x >= in.label_gap.z && px_x <= in.label_gap.w {
+                stroke_a = 0.0;
+            }
         }
     }
 

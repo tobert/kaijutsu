@@ -621,6 +621,25 @@ CREATE TABLE IF NOT EXISTS oplog (
     FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
+-- ── Ingest Provenance (docs/ansi-and-beyond.md) ─────────────────
+-- The byte-for-byte original an ingest transform consumed to produce a
+-- block's content (today: 'ansi-strip'). Kernel-side only — never rides the
+-- oplog, snapshots, or the change feed; fetched on demand (`kj block
+-- original`) and replayed by `kj block reproject`. Keyed on the BlockId
+-- components, NEVER oplog seq: compaction truncates the oplog and would
+-- orphan seq-keyed rows, while block ids survive it.
+CREATE TABLE IF NOT EXISTS block_provenance (
+    context_id    BLOB    NOT NULL,
+    principal_id  BLOB    NOT NULL,
+    block_seq     INTEGER NOT NULL,
+    transform     TEXT    NOT NULL,
+    version       INTEGER NOT NULL,
+    original      BLOB    NOT NULL,
+    created_at    INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (context_id, principal_id, block_seq, transform),
+    FOREIGN KEY (context_id) REFERENCES documents(document_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
 -- Compaction checkpoints: latest snapshot per document.
 CREATE TABLE IF NOT EXISTS doc_snapshots (
     document_id BLOB    NOT NULL PRIMARY KEY,
@@ -2373,6 +2392,92 @@ impl KernelDb {
             params![blob_param(document_id.as_bytes()), seq, payload],
         )?;
         Ok(())
+    }
+
+    /// Store the byte-exact original an ingest transform consumed for this
+    /// block (docs/ansi-and-beyond.md). `OR REPLACE`: originals are
+    /// write-once in practice, but re-running an ingest hook on the same
+    /// block must not fail — last write wins, and both writes carry the same
+    /// bytes by construction (the hook writes what it just stripped).
+    pub fn insert_block_provenance(
+        &self,
+        block_id: &BlockId,
+        transform: &str,
+        version: u32,
+        original: &[u8],
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO block_provenance
+                 (context_id, principal_id, block_seq, transform, version, original)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                blob_param(block_id.context_id.as_bytes()),
+                blob_param(block_id.principal_id.as_bytes()),
+                block_id.seq as i64,
+                transform,
+                version,
+                original,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch the stored original for one (block, transform), or `None` — a
+    /// block whose `provenance` tag names a transform with no row here is a
+    /// detectable gap (crash between the block write and this row), and
+    /// callers report it rather than inventing bytes.
+    pub fn get_block_provenance(
+        &self,
+        block_id: &BlockId,
+        transform: &str,
+    ) -> KernelDbResult<Option<(u32, Vec<u8>)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT version, original FROM block_provenance
+                 WHERE context_id = ?1 AND principal_id = ?2
+                   AND block_seq = ?3 AND transform = ?4",
+                params![
+                    blob_param(block_id.context_id.as_bytes()),
+                    blob_param(block_id.principal_id.as_bytes()),
+                    block_id.seq as i64,
+                    transform,
+                ],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List the transforms holding an original for this block:
+    /// `(transform, version, original_len)`. The bytes stay in the store —
+    /// this is the cheap "what could reproject?" question.
+    pub fn list_block_provenance(
+        &self,
+        block_id: &BlockId,
+    ) -> KernelDbResult<Vec<(String, u32, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT transform, version, length(original) FROM block_provenance
+             WHERE context_id = ?1 AND principal_id = ?2 AND block_seq = ?3
+             ORDER BY transform",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    blob_param(block_id.context_id.as_bytes()),
+                    blob_param(block_id.principal_id.as_bytes()),
+                    block_id.seq as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, i64>(2)? as usize,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// True when the named one-time migration has already been recorded in
@@ -11330,6 +11435,52 @@ mod tests {
 
     /// 1. Re-inserting a `DocumentRow` with an already-used `document_id`
     ///    must classify as `DuplicateDocument`, carrying the right id.
+    #[test]
+    fn block_provenance_roundtrip_and_cascade() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let doc_id = ContextId::new();
+        db.insert_document(&DocumentRow {
+            document_id: doc_id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: now_millis(),
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+
+        let block_id = BlockId::new(doc_id, PrincipalId::system(), 7);
+        let original = b"\x1b[31mred\x1b[0m plain";
+
+        assert_eq!(db.get_block_provenance(&block_id, "ansi-strip").unwrap(), None);
+
+        db.insert_block_provenance(&block_id, "ansi-strip", 1, original).unwrap();
+        let (version, bytes) = db
+            .get_block_provenance(&block_id, "ansi-strip")
+            .unwrap()
+            .expect("row just written");
+        assert_eq!(version, 1);
+        assert_eq!(bytes, original, "byte-exact round trip");
+
+        // OR REPLACE: a re-run updates in place (version bumps, no dup row).
+        db.insert_block_provenance(&block_id, "ansi-strip", 2, original).unwrap();
+        assert_eq!(
+            db.list_block_provenance(&block_id).unwrap(),
+            vec![("ansi-strip".to_string(), 2, original.len())]
+        );
+
+        // Cascade with the document — the eviction story provenance rides on.
+        db.conn
+            .execute(
+                "DELETE FROM documents WHERE document_id = ?1",
+                params![blob_param(doc_id.as_bytes())],
+            )
+            .unwrap();
+        assert_eq!(db.get_block_provenance(&block_id, "ansi-strip").unwrap(), None);
+    }
+
     #[test]
     fn insert_document_duplicate_id_is_typed_duplicate_document() {
         let db = KernelDb::temporary().unwrap();
