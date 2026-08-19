@@ -34,6 +34,38 @@ fields are slice 5. That is half of rule 4. Amy has approved a **read-only VFS
 mount** as the answer, so swaps are discoverable with `ls` and `grep` the way
 vim's sidecar file is; model it on `runtime/docs_filesystem.rs`.
 
+## Opening a file that already has an editor session should announce it (2026-08-19)
+
+Vim's E325. Amy, 2026-08-19: *"we'll also have ctrl-z like behavior so editors
+can be backgrounded with their swap, then if we start another, like vim it
+should detect that and tell me, so I can go back to the other one or shut it
+down."*
+
+Half of this already ships: Ctrl+Z suspend and `fg` resume are in (`docs/vi.md`
+Status), and `EditorSessions::quit` already computes `sibling_bound` — whether
+another session is bound to the same target — so "is someone already on this
+file" is computable today. What is missing is the announcement and the choice at
+open time.
+
+Shape to aim for, once `:w` flushes through the cache:
+
+- `editor_open` on a path with a live session announces it rather than silently
+  opening a second view.
+- The player can attach to the existing session or discard it. "Discard" must be
+  explicit, because the other session may hold unsaved work — the swap row and
+  the block are the evidence.
+- A backgrounded session holding unsaved work is exactly a vim swap file. Once
+  editor edits mark the cache dirty, `/v/swap/<kernel_id>/<path>` shows it,
+  which gives the announcement somewhere concrete to point.
+
+Note the interaction with shared sessions: two players on one block is a
+*supported* state here, not an error (`docs/vi.md`, "quit *me* out of the doc,
+leave the others playing"). So this is not "refuse the second open" — it is
+"tell the human what they are walking into". Crosstalk is a feature; a silent
+surprise is not.
+
+---
+
 ## File documents should be created lazily, not on every read (2026-08-19)
 
 The eventual model behind the slice 2 decision above, deferred deliberately.
