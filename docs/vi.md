@@ -26,7 +26,13 @@ cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin,
 `Kernel::editor_open` and one `EditorState::to_json` shape. The `:` command
 dialect shipped (core verbs, a hand-rolled `:s`, `:r <file>` / `:r !cmd`),
 as did Ctrl+Z suspend / `fg` resume. The cache-coherence and restart-staleness
-issues are fixed.
+issues are fixed. The editor now participates in the file-buffer layer it
+sits on (`docs/file-buffers.md`): an edit to a file-backed session marks the
+durable swap row, and `:w`/`:wq`/`:x`/`ZZ` flush to disk through the same
+`FileDocumentCache` every other writer uses — previously the editor mirrored
+edits onto the kernel block and never touched the cache at all, so `:w` on a
+file never reached disk and an unsaved edit had no swap row to survive a
+restart.
 
 **Open** (only in this doc; the backlog proper is `docs/issues.md`):
 
@@ -57,11 +63,13 @@ issues are fixed.
   last-edit-sequence machinery.
 - **`:s` refinements** — bare `:s` (repeat-last) errors; `.`/`$` symbolic
   ranges, `&`/`~` repeat, and finer-than-`set_text` undo granularity deferred.
-- **`:w!` changed-under-us guard.** `:w!` == `:w` today (decided 2026-06-27).
-  `CommandRequest::Write{force}` carries the bang for a future guard: when the
-  kernel detects the block moved since open (a concurrent writer), a plain `:w`
-  refuses and `:w!` overrides — vim's "file has changed since editing started".
-  Not a permission gate.
+- **`:w!` changed-under-us guard.** `:w!` == `:w` today (decided 2026-06-27):
+  both checkpoint and flush identically — force changes nothing yet.
+  `CommandRequest::Write{force}` carries the bang through
+  `KeysUpdate::forced` for a future guard: when the kernel detects the block
+  moved since open (a concurrent writer), a plain `:w` refuses and `:w!`
+  overrides — vim's "file has changed since editing started". Not a
+  permission gate.
 - **Exact-window peer targeting.** The `open_editor` signal fans out to the
   submitter *principal's* windows; targeting the submitter's exact `instance`
   needs the instance threaded onto the execute path
@@ -150,7 +158,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 | Verb | Does |
 |---|---|
 | `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
-| `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. **Async** since `:r` — sync-lock, release, await the fetch, sync-lock again; `EditorCore` never crosses the await, only the fetched `String` does. |
+| `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. A dirty file-backed edit marks the swap row; a `:w`/`:wq`/`:x`/`ZZ` inside the batch flushes to disk too (`docs/file-buffers.md`). **Async** since `:r` (and now the flush) — sync-lock, release, await, sync-lock again; `EditorCore` never crosses the await, only the fetched `String`/flush result does. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty (what a renderer draws). |
 | `editor_save(session)` | `ZZ` / `:w` — flush the document to its owner; advance the checkpoint. |
 | `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. |
@@ -363,8 +371,11 @@ push channel; the app renders it read-only.
 - **Core verbs:** `:w :q :wq :q! :x :w!`. `:q` on a dirty buffer **refuses**
   on the status line (vim's E37 "No write since last change"); `:q!` discards
   and rolls the block back (when provably alone — see Rollback's entanglement
-  guard); `:wq`/`:x` save-then-close; `:w` saves and stays. `:w!` == `:w`
-  (force is reserved — see Open).
+  guard); `:wq`/`:x` save-then-close; `:w` saves and stays. For a file-backed
+  session "saves" means both the kernel checkpoint *and* a
+  `FileDocumentCache::flush_one` to disk (`docs/file-buffers.md`); a
+  config/rc session has no host file, so only the checkpoint applies. `:w!`
+  == `:w` (force is reserved — see Open).
 - **Substitute:** `:s/old/new/`, `:%s/…/…/`, `:N,Ms/…/…/`. Hand-rolled
   (modalkit's `vim_cmd_substitute` is an explicit stub). **The dialect is Rust
   regex + Rust replacement syntax** (`$1` capture refs) — a deliberate choice

@@ -1302,6 +1302,13 @@ impl Kernel {
     /// this session updates. A `ZZ`/`ZQ` in the batch saves/discards and closes
     /// the session (modalkit disambiguates it from an inserted `ZZ`), publishing
     /// `Closed` instead — so a key forwarder never needs to detect quit itself.
+    ///
+    /// For a **file-backed** session (`docs/file-buffers.md`): an edit that
+    /// leaves the buffer dirty records the durable swap marker
+    /// (`file_cache.mark_dirty`) so unsaved work survives a restart; a batch
+    /// that executed a checkpoint (`:w`/`:wq`/`:x`/`ZZ`) flushes to disk
+    /// (`file_cache.flush_one`) instead. A config/rc session has no host file
+    /// and never touches the file cache (`EditorSessions::file_backed_path`).
     pub async fn editor_keys(
         &self,
         id: crate::editor::EditorSessionId,
@@ -1314,9 +1321,12 @@ impl Kernel {
         // fulfilled below: the async fetch happens *outside* the lock, so the
         // `!Send` `EditorCore` never crosses an await (the `SendSessions`
         // invariant); only the fetched `String` does.
-        let (path, outcome, io, io_cursor, io_opener) = {
+        let (path, file_path, outcome, io, io_cursor, io_opener) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
+            // Captured now (session still exists) — `Closed` outcomes below
+            // drop the session before the kernel ever sees it again.
+            let file_path = sessions.0.file_backed_path(id);
             let outcome = sessions.0.keys(id, keys, blocks)?;
             let io = if matches!(outcome, crate::editor::KeysOutcome::Updated(_)) {
                 sessions.0.take_io(id)
@@ -1330,7 +1340,7 @@ impl Kernel {
             // The opener context, captured at submit too — `:r !cmd` shells out
             // in it (the caller's context/capabilities, not the edited block's).
             let io_opener = io.as_ref().and_then(|_| sessions.0.session_opener(id));
-            (path, outcome, io, io_cursor, io_opener)
+            (path, file_path, outcome, io, io_cursor, io_opener)
         };
 
         // Fulfill a `:r` read: fetch the content, then splice it at the cursor
@@ -1362,6 +1372,14 @@ impl Kernel {
                     state
                 }
             };
+            // `:r` is an edit, never a save — mark dirty, don't flush.
+            if let Some(fp) = file_path.as_deref()
+                && state.dirty
+            {
+                self.file_cache
+                    .mark_dirty(fp)
+                    .map_err(|e| format!("editor :r: failed to mark {fp} dirty: {e}"))?;
+            }
             self.publish_editor_state(id, &state);
             return Ok(state);
         }
@@ -1372,15 +1390,52 @@ impl Kernel {
             self.invalidate_config_file_cache(path);
         }
         match outcome {
-            crate::editor::KeysOutcome::Updated(state) => {
+            crate::editor::KeysOutcome::Updated(update) => {
+                let mut state = update.state;
+                if let Some(fp) = file_path.as_deref() {
+                    if update.saved {
+                        if let Err(e) = self.file_cache.flush_one(fp).await {
+                            // Never serve content that never reached disk —
+                            // drop the stale cache entry, same as
+                            // `mount_backend.rs`'s write rollback.
+                            self.file_cache.invalidate(fp);
+                            state.message =
+                                Some(format!("E212: Can't open file for writing: {fp}: {e}"));
+                        }
+                    } else if state.dirty {
+                        self.file_cache.mark_dirty(fp).map_err(|e| {
+                            format!("editor keys: failed to mark {fp} dirty: {e}")
+                        })?;
+                    }
+                }
                 self.publish_editor_state(id, &state);
                 Ok(state)
             }
-            crate::editor::KeysOutcome::Closed(state) => {
+            crate::editor::KeysOutcome::Closed(update) => {
+                // The session is already gone (ZZ/`:wq`/`:x`/ZQ dropped it
+                // inside `EditorSessions::keys`) — there is no open session
+                // left to report a flush failure on the status line, so it
+                // surfaces as a hard error instead. This is the "infrastructure
+                // failure" class `docs/vi.md` reserves for exactly this: the
+                // app's session-lost detection keys on it, and here the
+                // session genuinely IS lost — closed, with the write it
+                // promised never landing.
+                let flush_err = if update.saved
+                    && let Some(fp) = file_path.as_deref()
+                    && let Err(e) = self.file_cache.flush_one(fp).await
+                {
+                    self.file_cache.invalidate(fp);
+                    Some(format!("E212: Can't open file for writing: {fp}: {e}"))
+                } else {
+                    None
+                };
                 self.editor_flows.publish(crate::flows::EditorFlow::Closed {
                     session_id: id.as_u64(),
                 });
-                Ok(state)
+                match flush_err {
+                    Some(e) => Err(e),
+                    None => Ok(update.state),
+                }
             }
         }
     }
@@ -1455,13 +1510,34 @@ impl Kernel {
         self.editor_sessions.lock().0.list()
     }
 
-    /// `ZZ` — checkpoint the session's buffer as saved. Publishes the now-clean
-    /// state (dirty flips false) so renderers reflect the save.
-    pub fn editor_save(
+    /// `ZZ` — checkpoint the session's buffer as saved, and for a file-backed
+    /// session (`docs/file-buffers.md`) flush it to disk. Publishes the
+    /// now-clean state (dirty flips false) so renderers reflect the save.
+    ///
+    /// The session stays open on a flush failure: this is the direct-call
+    /// path (the wire `editorSave`, `kj editor save`), not a `ZZ`/`:wq` that
+    /// already dropped the session — so, unlike `editor_keys`' `Closed` arm,
+    /// there is somewhere to report it. Mirrors `run_commands`' `Quit{force}`
+    /// dialect-level refusal: the status line gets the message, the call
+    /// still returns `Ok`, and the stale cache entry is invalidated so a
+    /// later read can't serve content that never reached disk (the same
+    /// rollback `mount_backend.rs`'s write path takes).
+    pub async fn editor_save(
         &self,
         id: crate::editor::EditorSessionId,
     ) -> Result<crate::editor::EditorState, String> {
-        let state = self.editor_sessions.lock().0.save(id)?;
+        let (file_path, mut state) = {
+            let mut sessions = self.editor_sessions.lock();
+            let file_path = sessions.0.file_backed_path(id);
+            let state = sessions.0.save(id)?;
+            (file_path, state)
+        };
+        if let Some(fp) = file_path.as_deref()
+            && let Err(e) = self.file_cache.flush_one(fp).await
+        {
+            self.file_cache.invalidate(fp);
+            state.message = Some(format!("E212: Can't open file for writing: {fp}: {e}"));
+        }
         self.publish_editor_state(id, &state);
         Ok(state)
     }
@@ -2306,6 +2382,204 @@ mod tests {
         // The session is alive and the message is transient.
         let state = kernel.editor_keys(id, "l").await.unwrap();
         assert!(state.message.is_none(), "message clears on the next batch");
+    }
+
+    // ── The gap: the editor never touched the file-document cache ───────────
+    // (docs/file-buffers.md). These cover the fix: an edit to a file-backed
+    // session records the durable swap marker, and `:w`/`:wq`/`ZZ` flush to
+    // disk through the same cache every other writer uses.
+
+    /// Mount a `MemoryBackend` (an ordinary, non-config VFS backend — no
+    /// `owns_config_docs`) so `resolve_editor_target` routes through
+    /// `FileDocumentCache::get_or_load`, the "ordinary file" branch, not the
+    /// config-doc branch the other editor tests in this module exercise.
+    async fn kernel_with_mem_fs() -> Kernel {
+        use crate::vfs::backends::MemoryBackend;
+        let kernel = Kernel::new_ephemeral("test").await;
+        kernel.mount("/mem", MemoryBackend::new()).await;
+        kernel
+    }
+
+    #[tokio::test]
+    async fn editor_edit_marks_a_file_backed_session_dirty_in_the_cache() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/note.txt");
+        kernel.vfs().write_all(path, b"hello").await.unwrap();
+
+        let (id, st) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        assert_eq!(st.text, "hello");
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .is_empty(),
+            "opening clean must not mark anything dirty"
+        );
+
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+
+        let rows = kernel.kernel_db().lock().list_dirty_file_buffers().unwrap();
+        assert!(
+            rows.iter().any(|r| r.path == "/mem/note.txt"),
+            "an edit to a file-backed session must record a dirty_file_buffers \
+             row — unsaved editor work must survive a restart, got rows: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn colon_w_flushes_a_file_backed_session_to_disk_and_clears_the_swap_row() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/note.txt");
+        kernel.vfs().write_all(path, b"hello").await.unwrap();
+
+        let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        // Not on disk yet — only `:w` flushes.
+        assert_eq!(
+            kernel.vfs().read_all(path).await.unwrap(),
+            b"hello",
+            "an edit alone must not reach disk"
+        );
+
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert!(!st.dirty, ":w clears the editor's own dirty flag");
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
+            "Xhello",
+            ":w must write the buffer to disk through the VFS"
+        );
+        assert!(
+            !kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "a flushed buffer's swap row must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn colon_wq_and_zz_flush_a_file_backed_session_before_closing() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+
+        // `:wq`
+        let path_a = Path::new("/mem/a.txt");
+        kernel.vfs().write_all(path_a, b"hello").await.unwrap();
+        let (id_a, _) = kernel.editor_open("/mem/a.txt").await.unwrap();
+        kernel.editor_keys(id_a, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id_a, ":wq<CR>").await.unwrap();
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path_a).await.unwrap()).unwrap(),
+            "Xhello",
+            ":wq must flush before closing the session"
+        );
+
+        // `ZZ`
+        let path_b = Path::new("/mem/b.txt");
+        kernel.vfs().write_all(path_b, b"hello").await.unwrap();
+        let (id_b, _) = kernel.editor_open("/mem/b.txt").await.unwrap();
+        kernel.editor_keys(id_b, "iY<Esc>").await.unwrap();
+        kernel.editor_keys(id_b, "ZZ").await.unwrap();
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path_b).await.unwrap()).unwrap(),
+            "Yhello",
+            "ZZ must flush before closing the session"
+        );
+
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .is_empty(),
+            "both sessions flushed cleanly — no swap rows left"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_edit_on_a_config_owned_session_never_touches_the_file_cache() {
+        // Config/rc blocks have no host file — flushing the FileDocumentCache's
+        // *shadow* entry for a config path would write the wrong content (a
+        // stale read-through copy, not the block the editor is bound to) to
+        // the wrong place. A config-owned session must never mark or flush it.
+        use crate::runtime::config_doc_fs::ConfigDocFs;
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let blocks = kernel.blocks().clone();
+        kernel
+            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
+            .await;
+        ConfigDocFs::new(blocks.clone(), RC_ROOT)
+            .write_all(Path::new("coder/create/S00.kai"), b"hello")
+            .await
+            .unwrap();
+        let path = "/etc/rc/coder/create/S00.kai";
+
+        let (id, _) = kernel.editor_open(path).await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert!(
+            st.message.is_none(),
+            "a config-owned :w must not report a (nonexistent) flush failure"
+        );
+
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .is_empty(),
+            "a config-owned session has no host file and must never record a \
+             file-cache swap row"
+        );
+    }
+
+    #[tokio::test]
+    async fn colon_w_round_trips_multibyte_content_to_disk() {
+        // Regression coverage for the class of bug docs/vi.md already records
+        // (`create_or_replace` once deleted BYTE count instead of CHAR count
+        // and panicked on multi-byte content) — reusing the same characters
+        // (改善, an em-dash) through the *new* flush path.
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/kanji.txt");
+        kernel
+            .vfs()
+            .write_all(path, "改善—work".as_bytes())
+            .await
+            .unwrap();
+
+        let (id, st) = kernel.editor_open("/mem/kanji.txt").await.unwrap();
+        assert_eq!(st.text, "改善—work");
+
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert_eq!(st.text, "X改善—work");
+
+        let disk = String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap();
+        assert_eq!(
+            disk, "X改善—work",
+            "multi-byte content must round-trip through :w intact"
+        );
     }
 
     #[tokio::test]

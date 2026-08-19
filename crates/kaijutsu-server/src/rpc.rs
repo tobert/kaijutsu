@@ -3216,16 +3216,23 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::EditorSaveResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _guard = extract_rpc_trace(p.get_trace(), "editor_save").entered();
+        let span = extract_rpc_trace(p.get_trace(), "editor_save");
         let session_id = p.get_session_id();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
-        match self.kernel.kernel.editor_save(id) {
-            Ok(state) => {
-                set_editor_state(results.get().init_state(), session_id, &state);
-                Promise::ok(())
+        let kernel = self.kernel.clone();
+        // `editor_save` is async now (a file-backed session flushes to disk).
+        Promise::from_future(
+            async move {
+                match kernel.kernel.editor_save(id).await {
+                    Ok(state) => {
+                        set_editor_state(results.get().init_state(), session_id, &state);
+                        Ok(())
+                    }
+                    Err(e) => Err(capnp::Error::failed(format!("editor_save failed: {e}"))),
+                }
             }
-            Err(e) => Promise::err(capnp::Error::failed(format!("editor_save failed: {e}"))),
-        }
+            .instrument(span),
+        )
     }
 
     fn editor_quit(

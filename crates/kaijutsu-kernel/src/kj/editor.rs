@@ -42,7 +42,7 @@ enum EditorCommand {
         /// Session handle.
         session: u64,
     },
-    /// Checkpoint the buffer as saved (`ZZ`).
+    /// Checkpoint the buffer as saved (`ZZ`); for a file, also flush to disk.
     Save {
         /// Session handle.
         session: u64,
@@ -140,11 +140,17 @@ impl KjDispatcher {
             }
             EditorCommand::Save { session } => {
                 let id = EditorSessionId::from_u64(session);
-                match kernel.editor_save(id) {
-                    Ok(st) => KjResult::ok_with_data(
-                        format!("session {session}: saved"),
-                        state_json(id, &st),
-                    ),
+                match kernel.editor_save(id).await {
+                    Ok(st) => {
+                        // A flush failure (E212) rides `st.message`, not the
+                        // error path — surface it so a driver can't miss it,
+                        // same as `Keys` below.
+                        let mut line = format!("session {session}: saved");
+                        if let Some(msg) = &st.message {
+                            line.push_str(&format!(" — {msg}"));
+                        }
+                        KjResult::ok_with_data(line, state_json(id, &st))
+                    }
                     Err(e) => KjResult::Err(format!("kj editor save: {e}")),
                 }
             }

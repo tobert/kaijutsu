@@ -143,13 +143,30 @@ pub struct EditorSessionInfo {
 }
 
 /// The result of feeding a key batch to a session via [`EditorSessions::keys`].
+/// Each variant carries a [`KeysUpdate`] — the renderer state plus the save
+/// signal the **kernel** layer (which holds the file-document cache;
+/// `EditorSessions` deliberately does not) needs to decide whether to flush a
+/// file-backed session to disk. See `docs/file-buffers.md`.
 #[derive(Debug)]
 pub enum KeysOutcome {
     /// The buffer updated; the new renderer state to push.
-    Updated(EditorState),
+    Updated(KeysUpdate),
     /// A `ZZ`/`ZQ` closed the session (already saved/discarded + dropped). The
     /// state is the last view before close; renderers react to the `Closed` push.
-    Closed(EditorState),
+    Closed(KeysUpdate),
+}
+
+/// A key batch's resulting state, plus whether this batch executed a
+/// checkpoint (`:w`, `:wq`/`:x`, `ZZ`) rather than merely settling back to a
+/// clean buffer on its own (e.g. an undo) — only the former means "flush to
+/// disk." `forced` carries `:w!`'s bang through for the future W12
+/// changed-under-us guard (docs/file-buffers.md); nothing consumes it yet, so
+/// a forced save behaves exactly like a plain one until that guard exists.
+#[derive(Debug)]
+pub struct KeysUpdate {
+    pub state: EditorState,
+    pub saved: bool,
+    pub forced: bool,
 }
 
 impl KeysOutcome {
@@ -157,7 +174,15 @@ impl KeysOutcome {
     /// last view before a `ZZ`/`ZQ` close.
     pub fn state(&self) -> &EditorState {
         match self {
-            Self::Updated(s) | Self::Closed(s) => s,
+            Self::Updated(u) | Self::Closed(u) => &u.state,
+        }
+    }
+
+    /// Whether this batch executed a checkpoint the kernel layer should flush
+    /// to disk for a file-backed session.
+    pub fn saved(&self) -> bool {
+        match self {
+            Self::Updated(u) | Self::Closed(u) => u.saved,
         }
     }
 }
@@ -387,22 +412,29 @@ impl EditorSessions {
         // `ZZ`/`ZQ` close the session. The returned state is informational (the
         // last view before close); renderers react to the `Closed` push.
         if let Some(close) = close {
-            let final_state = match close {
+            let (final_state, saved) = match close {
                 CloseRequest::Write => {
-                    // ZZ: checkpoint current as saved (flush to owner), then quit
-                    // — the rollback to that just-taken checkpoint is a no-op.
+                    // ZZ: checkpoint current as saved, then quit — the rollback
+                    // to that just-taken checkpoint is a no-op. `saved: true`
+                    // tells the kernel layer to flush a file-backed session.
                     let state = self.save(id)?;
                     self.quit(id, blocks)?;
-                    state
+                    (state, true)
                 }
                 CloseRequest::Discard => {
-                    // ZQ: snapshot the view, then roll back to the last checkpoint.
+                    // ZQ: snapshot the view, then roll back to the last
+                    // checkpoint. Nothing to flush — the discard never advanced
+                    // the checkpoint.
                     let state = self.state(id)?;
                     self.quit(id, blocks)?;
-                    state
+                    (state, false)
                 }
             };
-            return Ok(KeysOutcome::Closed(final_state));
+            return Ok(KeysOutcome::Closed(KeysUpdate {
+                state: final_state,
+                saved,
+                forced: false,
+            }));
         }
 
         // A submitted `:`-line (`:w`/`:wq`/`:q!`/…). A parsed batch runs in
@@ -415,17 +447,25 @@ impl EditorSessions {
                 Ok(cmds) => return self.run_commands(id, cmds, blocks),
                 Err(msg) => {
                     let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-                    let saved = session.saved_content.clone();
-                    let mut state = state_of(&mut session.core, &saved);
+                    let checkpoint = session.saved_content.clone();
+                    let mut state = state_of(&mut session.core, &checkpoint);
                     state.message = Some(msg);
-                    return Ok(KeysOutcome::Updated(state));
+                    return Ok(KeysOutcome::Updated(KeysUpdate {
+                        state,
+                        saved: false,
+                        forced: false,
+                    }));
                 }
             }
         }
 
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let saved = session.saved_content.clone();
-        Ok(KeysOutcome::Updated(state_of(&mut session.core, &saved)))
+        let checkpoint = session.saved_content.clone();
+        Ok(KeysOutcome::Updated(KeysUpdate {
+            state: state_of(&mut session.core, &checkpoint),
+            saved: false,
+            forced: false,
+        }))
     }
 
     /// Act on a parsed `:`-command batch (`docs/vi.md` → *Command mode*). `Write`
@@ -433,7 +473,9 @@ impl EditorSessions {
     /// without `!` (vim's E37 "No write since last change", reported on the
     /// status line like every dialect-level failure). `[Write, Quit]` (`:wq`)
     /// saves-clean then closes. Returns [`KeysOutcome::Closed`] if a `Quit` ran,
-    /// else [`KeysOutcome::Updated`] with the post-save state.
+    /// else [`KeysOutcome::Updated`] with the post-save state. The returned
+    /// `saved` flag (true whenever this batch ran a `Write`, including inside
+    /// `:wq`/`:x`) is the kernel layer's cue to flush a file-backed session.
     fn run_commands(
         &mut self,
         id: EditorSessionId,
@@ -441,14 +483,19 @@ impl EditorSessions {
         blocks: &SharedBlockStore,
     ) -> Result<KeysOutcome, String> {
         let mut saved_state = None;
+        let mut forced = false;
         for cmd in commands {
             match cmd {
-                // `:w!` == `:w` today. `force` is reserved for the planned
-                // changed-under-us guard: once a plain `:w` refuses when the block
-                // moved since open (a concurrent writer), `:w!` overrides it. No
-                // such detection yet, so a forced write is just a write.
-                CommandRequest::Write { force: _ } => {
+                // `:w!` behaves exactly like `:w` today: both checkpoint and
+                // flush to disk unconditionally. `force` rides through to the
+                // returned `KeysUpdate` so the future W12 changed-under-us
+                // guard has it to gate on — once a plain `:w` refuses when the
+                // block moved since open (a concurrent writer), `:w!` will
+                // override that refusal. No such detection exists yet, so a
+                // forced write changes nothing.
+                CommandRequest::Write { force } => {
                     saved_state = Some(self.save(id)?);
+                    forced = force;
                 }
                 CommandRequest::Quit { force } => {
                     let mut state = self.state(id)?;
@@ -459,20 +506,32 @@ impl EditorSessions {
                         // renderer's `:`-strip showing the stale submitted line.
                         state.message =
                             Some("No write since last change (add ! to override)".to_string());
-                        return Ok(KeysOutcome::Updated(state));
+                        return Ok(KeysOutcome::Updated(KeysUpdate {
+                            state,
+                            saved: false,
+                            forced: false,
+                        }));
                     }
                     self.quit(id, blocks)?;
-                    return Ok(KeysOutcome::Closed(state));
+                    // `saved_state.is_some()` covers `:wq`/`:x` (Write ran
+                    // earlier in this same batch); a bare `:q`/`:q!` never set
+                    // it, so nothing to flush.
+                    return Ok(KeysOutcome::Closed(KeysUpdate {
+                        state,
+                        saved: saved_state.is_some(),
+                        forced,
+                    }));
                 }
             }
         }
         // No `Quit` ran (a bare `:w`, or an empty `:` line). Report the post-save
         // state, or — for a no-op line — the current view.
+        let saved = saved_state.is_some();
         let state = match saved_state {
             Some(state) => state,
             None => self.state(id)?,
         };
-        Ok(KeysOutcome::Updated(state))
+        Ok(KeysOutcome::Updated(KeysUpdate { state, saved, forced }))
     }
 
     /// Reconcile every open session bound to `(context_id, block_id)` against
@@ -583,9 +642,24 @@ impl EditorSessions {
         self.sessions.get(&id).map(|s| s.path.clone())
     }
 
+    /// `session_path`, filtered to the sessions the kernel's file-document
+    /// cache actually owns a flushable entry for. `None` covers both "no such
+    /// session" and "config/rc session" — a config/rc block has no host file
+    /// and its `FileDocumentCache` entry (if any) is a separate read-through
+    /// shadow, not the block the editor is writing (`docs/vi.md` → "Path
+    /// resolution"); flushing that shadow would write the wrong content to
+    /// the wrong place. Only a `Some` here is safe to hand to `mark_dirty`/
+    /// `flush_one`.
+    pub fn file_backed_path(&self, id: EditorSessionId) -> Option<String> {
+        let path = self.session_path(id)?;
+        (!config_owned(&path)).then_some(path)
+    }
+
     /// `ZZ` — checkpoint the current buffer as saved, returning the now-clean
     /// state. For config/rc blocks the kernel is already the persistent owner;
-    /// file-doc disk flush is TBD (see `docs/vi.md` tech-debt sweep).
+    /// for an ordinary file, the kernel layer (which holds the file-document
+    /// cache this pure session registry does not) flushes it to disk after
+    /// this call — see `Kernel::editor_save`/`Kernel::editor_keys`.
     pub fn save(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         session.saved_content = session.core.text();
