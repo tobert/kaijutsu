@@ -293,6 +293,30 @@ path when the context has no cwd, and say so themselves — "cannot resolve any
 path — relative or otherwise". An absolute path needs no cwd. Also, a cwd set
 via the `shell` tool did not reach the file tool's exec context.
 
+**`edit`'s hashline guard has a hole, found while scoping W12 (2026-08-19).**
+"A stale edit fails loud instead of corrupting" holds only while the cached
+entry is *clean*. A hashline is computed from the cached block, and
+`try_get_or_load` serves a **dirty** entry as-is without reconciling — so when
+a buffer holds unsaved work and disk moves underneath it, the hashline matches
+the stale buffer, `edit` succeeds, and `flush_one` writes the buffer over the
+external change. The reader's own edit is preserved; the external writer's is
+silently reverted.
+
+Narrow in practice: `mount_backend` and `file.rs` both flush immediately after
+`mark_dirty`, so the only producer of a long-lived dirty entry is the vi
+editor. The scenario is "vi holds unsaved work on a file, an external tool
+writes it, an agent then calls `edit` on it."
+
+W12 (slice 3) fixes this for `:w` only, and deliberately: `flush_one_guarded`
+is opt-in per call site because `create_or_replace` does not re-stamp
+`loaded_generation`, so guarding `flush_one` itself would make every `echo x >
+file` refuse after any external edit — a whole-file overwrite *means* "I do not
+care what is there." **The open question is what the override looks like for a
+non-interactive caller**, which has no `!` to type. A generation precondition
+on `edit` is one answer and folds into the `write`-precondition question above;
+another is that `edit` should reconcile a dirty entry against disk before
+computing hashlines, which fixes it with no new surface.
+
 ---
 
 ## The writing-style guide is absorbed but not yet applied (2026-08-18)
