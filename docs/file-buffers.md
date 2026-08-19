@@ -165,6 +165,18 @@ via a file tool gets a tool *result*; the announcement rides that text.
 2. **Swap semantics.** Persist only dirty buffers as recoverable. A clean entry
    is a cache, discarded and re-read. Announce a recovery; do not serve it as
    authoritative until acknowledged.
+
+   The cold path cannot tell a swap from a stale cache without a durable
+   marker, and slice 1 reconciles both — so until this lands, unsaved work is
+   discarded on restart rather than silently served. **A KernelDb row carries
+   the marker** (Amy, 2026-08-19): one normalized row per path holding the
+   dirty flag and `loaded_generation`. A dirty row means announce; no row
+   means reconcile. Slice 3 needs a restart-surviving generation anyway.
+
+   The eventual model is lazy document creation — a clean buffer never becomes
+   a document, so a document existing *means* unsaved work, with no marker at
+   all. Deferred for cost (`block_id` becomes optional across every caller) and
+   filed in `docs/issues.md`; the row goes away if it lands.
 3. **`:w` guard.** Implement W12 — `:w` refuses when the disk generation moved
    past the load generation, `:w!` overrides. Retires "`:w!` == `:w` today".
 4. **Tool surface.** Remove `write` and `grep`; make `edit` hashline-only; add

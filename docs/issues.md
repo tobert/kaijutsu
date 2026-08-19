@@ -6,73 +6,42 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## P1: the file cache serves months-old content and writes it back (2026-08-18)
+## File buffers: unsaved work is discarded on a cold cache (2026-08-19)
 
-**Live, silent data corruption.** This is the root cause of today's
-`docs/issues.md` clobber, and it is not specific to that file.
+**The months-old-content corruption is fixed** in `11c21b69` (slice 1 of
+`docs/file-buffers.md`): a cold cache miss now reconciles the pre-existing
+document against disk instead of serving it. The standing "do not edit through
+the kernel file tools" warning is lifted.
 
-Measured against the running kernel, all on 2026-08-18:
+That fix has a consequence the design doc anticipates in rule 2, and slice 2
+must close it. A buffer that was **dirty** when the kernel went down now has
+its unsaved content replaced by disk content on the next read — the cold path
+cannot tell a swap file from a stale cache, so it reconciles both. Nothing
+flushes dirty buffers at shutdown; `flush_dirty` has no callers outside
+`file_tools/cache.rs`. The trade is deliberate and the right direction (loud
+loss beats silent corruption), but it is still loss.
 
-| path | kernel serves | disk truth |
-|---|---|---|
-| `crates/kaijutsu-kernel/src/mcp/servers/file.rs` | 1250 lines | 1798 |
-| `crates/kaijutsu-kernel/src/kj/ledger.rs` | 1221 | 2101 |
-| `crates/kaijutsu-kernel/src/kj/mod.rs` | 1084 | 1663 |
-| `crates/kaijutsu-kernel/src/mcp/error.rs` | 97 | 208 |
-| `AGENTS.md` | 102 | 422 |
+**Decided (Amy, 2026-08-19): a KernelDb row now, lazy document creation
+later.** Slice 2 records dirty state and `loaded_generation` durably, one
+normalized row per path; a cold load consults it, and a dirty row means
+announce a swap rather than reconcile. Slice 3's W12 guard needs a
+restart-surviving generation anyway, so the row earns its place twice.
 
-1250 lines is an exact match for `3321e597` — **2026-06-26**. The kernel is
-serving a file as it stood nearly two months ago, and a model reading it gets
-that content with no indication anything is wrong.
+---
 
-The chain, all in `file_tools/cache.rs`:
+## File documents should be created lazily, not on every read (2026-08-19)
 
-1. `file_context_id(path)` is `UUIDv5(NAMESPACE_URL, "kaijutsu:file:" + path)`
-   (`cache.rs:703`) — deterministic, so a path maps to the same document id
-   forever.
-2. File documents live in the **durable** block store, so they outlive a kernel
-   restart. Restarting does not clear this.
-3. On a cache miss, `try_get_or_load` reads the file from disk into `text` and
-   computes a fresh `loaded_generation` — then calls `create_document`.
-4. **`Err(_)` — "document already exists" — discards the freshly-read `text`
-   entirely** and returns `snapshots.first()`, the block from whenever the file
-   was first read (`cache.rs:339-365`).
-5. It then caches that ancient content stamped with the **current** disk
-   generation, so the `d > l` staleness check at `cache.rs:259` can never fire
-   afterwards. The path poisons its own freshness stamp.
-6. Any write flushes that content back to disk. That is the clobber.
+The eventual model behind the slice 2 decision above, deferred deliberately.
+Today every file the kernel reads leaves a durable block-store document
+forever, keyed by `file_context_id(path)` — a `UUIDv5`, so the residue is
+permanent and self-colliding. If a clean buffer stayed in memory as a `String`
+and a document were materialized only on the first edit, then **a file document
+existing would mean unsaved work exists**, by construction — no marker, no
+schema, and the residue class disappears.
 
-Two smaller defects in the same path. `dirty` short-circuits the staleness
-check before it is reached (`cache.rs:255`), so a stuck-dirty entry serves
-stale content indefinitely. And `Err(_)` swallows the error *kind*, so a real
-block-store failure is misread as "already exists" — the silent fallback
-CLAUDE.md warns about, in the same arm that causes the corruption.
-
-**This looks like a CRDT-era leftover.** Persisting a file as a durable
-document made sense when the document was the source of truth. Post-demolition
-disk is the source of truth, and a durable document keyed deterministically by
-path is a stale mirror guaranteed to collide with its future self.
-
-**Decided 2026-08-18 — the design is `docs/file-buffers.md`, which is
-canonical.** In-memory-only was proposed and rejected: the durable document is
-load-bearing, because unsaved editor edits live in the block and that is what
-makes them survive a restart (`docs/vi.md` calls it "restart-safe"). The answer
-is vim's, faithfully — a clean buffer is a cache and is always re-read from
-disk; a dirty buffer is a swap file, persisted and **announced** on reopen
-rather than served silently; `:w` refuses when disk moved and `:w!` overrides.
-
-Also decided: `write` and `grep` are removed, `edit` becomes hashline-only
-(the anchor hash is a per-line changed-under-us check), and `create_file` may
-replace `write` since a create has no prior state to clobber. Removing `write`
-also closes a standing gate bypass — `shell_write` is ledger-gated and the file
-tools are not.
-
-Slice order and the two non-negotiable tests are in `docs/file-buffers.md`.
-Slice 1 (load path) is the containment and lands alone, first.
-
-**Until this is fixed, do not edit files through the kernel's file tools or the
-`vi` editor** — read and write through host tools. Every file the kernel has
-ever read is a candidate.
+Cost is why it is deferred: `block_id` becomes optional and ripples through
+every caller of `get_or_load`. Revisit once swap semantics are proven, and
+delete the KernelDb row from slice 2 if this lands.
 
 ---
 
