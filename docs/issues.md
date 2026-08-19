@@ -6923,3 +6923,29 @@ viewport-sized layer and composite with a post shader — slots into the
 existing pass order, never per-block, so the tall-block trap stays dead.
 This is the intended route for restoring rainbow + the deferred
 chase-brightening/halo entries above.
+
+## ANSI ingest + styled spans: design settled, build unstarted (2026-08-19)
+
+Design lives in `docs/ansi-and-beyond.md` (living doc, checked in) — strip
+ANSI at ingestion via `vte`, block content is the clean text, semantic
+`style_spans` + a tiny `provenance` tag ride the block, original bytes go to
+a kernel-side `block_provenance` sqlite table (map-shaped: one row per
+block × transform). Round-trip comes from the stored copy, never the span
+map. Policy in rc (which flows get which transforms), mechanism in the
+kernel (versioned `ansi-strip@N`), plus a kaish verb for ad-hoc pipelines.
+Build lanes, roughly in order:
+
+1. Parser crate lane: vte + SGR mapping + span assembly, with the test
+   ladder (fuzz totality, chunk-boundary ≡ one-shot, projection properties,
+   real-world goldens, differential vs termwiz/vt100).
+2. Kernel lane: `block_provenance` table, ingest hook at kaish output
+   capture (same-transaction commit), `style_spans`/`provenance` fields on
+   BlockSnapshot (`#[serde(default)]`), `kj block original|reproject`.
+3. App lane: spans → glyph instance styling; then the style-table
+   indirection (semantic ANSI index resolved through a GPU palette — retheme
+   = buffer write) which is the same slot the rainbow/effects revival uses
+   (see "the instance buffer IS the map" above).
+
+Renders SGR only; cursor/screen codes are preserved in provenance, never
+rendered (kills hidden-text-by-overwrite by construction). Standing safety
+invariants and the `\r`-progress-bar open question are in the doc.
