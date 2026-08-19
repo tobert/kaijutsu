@@ -1392,39 +1392,65 @@ impl Kernel {
         match outcome {
             crate::editor::KeysOutcome::Updated(update) => {
                 let mut state = update.state;
-                if let Some(fp) = file_path.as_deref() {
-                    if update.saved {
-                        if let Err(e) = self.file_cache.flush_one(fp).await {
-                            // Never serve content that never reached disk —
-                            // drop the stale cache entry, same as
-                            // `mount_backend.rs`'s write rollback.
-                            self.file_cache.invalidate(fp);
-                            state.message =
-                                Some(format!("E212: Can't open file for writing: {fp}: {e}"));
+                if update.saved {
+                    match file_path.as_deref() {
+                        Some(fp) => {
+                            // File-backed: `state` still reads dirty here —
+                            // `EditorSessions` deferred the checkpoint (see
+                            // `KeysUpdate`). Flush to disk FIRST; the
+                            // checkpoint must not advance unless the bytes
+                            // actually landed.
+                            if let Err(e) = self.file_cache.flush_one(fp).await {
+                                // Leave the swap row and the cache entry alone
+                                // — the entry is legitimately dirty and the
+                                // block IS the player's live buffer, not a
+                                // speculative write with nothing else reading
+                                // it. Invalidating (as `mount_backend.rs`'s
+                                // *external*-write rollback correctly does)
+                                // would turn a retry `:w` into a cold miss
+                                // that recovers as an unacknowledged swap —
+                                // the wrong error for a player retrying a
+                                // write that just failed.
+                                state.message = Some(format!(
+                                    "E212: Can't open file for writing: {fp}: {e}"
+                                ));
+                            } else {
+                                state = self.editor_sessions.lock().0.save(id)?;
+                            }
                         }
-                    } else if state.dirty {
-                        self.file_cache.mark_dirty(fp).map_err(|e| {
-                            format!("editor keys: failed to mark {fp} dirty: {e}")
-                        })?;
+                        None => {
+                            // Config/rc: no file to flush — the block write
+                            // already IS the durable persistence.
+                            state = self.editor_sessions.lock().0.save(id)?;
+                        }
                     }
+                } else if let Some(fp) = file_path.as_deref()
+                    && state.dirty
+                {
+                    self.file_cache.mark_dirty(fp).map_err(|e| {
+                        format!("editor keys: failed to mark {fp} dirty: {e}")
+                    })?;
                 }
                 self.publish_editor_state(id, &state);
                 Ok(state)
             }
             crate::editor::KeysOutcome::Closed(update) => {
                 // The session is already gone (ZZ/`:wq`/`:x`/ZQ dropped it
-                // inside `EditorSessions::keys`) — there is no open session
-                // left to report a flush failure on the status line, so it
-                // surfaces as a hard error instead. This is the "infrastructure
+                // inside `EditorSessions::keys`, checkpointing before it did —
+                // see `run_commands`) — there is no open session left to
+                // report a flush failure on the status line, so it surfaces
+                // as a hard error instead. This is the "infrastructure
                 // failure" class `docs/vi.md` reserves for exactly this: the
                 // app's session-lost detection keys on it, and here the
                 // session genuinely IS lost — closed, with the write it
-                // promised never landing.
+                // promised never landing. The swap row is left alone on
+                // failure (same reasoning as the `Updated` arm above), so a
+                // fresh `vi` on the path recovers the lost edit as a swap
+                // instead of losing it.
                 let flush_err = if update.saved
                     && let Some(fp) = file_path.as_deref()
                     && let Err(e) = self.file_cache.flush_one(fp).await
                 {
-                    self.file_cache.invalidate(fp);
                     Some(format!("E212: Can't open file for writing: {fp}: {e}"))
                 } else {
                     None
@@ -1510,18 +1536,20 @@ impl Kernel {
         self.editor_sessions.lock().0.list()
     }
 
-    /// `ZZ` — checkpoint the session's buffer as saved, and for a file-backed
-    /// session (`docs/file-buffers.md`) flush it to disk. Publishes the
-    /// now-clean state (dirty flips false) so renderers reflect the save.
+    /// `ZZ` (direct call) — for a file-backed session (`docs/file-buffers.md`),
+    /// flush to disk FIRST and only advance the checkpoint once the bytes
+    /// land; a config/rc session has no flush step, so its checkpoint
+    /// advances immediately. Publishes the resulting state so renderers
+    /// reflect it — clean on success, still dirty on failure.
     ///
     /// The session stays open on a flush failure: this is the direct-call
     /// path (the wire `editorSave`, `kj editor save`), not a `ZZ`/`:wq` that
     /// already dropped the session — so, unlike `editor_keys`' `Closed` arm,
     /// there is somewhere to report it. Mirrors `run_commands`' `Quit{force}`
-    /// dialect-level refusal: the status line gets the message, the call
-    /// still returns `Ok`, and the stale cache entry is invalidated so a
-    /// later read can't serve content that never reached disk (the same
-    /// rollback `mount_backend.rs`'s write path takes).
+    /// dialect-level refusal: the status line gets the message and the call
+    /// still returns `Ok`. The swap row and cache entry are left alone on
+    /// failure — see `editor_keys`'s `Updated` arm for why this differs from
+    /// `mount_backend.rs`'s *external*-write rollback.
     pub async fn editor_save(
         &self,
         id: crate::editor::EditorSessionId,
@@ -1529,14 +1557,20 @@ impl Kernel {
         let (file_path, mut state) = {
             let mut sessions = self.editor_sessions.lock();
             let file_path = sessions.0.file_backed_path(id);
-            let state = sessions.0.save(id)?;
+            let state = sessions.0.state(id)?;
             (file_path, state)
         };
-        if let Some(fp) = file_path.as_deref()
-            && let Err(e) = self.file_cache.flush_one(fp).await
-        {
-            self.file_cache.invalidate(fp);
-            state.message = Some(format!("E212: Can't open file for writing: {fp}: {e}"));
+        match file_path.as_deref() {
+            Some(fp) => {
+                if let Err(e) = self.file_cache.flush_one(fp).await {
+                    state.message = Some(format!("E212: Can't open file for writing: {fp}: {e}"));
+                } else {
+                    state = self.editor_sessions.lock().0.save(id)?;
+                }
+            }
+            None => {
+                state = self.editor_sessions.lock().0.save(id)?;
+            }
         }
         self.publish_editor_state(id, &state);
         Ok(state)
@@ -2579,6 +2613,110 @@ mod tests {
         assert_eq!(
             disk, "X改善—work",
             "multi-byte content must round-trip through :w intact"
+        );
+    }
+
+    // ── A failed `:w` (docs/issues.md, "A failed `:w` reports clean, and
+    // retrying it hits the wrong error") ────────────────────────────────────
+
+    /// A file-backed session over a read-only host mount: `flush_one`'s VFS
+    /// write genuinely fails (`VfsError::ReadOnly`), the honest way to
+    /// provoke the failure without a test-only injection hook. The seed file
+    /// is written directly to the host path before mounting, since the mount
+    /// itself refuses writes.
+    async fn kernel_with_readonly_fs(initial: &[u8]) -> (Kernel, tempfile::TempDir) {
+        use crate::vfs::backends::LocalBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), initial).unwrap();
+        let kernel = Kernel::new_ephemeral("test").await;
+        kernel.mount("/mem", LocalBackend::read_only(dir.path())).await;
+        (kernel, dir)
+    }
+
+    #[tokio::test]
+    async fn failed_w_leaves_the_buffer_dirty_and_q_still_refuses() {
+        let (kernel, _dir) = kernel_with_readonly_fs(b"hello").await;
+
+        let (id, st) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        assert_eq!(st.text, "hello");
+
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert!(
+            st.dirty,
+            "a flush that failed must not let the buffer read clean"
+        );
+        assert!(
+            st.message.as_deref().unwrap_or_default().starts_with("E212"),
+            "got: {:?}",
+            st.message
+        );
+
+        // The swap row must survive the failed flush — a following `:q`
+        // still refuses with vim's E37, exactly as if `:w` had never run.
+        let st = kernel.editor_keys(id, ":q<CR>").await.unwrap();
+        assert!(
+            st.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No write since last change"),
+            "got: {:?}",
+            st.message
+        );
+        assert!(kernel.editor_state(id).is_ok(), "the session must still be open");
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "the swap row must survive a failed flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_w_then_a_successful_retry_clears_the_row_without_a_swap_error() {
+        use crate::vfs::backends::LocalBackend;
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let (kernel, dir) = kernel_with_readonly_fs(b"hello").await;
+
+        let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert!(st.dirty, "first :w must fail against the read-only mount");
+
+        // Whatever caused the failure clears (permissions restored, disk
+        // space freed) — remount the same host directory read-write.
+        kernel.unmount("/mem").await;
+        kernel.mount("/mem", LocalBackend::new(dir.path())).await;
+
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        assert!(
+            st.message.is_none(),
+            "a retry must not report the swap-acknowledgement error, got: {:?}",
+            st.message
+        );
+        assert!(!st.dirty, "the successful retry must clear dirty");
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(Path::new("/mem/note.txt")).await.unwrap())
+                .unwrap(),
+            "Xhello",
+            "the retried write must land"
+        );
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .all(|r| r.path != "/mem/note.txt"),
+            "the swap row must clear once the retry lands"
         );
     }
 

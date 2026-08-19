@@ -156,12 +156,21 @@ pub enum KeysOutcome {
     Closed(KeysUpdate),
 }
 
-/// A key batch's resulting state, plus whether this batch executed a
-/// checkpoint (`:w`, `:wq`/`:x`, `ZZ`) rather than merely settling back to a
-/// clean buffer on its own (e.g. an undo) — only the former means "flush to
-/// disk." `forced` carries `:w!`'s bang through for the future W12
-/// changed-under-us guard (docs/file-buffers.md); nothing consumes it yet, so
-/// a forced save behaves exactly like a plain one until that guard exists.
+/// A key batch's resulting state, plus whether this batch **requested** a
+/// write (`:w`, `:wq`/`:x`, `ZZ`) rather than merely settling back to a clean
+/// buffer on its own (e.g. an undo) — only the former means "flush to disk."
+///
+/// `saved: true` does NOT always mean the checkpoint has already advanced.
+/// For a `Closed` outcome, or an `Updated` one from a config/rc session, it
+/// has (there is no separate flush step to gate on). For an `Updated`
+/// outcome from an ordinary file session — a plain `:w` that leaves the
+/// session open — it has **not**: `state.dirty` is still `true`, and the
+/// kernel layer must flush to disk first and only then checkpoint, or the
+/// buffer would read clean before the bytes land (docs/file-buffers.md).
+///
+/// `forced` carries `:w!`'s bang through for the future W12 changed-under-us
+/// guard (docs/file-buffers.md); nothing consumes it yet, so a forced save
+/// behaves exactly like a plain one until that guard exists.
 #[derive(Debug)]
 pub struct KeysUpdate {
     pub state: EditorState,
@@ -178,8 +187,9 @@ impl KeysOutcome {
         }
     }
 
-    /// Whether this batch executed a checkpoint the kernel layer should flush
-    /// to disk for a file-backed session.
+    /// Whether this batch requested a write the kernel layer should flush to
+    /// disk for a file-backed session (see [`KeysUpdate`] for whether the
+    /// checkpoint has already advanced).
     pub fn saved(&self) -> bool {
         match self {
             Self::Updated(u) | Self::Closed(u) => u.saved,
@@ -468,42 +478,63 @@ impl EditorSessions {
         }))
     }
 
-    /// Act on a parsed `:`-command batch (`docs/vi.md` → *Command mode*). `Write`
-    /// checkpoints and stays open; `Quit` closes — refusing a dirty buffer
-    /// without `!` (vim's E37 "No write since last change", reported on the
-    /// status line like every dialect-level failure). `[Write, Quit]` (`:wq`)
-    /// saves-clean then closes. Returns [`KeysOutcome::Closed`] if a `Quit` ran,
-    /// else [`KeysOutcome::Updated`] with the post-save state. The returned
-    /// `saved` flag (true whenever this batch ran a `Write`, including inside
-    /// `:wq`/`:x`) is the kernel layer's cue to flush a file-backed session.
+    /// Act on a parsed `:`-command batch (`docs/vi.md` → *Command mode*). `Quit`
+    /// closes — refusing a dirty buffer without `!` (vim's E37 "No write since
+    /// last change", reported on the status line like every dialect-level
+    /// failure). Returns [`KeysOutcome::Closed`] if a `Quit` ran, else
+    /// [`KeysOutcome::Updated`]. The returned `saved` flag (true whenever this
+    /// batch ran a `Write`, including inside `:wq`/`:x`) is the kernel layer's
+    /// cue to flush a file-backed session.
+    ///
+    /// **`Write` does not checkpoint by itself for a file-backed session.**
+    /// The checkpoint must not advance until the write actually lands, and
+    /// this pure registry has no file cache to flush through — that lives in
+    /// the kernel layer (`Kernel::editor_keys`/`editor_save`), which flushes
+    /// first and checkpoints only on success (docs/file-buffers.md). A
+    /// config/rc session has no such flush step: the block write the
+    /// keystrokes already mirrored IS the durable persistence, so its
+    /// checkpoint can still advance right here, same as before this rule
+    /// existed. A `Quit` in the same batch (`:wq`/`:x`) is the one case that
+    /// checkpoints unconditionally, file-backed or not: the session is about
+    /// to be dropped, `quit`'s rollback reads the checkpoint to know what to
+    /// restore, and there is no later kernel-layer moment left to defer to —
+    /// deferring here would let quit roll back the very edit `:wq` promised
+    /// to keep. The disk flush that follows in the kernel layer can still
+    /// fail; that surfaces as the existing session-lost hard error on
+    /// `KeysOutcome::Closed`, never a reverted edit.
     fn run_commands(
         &mut self,
         id: EditorSessionId,
         commands: Vec<CommandRequest>,
         blocks: &SharedBlockStore,
     ) -> Result<KeysOutcome, String> {
-        let mut saved_state = None;
+        let mut write_requested = false;
         let mut forced = false;
         for cmd in commands {
             match cmd {
-                // `:w!` behaves exactly like `:w` today: both checkpoint and
-                // flush to disk unconditionally. `force` rides through to the
-                // returned `KeysUpdate` so the future W12 changed-under-us
-                // guard has it to gate on — once a plain `:w` refuses when the
-                // block moved since open (a concurrent writer), `:w!` will
-                // override that refusal. No such detection exists yet, so a
-                // forced write changes nothing.
+                // `:w!` behaves exactly like `:w` today: both request a write
+                // unconditionally. `force` rides through to the returned
+                // `KeysUpdate` so the future W12 changed-under-us guard has it
+                // to gate on — once a plain `:w` refuses when the block moved
+                // since open (a concurrent writer), `:w!` will override that
+                // refusal. No such detection exists yet, so a forced write
+                // changes nothing.
                 CommandRequest::Write { force } => {
-                    saved_state = Some(self.save(id)?);
+                    write_requested = true;
                     forced = force;
                 }
                 CommandRequest::Quit { force } => {
-                    let mut state = self.state(id)?;
+                    let state = if write_requested {
+                        self.save(id)?
+                    } else {
+                        self.state(id)?
+                    };
                     if !force && state.dirty {
                         // A dialect-level refusal, not an RPC failure: ride the
                         // status line (like E492) and keep the session open. A
                         // hard error here never reaches the GUI and leaves the
                         // renderer's `:`-strip showing the stale submitted line.
+                        let mut state = state;
                         state.message =
                             Some("No write since last change (add ! to override)".to_string());
                         return Ok(KeysOutcome::Updated(KeysUpdate {
@@ -513,25 +544,37 @@ impl EditorSessions {
                         }));
                     }
                     self.quit(id, blocks)?;
-                    // `saved_state.is_some()` covers `:wq`/`:x` (Write ran
-                    // earlier in this same batch); a bare `:q`/`:q!` never set
-                    // it, so nothing to flush.
+                    // `write_requested` covers `:wq`/`:x` (Write ran earlier
+                    // in this same batch); a bare `:q`/`:q!` never set it, so
+                    // nothing to flush.
                     return Ok(KeysOutcome::Closed(KeysUpdate {
                         state,
-                        saved: saved_state.is_some(),
+                        saved: write_requested,
                         forced,
                     }));
                 }
             }
         }
-        // No `Quit` ran (a bare `:w`, or an empty `:` line). Report the post-save
-        // state, or — for a no-op line — the current view.
-        let saved = saved_state.is_some();
-        let state = match saved_state {
-            Some(state) => state,
-            None => self.state(id)?,
-        };
-        Ok(KeysOutcome::Updated(KeysUpdate { state, saved, forced }))
+        // No `Quit` ran — a bare `:w`/`:w!`, or an empty `:` line. A config/rc
+        // session checkpoints immediately (see the doc above); an ordinary
+        // file session defers, so `state` here still reads dirty and the
+        // kernel layer flushes-then-checkpoints.
+        if write_requested {
+            let is_config = self
+                .sessions
+                .get(&id)
+                .map(|s| config_owned(&s.path))
+                .ok_or_else(|| no_session(id))?;
+            if is_config {
+                self.save(id)?;
+            }
+        }
+        let state = self.state(id)?;
+        Ok(KeysOutcome::Updated(KeysUpdate {
+            state,
+            saved: write_requested,
+            forced,
+        }))
     }
 
     /// Reconcile every open session bound to `(context_id, block_id)` against
