@@ -2409,7 +2409,7 @@ mod publish_tests {
             .unwrap();
 
         let provider = Arc::new(provider);
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
         arm_interrupt(&interrupt);
@@ -2814,7 +2814,7 @@ mod publish_tests {
         let after = kaijutsu_types::BlockId::new(ctx, player, 0);
 
         let provider = Arc::new(Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n")));
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
@@ -3294,7 +3294,7 @@ mod usage_tests {
             .unwrap();
 
         let provider = Arc::new(provider);
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         // `set_context_usage` FK-references `contexts.context_id`, which
         // FK-references `documents.document_id` — both rows must exist
         // before a usage write will stick. Production always creates them

@@ -1663,6 +1663,12 @@ pub struct DteCutoverPurge {
 /// SQLite database for kernel context metadata.
 pub struct KernelDb {
     conn: Connection,
+    /// Owns the throwaway directory a `temporary()` database was opened
+    /// under; `None` for every `open()`. Held only for its `Drop` — removing
+    /// the directory (and the `.db` file inside it) once nothing can reach
+    /// this handle anymore.
+    #[cfg(any(test, feature = "test-util"))]
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 impl KernelDb {
@@ -1980,18 +1986,35 @@ impl KernelDb {
         Self::apply_additive_migrations(&conn)?;
         Self::migrate_ledger(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            #[cfg(any(test, feature = "test-util"))]
+            _temp_dir: None,
+        })
     }
 
-    /// Create an in-memory database (for testing).
-    pub fn in_memory() -> KernelDbResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init_connection(&conn)?;
-        conn.execute_batch(SCHEMA)?;
-        Self::apply_additive_migrations(&conn)?;
-        Self::migrate_ledger(&conn)?;
-        Self::ensure_singleton_kernel(&conn)?;
-        Ok(Self { conn })
+    /// Create a real, file-backed database under a fresh throwaway directory,
+    /// owned by the returned handle: the directory (and the `.db` file inside
+    /// it) is removed when this `KernelDb` drops.
+    ///
+    /// Never `:memory:`. A `:memory:` connection is per-connection state that
+    /// never touches a file, so two `in_memory()` handles used to be two
+    /// separate, unrelated databases even though the name suggested shared
+    /// state — and none of it exercised WAL mode, file locking, or reopening
+    /// across a restart, all of which durability work needs to hit. `open()`
+    /// and `temporary()` run the identical setup sequence (`SCHEMA`,
+    /// migrations); the only difference is a real file under a directory
+    /// nobody but this handle knows about.
+    ///
+    /// Test-only: gated behind `cfg(test)` for this crate's own tests and
+    /// `feature = "test-util"` for integration tests and other crates
+    /// (`kaijutsu-server`) that opt in — never reachable from production code.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn temporary() -> KernelDbResult<Self> {
+        let dir = tempfile::tempdir().expect("create temporary kernel db directory");
+        let mut db = Self::open(dir.path().join("kernel.db"))?;
+        db._temp_dir = Some(dir);
+        Ok(db)
     }
 
     /// Migrate the approval-ledger schema into the kernel DB. The ledger is
@@ -6780,7 +6803,7 @@ mod tests {
 
     #[test]
     fn preset_args_roundtrip_verb_scoped_and_dedup() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let pid = insert_test_preset(&db, "window");
 
         assert!(db.get_preset_args(pid, "fork").unwrap().is_empty());
@@ -6819,7 +6842,7 @@ mod tests {
 
     #[test]
     fn preset_args_cascade_on_preset_delete() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let pid = insert_test_preset(&db, "spawn");
         db.set_preset_args(pid, "fork", &[arg("include", ":0")]).unwrap();
         assert_eq!(db.get_preset_args(pid, "fork").unwrap().len(), 1);
@@ -6835,14 +6858,14 @@ mod tests {
 
     #[test]
     fn schema_idempotent() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         // Apply schema again — should not error.
         db.conn.execute_batch(SCHEMA).unwrap();
     }
 
     #[test]
     fn backends_kind_check_migration_accepts_codex_app_on_an_old_db() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         // Simulate a pre-Codex database: retain all child tables, but replace
         // only the parent table with its former CHECK constraint. The real
         // migration runs on open before any backend write occurs.
@@ -6888,8 +6911,8 @@ mod tests {
     /// a guarded no-op — the same idempotency contract as `concluded_at`.
     #[test]
     fn last_activity_at_migration_is_idempotent_no_op_on_fresh_db() {
-        let db = KernelDb::in_memory().unwrap();
-        // in_memory() already ran apply_additive_migrations() once; running it
+        let db = KernelDb::temporary().unwrap();
+        // temporary() already ran apply_additive_migrations() once; running it
         // again must not error (duplicate-column guard) and the column must
         // still be queryable.
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
@@ -6909,7 +6932,7 @@ mod tests {
     /// the same fact as "a fresh, never-set row reads back as None".
     #[test]
     fn origin_host_migration_is_idempotent_no_op_on_fresh_db() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
 
@@ -6934,7 +6957,7 @@ mod tests {
     /// but mean different things to a caller checking `.is_some()`).
     #[test]
     fn set_origin_host_round_trips_through_get_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("origin-host-set"));
         insert_context_with_doc(&db, &row, ws_id);
@@ -6963,7 +6986,7 @@ mod tests {
     /// — never a silent no-op that could be mistaken for success.
     #[test]
     fn set_origin_host_unknown_context_is_not_found() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let err = db.set_origin_host(ContextId::new(), Some("moltar")).unwrap_err();
         assert!(matches!(err, KernelDbError::NotFound(_)), "got: {err:?}");
     }
@@ -6978,7 +7001,7 @@ mod tests {
     /// read together.
     #[test]
     fn origin_host_survives_the_context_dag_cte_read() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("origin-host-dag"));
         insert_context_with_doc(&db, &row, ws_id);
@@ -7001,7 +7024,7 @@ mod tests {
     /// `Err` instead of silently continuing.
     #[test]
     fn apply_additive_migrations_propagates_real_errors() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.conn.execute_batch("DROP TABLE tracks").unwrap();
         let result = KernelDb::apply_additive_migrations(&db.conn);
         match result {
@@ -7022,7 +7045,7 @@ mod tests {
     /// ignorable case and swallowed).
     #[test]
     fn duplicate_column_error_detection_is_specific() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let dup = db
             .conn
             .execute(
@@ -7049,7 +7072,7 @@ mod tests {
     /// name in the new factory floor, not a rename target.
     #[test]
     fn context_model_rollover_keeps_surviving_backend_names_untouched() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let mut anthropic = make_context_row(Some("keep-anthropic"));
@@ -7090,7 +7113,7 @@ mod tests {
     /// travels unchanged.
     #[test]
     fn context_model_rollover_renames_openai_to_gpt() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let mut row = make_context_row(Some("was-openai"));
@@ -7111,7 +7134,7 @@ mod tests {
     /// deepseek v4 flash for now").
     #[test]
     fn context_model_rollover_falls_back_everything_else_to_deepseek_flash() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let mut lemonade = make_context_row(Some("was-lemonade"));
@@ -7154,7 +7177,7 @@ mod tests {
     /// not turn an implicit default into an explicit pin nobody asked for.
     #[test]
     fn context_model_rollover_leaves_fully_unset_rows_untouched() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let row = make_context_row(Some("never-configured"));
@@ -7168,13 +7191,13 @@ mod tests {
         assert!(after.model.is_none());
     }
 
-    /// The whole migration re-runs on every kernel `open()`/`in_memory()` —
+    /// The whole migration re-runs on every kernel `open()`/`temporary()` —
     /// it must be a no-op the second time, including for rows it JUST
     /// rewrote (a re-mapped `gpt`/`deepseek` row must not be re-mapped
     /// again on the next pass).
     #[test]
     fn context_model_rollover_is_idempotent() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let mut openai = make_context_row(Some("was-openai-2"));
@@ -7273,8 +7296,8 @@ mod tests {
     /// nothing to narrow.
     #[test]
     fn preset_cast_narrowing_is_a_no_op_on_a_fresh_db() {
-        let db = KernelDb::in_memory().unwrap();
-        // in_memory() already ran it once as part of open; running again
+        let db = KernelDb::temporary().unwrap();
+        // temporary() already ran it once as part of open; running again
         // directly must still be a clean no-op.
         KernelDb::migrate_preset_cast_narrowing(&db.conn).unwrap();
     }
@@ -7284,7 +7307,7 @@ mod tests {
     /// backfill via COALESCE, not this row-level accessor.
     #[test]
     fn touch_context_activity_stamps_and_advances() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("touch-me"));
         let cid = row.context_id;
@@ -7354,7 +7377,7 @@ mod tests {
     /// file and shrink the `-wal` file back to zero. Guards the proactive
     /// checkpoint that compaction relies on so a bare-file read of the main
     /// `.db` stops lagging committed history (2026-06-11 forensics). On-disk
-    /// db required — `in_memory()` has no WAL file.
+    /// db required — a `:memory:` connection has no WAL file.
     #[test]
     fn checkpoint_truncates_wal() {
         let dir = tempfile::tempdir().unwrap();
@@ -7526,7 +7549,7 @@ mod tests {
 
     #[test]
     fn context_lifecycle() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("main"));
         let cid = row.context_id;
@@ -7557,7 +7580,7 @@ mod tests {
 
     #[test]
     fn conclude_context_sets_state_timestamp_and_is_idempotent() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("worky"));
         let cid = row.context_id;
@@ -7587,7 +7610,7 @@ mod tests {
 
     #[test]
     fn conclude_context_rejects_archived() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("gone"));
         let cid = row.context_id;
@@ -7602,7 +7625,7 @@ mod tests {
 
     #[test]
     fn label_validation_colon() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let row = make_context_row(Some("my:label"));
 
         let err = db.insert_context(&row).unwrap_err();
@@ -7613,7 +7636,7 @@ mod tests {
 
     #[test]
     fn label_uniqueness() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let row1 = make_context_row(Some("shared"));
@@ -7646,7 +7669,7 @@ mod tests {
 
     #[test]
     fn fork_lineage_3_deep() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let root = make_context_row(Some("root"));
@@ -7676,7 +7699,7 @@ mod tests {
 
     #[test]
     fn subtree_snapshot() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let parent = make_context_row(Some("template"));
@@ -7711,7 +7734,7 @@ mod tests {
 
     #[test]
     fn structural_edge_unique() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let a = make_context_row(Some("a"));
@@ -7738,7 +7761,7 @@ mod tests {
 
     #[test]
     fn drift_edge_allows_dupes() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let a = make_context_row(None);
@@ -7760,7 +7783,7 @@ mod tests {
 
     #[test]
     fn cycle_detection() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let a = make_context_row(Some("cyc-a"));
@@ -7791,7 +7814,7 @@ mod tests {
 
     #[test]
     fn preset_lifecycle() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -7857,7 +7880,7 @@ mod tests {
 
     #[test]
     fn workspace_lifecycle() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -7910,7 +7933,7 @@ mod tests {
 
     #[test]
     fn workspace_soft_delete() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -7945,7 +7968,7 @@ mod tests {
 
     #[test]
     fn drift_push_creates_edge() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let a = make_context_row(Some("source"));
@@ -7976,7 +7999,7 @@ mod tests {
 
     #[test]
     fn context_dag_recursive() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         // Create a 5-node tree: root → [a, b], a → [c, d]
@@ -8027,7 +8050,7 @@ mod tests {
 
     #[test]
     fn tag_resolution() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let ctx1 = make_context_row(Some("opusplan"));
@@ -8048,7 +8071,7 @@ mod tests {
 
     #[test]
     fn resolve_context_basic() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let ctx = make_context_row(Some("unique-label"));
@@ -8075,7 +8098,7 @@ mod tests {
 
     #[test]
     fn null_labels_coexist() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         // Insert 5 contexts with NULL label — all succeed
@@ -8092,7 +8115,7 @@ mod tests {
 
     #[test]
     fn archive_excludes_from_active() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let parent = make_context_row(Some("parent"));
@@ -8127,7 +8150,7 @@ mod tests {
 
     #[test]
     fn context_edge_cascade() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let a = make_context_row(Some("edge-a"));
@@ -8202,7 +8225,7 @@ mod tests {
 
     #[test]
     fn roundtrip_create_and_recover() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let creator = PrincipalId::new();
         let parent_id = ContextId::new();
@@ -8319,7 +8342,7 @@ mod tests {
 
     #[test]
     fn fk_violation_is_validation_error() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         // Reference a workspace_id that doesn't exist on the context
@@ -8371,7 +8394,7 @@ mod tests {
 
     #[test]
     fn context_shell_upsert_and_get() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("shell-test"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8404,7 +8427,7 @@ mod tests {
 
     #[test]
     fn context_shell_get_unknown() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(db.get_context_shell(ContextId::new()).unwrap().is_none());
     }
 
@@ -8413,7 +8436,7 @@ mod tests {
     /// indistinguishable from "measured and genuinely empty").
     #[test]
     fn context_usage_absent_by_default() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("usage-absent"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8422,7 +8445,7 @@ mod tests {
 
     #[test]
     fn context_usage_set_and_get_round_trips() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("usage-roundtrip"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8450,7 +8473,7 @@ mod tests {
     /// spend counter — see the `context_usage` table doc comment in `SCHEMA`.
     #[test]
     fn context_usage_upsert_overwrites_not_sums() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("usage-overwrite"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8494,7 +8517,7 @@ mod tests {
     /// DB round-trip per context.
     #[test]
     fn list_all_context_usage_returns_every_row() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx_a = make_context_row(Some("usage-list-a"));
         let ctx_b = make_context_row(Some("usage-list-b"));
@@ -8606,7 +8629,7 @@ mod tests {
 
     #[test]
     fn context_shell_copy() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("src"));
         let tgt = make_context_row(Some("tgt"));
@@ -8632,7 +8655,7 @@ mod tests {
 
     #[test]
     fn context_shell_copy_empty() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("src"));
         let tgt = make_context_row(Some("tgt"));
@@ -8649,7 +8672,7 @@ mod tests {
 
     #[test]
     fn context_shell_cascade_delete() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8688,7 +8711,7 @@ mod tests {
 
     #[test]
     fn context_binding_roundtrip_preserves_order_and_sticky_names() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("binding-roundtrip"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8731,7 +8754,7 @@ mod tests {
     #[test]
     fn context_binding_roundtrip_preserves_tool_and_facade_grants() {
         use crate::mcp::Capability;
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("binding-caps"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8773,7 +8796,7 @@ mod tests {
     #[test]
     fn context_binding_flags_roundtrip() {
         use crate::mcp::Capability;
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("binding-flags"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8800,7 +8823,7 @@ mod tests {
         // Permissions follow the fork: copy_context_binding clones the parent's
         // loadout so a fork is not locked out under deny-by-default.
         use crate::mcp::Capability;
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let parent = make_context_row(Some("fork-parent"));
         let child = make_context_row(Some("fork-child"));
@@ -8823,7 +8846,7 @@ mod tests {
 
     #[test]
     fn context_binding_get_absent_returns_none() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         // No context, no upsert: get must return None. Deny-by-default — the
         // broker treats None as "grants nothing", no first-touch fallback.
         assert!(db.get_context_binding(ContextId::new()).unwrap().is_none());
@@ -8834,7 +8857,7 @@ mod tests {
         // Phase 5 writes bindings as whole units; a second upsert must
         // wholly replace the children, not accumulate. Regression guard
         // against "leftover rows from a previous binding leak through."
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("binding-replace"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8861,7 +8884,7 @@ mod tests {
 
     #[test]
     fn context_binding_delete_returns_whether_existed() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("binding-delete"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8884,7 +8907,7 @@ mod tests {
     fn context_binding_cascades_on_context_delete() {
         // Parent context gone → all three binding tables cascade-clear.
         // Guards against orphaned rows in binding_instances / binding_names.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("binding-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -8959,7 +8982,7 @@ mod tests {
         // One insert per action_kind. Round-trip must preserve every
         // variant-specific column and every match field so the broker's
         // reconstruction loses no information.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
 
         // Builtin-invoke with full match fields.
         let ctx_id = ContextId::new();
@@ -9127,7 +9150,7 @@ mod tests {
 
     #[test]
     fn hook_delete_returns_whether_existed() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         // Delete of absent id is false (idempotent cleanup).
         assert!(!db.delete_hook("nope").unwrap());
 
@@ -9144,7 +9167,7 @@ mod tests {
         // insertion-order tiebreak. Insert three hooks in pre_call with
         // identical priority; load must return them in insertion order.
         // Cross-phase, ordering within each phase must be preserved.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.insert_hook(&minimal_hook_row("a", "pre_call", 5))
             .unwrap();
         db.insert_hook(&minimal_hook_row("b", "pre_call", 5))
@@ -9178,7 +9201,7 @@ mod tests {
         // Primary-key collision is a load-bearing signal: the broker
         // should call `delete_hook` first for replace semantics rather
         // than relying on an implicit upsert. Lock that contract in.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.insert_hook(&minimal_hook_row("dup", "pre_call", 0))
             .unwrap();
         let err = db
@@ -9194,7 +9217,7 @@ mod tests {
 
     #[test]
     fn context_env_set_and_get() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("env-test"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9219,7 +9242,7 @@ mod tests {
 
     #[test]
     fn context_env_upsert() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("env-upsert"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9236,14 +9259,14 @@ mod tests {
 
     #[test]
     fn context_env_get_empty() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let vars = db.get_context_env(ContextId::new()).unwrap();
         assert!(vars.is_empty());
     }
 
     #[test]
     fn context_env_delete() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("env-del"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9256,7 +9279,7 @@ mod tests {
 
     #[test]
     fn context_env_clear() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("env-clear"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9271,7 +9294,7 @@ mod tests {
 
     #[test]
     fn context_env_copy() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("env-src"));
         let tgt = make_context_row(Some("env-tgt"));
@@ -9293,7 +9316,7 @@ mod tests {
 
     #[test]
     fn context_env_cascade_delete() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("env-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9310,7 +9333,7 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_empty_for_unknown_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let bps = db.list_cache_breakpoints(ContextId::new()).unwrap();
         assert!(bps.is_empty());
     }
@@ -9320,7 +9343,7 @@ mod tests {
         // Round-trip every CacheTarget variant plus both CacheTtl values
         // — the table schema is right only if every shape survives a
         // write+read.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-rt"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9345,13 +9368,13 @@ mod tests {
     #[test]
     fn hydration_policy_unset_is_none() {
         // No row → None → hydrate everything (the default for every context).
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(db.get_hydration_policy(ContextId::new()).unwrap().is_none());
     }
 
     #[test]
     fn hydration_policy_set_get_round_trip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("hydra-rt"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9367,7 +9390,7 @@ mod tests {
     fn hydration_policy_upsert_advances_marker_in_place() {
         // Advancing the marker (a durable revision) is a single in-place upsert,
         // not a second row — the PK is context_id.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("hydra-up"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9390,7 +9413,7 @@ mod tests {
         // prefix-only and drop the current turn from the wire. Corrupt config is
         // a LOUD failure (the caller fails the turn), not a silent degrade to
         // hydrate-everything that disables the cost guard.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("hydra-zero"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9410,7 +9433,7 @@ mod tests {
     fn hydration_policy_unparseable_marker_is_loud_error() {
         // A stored marker that no longer parses is corruption in this one row.
         // Same stance as a bad window: refuse loudly, don't silently hydrate all.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("hydra-badmark"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9434,7 +9457,7 @@ mod tests {
 
     #[test]
     fn hydration_policy_clear_reverts_to_none() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("hydra-clear"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -9452,13 +9475,13 @@ mod tests {
 
     #[test]
     fn client_view_unset_is_none() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(db.get_client_view("client-a").unwrap().is_none());
     }
 
     #[test]
     fn client_view_set_get_round_trip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx = ContextId::new();
         db.set_client_view("client-a", ctx).unwrap();
         assert_eq!(db.get_client_view("client-a").unwrap(), Some(ctx));
@@ -9469,7 +9492,7 @@ mod tests {
         // Set twice: the second write replaces the first in place (PK is
         // client_id), matching the "one row per installation" design — not a
         // history of every context this client ever looked at.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let first = ContextId::new();
         let second = ContextId::new();
         db.set_client_view("client-a", first).unwrap();
@@ -9485,7 +9508,7 @@ mod tests {
     fn client_view_is_namespaced_per_client() {
         // Two installations don't clobber each other's view — the whole point
         // of keying by client_id instead of a single global row.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx_a = ContextId::new();
         let ctx_b = ContextId::new();
         db.set_client_view("client-a", ctx_a).unwrap();
@@ -9498,13 +9521,13 @@ mod tests {
 
     #[test]
     fn dirty_file_buffer_unset_is_none() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(db.get_dirty_file_buffer("/tmp/never-touched.txt").unwrap().is_none());
     }
 
     #[test]
     fn dirty_file_buffer_round_trips_with_generation() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx = ContextId::new();
         db.record_dirty_file_buffer("/tmp/a.txt", ctx, Some(7)).unwrap();
         let row = db.get_dirty_file_buffer("/tmp/a.txt").unwrap().expect("row recorded");
@@ -9517,7 +9540,7 @@ mod tests {
     fn dirty_file_buffer_round_trips_with_none_generation() {
         // Nullable because the cache already models "couldn't read the VFS
         // attr" as None — the row must preserve that, not coerce to 0.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx = ContextId::new();
         db.record_dirty_file_buffer("/tmp/b.txt", ctx, None).unwrap();
         let row = db.get_dirty_file_buffer("/tmp/b.txt").unwrap().expect("row recorded");
@@ -9527,7 +9550,7 @@ mod tests {
 
     #[test]
     fn dirty_file_buffer_upsert_replaces_not_duplicates() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let first_ctx = ContextId::new();
         let second_ctx = ContextId::new();
         db.record_dirty_file_buffer("/tmp/c.txt", first_ctx, Some(1)).unwrap();
@@ -9548,7 +9571,7 @@ mod tests {
 
     #[test]
     fn dirty_file_buffer_clear_removes_it() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx = ContextId::new();
         db.record_dirty_file_buffer("/tmp/d.txt", ctx, Some(1)).unwrap();
         assert!(db.clear_dirty_file_buffer("/tmp/d.txt").unwrap(), "a row existed to clear");
@@ -9557,7 +9580,7 @@ mod tests {
 
     #[test]
     fn dirty_file_buffer_clear_unrecorded_path_is_noop() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(
             !db.clear_dirty_file_buffer("/tmp/never-recorded.txt").unwrap(),
             "clearing a path with no row is a no-op, not an error"
@@ -9566,7 +9589,7 @@ mod tests {
 
     #[test]
     fn dirty_file_buffer_list_returns_multiple_paths() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.record_dirty_file_buffer("/tmp/e1.txt", ContextId::new(), Some(1)).unwrap();
         db.record_dirty_file_buffer("/tmp/e2.txt", ContextId::new(), None).unwrap();
         db.record_dirty_file_buffer("/tmp/e3.txt", ContextId::new(), Some(3)).unwrap();
@@ -9602,7 +9625,7 @@ mod tests {
 
     #[test]
     fn track_upsert_get_round_trip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let t = make_track("bass", 250);
         db.upsert_track(&t).unwrap();
         assert_eq!(db.get_track("bass").unwrap(), Some(t), "track survives write→read");
@@ -9610,7 +9633,7 @@ mod tests {
 
     #[test]
     fn track_absent_is_none() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(
             db.get_track("no-such-track").unwrap().is_none(),
             "absent track → None"
@@ -9619,7 +9642,7 @@ mod tests {
 
     #[test]
     fn get_track_empty_id_is_loud_error() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         assert!(
             matches!(db.get_track(""), Err(KernelDbError::Validation(_))),
             "empty track_id is corrupt → Validation error, not a silent None"
@@ -9629,7 +9652,7 @@ mod tests {
     #[test]
     fn get_track_zero_period_is_loud_error() {
         // A zero period is a beat that never advances — corrupt stored state.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.conn
             .execute(
                 "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
@@ -9647,7 +9670,7 @@ mod tests {
     fn get_track_negative_field_is_loud_error() {
         // A negative INTEGER written into SQLite (tampering / bit rot) must not
         // silently cast to a huge u64. Reject it loudly.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.conn
             .execute(
                 "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
@@ -9666,7 +9689,7 @@ mod tests {
         // `list_tracks` must run the SAME numeric validation as `get_track` — a
         // corrupt row (here a negative period) must surface as a loud Validation
         // error, never a nonsense `u64::MAX` cadence cast silently into the roster.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.upsert_track(&make_track("good", 500)).unwrap();
         db.conn
             .execute(
@@ -9684,7 +9707,7 @@ mod tests {
     #[test]
     fn track_upsert_updates_in_place() {
         // A tempo change updates one row, not a second — PK is track_id.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.upsert_track(&make_track("bass", 500)).unwrap();
         db.upsert_track(&make_track("bass", 250)).unwrap(); // tempo up
         assert_eq!(
@@ -9701,7 +9724,7 @@ mod tests {
 
     #[test]
     fn track_list_and_delete() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         db.upsert_track(&make_track("bass", 250)).unwrap();
@@ -9737,7 +9760,7 @@ mod tests {
         // untouched (the durable recovery payload), and the tombstoned row is
         // invisible to both `list_tracks` and a `get_track` lookup by the
         // ORIGINAL name (so re-attaching that name starts fresh).
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let score = ContextId::new();
         db.upsert_track(&PersistedTrack { score_context_id: Some(score), ..make_track("bass", 250) })
             .unwrap();
@@ -9794,7 +9817,7 @@ mod tests {
         // BEFORE tombstoning; if it didn't, renaming the track_id out from under
         // a live attachment row would leave that row pointing at a name that no
         // longer resolves. Refuse loudly rather than silently orphan it.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         let ctx = make_context_row(Some("dangling"));
@@ -9812,7 +9835,7 @@ mod tests {
 
     #[test]
     fn tombstone_track_unknown_track_is_not_found() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         assert!(matches!(
             db.tombstone_track("no-such-track"),
             Err(KernelDbError::NotFound(_))
@@ -9821,7 +9844,7 @@ mod tests {
 
     #[test]
     fn track_playhead_and_playing_round_trip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let t = PersistedTrack {
             playhead_tick: Some(1024),
             playing: true,
@@ -9835,7 +9858,7 @@ mod tests {
 
     #[test]
     fn track_score_context_round_trips_and_is_set_once() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let score = ContextId::new();
         // Created with a score context.
         db.upsert_track(&PersistedTrack {
@@ -9867,7 +9890,7 @@ mod tests {
         // Unlike `score_context_id` (set-once), `clock_kind` is MUTABLE: a track
         // sketched on the system clock can be slaved to a MIDI master later
         // (docs/tracks.md Stage 3). The driver swap must survive an upsert.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.upsert_track(&make_track("bass", 250)).unwrap();
         assert_eq!(
             db.get_track("bass").unwrap().unwrap().clock_kind,
@@ -9906,7 +9929,7 @@ mod tests {
         // A row inserted without the `clock_kind` column (the pre-Stage-3 shape an
         // additive ALTER backfills) reads back as 'system' via the column DEFAULT,
         // never NULL — `get_track`'s `String` read would fail loud on NULL.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.conn
             .execute(
                 "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
@@ -9925,7 +9948,7 @@ mod tests {
 
     #[test]
     fn attachment_upsert_get_round_trip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         let ctx = make_context_row(Some("att-rt"));
@@ -9948,7 +9971,7 @@ mod tests {
 
     #[test]
     fn attachment_absent_is_none() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.upsert_track(&make_track("bass", 250)).unwrap();
         assert!(
             db.get_attachment("bass", ContextId::new()).unwrap().is_none(),
@@ -9958,7 +9981,7 @@ mod tests {
 
     #[test]
     fn attachment_upsert_updates_in_place() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         let ctx = make_context_row(Some("att-up"));
@@ -9983,7 +10006,7 @@ mod tests {
 
     #[test]
     fn list_attachments_for_track() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         db.upsert_track(&make_track("lead", 500)).unwrap();
@@ -10009,7 +10032,7 @@ mod tests {
 
     #[test]
     fn list_attachments_for_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         db.upsert_track(&make_track("lead", 500)).unwrap();
@@ -10030,7 +10053,7 @@ mod tests {
 
     #[test]
     fn delete_attachment() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         let ctx = make_context_row(Some("att-del"));
@@ -10061,7 +10084,7 @@ mod tests {
         // is the durable clock domain identity across the fork-lineage (the
         // rotation page-turn: docs/tracks.md §3). A thin spawn-fork has no label,
         // so without this copy the child would have no track to re-bind on.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         db.upsert_track(&make_track("lead", 500)).unwrap();
@@ -10104,7 +10127,7 @@ mod tests {
     fn fork_of_a_non_musician_copies_no_attachments() {
         // A non-musician parent has no attachments; the fork copy is a clean no-op
         // (does not error, does not leave stale rows behind).
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let parent = make_context_row(Some("coder"));
         insert_context_with_doc(&db, &parent, ws_id);
@@ -10122,7 +10145,7 @@ mod tests {
     #[test]
     fn copy_attachments_for_fork_in_transaction() {
         // Directly tests the tx-level primitive with two source attachments.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         db.upsert_track(&make_track("bass", 250)).unwrap();
         db.upsert_track(&make_track("lead", 500)).unwrap();
@@ -10166,7 +10189,7 @@ mod tests {
         // Insertion order must be preserved — populators (rc scripts)
         // rely on this for the wire-layer's first-write-wins dedupe to
         // produce predictable results.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-order"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10207,7 +10230,7 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_clear_returns_count_and_empties_list() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-clear"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10229,7 +10252,7 @@ mod tests {
         // After clearing, the next add should start back at seq=0.
         // This matters for rc-on-drift scripts that clear-then-rebuild
         // — we don't want sequence numbers to grow unboundedly.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-resume"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10250,7 +10273,7 @@ mod tests {
     fn cache_breakpoints_cascade_delete_on_context() {
         // Context deletion must remove all of its breakpoints (via the
         // FK ON DELETE CASCADE through contexts -> documents).
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10275,7 +10298,7 @@ mod tests {
     fn cache_breakpoints_storage_does_not_enforce_4_cap() {
         // Storage is liberal — populators may add more than 4. The wire
         // layer applies the cap. This test pins the policy choice.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-nocap"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10295,7 +10318,7 @@ mod tests {
         // Forwards-compat: an unknown target_kind in the DB (e.g. from a
         // future schema variant downgraded to this binary) must be
         // silently skipped, not panic the read path.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-future"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10319,7 +10342,7 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_decode_drops_unrecognized_ttl() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-future-ttl"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10342,7 +10365,7 @@ mod tests {
         // MessageIndex(fork_at - 1); when fork_at is 1, that's
         // MessageIndex(0). Make sure index 0 doesn't get confused with
         // SQL NULL or default fallback.
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("cache-idx0"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10360,7 +10383,7 @@ mod tests {
 
     #[test]
     fn workspace_path_read_only_roundtrip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -10402,7 +10425,7 @@ mod tests {
 
     #[test]
     fn fork_context_config_full() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("fork-src"));
         let tgt = make_context_row(Some("fork-tgt"));
@@ -10436,7 +10459,7 @@ mod tests {
 
     #[test]
     fn fork_context_config_empty_source() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("empty-src"));
         let tgt = make_context_row(Some("empty-tgt"));
@@ -10460,7 +10483,7 @@ mod tests {
     /// survive and this fails.
     #[test]
     fn fork_context_config_rolls_back_on_partial_failure() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("atomic-src"));
         let tgt = make_context_row(Some("atomic-tgt"));
@@ -10510,7 +10533,7 @@ mod tests {
     /// brand-new target via `insert_forked_context`, and prove every piece arrived.
     #[test]
     fn insert_forked_context_creates_rows_and_copies_config() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("ifc-src"));
         insert_context_with_doc(&db, &src, ws_id);
@@ -10572,7 +10595,7 @@ mod tests {
     /// pair (two separate autocommits), the context row would persist.
     #[test]
     fn insert_forked_context_rolls_back_rows_on_config_failure() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("ifc-atomic-src"));
         insert_context_with_doc(&db, &src, ws_id);
@@ -10611,7 +10634,7 @@ mod tests {
 
     #[test]
     fn context_workspace_paths_bound() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -10652,7 +10675,7 @@ mod tests {
 
     #[test]
     fn context_workspace_paths_unbound() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("unbound"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10663,7 +10686,7 @@ mod tests {
 
     #[test]
     fn get_or_create_kernel_id_stable_across_calls() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let id1 = db.kernel_id().unwrap();
         let id2 = db.kernel_id().unwrap();
         assert_eq!(id1, id2, "should return same ID on second call");
@@ -10671,7 +10694,7 @@ mod tests {
 
     #[test]
     fn get_or_create_kernel_id_fresh_on_empty_db() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let id = db.kernel_id().unwrap();
         // Should be a valid UUIDv7 (non-zero)
         assert_ne!(id.as_bytes(), &[0u8; 16]);
@@ -10681,7 +10704,7 @@ mod tests {
 
     #[test]
     fn check_workspace_path_unbound_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ctx = make_context_row(Some("unbound"));
         insert_context_with_doc(&db, &ctx, ws_id);
@@ -10695,7 +10718,7 @@ mod tests {
 
     #[test]
     fn check_workspace_path_allowed_rw() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -10729,7 +10752,7 @@ mod tests {
 
     #[test]
     fn check_workspace_path_allowed_ro() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -10763,7 +10786,7 @@ mod tests {
 
     #[test]
     fn check_workspace_path_outside_scope() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -10797,7 +10820,7 @@ mod tests {
 
     #[test]
     fn check_workspace_path_longest_prefix() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let creator = PrincipalId::new();
         let now = now_millis();
 
@@ -10848,7 +10871,7 @@ mod tests {
 
     #[test]
     fn promote_context_stamps_and_is_append_stable() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("candidate"));
         let cid = row.context_id;
@@ -10878,7 +10901,7 @@ mod tests {
 
     #[test]
     fn promote_clears_demoted_and_demote_clears_promoted() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("seesaw"));
         let cid = row.context_id;
@@ -10914,7 +10937,7 @@ mod tests {
 
     #[test]
     fn demote_ladder_ends_archived() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("ladder"));
         let cid = row.context_id;
@@ -10940,7 +10963,7 @@ mod tests {
 
     #[test]
     fn conclude_context_clears_promoted_seat() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("mux-exit"));
         let cid = row.context_id;
@@ -10955,7 +10978,7 @@ mod tests {
 
     #[test]
     fn archive_context_clears_promoted_and_demoted() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("archived-seat"));
         let cid = row.context_id;
@@ -10971,7 +10994,7 @@ mod tests {
 
     #[test]
     fn set_context_paused_roundtrip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("pausable"));
         let cid = row.context_id;
@@ -10991,7 +11014,7 @@ mod tests {
 
     #[test]
     fn active_ring_cap_refuses_an_eleventh_seat_until_a_demote() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         let mut ids = Vec::new();
@@ -11028,7 +11051,7 @@ mod tests {
 
     #[test]
     fn promote_resurrects_an_archived_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("lazarus"));
         let cid = row.context_id;
@@ -11053,7 +11076,7 @@ mod tests {
 
     #[test]
     fn promote_resurrects_a_concluded_context_without_unconcluding() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("done-but-back"));
         let cid = row.context_id;
@@ -11077,7 +11100,7 @@ mod tests {
 
     #[test]
     fn ring_full_resurrection_errors_and_stays_archived() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         for i in 0..ACTIVE_RING_CAPACITY {
@@ -11104,7 +11127,7 @@ mod tests {
 
     #[test]
     fn resurrection_stamps_a_fresh_promoted_at() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("stale-seat"));
         let cid = row.context_id;
@@ -11136,7 +11159,7 @@ mod tests {
 
     #[test]
     fn resolve_context_full_id_reaches_an_archived_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("ghost"));
         let cid = row.context_id;
@@ -11160,7 +11183,7 @@ mod tests {
     /// omits the columns would silently drop values any future caller sets.
     #[test]
     fn insert_context_round_trips_placement_stamps() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let mut row = make_context_row(Some("stamped-at-birth"));
         row.last_activity_at = Some(1_111);
@@ -11184,7 +11207,7 @@ mod tests {
     /// stamp keeps it visually in ring 3.
     #[test]
     fn demote_on_a_corrupt_both_stamps_row_archives() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("both-stamps"));
         let cid = row.context_id;
@@ -11204,7 +11227,7 @@ mod tests {
 
     #[test]
     fn set_context_paused_rejects_archived_and_unknown() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("buried-napper"));
         let cid = row.context_id;
@@ -11224,7 +11247,7 @@ mod tests {
     /// demote, and conclude must all leave it alone.
     #[test]
     fn paused_at_survives_promote_demote_conclude() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("sleeper"));
         let cid = row.context_id;
@@ -11249,7 +11272,7 @@ mod tests {
     /// the demoted ring instead of floating back to the auto pool.
     #[test]
     fn conclude_preserves_demoted_at() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("demoted-then-done"));
         let cid = row.context_id;
@@ -11273,7 +11296,7 @@ mod tests {
     /// only ever exercise the `created_at` fallback).
     #[test]
     fn list_orders_by_last_activity_over_created_at() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
 
         // `old` was created first but touched most recently; `new` was
@@ -11309,7 +11332,7 @@ mod tests {
     ///    must classify as `DuplicateDocument`, carrying the right id.
     #[test]
     fn insert_document_duplicate_id_is_typed_duplicate_document() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let doc_id = ContextId::new();
         let row = DocumentRow {
@@ -11337,7 +11360,7 @@ mod tests {
     ///    path and the id of the document that actually holds it.
     #[test]
     fn insert_document_path_conflict_is_typed_document_path_conflict() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let first_id = ContextId::new();
         db.insert_document(&DocumentRow {
@@ -11378,7 +11401,7 @@ mod tests {
     ///    into a full unique index, this must fail loudly.
     #[test]
     fn insert_document_two_null_paths_in_same_workspace_both_succeed() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         for _ in 0..2 {
             db.insert_document(&DocumentRow {
@@ -11406,7 +11429,7 @@ mod tests {
 
     #[test]
     fn roster_status_availability_check_rejects_an_unrecognized_value() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("roster-avail"));
         insert_context_with_doc(&db, &row, ws_id);
@@ -11432,7 +11455,7 @@ mod tests {
 
     #[test]
     fn roster_presence_liveness_kind_check_rejects_an_unrecognized_value() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("roster-liveness"));
         insert_context_with_doc(&db, &row, ws_id);
@@ -11459,7 +11482,7 @@ mod tests {
 
     #[test]
     fn roster_activity_live_check_rejects_a_non_boolean_value() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("roster-live-check"));
         insert_context_with_doc(&db, &row, ws_id);
@@ -11496,7 +11519,7 @@ mod tests {
     /// phantom id (never inserted into `contexts`) is refused outright.
     #[test]
     fn roster_entity_context_must_exist_trigger_refuses_a_phantom_context() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let _ws_id = setup_test_db(&db);
         let phantom = ContextId::new();
         let err = db
@@ -11519,7 +11542,7 @@ mod tests {
     /// `roster.rs`'s module doc as Rust-API-only discipline for that half).
     #[test]
     fn roster_entity_principal_kind_is_not_checked_against_any_table() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.conn
             .execute(
                 "INSERT INTO roster_entity (entity_kind, entity_id, first_seen_at)
@@ -11534,7 +11557,7 @@ mod tests {
     /// Basic set → get → clear roundtrip.
     #[test]
     fn well_known_context_set_get_clear_roundtrip() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("lost+found"));
         insert_context_with_doc(&db, &row, ws_id);
@@ -11555,7 +11578,7 @@ mod tests {
     /// UPDATEs rather than erroring, and the second id wins.
     #[test]
     fn set_well_known_context_twice_rotates_rather_than_conflicts() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let incumbent = make_context_row(Some("lost+found"));
         insert_context_with_doc(&db, &incumbent, ws_id);
@@ -11623,7 +11646,7 @@ mod tests {
     /// the migration rewrites a tag, it never deletes or inserts.
     #[test]
     fn migrate_doc_kind_file_collapse_remaps_legacy_tags() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ids = insert_raw_kind_docs(&db, ws_id, &["code", "text", "config"]);
         let before = db.list_documents().unwrap().len();
@@ -11646,7 +11669,7 @@ mod tests {
     /// `WHERE` clause names three tags and only those three.
     #[test]
     fn migrate_doc_kind_file_collapse_leaves_conversation_and_symlink() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ids = insert_raw_kind_docs(&db, ws_id, &["conversation", "symlink"]);
         let before = db.list_documents().unwrap().len();
@@ -11670,7 +11693,7 @@ mod tests {
     /// which is why it carries no `kernel_migrations` marker.
     #[test]
     fn migrate_doc_kind_file_collapse_is_idempotent() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let ids = insert_raw_kind_docs(&db, ws_id, &["code", "text", "config"]);
 
@@ -11685,15 +11708,15 @@ mod tests {
 
     /// The backfill migration (`migrate_well_known_lost_found`) adopts a
     /// pre-existing `label = 'lost+found'` row into the registry, and running
-    /// it again (as every `open()`/`in_memory()` does) is a no-op.
+    /// it again (as every `open()`/`temporary()` does) is a no-op.
     #[test]
     fn migrate_well_known_lost_found_backfills_and_is_idempotent() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let legacy = make_context_row(Some("lost+found"));
         insert_context_with_doc(&db, &legacy, ws_id);
 
-        // Pre-migration: nothing in the registry yet (in_memory() already ran
+        // Pre-migration: nothing in the registry yet (temporary() already ran
         // the migration once before this row existed).
         assert_eq!(db.well_known_context(WellKnownRole::LostFound).unwrap(), None);
 
@@ -11714,6 +11737,25 @@ mod tests {
             db.well_known_context(WellKnownRole::LostFound).unwrap(),
             Some(rotated.context_id),
             "re-running the backfill must not clobber a later rotation"
+        );
+    }
+
+    /// `temporary()` must open a real file on disk, not `:memory:` — and that
+    /// file (and the directory holding it) must be gone once nothing holds
+    /// the `KernelDb` anymore. Asserted against the filesystem directly, not
+    /// against any in-process bookkeeping.
+    #[test]
+    fn temporary_writes_a_real_file_and_removes_it_on_drop() {
+        let db = KernelDb::temporary().unwrap();
+        let dir = db._temp_dir.as_ref().unwrap().path().to_path_buf();
+        let db_path = dir.join("kernel.db");
+        assert!(db_path.is_file(), "temporary() must back its handle with a real file");
+
+        drop(db);
+
+        assert!(
+            !dir.exists(),
+            "the temp directory must be removed once the KernelDb handle drops"
         );
     }
 }

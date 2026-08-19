@@ -6393,6 +6393,7 @@ dependencies = [
  "kaijutsu-editor",
  "kaijutsu-hyoushigi",
  "kaijutsu-index",
+ "kaijutsu-kernel",
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "kaish-glob",

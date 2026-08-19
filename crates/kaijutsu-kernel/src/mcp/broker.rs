@@ -6563,7 +6563,7 @@ mod tests {
 
     fn hook_db() -> DbHandle {
         use crate::kernel_db::KernelDb;
-        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()))
+        Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()))
     }
 
     fn log_entry(id: &str, match_tool: Option<&str>) -> super::HookEntry {
@@ -7020,7 +7020,7 @@ mod tests {
     async fn binding_checked_never_bound_context_is_default_not_error() {
         use crate::kernel_db::KernelDb;
 
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let broker = Arc::new(Broker::new());
         broker.set_db(kernel_db).await;
 
@@ -7045,7 +7045,7 @@ mod tests {
         use crate::kernel_db::{ContextRow, DocumentRow, KernelDb};
         use kaijutsu_types::{now_millis, ConsentMode, ContextState, DocKind};
 
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ctx = ContextId::new();
         {
             let mut db = kernel_db.lock();
@@ -7156,7 +7156,7 @@ mod tests {
 
         let kernel = Arc::new(crate::Kernel::new_ephemeral(name).await.with_timeouts(policy));
         let store = crate::block_store::shared_block_store(PrincipalId::system());
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         {
             let db = kernel_db.lock();
             db.get_or_create_default_workspace(PrincipalId::system())

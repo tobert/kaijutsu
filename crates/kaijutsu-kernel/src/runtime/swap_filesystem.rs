@@ -365,7 +365,7 @@ mod tests {
     /// `Arc<Mutex<KernelDb>>` the production wiring shares between
     /// `FileDocumentCache` and `SwapFilesystem` — never a second instance.
     async fn test_fs() -> (Arc<MountTable>, Arc<FileDocumentCache>, SwapFilesystem, KernelId) {
-        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(Mutex::new(KernelDb::temporary().unwrap()));
         let blocks = shared_block_store(PrincipalId::system());
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/tmp", MemoryBackend::new()).await;

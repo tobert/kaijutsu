@@ -408,7 +408,7 @@ mod tests {
     use kaijutsu_types::{ConsentMode, ContextState};
 
     fn db_with_context() -> (Arc<parking_lot::Mutex<KernelDb>>, ContextId) {
-        let db = KernelDb::in_memory().expect("in-memory KernelDb");
+        let db = KernelDb::temporary().expect("temporary KernelDb");
         let ws = db.get_or_create_default_workspace(PrincipalId::system()).unwrap();
         let ctx_id = ContextId::new();
         let row = ContextRow {

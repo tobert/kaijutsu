@@ -751,13 +751,13 @@ mod tests {
     use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
     use std::sync::Arc;
 
-    /// A block store with a real (in-memory) KernelDb, so the `documents`
+    /// A block store with a real, temporary KernelDb, so the `documents`
     /// manifest — which backs readdir — is actually populated by
     /// `create_document_with_path`. A bare `shared_block_store` has no DB and
     /// would make every readdir empty.
     fn fs() -> ConfigDocFs {
         let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws_id, creator);
         ConfigDocFs::new(blocks, RC_ROOT)
@@ -1037,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn config_mount_seeds_and_reads_via_seed_entries() {
         let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws_id, creator);
         let fs = ConfigDocFs::new(blocks, CONFIG_ROOT);

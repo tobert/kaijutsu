@@ -141,8 +141,18 @@ russh-sftp.workspace = true
 # version skew between the two rten copies in the workspace).
 beat-this = "1.0"
 
+# Backs `KernelDb::temporary()` (kernel_db.rs) — optional so a production
+# build never links it; pulled in only by the `test-util` feature below.
+tempfile = { workspace = true, optional = true }
+
 [features]
 test-mock = []
+# `KernelDb::temporary()` and other test-only constructors reachable outside
+# this crate's own `cfg(test)` build: this crate's integration tests under
+# `tests/` (a separate compilation unit that links the lib without
+# `cfg(test)`) and other crates' tests (`kaijutsu-server`). Never enabled in
+# production builds.
+test-util = ["dep:tempfile"]
 
 # "process" — setpgid/kill_process_group/PR_SET_PDEATHSIG for background_exec.rs
 # (own process group for group-kill semantics; parent-death signal so a
@@ -160,3 +170,10 @@ tracing-subscriber = { workspace = true }
 # Enable the cross-crate test-only helpers (e.g. push_committed_for_test) for the
 # kernel's own tests — feature unification makes this dev-only.
 kaijutsu-hyoushigi = { workspace = true, features = ["test-util"] }
+# Self-dependency so this crate's OWN `test-util` feature (KernelDb::temporary())
+# is enabled when building its integration tests under `tests/` — that build
+# links the lib as an ordinary dependency (no `cfg(test)`), so without this the
+# feature-gated constructor would compile out of the rlib those tests link
+# against. `cargo test --lib` doesn't need this (its `cfg(test)` build already
+# satisfies the gate directly) but the self-dependency is harmless there too.
+kaijutsu-kernel = { path = ".", features = ["test-util"] }

@@ -43,7 +43,7 @@ struct Fixture {
 async fn setup() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
 
-    let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+    let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
     let creator = PrincipalId::system();
     let ws_id = {
         let g = db.lock();
@@ -338,7 +338,7 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
     let dispatcher = KjDispatcher::new(
         shared_drift_router(),
         shared_block_store(PrincipalId::system()),
-        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap())),
+        Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap())),
         fx.kernel.clone(),
     );
     // Widening (`allow`) requires a privileged (rc) or admin caller — simulate
@@ -1340,7 +1340,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
 
     let tmp = tempfile::tempdir().unwrap();
 
-    let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+    let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
     let creator = PrincipalId::system();
     let ws_id = {
         let g = db.lock();

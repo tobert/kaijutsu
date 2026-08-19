@@ -1338,7 +1338,7 @@ mod context_bootstrap_tests {
     use super::*;
 
     fn db() -> KernelDb {
-        KernelDb::in_memory().expect("in-memory KernelDb")
+        KernelDb::temporary().expect("temporary KernelDb")
     }
 
     /// A context the way a real one looks on disk: a human label, a real

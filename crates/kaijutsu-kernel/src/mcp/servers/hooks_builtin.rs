@@ -1437,7 +1437,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         let broker = Arc::new(Broker::new());
         let db: crate::block_store::DbHandle =
-            Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+            Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let broker_clone = broker.clone();
         // set_db is async; resolve synchronously via a one-shot block_on
         // — these tests are already inside `tokio::test`, but the

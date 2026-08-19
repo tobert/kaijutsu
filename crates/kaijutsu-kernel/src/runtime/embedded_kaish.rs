@@ -1277,7 +1277,7 @@ mod tests {
 
         let context_id = ContextId::new();
         let principal = PrincipalId::system();
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
 
         let ws_id = db
             .get_or_create_default_workspace(principal)
@@ -1385,7 +1385,7 @@ mod tests {
 
         let context_id = ContextId::new();
         let principal = PrincipalId::system();
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(
             &ContextRow {

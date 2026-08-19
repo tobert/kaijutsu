@@ -387,7 +387,7 @@ mod tests {
     use kaijutsu_types::PrincipalId;
 
     fn fs() -> (Arc<RosterStore>, RosterFs) {
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let roster = Arc::new(RosterStore::new(db));
         (roster.clone(), RosterFs::new(roster))
     }

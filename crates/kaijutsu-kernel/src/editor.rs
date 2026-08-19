@@ -723,13 +723,13 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    /// A block store backed by an in-memory KernelDb, so config docs created via
+    /// A block store backed by a temporary KernelDb, so config docs created via
     /// `create_document_with_path` land in the `documents` manifest (mirrors the
     /// ConfigDocFs test fixture). Returns the db handle too, since
     /// `FileDocumentCache::new` also requires one.
     fn blocks_with_db() -> (SharedBlockStore, Arc<parking_lot::Mutex<KernelDb>>) {
         let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         (shared_block_store_with_db(db.clone(), ws_id, creator), db)
     }
@@ -873,7 +873,7 @@ mod session_tests {
     /// ConfigDocFs backend, plus the resolved editor target for it.
     async fn seeded(initial: &[u8]) -> (SharedBlockStore, EditorTarget) {
         let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db.clone(), ws, creator);
         let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);

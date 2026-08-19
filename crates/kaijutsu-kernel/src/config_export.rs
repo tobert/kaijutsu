@@ -399,13 +399,13 @@ mod tests {
     use std::path::Path as StdPath;
     use std::sync::Arc;
 
-    /// A block store backed by an in-memory `KernelDb`, so config docs
+    /// A block store backed by a temporary `KernelDb`, so config docs
     /// created via `create_document_with_path` land in the `documents`
     /// manifest `documents_under_path` reads. Mirrors the fixture in
     /// `runtime/config_doc_fs.rs` and `editor.rs`.
     fn blocks_with_db() -> SharedBlockStore {
         let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         shared_block_store_with_db(db, ws_id, creator)
     }

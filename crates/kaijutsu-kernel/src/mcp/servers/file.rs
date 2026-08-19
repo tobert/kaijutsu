@@ -1072,11 +1072,11 @@ mod tests {
     use crate::vfs::MountTable;
     use kaijutsu_types::PrincipalId;
 
-    /// A fresh in-memory `KernelDb` for tests that don't otherwise need one —
+    /// A fresh temporary `KernelDb` for tests that don't otherwise need one —
     /// `FileDocumentCache` requires a handle to back its durable swap-file
     /// marker (docs/file-buffers.md), even when the test never exercises it.
     fn test_kernel_db() -> Arc<parking_lot::Mutex<KernelDb>> {
-        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()))
+        Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()))
     }
 
     async fn broker_with_file(path: &str, content: &str) -> (Arc<Broker>, Arc<FileDocumentCache>) {
@@ -1407,7 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_via_broker() {
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = db
             .lock()

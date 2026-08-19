@@ -163,7 +163,7 @@ mod tests {
     /// In-memory DB seeded with a persisted context row of the given type, so
     /// whoami's DB-backed `context_type` is always populated (never null).
     fn db_with_context(id: ContextId, context_type: &str) -> Arc<Mutex<KernelDb>> {
-        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(Mutex::new(KernelDb::temporary().unwrap()));
         {
             let g = db.lock();
             let creator = PrincipalId::new();
@@ -313,7 +313,7 @@ mod tests {
             .register(ctx.context_id, Some("ghost"), None, PrincipalId::new())
             .unwrap();
 
-        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(Mutex::new(KernelDb::temporary().unwrap()));
         let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker
@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn whoami_rejects_unknown_tool() {
         let drift = shared_drift_router();
-        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(Mutex::new(KernelDb::temporary().unwrap()));
         let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker

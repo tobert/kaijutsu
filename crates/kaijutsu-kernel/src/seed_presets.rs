@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn ensure_is_idempotent_and_seeds_three_bases() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::new();
 
         assert_eq!(ensure_factory_presets(&mut db, who).unwrap(), 3, "first run seeds all three");
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn reseed_force_restores_after_user_edit() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::new();
         ensure_factory_presets(&mut db, who).unwrap();
 

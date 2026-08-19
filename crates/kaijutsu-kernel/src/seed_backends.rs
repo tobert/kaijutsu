@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn ensure_is_idempotent_and_seeds_four_backends() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::system();
         assert_eq!(ensure_factory_backends(&mut db, who).unwrap(), 4, "first run seeds all four");
         assert_eq!(ensure_factory_backends(&mut db, who).unwrap(), 0, "second run is a no-op");
@@ -331,7 +331,7 @@ mod tests {
         // Both are operator/agent data. The old alias set was a pile of
         // guesses about which model deserves which adjective; shipping none
         // is the honest floor.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::system();
         ensure_factory_backends(&mut db, who).unwrap();
         assert!(db.list_model_aliases().unwrap().is_empty());
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn reseed_leaves_operator_aliases_alone() {
         // The floor owns no aliases, so a reseed must not touch one.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::system();
         ensure_factory_backends(&mut db, who).unwrap();
         let anthropic = db.get_backend_by_name("anthropic").unwrap().unwrap();
@@ -364,7 +364,7 @@ mod tests {
     fn no_backend_row_carries_key_material() {
         // The whole point of dropping the inline `api_key` field: config
         // stores WHERE a key lives, never the key.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
         for b in db.list_backends().unwrap() {
             if let Some(f) = &b.api_key_file {
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn ollama_is_key_optional_and_gpt_is_not() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
         assert!(db.get_backend_by_name("ollama").unwrap().unwrap().key_optional);
         assert!(!db.get_backend_by_name("gpt").unwrap().unwrap().key_optional);
@@ -388,7 +388,7 @@ mod tests {
     fn openai_kind_backends_all_carry_a_base_url() {
         // kind=openai means "some OpenAI-compatible server"; without the URL
         // the row does not say which one.
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
         for b in db.list_backends().unwrap().into_iter().filter(|b| b.kind == "openai") {
             assert!(b.base_url.is_some(), "{} has kind=openai but no base_url", b.name);
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn unknown_windows_stay_unset_not_guessed() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
         for name in ["gpt", "ollama"] {
             let b = db.get_backend_by_name(name).unwrap().unwrap();
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn ensure_preserves_an_operator_edit_but_reseed_restores_it() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::system();
         ensure_factory_backends(&mut db, who).unwrap();
 
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn reseed_leaves_operator_added_backends_alone() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         let who = PrincipalId::system();
         ensure_factory_backends(&mut db, who).unwrap();
         db.upsert_backend(&BackendRow {

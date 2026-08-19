@@ -4593,7 +4593,7 @@ mod tests {
 
         let kernel = Arc::new(Kernel::new_ephemeral("test").await);
         let db: kaijutsu_kernel::block_store::DbHandle =
-            Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+            Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let principal = PrincipalId::new();
         let ctx = ContextId::new();
         let ws_id = {

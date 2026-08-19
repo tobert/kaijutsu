@@ -488,7 +488,7 @@ mod tests {
     use kaijutsu_types::{PrincipalId, now_millis};
 
     async fn setup() -> (Arc<Broker>, CallContext, SharedBlockStore) {
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::new();
         let ws_id = {
             let g = db.lock();

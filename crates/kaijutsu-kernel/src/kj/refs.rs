@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn resolve_current() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx_id = ContextId::new();
         let caller = KjCaller {
             principal_id: kaijutsu_types::PrincipalId::new(),
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn resolve_parent_no_parent() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let ctx_id = ContextId::new();
         let principal = kaijutsu_types::PrincipalId::new();
 
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn resolve_parent_chain() {
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         let principal = kaijutsu_types::PrincipalId::new();
 
         let grandparent_id = ContextId::new();

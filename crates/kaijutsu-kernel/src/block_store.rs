@@ -4670,7 +4670,7 @@ mod tests {
         use crate::kernel_db::{ContextRow, KernelDb};
         use kaijutsu_types::{ConsentMode, ContextState};
 
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
 
@@ -4788,7 +4788,7 @@ mod tests {
     fn content_at_seq_refuses_a_gapped_oplog() {
         use crate::kernel_db::KernelDb;
 
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let store = BlockStore::with_db(db.clone(), ws_id, creator);
@@ -4842,7 +4842,7 @@ mod tests {
     fn content_at_seq_refuses_an_uncommitted_head_row() {
         use crate::kernel_db::KernelDb;
 
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let store = BlockStore::with_db(db.clone(), ws_id, creator);
@@ -5668,7 +5668,7 @@ mod tests {
         use crate::kernel_db::{DocumentRow, KernelDb};
         use kaijutsu_types::now_millis;
 
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = {
             let db_guard = db.lock();
@@ -5706,7 +5706,7 @@ mod tests {
         use crate::kernel_db::{DocumentRow, KernelDb};
         use kaijutsu_types::now_millis;
 
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = {
             let db_guard = db.lock();
@@ -5752,7 +5752,7 @@ mod tests {
         use crate::kernel_db::{DocumentRow, KernelDb};
         use kaijutsu_types::now_millis;
 
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
         let ws_id = {
             let db_guard = db.lock();

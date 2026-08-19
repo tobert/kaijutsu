@@ -35,7 +35,7 @@ struct Harness {
 async fn harness() -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let creator = PrincipalId::system();
-    let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+    let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
     let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
     let store = shared_block_store_with_db(db.clone(), ws_id, creator);
 

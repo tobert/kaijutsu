@@ -95,7 +95,7 @@ pub struct FileDocumentCache {
     /// with nowhere to durably record "this path has unsaved work" cannot
     /// tell a swap from a stale cache on a cold restart, which is the exact
     /// failure this table exists to prevent. Every caller — production and
-    /// test alike — must supply a real `KernelDb` (`KernelDb::in_memory()`
+    /// test alike — must supply a real `KernelDb` (`KernelDb::temporary()`
     /// is public and ungated for tests) so the code path under test is the
     /// one that ships.
     db: Arc<Mutex<KernelDb>>,
@@ -970,16 +970,16 @@ mod tests {
     use crate::vfs::VfsOps;
     use kaijutsu_types::PrincipalId;
 
-    /// A fresh in-memory `KernelDb` for tests — `FileDocumentCache` requires
+    /// A fresh temporary `KernelDb` for tests — `FileDocumentCache` requires
     /// one to back its durable swap-file marker (docs/file-buffers.md).
     /// Factored out so `tmp_cache` (and anything else that needs its own
     /// handle) doesn't repeat the construction.
     fn tmp_db() -> Arc<Mutex<KernelDb>> {
-        Arc::new(Mutex::new(KernelDb::in_memory().unwrap()))
+        Arc::new(Mutex::new(KernelDb::temporary().unwrap()))
     }
 
     /// Build a cache over a MemoryBackend mounted at /tmp, backed by a fresh
-    /// in-memory KernelDb (see `tmp_db`) — the same durable path production
+    /// temporary KernelDb (see `tmp_db`) — the same durable path production
     /// runs, so a swap survives `invalidate` the way it survives a real
     /// restart.
     async fn tmp_cache() -> (Arc<MountTable>, FileDocumentCache) {

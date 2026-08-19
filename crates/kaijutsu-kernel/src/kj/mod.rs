@@ -953,7 +953,7 @@ pub(crate) mod test_helpers {
         let drift = shared_drift_router();
         let blocks = shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(parking_lot::Mutex::new(
-            KernelDb::in_memory().expect("in-memory KernelDb"),
+            KernelDb::temporary().expect("temporary KernelDb"),
         ));
         // Create default workspace for test contexts
         {
@@ -1007,7 +1007,7 @@ pub(crate) mod test_helpers {
     pub async fn test_dispatcher_rc() -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
-            KernelDb::in_memory().expect("in-memory KernelDb"),
+            KernelDb::temporary().expect("temporary KernelDb"),
         ));
         let ws_id = {
             let db = kernel_db.lock();

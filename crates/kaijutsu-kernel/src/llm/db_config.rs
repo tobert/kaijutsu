@@ -257,7 +257,7 @@ mod tests {
     use kaijutsu_types::{BackendId, CastId, PrincipalId};
 
     fn seeded_db() -> KernelDb {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
         db
     }
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn missing_default_backend_is_fatal_not_a_silent_fallback() {
-        let mut db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::temporary().unwrap();
         ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
         // Point the defaults at a backend name nothing registers under.
         // `set_llm_defaults` refuses a dangling name outright, so get there
@@ -395,7 +395,7 @@ mod tests {
         // The write path refuses unknown kinds, so one in the table means the
         // DB was edited behind our back. Skipping it would hang a later turn
         // on a backend that "was configured".
-        let db = KernelDb::in_memory().unwrap();
+        let db = KernelDb::temporary().unwrap();
         db.upsert_backend(&crate::kernel_db::BackendRow {
             backend_id: BackendId::new(),
             name: "gemini".into(),

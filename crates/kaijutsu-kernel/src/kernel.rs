@@ -301,12 +301,13 @@ impl Kernel {
     /// when the kernel drops (a `TempDirGuard` on `temp_cleanup`), so repeated
     /// test runs don't accumulate `kj-eph-*` dirs in `/tmp`.
     ///
-    /// Opens a real file-backed `KernelDb` under that same temp dir (never
-    /// `KernelDb::in_memory()` — the temp dir already gives isolation, and a
-    /// real file is what production opens) and builds its own block store
-    /// over it, so callers that just want a working kernel need no db
-    /// plumbing of their own. `blocks()`/`file_cache()` expose them for
-    /// callers that need to share the same instances.
+    /// Opens a real file-backed `KernelDb` under that same temp dir via
+    /// `KernelDb::open` directly (never `KernelDb::temporary()` — this
+    /// function already mints and owns the temp dir, so calling `temporary()`
+    /// too would only nest a second, redundant one inside it) and builds its
+    /// own block store over it, so callers that just want a working kernel
+    /// need no db plumbing of their own. `blocks()`/`file_cache()` expose
+    /// them for callers that need to share the same instances.
     pub async fn new_ephemeral(name: impl Into<String>) -> Self {
         let dir = std::env::temp_dir()
             .join(format!("kj-eph-{}", kaijutsu_types::KernelId::new().to_hex()));
