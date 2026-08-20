@@ -413,10 +413,16 @@ impl BlockContent {
     /// `style_spans` are left untouched: this is always a true end-append
     /// (`push_str`), and a span's byte offsets index into a prefix of `text`
     /// that this call never touches — unlike `edit_text`, there is nothing
-    /// stale to drop.
+    /// stale to drop. An append to a block that already carries a provenance
+    /// tag still moves the content away from `strip(original)`, so it sets
+    /// `edited_since_ingest` like any other edit; streaming appends land
+    /// before the tag exists and do not.
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
         self.char_len += text.chars().count();
+        if self.provenance.is_some() {
+            self.edited_since_ingest = true;
+        }
     }
 
     /// Get the character count of the content. O(1) — reads the counter
@@ -1075,6 +1081,37 @@ mod text_edit_tests {
     /// `edit_text` sets the marker (in addition to clearing spans) — the
     /// fix for B1: before this field existed, nothing in durable state could
     /// tell an edited tagged block from an unedited one.
+    #[test]
+    fn append_text_on_a_tagged_block_sets_edited_since_ingest() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello world")
+            .provenance(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+        assert!(!b.edited_since_ingest(), "fixture must start unedited");
+
+        b.append_text("!");
+
+        assert!(b.edited_since_ingest(), "an append past the tag is an edit");
+    }
+
+    #[test]
+    fn append_text_before_any_tag_leaves_the_marker_alone() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("streaming")
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+
+        b.append_text(" more");
+
+        assert!(!b.edited_since_ingest(), "streaming appends precede the tag");
+    }
+
     #[test]
     fn edit_text_sets_edited_since_ingest() {
         let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
