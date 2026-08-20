@@ -6,107 +6,63 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Tech-debt audits, 2026-08-20: verified bugs first, then the debt (lead-verified)
+## Tech-debt audits, 2026-08-20 — what is still open (lead-verified)
 
-Three read-only audits of the code that churned most over 08-18/19 — the
-editor + file-I/O path (Opus lane), the ANSI ingest + provenance + conversation
-surface (Opus lane), and the kaish glue in `kaijutsu-kernel` (kaibo, GLM-5.2).
-Full reports with the "verified NOT debt" lists live in `docs/audits/`; **read
-the not-debt list before re-auditing any of these areas.** Every item below
-was re-read by the lead against `7f3ab694`; "needs ruling" means the code does
-what a comment says it should and the question is whether the rule is right.
+Three read-only audits (editor + file I/O, ANSI/provenance/surface, kaish glue)
+ran on 08-20; full reports with each lane's "verified NOT debt" list live in
+`docs/audits/`. **Read the not-debt list before re-auditing those areas.** The
+bugs and most of the debt shipped the same day — see `git log --since=2026-08-20`
+and the devlog. What remains:
 
-### Editor + file I/O — four bugs, two are data-loss class
+### Editor + file I/O
 
-- ~~P1 evicted buffer / P1 `acknowledge_swap`~~ — **both shipped 2026-08-20**
-  (`FlushError::NotCached`, editor pins its entry; `kj swap list|ack|discard`).
-  Two findings from the lanes, still open:
-  - **`kj editor save` has no capability gate.** `dispatch_editor` never calls
-    `require_cap`; `kj swap ack`/`discard` gate on `Capability::Tool
-    {builtin.file, edit}` (the MCP `edit` tool's cap) and documented the gap
-    rather than copying it. Decide what the editor's write cap is and apply it
-    in one place. S.
-  - **`invalidate`/`invalidate_document` remove a pinned entry outright.** The
-    pin (`FileDocumentCache::pin`, `cache.rs`) only protects against eviction;
-    a concurrent writer's invalidate still drops an open session's entry. A
-    different race from the eviction bug, left out of that fix on purpose.
-    `kj swap discard` on a path with an open editor session is the one
-    reachable case today. S–M.
-- **`:w` on `/etc/client/*` or `/etc/midi/*` reverts the edit.**
-  `config_owned()` (`editor.rs:64`) is rc ∥ config, but `rpc.rs:1636/1654/
-  1688/1710` mount four `ConfigDocFs` trees, all `owns_config_docs() == true`.
-  `resolve_editor_target` follows the mount table; `file_backed_path`
-  (`editor.rs:701`) follows the narrow predicate, so the kernel flushes a
-  file-cache shadow over a config-owned block. One `cat` mints the shadow.
-  Fix: one ownership question answered by the mount table, predicate deleted.
-- **A write onto a recovered swap clobbers it, then refuses.**
-  `create_or_replace` (`cache.rs:555`) has no `swap_recovered` check; only
-  `flush_one`/`flush_dirty` clear the row, so `/v/swap` keeps advertising a
-  swap whose content is gone.
+- **`kj editor save` has no capability gate.** Decide the editor's write cap
+  and apply it in one place; `kj swap ack|discard` gate on the MCP `edit`
+  tool's cap for now. S.
+- **`get_or_load`/`read_content` are "legacy, prefer `try_*`"** with eight
+  production callers — two APIs, not a deprecation. Pick one. S.
+- **`cache.rs` keeps an `Err(_)` catch-all** in the sibling of the function
+  slice 1 fixed. S.
+- **`kernel.rs` asserts on an `E212` prefix** that two `FlushError` variants
+  share — the substring trap `FlushError` was typed to avoid. S.
+- **`dirty_file_buffers.context_id` is written and never read** — a second
+  source of truth for `file_context_id(path)`. S.
+- **`kaijutsu-editor/src/lib.rs` still says `:w!` is a no-op**; W12 shipped in
+  that code path. S.
+- **`kj context set --env` does not validate keys at write time**; a malformed
+  key is stored and only refused at the next shell materialization (found by
+  kaibo's review of the glue refactor). Validate where it is written. S.
 
-Top debt: a second, unhardened `PatchOp` implementation in
-`mount_backend.rs:423-546` that panics on a mid-char byte offset — unreachable
-from kaish 0.15 (patch/sed send whole-file `Replace`), reachable the day 0.15.1's
-`edit` sends real offsets; `flush_dirty` (`cache.rs:667`) has no callers and no
-rule-4 guard; `get_or_load`/`read_content` are "legacy, prefer `try_*`" with
-eight production callers; `cache.rs:929` keeps the `Err(_)` catch-all slice 1
-removed from its sibling; `kaijutsu-editor/src/lib.rs:72-77` still says `:w!`
-is a no-op; `kernel.rs:2737` asserts on an `E212` prefix that two `FlushError`
-variants share; `dirty_file_buffers.context_id` is written and never read.
+### ANSI + surface
 
-### ANSI ingest + provenance + surface — one bug, one ruling, a prose cleanup
+- **`set_style_spans` clears `edited_since_ingest` for any caller.** Both
+  callers today derive spans from the stored original, but nothing enforces
+  it; a future caller passing spans from elsewhere makes the marker lie
+  (kaibo review). Make the method take the original and derive, or assert.
+  S.
+- **`styled_spans_fingerprint`/`SpanBrush`** in the app should destructure
+  exhaustively so a new `StyledSpan` field is a compile error. S.
+- **`shape_visible_blocks` (330 lines) has no test**; two bugs already lived in
+  its bookkeeping. M.
+- **`render_store.rs` `move_block`/`remove_at` have zero callers**, including
+  tests — their `#[allow(dead_code)]` notes cited a deleted function. Delete.
+  S.
+- **`docs/architecture/app.md` predates the conversation surface** (says
+  Bevy 0.18, omits `view/surface/`); carries a top-of-file note. Refresh. M.
+- Six copies of `(x.clamp(0,1)*255.0) as u8` while `layout_bridge.rs` claims to
+  be the one place; `StyleEntry.effect`/`param`/`_pad` and
+  `ChromeInstance.anim[1]` are unread (documented, leave with an expiry note).
 
-- **`background_exec.rs:826` re-derives the ingest predicate and disagrees.**
-  It checks only for ESC; `ansi_ingest::project` (`ansi_ingest.rs:74-83`) also
-  treats "escape bytes present but projection byte-identical" as a no-op. A
-  background process emitting a stray `\x1b` gets a tag, a provenance row and
-  a `SpansChanged` event `project` exists to suppress — the drift
-  `ansi_ingest.rs:15-17` predicted, in the same commit. S.
-- **Needs ruling: the `provenance` tag survives an edit.** `blocks/content.rs:
-  384-393` clears spans and keeps the tag on purpose; `types/block.rs:1661`
-  documents the tag as "content *is* a projection", `:1425` says the weaker
-  true thing. An edited tagged block is indistinguishable from an unedited one,
-  so the stated invariant is not mechanically checkable, and `kj block
-  reproject` on a capped background block always fails with the wrong cause
-  ("edited since ingest"; by design `content == strip(original) + marker`).
-- **Prose that describes deleted code:** 59 present-tense citations of symbols
-  deleted in `1fb5ff25` across 16 crate files and 6 docs, four pointing a
-  `file:line` at unrelated live code (`shape_cache.rs:600` →
-  `block_render.rs:660-668`); `content.rs:14-17` and `shape_cache.rs:31`
-  contradict each other about a 200-char debounce that no longer exists; nine
-  mentions of a "CI invariant" and there is no `.github/` — the three unit tests
-  that hold the property are what should be named; `docs/ansi-and-beyond.md:
-  105-109` asserts atomic commit and `:124-129` denies it.
-- Smaller: `--transform` on `reproject` has one legal value (`kj/block.rs:1043`)
-  — delete the knob; six copies of `(x.clamp(0,1)*255.0) as u8` while
-  `layout_bridge.rs:219` claims to be the one place; `text/rich.rs:512`
-  `detect_rich_content` has no callers; `background_exec.rs:932-937` puts the
-  literal `DEFAULT_OUTPUT_CAP` into a block the model reads instead of the
-  number (262144).
-- Tests: `AnsiDrain::finish`'s span-truncation branch has zero coverage (the
-  branch that guarantees `content == strip(original) + marker` for a capped
-  block — highest-value missing test); `shape_visible_blocks` (330 lines) has
-  none; the `strip_totality` fuzz target asserts `start <= end` where the crate
-  requires `<`, permitting the bug it should find; `styled_spans_fingerprint`
-  should destructure exhaustively so a new field is a compile error.
+### Kaish glue
 
-### Kaish glue — no bugs; two real reductions and one bug class
-
-- **Two `apply_context_config` implementations.** `EmbeddedKaish`'s
-  (`runtime/embedded_kaish.rs:600-628`) runs one `export` script per env var
-  with hand-escaping and `warn!`s failures away — a silent fallback;
-  `KjBuiltin`'s (`runtime/kj_builtin.rs:113-149`) uses `scope.set_exported`.
-  Collapse onto the scope API; failure bubbles. M.
-- **`KaijutsuBackend`'s file half is a dead editing surface.** kaish's backend
-  is `MountBackend` (`embedded_kaish.rs:425`); `KaijutsuBackend` is reachable
-  only via `/v/docs` (`docs_filesystem.rs`), which only ever overwrites. ~250
-  lines of write/append/patch/range helpers (`kaish_backend.rs:782-1030`) are
-  unreachable; the tool-dispatch half stays. M.
-- **The `kj` builtin flattens kaish's typed `ToolArgs` back to argv for clap to
-  re-parse** (`kj_builtin.rs:487-594`) — the `--include` bug class. Let
-  `KjDispatcher::dispatch` take the parsed form. M.
-- S: stale 0.9–0.14 kaish comments; `OutputProfile::Internal` becomes deletable
-  when kaish ships a no-exit-remap spill knob.
+- **The `kj` builtin flattens kaish's typed `ToolArgs` back to argv** for clap
+  to re-parse (`kj_builtin.rs`) — the `--include` bug class. Waits on kaish
+  0.16's `ArgBinding::Verbatim`; then let `KjDispatcher::dispatch` take the
+  words. M.
+- **`OutputProfile::Internal`** becomes deletable when kaish ships a spill knob
+  that does not remap the exit code.
+- Stale kaish-version comments in `background_exec.rs` (cites 0.13 file:lines
+  that are unverifiable against 0.15). S.
 
 ---
 
