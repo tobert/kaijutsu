@@ -18,19 +18,20 @@ what a comment says it should and the question is whether the rule is right.
 
 ### Editor + file I/O — four bugs, two are data-loss class
 
-- **P1 — an evicted buffer makes `:w` report success and write nothing.**
-  `mark_dirty` (`file_tools/cache.rs:644-663`) returns `Ok(())` with no
-  `dirty_file_buffers` row when the path is not cached; `flush_one`
-  (`cache.rs:769`) has `None => Ok(())`; `evict_if_needed` (`cache.rs:977`)
-  drops clean entries past the cap, and every MCP `read` / kaish `cat` inserts
-  one; editor sessions hold no cache pin. Checkpoint advances, buffer reads
-  clean, and the next load reconciles the block against disk — unsaved vi work
-  lost under an open session. Fix shape: an uncached path in `mark_dirty` /
-  `flush_one` is an error, and an editor session pins (or re-loads) its entry.
-- **P1 — nothing calls `acknowledge_swap`** (`cache.rs:880`, zero non-test
-  callers). Rule 4's refusal is permanent on a recovered path, and the status
-  line mislabels it E212 and leaks a method name. Needs the acknowledgment
-  surface (`kj` verb or `:w!`-class override) the swap design assumed.
+- ~~P1 evicted buffer / P1 `acknowledge_swap`~~ — **both shipped 2026-08-20**
+  (`FlushError::NotCached`, editor pins its entry; `kj swap list|ack|discard`).
+  Two findings from the lanes, still open:
+  - **`kj editor save` has no capability gate.** `dispatch_editor` never calls
+    `require_cap`; `kj swap ack`/`discard` gate on `Capability::Tool
+    {builtin.file, edit}` (the MCP `edit` tool's cap) and documented the gap
+    rather than copying it. Decide what the editor's write cap is and apply it
+    in one place. S.
+  - **`invalidate`/`invalidate_document` remove a pinned entry outright.** The
+    pin (`FileDocumentCache::pin`, `cache.rs`) only protects against eviction;
+    a concurrent writer's invalidate still drops an open session's entry. A
+    different race from the eviction bug, left out of that fix on purpose.
+    `kj swap discard` on a path with an open editor session is the one
+    reachable case today. S–M.
 - **`:w` on `/etc/client/*` or `/etc/midi/*` reverts the edit.**
   `config_owned()` (`editor.rs:64`) is rc ∥ config, but `rpc.rs:1636/1654/
   1688/1710` mount four `ConfigDocFs` trees, all `owns_config_docs() == true`.
