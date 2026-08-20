@@ -321,4 +321,42 @@ mod tests {
             "the fork hydrate seed must branch on fork kind (skip a full clone)"
         );
     }
+
+    /// Every seed body that is a bare path token must resolve to another
+    /// seeded path. The init.d composition format carries a symlink as a file
+    /// whose whole content is its target (`include_dir!` cannot embed real
+    /// links), and `seed_link_target` reconstructs the link only when that
+    /// target is itself in the seed set. A target that is missing — renamed,
+    /// moved, or typo'd — does not fail: the body is written as a literal
+    /// file whose entire content is a path string, which then runs as an rc
+    /// script. This is the check that turns that silent degradation into a
+    /// failing test at the moment the rename lands.
+    #[test]
+    fn every_bare_path_seed_body_resolves_to_a_seeded_target() {
+        let seeds = seed_files();
+        let known: std::collections::HashSet<String> =
+            seeds.iter().map(|(p, _)| p.clone()).collect();
+
+        let mut broken = Vec::new();
+        for (path, body) in &seeds {
+            let t = body.trim();
+            // A link body is one bare path token. Anything carrying whitespace
+            // is a script line (`. /etc/rc/lib/x.kai`), not a link, and is
+            // correctly seeded as content.
+            let bare_path_token =
+                !t.is_empty() && t.contains('/') && !t.contains(char::is_whitespace);
+            if !bare_path_token {
+                continue;
+            }
+            if crate::runtime::config_doc_fs::seed_link_target(path, body, &known).is_none() {
+                broken.push(format!("{path} → {t}"));
+            }
+        }
+
+        assert!(
+            broken.is_empty(),
+            "these seeds look like symlinks but their targets are not seeded paths, \
+             so each would silently become a file containing a path string: {broken:#?}"
+        );
+    }
 }

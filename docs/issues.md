@@ -93,6 +93,30 @@ and the devlog. What remains:
 
 ### rc scripts and comments
 
+- **The rc bootstrap gate is untested, and installing a missing seed is
+  path-by-path.** `rpc.rs:1640` seeds only `if rc_fs.is_empty()`, so a script
+  added to the embedded set after a kernel was first seeded never lands on its
+  own. Live receipt (2026-08-20): `S45-shell-guard`, `S50-lfm2d` and
+  `S15-recall` were shipped-and-dead on zorak's kernel until a manual `kj rc
+  reset` of 9 paths. The gate is deliberate (a script you `rm`'d stays gone)
+  and `kj rc list` now reports the gap as `not installed`, so this is no longer
+  silent — what remains is that `rpc.rs` has **no `mod tests` at all**, so the
+  partially-populated case (namespace non-empty, one seed path absent) has no
+  coverage, and there is no bulk `kj rc reseed` for a kernel missing several.
+  Order matters when installing by hand: a symlink seed's target must exist
+  first. S–M.
+- **A dangling rc symlink reports `in-sync` while hard-failing every context
+  create.** `rc_seed_status` (`rc.rs`) compares target *strings* only, so `kj
+  rc list` shows a broken link as healthy; `load_rc_scripts`
+  (`lifecycle.rs:386-389`) treats the `read_all` failure as fatal and kills the
+  whole lifecycle run. `kj rc reset` on the link re-creates the link and never
+  restores the target, so reset does not repair it. Reachable by `kj rc rm`-ing
+  a `lib/create/*` target that four per-type links point at. The defect is
+  pinned by `rc_list_calls_a_dangling_seed_symlink_in_sync`; the fix is roughly
+  one condition — require `matches!(read_rc_content(path).await, Ok(Some(_)))`
+  before returning `InSync` on a matching link pair (note `read_rc_content`
+  returns `Ok(None)`, not `Err`, for a missing file) — plus rewriting that test
+  to assert the honest status. S.
 - **`S50-lfm2d.kai` round-trips its hook body through a temp file** to dodge
   a kaish quoting rule the lane read too broadly. The real rule (kaish-lead,
   08-20): only `"$(… "…" …)"` — double quotes at both levels — fails to

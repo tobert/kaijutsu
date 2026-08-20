@@ -1,4 +1,4 @@
-//! Run-control (rc) subcommands: add, list, rm, show, edit, reseed.
+//! Run-control (rc) subcommands: add, list, rm, show, edit, reset.
 //!
 //! Manages lifecycle script **files** at canonical paths
 //! `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
@@ -44,8 +44,11 @@ enum RcCommand {
     },
     /// List installed scripts, optionally filtered. Each entry is marked
     /// against its embedded seed: in-sync, differs (edited since seeding),
-    /// or no-seed (a live-only, user-authored script). Indicator only — never
-    /// auto-resets; `kj rc reset <path>` is the explicit manual pull.
+    /// no-seed (a live-only, user-authored script), or not-installed (a seed
+    /// ships for the path and nothing is live at it — a script added to the
+    /// embedded set after this kernel was first seeded). Indicator only —
+    /// never auto-resets; `kj rc reset <path>` is the explicit manual pull,
+    /// and the install for a not-installed path.
     #[command(alias = "ls")]
     List {
         /// Filter by context_type
@@ -110,6 +113,12 @@ enum RcSeedStatus {
     /// script. Nothing to compare against, so it's neither in-sync nor
     /// differing.
     NoSeed,
+    /// A seed ships for this path and nothing is live at it. The kernel owns
+    /// `/etc/rc` and seeds the namespace only when it is entirely empty, so a
+    /// script added to the embedded set after this kernel was first seeded
+    /// never lands on its own. `kj rc reset <path>` installs one; a path you
+    /// deliberately removed keeps reporting this until you do.
+    NotInstalled,
 }
 
 impl RcSeedStatus {
@@ -119,6 +128,7 @@ impl RcSeedStatus {
             RcSeedStatus::InSync => "in-sync",
             RcSeedStatus::Differs => "differs from seed",
             RcSeedStatus::NoSeed => "no seed",
+            RcSeedStatus::NotInstalled => "not installed",
         }
     }
 
@@ -128,6 +138,7 @@ impl RcSeedStatus {
             RcSeedStatus::InSync => "in_sync",
             RcSeedStatus::Differs => "differs",
             RcSeedStatus::NoSeed => "no_seed",
+            RcSeedStatus::NotInstalled => "not_installed",
         }
     }
 }
@@ -354,17 +365,32 @@ impl KjDispatcher {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
         };
-        paths.retain(|p| {
+        let matches_filters = |p: &str| {
             let parts = match parse_rc_path(p) {
                 Ok(parts) => parts,
                 Err(_) => return false, // stray non-canonical file
             };
             type_filter.is_none_or(|t| parts.context_type == t)
                 && verb_filter.is_none_or(|v| parts.verb == v)
-        });
+        };
+        paths.retain(|p| matches_filters(p));
         paths.sort();
 
-        if paths.is_empty() {
+        // Anti-join: a seed that ships in this binary with nothing live at its
+        // path. The namespace is seeded only when it is entirely empty, so a
+        // script added to the embedded set after this kernel was first seeded
+        // never lands on its own and is otherwise invisible here — the listing
+        // walks live paths, and a path with nothing at it has no entry to walk.
+        // Reporting it is the whole point: `kj rc reset <path>` is the install.
+        let live: std::collections::HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
+        let mut missing: Vec<String> = crate::seed_scripts::seed_files()
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| !live.contains(p.as_str()) && matches_filters(p))
+            .collect();
+        missing.sort();
+
+        if paths.is_empty() && missing.is_empty() {
             return KjResult::ok_with_data(
                 "(no rc scripts)".to_string(),
                 serde_json::Value::Array(Vec::new()),
@@ -383,12 +409,21 @@ impl KjDispatcher {
 
         // One pass: resolve each path's live symlink target (if any) and its
         // seed staleness, shared by both the human listing and `--json`.
-        let mut rows: Vec<(String, Option<String>, RcSeedStatus)> = Vec::with_capacity(paths.len());
+        let mut rows: Vec<(String, Option<String>, RcSeedStatus)> =
+            Vec::with_capacity(paths.len() + missing.len());
         for p in &paths {
             let link = self.rc_link_target(p).await;
             let status = self.rc_seed_status(p, link.as_deref()).await;
             rows.push((p.clone(), link, status));
         }
+        // Not-installed rows have no live link to resolve and skip the
+        // body comparison — there is no body.
+        rows.extend(
+            missing
+                .into_iter()
+                .map(|p| (p, None, RcSeedStatus::NotInstalled)),
+        );
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
 
         if json {
             let scripts: Vec<serde_json::Value> = rows
@@ -1590,6 +1625,149 @@ mod tests {
                 );
             }
             other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// A seed that ships in this binary with nothing live at its path is
+    /// reported as "not installed" rather than being silently absent from the
+    /// listing. This is the state a kernel lands in whenever a script is added
+    /// to the embedded set after that kernel was first seeded: the namespace
+    /// seeds only when it is entirely empty, so the new path never arrives on
+    /// its own, and a listing that walks live paths has no entry to show. `rm`
+    /// is the reachable way to produce the same state in a test.
+    #[tokio::test]
+    async fn rc_list_marks_a_seed_with_nothing_live_as_not_installed() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let path = "/etc/rc/coder/create/S00-stance.kai";
+
+        d.dispatch(&[s("rc"), s("rm"), s(path)], &c).await;
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, data: Some(v), .. } => {
+                assert!(
+                    message.contains(&format!("{path} [not installed]")),
+                    "a seed with nothing live must be reported, not omitted: {message}"
+                );
+                // `data` stays the live-path array: it is the resolver key list
+                // for `kj rc show`/`rm`, and a not-installed path resolves to
+                // nothing. `kj rc reset` takes the path from the listing text.
+                let paths: Vec<&str> = v
+                    .as_array()
+                    .expect("data stays an array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(
+                    !paths.contains(&path),
+                    "data must not offer a path with nothing live at it: {paths:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The not-installed marker rides `--json` as `not_installed` too, so a
+    /// client can find the gap without parsing the human listing.
+    #[tokio::test]
+    async fn rc_list_json_carries_not_installed_status() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let path = "/etc/rc/coder/create/S00-stance.kai";
+
+        d.dispatch(&[s("rc"), s("rm"), s(path)], &c).await;
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create"), s("--json")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&message).expect("--json message is JSON");
+                let scripts = parsed["scripts"].as_array().expect("scripts array");
+                let entry = scripts
+                    .iter()
+                    .find(|e| e["path"] == path)
+                    .expect("removed seed still appears as an entry");
+                assert_eq!(entry["seed_status"], "not_installed");
+                assert!(entry["link"].is_null(), "nothing live means no link target");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// Removing the target of a seed symlink leaves every link to it dangling,
+    /// and `kj rc list` calls the dangling link "in-sync" — `rc_seed_status`
+    /// compares target *strings*, so it never learns the target is gone. This
+    /// pins the defect: reading through the link fails while the marker reports
+    /// health. See `docs/issues.md`, "A dangling rc symlink reports `in-sync`".
+    /// When the marker learns to check the target, this test fails and should
+    /// be rewritten to assert the honest status.
+    #[tokio::test]
+    async fn rc_list_calls_a_dangling_seed_symlink_in_sync() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let target = "/etc/rc/lib/create/S20-cache.kai";
+        let link = "/etc/rc/coder/create/S20-cache.kai";
+
+        // Precondition: the link is a real seed symlink onto the shared target.
+        let before = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match before {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains(&format!("{link} → {target} [in-sync]")),
+                "expected a healthy seed symlink first: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        d.dispatch(&[s("rc"), s("rm"), s(target)], &c).await;
+
+        // The link now points at nothing. Reading through it fails...
+        let show = d.dispatch(&[s("rc"), s("show"), s(link)], &c).await;
+        assert!(
+            matches!(show, KjResult::Err(_)),
+            "reading through a dangling link must fail, got {show:?}"
+        );
+
+        // ...while the listing still reports it healthy. Defect, pinned.
+        let after = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match after {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains(&format!("{link} → {target} [in-sync]")),
+                "pinning the known defect: a dangling link still reads in-sync: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 }
