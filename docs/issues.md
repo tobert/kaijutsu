@@ -105,18 +105,6 @@ and the devlog. What remains:
   coverage, and there is no bulk `kj rc reseed` for a kernel missing several.
   Order matters when installing by hand: a symlink seed's target must exist
   first. S–M.
-- **A dangling rc symlink reports `in-sync` while hard-failing every context
-  create.** `rc_seed_status` (`rc.rs`) compares target *strings* only, so `kj
-  rc list` shows a broken link as healthy; `load_rc_scripts`
-  (`lifecycle.rs:386-389`) treats the `read_all` failure as fatal and kills the
-  whole lifecycle run. `kj rc reset` on the link re-creates the link and never
-  restores the target, so reset does not repair it. Reachable by `kj rc rm`-ing
-  a `lib/create/*` target that four per-type links point at. The defect is
-  pinned by `rc_list_calls_a_dangling_seed_symlink_in_sync`; the fix is roughly
-  one condition — require `matches!(read_rc_content(path).await, Ok(Some(_)))`
-  before returning `InSync` on a matching link pair (note `read_rc_content`
-  returns `Ok(None)`, not `Err`, for a missing file) — plus rewriting that test
-  to assert the honest status. S.
 - **`S50-lfm2d.kai` round-trips its hook body through a temp file** to dodge
   a kaish quoting rule the lane read too broadly. The real rule (kaish-lead,
   08-20): only `"$(… "…" …)"` — double quotes at both levels — fails to

@@ -44,11 +44,14 @@ enum RcCommand {
     },
     /// List installed scripts, optionally filtered. Each entry is marked
     /// against its embedded seed: in-sync, differs (edited since seeding),
-    /// no-seed (a live-only, user-authored script), or not-installed (a seed
+    /// no-seed (a live-only, user-authored script), not-installed (a seed
     /// ships for the path and nothing is live at it — a script added to the
-    /// embedded set after this kernel was first seeded). Indicator only —
-    /// never auto-resets; `kj rc reset <path>` is the explicit manual pull,
-    /// and the install for a not-installed path.
+    /// embedded set after this kernel was first seeded), or dangling (a
+    /// symlink whose target is gone, which fails every lifecycle run through
+    /// it). Indicator only — never auto-resets. `kj rc reset <path>` is the
+    /// explicit manual pull and the install for a not-installed path; repair a
+    /// dangling link by resetting its **target**, since resetting the link
+    /// only rebuilds the link.
     #[command(alias = "ls")]
     List {
         /// Filter by context_type
@@ -119,6 +122,12 @@ enum RcSeedStatus {
     /// never lands on its own. `kj rc reset <path>` installs one; a path you
     /// deliberately removed keeps reporting this until you do.
     NotInstalled,
+    /// The live entry is a symlink whose target cannot be read. This outranks
+    /// every seed comparison because it is the more urgent fact: the lifecycle
+    /// loader treats an unreadable entry as fatal, so one dangling link fails
+    /// every run of the verb it sits in. The repair is `kj rc reset` on the
+    /// **target**, not on the link — resetting the link only rebuilds the link.
+    Dangling,
 }
 
 impl RcSeedStatus {
@@ -129,6 +138,7 @@ impl RcSeedStatus {
             RcSeedStatus::Differs => "differs from seed",
             RcSeedStatus::NoSeed => "no seed",
             RcSeedStatus::NotInstalled => "not installed",
+            RcSeedStatus::Dangling => "dangling — target missing",
         }
     }
 
@@ -139,6 +149,7 @@ impl RcSeedStatus {
             RcSeedStatus::Differs => "differs",
             RcSeedStatus::NoSeed => "no_seed",
             RcSeedStatus::NotInstalled => "not_installed",
+            RcSeedStatus::Dangling => "dangling",
         }
     }
 }
@@ -464,6 +475,17 @@ impl KjDispatcher {
     /// literal body-to-body. Mixing the two (a live file where the seed wants
     /// a link, or vice versa) is `Differs`, never silently treated as a match.
     async fn rc_seed_status(&self, path: &str, live_link: Option<&str>) -> RcSeedStatus {
+        // A link that resolves to nothing outranks every seed comparison, and
+        // is checked before the seed lookup so a user-authored link reports it
+        // too. Comparing target strings alone cannot see this: the link matches
+        // its seed exactly and still breaks every lifecycle run through it.
+        // `Ok(None)` is the absent-target signal; `Err` is a read fault, which
+        // is a different problem and is left to the comparison below.
+        if live_link.is_some()
+            && matches!(self.read_rc_content(path).await, Ok(None))
+        {
+            return RcSeedStatus::Dangling;
+        }
         let Some(seed) = crate::seed_scripts::seed_body(path) else {
             return RcSeedStatus::NoSeed;
         };
@@ -1713,15 +1735,14 @@ mod tests {
         }
     }
 
-    /// Removing the target of a seed symlink leaves every link to it dangling,
-    /// and `kj rc list` calls the dangling link "in-sync" — `rc_seed_status`
-    /// compares target *strings*, so it never learns the target is gone. This
-    /// pins the defect: reading through the link fails while the marker reports
-    /// health. See `docs/issues.md`, "A dangling rc symlink reports `in-sync`".
-    /// When the marker learns to check the target, this test fails and should
-    /// be rewritten to assert the honest status.
+    /// Removing the target of a seed symlink leaves every link to it dangling.
+    /// The link still matches its seed byte for byte, so a status that compares
+    /// target strings reports it healthy; the marker resolves the link instead
+    /// and says "dangling". This is the more urgent fact than any seed
+    /// comparison — the lifecycle loader treats an unreadable entry as fatal,
+    /// so one dangling link fails every run of the verb it sits in.
     #[tokio::test]
-    async fn rc_list_calls_a_dangling_seed_symlink_in_sync() {
+    async fn rc_list_reports_a_dangling_seed_symlink_as_dangling() {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
@@ -1755,7 +1776,7 @@ mod tests {
             "reading through a dangling link must fail, got {show:?}"
         );
 
-        // ...while the listing still reports it healthy. Defect, pinned.
+        // ...and the listing says so instead of calling it healthy.
         let after = d
             .dispatch(
                 &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
@@ -1764,8 +1785,51 @@ mod tests {
             .await;
         match after {
             KjResult::Ok { message, .. } => assert!(
-                message.contains(&format!("{link} → {target} [in-sync]")),
-                "pinning the known defect: a dangling link still reads in-sync: {message}"
+                message.contains(&format!("{link} → {target} [dangling — target missing]")),
+                "a link resolving to nothing must not read in-sync: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// A dangling link that has no embedded seed at all still reports
+    /// "dangling", not "no seed": the broken target is what fails the
+    /// lifecycle, and it is the fact worth surfacing either way.
+    #[tokio::test]
+    async fn rc_list_reports_a_dangling_unseeded_symlink_as_dangling() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let target = "/etc/rc/bassist/create/S05-chair.md";
+        let link = "/etc/rc/bassist/create/S00-stance.md";
+
+        // Point a user-authored link at another user-authored path, then
+        // remove the target out from under it.
+        d.dispatch(&[s("rc"), s("add"), s(target), s("--content"), s("# chair")], &c)
+            .await;
+        d.dispatch(&[s("rc"), s("rm"), s(link)], &c).await;
+        use crate::vfs::VfsOps;
+        let made = d
+            .kernel()
+            .vfs()
+            .symlink(std::path::Path::new(link), std::path::Path::new(target))
+            .await;
+        assert!(made.is_ok(), "symlink setup failed: {made:?}");
+        d.dispatch(&[s("rc"), s("rm"), s(target)], &c).await;
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("bassist"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains(&format!("{link} → {target} [dangling — target missing]")),
+                "an unseeded dangling link must report dangling, not no-seed: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
         }
