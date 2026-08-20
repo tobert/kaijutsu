@@ -2638,6 +2638,50 @@ impl kernel::Server for KernelImpl {
                 let started_ctx = connection.borrow().require_context()?;
                 let kaish = materialize_context_shell(&kernel, &connection).await?;
 
+                // Same ruling as `execute_shell_command`/`execute_kj_command`
+                // (docs/gate-and-shell-split.md, "The three rpc.rs shell
+                // paths take the hook path"): this is the raw interactive
+                // exec path, running kaish directly with no hook watching it
+                // at all. Evaluate the same PreCall phase a `shell_write`
+                // tool call gets before the exec_id is even allocated, so a
+                // denied command never starts and never occupies the
+                // connection's one concurrent-execution slot.
+                //
+                // Narrower than the other two sites: `ShortCircuit` is
+                // treated as a denial here rather than synthesized into the
+                // streaming output-event path (`dispatch_output_events`)
+                // this RPC uses instead of writing context blocks — a real
+                // synthesis would need to fabricate an `ExecResult` and feed
+                // it through the same event dispatch a real exec uses. Filed
+                // as a known gap in this pass rather than built now.
+                {
+                    let (principal_id, session_id) = {
+                        let conn = connection.borrow();
+                        (conn.principal.id, conn.session_id)
+                    };
+                    let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
+                        principal_id,
+                        started_ctx,
+                        session_id,
+                        kernel.id,
+                    );
+                    match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
+                        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
+                        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(_) => {
+                            return Err(capnp::Error::failed(
+                                "execute: denied by hook (short-circuit results are not yet \
+                                 synthesized on this path — see rpc.rs::execute)"
+                                    .into(),
+                            ));
+                        }
+                        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+                            return Err(capnp::Error::failed(format!(
+                                "execute: denied by hook: {err}"
+                            )));
+                        }
+                    }
+                }
+
                 // Reject concurrent executions — kaish kernel is serial.
                 {
                     let conn = connection.borrow();
@@ -8354,6 +8398,55 @@ async fn execute_shell_command(
         }
     }
 
+    // Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "The three
+    // rpc.rs shell paths take the hook path"): this path runs kaish
+    // directly, bypassing `Broker::call_tool` and every hook that watches
+    // it — so no `PreCall` hook ever sees a human typing at the interactive
+    // shell. Evaluate the same phase a `shell_write` tool call gets, right
+    // where the command would otherwise start running, so a `Deny`/`Ask`
+    // hook (the sh -c guard, a future lfm2d scorer) covers this path too.
+    // The blocks already exist at this point (unlike a tool call, which has
+    // none to show) — a denial settles them to `Error` with the reason
+    // rather than leaving them `Running` forever, so the human sees WHY
+    // nothing ran instead of a hang.
+    let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
+        user_principal_id,
+        context_id,
+        connection.borrow().session_id,
+        kernel.id,
+    );
+    match kernel_arc.broker().shell_pre_call_hooks(code, &call_ctx).await {
+        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
+        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
+            let text = shell_hook_result_text(&result);
+            if let Err(e) = documents.edit_text_as(
+                context_id,
+                &output_block_id,
+                0,
+                &text,
+                0,
+                Some(PrincipalId::system()),
+            ) {
+                log::error!("Failed to write short-circuited shell output: {}", e);
+            }
+            let status = if result.is_error {
+                Status::Error
+            } else {
+                Status::Done
+            };
+            let _ = documents.set_status(context_id, &output_block_id, status);
+            let _ = documents.set_status(context_id, &command_block_id, status);
+            return Ok(command_block_id);
+        }
+        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+            let reason = format!("shell command denied: {err}");
+            let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
+            let _ = documents.set_status(context_id, &output_block_id, Status::Error);
+            let _ = documents.set_status(context_id, &command_block_id, Status::Error);
+            return Err(capnp::Error::failed(reason));
+        }
+    }
+
     // Spawn execution in background
     let code = code.to_owned();
     let documents_clone = documents.clone();
@@ -8630,6 +8723,23 @@ struct ExecutedKj {
 
 struct ExecutedKjLatch { command: String, target: String, message: String }
 
+/// Flatten a `KernelToolResult`'s text content — used to render a
+/// `ShellHookVerdict::ShortCircuit` result as block output the way the
+/// text-content half of `error_to_hook_json`/`result_to_hook_json` do in
+/// `mcp/broker.rs`, minus the JSON wrapper (this becomes the block's plain
+/// text, not a hook-visible var).
+fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            kaijutsu_kernel::mcp::ToolContent::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn kaish_quote(word: &str) -> String {
     let escaped = word.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -8666,12 +8776,45 @@ async fn execute_kj_command(
     ).map_err(|e| capnp::Error::failed(format!("failed to insert kj output: {e}")))?;
     let _ = documents.set_status(context_id, &output_block_id, Status::Running);
 
-    let state_before = snapshot_shell_state(&kaish).await;
     let mut code = String::from("kj");
     for arg in argv {
         code.push(' ');
         code.push_str(&kaish_quote(arg));
     }
+
+    // Same ruling as `execute_shell_command` (docs/gate-and-shell-split.md,
+    // "The three rpc.rs shell paths take the hook path"): this also runs
+    // kaish directly, so it gets the same PreCall verdict a `shell_write`
+    // tool call would.
+    let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
+        principal,
+        context_id,
+        connection.borrow().session_id,
+        kernel.id,
+    );
+    match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
+        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
+        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
+            let text = shell_hook_result_text(&sc_result);
+            let status = if sc_result.is_error { Status::Error } else { Status::Done };
+            let _ = documents.edit_text_as(context_id, &output_block_id, 0, &text, 0, Some(PrincipalId::system()));
+            let _ = documents.set_status(context_id, &output_block_id, status);
+            let _ = documents.set_status(context_id, &command_block_id, status);
+            let exit_code = if sc_result.is_error { 1 } else { 0 };
+            return Ok(ExecutedKj {
+                exit_code, stdout: text, stderr: String::new(), command_block_id, latch: None, data: None,
+            });
+        }
+        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+            let reason = format!("kj command denied: {err}");
+            let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
+            let _ = documents.set_status(context_id, &output_block_id, Status::Error);
+            let _ = documents.set_status(context_id, &command_block_id, Status::Error);
+            return Err(capnp::Error::failed(reason));
+        }
+    }
+
+    let state_before = snapshot_shell_state(&kaish).await;
     let result = match kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()).await {
         Ok(result) => result,
         Err(e) => {

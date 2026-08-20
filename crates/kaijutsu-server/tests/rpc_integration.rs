@@ -595,6 +595,55 @@ async fn setup_execute_context(
     (client, kernel)
 }
 
+/// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "The three
+/// rpc.rs shell paths take the hook path"): `execute_shell_command` runs
+/// kaish directly, bypassing `Broker::call_tool` entirely — before this
+/// ruling landed, a `PreCall Deny` matched on `shell_write` had no effect on
+/// `shell_execute`, because nothing on this path ever asked the broker. This
+/// installs the hook directly on the live kernel's broker (reached via
+/// `start_server_with_kernel_handle`, same pattern `ledger_events_wire.rs`
+/// uses) and proves it now blocks the RPC end to end, not just a real MCP
+/// tool call.
+#[test]
+fn pre_call_deny_on_shell_write_blocks_shell_execute_end_to_end() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+
+        kernel
+            .kernel
+            .broker()
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(kaijutsu_kernel::mcp::HookEntry {
+                id: kaijutsu_kernel::mcp::HookId("deny-shell-write-e2e".into()),
+                match_instance: None,
+                match_tool: Some(kaijutsu_kernel::mcp::GlobPattern("shell_write".into())),
+                match_context: None,
+                match_principal: None,
+                action: kaijutsu_kernel::mcp::HookAction::Deny("no shells today".into()),
+                priority: 0,
+                kaish_script_id: None,
+            });
+
+        let client = connect_client(addr).await;
+        let (kj_kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+        let context_id = kj_kernel.create_context("gate-e2e").await.unwrap();
+        kj_kernel.join_context(context_id, "gate-e2e").await.unwrap();
+
+        let result = kj_kernel
+            .shell_execute("echo should-not-run", context_id, true)
+            .await;
+        assert!(
+            result.is_err(),
+            "a PreCall Deny on shell_write must block execute_shell_command end to end, \
+             got {result:?}"
+        );
+    });
+}
+
 #[test]
 fn test_execute_returns_immediately() {
     run_local(async {

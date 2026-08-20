@@ -217,6 +217,47 @@ enum PermissionAskOutcome {
     Unavailable(String),
 }
 
+/// What `run_kaish_hook` decided from one `HookBody::Kaish` run. Amy's
+/// ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "Exit 3 = escalate
+/// to an ask; a hook-body fault escalates by default"): exit 0 continues,
+/// exit 3 escalates to the same ledger ask round trip `HookAction::Ask`
+/// uses, any other non-zero exit denies as before, and — the part that
+/// changes today's behavior — a fault running the body at all (exec error,
+/// timeout, `Broker::set_kj_dispatcher` never wired) ALSO escalates rather
+/// than denying. A DB/runtime fault must never be indistinguishable from a
+/// human's "no": denying on a fault teaches the model the wrong lesson
+/// (the action was refused on the merits) when nobody actually rendered a
+/// verdict.
+enum KaishHookOutcome {
+    /// Exit 0. The phase continues.
+    Continue,
+    /// A non-zero, non-3 exit. `reason` carries the exit code and stderr
+    /// tail — a real "no" from the body.
+    Deny(String),
+    /// Exit 3, or the body could not run at all. `description` is the
+    /// stderr tail (exit 3) or the fault reason (couldn't run), fed to
+    /// `run_permission_ask` as the ask's description exactly like
+    /// `HookAction::Ask` does.
+    Escalate(String),
+}
+
+/// What running the `shell_write` hook phases against a direct kaish exec
+/// decided (`Broker::shell_pre_call_hooks` / `shell_post_call_hooks`,
+/// `docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
+/// hook path"). Mirrors `PhaseOutcome` collapsed to the three shapes a
+/// caller outside `call_tool` needs to act on.
+#[derive(Debug)]
+pub enum ShellHookVerdict {
+    /// No hook fired, or every matching hook let the call through.
+    Proceed,
+    /// A hook produced a synthetic result in lieu of the real command —
+    /// the caller must use this instead of running/having run anything.
+    ShortCircuit(KernelToolResult),
+    /// A real "no" (`McpError::Denied`) or a broken control
+    /// (`McpError::GateUnavailable`) — same distinction `call_tool` makes.
+    Denied(McpError),
+}
+
 impl Broker {
     pub fn new() -> Self {
         let (notif_tx, _) = broadcast::channel(NOTIF_CAPACITY);
@@ -1692,12 +1733,35 @@ impl Broker {
                             .run_kaish_hook(phase, &script, params, ctx, &payload)
                             .await
                         {
-                            Ok(()) => {}
-                            Err(reason) => {
+                            KaishHookOutcome::Continue => {}
+                            KaishHookOutcome::Deny(reason) => {
                                 return Ok(PhaseOutcome::Deny {
                                     hook_id: entry.id,
                                     reason,
                                 });
+                            }
+                            KaishHookOutcome::Escalate(description) => {
+                                let ask_spec = AskSpec {
+                                    description: Some(description),
+                                };
+                                match self
+                                    .run_permission_ask(&entry.id, &ask_spec, params, ctx)
+                                    .await
+                                {
+                                    PermissionAskOutcome::Proceed => {}
+                                    PermissionAskOutcome::Denied(reason) => {
+                                        return Ok(PhaseOutcome::Deny {
+                                            hook_id: entry.id,
+                                            reason,
+                                        });
+                                    }
+                                    PermissionAskOutcome::Unavailable(reason) => {
+                                        return Ok(PhaseOutcome::GateUnavailable {
+                                            hook_id: entry.id,
+                                            reason,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -1860,7 +1924,7 @@ impl Broker {
         params: &super::types::KernelCallParams,
         ctx: &CallContext,
         payload: &PhasePayload<'_>,
-    ) -> Result<(), String> {
+    ) -> KaishHookOutcome {
         use std::collections::HashMap;
 
         // A hook body runs in a single-use context shell — a snapshot of the
@@ -1878,12 +1942,17 @@ impl Broker {
         {
             Some(d) => d,
             None => {
-                return Err(
+                // A fault, not a verdict (Amy's ruling, 2026-08-20): escalate
+                // rather than deny. `run_permission_ask` below performs the
+                // same `kj_dispatcher()` lookup and, finding nothing either,
+                // resolves this to `PermissionAskOutcome::Unavailable` →
+                // `McpError::GateUnavailable` — never `Denied`.
+                return KaishHookOutcome::Escalate(
                     "kaish hook requires Broker::set_kj_dispatcher; not wired".to_string(),
                 );
             }
         };
-        let kaish = dispatcher
+        let kaish = match dispatcher
             .materialize_context_kaish_internal(
                 "hook",
                 ctx.principal_id,
@@ -1893,7 +1962,12 @@ impl Broker {
                 Arc::new(crate::kj::lifecycle::NoopBlockSource),
             )
             .await
-            .map_err(|e| format!("kaish hook init failed: {e}"))?;
+        {
+            Ok(k) => k,
+            Err(e) => {
+                return KaishHookOutcome::Escalate(format!("kaish hook init failed: {e}"));
+            }
+        };
 
         let phase_str = match phase {
             McpHookPhase::PreCall => "pre_call",
@@ -1948,20 +2022,183 @@ impl Broker {
             }
         }
 
+        // `KJ_TOOL_PLAN` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): when
+        // the hooked tool is the shell, hand the body kaish's own plan
+        // projection of the `command` argument — `{"statements":[{"index",
+        // "plan":{"rendered","statement_kind","commands":[{"name","args",..}]}}]}`.
+        // `commands[]` descends into control-structure and `$(...)` bodies and
+        // `--confirm=<key>` literals are redacted, so a classifier scores what
+        // was asked for without the body re-deriving clause structure. This is
+        // the stable surface; the AST types are not. Read entries by array
+        // position, never by `index`. On a parse failure the var is absent and
+        // `KJ_TOOL_PLAN_ERROR` carries the diagnostics.
+        if matches!(params.tool.as_str(), "shell" | "shell_write") {
+            if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
+                match kaish_kernel::ast::plan::plan_program(command) {
+                    Ok(statements) => {
+                        let json = serde_json::to_string(&serde_json::json!({
+                            "statements": statements,
+                        }))
+                        .unwrap_or_else(|_| r#"{"statements":[]}"#.to_string());
+                        vars.insert(
+                            "KJ_TOOL_PLAN".into(),
+                            kaish_kernel::ast::Value::String(json),
+                        );
+                    }
+                    Err(errors) => {
+                        let msg = errors
+                            .iter()
+                            .map(|e| e.format(command))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        vars.insert(
+                            "KJ_TOOL_PLAN_ERROR".into(),
+                            kaish_kernel::ast::Value::String(msg),
+                        );
+                    }
+                }
+            }
+        }
+
         let opts = kaish_kernel::ExecuteOptions::new()
             .with_vars(vars)
             .with_timeout(kaish.timeouts().hook_body_timeout);
         match kaish.execute_with_options(body, opts).await {
-            Ok(exec) if exec.code == 0 => Ok(()),
+            Ok(exec) if exec.code == 0 => KaishHookOutcome::Continue,
+            Ok(exec) if exec.code == 3 => {
+                let stderr_tail: String = exec.err.chars().take(512).collect();
+                KaishHookOutcome::Escalate(if stderr_tail.trim().is_empty() {
+                    format!("{}.{}", params.instance, params.tool)
+                } else {
+                    stderr_tail.trim().to_string()
+                })
+            }
             Ok(exec) => {
                 let stderr_tail: String = exec.err.chars().take(512).collect();
-                Err(format!(
+                KaishHookOutcome::Deny(format!(
                     "kaish hook exit {}: {}",
                     exec.code,
                     stderr_tail.trim()
                 ))
             }
-            Err(e) => Err(format!("kaish hook exec error: {e}")),
+            Err(e) => {
+                tracing::warn!(
+                    target: "kaijutsu::hooks",
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    error = %e,
+                    "kaish hook body faulted (exec error/timeout); escalating to an ask \
+                     rather than denying — a runtime fault is not a verdict",
+                );
+                KaishHookOutcome::Escalate(format!("kaish hook exec error: {e}"))
+            }
+        }
+    }
+
+    // ── Direct kaish exec paths take the hook path (docs/gate-and-shell-
+    // split.md, "The three rpc.rs shell paths take the hook path") ──────
+    //
+    // `crates/kaijutsu-server/src/rpc.rs`'s `execute`, `execute_shell_command`,
+    // and `execute_kj_command` run `EmbeddedKaish::execute_with_options`
+    // directly — never through `Broker::call_tool` — so no `PreCall`/
+    // `PostCall`/`OnError` hook ever sees a human typing at the shell. These
+    // two methods give `rpc.rs` the same PreCall/PostCall verdict a
+    // `shell_write` tool call gets, matched as `instance: builtin.shell_write,
+    // tool: shell_write, args: {command}` — the identity every
+    // `match_tool: "shell_write"` hook (the sh -c guard, a future lfm2d
+    // scorer) already expects, so one hook fires on both the tool-call path
+    // and the interactive-shell path with no special-casing on either side.
+    //
+    // Deliberately NOT a full reroute through `call_tool`: these RPC paths
+    // stream output, register a cancel token, and write directly to context
+    // blocks — none of which `call_tool`'s `(KernelCallParams) ->
+    // KernelToolResult` shape carries. Evaluating the phases directly and
+    // handing the caller a verdict to act on is the smaller, honest
+    // integration `docs/gate-and-shell-split.md` calls for.
+
+    /// Instance/tool identity used to match a direct kaish exec against the
+    /// broker's hook tables — the same identity `builtin.shell_write`'s real
+    /// tool call presents, so a hook written against `shell_write` fires on
+    /// both paths without change.
+    const SHELL_WRITE_INSTANCE: &'static str = "builtin.shell_write";
+    const SHELL_WRITE_TOOL: &'static str = "shell_write";
+
+    fn shell_write_hook_params(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(Self::SHELL_WRITE_INSTANCE),
+            tool: Self::SHELL_WRITE_TOOL.to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        }
+    }
+
+    /// Run `PreCall` against `command` as if it were a `shell_write` tool
+    /// call. The caller must honor the verdict before running anything:
+    /// `Proceed` runs the command normally, `ShortCircuit` substitutes the
+    /// synthetic result and never runs the command, `Denied` refuses the
+    /// call outright (a real "no" or a broken control — see
+    /// `McpError::Denied` vs `McpError::GateUnavailable`).
+    pub async fn shell_pre_call_hooks(
+        &self,
+        command: &str,
+        ctx: &CallContext,
+    ) -> ShellHookVerdict {
+        let params = Self::shell_write_hook_params(command);
+        match self
+            .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None)
+            .await
+        {
+            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
+            Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
+                emit_short_circuit_attribution(McpHookPhase::PreCall, &hook_id);
+                ShellHookVerdict::ShortCircuit(result)
+            }
+            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                emit_deny_attribution(McpHookPhase::PreCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::Denied { by_hook: hook_id })
+            }
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                emit_gate_unavailable_attribution(McpHookPhase::PreCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+            }
+            Err(e) => ShellHookVerdict::Denied(e),
+        }
+    }
+
+    /// Run `PostCall` against `command`'s produced `result`, same identity
+    /// as [`Self::shell_pre_call_hooks`]. Lets a hook observe (or override)
+    /// what a direct kaish exec actually produced, the way `PostCall`
+    /// observes a real `shell_write` tool call's result.
+    pub async fn shell_post_call_hooks(
+        &self,
+        command: &str,
+        ctx: &CallContext,
+        result: &KernelToolResult,
+    ) -> ShellHookVerdict {
+        let params = Self::shell_write_hook_params(command);
+        match self
+            .evaluate_phase(
+                McpHookPhase::PostCall,
+                &params,
+                ctx,
+                PhasePayload::Result(result),
+            )
+            .await
+        {
+            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
+            Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
+                emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
+                ShellHookVerdict::ShortCircuit(result)
+            }
+            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::Denied { by_hook: hook_id })
+            }
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+            }
+            Err(e) => ShellHookVerdict::Denied(e),
         }
     }
 
@@ -6036,6 +6273,321 @@ mod tests {
             matches!(err, McpError::Denied { .. }),
             "expected Denied, got {err:?}"
         );
+    }
+
+    /// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "Exit 3 =
+    /// escalate to an ask"): a `HookBody::Kaish` body that exits 3 does not
+    /// deny outright — it escalates through the same ledger ask round trip
+    /// `HookAction::Ask` uses, with the body's stderr tail as the ask's
+    /// description. Answered `allow`, the call proceeds.
+    #[tokio::test]
+    async fn kaish_hook_exit_3_escalates_and_allow_answer_proceeds() {
+        let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-exit3-allow").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-escalate"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(
+                "echo needs a human >&2; exit 3".into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let answerer = spawn_gate_answerer(kj.kernel_db().clone(), true);
+        let result = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an allowed escalation must let the call proceed");
+        answerer.await.unwrap();
+        assert!(!result.is_error);
+    }
+
+    /// Same escalation, answered `deny` — a REAL verdict this time
+    /// (`McpError::Denied`, not `GateUnavailable`), because a human actually
+    /// looked at it and said no.
+    #[tokio::test]
+    async fn kaish_hook_exit_3_escalates_and_deny_answer_denies() {
+        let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-exit3-deny").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-escalate"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish("exit 3".into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let answerer = spawn_gate_answerer(kj.kernel_db().clone(), false);
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a denied escalation must deny the call");
+        answerer.await.unwrap();
+        assert!(
+            matches!(err, McpError::Denied { .. }),
+            "expected Denied, got {err:?}"
+        );
+    }
+
+    /// The other half of the ruling: a fault running the body at all — no
+    /// `KjDispatcher` wired, same misconfiguration `a_hook_ask_with_no_dispatcher_wired_is_gate_unavailable_not_denied`
+    /// covers for `HookAction::Ask` — must ALSO escalate rather than deny.
+    /// Since escalating calls `run_permission_ask`, which performs the same
+    /// dispatcher lookup and finds nothing either, this resolves to
+    /// `McpError::GateUnavailable`: a broken control, never indistinguishable
+    /// from a real "no". Before this ruling this hit `McpError::Denied`.
+    #[tokio::test]
+    async fn kaish_hook_fault_with_no_dispatcher_wired_is_gate_unavailable_not_denied() {
+        let broker = Arc::new(Broker::new());
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-no-dispatcher"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            // The body never runs — there is no KjDispatcher to materialize
+            // a shell from — so its content doesn't matter.
+            action: HookAction::Invoke(HookBody::Kaish("exit 0".into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let err = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::GateUnavailable { .. }),
+            "expected GateUnavailable (a fault, not a verdict), got {err:?}"
+        );
+    }
+
+    /// `KJ_TOOL_PLAN` (`docs/gate-and-shell-split.md`): a shell hook body
+    /// sees kaish's plan projection of the `command` argument. Three
+    /// statements for `a && b; c | d; for f in x; do delete $f; done`, and
+    /// `delete` appears as its own command inside the loop body — per-command
+    /// granularity, finer than clauses. Entries are read by array position.
+    #[tokio::test]
+    async fn kj_tool_plan_projects_the_shell_command() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-plan").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("plan-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(
+                "n=$(echo $KJ_TOOL_PLAN | jq -r '.statements|length')\n\
+                 names=$(echo $KJ_TOOL_PLAN | jq -r '.statements[2].plan.commands|map(.name)|join(\",\")')\n\
+                 test $n = 3 || exit 1\n\
+                 case $names in *delete*) exit 0 ;; *) exit 1 ;; esac"
+                    .into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let mut call = params("svc", "shell_write");
+        call.arguments =
+            serde_json::json!({ "command": "a && b; c | d; for f in x; do delete $f; done" });
+
+        let result = broker
+            .call_tool(call, &CallContext::test(), CancellationToken::new())
+            .await
+            .expect("KJ_TOOL_PLAN must carry three statements with `delete` inside the loop");
+        assert!(!result.is_error);
+    }
+
+    /// A command that fails to parse leaves `KJ_TOOL_PLAN` unset and sets
+    /// `KJ_TOOL_PLAN_ERROR` with the diagnostics — never a silently empty
+    /// plan.
+    #[tokio::test]
+    async fn kj_tool_plan_error_is_set_on_parse_failure() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-clauses-error").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("clause-error-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(
+                // `[` is a banned command in kaish (gotcha_kaish.md); `[[ ]]`
+                // is the real test surface.
+                "[[ -n \"$KJ_TOOL_PLAN_ERROR\" ]] && [[ -z \"$KJ_TOOL_PLAN\" ]]".into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        // An unterminated single-quote never parses.
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": "echo 'unterminated" });
+
+        let result = broker
+            .call_tool(call, &CallContext::test(), CancellationToken::new())
+            .await
+            .expect("a parse failure must set KJ_TOOL_PLAN_ERROR and leave KJ_TOOL_PLAN unset");
+        assert!(!result.is_error);
+    }
+
+    /// The literal `assets/defaults/rc/lib/create/S45-shell-guard.kai`
+    /// seed — read from disk (not hand-copied into the test) so this test
+    /// falsifies the SAME script rc runs, not an extracted/duplicated
+    /// approximation of it.
+    const SHELL_GUARD_SEED: &str =
+        include_str!("../../../../assets/defaults/rc/lib/create/S45-shell-guard.kai");
+
+    /// The `sh -c` guard (`docs/gate-and-shell-split.md` item 4, Amy
+    /// 2026-08-20): denies any `shell_write` command that routes through
+    /// `sh`/`bash`/`zsh`/`dash` `-c` (optionally via `exec`) at a statement
+    /// boundary or the start of the command, and lets everything else
+    /// through — including the three benign shapes that tripped an earlier,
+    /// looser regex on our own probe this morning (per the ruling text):
+    /// `grep 'sh -c' file`, `echo "bash -c"`, and a commit message
+    /// containing the substring `sh -c`.
+    ///
+    /// Installs the hook by running the REAL seed script through kaish
+    /// (`kj hook add` and all), not by hand-building a `HookEntry` with an
+    /// extracted/approximated body — so this exercises the seed's own
+    /// `jq`-built action JSON, the same install path
+    /// `kj::hook::tests::s45_shell_guard_installs_via_the_real_create_lifecycle`
+    /// exercises via the full rc lifecycle; this test's focus is the
+    /// guard's OWN matching logic once installed, falsified against the
+    /// exact benign-vs-deny shapes below.
+    #[tokio::test]
+    async fn shell_guard_denies_sh_dash_c_and_allows_benign_shapes() {
+        let (broker, _kernel, kj) = wired_kaish_broker("shell-guard-falsify").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // `materialize_context_kaish_rc`, not `_internal` — `kj hook add` is
+        // gated on `Capability::ConfigWrite` unless the caller is
+        // privileged, and the ONLY privileged path is rc's own
+        // materialization (see that method's doc). This mirrors how the
+        // real seed actually runs (`run_rc_lifecycle`'s own rc kaish), not
+        // a hook body's unprivileged shell.
+        let kaish = kj
+            .materialize_context_kaish_rc(
+                "rc",
+                PrincipalId::new(),
+                kaijutsu_types::ContextId::new(),
+                kaijutsu_types::SessionId::new(),
+                None,
+                Arc::new(crate::kj::lifecycle::NoopBlockSource),
+            )
+            .await
+            .expect("materialize kaish for installing the seed script");
+        let install = kaish
+            .execute_with_options(SHELL_GUARD_SEED, kaish_kernel::ExecuteOptions::default())
+            .await
+            .expect("S45-shell-guard.kai must not fault while installing");
+        assert_eq!(
+            install.code, 0,
+            "S45-shell-guard.kai must install cleanly: {}",
+            install.err
+        );
+        assert!(
+            broker
+                .hooks()
+                .read()
+                .await
+                .pre_call
+                .entries
+                .iter()
+                .any(|e| e.id.0 == "shell-escape-guard"),
+            "the seed script must have installed the shell-escape-guard hook"
+        );
+
+        let denied = [
+            "sh -c 'rm -rf /tmp/x'",
+            "bash -c 'echo hi'",
+            "exec sh -c 'echo hi'",
+            "true; sh -c 'echo hi'",
+            "true && bash -c 'echo hi'",
+            "echo one | zsh -c 'echo two'",
+            "(dash -c 'echo hi')",
+        ];
+        for cmd in denied {
+            let mut call = params("svc", "shell_write");
+            call.arguments = serde_json::json!({ "command": cmd });
+            let err = broker
+                .call_tool(call, &CallContext::test(), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, McpError::Denied { .. }),
+                "expected the guard to deny {cmd:?}, got {err:?}"
+            );
+        }
+
+        // Falsified against Amy's own morning incident: the Claude Code
+        // regex hook blocked this exact data-position false positive.
+        let benign = [
+            "grep 'sh -c' file",
+            "echo \"bash -c\"",
+            "git commit -m \"note: sh -c is banned here\"",
+        ];
+        for cmd in benign {
+            let mut call = params("svc", "shell_write");
+            call.arguments = serde_json::json!({ "command": cmd });
+            let result = broker
+                .call_tool(call, &CallContext::test(), CancellationToken::new())
+                .await;
+            assert!(
+                result.is_ok(),
+                "the guard must NOT deny the benign shape {cmd:?}, got {result:?}"
+            );
+        }
     }
 
     /// `kj` is callable from inside a kaish hook body once

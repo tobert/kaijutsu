@@ -94,7 +94,13 @@ enum HookCommand {
         /// Hook id
         hook_id: String,
     },
-    /// Register a new hook entry.
+    /// Register a new hook entry. Idempotent on `hook_id` (in `match_json`,
+    /// or a generated one if omitted): re-adding the SAME id with an
+    /// otherwise identical phase/match/priority/action is a no-op success —
+    /// safe to run from rc on every context create. Re-adding the same id
+    /// with anything different REPLACES the existing entry (durable delete,
+    /// then insert) rather than erroring on the id collision or leaving a
+    /// stale duplicate behind.
     Add {
         /// pre_call | post_call | on_error | on_notification | list_tools
         phase: String,
@@ -315,6 +321,53 @@ impl KjDispatcher {
             action,
             priority: m.priority.unwrap_or(0),
         };
+
+        // Idempotency on `hook_id` (Amy's ruling, 2026-08-20,
+        // `docs/gate-and-shell-split.md` item 4): `hooks.hook_id` is the
+        // DB's PRIMARY KEY (`kernel_db.rs`), and `insert_hook` is a bare
+        // `INSERT`, not an upsert — re-adding the same id today fails the
+        // DB write outright, and even if it didn't, the in-memory
+        // `entries.push` would leave a duplicate that fires the SAME guard
+        // twice per call. rc re-running `kj hook add` with a stable id on
+        // every context create needs this to be a no-op, not a growing
+        // pile or a loud failure.
+        let existing = {
+            let hooks = broker.hooks().read().await;
+            find_entry_by_id(&hooks, &id).map(|(p, e)| (p, e.clone()))
+        };
+        let replaced = match &existing {
+            Some((existing_phase, existing_entry)) => {
+                if *existing_phase == phase && hook_entry_equivalent(existing_entry, &entry) {
+                    let data = serde_json::json!({ "hook_id": id, "replaced": false });
+                    return KjResult::ok_with_data(
+                        format!(
+                            "hook '{id}' already present on phase {phase_str} with the same \
+                             shape (no-op)"
+                        ),
+                        data,
+                    );
+                }
+                // Different shape (or a different phase) under the same id:
+                // replace rather than error or duplicate. Durable delete
+                // first — same discipline as `hook_remove` — then the
+                // insert below re-adds it fresh; an UPDATE would need a
+                // second SQL shape for what delete+insert already covers.
+                if let Err(e) = broker.persist_hook_delete(&id).await {
+                    return KjResult::Err(format!(
+                        "kj hook add: failed to replace hook {id} (delete step): {e}"
+                    ));
+                }
+                let mut hooks_w = broker.hooks().write().await;
+                hooks_w.pre_call.entries.retain(|e| e.id.0 != id);
+                hooks_w.post_call.entries.retain(|e| e.id.0 != id);
+                hooks_w.on_error.entries.retain(|e| e.id.0 != id);
+                hooks_w.on_notification.entries.retain(|e| e.id.0 != id);
+                hooks_w.list_tools.entries.retain(|e| e.id.0 != id);
+                true
+            }
+            None => false,
+        };
+
         // Durable store FIRST — same contract as the MCP `hook_add` tool.
         if let Err(e) = broker.persist_hook_insert(phase, &entry).await {
             return KjResult::Err(format!("kj hook add: failed to persist hook {id}: {e}"));
@@ -323,9 +376,74 @@ impl KjDispatcher {
             let mut hooks = broker.hooks().write().await;
             phase_table_mut(&mut hooks, phase).entries.push(entry);
         }
-        let data = serde_json::json!({ "hook_id": id });
-        KjResult::ok_with_data(format!("hook '{id}' added on phase {phase_str}"), data)
+        let data = serde_json::json!({ "hook_id": id, "replaced": replaced });
+        let verb = if replaced { "replaced" } else { "added" };
+        KjResult::ok_with_data(format!("hook '{id}' {verb} on phase {phase_str}"), data)
     }
+}
+
+/// Find a hook entry by id across every phase table — `hook_id` is a
+/// single PRIMARY KEY spanning all phases, not scoped per phase, so a
+/// caller checking for a collision must search all five the same way
+/// `hook_show`/`hook_remove` already do.
+fn find_entry_by_id<'a>(
+    hooks: &'a HookTables,
+    id: &str,
+) -> Option<(McpHookPhase, &'a HookEntry)> {
+    phase_tables(hooks)
+        .into_iter()
+        .find_map(|(phase, table)| table.entries.iter().find(|e| e.id.0 == id).map(|e| (phase, e)))
+}
+
+/// Whether two entries (assumed to share an id) are the same request in
+/// every field that matters to evaluation — match criteria, priority, and
+/// action. `kaish_script_id` is provenance metadata, not evaluated
+/// behavior, so it is deliberately excluded: re-adding the same inline
+/// body from a different (or no) script reference is still the same hook.
+fn hook_entry_equivalent(a: &HookEntry, b: &HookEntry) -> bool {
+    glob_eq(&a.match_instance, &b.match_instance)
+        && glob_eq(&a.match_tool, &b.match_tool)
+        && a.match_context == b.match_context
+        && a.match_principal == b.match_principal
+        && a.priority == b.priority
+        && action_equivalent(&a.action, &b.action)
+}
+
+fn glob_eq(a: &Option<GlobPattern>, b: &Option<GlobPattern>) -> bool {
+    a.as_ref().map(|g| &g.0) == b.as_ref().map(|g| &g.0)
+}
+
+/// `HookAction`/`HookBody` derive no `PartialEq` — `HookBody::Builtin`
+/// carries an `Arc<dyn Hook>`, which cannot be compared — so this compares
+/// the fields that describe a request's SHAPE rather than the trait
+/// object's identity. Two `Builtin` actions naming the same registry key
+/// are equivalent regardless of which `Arc` the registry happened to hand
+/// back.
+fn action_equivalent(a: &HookAction, b: &HookAction) -> bool {
+    match (a, b) {
+        (HookAction::Invoke(HookBody::Builtin { name: n1, .. }), HookAction::Invoke(HookBody::Builtin { name: n2, .. })) => {
+            n1 == n2
+        }
+        (HookAction::Invoke(HookBody::Kaish(s1)), HookAction::Invoke(HookBody::Kaish(s2))) => {
+            s1 == s2
+        }
+        (HookAction::ShortCircuit(r1), HookAction::ShortCircuit(r2)) => {
+            r1.is_error == r2.is_error && short_circuit_text(r1) == short_circuit_text(r2)
+        }
+        (HookAction::Deny(r1), HookAction::Deny(r2)) => r1 == r2,
+        (HookAction::Log(l1), HookAction::Log(l2)) => {
+            l1.target == l2.target && l1.level == l2.level
+        }
+        (HookAction::Ask(s1), HookAction::Ask(s2)) => s1.description == s2.description,
+        _ => false,
+    }
+}
+
+fn short_circuit_text(result: &crate::mcp::KernelToolResult) -> Option<&str> {
+    result.content.iter().find_map(|c| match c {
+        ToolContent::Text(s) => Some(s.as_str()),
+        _ => None,
+    })
 }
 
 fn phase_tables(hooks: &HookTables) -> [(McpHookPhase, &HookTable); 5] {
@@ -685,6 +803,103 @@ mod tests {
         assert_eq!(data.as_ref().unwrap()["removed"], false);
     }
 
+    /// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md` item 4):
+    /// `kj hook add` with a stable id must be a no-op on re-add of the
+    /// SAME shape — no DB primary-key error, no duplicate entry (so rc can
+    /// run it on every context create without piling up hooks). Falsified
+    /// against the `hooks.hook_id PRIMARY KEY` constraint: without this
+    /// change, the second add's `persist_hook_insert` fails outright.
+    #[tokio::test]
+    async fn add_with_same_id_and_shape_is_a_noop() {
+        let d = test_helpers::test_dispatcher().await;
+        let caller = test_helpers::test_caller();
+
+        let match_json = r#"{"match_tool":"shell_write","hook_id":"stable-guard"}"#;
+        let action_json = r#"{"type":"deny","reason":"no"}"#;
+
+        let first = d
+            .dispatch_hook(&[s("add"), s("pre_call"), s(match_json), s(action_json)], &caller)
+            .await;
+        let KjResult::Ok { data, .. } = &first else {
+            panic!("expected Ok, got {first:?}");
+        };
+        assert_eq!(data.as_ref().unwrap()["replaced"], false);
+
+        // Re-add: same phase, same match, same action. Must succeed as a
+        // no-op, not error on the DB's PRIMARY KEY(hook_id).
+        let second = d
+            .dispatch_hook(&[s("add"), s("pre_call"), s(match_json), s(action_json)], &caller)
+            .await;
+        let KjResult::Ok { data, .. } = &second else {
+            panic!("second add with identical shape must succeed as a no-op, got {second:?}");
+        };
+        assert_eq!(data.as_ref().unwrap()["replaced"], false);
+        assert_eq!(data.as_ref().unwrap()["hook_id"], "stable-guard");
+
+        // Exactly one entry, not two.
+        let hooks = d.kernel().broker().hooks().read().await;
+        let count = hooks
+            .pre_call
+            .entries
+            .iter()
+            .filter(|e| e.id.0 == "stable-guard")
+            .count();
+        assert_eq!(count, 1, "a no-op re-add must not duplicate the entry");
+    }
+
+    /// Same id, different action: REPLACES the entry (durable delete +
+    /// fresh insert) rather than erroring or leaving two entries.
+    #[tokio::test]
+    async fn add_with_same_id_and_different_action_replaces() {
+        let d = test_helpers::test_dispatcher().await;
+        let caller = test_helpers::test_caller();
+
+        let match_json = r#"{"match_tool":"shell_write","hook_id":"stable-guard"}"#;
+
+        let first = d
+            .dispatch_hook(
+                &[
+                    s("add"),
+                    s("pre_call"),
+                    s(match_json),
+                    s(r#"{"type":"deny","reason":"v1"}"#),
+                ],
+                &caller,
+            )
+            .await;
+        assert!(first.is_ok(), "{first:?}");
+
+        let second = d
+            .dispatch_hook(
+                &[
+                    s("add"),
+                    s("pre_call"),
+                    s(match_json),
+                    s(r#"{"type":"deny","reason":"v2"}"#),
+                ],
+                &caller,
+            )
+            .await;
+        let KjResult::Ok { data, .. } = &second else {
+            panic!("expected Ok, got {second:?}");
+        };
+        assert_eq!(data.as_ref().unwrap()["replaced"], true);
+
+        let hooks = d.kernel().broker().hooks().read().await;
+        let matches: Vec<_> = hooks
+            .pre_call
+            .entries
+            .iter()
+            .filter(|e| e.id.0 == "stable-guard")
+            .collect();
+        assert_eq!(matches.len(), 1, "replace must not leave a duplicate");
+        assert!(
+            matches!(&matches[0].action, HookAction::Deny(r) if r == "v2"),
+            "replace must land the NEW action, got {:?}",
+            matches[0].action
+        );
+    }
+
     #[tokio::test]
     async fn add_rejects_shortcircuit_for_list_tools() {
         let d = test_helpers::test_dispatcher().await;
@@ -740,6 +955,64 @@ mod tests {
         assert!(
             matches!(&show, KjResult::Err(m) if m.contains("no hook with id")),
             "{show:?}"
+        );
+    }
+
+    /// End-to-end for `assets/defaults/rc/lib/create/S45-shell-guard.kai`
+    /// (`docs/gate-and-shell-split.md` item 4): run through the REAL `create`
+    /// rc lifecycle for a context type it's symlinked into (`default`), not
+    /// just its extracted body in isolation
+    /// (`mcp::broker::tests::shell_guard_denies_sh_dash_c_and_allows_benign_shapes`
+    /// covers the guard's own matching logic).
+    ///
+    /// Deliberately `test_dispatcher_rc`, not the plain `test_dispatcher`:
+    /// the seed convention for a per-type script is a symlink whose body is
+    /// just the link target path (`seed_scripts.rs`), reconstructed into a
+    /// REAL symlink only by the document-backed `ConfigDocFs` seed —
+    /// `test_dispatcher`'s host-backed `LocalBackend` writes that path
+    /// string as a literal file instead, so `kj rc dispatch` tries to run
+    /// the path text itself as a command (`command not found:
+    /// /etc/rc/lib/create/S05-kaish.kai`) for EVERY symlinked script in
+    /// `default/create/`, not just this one — confirmed by probe, not
+    /// assumed, before switching helpers.
+    #[tokio::test]
+    async fn s45_shell_guard_installs_via_the_real_create_lifecycle() {
+        let d = std::sync::Arc::new(test_helpers::test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = kaijutsu_types::PrincipalId::new();
+        let ctx = test_helpers::register_context(&d, Some("guard-install-e2e"), None, principal);
+        d.kernel_db()
+            .lock()
+            .update_context_type(ctx, "default")
+            .expect("set context_type");
+
+        let caller = crate::kj::KjCaller {
+            principal_id: principal,
+            context_id: Some(ctx),
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: false,
+        };
+        d.run_rc_lifecycle("create", ctx, None, None, None, &caller)
+            .await
+            .expect("create lifecycle must not hard-fail");
+
+        let hooks = d.kernel().broker().hooks().read().await;
+        let installed = hooks
+            .pre_call
+            .entries
+            .iter()
+            .find(|e| e.id.0 == "shell-escape-guard");
+        assert!(
+            installed.is_some(),
+            "S45-shell-guard.kai's create lifecycle must install the pre_call hook, got: {:?}",
+            hooks.pre_call.entries.iter().map(|e| &e.id.0).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(&installed.unwrap().action, HookAction::Invoke(HookBody::Kaish(_))),
+            "installed action must be a kaish body, got {:?}",
+            installed.unwrap().action
         );
     }
 }

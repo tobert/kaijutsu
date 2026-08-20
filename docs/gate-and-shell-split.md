@@ -609,40 +609,47 @@ different `McpError`s under Ruling 2 above, which makes a DB fault
 indistinguishable from a human's refusal at exactly the seam that ruling
 exists to protect. `GateOutcome` needs to carry the distinction.
 
-### A future advisory input: lfm2d risk scoring (hook point, not a slice)
+### An advisory input, shipped log-only: lfm2d risk scoring
 
 Amy asked 2026-08-17 whether lfm2d-scored risk feeding the ledger via rc was
-still planned. It isn't written down anywhere as a plan — the pieces exist
-(the `/v1/cascade` scorer, this ledger, rc's per-context-type composition,
-this gate's `HookAction::Ask` seam) and the join does not, and it is filed
-in full in `docs/issues.md` ("lfm2d risk scoring into the approval ledger,
-via rc") — read that entry rather than this paragraph for the receipts; it
-is not re-derived here.
+still planned; the join from `/v1/cascade` to this ledger via rc landed
+2026-08-20, log-only, per her ruling that log-only runs first (receipts and
+the open re-measurement question stay in `docs/issues.md`, "lfm2d risk
+scoring into the approval ledger, via rc" — not re-derived here).
 
-What this design owes that entry is a seam that can accept the input
-without inviting the wrong one. The constraint is not optional: **a score
-may RAISE a prompt that would not otherwise fire, or enrich one that does;
-it must never lower one, and must never silently allow** — grounded in a
-real measurement (`/v1/cascade` scored `git checkout -- crates/` at 0.210
+The constraint that shaped the shape was never optional: **a score may RAISE
+a prompt that would not otherwise fire, or enrich one that does; it must
+never lower one, and must never silently allow** — grounded in a real
+measurement (`/v1/cascade` scored `git checkout -- crates/` at 0.210
 "situation-normal," confidently wrong, on an operation that has already
-destroyed uncommitted work in this repo). This is expressible today without
-a schema change: `approval_signals` (`schema.rs:364-377`) already exists
-for exactly this — a `SignalSourceKind::Classifier` row with a `verdict` of
-`escalate`/`deny`/`allow`, attached to an ask — and, verified by reading
-`ask.rs`/`rules.rs`/`decide.rs`, **nothing in this crate reads a signal to
-auto-decide anything today.** `rules::redeem` composes coverage from
-`approval_rules` alone; `approval_signals` rows are write-and-display only.
-That is structurally the right shape for "advisory, never authoritative" —
-a future consumer of `NewSignal` must keep it that way: a classifier's
-`allow` verdict may never become an input to `AskCoverage::verdict()`,
-only to what a human sees before they decide. Where the score would come
-*from* is a per-`context_type` rc question, not a kernel one — an
-`/etc/rc/<type>/create-or-verb/SXX-risk.kai` that calls the scorer before a
-destructive verb and, if the score says raise, forces escalation (skips
-rule-coverage auto-allow, goes straight to asking) rather than kernel code
-deciding for every context type at once. None of this is scheduled — it is
-blocked on the re-measurement `docs/issues.md` calls out (one sample is not
-a distribution), named here only so the seam isn't retrofitted badly later.
+destroyed uncommitted work in this repo). This held with no schema change:
+`approval_signals` (`schema.rs`, "Approval signals") already carried a
+`SignalSourceKind::Classifier` row with a `verdict` of
+`escalate`/`deny`/`allow`, attached to an ask, and `rules::redeem` was
+already verified to compose coverage from `approval_rules` alone — a signal
+was write-and-display only before this landed, and stays that way after:
+`redeem_ignores_a_signal_even_when_its_verdict_is_allow` (`rules.rs`) pins
+it as a test, not just a reading of the code. `approval_ledger::ask::
+create_auto_allowed_ask` is the one addition — creates an ask already
+decided `Allowed`, in the same transaction as its creation, with the
+classifier's read attached as a signal; log-only means "auto-approved and
+recorded," never "silently allowed and dropped." `kj ledger signal add`
+(`--auto-allow` | `--request-id`) is the verb a hook body calls; `--signals`
+on `kj ledger list`/`show` makes the attached rows visible.
+
+The score comes from a per-`context_type` rc script, not kernel code, per
+the design this paragraph always argued for: `assets/defaults/rc/coder/
+create/S50-lfm2d.kai` exports `LFM2D_MODE=log` / `LFM2D_URL` as durable env
+and installs a `pre_call` hook (`hook_id lfm2d-advisory`, `match_tool
+shell_write`) that scores the command through `/v1/cascade`, reads the
+severity ladder from `/v1/models` at fire time (never a hard-coded label —
+lfm2d's checkpoints change their label vocabulary between releases), and
+degrades to a `Trace` block plus `exit 0` whenever `kaish-tools-curl` isn't
+registered — which is every context today, since that lane hasn't landed
+yet. **Still open, and still blocking anything past log-only:** the
+re-measurement `docs/issues.md` calls out (one sample is not a
+distribution) — enforce mode is not scheduled, and this paragraph is not
+where that decision gets made.
 
 ## Slices
 
@@ -1195,3 +1202,144 @@ exactly as they are.
   test harness finds the request id to answer). Whoever picks up Slice 4/5
   should read `kj/gate.rs` as a working reference implementation, not a
   half-finished stub.
+
+## 2026-08-20 — a hook-body fault escalates; `KJ_TOOL_PLAN`; the direct
+## kaish exec paths take the hook path; the `sh -c` guard — SHIPPED
+
+Four of Amy's 2026-08-20 rulings, on top of the already-shipped slices
+above. All four build on machinery Slice 2/4.5/4.7 already shipped
+(`PermissionAskOutcome`, `run_permission_ask`, `McpError::GateUnavailable`)
+rather than inventing a second one.
+
+**Exit 3 = escalate; a hook-body fault escalates too**
+(`crates/kaijutsu-kernel/src/mcp/broker.rs`). `run_kaish_hook` now returns
+`KaishHookOutcome` (`Continue`/`Deny(reason)`/`Escalate(description)`)
+instead of `Result<(), String>`: exit 0 continues; exit 3 escalates with the
+stderr tail as the ask description; any other non-zero exit still denies;
+and — the behavior change — a fault running the body at all (no
+`KjDispatcher` wired, `materialize_context_kaish_internal` failing,
+`execute_with_options` returning `Err`) ALSO escalates rather than denying.
+`evaluate_phase`'s `HookBody::Kaish` arm routes `Escalate` through
+`self.run_permission_ask` — the exact same call `HookAction::Ask` makes —
+so a fault-with-no-dispatcher naturally resolves to
+`PermissionAskOutcome::Unavailable` → `McpError::GateUnavailable`, not
+`Denied`: the fault stays a broken control, never a verdict, all the way to
+the model. `HookActionWire::Kaish`'s doc comment
+(`mcp/servers/hooks_builtin.rs`) states the full contract. Tests (all in
+`mcp::broker::tests`): `kaish_hook_exit_3_escalates_and_allow_answer_proceeds`,
+`kaish_hook_exit_3_escalates_and_deny_answer_denies`,
+`kaish_hook_fault_with_no_dispatcher_wired_is_gate_unavailable_not_denied`
+(this one is the direct regression pin — reverting the fault-handling change
+makes it assert `McpError::Denied` was returned instead). No existing test
+asserted `Denied` on a kaish-hook fault before this change, so nothing
+needed deliberate updating.
+
+**`KJ_TOOL_PLAN`** (`broker.rs::run_kaish_hook`). When the hooked tool is
+`shell` or `shell_write`, the `command` argument is projected with
+`kaish_kernel::ast::plan::plan_program` and the body receives
+`{"statements":[{"index":N,"plan":{"rendered":…,"statement_kind":…,
+"commands":[{"name":…,"args":[…],"redirects":[…],"background":…}],…}}]}` —
+kaish's stable plan surface (the `PlannedStatement` type is `Serialize`;
+the AST types deliberately are not). `commands[]` descends into `for`/`if`/
+`$(...)` bodies, `--confirm=<key>` literals are redacted, and nothing is
+executed or substituted, so a classifier scores per command — finer than
+clauses — without the body re-deriving statement structure. Consumers read
+entries by array position, never by `index` (kaish 0.16 makes it dense; it
+can be off by one today when a script opens with a comment). On a parse
+failure the var is absent and `KJ_TOOL_PLAN_ERROR` carries the diagnostics.
+kaish 0.16 adds a `plan` builtin that emits the same object, so a hook body
+can also call it directly. Tests: `kj_tool_plan_projects_the_shell_command`
+(three statements for `a && b; c | d; for f in x; do delete $f; done`, with
+`delete` as its own command inside the loop) and
+`kj_tool_plan_error_is_set_on_parse_failure`.
+
+**The three `rpc.rs` shell paths take the hook path.** `Broker` gains two
+public methods (`shell_pre_call_hooks`/`shell_post_call_hooks`,
+`mcp/broker.rs`) that run the same `PreCall`/`PostCall` phases a real
+`shell_write` tool call gets, matched as `instance: builtin.shell_write,
+tool: shell_write, args: {command}` — the identity every
+`match_tool: "shell_write"` hook already expects — and return a
+`ShellHookVerdict` (`Proceed`/`ShortCircuit(result)`/`Denied(err)`) for the
+caller to act on, since none of these three sites has a `KernelToolResult`
+to hand back the way `call_tool` does. Deliberately NOT a full reroute
+through `call_tool`: these sites stream output, hold a cancel token, and
+write directly to context blocks.
+- `execute_shell_command` (`crates/kaijutsu-server/src/rpc.rs`) evaluates
+  `PreCall` right after the ToolCall/ToolResult blocks exist: `Proceed`
+  continues to the existing spawned exec; `ShortCircuit` writes the
+  synthetic text into the output block and settles both blocks without ever
+  running kaish; `Denied` settles both blocks to `Error` with the reason and
+  returns `Err` — so a denied command shows WHY it didn't run instead of
+  hanging `Running` forever.
+- `execute_kj_command` gets the identical treatment (same three verdict
+  arms), gated as `shell_write` even though the source happens to start
+  with `kj` — the point is "this runs kaish directly, unwatched," not "this
+  looks like a shell command."
+- `execute` (the raw interactive exec RPC, `kernel::Server::execute`) gates
+  `PreCall` before the exec_id is even allocated, so a denied command never
+  occupies the connection's one concurrent-execution slot. Narrower than the
+  other two: `ShortCircuit` is treated as a denial here rather than
+  synthesized into the `dispatch_output_events` streaming path — filed as a
+  known gap, not built in this pass (see the comment at the call site).
+
+Test: `pre_call_deny_on_shell_write_blocks_shell_execute_end_to_end`
+(`crates/kaijutsu-server/tests/rpc_integration.rs`) installs a `PreCall
+Deny` on `shell_write` directly on a live kernel's broker
+(`start_server_with_kernel_handle`, the same pattern
+`ledger_events_wire.rs` uses) and proves a real `shell_execute` RPC call is
+blocked end to end — before this change nothing on this path ever asked the
+broker anything.
+
+**The `sh -c` guard, as rc + hook.** `assets/defaults/rc/lib/create/
+S45-shell-guard.kai` installs one global `pre_call` hook
+(`match_tool: "shell_write"`, `hook_id: "shell-escape-guard"`) whose kaish
+body reads `$KJ_TOOL_ARGS` → `.command` via `jq`, counts matches for
+`(^|[;&|(][[:space:]]*)(exec[[:space:]]+)?(ba|z|da)?sh[[:space:]]+-[a-z]*c\b`
+into a variable (`grep -Ec`, since a pipeline can't be an `if` condition in
+kaish), and exits 1 with a stderr hint ("run it as kaish directly, not
+through `sh -c`") on a match — a hard deny, not an escalation, per Amy's
+own "good for testing" framing. Symlinked (the seed-file convention
+`seed_scripts.rs` documents — the per-type file's body is just the link
+target path, reconstructed into a real symlink by `ConfigDocFs::seed`) into
+`coder`, `default`, `mcp`, and `director`'s `create/` — every context type
+that holds `Capability::Exec` today; `musician`/`toolie` don't and are left
+alone (they only ever see the `ExternalExec::Deny` safe `shell`, which
+cannot invoke `sh -c` regardless). Falsified against the exact benign shapes
+Amy named (a probe that morning was blocked by this pattern's own class of
+bug in an unrelated tool): `grep 'sh -c' file`, `echo "bash -c"`, and a
+commit message containing `sh -c` all proceed; `sh -c '...'`,
+`bash -c '...'`, `exec sh -c '...'`, `true; sh -c '...'`,
+`true && bash -c '...'`, a non-last pipeline stage, and a parenthesized
+subshell all deny. Tests: `mcp::broker::tests::
+shell_guard_denies_sh_dash_c_and_allows_benign_shapes` reads the literal
+seed file via `include_str!` (not a hand-copied duplicate) so it falsifies
+the guard's own logic against the exact body rc installs, and
+`kj::hook::tests::s45_shell_guard_installs_via_the_real_create_lifecycle`
+runs the seed through the REAL `create` rc lifecycle (seed →
+`ConfigDocFs`-reconstructed symlink → dispatch → `kj hook add`) and asserts
+the hook actually lands.
+
+**A kaish 0.15.0 quoting rule this script's authoring surfaced** (confirmed
+by kaish-lead's probe table): a double-quoted string containing a `$(...)`
+whose body contains a double-quoted word fails to parse — `x="$(printf "a")"`
+— while `x=$(printf "a")`, `"$(echo hi)"`, `"$(echo 'a')"` and a heredoc
+inside `$()` all parse. An unquoted assignment does not word-split the
+captured value, so `action_json=$(jq -n …)` is both the fix and safe. A
+single-quoted kaish token does not span a newline, so the guard's `jq -n`
+program is one line and builds `'`, `"`, newline and `\` with
+`([N]|implode)`. Reported upstream; candidate for a 0.16 fix.
+
+**`kj hook add` is now idempotent on a stable `hook_id`**
+(`crates/kaijutsu-kernel/src/kj/hook.rs`) — required for the guard above to
+be installable from rc on every context create without a
+`hooks.hook_id PRIMARY KEY` collision (`kernel_db.rs`; `insert_hook` is a
+bare `INSERT`, not an upsert) or, in memory, a duplicate entry firing the
+same guard twice per call. Same id + same shape (match criteria, priority,
+AND action — compared structurally since `HookAction`/`HookBody` derive no
+`PartialEq`, `HookBody::Builtin`'s `Arc<dyn Hook>` can't be) is a no-op
+success (`data.replaced: false`); same id + anything different replaces
+(durable delete, then a fresh insert; `data.replaced: true`) rather than
+erroring on the id collision or leaving a stale duplicate. `kaish_script_id`
+(provenance metadata, not evaluated behavior) is deliberately excluded from
+the shape comparison. Tests: `add_with_same_id_and_shape_is_a_noop`,
+`add_with_same_id_and_different_action_replaces`.

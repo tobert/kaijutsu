@@ -103,6 +103,7 @@ mod tests {
             task_status: kaijutsu_types::TaskStatus::default(),
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 

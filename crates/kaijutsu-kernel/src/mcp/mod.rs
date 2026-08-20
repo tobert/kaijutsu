@@ -21,7 +21,7 @@ pub mod toml;
 pub mod types;
 
 pub use binding::{Capability, ContextToolBinding, ResolvedName};
-pub use broker::Broker;
+pub use broker::{Broker, ShellHookVerdict};
 pub use coalescer::{CoalescePolicy, NotificationCoalescer};
 pub use external_registry::{
     ExternalMcpReconcileReport, external_instance_id, reconcile_external_mcp_servers,

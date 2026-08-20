@@ -46,7 +46,26 @@ pub enum HookActionWire {
     BuiltinInvoke { name: String },
     /// Inline kaish source body. Persisted in `hooks.action_kaish_body`.
     /// Evaluated at fire time via `EmbeddedKaish::execute_with_vars`.
-    /// Exit 0 → phase continues; non-zero → `PhaseOutcome::Deny`.
+    ///
+    /// The exit-code contract (Amy's ruling, 2026-08-20,
+    /// `docs/gate-and-shell-split.md`, "Exit 3 = escalate to an ask; a
+    /// hook-body fault escalates by default"):
+    /// - **Exit 0** → the phase continues.
+    /// - **Exit 3** → escalates to the SAME ledger ask round trip
+    ///   `HookAction::Ask` uses (`Broker::run_permission_ask`), with the
+    ///   body's stderr tail as the ask's description. kaish used exit 3
+    ///   for its own now-deleted confirmation latch, which is why it was
+    ///   picked here too.
+    /// - **Any other non-zero exit** → `PhaseOutcome::Deny`, unchanged.
+    /// - **A fault running the body at all** — an exec error, a timeout,
+    ///   or no `KjDispatcher` wired (`Broker::set_kj_dispatcher` never
+    ///   called) — ALSO escalates, exactly like exit 3, rather than
+    ///   denying. A runtime/DB fault is never a verdict: escalating routes
+    ///   it through the same ask machinery, which itself resolves to
+    ///   `McpError::GateUnavailable` (not `Denied`) when there is nowhere
+    ///   to run the gate — so a fault stays distinguishable from a real
+    ///   "no" all the way to the model, the same distinction Ruling 2
+    ///   makes for `HookAction::Ask`.
     Kaish { body: String },
     /// Reference to a stored shared script in the `hook_scripts` table.
     /// The body is resolved at hook_add time and SNAPSHOTTED into the

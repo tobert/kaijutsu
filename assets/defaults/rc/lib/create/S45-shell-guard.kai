@@ -1,0 +1,34 @@
+# The `sh -c` guard (docs/gate-and-shell-split.md, "shell escape guard").
+# A simple deny for bash/sh/zsh/dash. A `shell_write` command that routes through `sh -c`/`bash -c`/
+# `zsh -c`/`dash -c` (optionally via `exec`) is opaque to the shell gate —
+# `kj/shell_gate.rs`'s own module docs name this exact gap: the gate only
+# ever sees kaish source text, never what an interpreter invoked that way
+# will actually do. This hook denies the shape outright rather than trying
+# to gate what it cannot see into.
+#
+# Hard `exit 1` deny, not an `Ask` escalation: this ships as a plain deny;
+# a conditional Ask outcome for this guard is future work.
+#
+# `kj hook add` is idempotent on a stable `hook_id` (docs/gate-and-shell-
+# split.md item 4; kj/hook.rs) — same id + same shape is a no-op — so
+# running this on every context create keeps exactly ONE global hook row
+# rather than one per context, the same way S05/S10/S20/S25 in this
+# directory compose once and are symlinked, not copied, into each context
+# type. This script itself is symlinked (not copied) into the create/
+# lifecycle of every context type that holds `Capability::Exec` — see
+# lib/create/S10-binding.kai's own "exec" grant and this repo's
+# coder/director/default/mcp `create/S10-binding.kai` seeds — because a
+# context that never holds Exec never reaches a HOT shell in the first
+# place (`toolie`/`musician` get the safe, `ExternalExec::Deny` `shell`
+# tool only, which cannot invoke `sh -c` at all).
+#
+# The action JSON (match + kaish body) is built in ONE `jq -n` program
+# rather than hand-escaped kaish string concatenation, and captured with an
+# UNQUOTED assignment. kaish 0.15.0's parser rejects a double-quoted string
+# that contains a `$(...)` whose body contains a double-quoted word
+# (`x="$(printf "a")"` fails; `x=$(printf "a")` and `"$(echo 'a')"` parse).
+# An unquoted assignment does not word-split the captured value.
+
+match_json='{"match_tool":"shell_write","hook_id":"shell-escape-guard"}'
+action_json=$(jq -n '([39]|implode) as $q | ([34]|implode) as $dq | ([10]|implode) as $nl | ([92]|implode) as $bs | {type: "kaish", body: ("cmd=" + $dq + "$(printf " + $q + "%s" + $q + " $KJ_TOOL_ARGS | jq -r " + $q + ".command" + $q + ")" + $dq + $nl + "hits=" + $dq + "$(printf " + $q + "%s" + $q + " $cmd | grep -Ec " + $q + "(^|[;&|(][[:space:]]*)(exec[[:space:]]+)?(ba|z|da)?sh[[:space:]]+-[a-z]*c" + $bs + "b" + $q + ")" + $dq + $nl + "if test " + $dq + "$hits" + $dq + " -gt 0; then" + $nl + "    echo " + $dq + "blocked: sh -c / bash -c / zsh -c / dash -c is opaque to the shell gate — run it as kaish directly, not through sh -c" + $dq + " >&2" + $nl + "    exit 1" + $nl + "fi")}')
+kj hook add pre_call "$match_json" "$action_json"
