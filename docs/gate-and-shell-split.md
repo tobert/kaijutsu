@@ -1253,7 +1253,7 @@ can also call it directly. Tests: `kj_tool_plan_projects_the_shell_command`
 `delete` as its own command inside the loop) and
 `kj_tool_plan_error_is_set_on_parse_failure`.
 
-**The three `rpc.rs` shell paths take the hook path.** `Broker` gains two
+**The three `rpc.rs` shell paths take the hook path — PreCall today; PostCall/OnError are filed in `docs/issues.md`.** `Broker` gains two
 public methods (`shell_pre_call_hooks`/`shell_post_call_hooks`,
 `mcp/broker.rs`) that run the same `PreCall`/`PostCall` phases a real
 `shell_write` tool call gets, matched as `instance: builtin.shell_write,

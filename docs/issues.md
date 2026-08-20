@@ -63,6 +63,34 @@ and the devlog. What remains:
   be the one place; `StyleEntry.effect`/`param`/`_pad` and
   `ChromeInstance.anim[1]` are unread (documented, leave with an expiry note).
 
+### Hooks (kaibo review of the 08-20 hook work, DeepSeek)
+
+- **PostCall/OnError are not evaluated on the rpc.rs shell paths.**
+  `Broker::shell_post_call_hooks` exists with zero callers and there is no
+  OnError counterpart; only PreCall landed in `execute`,
+  `execute_shell_command`, `execute_kj_command`. A PostCall hook never sees a
+  direct-exec command's result. Wire both with the real result/error. M.
+- **`kj hook add` idempotency has a TOCTOU and a non-atomic replace.** The
+  lookup releases its lock before the durable insert (`kj/hook.rs`); two
+  concurrent creates re-adding `shell-escape-guard` race to a UNIQUE
+  violation — a spurious rc failure instead of the intended no-op — and a
+  replace is delete-then-insert, so a failed insert loses the hook. Make the
+  add an upsert in one transaction. S–M.
+- **Escalate in PostCall/OnError/OnNotification blocks the path up to the
+  gate wait (300 s) and leaves an Expired ask per call** when a body exits 3
+  every time. Decide whether escalate is meaningful outside PreCall; at least
+  OnNotification should not block the emission loop. M, design.
+- **The exit-3 stderr tail is length-capped but not control-char-sanitized**
+  before it becomes the ask description a human reads. S.
+- **The `sh -c` guard is a grep over raw text:** `sh \`+newline+`-c`,
+  `if sh -c …`, and `fish -c`/`ksh -c` pass; a heredoc line starting `sh -c`
+  is denied; a missing `jq`/`grep` fails open. The honest successor scores
+  `KJ_TOOL_PLAN.commands[]` by `name` instead of regexing the blob. S once
+  `plan` is the input.
+- **A human's interactive shell is gated by the guard too** (by design: the
+  rpc paths take the hook path) — say so in `docs/gate-and-shell-split.md`
+  and let rc soften it for interactive seats when the Ask outcome lands.
+
 ### rc scripts and comments
 
 - **`S50-lfm2d.kai` round-trips its hook body through a temp file** to dodge

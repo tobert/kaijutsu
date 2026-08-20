@@ -241,6 +241,33 @@ enum KaishHookOutcome {
     Escalate(String),
 }
 
+/// kaish's per-call timeout surfaces as exit 124 (`TimeoutPolicy`), not as
+/// `Err`, so it is classified here with the other exit codes.
+const KAISH_TIMEOUT_EXIT: i64 = 124;
+
+/// Map a hook body's exit to an outcome: 0 continues; 3 escalates with the
+/// stderr tail as the ask description (`fallback` when stderr is empty);
+/// 124 — the body timed out — escalates, because a body that could not
+/// finish is a fault, not a verdict; any other non-zero exit denies.
+fn classify_kaish_hook_exit(code: i64, stderr: &str, fallback: &str) -> KaishHookOutcome {
+    let stderr_tail: String = stderr.chars().take(512).collect();
+    let tail = stderr_tail.trim();
+    match code {
+        0 => KaishHookOutcome::Continue,
+        3 => KaishHookOutcome::Escalate(if tail.is_empty() {
+            fallback.to_string()
+        } else {
+            tail.to_string()
+        }),
+        KAISH_TIMEOUT_EXIT => KaishHookOutcome::Escalate(format!(
+            "kaish hook body timed out ({fallback}){}{}",
+            if tail.is_empty() { "" } else { ": " },
+            tail
+        )),
+        other => KaishHookOutcome::Deny(format!("kaish hook exit {other}: {tail}")),
+    }
+}
+
 /// What running the `shell_write` hook phases against a direct kaish exec
 /// decided (`Broker::shell_pre_call_hooks` / `shell_post_call_hooks`,
 /// `docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
@@ -2063,24 +2090,9 @@ impl Broker {
         let opts = kaish_kernel::ExecuteOptions::new()
             .with_vars(vars)
             .with_timeout(kaish.timeouts().hook_body_timeout);
+        let fallback = format!("{}.{}", params.instance, params.tool);
         match kaish.execute_with_options(body, opts).await {
-            Ok(exec) if exec.code == 0 => KaishHookOutcome::Continue,
-            Ok(exec) if exec.code == 3 => {
-                let stderr_tail: String = exec.err.chars().take(512).collect();
-                KaishHookOutcome::Escalate(if stderr_tail.trim().is_empty() {
-                    format!("{}.{}", params.instance, params.tool)
-                } else {
-                    stderr_tail.trim().to_string()
-                })
-            }
-            Ok(exec) => {
-                let stderr_tail: String = exec.err.chars().take(512).collect();
-                KaishHookOutcome::Deny(format!(
-                    "kaish hook exit {}: {}",
-                    exec.code,
-                    stderr_tail.trim()
-                ))
-            }
+            Ok(exec) => classify_kaish_hook_exit(exec.code, &exec.err, &fallback),
             Err(e) => {
                 tracing::warn!(
                     target: "kaijutsu::hooks",
@@ -2088,8 +2100,8 @@ impl Broker {
                     tool = %params.tool,
                     context_id = %ctx.context_id,
                     error = %e,
-                    "kaish hook body faulted (exec error/timeout); escalating to an ask \
-                     rather than denying — a runtime fault is not a verdict",
+                    "kaish hook body faulted; escalating to an ask rather than denying — \
+                     a runtime fault is not a verdict",
                 );
                 KaishHookOutcome::Escalate(format!("kaish hook exec error: {e}"))
             }
@@ -6392,6 +6404,28 @@ mod tests {
             matches!(err, McpError::GateUnavailable { .. }),
             "expected GateUnavailable (a fault, not a verdict), got {err:?}"
         );
+    }
+
+    /// The exit classifier: 0 continues, 3 escalates, 124 (kaish's timeout)
+    /// escalates rather than denying, anything else denies.
+    #[test]
+    fn kaish_hook_exit_classification() {
+        use super::{classify_kaish_hook_exit, KaishHookOutcome};
+        assert!(matches!(classify_kaish_hook_exit(0, "", "i.t"), KaishHookOutcome::Continue));
+        assert!(matches!(
+            classify_kaish_hook_exit(3, "why", "i.t"),
+            KaishHookOutcome::Escalate(d) if d == "why"
+        ));
+        assert!(matches!(
+            classify_kaish_hook_exit(3, "  ", "i.t"),
+            KaishHookOutcome::Escalate(d) if d == "i.t"
+        ));
+        assert!(matches!(
+            classify_kaish_hook_exit(124, "", "i.t"),
+            KaishHookOutcome::Escalate(_)
+        ));
+        assert!(matches!(classify_kaish_hook_exit(1, "no", "i.t"), KaishHookOutcome::Deny(_)));
+        assert!(matches!(classify_kaish_hook_exit(2, "", "i.t"), KaishHookOutcome::Deny(_)));
     }
 
     /// `KJ_TOOL_PLAN` (`docs/gate-and-shell-split.md`): a shell hook body
