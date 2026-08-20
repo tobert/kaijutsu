@@ -2050,3 +2050,69 @@ no longer occur is deleted, not wrapped; a second mechanism for one question
 — config ownership answered by a path prefix *and* a mount table — is the
 kind of thing that reverts a human's edit when the two disagree, and one of
 them goes.
+
+## The scripts that shipped and never arrived (August 20, afternoon)
+
+The morning's hook work ended with a guard against `sh -c` and a risk scorer
+wired to every shell call. Both were written, tested, reviewed, committed, and
+deployed. Neither had ever run.
+
+The kernel owns `/etc/rc`, and it seeds that tree from the binary's embedded
+defaults only when the tree is entirely empty. That rule is deliberate and
+worth keeping: a script you deleted stays deleted, and a repo-dropped seed does
+not resurrect behind your back. What nobody had noticed is its other half — a
+script *added* to the embedded set after a kernel was first seeded never lands
+either, and no surface said so. `kj rc list` walks the live tree and marks each
+entry against its seed, so a path with nothing at it has no entry to walk. The
+absence was not reported as an absence. It was reported as nothing at all.
+
+Three scripts had been sitting in that gap, one of them for days. The way it
+surfaced is worth keeping: a handoff note claimed the seeding was per-path and
+ran at every boot, and it named the file and line. Reading that line said
+otherwise, in a comment that had been describing the real behavior the whole
+time. The note was written from what the change was supposed to do; the code
+said what it did.
+
+The fix was not to seed harder. Seeding harder resurrects deleted scripts, and
+the once-only rule exists to prevent exactly that. The fix was to make the
+discrepancy visible: an anti-join between the embedded set and the live tree,
+and a fourth status that says a seed exists here and nothing is installed. The
+choice of a status over a repair verb was Amy's, and the reasoning generalizes
+— a verb only helps someone who already suspects there is something to run it
+for, while a status announces itself to anyone who looks. It proved itself
+within the hour: the next change moved a script between directories, and the
+listing named the three paths that had not landed before anyone had to wonder.
+
+The same afternoon turned up its sibling defect. A symlink whose target had
+been removed still reported in-sync, because the comparison matched target
+*strings* and never asked whether the target was there — while the lifecycle
+loader treats an unreadable script as fatal. A green marker sitting on top of a
+hard failure. Resolving the link before comparing anything fixed it, and the
+status it now reports is its own word rather than "differs", because the two
+want opposite repairs: resetting a dangling link rebuilds the link and leaves
+the target missing.
+
+Then the scorer, which had been reported as recording nothing. It was recording
+nothing, and it was not broken. It armed itself only in the seat whose rc
+exported its mode, and every other seat fell through a `case` to a silent exit.
+Unarmed and broken looked identical from outside, which is the actual defect in
+that shape. Once armed the whole path lit up on the first try. The classifier
+had looked inert for the same reason the hook had: everything sampled while
+diagnosing was benign, so every verdict came back the least severe label. On
+adversarial input it separates them correctly. Twice in one afternoon, a thing
+that appeared dead was merely never asked a question it could answer.
+
+The last piece was unwinding a temp-file detour that existed to dodge a parser
+rule stated too broadly — a heredoc round-tripped through `mktemp` because a
+lane had generalized "double quotes at both levels fail" into "any quote
+fails". Probing the constructs against the live shell before writing them paid
+for itself immediately: the obvious validation guard, `test -z "$x" -o "$x" =
+"null"`, silently returns false instead of or-ing. Writing it would have
+reproduced the exact failure mode the change was there to remove — a check that
+never fires, at exit zero.
+
+What ties the afternoon together is that every one of these was silent. Not one
+produced an error, a warning, or a wrong answer anyone could see. The recurring
+work was not fixing behavior but building the surface that would have said
+something was wrong, and the recurring lesson is that a system which cannot
+report an absence will keep the absence.
