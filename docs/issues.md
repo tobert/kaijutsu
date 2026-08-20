@@ -6,6 +6,109 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Tech-debt audits, 2026-08-20: verified bugs first, then the debt (lead-verified)
+
+Three read-only audits of the code that churned most over 08-18/19 — the
+editor + file-I/O path (Opus lane), the ANSI ingest + provenance + conversation
+surface (Opus lane), and the kaish glue in `kaijutsu-kernel` (kaibo, GLM-5.2).
+Full reports with the "verified NOT debt" lists live in `docs/audits/`; **read
+the not-debt list before re-auditing any of these areas.** Every item below
+was re-read by the lead against `7f3ab694`; "needs ruling" means the code does
+what a comment says it should and the question is whether the rule is right.
+
+### Editor + file I/O — four bugs, two are data-loss class
+
+- **P1 — an evicted buffer makes `:w` report success and write nothing.**
+  `mark_dirty` (`file_tools/cache.rs:644-663`) returns `Ok(())` with no
+  `dirty_file_buffers` row when the path is not cached; `flush_one`
+  (`cache.rs:769`) has `None => Ok(())`; `evict_if_needed` (`cache.rs:977`)
+  drops clean entries past the cap, and every MCP `read` / kaish `cat` inserts
+  one; editor sessions hold no cache pin. Checkpoint advances, buffer reads
+  clean, and the next load reconciles the block against disk — unsaved vi work
+  lost under an open session. Fix shape: an uncached path in `mark_dirty` /
+  `flush_one` is an error, and an editor session pins (or re-loads) its entry.
+- **P1 — nothing calls `acknowledge_swap`** (`cache.rs:880`, zero non-test
+  callers). Rule 4's refusal is permanent on a recovered path, and the status
+  line mislabels it E212 and leaks a method name. Needs the acknowledgment
+  surface (`kj` verb or `:w!`-class override) the swap design assumed.
+- **`:w` on `/etc/client/*` or `/etc/midi/*` reverts the edit.**
+  `config_owned()` (`editor.rs:64`) is rc ∥ config, but `rpc.rs:1636/1654/
+  1688/1710` mount four `ConfigDocFs` trees, all `owns_config_docs() == true`.
+  `resolve_editor_target` follows the mount table; `file_backed_path`
+  (`editor.rs:701`) follows the narrow predicate, so the kernel flushes a
+  file-cache shadow over a config-owned block. One `cat` mints the shadow.
+  Fix: one ownership question answered by the mount table, predicate deleted.
+- **A write onto a recovered swap clobbers it, then refuses.**
+  `create_or_replace` (`cache.rs:555`) has no `swap_recovered` check; only
+  `flush_one`/`flush_dirty` clear the row, so `/v/swap` keeps advertising a
+  swap whose content is gone.
+
+Top debt: a second, unhardened `PatchOp` implementation in
+`mount_backend.rs:423-546` that panics on a mid-char byte offset — unreachable
+from kaish 0.15 (patch/sed send whole-file `Replace`), reachable the day 0.15.1's
+`edit` sends real offsets; `flush_dirty` (`cache.rs:667`) has no callers and no
+rule-4 guard; `get_or_load`/`read_content` are "legacy, prefer `try_*`" with
+eight production callers; `cache.rs:929` keeps the `Err(_)` catch-all slice 1
+removed from its sibling; `kaijutsu-editor/src/lib.rs:72-77` still says `:w!`
+is a no-op; `kernel.rs:2737` asserts on an `E212` prefix that two `FlushError`
+variants share; `dirty_file_buffers.context_id` is written and never read.
+
+### ANSI ingest + provenance + surface — one bug, one ruling, a prose cleanup
+
+- **`background_exec.rs:826` re-derives the ingest predicate and disagrees.**
+  It checks only for ESC; `ansi_ingest::project` (`ansi_ingest.rs:74-83`) also
+  treats "escape bytes present but projection byte-identical" as a no-op. A
+  background process emitting a stray `\x1b` gets a tag, a provenance row and
+  a `SpansChanged` event `project` exists to suppress — the drift
+  `ansi_ingest.rs:15-17` predicted, in the same commit. S.
+- **Needs ruling: the `provenance` tag survives an edit.** `blocks/content.rs:
+  384-393` clears spans and keeps the tag on purpose; `types/block.rs:1661`
+  documents the tag as "content *is* a projection", `:1425` says the weaker
+  true thing. An edited tagged block is indistinguishable from an unedited one,
+  so the stated invariant is not mechanically checkable, and `kj block
+  reproject` on a capped background block always fails with the wrong cause
+  ("edited since ingest"; by design `content == strip(original) + marker`).
+- **Prose that describes deleted code:** 59 present-tense citations of symbols
+  deleted in `1fb5ff25` across 16 crate files and 6 docs, four pointing a
+  `file:line` at unrelated live code (`shape_cache.rs:600` →
+  `block_render.rs:660-668`); `content.rs:14-17` and `shape_cache.rs:31`
+  contradict each other about a 200-char debounce that no longer exists; nine
+  mentions of a "CI invariant" and there is no `.github/` — the three unit tests
+  that hold the property are what should be named; `docs/ansi-and-beyond.md:
+  105-109` asserts atomic commit and `:124-129` denies it.
+- Smaller: `--transform` on `reproject` has one legal value (`kj/block.rs:1043`)
+  — delete the knob; six copies of `(x.clamp(0,1)*255.0) as u8` while
+  `layout_bridge.rs:219` claims to be the one place; `text/rich.rs:512`
+  `detect_rich_content` has no callers; `background_exec.rs:932-937` puts the
+  literal `DEFAULT_OUTPUT_CAP` into a block the model reads instead of the
+  number (262144).
+- Tests: `AnsiDrain::finish`'s span-truncation branch has zero coverage (the
+  branch that guarantees `content == strip(original) + marker` for a capped
+  block — highest-value missing test); `shape_visible_blocks` (330 lines) has
+  none; the `strip_totality` fuzz target asserts `start <= end` where the crate
+  requires `<`, permitting the bug it should find; `styled_spans_fingerprint`
+  should destructure exhaustively so a new field is a compile error.
+
+### Kaish glue — no bugs; two real reductions and one bug class
+
+- **Two `apply_context_config` implementations.** `EmbeddedKaish`'s
+  (`runtime/embedded_kaish.rs:600-628`) runs one `export` script per env var
+  with hand-escaping and `warn!`s failures away — a silent fallback;
+  `KjBuiltin`'s (`runtime/kj_builtin.rs:113-149`) uses `scope.set_exported`.
+  Collapse onto the scope API; failure bubbles. M.
+- **`KaijutsuBackend`'s file half is a dead editing surface.** kaish's backend
+  is `MountBackend` (`embedded_kaish.rs:425`); `KaijutsuBackend` is reachable
+  only via `/v/docs` (`docs_filesystem.rs`), which only ever overwrites. ~250
+  lines of write/append/patch/range helpers (`kaish_backend.rs:782-1030`) are
+  unreachable; the tool-dispatch half stays. M.
+- **The `kj` builtin flattens kaish's typed `ToolArgs` back to argv for clap to
+  re-parse** (`kj_builtin.rs:487-594`) — the `--include` bug class. Let
+  `KjDispatcher::dispatch` take the parsed form. M.
+- S: stale 0.9–0.14 kaish comments; `OutputProfile::Internal` becomes deletable
+  when kaish ships a no-exit-remap spill knob.
+
+---
+
 ## File buffers: slices 4-5 remain (2026-08-19)
 
 Slices 1, 2 and 3 of `docs/file-buffers.md` shipped (`11c21b69`, `38f77ae2`,
@@ -368,7 +471,6 @@ up in real prose. Add to it when you hit one.
 
 ---
 
-## The conversation surface draws no block border labels or gutter checkbox (2026-08-18)
 ## Two features silently lost when the legacy conversation path was deleted (2026-08-18, found during slice 5)
 
 Slice 5 (decapitation, `docs/conversation-surface.md`) deleted the legacy
@@ -7266,32 +7368,6 @@ viewport-sized layer and composite with a post shader — slots into the
 existing pass order, never per-block, so the tall-block trap stays dead.
 This is the intended route for restoring rainbow + the deferred
 chase-brightening/halo entries above.
-
-## ANSI ingest + styled spans: design settled, build unstarted (2026-08-19)
-
-Design lives in `docs/ansi-and-beyond.md` (living doc, checked in) — strip
-ANSI at ingestion via `vte`, block content is the clean text, semantic
-`style_spans` + a tiny `provenance` tag ride the block, original bytes go to
-a kernel-side `block_provenance` sqlite table (map-shaped: one row per
-block × transform). Round-trip comes from the stored copy, never the span
-map. Policy in rc (which flows get which transforms), mechanism in the
-kernel (versioned `ansi-strip@N`), plus a kaish verb for ad-hoc pipelines.
-Build lanes, roughly in order:
-
-1. Parser crate lane: vte + SGR mapping + span assembly, with the test
-   ladder (fuzz totality, chunk-boundary ≡ one-shot, projection properties,
-   real-world goldens, differential vs termwiz/vt100).
-2. Kernel lane: `block_provenance` table, ingest hook at kaish output
-   capture (same-transaction commit), `style_spans`/`provenance` fields on
-   BlockSnapshot (`#[serde(default)]`), `kj block original|reproject`.
-3. App lane: spans → glyph instance styling; then the style-table
-   indirection (semantic ANSI index resolved through a GPU palette — retheme
-   = buffer write) which is the same slot the rainbow/effects revival uses
-   (see "the instance buffer IS the map" above).
-
-Renders SGR only; cursor/screen codes are preserved in provenance, never
-rendered (kills hidden-text-by-overwrite by construction). Standing safety
-invariants and the `\r`-progress-bar open question are in the doc.
 
 ## ANSI rendering, pass 1: four corners left open (2026-08-19)
 
