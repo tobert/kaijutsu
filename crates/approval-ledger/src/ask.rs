@@ -12,6 +12,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use rusqlite::Transaction;
 
 use crate::error::{LedgerError, Result};
+use crate::events;
+use crate::time::now_millis;
 use crate::types::{
     ApprovalRow, AskStatementRow, EventKind, EventRow, NewAsk, NewPlanStatement, NewPlannedValue,
     Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow, PlannedValueRow,
@@ -32,7 +34,69 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
     // IMMEDIATE`): nothing else can reference `request_id` before this
     // function hands it back, so there is no race to lose.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    insert_ask(&tx, &request_id, req)?;
+    tx.commit()?;
+    Ok(request_id)
+}
 
+/// Create an ask that is decided `Allowed` in the SAME transaction as its
+/// creation — the log-only path for an advisory classifier (Amy's ruling:
+/// *"log-only = an auto-approved ask with the classifier signal attached;
+/// `approval_signals.request_id` stays NOT NULL"* — never a nullable
+/// half-row). `req.signals` (typically one `NewSignal` with
+/// `source_kind: Classifier`) is what attaches the classifier's read;
+/// this function only decides who gets credit for the ALLOW.
+///
+/// `auto_reason` names the source that auto-allowed this ask (e.g.
+/// `"lfm2d:kube_ordinal_v8 (log-only)"`) and lands on both the `approvals`
+/// row's `auto_reason` column and the `approval_events` "decided" row's
+/// `auto_reason` — an audit read can tell "a human said yes"
+/// (`decided_by` set, `auto_reason` NULL) from "a classifier auto-allowed
+/// this in log-only mode" (`decided_by` NULL, `auto_reason` set) without
+/// ever inspecting `approval_signals`. `decided_option` is the fixed
+/// literal `"auto_allow"` — there is no human-offered option list to pick
+/// from (`req.options` is typically empty for this path; nothing here
+/// requires it to be).
+///
+/// Deliberately NOT a thin wrapper calling [`create_ask`] then
+/// [`crate::decide::decide`]: SQLite has no nested transactions, so the
+/// "same transaction" guarantee this function exists to provide can only
+/// be had by inlining the insert and the decide-update under one
+/// `Transaction`, not by composing two functions that each open their own.
+pub fn create_auto_allowed_ask(conn: &Connection, req: &NewAsk, auto_reason: &str) -> Result<String> {
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    insert_ask(&tx, &request_id, req)?;
+
+    let now = now_millis();
+    let decided_option = "auto_allow";
+    let updated = tx.execute(
+        "UPDATE approvals SET status = 'allowed', decided_at = ?1, decided_option = ?2, auto_reason = ?3
+         WHERE request_id = ?4 AND status = 'pending'",
+        params![now, decided_option, auto_reason, request_id],
+    )?;
+    debug_assert_eq!(updated, 1, "the row this function just inserted must still be pending");
+
+    events::append(
+        &tx,
+        &request_id,
+        EventKind::Decided,
+        None,
+        Some(decided_option),
+        None,
+        Some(auto_reason),
+        None,
+    )?;
+
+    tx.commit()?;
+    Ok(request_id)
+}
+
+/// Shared insert body for [`create_ask`] and [`create_auto_allowed_ask`]:
+/// the `approvals` row plus its statements/options/signals. Leaves the row
+/// `pending` — callers decide whether (and how) to transition it further,
+/// inside the same transaction `tx` already holds open.
+fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
     tx.execute(
         "INSERT INTO approvals (
             request_id, context_id, principal_id, origin, instance, tool, hook_id,
@@ -54,7 +118,7 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
     )?;
 
     for (stmt_seq, stmt) in req.statements.iter().enumerate() {
-        insert_statement_if_new(&tx, stmt)?;
+        insert_statement_if_new(tx, stmt)?;
         tx.execute(
             "INSERT INTO approval_ask_statements (request_id, stmt_seq, statement_digest)
              VALUES (?1, ?2, ?3)",
@@ -92,8 +156,7 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
         )?;
     }
 
-    tx.commit()?;
-    Ok(request_id)
+    Ok(())
 }
 
 /// Insert `stmt`'s tree, but only if `stmt.statement_digest` isn't already
@@ -390,6 +453,58 @@ pub fn list_options(conn: &Connection, request_id: &str) -> Result<Vec<OptionRow
     Ok(rows)
 }
 
+/// Attach one advisory signal to an ask that already exists — the
+/// non-auto-allow half of `kj ledger signal add`: a hook body that already
+/// created the ask via [`create_auto_allowed_ask`]'s winner call attaches
+/// every OTHER scored clause this way, via `--request-id`. Fails with
+/// [`LedgerError::NotFound`] rather than silently inserting an orphan row —
+/// `approval_signals.request_id` is a real `REFERENCES approvals` foreign
+/// key (`schema.rs`), and this is the same check made loud at the Rust
+/// layer instead of only at the SQLite one. Not gated on the ask's own
+/// status: a signal is an annotation, attachable to a still-pending, a
+/// claimed, or an already-decided ask alike — it never changes what the
+/// ask decided (see the crate root docs: a classifier's `verdict` is
+/// advisory forever, never read by [`crate::rules::redeem`]).
+pub fn add_signal(conn: &Connection, request_id: &str, sig: &crate::types::NewSignal) -> Result<SignalRow> {
+    if get_approval(conn, request_id)?.is_none() {
+        return Err(LedgerError::NotFound(request_id.to_string()));
+    }
+    let seq: i64 = conn.query_row(
+        "INSERT INTO approval_signals (
+            request_id, seq, source_kind, source_id, model_id, weight_hash,
+            stmt_seq, cmd_seq, label, score, verdict
+         ) VALUES (
+            ?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM approval_signals WHERE request_id = ?1),
+            ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+         ) RETURNING seq",
+        params![
+            request_id,
+            sig.source_kind.as_str(),
+            sig.source_id,
+            sig.model_id,
+            sig.weight_hash,
+            sig.stmt_seq,
+            sig.cmd_seq,
+            sig.label,
+            sig.score,
+            sig.verdict.as_str(),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(SignalRow {
+        seq,
+        source_kind: sig.source_kind,
+        source_id: sig.source_id.clone(),
+        model_id: sig.model_id.clone(),
+        weight_hash: sig.weight_hash.clone(),
+        stmt_seq: sig.stmt_seq,
+        cmd_seq: sig.cmd_seq,
+        label: sig.label.clone(),
+        score: sig.score,
+        verdict: sig.verdict,
+    })
+}
+
 /// The advisory signals attached to this ask, in insertion order.
 pub fn list_signals(conn: &Connection, request_id: &str) -> Result<Vec<SignalRow>> {
     let mut stmt = conn.prepare(
@@ -611,9 +726,160 @@ fn load_vars(conn: &Connection, statement_digest: &str) -> Result<(Vec<String>, 
 #[cfg(test)]
 mod tests {
     use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
-    use crate::types::{ApprovalStatus, NewPlanRedirect, NewPlannedValue, PlannedValueRow, VarBinding};
+    use crate::types::{
+        ApprovalStatus, NewPlanRedirect, NewPlannedValue, NewSignal, PlannedValueRow,
+        SignalSourceKind, SignalVerdict, VarBinding,
+    };
 
     use super::*;
+
+    // ── `create_auto_allowed_ask` (log-only classifier path) ─────────────
+
+    fn classifier_signal() -> NewSignal {
+        NewSignal {
+            source_kind: SignalSourceKind::Classifier,
+            source_id: Some("lfm2d".into()),
+            model_id: Some("kube_ordinal_v8".into()),
+            weight_hash: Some("abc123".into()),
+            stmt_seq: Some(0),
+            cmd_seq: None,
+            label: Some("situation-normal".into()),
+            score: Some(0.6),
+            verdict: SignalVerdict::Escalate,
+        }
+    }
+
+    #[test]
+    fn create_auto_allowed_ask_row_exists_and_is_allowed() {
+        let conn = open_memory();
+        let mut ask = minimal_ask();
+        ask.signals = vec![classifier_signal()];
+        let request_id = create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+
+        let row = get_approval(&conn, &request_id).unwrap().expect("row must exist");
+        assert_eq!(row.status, ApprovalStatus::Allowed);
+        assert!(row.status.is_allowed());
+        assert!(row.decided_by.is_none(), "no human decided this — decided_by must stay NULL");
+        assert_eq!(row.decided_option.as_deref(), Some("auto_allow"));
+        assert_eq!(row.auto_reason.as_deref(), Some("lfm2d:kube_ordinal_v8 (log-only)"));
+        assert!(row.decided_at.is_some());
+    }
+
+    #[test]
+    fn create_auto_allowed_ask_list_signals_returns_the_signal() {
+        let conn = open_memory();
+        let mut ask = minimal_ask();
+        ask.signals = vec![classifier_signal()];
+        let request_id = create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+
+        let signals = list_signals(&conn, &request_id).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].source_kind, SignalSourceKind::Classifier);
+        assert_eq!(signals[0].source_id.as_deref(), Some("lfm2d"));
+        assert_eq!(signals[0].model_id.as_deref(), Some("kube_ordinal_v8"));
+        assert_eq!(signals[0].weight_hash.as_deref(), Some("abc123"));
+        assert_eq!(signals[0].label.as_deref(), Some("situation-normal"));
+        assert_eq!(signals[0].verdict, SignalVerdict::Escalate);
+    }
+
+    /// The event row is what an audit read uses to tell "a human said yes"
+    /// from "a classifier auto-allowed this in log-only mode" — `actor`
+    /// stays NULL (nobody's `PrincipalId` decided this) and `auto_reason`
+    /// names the classifier source, on the SAME `Decided` event a human
+    /// answer would also produce (never a distinct event kind — this is a
+    /// decision, made differently, not a different KIND of thing).
+    #[test]
+    fn create_auto_allowed_ask_event_names_the_classifier() {
+        let conn = open_memory();
+        let mut ask = minimal_ask();
+        ask.signals = vec![classifier_signal()];
+        let request_id = create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+
+        let events = list_events(&conn, &request_id).unwrap();
+        assert_eq!(events.len(), 1, "creation and decision are ONE event, not two: {events:?}");
+        assert_eq!(events[0].kind, EventKind::Decided);
+        assert!(events[0].actor.is_none(), "no human actor decided this");
+        assert_eq!(events[0].auto_reason.as_deref(), Some("lfm2d:kube_ordinal_v8 (log-only)"));
+        assert_eq!(events[0].decided_option.as_deref(), Some("auto_allow"));
+    }
+
+    /// `approval_signals.request_id` stays `NOT NULL` (Amy's ruling) — this
+    /// is provable at the schema level, not just by this crate's own API
+    /// never emitting a NULL: a raw INSERT bypassing this crate entirely
+    /// must also fail. This pins the schema decision this whole function
+    /// exists to serve, not just this function's own behavior.
+    #[test]
+    fn approval_signals_request_id_column_is_not_null() {
+        let conn = open_memory();
+        let err = conn
+            .execute(
+                "INSERT INTO approval_signals (request_id, seq, source_kind, verdict)
+                 VALUES (NULL, 0, 'classifier', 'escalate')",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("NOT NULL"), "expected a NOT NULL violation, got: {err}");
+    }
+
+    // ── `add_signal` (attach to an existing ask) ──────────────────────────
+
+    #[test]
+    fn add_signal_attaches_to_an_existing_ask() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let row = add_signal(&conn, &request_id, &classifier_signal()).unwrap();
+        assert_eq!(row.seq, 0);
+        assert_eq!(row.label.as_deref(), Some("situation-normal"));
+
+        let signals = list_signals(&conn, &request_id).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].seq, 0);
+    }
+
+    /// Two attaches to the SAME ask get distinct, increasing `seq` — this
+    /// is how the hook body logs every scored clause as its own signal on
+    /// one ask, not just the winner's.
+    #[test]
+    fn add_signal_twice_gets_distinct_increasing_seq() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let first = add_signal(&conn, &request_id, &classifier_signal()).unwrap();
+        let mut second_sig = classifier_signal();
+        second_sig.label = Some("informative".into());
+        let second = add_signal(&conn, &request_id, &second_sig).unwrap();
+
+        assert_eq!(first.seq, 0);
+        assert_eq!(second.seq, 1);
+        let signals = list_signals(&conn, &request_id).unwrap();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].label.as_deref(), Some("situation-normal"));
+        assert_eq!(signals[1].label.as_deref(), Some("informative"));
+    }
+
+    #[test]
+    fn add_signal_to_an_unknown_ask_is_not_found() {
+        let conn = open_memory();
+        let err = add_signal(&conn, "does-not-exist", &classifier_signal()).unwrap_err();
+        assert!(matches!(err, LedgerError::NotFound(id) if id == "does-not-exist"));
+    }
+
+    /// A signal is an annotation, not a gate participant — attachable even
+    /// after the ask is already decided, and attaching one must never
+    /// change the decided status.
+    #[test]
+    fn add_signal_to_an_already_decided_ask_does_not_change_its_status() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        crate::decide::decide(&conn, &request_id, crate::decide::DecideInput { allow: true, ..Default::default() })
+            .unwrap();
+
+        add_signal(&conn, &request_id, &classifier_signal()).unwrap();
+
+        let row = get_approval(&conn, &request_id).unwrap().unwrap();
+        assert_eq!(row.status, ApprovalStatus::Allowed);
+    }
 
     #[test]
     fn create_ask_round_trips_through_get_approval() {

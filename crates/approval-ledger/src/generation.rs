@@ -195,6 +195,37 @@ mod tests {
         assert_eq!(current(&conn).unwrap(), before + 1, "approval_rules DELETE must bump exactly once");
     }
 
+    /// `ask::add_signal` (a hook body attaching a second scored clause onto
+    /// an ask its `--auto-allow` call already created) is a standalone
+    /// write — the row `approval_signals.request_id` points at already
+    /// exists, so this is the ONLY trigger that fires, unconfounded by the
+    /// approvals-insert trigger the way a signal inserted alongside its own
+    /// ask's creation would be.
+    #[test]
+    fn inserting_a_standalone_signal_bumps_the_generation() {
+        let conn = open_memory();
+        let request_id = crate::ask::create_ask(&conn, &minimal_ask()).unwrap();
+        let before = current(&conn).unwrap();
+
+        crate::ask::add_signal(
+            &conn,
+            &request_id,
+            &crate::types::NewSignal {
+                source_kind: crate::types::SignalSourceKind::Classifier,
+                source_id: Some("lfm2d".into()),
+                model_id: None,
+                weight_hash: None,
+                stmt_seq: None,
+                cmd_seq: None,
+                label: Some("informative".into()),
+                score: Some(0.9),
+                verdict: crate::types::SignalVerdict::Escalate,
+            },
+        )
+        .unwrap();
+        assert_eq!(current(&conn).unwrap(), before + 1, "a standalone approval_signals INSERT must bump exactly once");
+    }
+
     #[test]
     fn generation_survives_across_separate_migrate_calls_on_the_same_connection() {
         let conn = open_memory(); // already migrated once by the fixture

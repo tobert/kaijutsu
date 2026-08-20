@@ -36,7 +36,7 @@
 //! `kj ledger forget` is how that stops.
 
 use approval_ledger::error::LedgerError;
-use approval_ledger::types::{ApprovalStatus, Origin, RuleScope};
+use approval_ledger::types::{ApprovalStatus, NewAsk, NewSignal, Origin, RuleScope, SignalSourceKind, SignalVerdict};
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -138,6 +138,35 @@ impl StatusArg {
     }
 }
 
+/// `--verdict <verdict>` on `signal add` — a `ValueEnum` for the same
+/// typo-fails-loud reason as `OriginArg`/`StatusArg`. Values match
+/// `approval_signals.verdict`'s own `CHECK`-constrained strings exactly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum SignalVerdictArg {
+    /// The signal recommends raising a prompt that would not otherwise
+    /// fire, or leaving an already-firing one alone. Never auto-decides.
+    Escalate,
+    /// The signal recommends denial. Advisory only — see the module doc:
+    /// nothing in `approval_ledger` reads a signal to auto-decide an ask.
+    Deny,
+    /// The signal recommends allowing. Advisory only, same as `deny` —
+    /// this can never become an auto-allow by itself (`rules::redeem`
+    /// composes coverage from `approval_rules` alone, never from
+    /// `approval_signals`).
+    Allow,
+}
+
+impl SignalVerdictArg {
+    fn to_ledger(self) -> SignalVerdict {
+        match self {
+            Self::Escalate => SignalVerdict::Escalate,
+            Self::Deny => SignalVerdict::Deny,
+            Self::Allow => SignalVerdict::Allow,
+        }
+    }
+}
+
 /// `--verb <verb>` on `runs` — validated against
 /// [`super::lifecycle::RC_VERBS`] instead of its own duplicate `ValueEnum`.
 /// That list is already documented as "the single source of truth" for
@@ -211,6 +240,24 @@ fn truncation_notice(shown: usize, total: i64, extra_flags: &str) -> Option<Stri
     }
 }
 
+/// One `SignalRow` as `.data` JSON — shared by `--signals` on `list` and
+/// `show`, so the two commands never drift on what a signal looks like on
+/// the wire.
+fn signal_row_json(s: &approval_ledger::types::SignalRow) -> serde_json::Value {
+    serde_json::json!({
+        "seq": s.seq,
+        "source_kind": s.source_kind.to_string(),
+        "source_id": s.source_id,
+        "model_id": s.model_id,
+        "weight_hash": s.weight_hash,
+        "stmt_seq": s.stmt_seq,
+        "cmd_seq": s.cmd_seq,
+        "label": s.label,
+        "score": s.score,
+        "verdict": s.verdict.to_string(),
+    })
+}
+
 #[derive(Subcommand, Debug)]
 enum LedgerCommand {
     /// List asks. By default, shows the live pending queue, oldest first
@@ -242,12 +289,23 @@ enum LedgerCommand {
         /// `claimed` shows the in-flight queue the default hides.
         #[arg(long)]
         status: Option<StatusArg>,
+        /// Add a SIGNALS column (the advisory-signal count) to the table,
+        /// and switch `.data` from a flat array of request-id strings to
+        /// an array of `{request_id, signals}` objects. Off by default —
+        /// most listings don't want per-row detail.
+        #[arg(long)]
+        signals: bool,
     },
     /// Show one ask in full, including the statement being authorized.
     /// Works for a decided ask as well as a pending one.
     Show {
         /// The ask to show. Request ids come from `kj ledger list`.
         request_id: String,
+        /// Also show every advisory signal attached to this ask (a rule
+        /// that almost matched, a classifier's read) — informational only,
+        /// never itself a gate. Off by default.
+        #[arg(long)]
+        signals: bool,
     },
     /// Allow one ask (claims it first; exactly one answerer wins).
     Allow {
@@ -314,6 +372,69 @@ enum LedgerCommand {
         #[arg(long, value_parser = parse_verb_arg)]
         verb: Option<String>,
     },
+    /// Advisory signals — a rule that almost matched, a classifier's risk
+    /// read — attached to an ask but never themselves a gate.
+    Signal {
+        #[command(subcommand)]
+        command: SignalCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SignalCommand {
+    /// Add one advisory signal from a scorer (a hook body calls this after
+    /// scoring a command). With `--auto-allow`, creates a new ask that is
+    /// decided `allowed` in the same transaction — the log-only path: the
+    /// ask is recorded and never blocks on a human. With `--request-id <id>`,
+    /// attaches the signal to an existing ask (a second scored command from
+    /// the same statement lands on the ask the first one created). Exactly
+    /// one of the two is required. A signal is advisory: nothing reads it to
+    /// decide an ask.
+    Add {
+        /// The statement text this signal is about. Becomes the new ask's
+        /// description under `--auto-allow`; under `--request-id` it is
+        /// informational only (the row it attaches to already has its own
+        /// description). Unquoted kaish variable expansion carries embedded
+        /// spaces as one argument (kaish does no word splitting), so a
+        /// caller with arbitrarily long or `"`-laden text needs nothing
+        /// beyond passing `$var` here — there is no `--stdin` on this verb.
+        statement: String,
+        /// Who produced this signal, e.g. `lfm2d`.
+        #[arg(long = "source-id")]
+        source_id: Option<String>,
+        /// Which model scored it, e.g. `kube_ordinal_v8` — read from the
+        /// scorer's own response at call time, never hard-coded by a
+        /// caller (label/model vocabularies change between checkpoints).
+        #[arg(long = "model-id")]
+        model_id: Option<String>,
+        /// The scoring checkpoint's weight hash — the audit pairing a
+        /// verdict to the exact weights that produced it.
+        #[arg(long = "weight-hash")]
+        weight_hash: Option<String>,
+        /// The winning label, read from the scorer's response (e.g.
+        /// `situation-normal`) — never a value this verb invents.
+        #[arg(long)]
+        label: Option<String>,
+        /// The winning label's score, as the scorer reported it. Not
+        /// thresholded here or anywhere in this crate — see `--verdict`.
+        #[arg(long)]
+        score: Option<f64>,
+        /// The signal's own recommendation: `escalate` (raise or leave a
+        /// prompt), `deny`, or `allow`. Always advisory — see the module
+        /// doc: nothing in `approval_ledger` ever reads a signal to
+        /// auto-decide an ask, `allow` included.
+        #[arg(long, value_enum)]
+        verdict: SignalVerdictArg,
+        /// Create a NEW ask, already decided `Allowed`, carrying this
+        /// signal — the log-only classifier path. Mutually exclusive with
+        /// `--request-id`.
+        #[arg(long = "auto-allow")]
+        auto_allow: bool,
+        /// Attach this signal to an ask that already exists, instead of
+        /// creating one. Required unless `--auto-allow` is given.
+        #[arg(long = "request-id")]
+        request_id: Option<String>,
+    },
 }
 
 impl KjDispatcher {
@@ -335,10 +456,10 @@ impl KjDispatcher {
             }
         };
         match parsed.command {
-            LedgerCommand::List { history, limit, since, origin, status } => {
-                self.ledger_list(history, limit, since.as_deref(), origin, status)
+            LedgerCommand::List { history, limit, since, origin, status, signals } => {
+                self.ledger_list(history, limit, since.as_deref(), origin, status, signals)
             }
-            LedgerCommand::Show { request_id } => self.ledger_show(&request_id),
+            LedgerCommand::Show { request_id, signals } => self.ledger_show(&request_id, signals),
             LedgerCommand::Allow { request_id, remember } => {
                 self.ledger_decide(&request_id, true, caller, remember)
             }
@@ -350,6 +471,30 @@ impl KjDispatcher {
             LedgerCommand::Runs { run_id, limit, since, context, verb } => match run_id {
                 Some(id) => self.ledger_run_show(&id),
                 None => self.ledger_runs_list(caller, limit, since.as_deref(), context.as_deref(), verb.as_deref()),
+            },
+            LedgerCommand::Signal { command } => match command {
+                SignalCommand::Add {
+                    statement,
+                    source_id,
+                    model_id,
+                    weight_hash,
+                    label,
+                    score,
+                    verdict,
+                    auto_allow,
+                    request_id,
+                } => self.ledger_signal_add(
+                    caller,
+                    &statement,
+                    source_id,
+                    model_id,
+                    weight_hash,
+                    label,
+                    score,
+                    verdict,
+                    auto_allow,
+                    request_id.as_deref(),
+                ),
             },
         }
     }
@@ -373,6 +518,7 @@ impl KjDispatcher {
         since: Option<&str>,
         origin: Option<OriginArg>,
         status: Option<StatusArg>,
+        show_signals: bool,
     ) -> KjResult {
         let since_ms = match since {
             Some(s) => match parse_since_duration_ms(s) {
@@ -415,11 +561,46 @@ impl KjDispatcher {
             }
         };
 
-        let data = serde_json::Value::Array(
-            rows.iter()
-                .map(|r| serde_json::json!(r.request_id.clone()))
-                .collect(),
-        );
+        // `--signals` fetches every listed row's advisory signals — one
+        // query per row, acceptable at `--limit`'s default (20) and never
+        // unbounded (the same cap that bounds the listing itself). Off by
+        // default: most listings don't want per-row detail, and `.data`'s
+        // shape stays the plain array-of-ids convention every other kj
+        // list command uses unless a caller opts into more.
+        let signals_by_row: Vec<Vec<approval_ledger::types::SignalRow>> = if show_signals {
+            let db = self.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                match approval_ledger::ask::list_signals(conn, &r.request_id) {
+                    Ok(s) => out.push(s),
+                    Err(e) => return KjResult::Err(format!("kj ledger list: {e}")),
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
+        let data = if show_signals {
+            serde_json::Value::Array(
+                rows.iter()
+                    .zip(signals_by_row.iter())
+                    .map(|(r, sigs)| {
+                        serde_json::json!({
+                            "request_id": r.request_id.clone(),
+                            "signals": sigs.iter().map(signal_row_json).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::Array(
+                rows.iter()
+                    .map(|r| serde_json::json!(r.request_id.clone()))
+                    .collect(),
+            )
+        };
         if rows.is_empty() {
             let msg = if is_default_pending {
                 "(no pending approvals)"
@@ -430,18 +611,30 @@ impl KjDispatcher {
             };
             return KjResult::ok_with_data(msg.to_string(), data);
         }
-        let mut lines = vec![format!(
-            "  {:<38}  {:<8}  {:<9}  {}",
-            "REQUEST", "ORIGIN", "STATUS", "DESCRIPTION"
-        )];
-        for r in &rows {
-            lines.push(format!(
-                "  {:<38}  {:<8}  {:<9}  {}",
-                r.request_id,
-                r.origin,
-                r.status,
-                r.description,
-            ));
+        let mut lines = vec![if show_signals {
+            format!("  {:<38}  {:<8}  {:<9}  {:<7}  {}", "REQUEST", "ORIGIN", "STATUS", "SIGNALS", "DESCRIPTION")
+        } else {
+            format!("  {:<38}  {:<8}  {:<9}  {}", "REQUEST", "ORIGIN", "STATUS", "DESCRIPTION")
+        }];
+        for (i, r) in rows.iter().enumerate() {
+            if show_signals {
+                lines.push(format!(
+                    "  {:<38}  {:<8}  {:<9}  {:<7}  {}",
+                    r.request_id,
+                    r.origin,
+                    r.status,
+                    signals_by_row[i].len(),
+                    r.description,
+                ));
+            } else {
+                lines.push(format!(
+                    "  {:<38}  {:<8}  {:<9}  {}",
+                    r.request_id,
+                    r.origin,
+                    r.status,
+                    r.description,
+                ));
+            }
         }
         lines.push(String::new());
         if let Some(notice) = truncation_notice(rows.len(), total, "/--origin/--status") {
@@ -456,7 +649,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    fn ledger_show(&self, request_id: &str) -> KjResult {
+    fn ledger_show(&self, request_id: &str, show_signals: bool) -> KjResult {
         let db = self.kernel_db.lock();
         let conn = db.conn_for_ledger();
         let row = match approval_ledger::ask::get_approval(conn, request_id) {
@@ -469,6 +662,14 @@ impl KjDispatcher {
         let statements = match approval_ledger::ask::load_ask_statements(conn, request_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+        };
+        let signal_rows = if show_signals {
+            match approval_ledger::ask::list_signals(conn, request_id) {
+                Ok(s) => s,
+                Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+            }
+        } else {
+            Vec::new()
         };
 
         let mut lines = vec![
@@ -489,13 +690,28 @@ impl KjDispatcher {
         if let Some(decided) = &row.decided_option {
             lines.push(format!("decided:    {decided}"));
         }
+        if let Some(reason) = &row.auto_reason {
+            lines.push(format!("auto:       {reason}"));
+        }
+        if show_signals {
+            for s in &signal_rows {
+                lines.push(format!(
+                    "signal:     {} {} label={} score={} verdict={}",
+                    s.source_kind,
+                    s.source_id.as_deref().unwrap_or("-"),
+                    s.label.as_deref().unwrap_or("-"),
+                    s.score.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                    s.verdict,
+                ));
+            }
+        }
         // `context_id`, `instance`, `tool` and `hook_id` are here for a
         // client that has to ROUTE this ask, not just render it: an ACP
         // session, or the app, needs to know which context an ask belongs
         // to before it can decide whose screen to put it on. They were
         // missing while the only reader was a human at a shell, who
         // already knew.
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "request_id": row.request_id,
             "context_id": ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()),
             "status": row.status.to_string(),
@@ -507,6 +723,9 @@ impl KjDispatcher {
             "authorized_label": row.authorized_label,
             "statements": statements.iter().map(|s| s.statement.rendered.clone()).collect::<Vec<_>>(),
         });
+        if show_signals {
+            data["signals"] = serde_json::Value::Array(signal_rows.iter().map(signal_row_json).collect());
+        }
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
@@ -856,6 +1075,118 @@ impl KjDispatcher {
         });
         KjResult::ok_with_data(lines.join("\n"), data)
     }
+
+    /// `kj ledger signal add` — see [`SignalCommand::Add`] for the full
+    /// contract. `--auto-allow` and `--request-id` are validated mutually
+    /// exclusive-and-required here rather than via clap's `ArgGroup`: the
+    /// error needs to name BOTH the missing choice and why (log-only vs.
+    /// attach), which reads better as prose than as clap's generic
+    /// "one of these is required" message.
+    #[allow(clippy::too_many_arguments)]
+    fn ledger_signal_add(
+        &self,
+        caller: &KjCaller,
+        statement: &str,
+        source_id: Option<String>,
+        model_id: Option<String>,
+        weight_hash: Option<String>,
+        label: Option<String>,
+        score: Option<f64>,
+        verdict: SignalVerdictArg,
+        auto_allow: bool,
+        request_id: Option<&str>,
+    ) -> KjResult {
+        match (auto_allow, request_id) {
+            (true, Some(_)) => {
+                return KjResult::Err(
+                    "kj ledger signal add: --auto-allow and --request-id are mutually exclusive \
+                     — --auto-allow creates a new ask, --request-id attaches to an existing one"
+                        .to_string(),
+                );
+            }
+            (false, None) => {
+                return KjResult::Err(
+                    "kj ledger signal add: give --auto-allow (create a new log-only ask) or \
+                     --request-id <id> (attach to an existing one)"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        let sig = NewSignal {
+            source_kind: SignalSourceKind::Classifier,
+            source_id: source_id.clone(),
+            model_id: model_id.clone(),
+            weight_hash,
+            stmt_seq: None,
+            cmd_seq: None,
+            label,
+            score,
+            verdict: verdict.to_ledger(),
+        };
+
+        if auto_allow {
+            let Some(context_id) = caller.context_id else {
+                return KjResult::Err(
+                    "kj ledger signal add --auto-allow: no active context to attribute this ask to"
+                        .to_string(),
+                );
+            };
+            let auto_reason = format!(
+                "{} (log-only)",
+                source_id.as_deref().unwrap_or("classifier")
+            );
+            let ask = NewAsk {
+                context_id: context_id.as_bytes().to_vec(),
+                principal_id: caller.principal_id.as_bytes().to_vec(),
+                origin: Origin::Hook,
+                instance: None,
+                tool: None,
+                hook_id: None,
+                description: statement.to_string(),
+                statements: vec![],
+                authorized_label: None,
+                rc_run_id: None,
+                expires_at: None,
+                options: vec![],
+                signals: vec![sig],
+            };
+            let result = {
+                let db = self.kernel_db.lock();
+                approval_ledger::ask::create_auto_allowed_ask(db.conn_for_ledger(), &ask, &auto_reason)
+            };
+            let new_request_id = match result {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj ledger signal add: {e}")),
+            };
+            crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+            KjResult::ok_with_data(
+                format!("auto-allowed ask {new_request_id} ({statement})"),
+                serde_json::json!({ "request_id": new_request_id, "auto_allow": true }),
+            )
+        } else {
+            // `request_id` is `Some` here — checked above.
+            let request_id = request_id.expect("checked above: request_id is Some without --auto-allow");
+            let result = {
+                let db = self.kernel_db.lock();
+                approval_ledger::ask::add_signal(db.conn_for_ledger(), request_id, &sig)
+            };
+            match result {
+                Ok(row) => {
+                    crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+                    KjResult::ok_with_data(
+                        format!("attached signal (seq {}) to ask {request_id}", row.seq),
+                        serde_json::json!({ "request_id": request_id, "seq": row.seq }),
+                    )
+                }
+                Err(LedgerError::NotFound(_)) => {
+                    KjResult::Err(format!("kj ledger signal add: no such ask {request_id}"))
+                }
+                Err(e) => KjResult::Err(format!("kj ledger signal add: {e}")),
+            }
+        }
+    }
 }
 
 /// Generalize EVERY statement of `request_id` into a standing rule, all in
@@ -1162,6 +1493,224 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such ask"));
+    }
+
+    // ── `kj ledger signal add` ─────────────────────────────────────────
+
+    fn signal_add_argv(statement: &str, extra: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            s("ledger"),
+            s("signal"),
+            s("add"),
+            s(statement),
+            s("--source-id"),
+            s("lfm2d"),
+            s("--model-id"),
+            s("kube_ordinal_v8"),
+            s("--weight-hash"),
+            s("abc123"),
+            s("--label"),
+            s("situation-normal"),
+            s("--score"),
+            s("0.6"),
+            s("--verdict"),
+            s("escalate"),
+        ];
+        argv.extend(extra.iter().map(|s| (*s).to_string()));
+        argv
+    }
+
+    #[tokio::test]
+    async fn ledger_signal_add_auto_allow_creates_an_allowed_ask() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let argv = signal_add_argv("rm build artifacts now", &["--auto-allow"]);
+        let result = d.dispatch(&argv, &c).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let data = match &result {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("kj ledger signal add --auto-allow must emit structured data: {other:?}"),
+        };
+        let request_id = data["request_id"].as_str().expect("request_id string").to_string();
+        assert_eq!(data["auto_allow"], serde_json::json!(true));
+
+        let db = d.kernel_db.lock();
+        let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id).unwrap().unwrap();
+        assert_eq!(row.status, approval_ledger::types::ApprovalStatus::Allowed);
+        assert!(row.decided_by.is_none(), "log-only: no human decided this");
+        assert_eq!(row.decided_option.as_deref(), Some("auto_allow"));
+        assert!(
+            row.auto_reason.as_deref().unwrap_or_default().contains("lfm2d"),
+            "auto_reason must name the classifier source: {:?}",
+            row.auto_reason
+        );
+
+        let signals = approval_ledger::ask::list_signals(db.conn_for_ledger(), &request_id).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].label.as_deref(), Some("situation-normal"));
+    }
+
+    /// The second half of the design: a hook body's later scored clauses
+    /// attach to the SAME ask the first `--auto-allow` call created,
+    /// rather than minting a new ask per clause.
+    #[tokio::test]
+    async fn ledger_signal_add_attaches_to_an_existing_ask_via_request_id() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let first = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
+        assert!(first.is_ok(), "{first:?}");
+        let request_id = match &first {
+            KjResult::Ok { data: Some(v), .. } => v["request_id"].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+
+        let second = d
+            .dispatch(&signal_add_argv("rm build artifacts now", &["--request-id", &request_id]), &c)
+            .await;
+        assert!(second.is_ok(), "{second:?}");
+        let data = match &second {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("kj ledger signal add --request-id must emit structured data: {other:?}"),
+        };
+        assert_eq!(data["request_id"], serde_json::json!(request_id));
+        assert_eq!(data["seq"], serde_json::json!(1), "the second attach must get seq 1, after the auto-allow call's seq 0");
+
+        let db = d.kernel_db.lock();
+        let signals = approval_ledger::ask::list_signals(db.conn_for_ledger(), &request_id).unwrap();
+        assert_eq!(signals.len(), 2, "both signals must land on the ONE ask: {signals:?}");
+    }
+
+    #[tokio::test]
+    async fn ledger_signal_add_requires_auto_allow_or_request_id() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d.dispatch(&signal_add_argv("echo hi", &[]), &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("--auto-allow"), "{}", result.message());
+        assert!(result.message().contains("--request-id"), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn ledger_signal_add_auto_allow_and_request_id_are_mutually_exclusive() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(&signal_add_argv("echo hi", &["--auto-allow", "--request-id", "deadbeef"]), &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("mutually exclusive"), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn ledger_signal_add_attach_to_an_unknown_ask_errors_loudly() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(&signal_add_argv("echo hi", &["--request-id", "does-not-exist"]), &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("no such ask"), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn ledger_signal_add_invalid_verdict_fails_at_parse_time() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(
+                &[
+                    s("ledger"), s("signal"), s("add"), s("echo hi"),
+                    s("--verdict"), s("maybe"), s("--auto-allow"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("escalate") && result.message().contains("allow"),
+            "clap's error should name the valid choices: {}",
+            result.message()
+        );
+    }
+
+    // ── `--signals` on `kj ledger list`/`show` ─────────────────────────
+
+    #[tokio::test]
+    async fn ledger_show_signals_flag_includes_signal_detail() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let created = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
+        let request_id = match &created {
+            KjResult::Ok { data: Some(v), .. } => v["request_id"].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+
+        // Without --signals: no signals key at all, and no "signal:" line.
+        let plain = d.dispatch(&[s("ledger"), s("show"), s(&request_id)], &c).await;
+        assert!(plain.is_ok(), "{plain:?}");
+        assert!(!plain.message().contains("signal:"), "{}", plain.message());
+        let plain_data = match &plain {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(plain_data.get("signals").is_none(), "{plain_data}");
+
+        // With --signals: the signal shows up in both the text and .data.
+        let shown = d.dispatch(&[s("ledger"), s("show"), s(&request_id), s("--signals")], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(shown.message().contains("signal:"), "{}", shown.message());
+        assert!(shown.message().contains("situation-normal"), "{}", shown.message());
+        let data = match &shown {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        let signals = data["signals"].as_array().expect("signals array");
+        assert_eq!(signals.len(), 1, "{data}");
+        assert_eq!(signals[0]["label"], serde_json::json!("situation-normal"));
+        assert_eq!(signals[0]["source_kind"], serde_json::json!("classifier"));
+    }
+
+    #[tokio::test]
+    async fn ledger_list_signals_flag_adds_a_signals_column_and_reshapes_data() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let created = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
+        let request_id = match &created {
+            KjResult::Ok { data: Some(v), .. } => v["request_id"].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+
+        // Default .data stays the flat array-of-ids convention.
+        let plain = d.dispatch(&[s("ledger"), s("list"), s("--status"), s("allowed")], &c).await;
+        assert!(plain.is_ok(), "{plain:?}");
+        let plain_data = match &plain {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plain_data[0], serde_json::json!(request_id), "{plain_data}");
+
+        // --signals reshapes .data to {request_id, signals} objects and
+        // adds a SIGNALS column to the table.
+        let with_signals = d
+            .dispatch(&[s("ledger"), s("list"), s("--status"), s("allowed"), s("--signals")], &c)
+            .await;
+        assert!(with_signals.is_ok(), "{with_signals:?}");
+        assert!(with_signals.message().contains("SIGNALS"), "{}", with_signals.message());
+        let data = match &with_signals {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        let rows = data.as_array().expect("array of row objects");
+        assert_eq!(rows.len(), 1, "{data}");
+        assert_eq!(rows[0]["request_id"], serde_json::json!(request_id));
+        let sigs = rows[0]["signals"].as_array().expect("signals array");
+        assert_eq!(sigs.len(), 1, "{data}");
+        assert_eq!(sigs[0]["label"], serde_json::json!("situation-normal"));
     }
 
     /// A decided ask must drop off `kj ledger list`'s live queue and show
@@ -2099,3 +2648,5 @@ mod tests {
         }
     }
 }
+
+

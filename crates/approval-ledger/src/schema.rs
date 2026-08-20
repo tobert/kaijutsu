@@ -559,6 +559,22 @@ BEGIN
     UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
 END;
 
+-- An advisory signal attached to an ALREADY-EXISTING ask (`ask::add_signal`
+-- — a hook body logging a second scored clause onto the ask its first
+-- `--auto-allow` call created) is a durable change on its own: a live
+-- `kj ledger show --signals` or an ACP session watching this ask would
+-- otherwise see nothing move. A signal inserted alongside its OWN ask's
+-- creation (`ask::create_ask`/`create_auto_allowed_ask`) is already covered
+-- by the `approvals` insert trigger above — this one exists for the
+-- standalone attach, and firing it there too is a harmless no-op re-bump,
+-- not a double-count of anything a reader depends on (the invariant is
+-- "changed ⇒ bumped", not "bumped exactly once per change").
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_signal_insert
+AFTER INSERT ON approval_signals
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
 -- ── rc run log (the "checklist of what ran") ────────────────────────
 -- One row per rc-lifecycle invocation (create/fork/drift/…) for a
 -- context. This is what would have made a silently-inert startup rc

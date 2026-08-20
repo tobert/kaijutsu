@@ -292,12 +292,54 @@ fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<RuleRow> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ask::create_ask;
+    use crate::ask::{create_auto_allowed_ask, create_ask};
     use crate::decide::{DecideInput, decide};
     use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
-    use crate::types::{AskVerdict, VarBinding};
+    use crate::types::{AskVerdict, NewSignal, SignalSourceKind, SignalVerdict, VarBinding};
 
     use super::*;
+
+    /// Guarantee pinned by Amy's ruling (2026-08-17, lfm2d log-only): a
+    /// classifier signal is advisory forever — `rules::redeem` composes
+    /// coverage from `approval_rules` alone, and a signal, even one
+    /// carrying `verdict: allow` on the exact statement digest a redemption
+    /// asks about, must never be read as coverage. This creates an ask via
+    /// [`create_auto_allowed_ask`] (the log-only path this ruling protects)
+    /// with an `allow`-verdict signal on `digest-signal-only`, and confirms
+    /// `redeem` still reports `Uncovered` for that digest — there is no
+    /// `approval_rules` row, only a signal, and the two must never be
+    /// conflated.
+    #[test]
+    fn redeem_ignores_a_signal_even_when_its_verdict_is_allow() {
+        let conn = open_memory();
+        let mut ask = ask_with_statement("digest-signal-only", VarBinding::Bound, "rm target");
+        ask.signals = vec![NewSignal {
+            source_kind: SignalSourceKind::Classifier,
+            source_id: Some("lfm2d".into()),
+            model_id: Some("kube_ordinal_v8".into()),
+            weight_hash: Some("abc123".into()),
+            stmt_seq: Some(0),
+            cmd_seq: None,
+            label: Some("informative".into()),
+            score: Some(0.9),
+            verdict: SignalVerdict::Allow,
+        }];
+        create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+
+        let coverage = redeem(&conn, &["digest-signal-only"], "rm target", None, None).unwrap();
+        assert!(
+            matches!(coverage.per_statement[0], StatementVerdict::Uncovered),
+            "a signal must never be read as rule coverage, allow-verdict or not: {:?}",
+            coverage.per_statement[0]
+        );
+        assert_eq!(coverage.verdict(), AskVerdict::Escalate);
+
+        // And there really is no rule — the escalate above isn't hiding an
+        // accidental one.
+        let rule_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM approval_rules", [], |row| row.get(0)).unwrap();
+        assert_eq!(rule_count, 0);
+    }
 
     fn decided_allowed(conn: &Connection, request_id: &str) {
         decide(conn, request_id, DecideInput { allow: true, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
