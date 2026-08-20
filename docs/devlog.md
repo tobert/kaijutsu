@@ -1996,3 +1996,57 @@ Side quests the lane forced: reconstructing the kaish-integration worktree
 on moltar (the Cargo.toml comment's warning came true), and a peer-to-peer
 merge of zorak's unpushed wire-handshake line after its deployed kernel
 locked out every origin-built client mid-verification.
+
+## The file cache learns what vim already knew (August 18–20)
+
+The file tools had a cache that nobody had asked to be authoritative, and for
+a while it was. A cold miss served a kernel document written in June and
+wrote it back over a file that had moved on since — the kernel was the one
+player on the instrument that could revert a human's work and call it a save.
+The first reaction was a warning in the docs: do not edit through the kernel
+file tools or `vi`. The second was `docs/file-buffers.md`, whose thesis is
+that disk is the source of truth and vim solved the rest of this decades ago:
+a buffer is a view of a file, an unsaved buffer is a swap, and a swap that
+survives a crash is announced, never silently served.
+
+Three slices carried that into the kernel in two days. A cold miss now
+reconciles against disk. A dirty buffer leaves a durable row whose presence
+*is* the flag — no dirty column to drift — so it survives a restart as a
+recovered swap that every flush refuses until a player acknowledges it, and
+the unsaved text is readable at `/v/swap/<kernel_id>/<path>` because the
+kernel id is the one thing that persists across the restart that stranded it.
+Then the editor was wired to the cache: `:w` flushes through it, an edit marks
+the buffer dirty, a failed `:w` leaves the buffer honestly dirty instead of
+reporting clean, and `:w` refuses when the disk generation moved under the
+buffer unless the player types the `!` — vim's W12, with the kernel as the
+place the rule lives rather than a renderer.
+
+The refactor underneath mattered as much as the slices. `Kernel` came to own
+its block store and file cache by construction, which deleted a `OnceLock`
+pair that had let two caches exist over the same documents with independent
+dirty flags — the incident's shape, one level up. A patch batch became
+all-or-nothing by separating compute from commit, urgent because kaish's
+coming `edit` builtin will not lower to a whole-file write. And the test
+database stopped being `:memory:`: 228 call sites moved to a real file,
+because the in-memory path was a second code path production could never
+reach and tests could never trust.
+
+The method lesson from those days is the one that keeps earning its place:
+**falsification is the lead's job, not the lane's.** A lane that writes a
+test against the code it is building will honestly report green; only a
+targeted fault — flip the branch, pin the flag, drop the call — shows whether
+the test guards anything. It caught two tests written that way on the first
+day, and on the 20th it was how a morning's audit turned into fixes by noon:
+an evicted cache entry had made `:w` a silent no-op (the two halves of the
+protocol both returned `Ok` on a path they had never seen), and the
+acknowledgment the swap design assumed had never been given a surface. An
+open editor session now pins its entry, `kj swap list|ack|discard` is the
+surface, and every one of the new tests was broken once, on purpose, by the
+lead before it was kept.
+
+The audits that found those also named the debt the churn left behind, and
+the stance about it is the learning-space rule: a guard for a state that can
+no longer occur is deleted, not wrapped; a second mechanism for one question
+— config ownership answered by a path prefix *and* a mount table — is the
+kind of thing that reverts a human's edit when the two disagree, and one of
+them goes.
