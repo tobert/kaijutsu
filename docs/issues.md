@@ -105,14 +105,6 @@ and the devlog. What remains:
   coverage, and there is no bulk `kj rc reseed` for a kernel missing several.
   Order matters when installing by hand: a symlink seed's target must exist
   first. S–M.
-- **`S50-lfm2d.kai` round-trips its hook body through a temp file** to dodge
-  a kaish quoting rule the lane read too broadly. The real rule (kaish-lead,
-  08-20): only `"$(… "…" …)"` — double quotes at both levels — fails to
-  parse. Drop the temp file and the comment that states the wrong rule; keep
-  `jq --arg` bound outside the substitution. While there (kaibo review): the
-  secondary-signal loop does not check or trace a failed `kj ledger signal
-  add`, and classifier values (`score`, `label`) reach clap unvalidated — a
-  null score drops the signal silently. Trace both. S.
 - **Older comments still cite rulings and dates** (e.g. `kj/ledger.rs` has
   five "Amy's ruling" mentions predating today's rule). Sweep them when the
   file is next touched — state the rule, point at docs. S, incremental.

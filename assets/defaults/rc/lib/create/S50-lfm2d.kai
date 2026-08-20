@@ -24,19 +24,15 @@ kj context set . --env LFM2D_URL=http://lfm2d-1.taila4abc.ts.net:8088
 # The hook body is embedded below and installed as an inline HookBody::Kaish
 # action, not a stored hook_scripts row (docs/gate-and-shell-split.md, "Slice
 # 1"'s `KaishScript` variant -- no admin path mints a script_id from rc yet).
-# It is captured through a temp FILE, not a direct `$(cat <<'EOF' ... EOF)`:
-# kaish's command-substitution parser refuses any literal `"` between `$(`
-# and its matching `)`, including inside a heredoc body captured that way --
-# and this body is full of JSON and `--content "..."` strings. Writing the
-# heredoc straight to a file (no `$(...)` involved) and reading it back
-# through a bare `$(cat $file)` sidesteps this: the read-back command's own
-# source text carries no literal quote, so the file's content is free to
-# carry as many as it needs. Every other `$(...)` in this script and in the
-# hook body follows the same rule -- a literal string that must reach a jq
-# filter travels through `--arg`/`--argjson` with a variable set outside any
-# `$(...)`, never as a quoted literal inside one.
-hook_body_tmp="$(mktemp)"
-cat <<'HOOK_BODY_EOF' > $hook_body_tmp
+# It is captured with an UNQUOTED `$(cat <<'EOF' ... EOF)`. The parser rule
+# is narrower than it first reads: only double quotes at BOTH levels fail, so
+# `x="$(printf "a")"` is a parse error while `x=$(printf "a")` parses, and an
+# unquoted assignment does not word-split the captured value. The body's own
+# quotes, JSON, and `--content "..."` strings survive it intact. Inside a
+# `$(...)` the rule still governs: a literal string that must reach a jq
+# filter travels through `--arg`/`--argjson` with a variable set outside the
+# substitution, never as a quoted literal inside one.
+hook_body=$(cat <<'HOOK_BODY_EOF'
 # lfm2d-advisory pre_call hook body (installed by S50-lfm2d.kai as
 # hook_id lfm2d-advisory, match_tool shell_write). Runs in a snapshot of
 # the calling context's durable env (LFM2D_MODE, LFM2D_URL) plus the
@@ -163,6 +159,23 @@ if [[ "$models_rc" -eq 0 ]]; then
   fi
 fi
 
+# -- an unresolved jq field renders as the literal `null`, which reaches
+# clap as a value it refuses: the add fails, and its trace names the clap
+# error rather than the missing classifier field. Refuse it here instead,
+# while the cause is still legible.
+case "$winner_label" in
+  ""|null)
+    kj block create --kind trace --content "lfm2d-advisory: winner label unusable (label=$winner_label); skipping"
+    exit 0
+    ;;
+esac
+case "$winner_score" in
+  ""|null)
+    kj block create --kind trace --content "lfm2d-advisory: winner score unusable (score=$winner_score); skipping"
+    exit 0
+    ;;
+esac
+
 # -- log-only: create the ask already decided Allowed, carrying the
 # winner as the primary signal. approval_signals.request_id stays NOT
 # NULL -- this is an auto-approved ask, not a nullable half-row.
@@ -186,12 +199,28 @@ SECONDARY_FILTER_EOF
 for row in $(echo $resp | jq -r --argjson wi $winner_index --arg tab $tab $other_filter); do
   c_label="$(echo $row | cut -f2)"
   c_score="$(echo $row | cut -f3)"
-  kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --verdict escalate
+  c_skip=""
+  case "$c_label" in
+    ""|null) c_skip="label=$c_label" ;;
+  esac
+  case "$c_score" in
+    ""|null) c_skip="score=$c_score" ;;
+  esac
+  if test -n "$c_skip"; then
+    kj block create --kind trace --content "lfm2d-advisory: secondary signal skipped, unusable classifier value ($c_skip)"
+  else
+    sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --verdict escalate)"
+    sec_rc=$?
+    case "$sec_rc" in
+      0) ;;
+      *) kj block create --kind trace --content "lfm2d-advisory: secondary signal add failed (rc=$sec_rc label=$c_label score=$c_score): $sec_out" ;;
+    esac
+  fi
 done
 
 exit 0
 HOOK_BODY_EOF
-hook_body="$(cat $hook_body_tmp)"
+)
 
 mt="shell_write"
 hid="lfm2d-advisory"
