@@ -32,6 +32,16 @@ and the devlog. What remains:
 - **`kj context set --env` does not validate keys at write time**; a malformed
   key is stored and only refused at the next shell materialization (found by
   kaibo's review of the glue refactor). Validate where it is written. S.
+- **The `kj swap ack`-then-`ZQ` mark-dirty fix only covers `Kernel::editor_quit`,
+  not the same discard closing through `editor_keys`** (a batched
+  `iEdit<Esc>ZQ`, or a separate `editor_keys(id, "ZQ")`/`":q<CR>"` call). Both
+  reach the same `EditorSessions::quit` and get the same `rolled_back` bool
+  back, but `editor_keys_checked`'s `Closed` arm only ever calls
+  `mark_dirty`/`flush_one_guarded` when `update.saved` (a `ZZ`/`:wq`/`:x`-style
+  write), never for a bare discard — plumbing `rolled_back` through
+  `KeysOutcome::Closed`'s `KeysUpdate` (a new field) is the fix, deferred
+  because it touches every `KeysUpdate` construction site for a gap only
+  `Kernel::editor_quit` was directly demonstrated to hit. M.
 
 ### ANSI + surface
 

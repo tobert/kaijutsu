@@ -102,6 +102,40 @@ is the correct outcome, not a failure of the caller's own operation.
 production-reachable case today, and it now reports the refusal instead of
 silently orphaning the session's buffer.
 
+**The rule-4 swap check must run before every mutation, cold cache or warm,
+and on every mutation path — not just `create_or_replace`'s.** A kaibo
+review of the fixes above found the guard was still incomplete in three
+places:
+
+- `create_or_replace` only checked `entry.swap_recovered` on an
+  already-cached (warm) entry. On a cold cache — no entry at all, e.g. right
+  after a restart — it fell through to the "doc already exists" fallback and
+  spliced new content straight into the swap's block with no check
+  whatsoever. `FileDocumentCache::is_unacknowledged_swap`/`refuse_if_swap_recovered`
+  is the one check now: warm, it reads `entry.swap_recovered`; cold, it
+  consults the durable `dirty_file_buffers` row directly — the same row
+  `try_get_or_load`'s recovery arm reads to set that flag in the first
+  place.
+- The MCP `edit` tool's `apply_edit_plan` recovered a swap via `get_or_load`
+  and then mutated the block directly (`store.edit_text`, bypassing
+  `create_or_replace` entirely) before `flush_one`'s refusal ever ran — so
+  the recovered content was already clobbered by the time the caller saw an
+  error, and the failed-flush rollback's `invalidate_document` deleted the
+  document outright, orphaning the `dirty_file_buffers` row. It now calls
+  `refuse_if_swap_recovered` before its first `edit_text`, the same check
+  `create_or_replace` runs.
+- A discard rollback (`ZQ`/`Kernel::editor_quit`) rewrites the block via a
+  raw `blocks.edit_text` call that bypasses the file cache's own
+  dirty/flush bookkeeping entirely. If the rollback actually changed the
+  block's content — reachable via `kj swap ack` flushing a *later* edit than
+  the checkpoint being rolled back to — the entry could be left claiming
+  `dirty: false` while the block no longer matched disk: unflushable
+  (`flush_one` on a clean entry silently no-ops) and, on a cold restart,
+  missing the `dirty_file_buffers` row that content would need to be
+  recovered as a swap rather than quietly lost. `editor_quit` now marks the
+  entry dirty whenever `EditorSessions::quit` reports a content-changing
+  rollback.
+
 ## Tool surface: three removals
 
 Decided by Amy 2026-08-18. Each removal deletes a hazard rather than guarding

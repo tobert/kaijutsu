@@ -1677,24 +1677,23 @@ impl Kernel {
     /// failure — see `editor_keys`'s `Updated` arm for why this differs from
     /// `mount_backend.rs`'s *external*-write rollback.
     ///
-    /// Unrestricted (`can_write: true`) — see
-    /// [`editor_save_checked`](Self::editor_save_checked) for the gated
-    /// entry point.
+    /// **Not gated by `can_write` here.** `kj editor save` is the only
+    /// production caller and it already denies at the dispatcher
+    /// (`kj::editor::dispatch_editor`'s `Save` arm calls `require_cap` and
+    /// returns before ever reaching the kernel), and the wire `editorSave`
+    /// calls this unrestricted too — so a `can_write: false` path through
+    /// this function was unreachable in practice. `editor_keys` earns its own
+    /// `can_write` plumbing because one batch can mix a plain edit (ungated)
+    /// with a write intent (`:w`, `ZZ`) discovered only once the key stream
+    /// is parsed — there's no such ambiguity here: every call to `save` is
+    /// itself the write intent, so gating once at the dispatcher, before the
+    /// call, is the whole check. (There used to be a
+    /// `pub(crate) editor_save_checked(id, can_write)` split mirroring
+    /// `editor_keys`/`editor_keys_checked` — deleted as dead code once
+    /// grepping every caller confirmed `can_write` was always `true`.)
     pub async fn editor_save(
         &self,
         id: crate::editor::EditorSessionId,
-    ) -> Result<crate::editor::EditorState, String> {
-        self.editor_save_checked(id, true).await
-    }
-
-    /// [`editor_save`](Self::editor_save), gated: with `can_write: false` the
-    /// checkpoint does not advance and nothing flushes — same status-line
-    /// message and same "session stays open, call still returns `Ok`" shape
-    /// as every other dialect-level refusal on this path.
-    pub(crate) async fn editor_save_checked(
-        &self,
-        id: crate::editor::EditorSessionId,
-        can_write: bool,
     ) -> Result<crate::editor::EditorState, String> {
         let (file_path, mut state) = {
             let mut sessions = self.editor_sessions.lock();
@@ -1702,11 +1701,6 @@ impl Kernel {
             let state = sessions.0.state(id)?;
             (file_path, state)
         };
-        if !can_write {
-            state.message = Some(crate::editor::WRITE_CAPABILITY_REFUSED.to_string());
-            self.publish_editor_state(id, &state);
-            return Ok(state);
-        }
         match file_path.as_deref() {
             Some(fp) => {
                 // Guarded, unforced: this direct-call path (the wire
@@ -1729,13 +1723,43 @@ impl Kernel {
 
     /// `ZQ` — roll the block back to the session's checkpoint and close it.
     /// Publishes `Closed` so renderers drop the session.
+    ///
+    /// A rollback that actually rewrote the block (`EditorSessions::quit`'s
+    /// `rolled_back` return) marks the file-cache entry dirty afterward
+    /// (kaibo review of `d45e0484`/`4369bd77`/`f02f3688`, the `ack`-then-`ZQ`
+    /// divergence): the rewrite lands via a raw `blocks.edit_text` call that
+    /// bypasses the cache's own flush pipeline entirely, so without this the
+    /// entry can be left claiming `dirty: false` while the block no longer
+    /// matches what's on disk — e.g. after a `kj swap ack` flushed a *later*
+    /// edit than the one this discard rolls back to. A stale `dirty: false`
+    /// here isn't just wrong bookkeeping: it makes the rolled-back content
+    /// permanently unflushable (`flush_one` on a clean entry silently
+    /// no-ops) and, on a cold restart, drops the durable
+    /// `dirty_file_buffers` row that this rollback's content needs to be
+    /// recovered as a swap rather than quietly lost. `docs/file-buffers.md`
+    /// rule 2 ("a dirty buffer is a swap file") only holds if every path
+    /// that changes the block without flushing marks it dirty — this is one
+    /// of them. Only fires for a **file-backed** session (`file_path` is
+    /// `None` for config/rc, which has no file-cache entry to mark) and only
+    /// when the block genuinely changed — a no-op rollback must not
+    /// spuriously dirty an already-clean entry.
     pub fn editor_quit(&self, id: crate::editor::EditorSessionId) -> Result<(), String> {
-        let (path, file_path) = {
+        let (path, file_path, rolled_back) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
             let file_path = sessions.0.file_backed_path(id);
-            sessions.0.quit(id, self.blocks())?;
-            (path, file_path)
+            let rolled_back = sessions.0.quit(id, self.blocks())?;
+            (path, file_path, rolled_back)
+        };
+        let mark_err = if rolled_back
+            && let Some(fp) = file_path.as_deref()
+            && let Err(e) = self.file_cache.mark_dirty(fp)
+        {
+            Some(format!(
+                "editor quit: rollback landed but failed to mark {fp} dirty: {e}"
+            ))
+        } else {
+            None
         };
         // The session is gone — release the pin taken at open
         // (`editor_open_as`, docs/file-buffers.md P1) so eviction can
@@ -1750,7 +1774,10 @@ impl Kernel {
         self.editor_flows.publish(crate::flows::EditorFlow::Closed {
             session_id: id.as_u64(),
         });
-        Ok(())
+        match mark_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Invalidate the shared [`FileDocumentCache`] shadow for a **config** path
@@ -3091,6 +3118,63 @@ mod tests {
                  refuse mark_dirty, not silently succeed",
             );
         assert!(err.contains("note.txt"), "error must name the path: {err}");
+    }
+
+    /// BUG 1 regression at the layer the leak was actually observed (kaibo
+    /// review of `d45e0484`/`4369bd77`/`f02f3688`): `editor_quit` releases the
+    /// file-cache pin *after* `EditorSessions::quit` succeeds
+    /// (`sessions.0.quit(id, self.blocks())?`) — if that call instead failed
+    /// with the session already removed (the old `quit` behavior), this `?`
+    /// would return early and the pin taken at `editor_open_as` would never
+    /// be released, with no session left in `kj editor list` to explain why.
+    ///
+    /// `editor::session_tests::quit_keeps_the_session_when_rollback_fails_instead_of_leaking_it`
+    /// covers the fix itself (the session stays open); this test confirms
+    /// the consequence one layer up stays consistent: session state and pin
+    /// state agree. Forces the same rollback failure (delete the file's
+    /// document out from under the open session) and checks both sides
+    /// together — `editor_state` still resolving the session (not "no such
+    /// session") and the file cache still refusing to `invalidate` the path
+    /// (pin held). Neither side is orphaned relative to the other.
+    #[tokio::test]
+    async fn editor_quit_does_not_leak_the_pin_when_rollback_fails() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = "/mem/note.txt";
+        kernel.vfs().write_all(Path::new(path), b"hello").await.unwrap();
+
+        let (id, _) = kernel.editor_open(path).await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+
+        // Delete the file-document the session is bound to — forces the
+        // rollback's `block_text` read to fail.
+        let ctx_id = crate::file_tools::cache::file_context_id(path);
+        kernel.blocks().delete_document(ctx_id).unwrap();
+
+        let err = kernel
+            .editor_quit(id)
+            .expect_err("quit must fail when the rollback can't read the block");
+        assert!(err.contains("not found"), "got: {err}");
+
+        // Session side: still open, still answers `editor_state` — not the
+        // "no such session" a leaked-pin caller would get after the old
+        // unconditional removal.
+        assert!(
+            kernel.editor_state(id).is_ok(),
+            "a failed quit must not drop the session — that's how the pin \
+             used to leak with nothing left to release it"
+        );
+
+        // Pin side: still held. `invalidate` refuses on a pinned entry
+        // (`docs/file-buffers.md`) — this is the observable proof the pin
+        // was never released, matching the session that's still open.
+        let inv_err = kernel
+            .file_cache()
+            .invalidate(path)
+            .expect_err("the pin must still be held while the session is open");
+        assert!(inv_err.contains(path), "error must name the path: {inv_err}");
     }
 
     #[tokio::test]

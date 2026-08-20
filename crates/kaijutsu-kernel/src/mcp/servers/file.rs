@@ -474,6 +474,35 @@ impl McpServerLike for FileToolsServer {
 }
 
 impl FileToolsServer {
+    /// Roll the cache back after a flush failure: drop the in-memory entry
+    /// and its shadow document (`invalidate_document`) so the next load
+    /// starts fresh instead of re-adopting the phantom, never-flushed edit —
+    /// see `write_file`'s and `apply_edit_plan`'s call sites for the failure
+    /// this exists to unwind.
+    ///
+    /// Refuses to delete a **recovered, unacknowledged swap**'s document.
+    /// `create_or_replace` and `apply_edit_plan`'s `refuse_if_swap_recovered`
+    /// check already keep a swap-recovered entry from reaching this call in
+    /// every production path today (kaibo review of
+    /// `d45e0484`/`4369bd77`/`f02f3688`, "BUG 3": deleting the document here
+    /// is exactly how a recovered swap used to be lost) — this check holds
+    /// that invariant directly, at the one place a rollback can delete a
+    /// document, rather than trusting every future caller to have checked
+    /// upstream.
+    fn rollback_after_flush_failure(&self, op: &str, path: &str) {
+        if self.cache.swap_recovered(path) {
+            tracing::warn!(
+                "{op} {path}: flush failed but the entry is a recovered, unacknowledged \
+                 swap — leaving its document in place rather than deleting it \
+                 (docs/file-buffers.md)"
+            );
+            return;
+        }
+        if let Err(inv_err) = self.cache.invalidate_document(path) {
+            tracing::warn!("{op} {path}: failed to roll back cache after flush failure: {inv_err}");
+        }
+    }
+
     async fn write_file(&self, path: String, content: String) -> ExecResult {
         let vfs_path = std::path::Path::new(&path);
 
@@ -514,22 +543,7 @@ impl FileToolsServer {
                     );
                 }
                 if let Err(e) = self.cache.flush_one(&path).await {
-                    // Roll all the way back: a plain `invalidate` only drops
-                    // the in-memory map entry, but the persisted shadow
-                    // document still holds the phantom edit — the next
-                    // load's "document already exists" fallback would just
-                    // re-adopt that same phantom content instead of
-                    // rereading the (unchanged) disk bytes. `invalidate_document`
-                    // drops the shadow doc too, so a later read reloads fresh
-                    // from the VFS. A rollback failure is logged, never
-                    // swallowed — it means the poisoned entry survives.
-                    if let Err(inv_err) = self.cache.invalidate_document(&path) {
-                        tracing::warn!(
-                            "write {}: failed to roll back cache after flush failure: {}",
-                            path,
-                            inv_err
-                        );
-                    }
+                    self.rollback_after_flush_failure("write", &path);
                     return ExecResult::failure(
                         1,
                         format!("wrote the document but failed to flush {}: {}", path, e),
@@ -586,6 +600,19 @@ impl FileToolsServer {
             Err(e) => return ExecResult::failure(1, e),
         };
 
+        // `get_or_load` above may have just recovered an unacknowledged swap
+        // into the cache (`docs/file-buffers.md` rule 4). Unlike `write_file`
+        // (which goes through `create_or_replace`, already gated), this path
+        // mutates the block directly via `store.edit_text` below — refuse
+        // here, before that first mutation, or the swap gets clobbered and
+        // only then reported as a `flush_one` failure (kaibo review of
+        // `d45e0484`/`4369bd77`/`f02f3688`, "BUG 3"). Same typed check
+        // `create_or_replace` runs, so the message names the same
+        // `/v/swap` path and `kj swap ack`/`discard` verbs either way.
+        if let Err(e) = self.cache.refuse_if_swap_recovered(&path) {
+            return ExecResult::failure(1, e);
+        }
+
         let content = match self.cache.read_content(&path).await {
             Ok(c) => c,
             Err(e) => return ExecResult::failure(1, e),
@@ -618,16 +645,7 @@ impl FileToolsServer {
             );
         }
         if let Err(e) = self.cache.flush_one(&path).await {
-            // See `write_file`'s matching rollback: a plain `invalidate`
-            // leaves the persisted shadow doc holding the phantom edit,
-            // which the next load would just re-adopt. Drop the doc too.
-            if let Err(inv_err) = self.cache.invalidate_document(&path) {
-                tracing::warn!(
-                    "edit {}: failed to roll back cache after flush failure: {}",
-                    path,
-                    inv_err
-                );
-            }
+            self.rollback_after_flush_failure("edit", &path);
             return ExecResult::failure(
                 1,
                 format!("edited the document but failed to flush {}: {}", path, e),
@@ -1403,6 +1421,88 @@ mod tests {
         assert!(res.is_error, "stale anchor should fail");
         assert!(text_of(&res).contains("stale"), "got: {}", text_of(&res));
         assert_eq!(cache.read_content(path).await.unwrap(), "one\ntwo\nthree\n");
+    }
+
+    /// BUG 3 regression (kaibo review of `d45e0484`/`4369bd77`/`f02f3688`):
+    /// `apply_edit_plan` called `get_or_load` (which recovers a swap into the
+    /// cache with `swap_recovered: true`) and then mutated the block directly
+    /// via `store.edit_text` — bypassing `create_or_replace`'s swap check
+    /// entirely. `flush_one` refused afterward, but by then the recovered
+    /// content was already clobbered, and the rollback's `invalidate_document`
+    /// deleted the document outright — losing the swap and orphaning the
+    /// `dirty_file_buffers` row (the next load would create a fresh doc from
+    /// disk and never see the row again). The edit must refuse *before* its
+    /// first `edit_text` call. Falsify by removing `apply_edit_plan`'s
+    /// `refuse_if_swap_recovered` check.
+    #[tokio::test]
+    async fn edit_refuses_a_recovered_swap_before_mutating_it() {
+        let path = "/tmp/swap_edit.md";
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        vfs.write_all(std::path::Path::new(path), b"disk-v1")
+            .await
+            .unwrap();
+        let db = test_kernel_db();
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), db.clone()));
+
+        // Load, then dirty it with an unsaved edit.
+        assert_eq!(cache.read_content(path).await.unwrap(), "disk-v1");
+        cache.create_or_replace(path, "unsaved-edit").await.unwrap();
+        cache.mark_dirty(path).unwrap();
+        // No flush — this is the unsaved edit. Drop the in-memory entry
+        // (simulating a restart) while the document and the durable
+        // `dirty_file_buffers` row survive.
+        cache.invalidate(path).unwrap();
+
+        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+
+        // Recovers the swap into the cache — same as a fresh `vi`/`read`
+        // after restart would.
+        assert_eq!(cache.read_content(path).await.unwrap(), "unsaved-edit");
+        assert!(cache.swap_recovered(path), "must have recovered as a swap");
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "old_string": "unsaved",
+                "new_string": "CLOBBERED",
+            }),
+        )
+        .await;
+
+        assert!(res.is_error, "edit onto a recovered swap must refuse");
+        assert_eq!(
+            text_of(&res),
+            crate::file_tools::cache::FlushError::UnacknowledgedSwap {
+                path: path.to_string(),
+            }
+            .to_string(),
+            "must carry the same message shape create_or_replace's refusal uses"
+        );
+
+        // The block must be untouched by the refused edit — still exactly
+        // the recovered swap content, not "CLOBBERED" and not "disk-v1".
+        assert_eq!(
+            cache.read_content(path).await.unwrap(),
+            "unsaved-edit",
+            "a refused edit must not have mutated the recovered buffer"
+        );
+        assert!(
+            cache.swap_recovered(path),
+            "still an unacknowledged swap — the refusal did not consume it"
+        );
+        // The durable marker must survive too — `/v/swap` reads from exactly
+        // this row, and a lost row here means the recovered work becomes
+        // unreachable even though the block content above is intact.
+        assert!(
+            db.lock().get_dirty_file_buffer(path).unwrap().is_some(),
+            "the dirty_file_buffers row must survive a refused edit"
+        );
     }
 
     #[tokio::test]

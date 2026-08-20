@@ -47,9 +47,11 @@ pub const APP_PEER_NICK: &str = "kaijutsu-app";
 /// Status-line message for a write batch (`ZZ`, `:w`, `:wq`, `:x`) refused
 /// because the caller's seat lacks `Capability::Editor`. Vim's read-only-
 /// buffer shape (E45): the buffer stays open and dirty, nothing is
-/// checkpointed or flushed. Shared by [`EditorSessions::refuse_write`] and
-/// `Kernel::editor_save_checked` so both write surfaces name the gap the
-/// same way. See `docs/vi.md`.
+/// checkpointed or flushed. Used by [`EditorSessions::refuse_write`], the
+/// one write surface that can discover a write intent only mid-batch — `kj
+/// editor save` (`Kernel::editor_save`) is itself always a write intent, so
+/// it denies once at the dispatcher instead of needing this message. See
+/// `docs/vi.md`.
 pub const WRITE_CAPABILITY_REFUSED: &str =
     "write refused — this seat lacks the 'editor' capability";
 
@@ -788,17 +790,44 @@ impl EditorSessions {
     /// shared work — rolling it back would clobber them. A shared-session `ZQ`
     /// therefore just quits *this* player out of the doc and leaves the block's
     /// merged truth for the others (Amy, 2026-07-07; `docs/vi.md` → Rollback).
-    pub fn quit(&mut self, id: EditorSessionId, blocks: &SharedBlockStore) -> Result<(), String> {
-        let session = self.sessions.remove(&id).ok_or_else(|| no_session(id))?;
-        let sibling_bound = self.sessions.values().any(|s| s.target == session.target);
+    ///
+    /// **Removes the session only once the rollback has actually landed** (P1,
+    /// kaibo review of `d45e0484`/`4369bd77`/`f02f3688`, "BUG 1"): this used to
+    /// `remove` up front and roll back after, so a rollback failure
+    /// (`block_text`/`edit_text` erroring — a block deleted out from under the
+    /// session, a store error) returned `Err` with the session already gone.
+    /// Both `Kernel` callers (`editor_keys_checked`, `editor_quit`) propagate
+    /// that `Err` with `?` before ever reaching their `unpin`, so the
+    /// file-cache pin taken at open (`docs/file-buffers.md`) leaked for the
+    /// kernel's lifetime — nothing left to call `unpin`, and no session left
+    /// to retry. One invariant here (never remove before the rollback
+    /// succeeds) closes it at both call sites at once, instead of teaching
+    /// each caller to unpin on its own error path.
+    ///
+    /// Returns whether the rollback actually rewrote the block (`false` for
+    /// the sibling/peer-wrote early return, or when the block already held
+    /// the checkpoint). This pure registry has no file cache to inform, so
+    /// it can't mark the entry dirty itself — `Kernel::editor_quit` reads
+    /// this to do that (kaibo review of `d45e0484`/`4369bd77`/`f02f3688`,
+    /// the `ack`-then-`ZQ` divergence: a content-changing rollback mutates
+    /// the block via a raw `edit_text` call the file cache's own
+    /// dirty/flush bookkeeping never sees).
+    pub fn quit(&mut self, id: EditorSessionId, blocks: &SharedBlockStore) -> Result<bool, String> {
+        let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
+        let sibling_bound = self
+            .sessions
+            .iter()
+            .any(|(sid, s)| *sid != id && s.target == session.target);
         if sibling_bound || session.peer_wrote {
-            return Ok(());
+            self.sessions.remove(&id);
+            return Ok(false);
         }
         // Restore the normalized checkpoint *plus* the block's terminator, so a
         // rollback never strips a trailing newline the block opened with.
         let restore = format!("{}{}", session.saved_content, session.terminator);
         let current = block_text(blocks, &session.target)?;
-        if current != restore {
+        let rolled_back = current != restore;
+        if rolled_back {
             blocks
                 .edit_text(
                     session.target.context_id,
@@ -809,7 +838,8 @@ impl EditorSessions {
                 )
                 .map_err(|e| format!("editor quit: rollback failed: {e}"))?;
         }
-        Ok(())
+        self.sessions.remove(&id);
+        Ok(rolled_back)
     }
 
     /// Whether a session is still open.
@@ -1211,6 +1241,58 @@ mod session_tests {
         assert!(matches!(outcome, KeysOutcome::Updated(_)));
         assert!(sessions.is_open(id), "inserted ZZ leaves the session open");
         assert_eq!(block_text(&blocks, &target).unwrap(), "ZZ");
+    }
+
+    /// BUG 1 regression (kaibo review of `d45e0484`/`4369bd77`/`f02f3688`):
+    /// `quit` used to remove the session from the registry *before*
+    /// attempting the rollback, so a rollback failure (`block_text`/
+    /// `edit_text` erroring) returned `Err` with the session already gone.
+    /// Both `Kernel` callers (`editor_keys_checked`, `editor_quit`)
+    /// propagate that `Err` with `?` before ever reaching their `unpin` —
+    /// the file-cache pin taken at open leaked for the kernel's lifetime,
+    /// with no session left to release it and no way to retry.
+    ///
+    /// Forces the rollback to fail by deleting the target's document out
+    /// from under the session (`block_text`'s `blocks.get(target.context_id)`
+    /// then fails) — a `mocked store error` would work the same way, this is
+    /// just the simplest failure this pure registry can construct without a
+    /// mock. Falsify by reverting to `self.sessions.remove(&id)` at the top
+    /// of `quit`, before the rollback.
+    #[tokio::test]
+    async fn quit_keeps_the_session_when_rollback_fails_instead_of_leaking_it() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+
+        // Dirty the buffer so the rollback isn't a no-op (current != restore).
+        sessions.keys(id, "x", &blocks).unwrap();
+
+        // The document the session is bound to is gone — `block_text` (the
+        // first step of `quit`'s rollback) must now fail.
+        blocks.delete_document(target.context_id).unwrap();
+
+        let err = sessions
+            .quit(id, &blocks)
+            .expect_err("quit must fail when the rollback can't read the block");
+        assert!(
+            err.contains("not found"),
+            "must be the block_text failure, got: {err}"
+        );
+
+        // The session must still be open — the P1 fix. The old code removed
+        // it unconditionally before attempting the rollback, so a caller
+        // holding a pin on this session's target (`Kernel::editor_open_as`)
+        // would leak it forever: the session was gone (nothing left to call
+        // `unpin`), and `Kernel::editor_quit`/`editor_keys_checked` both
+        // propagate this `Err` via `?` before reaching their own `unpin`
+        // call. A session that's still open here is a session a caller can
+        // still see (`kj editor list`), still holds its rightful pin, and
+        // can still be retried or otherwise resolved — not an orphan.
+        assert!(
+            sessions.is_open(id),
+            "a failed rollback must not drop the session out from under an \
+             open pin — that is exactly how the pin leaked"
+        );
     }
 
     #[tokio::test]

@@ -384,6 +384,120 @@ mod tests {
         );
     }
 
+    /// Documents the `ack`-then-`ZQ` state (kaibo review of
+    /// `d45e0484`/`4369bd77`/`f02f3688`) and regresses the fix: a discard
+    /// rollback (`ZQ`/`Kernel::editor_quit`) rewrites the block via a raw
+    /// `blocks.edit_text` call that bypasses the file cache's own
+    /// dirty/flush bookkeeping entirely. If nothing re-marks the entry dirty
+    /// after that rewrite, a *later* flush sees `dirty: false` and silently
+    /// no-ops — the block the kernel just rolled back to never reaches disk,
+    /// and there's no durable `dirty_file_buffers` row recording that gap
+    /// either.
+    ///
+    /// Sequence: recover a swap, edit it further (marks dirty, clears
+    /// nothing), `kj swap ack` it (flushes the *edited* content to disk and
+    /// clears both `dirty` and the row), then `ZQ` — which discards that
+    /// edit, rolling the block back to the pre-edit (recovered-swap)
+    /// content. That rollback is a real, disk-diverging content change:
+    /// disk now holds what `ack` flushed (with the edit), but the block
+    /// holds the rolled-back text. Falsify by reverting `editor_quit`'s
+    /// `mark_dirty` call after a content-changing rollback — the two
+    /// assertions below (`get_dirty_file_buffer` and the disk content after
+    /// `flush_one`) both fail without it.
+    #[tokio::test]
+    async fn ack_then_zq_marks_dirty_so_the_discarded_rollback_still_reaches_disk() {
+        let d = test_dispatcher_with_tmp().await;
+        let c = test_caller();
+        let path = "/tmp/ack_then_zq.txt";
+
+        write_disk(&d, path, "disk-v1").await;
+        dirty_then_go_cold(&d, path, "unsaved-edit").await;
+
+        // Opens against the recovered swap: the session's checkpoint is
+        // "unsaved-edit", and the session itself reads clean (dirty: false)
+        // against it even though the cache still flags the entry
+        // `swap_recovered`.
+        let (id, st) = d.kernel().editor_open(path).await.unwrap();
+        assert_eq!(st.text, "unsaved-edit");
+        assert!(!st.dirty, "opens clean against the recovered content");
+        assert!(d.kernel().file_cache().swap_recovered(path));
+
+        // Edit further — cache stays dirty (it already was), `swap_recovered`
+        // is untouched by an ordinary edit.
+        d.kernel().editor_keys(id, "iMORE<Esc>").await.unwrap();
+
+        // `kj swap ack` flushes the *edited* buffer ("MOREunsaved-edit") to
+        // disk and clears `dirty` + the row — nothing gates this on the open
+        // session (unlike `discard`, `ack` never checks for a pin).
+        let acked = d.dispatch(&[s("swap"), s("ack"), s(path)], &c).await;
+        assert!(acked.is_ok(), "ack must succeed: {acked:?}");
+        assert_eq!(
+            String::from_utf8(
+                d.kernel()
+                    .vfs()
+                    .read_all(std::path::Path::new(path))
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            "MOREunsaved-edit",
+            "ack flushed the edited buffer"
+        );
+        assert!(
+            d.kernel()
+                .kernel_db()
+                .lock()
+                .get_dirty_file_buffer(path)
+                .unwrap()
+                .is_none(),
+            "ack + flush clears the row"
+        );
+
+        // ZQ discards the edit — the block rolls back to the checkpoint
+        // ("unsaved-edit"), diverging from what ack just put on disk
+        // ("MOREunsaved-edit"). This is the real content change the fix
+        // must account for.
+        d.kernel().editor_quit(id).unwrap();
+        assert_eq!(
+            d.kernel().file_cache().read_content(path).await.unwrap(),
+            "unsaved-edit",
+            "the rollback restored the checkpoint"
+        );
+
+        // The row must reflect this: the block just changed via a path the
+        // file cache's own flush pipeline never saw, so it must be marked
+        // dirty again — a silent `dirty: false` here is exactly the state
+        // that let the discarded rollback go unflushed forever.
+        assert!(
+            d.kernel()
+                .kernel_db()
+                .lock()
+                .get_dirty_file_buffer(path)
+                .unwrap()
+                .is_some(),
+            "a content-changing ZQ rollback must re-mark the entry dirty, \
+             not leave a stale `dirty: false` from the earlier ack"
+        );
+
+        // And that marking must be real, not cosmetic: a flush now must
+        // actually reach disk with the rolled-back content, not silently
+        // no-op on a (wrongly) clean entry.
+        d.kernel().file_cache().flush_one(path).await.unwrap();
+        assert_eq!(
+            String::from_utf8(
+                d.kernel()
+                    .vfs()
+                    .read_all(std::path::Path::new(path))
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            "unsaved-edit",
+            "the ZQ'd-away edit must be flushable to disk, not stuck \
+             behind a stale clean flag from the earlier ack"
+        );
+    }
+
     fn s(v: &str) -> String {
         v.to_string()
     }
