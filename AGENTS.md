@@ -300,6 +300,11 @@ Make errors, warnings, and failures informative and, where possible,
 instructive. Lead with the consequence, name the condition, and suggest the next
 step when it is known.
 
+**Code comments are technical, not historical.** No dates, rulings, quotes,
+slice numbers, or commit hashes in a Rust comment or a schema comment — those
+live in `git log`, `docs/devlog.md`, and `docs/issues.md`. State the rule the
+code follows; a `docs/<file>.md` pointer is the exit to the why.
+
 Text that faces users, agents, and models must not leak internals. An internal
 module path is unresolvable to its reader and should appear only in an assertion
 or an error that indicates a real defect in kaijutsu.
