@@ -207,7 +207,7 @@ mod tests {
         let cache = d.kernel().file_cache();
         cache.create_or_replace(path, unsaved_content).await.unwrap();
         cache.mark_dirty(path).unwrap();
-        cache.invalidate(path);
+        cache.invalidate(path).unwrap();
     }
 
     fn data_array(r: &KjResult) -> Vec<serde_json::Value> {
@@ -341,6 +341,47 @@ mod tests {
             .dispatch(&[s("swap"), s("discard"), s("/tmp/clean2.txt")], &c)
             .await;
         assert!(matches!(result, KjResult::Err(_)), "discard on a clean path must refuse");
+    }
+
+    /// C regression (`docs/audits/2026-08-20-editor-fileio.md`, `docs/issues.md`
+    /// "Tech-debt audits, 2026-08-20"): the pin `d45e0484` added only stopped
+    /// eviction — `invalidate`/`invalidate_document` still dropped a pinned
+    /// entry outright, so `kj swap discard` on a path with an open editor
+    /// session pulled the buffer out from under it. Falsify by reverting
+    /// `FileDocumentCache::invalidate`'s pin check.
+    #[tokio::test]
+    async fn discard_on_a_path_with_an_open_editor_session_refuses_and_the_session_survives() {
+        let d = test_dispatcher_with_tmp().await;
+        let c = test_caller();
+
+        write_disk(&d, "/tmp/pinned.txt", "orig").await;
+        let (id, _) = d.kernel().editor_open("/tmp/pinned.txt").await.unwrap();
+        // Dirty the session's buffer — this is what gives it a
+        // `dirty_file_buffers` row, the precondition `discard` checks for.
+        d.kernel().editor_keys(id, "iX<Esc>").await.unwrap();
+
+        let result = d
+            .dispatch(&[s("swap"), s("discard"), s("/tmp/pinned.txt")], &c)
+            .await;
+        assert!(
+            matches!(result, KjResult::Err(_)),
+            "discard on a path with an open editor session must refuse, got: {result:?}"
+        );
+
+        // The session must be untouched: still open, still holding the edit.
+        let state = d.kernel().editor_state(id).unwrap();
+        assert_eq!(state.text, "Xorig", "the open session's buffer must survive the refused discard");
+
+        // The swap marker must still be there too — discard did not partially apply.
+        assert!(
+            d.kernel()
+                .kernel_db()
+                .lock()
+                .get_dirty_file_buffer("/tmp/pinned.txt")
+                .unwrap()
+                .is_some(),
+            "a refused discard must not clear the swap marker"
+        );
     }
 
     fn s(v: &str) -> String {

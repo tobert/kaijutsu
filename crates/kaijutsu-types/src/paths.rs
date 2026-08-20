@@ -191,6 +191,18 @@ pub fn is_midi_path(path: &str) -> bool {
     is_or_under(path, MIDI_ROOT)
 }
 
+/// True if `path` is under one of the four kernel-owned `ConfigDocFs` roots
+/// (rc, kernel-global config, per-client config, MIDI device profiles) —
+/// the trees `kaijutsu-server/src/rpc.rs` mounts with that backend and
+/// `VfsOps::owns_config_docs` answers `true` for. The mount table is the
+/// live authority on ownership; this predicate exists for call chains that
+/// cannot reach it (no async, or no mount table in scope) and must be kept
+/// in sync with the same four `kernel.mount(...)` calls by hand — a fifth
+/// `ConfigDocFs` root needs a fifth arm here. See `docs/file-buffers.md`.
+pub fn is_config_doc_root(path: &str) -> bool {
+    is_rc_path(path) || is_config_path(path) || is_client_path(path) || is_midi_path(path)
+}
+
 /// True if `path` is under the ephemeral MIDI presence store (`/run/midi` or
 /// `/run/midi/...`). Disjoint from [`is_midi_path`]: the durable profile and
 /// the ephemeral presence record for one device live in different trees on
@@ -306,5 +318,25 @@ mod tests {
         assert!(!is_midi_path(CLIENT_ROOT));
         assert!(!is_rc_path(MIDI_ROOT));
         assert!(!is_config_path(MIDI_ROOT));
+    }
+
+    /// `is_config_doc_root` must enumerate exactly the same four roots
+    /// `kaijutsu-server/src/rpc.rs` mounts with `ConfigDocFs` — one list, one
+    /// place. A fifth root added to one side and not the other is exactly
+    /// the drift that reverted an edit under `is_config_doc_root`'s
+    /// predecessor (`docs/file-buffers.md`).
+    #[test]
+    fn is_config_doc_root_covers_exactly_the_four_configdocfs_roots() {
+        for root in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
+            assert!(is_config_doc_root(root), "{root} must be a config-doc root");
+        }
+        assert!(is_config_doc_root("/etc/rc/coder/create/S00.kai"));
+        assert!(is_config_doc_root("/etc/config/theme.toml"));
+        assert!(is_config_doc_root("/etc/client/metronome.toml"));
+        assert!(is_config_doc_root("/etc/midi/devices/minibrute"));
+        assert!(!is_config_doc_root("/etc"));
+        assert!(!is_config_doc_root("/etc/passwd"));
+        assert!(!is_config_doc_root(MIDI_RUN_ROOT), "the ephemeral presence tree is not a doc root");
+        assert!(!is_config_doc_root("/home/atobey/src/kaijutsu/notes.md"));
     }
 }

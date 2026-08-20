@@ -124,10 +124,13 @@ impl KjDispatcher {
             },
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
-                // A `:w` typed and left pending in an earlier call rides on
-                // the session's current command_line; fold it in before
-                // guessing whether THIS batch is the one that submits it.
-                match kernel.editor_keys(id, &keys).await {
+                // Never pre-parse `keys` to guess whether this batch writes —
+                // that heuristic was fragile and is gone. Instead compute the
+                // capability once (the same check `Save` denies on) and carry
+                // it through; the kernel refuses a write intent at the point
+                // its own state machine finds one, not before.
+                let can_write = self.require_cap(caller, write_cap(), "editor keys").is_ok();
+                match kernel.editor_keys_checked(id, &keys, can_write).await {
                     Ok(st) => {
                         // A dialect-level failure (bad `:cmd`, dirty-`:q` refusal,
                         // failed `:r`) rides the status line, not the error path —
@@ -425,6 +428,116 @@ mod tests {
         assert!(
             !matches!(written, KjResult::Err(_)),
             "`:w` should succeed with the editor capability: {written:?}"
+        );
+    }
+
+    /// A **file-backed** dispatcher, not `test_dispatcher_rc`'s ConfigDocFs
+    /// one: a config-owned session has no separate flush step (the block
+    /// mirror IS the persisted content the instant a key lands), so it can't
+    /// tell "the edit landed" apart from "the write reached disk." Only a
+    /// file-backed session has that separation — the exact thing the
+    /// capability gate needs to prove it refuses.
+    async fn test_dispatcher_with_mem() -> KjDispatcher {
+        use crate::vfs::backends::MemoryBackend;
+        let d = test_dispatcher().await;
+        d.kernel().mount("/mem", MemoryBackend::new()).await;
+        d
+    }
+
+    /// `kj editor keys` refuses a write intent at the flush, not by
+    /// pre-parsing the key text: `iX<Esc>:w<CR>` is one batch, the edit
+    /// mirrors onto the block same as always (that's the buffer, not the
+    /// file), and only the write half is refused — disk is untouched, the
+    /// buffer stays dirty, and the status message names the missing
+    /// capability. Falsify by forcing `can_write = true` in the `Keys`
+    /// dispatch arm.
+    #[tokio::test]
+    async fn keys_write_without_editor_capability_refuses_disk_unchanged_message_set() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let d = test_dispatcher_with_mem().await;
+        let s = |v: &str| v.to_string();
+        d.kernel()
+            .vfs()
+            .write_all(Path::new("/mem/note.txt"), b"hello")
+            .await
+            .unwrap();
+
+        let (_ctx, caller) = uncapable_caller(&d).await;
+        let opened = d
+            .dispatch(&[s("editor"), s("open"), s("/mem/note.txt")], &caller)
+            .await;
+        let id = session_of(&opened);
+
+        let result = d
+            .dispatch(
+                &[s("editor"), s("keys"), id.to_string(), s("iX<Esc>:w<CR>")],
+                &caller,
+            )
+            .await;
+        // A refused write is a dialect-level status-line outcome, like an
+        // unknown `:` command — never a hard `KjResult::Err`.
+        let dd = match result {
+            KjResult::Ok { data: Some(dd), .. } => dd,
+            other => panic!("expected ok-with-data, got {other:?}"),
+        };
+        assert_eq!(
+            dd["dirty"], true,
+            "the buffer must stay dirty — the checkpoint must not advance"
+        );
+        assert_eq!(dd["text"], "Xhello", "the edit itself is not gated, only the write");
+        assert!(
+            dd["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("capability")),
+            "the status message must name the missing capability, got: {dd:?}"
+        );
+
+        assert_eq!(
+            d.kernel()
+                .vfs()
+                .read_all(Path::new("/mem/note.txt"))
+                .await
+                .unwrap(),
+            b"hello",
+            "disk must be unchanged when the write is refused"
+        );
+
+        // With the capability granted, the same batch flushes for real — a
+        // second, untouched file so this half can't inherit the first
+        // session's still-open, never-flushed cache entry.
+        d.kernel()
+            .vfs()
+            .write_all(Path::new("/mem/note2.txt"), b"hello")
+            .await
+            .unwrap();
+        let (ctx2, caller2) = uncapable_caller(&d).await;
+        grant_editor(&d, ctx2);
+        let opened2 = d
+            .dispatch(&[s("editor"), s("open"), s("/mem/note2.txt")], &caller2)
+            .await;
+        let id2 = session_of(&opened2);
+        let written = d
+            .dispatch(
+                &[s("editor"), s("keys"), id2.to_string(), s("iY<Esc>:w<CR>")],
+                &caller2,
+            )
+            .await;
+        match written {
+            KjResult::Ok { data: Some(dd), .. } => {
+                assert_eq!(dd["dirty"], false, "the checkpoint advances once the write lands");
+            }
+            other => panic!("expected ok-with-data, got {other:?}"),
+        }
+        assert_eq!(
+            d.kernel()
+                .vfs()
+                .read_all(Path::new("/mem/note2.txt"))
+                .await
+                .unwrap(),
+            b"Yhello",
+            "with the capability, `:w` must actually flush to disk"
         );
     }
 }

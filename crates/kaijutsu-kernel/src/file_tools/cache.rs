@@ -576,6 +576,15 @@ impl FileDocumentCache {
     }
 
     /// Create or replace a file's content.
+    ///
+    /// Refuses on a recovered, unacknowledged swap (`docs/file-buffers.md`
+    /// rule 4) **before** touching the block — B3, `docs/audits/
+    /// 2026-08-20-editor-fileio.md`: this used to splice the new content in
+    /// first and only have `flush_one` refuse afterward, so the recovered
+    /// work was already destroyed by the time the caller saw the error. The
+    /// error carries the same `FlushError::UnacknowledgedSwap` shape
+    /// `flush_one` uses, so every caller's error handling (already written
+    /// against a flush failure) needs no new arm.
     pub async fn create_or_replace(
         &self,
         path: &str,
@@ -587,6 +596,12 @@ impl FileDocumentCache {
         {
             let cache = self.cache.read();
             if let Some(entry) = cache.get(&ctx_id) {
+                if entry.swap_recovered {
+                    return Err(FlushError::UnacknowledgedSwap {
+                        path: path.to_string(),
+                    }
+                    .to_string());
+                }
                 let old_content = self
                     .block_store
                     .block_snapshots(ctx_id)
@@ -624,9 +639,31 @@ impl FileDocumentCache {
     /// Drop a path's cached kernel document, if any. Used when a write bypasses
     /// the text substrate (e.g. binary content) so a later text read reloads
     /// fresh rather than serving a stale document.
-    pub fn invalidate(&self, path: &str) {
+    ///
+    /// Refuses on a pinned entry (P1, `docs/issues.md` "Tech-debt audits,
+    /// 2026-08-20"; `docs/audits/2026-08-20-editor-fileio.md` "the pin
+    /// protects eviction, not invalidate"): [`pin`](Self::pin) only stopped
+    /// [`evict_if_needed`](Self::evict_if_needed) from dropping an open
+    /// editor session's entry — this function removed it outright regardless,
+    /// so `kj swap discard` (or any other caller) on a path with an open
+    /// editor session silently pulled the buffer out from under the session.
+    /// The honest rule is the loud one: the caller must close the session
+    /// first. A caller that wants "unpin and proceed" instead is a different,
+    /// deliberate decision — not this function's default.
+    pub fn invalidate(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
-        self.cache.write().remove(&ctx_id);
+        let mut cache = self.cache.write();
+        match cache.get(&ctx_id) {
+            Some(entry) if entry.pin_count > 0 => Err(format!(
+                "{path}: {} open editor session(s) hold this buffer open — \
+                 close them (`ZZ`/`:q`), then retry",
+                entry.pin_count
+            )),
+            _ => {
+                cache.remove(&ctx_id);
+                Ok(())
+            }
+        }
     }
 
     /// Like [`invalidate`](Self::invalidate), but also drops the **backing shadow
@@ -651,10 +688,13 @@ impl FileDocumentCache {
     /// staleness detection. `invalidate_document` drops both the in-memory entry
     /// and the shadow document itself, so the next read reloads fresh from the
     /// VFS. The shadow is a pure cache materialization, so dropping it is safe;
-    /// a delete failure is surfaced (never a swallowed stale serve).
+    /// a delete failure is surfaced (never a swallowed stale serve). Refuses
+    /// on a pinned entry, same rule and same message as
+    /// [`invalidate`](Self::invalidate) — this is `invalidate` plus a
+    /// document delete, not a second ownership decision.
     pub fn invalidate_document(&self, path: &str) -> Result<(), String> {
+        self.invalidate(path)?;
         let ctx_id = file_context_id(path);
-        self.cache.write().remove(&ctx_id);
         self.block_store
             .delete_document(ctx_id)
             .map_err(|e| format!("invalidate_document({path}): {e}"))
@@ -1260,7 +1300,7 @@ mod tests {
 
         cache.create_or_replace("/tmp/r.kai", "v1").await.unwrap();
         // Simulate restart: cache entry gone, store doc remains.
-        cache.invalidate("/tmp/r.kai");
+        cache.invalidate("/tmp/r.kai").unwrap();
 
         // Replace through the cold-cache path (with multi-byte, to also cover
         // the char-count delete in the fallback branch).
@@ -1481,7 +1521,7 @@ mod tests {
 
         // Simulate a kernel restart: drop the in-memory entry, leave the
         // document (and its stale content) in the block store.
-        cache.invalidate("/tmp/incident.md");
+        cache.invalidate("/tmp/incident.md").unwrap();
 
         // A writer that bypasses the cache changes disk directly — exactly
         // what happens while the kernel is down or a sibling process edits
@@ -1511,7 +1551,7 @@ mod tests {
         vfs.write_all(p("/tmp/incident2.md"), b"v1").await.unwrap();
         assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v1");
 
-        cache.invalidate("/tmp/incident2.md");
+        cache.invalidate("/tmp/incident2.md").unwrap();
         vfs.write_all(p("/tmp/incident2.md"), b"v2").await.unwrap();
         assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v2");
 
@@ -1583,7 +1623,7 @@ mod tests {
         // Simulate a kernel restart: the in-memory entry (and its dirty flag)
         // is gone. Nothing flushed it first — the `dirty_file_buffers` row
         // (in the same `KernelDb` the cache holds) is what survives instead.
-        cache.invalidate("/tmp/swap.md");
+        cache.invalidate("/tmp/swap.md").unwrap();
 
         // The unsaved edit comes back, not disk content — recovered as a
         // swap, not silently discarded.
@@ -1612,7 +1652,7 @@ mod tests {
         assert_eq!(cache.read_content("/tmp/clean.md").await.unwrap(), "v1");
         // Never dirtied — no dirty_file_buffers row.
 
-        cache.invalidate("/tmp/clean.md");
+        cache.invalidate("/tmp/clean.md").unwrap();
         vfs.write_all(p("/tmp/clean.md"), b"v2").await.unwrap();
 
         assert_eq!(
@@ -1645,7 +1685,7 @@ mod tests {
 
         // Simulate a restart after the flush. If the marker weren't cleared,
         // this would be (wrongly) treated as a recovered swap.
-        cache.invalidate("/tmp/flushed.md");
+        cache.invalidate("/tmp/flushed.md").unwrap();
         vfs.write_all(p("/tmp/flushed.md"), b"disk-v2-external")
             .await
             .unwrap();
@@ -1672,7 +1712,7 @@ mod tests {
             .await
             .unwrap();
         cache.mark_dirty("/tmp/ack.md").unwrap();
-        cache.invalidate("/tmp/ack.md");
+        cache.invalidate("/tmp/ack.md").unwrap();
 
         // Reload recovers the swap.
         assert_eq!(cache.read_content("/tmp/ack.md").await.unwrap(), "unsaved-edit");
@@ -1701,6 +1741,75 @@ mod tests {
         assert_eq!(
             String::from_utf8(vfs.read_all(p("/tmp/ack.md")).await.unwrap()).unwrap(),
             "unsaved-edit"
+        );
+    }
+
+    /// B3 regression (`docs/audits/2026-08-20-editor-fileio.md`, `docs/issues.md`
+    /// "Tech-debt audits, 2026-08-20"): a write onto a recovered, unacknowledged
+    /// swap used to clobber the swap's content via `create_or_replace` *before*
+    /// `flush_one`'s `UnacknowledgedSwap` refusal ever ran — so the recovered
+    /// work was destroyed and only then reported as an error, and the
+    /// `dirty_file_buffers` row was left advertising a swap whose content was
+    /// already gone. `create_or_replace` must refuse before mutating, so the
+    /// swap survives intact for `kj swap ack`/`discard` to act on. Falsify by
+    /// removing `create_or_replace`'s `swap_recovered` check.
+    #[tokio::test]
+    async fn create_or_replace_refuses_on_a_recovered_swap_without_mutating_it() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/swap2.md"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/swap2.md").await.unwrap(), "disk-v1");
+
+        cache
+            .create_or_replace("/tmp/swap2.md", "unsaved-edit")
+            .await
+            .unwrap();
+        cache.mark_dirty("/tmp/swap2.md").unwrap();
+        cache.invalidate("/tmp/swap2.md").unwrap();
+
+        // Reload recovers the swap.
+        assert_eq!(
+            cache.read_content("/tmp/swap2.md").await.unwrap(),
+            "unsaved-edit"
+        );
+        assert!(cache.swap_recovered("/tmp/swap2.md"));
+
+        // A write onto the recovered-but-unacknowledged swap must refuse
+        // instead of overwriting it — the same typed error `flush_one`
+        // produces for this condition.
+        let err = cache
+            .create_or_replace("/tmp/swap2.md", "clobbering-write")
+            .await
+            .expect_err("create_or_replace must refuse a recovered unacknowledged swap");
+        assert_eq!(
+            err,
+            FlushError::UnacknowledgedSwap {
+                path: "/tmp/swap2.md".to_string(),
+            }
+            .to_string(),
+            "must carry the same message shape flush_one's refusal uses"
+        );
+
+        // The swap's content must be untouched — not the failed write's text.
+        assert_eq!(
+            cache.read_content("/tmp/swap2.md").await.unwrap(),
+            "unsaved-edit",
+            "a refused write must not have mutated the recovered buffer"
+        );
+        assert!(
+            cache.swap_recovered("/tmp/swap2.md"),
+            "still an unacknowledged swap — the refusal did not consume it"
+        );
+        // The durable marker must still be there — `/v/swap` keeps advertising
+        // the (still-intact) unsaved work.
+        assert!(
+            cache
+                .db
+                .lock()
+                .get_dirty_file_buffer("/tmp/swap2.md")
+                .unwrap()
+                .is_some(),
+            "the dirty_file_buffers row must survive a refused write"
         );
     }
 
@@ -1776,7 +1885,7 @@ mod tests {
 
         // Swap marker cleared: a later cold load reconciles against disk
         // instead of recovering a (nonexistent) unacknowledged swap.
-        cache.invalidate("/tmp/w12_ok.md");
+        cache.invalidate("/tmp/w12_ok.md").unwrap();
         vfs.write_all(p("/tmp/w12_ok.md"), b"disk-v2-external")
             .await
             .unwrap();
@@ -1806,7 +1915,7 @@ mod tests {
             .await
             .unwrap();
         cache.mark_dirty("/tmp/w12_swap.md").unwrap();
-        cache.invalidate("/tmp/w12_swap.md");
+        cache.invalidate("/tmp/w12_swap.md").unwrap();
 
         // Reload recovers the swap.
         assert_eq!(
@@ -1959,6 +2068,63 @@ mod tests {
                 .read()
                 .contains_key(&file_context_id("/tmp/pinned.txt")),
             "unpin must restore ordinary LRU eviction"
+        );
+    }
+
+    /// C (`docs/audits/2026-08-20-editor-fileio.md`, `docs/issues.md`
+    /// "Tech-debt audits, 2026-08-20"): `pin` only ever protected
+    /// `evict_if_needed` — `invalidate`/`invalidate_document` dropped a
+    /// pinned entry outright regardless, a different race from the eviction
+    /// bug the pin was built for. Both must now refuse instead. Falsify by
+    /// reverting the pin check in `invalidate`.
+    #[tokio::test]
+    async fn invalidate_and_invalidate_document_refuse_a_pinned_entry() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/held.txt"), b"v1").await.unwrap();
+        cache.read_content("/tmp/held.txt").await.unwrap();
+        cache.pin("/tmp/held.txt").expect("pin a cached entry");
+
+        let err = cache
+            .invalidate("/tmp/held.txt")
+            .expect_err("invalidate must refuse a pinned entry");
+        assert!(err.contains("/tmp/held.txt"), "error must name the path: {err}");
+        assert!(
+            cache
+                .cache
+                .read()
+                .contains_key(&file_context_id("/tmp/held.txt")),
+            "a refused invalidate must not remove the entry"
+        );
+
+        let err = cache
+            .invalidate_document("/tmp/held.txt")
+            .expect_err("invalidate_document must refuse a pinned entry too");
+        assert!(err.contains("/tmp/held.txt"), "error must name the path: {err}");
+        assert!(
+            cache
+                .cache
+                .read()
+                .contains_key(&file_context_id("/tmp/held.txt")),
+            "a refused invalidate_document must not remove the entry"
+        );
+        assert_eq!(
+            cache.read_content("/tmp/held.txt").await.unwrap(),
+            "v1",
+            "the pinned entry's content must be untouched"
+        );
+
+        // Once unpinned, both proceed normally.
+        cache.unpin("/tmp/held.txt");
+        cache
+            .invalidate("/tmp/held.txt")
+            .expect("invalidate must succeed once unpinned");
+        assert!(
+            !cache
+                .cache
+                .read()
+                .contains_key(&file_context_id("/tmp/held.txt")),
+            "an unpinned invalidate must remove the entry"
         );
     }
 }

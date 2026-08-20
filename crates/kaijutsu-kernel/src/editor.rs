@@ -32,7 +32,7 @@
 use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::{PrincipalId, SessionId};
 #[cfg(test)]
-use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
+use kaijutsu_types::paths::RC_ROOT;
 
 use crate::block_store::SharedBlockStore;
 use crate::config_doc::{config_context_id, first_block_id};
@@ -44,25 +44,30 @@ use crate::file_tools::FileDocumentCache;
 /// risk #1.
 pub const APP_PEER_NICK: &str = "kaijutsu-app";
 
+/// Status-line message for a write batch (`ZZ`, `:w`, `:wq`, `:x`) refused
+/// because the caller's seat lacks `Capability::Editor`. Vim's read-only-
+/// buffer shape (E45): the buffer stays open and dirty, nothing is
+/// checkpointed or flushed. Shared by [`EditorSessions::refuse_write`] and
+/// `Kernel::editor_save_checked` so both write surfaces name the gap the
+/// same way. See `docs/vi.md`.
+pub const WRITE_CAPABILITY_REFUSED: &str =
+    "write refused — this seat lacks the 'editor' capability";
+
 /// The location an editor binds to: the context + block that own a path's
 /// text. Edits go to `block_store.edit_text(context_id, block_id, …)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorTarget {
     pub context_id: ContextId,
     pub block_id: BlockId,
-}
-
-/// Cheap prefix test for whether `path` is in the rc/config trees.
-///
-/// **This is NOT the editor's ownership decision** — that is
-/// [`resolve_editor_target`], which asks the mount table
-/// ([`MountTable::owner_of`] + [`VfsOps::owns_config_docs`](crate::vfs::VfsOps::owns_config_docs))
-/// so the editor and the VFS can't drift on what owns a path. This prefix check survives
-/// only as the **synchronous** guard for `Kernel::invalidate_config_file_cache`,
-/// a cache-coherence optimization on the sync editor-quit path where an `async`
-/// mount-table query would cascade. Tracked in `docs/issues.md`.
-pub fn config_owned(path: &str) -> bool {
-    kaijutsu_types::paths::is_rc_path(path) || kaijutsu_types::paths::is_config_path(path)
+    /// Whether this target is one of the kernel-owned `ConfigDocFs` documents
+    /// (rc/config/client/midi) rather than an ordinary file-backed document.
+    /// Decided once, here, by [`resolve_editor_target`]'s mount-table query —
+    /// every other consumer (`EditorSessions::file_backed_path`, the
+    /// checkpoint-deferral branch in `run_commands`, `Kernel::editor_open_as`'s
+    /// pin decision) reads this stored fact instead of re-deriving it from
+    /// the path, so there is one place this question gets asked. See
+    /// `docs/file-buffers.md`.
+    pub config_owned: bool,
 }
 
 /// Resolve `path` to the `(context, block)` of the kernel document that owns its
@@ -103,6 +108,7 @@ pub async fn resolve_editor_target(
         return Ok(EditorTarget {
             context_id,
             block_id,
+            config_owned: true,
         });
     }
     let (context_id, block_id) = file_cache
@@ -112,6 +118,7 @@ pub async fn resolve_editor_target(
     Ok(EditorTarget {
         context_id,
         block_id,
+        config_owned: false,
     })
 }
 
@@ -392,18 +399,38 @@ impl EditorSessions {
     }
 
     /// Feed keys to a session, mirror the produced edits onto the kernel block,
-    /// and report the outcome. Fails loud if a mirror write fails — the buffer
-    /// and the block must never silently diverge.
-    ///
-    /// If the batch contained a `ZZ`/`ZQ` (which modalkit, owning the real mode,
-    /// distinguishes from an inserted `ZZ`), the session is saved/discarded and
-    /// dropped here and the outcome is [`KeysOutcome::Closed`]; otherwise it is
-    /// [`KeysOutcome::Updated`] with the new renderer state.
+    /// and report the outcome. Every caller in this crate except
+    /// `Kernel::editor_keys_checked` wants the unrestricted case — this is
+    /// [`keys_checked`](Self::keys_checked) with `can_write: true`.
     pub fn keys(
         &mut self,
         id: EditorSessionId,
         keys: &str,
         blocks: &SharedBlockStore,
+    ) -> Result<KeysOutcome, String> {
+        self.keys_checked(id, keys, blocks, true)
+    }
+
+    /// [`keys`](Self::keys), gated: a write intent in this batch (`ZZ`, or
+    /// `:w`/`:wq`/`:x` in the parsed command line) refuses when `can_write` is
+    /// false, vim's read-only-buffer shape (E45) — the buffer stays open and
+    /// dirty, nothing is checkpointed or quit, and the status line names the
+    /// missing capability. A plain edit or navigation batch is unaffected
+    /// either way; only a batch that would actually write is gated, and it is
+    /// gated here, at the point this state machine turns a write intent into
+    /// effect — not by scanning the raw key text beforehand. See
+    /// `docs/vi.md`.
+    ///
+    /// If the batch contained a `ZZ`/`ZQ` (which modalkit, owning the real mode,
+    /// distinguishes from an inserted `ZZ`), the session is saved/discarded and
+    /// dropped here and the outcome is [`KeysOutcome::Closed`]; otherwise it is
+    /// [`KeysOutcome::Updated`] with the new renderer state.
+    pub fn keys_checked(
+        &mut self,
+        id: EditorSessionId,
+        keys: &str,
+        blocks: &SharedBlockStore,
+        can_write: bool,
     ) -> Result<KeysOutcome, String> {
         let (close, commands) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
@@ -427,6 +454,9 @@ impl EditorSessions {
         if let Some(close) = close {
             let (final_state, saved) = match close {
                 CloseRequest::Write => {
+                    if !can_write {
+                        return self.refuse_write(id);
+                    }
                     // ZZ: checkpoint current as saved, then quit — the rollback
                     // to that just-taken checkpoint is a no-op. `saved: true`
                     // tells the kernel layer to flush a file-backed session.
@@ -457,7 +487,7 @@ impl EditorSessions {
         // renderer (the front door would otherwise surface it as a hard failure).
         if let Some(parsed) = commands {
             match parsed {
-                Ok(cmds) => return self.run_commands(id, cmds, blocks),
+                Ok(cmds) => return self.run_commands(id, cmds, blocks, can_write),
                 Err(msg) => {
                     let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
                     let checkpoint = session.saved_content.clone();
@@ -476,6 +506,22 @@ impl EditorSessions {
         let checkpoint = session.saved_content.clone();
         Ok(KeysOutcome::Updated(KeysUpdate {
             state: state_of(&mut session.core, &checkpoint),
+            saved: false,
+            forced: false,
+        }))
+    }
+
+    /// A write intent refused for lacking `Capability::Editor` — shared by
+    /// [`keys_checked`](Self::keys_checked)'s `ZZ` arm and
+    /// [`run_commands`](Self::run_commands)'s `Write`/`Quit` arm, so the
+    /// outcome shape and message are identical everywhere a refusal can fire.
+    /// Nothing is mutated: no checkpoint, no quit, no flush — the session is
+    /// exactly as it was before this batch's write intent.
+    fn refuse_write(&mut self, id: EditorSessionId) -> Result<KeysOutcome, String> {
+        let mut state = self.state(id)?;
+        state.message = Some(WRITE_CAPABILITY_REFUSED.to_string());
+        Ok(KeysOutcome::Updated(KeysUpdate {
+            state,
             saved: false,
             forced: false,
         }))
@@ -505,11 +551,17 @@ impl EditorSessions {
     /// to keep. The disk flush that follows in the kernel layer can still
     /// fail; that surfaces as the existing session-lost hard error on
     /// `KeysOutcome::Closed`, never a reverted edit.
+    ///
+    /// `can_write: false` refuses the `Write` command outright — same
+    /// message and outcome shape as [`refuse_write`](Self::refuse_write) —
+    /// before it can set `write_requested` or advance anything, so a `:wq`
+    /// with no write capability never reaches `Quit` either.
     fn run_commands(
         &mut self,
         id: EditorSessionId,
         commands: Vec<CommandRequest>,
         blocks: &SharedBlockStore,
+        can_write: bool,
     ) -> Result<KeysOutcome, String> {
         let mut write_requested = false;
         let mut forced = false;
@@ -523,6 +575,9 @@ impl EditorSessions {
                 // that refusal. This pure registry has no file cache to check
                 // against — it only carries the bit.
                 CommandRequest::Write { force } => {
+                    if !can_write {
+                        return self.refuse_write(id);
+                    }
                     write_requested = true;
                     forced = force;
                 }
@@ -566,7 +621,7 @@ impl EditorSessions {
             let is_config = self
                 .sessions
                 .get(&id)
-                .map(|s| config_owned(&s.path))
+                .map(|s| s.target.config_owned)
                 .ok_or_else(|| no_session(id))?;
             if is_config {
                 self.save(id)?;
@@ -609,7 +664,13 @@ impl EditorSessions {
         }
         // The block's text is the merged truth; reconcile against its normalized
         // (terminator-stripped) view, matching EditorCore's normalized buffer.
-        let raw = match block_text(blocks, &EditorTarget { context_id, block_id }) {
+        // Reuse a bound session's own target (every bound session shares this
+        // (context_id, block_id), so they share its `config_owned` too) rather
+        // than constructing a fresh `EditorTarget` — there is exactly one place
+        // that decides `config_owned` (`resolve_editor_target`), not a second
+        // ad hoc one here.
+        let target = self.sessions[&bound[0]].target;
+        let raw = match block_text(blocks, &target) {
             Ok(t) => t,
             Err(_) => return Vec::new(), // block gone (deleted) — nothing to do
         };
@@ -697,8 +758,8 @@ impl EditorSessions {
     /// the wrong place. Only a `Some` here is safe to hand to `mark_dirty`/
     /// `flush_one`.
     pub fn file_backed_path(&self, id: EditorSessionId) -> Option<String> {
-        let path = self.session_path(id)?;
-        (!config_owned(&path)).then_some(path)
+        let session = self.sessions.get(&id)?;
+        (!session.target.config_owned).then(|| session.path.clone())
     }
 
     /// `ZZ` — checkpoint the current buffer as saved, returning the now-clean
@@ -863,19 +924,6 @@ mod tests {
         Arc::new(mt)
     }
 
-    #[test]
-    fn config_owned_covers_rc_and_config_trees_only() {
-        assert!(config_owned(RC_ROOT));
-        assert!(config_owned("/etc/rc/coder/create/S00-stance.kai"));
-        assert!(config_owned(CONFIG_ROOT));
-        assert!(config_owned("/etc/config/model.toml"));
-        // Not the config trees:
-        assert!(!config_owned("/etc"));
-        assert!(!config_owned("/etc/passwd"));
-        assert!(!config_owned("/etc/rcfoo")); // prefix, not a child
-        assert!(!config_owned("/home/atobey/src/kaijutsu/notes.md"));
-    }
-
     #[tokio::test]
     async fn resolves_rc_path_to_its_configdocfs_owner_block() {
         let (blocks, db) = blocks_with_db();
@@ -905,6 +953,62 @@ mod tests {
             target.block_id,
             first_block_id(&blocks, expected_ctx).unwrap(),
             "must bind the owning block",
+        );
+        assert!(
+            target.config_owned,
+            "the mount table's owns_config_docs() answer must ride the target"
+        );
+    }
+
+    /// `resolve_editor_target` marks `config_owned` from the mount table's
+    /// answer, not a path prefix — so any `ConfigDocFs` root (not just rc)
+    /// comes back marked, and an ordinary file never does. Regression for
+    /// B1 (`docs/file-buffers.md`): `:w` on `/etc/client/*`/`/etc/midi/*`
+    /// used to revert the edit because a separate, narrower path predicate
+    /// disagreed with this exact mount-table answer.
+    #[tokio::test]
+    async fn resolve_editor_target_marks_config_owned_from_the_mount_table_not_a_path_prefix() {
+        use crate::vfs::backends::MemoryBackend;
+
+        let (blocks, db) = blocks_with_db();
+        let mounts = crate::vfs::MountTable::new();
+        mounts
+            .mount(
+                kaijutsu_types::paths::CLIENT_ROOT,
+                ConfigDocFs::new(blocks.clone(), kaijutsu_types::paths::CLIENT_ROOT),
+            )
+            .await;
+        mounts.mount("/mem", MemoryBackend::new()).await;
+        let mounts = Arc::new(mounts);
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
+
+        ConfigDocFs::new(blocks.clone(), kaijutsu_types::paths::CLIENT_ROOT)
+            .write_all(Path::new("theme.toml"), b"orig")
+            .await
+            .unwrap();
+        let client_target = resolve_editor_target(
+            "/etc/client/theme.toml",
+            &blocks,
+            &file_cache,
+            &mounts,
+        )
+        .await
+        .expect("client path resolves");
+        assert!(
+            client_target.config_owned,
+            "a ConfigDocFs root other than rc must still be marked config_owned"
+        );
+
+        mounts
+            .write_all(Path::new("/mem/note.txt"), b"hello")
+            .await
+            .unwrap();
+        let file_target = resolve_editor_target("/mem/note.txt", &blocks, &file_cache, &mounts)
+            .await
+            .expect("ordinary file path resolves");
+        assert!(
+            !file_target.config_owned,
+            "an ordinary file-backed target must not be marked config_owned"
         );
     }
 

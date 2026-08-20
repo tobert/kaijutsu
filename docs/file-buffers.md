@@ -87,6 +87,21 @@ lifetime, released on close (`editor_keys`'s `Closed` arm, `editor_quit`). A
 pinned entry is never evicted, dirty or not — the loud error is the backstop
 for every *other* caller, not the editor's steady-state path.
 
+**The pin protects eviction; `invalidate`/`invalidate_document` protect it
+too, by refusing.** The pin above only ever stopped `evict_if_needed` — a
+concurrent `invalidate`/`invalidate_document` (`kj swap discard`, a flush-
+failure rollback in `mount_backend.rs`, a binary write dropping a stale text
+shadow) still dropped a pinned entry outright, pulling the buffer out from
+under an open editor session. Both functions now refuse on a pinned entry
+instead of removing it, naming the path and the number of sessions holding it
+open. A caller in a rollback or best-effort position (mount_backend's
+flush-failure and binary-write paths) treats the refusal as informational —
+`tracing::warn!` and move on, since the entry surviving under a live session
+is the correct outcome, not a failure of the caller's own operation.
+`kj swap discard` on a path with an open editor session is the one
+production-reachable case today, and it now reports the refusal instead of
+silently orphaning the session's buffer.
+
 ## Tool surface: three removals
 
 Decided by Amy 2026-08-18. Each removal deletes a hazard rather than guarding
