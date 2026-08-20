@@ -163,6 +163,10 @@ async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
     // none", which was never true; it held the readonly facade.)
     assert!(!binding.is_admin(), "toolie must NOT be a binding admin");
     assert!(
+        !binding.allows(&Capability::Editor),
+        "toolie must NOT hold the editor write capability"
+    );
+    assert!(
         fx_broker_check(&h, &ctx, "shell").await.is_ok(),
         "toolie must hold the SAFE shell facade under the unmarked name"
     );
@@ -244,6 +248,15 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
 
     // Director is a binding admin — may write any context's loadout.
     assert!(binding.is_admin(), "director should hold binding-admin");
+
+    // Director holds the interactive editor's write capability alongside
+    // the file-tool writes above (assets/defaults/rc/director/create/
+    // S10-binding.kai grants it directly — not via the S10-lib symlink, so
+    // this harness's host `LocalBackend` mount does exercise it).
+    assert!(
+        binding.allows(&Capability::Editor),
+        "director should hold the editor write capability"
+    );
 
     // Facades: director gets the full (collapsed) interaction surface.
     for facade in ["shell", "edit_input", "submit_input"] {

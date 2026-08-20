@@ -20,8 +20,9 @@
 //!   • `*`                         — every instance (explicit permissive)
 //!   • `facade:*`                  — every facade surface
 //!   • `admin`                     — binding-admin (write any context's loadout)
-//!   • `drive`/`fork`/`drift`/`transport`/`operator` — kj verb authorities
-//!     (escalation-relevant kj subcommands; explicit, NOT implied by `*`)
+//!   • `drive`/`fork`/`drift`/`transport`/`operator`/`editor` — kj verb
+//!     authorities (escalation-relevant kj subcommands; explicit, NOT implied
+//!     by `*`) — `editor` gates a write through `kj editor` (docs/vi.md)
 //!
 //! Semantics: **deny-by-default** — a context with no binding grants nothing.
 //! The rc `create`/`fork` lifecycle assigns the initial loadout (broad roles
@@ -67,7 +68,7 @@ enum BindingCommand {
     Allow {
         /// Capability: <instance> | <instance>:<tool> | facade:<name> | * |
         /// facade:* | admin | rc-write | drive | fork | drift | transport |
-        /// operator | config-write | exec
+        /// operator | config-write | exec | editor
         cap: String,
         /// Target context: . (default) | .parent | <label> | <hex prefix>
         ctx: Option<String>,
@@ -385,7 +386,8 @@ pub(crate) fn cap_label(cap: &Capability) -> String {
         | Capability::Transport
         | Capability::Operator
         | Capability::ConfigWrite
-        | Capability::Exec => cap
+        | Capability::Exec
+        | Capability::Editor => cap
             .authority_name()
             .expect("authority variant has a token")
             .to_string(),
@@ -567,6 +569,7 @@ mod tests {
         assert_eq!(parse_capability("drift").unwrap(), Capability::Drift);
         assert_eq!(parse_capability("transport").unwrap(), Capability::Transport);
         assert_eq!(parse_capability("operator").unwrap(), Capability::Operator);
+        assert_eq!(parse_capability("editor").unwrap(), Capability::Editor);
         assert!(parse_capability("").is_err());
         assert!(parse_capability("builtin.file:").is_err());
         assert!(parse_capability("facade:").is_err());

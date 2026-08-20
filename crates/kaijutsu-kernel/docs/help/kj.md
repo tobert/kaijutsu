@@ -53,7 +53,7 @@ backend         list, show, set, remove, model set|remove, default show|set, res
                 and the kernel-wide defaults. Replaces models.toml entirely.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
                 (cap tokens incl. rc-write, config-write, drive, fork, drift, transport,
-                operator, exec, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
+                operator, exec, editor, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
 block           list, inspect, count, read, cat, append, history, diff, status, create,
                 edit (insert|delete|replace)
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
@@ -82,6 +82,8 @@ doc             list, tree, create, delete — storage layer (all kinds, not jus
 drift           push, pull, merge, flush, queue, cancel, history, edge rm
 drive           Clock one autonomous turn on a context (--prompt)
 editor          open, keys, state, save, quit, list — kernel-owned vi editor sessions
+                (save needs the `editor` capability; open/keys/state/quit/list
+                are ungated)
 fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
 hook            list, show, remove, add — broker hook tables, direct (never

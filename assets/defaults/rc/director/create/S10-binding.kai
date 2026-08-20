@@ -31,6 +31,13 @@ kj binding allow "operator"
 # reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
 # the VFS, so it's a dedicated authority, not implied by anything above.
 kj binding allow "exec"
+# The kernel-owned interactive editor's WRITE path (kj editor save, and a
+# `keys` batch that submits :w/:w!/:wq/:x/ZZ) — a director already holds
+# file:write/edit + rc-write above for governance artifacts, so it also gets
+# the editor's write surface. Dedicated authority, not implied by anything
+# above (docs/vi.md; Amy, 2026-08-20 — experiment ahead of a capability-names
+# sweep, docs/issues.md).
+kj binding allow "editor"
 # Facades: full interaction surface (shell + edit + submit). `facade:shell` is
 # the safe, unmarked shell (ExternalExec::Deny, docs/gate-and-shell-split.md
 # "Slice 3" — this used to be the mutating grant before the 2026-08-17 flag

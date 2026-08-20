@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::editor::{EditorSessionId, EditorState};
+use crate::mcp::Capability;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,7 +31,9 @@ enum EditorCommand {
         /// File or rc/config path to edit (e.g. /etc/rc/coder/create/S00.kai).
         path: String,
     },
-    /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>").
+    /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>"). A batch
+    /// that submits a write (`:w`, `:w!`, `:wq`, `:x`, `ZZ`, …) needs the
+    /// `editor` capability; plain edits and navigation don't.
     Keys {
         /// Session handle from `kj editor open`.
         session: u64,
@@ -43,6 +46,7 @@ enum EditorCommand {
         session: u64,
     },
     /// Checkpoint the buffer as saved (`ZZ`); for a file, also flush to disk.
+    /// Needs the `editor` capability.
     Save {
         /// Session handle.
         session: u64,
@@ -62,6 +66,20 @@ enum EditorCommand {
 fn state_json(id: EditorSessionId, st: &EditorState) -> serde_json::Value {
     st.to_json(id)
 }
+
+/// The capability `kj editor save` gates on. A write reached through
+/// `kj editor keys` (`:w`, `ZZ`) is refused at the flush inside the kernel,
+/// not by re-parsing keystrokes here. See [`Capability::Editor`] for why this
+/// is a dedicated authority rather than a reuse of `Tool{builtin.file, edit}`.
+fn write_cap() -> Capability {
+    Capability::Editor
+}
+
+/// The `:`-line verbs that report a write (`KeysUpdate.saved`,
+/// `crates/kaijutsu-kernel/src/editor.rs`): `parse_ex_command`
+/// (`crates/kaijutsu-editor/src/lib.rs`) matches these exactly, after
+/// stripping one adjacent trailing `!`. No abbreviations, no ranges — the
+/// dialect is this short list, verbatim.
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_editor(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -106,6 +124,9 @@ impl KjDispatcher {
             },
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
+                // A `:w` typed and left pending in an earlier call rides on
+                // the session's current command_line; fold it in before
+                // guessing whether THIS batch is the one that submits it.
                 match kernel.editor_keys(id, &keys).await {
                     Ok(st) => {
                         // A dialect-level failure (bad `:cmd`, dirty-`:q` refusal,
@@ -139,6 +160,9 @@ impl KjDispatcher {
                 }
             }
             EditorCommand::Save { session } => {
+                if let Err(denied) = self.require_cap(caller, write_cap(), "editor save") {
+                    return denied;
+                }
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_save(id).await {
                     Ok(st) => {
@@ -211,7 +235,7 @@ fn mode_label_of(mode: Option<&str>) -> &str {
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::*;
-    use crate::kj::{KjDispatcher, KjResult};
+    use crate::kj::{KjCaller, KjDispatcher, KjResult};
 
     /// Unique rc path (parse_rc_path needs SXX-name form), avoiding the seeded tree.
     const P: &str = "/etc/rc/editortest/create/S00-foo.kai";
@@ -306,5 +330,101 @@ mod tests {
             }
             other => panic!("expected ok-with-data, got {other:?}"),
         }
+    }
+
+    // ── capability gate ───────────────────────────────────────────────────
+
+    /// A second rc path for the capability tests, seeded by a privileged
+    /// caller (rc-write is a separate gate, not this task's concern) and
+    /// then driven by an unprivileged, editor-capability-less caller.
+    const P2: &str = "/etc/rc/editorcaptest/create/S00-foo.kai";
+
+    /// Bind a fresh, unprivileged context and return a caller for it.
+    /// `register_context` seeds a broad test loadout (`*`, `facade:*`,
+    /// admin, rc-write, drive/fork/drift/transport/operator/config-write) so
+    /// ordinary kj verb-mechanics tests don't trip the gates — it does NOT
+    /// include `editor` (like every authority, deliberately not implied by
+    /// `*`), so this is already the right fixture for "denied without
+    /// editor" without any further narrowing.
+    async fn uncapable_caller(d: &KjDispatcher) -> (kaijutsu_types::ContextId, KjCaller) {
+        let ctx = register_context(d, None, None, kaijutsu_types::PrincipalId::system());
+        let caller = caller_with_context(ctx);
+        (ctx, caller)
+    }
+
+    /// Grant `Capability::Editor` on `ctx`, writing straight through
+    /// `KernelDb` — the same store `require_cap` reads directly
+    /// (`crates/kaijutsu-kernel/src/kj/mod.rs`'s `require_cap`, not the
+    /// broker's cache) — because this harness never wires the broker's own
+    /// KernelDb handle, so `broker().set_binding()`'s persistence step would
+    /// silently no-op here.
+    fn grant_editor(d: &KjDispatcher, ctx: kaijutsu_types::ContextId) {
+        let mut db = d.kernel_db().lock();
+        let mut binding = db.get_context_binding(ctx).unwrap().unwrap_or_default();
+        binding.grant(crate::mcp::Capability::Editor);
+        db.upsert_context_binding(ctx, &binding).unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_denied_without_editor_capability_while_open_and_edits_pass() {
+        let d = test_dispatcher_rc().await;
+        let admin = test_caller();
+        let s = |v: &str| v.to_string();
+        d.dispatch(&[s("rc"), s("add"), s(P2), s("--content"), s("hello")], &admin)
+            .await;
+
+        let (_ctx, caller) = uncapable_caller(&d).await;
+
+        // Opening is ungated — no capability required at all.
+        let opened = d.dispatch(&[s("editor"), s("open"), s(P2)], &caller).await;
+        let id = session_of(&opened);
+
+        // A plain edit (no write verb) is ungated too.
+        let edited = d
+            .dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &caller)
+            .await;
+        assert!(
+            !matches!(edited, KjResult::Err(_)),
+            "a plain edit must not require the editor capability: {edited:?}"
+        );
+
+        // `kj editor save` is denied the same way.
+        let denied_save = d
+            .dispatch(&[s("editor"), s("save"), id.to_string()], &caller)
+            .await;
+        assert!(
+            matches!(denied_save, KjResult::Err(_)),
+            "save must be denied without the editor capability: {denied_save:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_write_and_save_succeed_with_editor_capability() {
+        let d = test_dispatcher_rc().await;
+        let admin = test_caller();
+        let s = |v: &str| v.to_string();
+        d.dispatch(&[s("rc"), s("add"), s(P2), s("--content"), s("hello")], &admin)
+            .await;
+
+        let (ctx, caller) = uncapable_caller(&d).await;
+        grant_editor(&d, ctx);
+
+        let opened = d.dispatch(&[s("editor"), s("open"), s(P2)], &caller).await;
+        let id = session_of(&opened);
+
+        let saved = d
+            .dispatch(&[s("editor"), s("save"), id.to_string()], &caller)
+            .await;
+        assert!(!matches!(saved, KjResult::Err(_)), "save should succeed: {saved:?}");
+
+        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &caller)
+            .await;
+        let written = d
+            .dispatch(&[s("editor"), s("keys"), id.to_string(), s(":w<CR>")], &caller)
+            .await;
+        assert!(
+            !matches!(written, KjResult::Err(_)),
+            "`:w` should succeed with the editor capability: {written:?}"
+        );
     }
 }

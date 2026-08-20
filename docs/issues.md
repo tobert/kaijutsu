@@ -7463,3 +7463,18 @@ upstream against `alacritty/vte`, or vendor-patch if a fix lands slowly and
 kaijutsu needs it sooner (chunked kaish output is exactly the profile that
 can hit this — a poorly-timed flush boundary during multibyte + escape
 mixed output).
+
+## Capability names and layout need a redesign sweep (Amy, 2026-08-20)
+
+The allow-set has grown ad-hoc, single-purpose variants as gaps were found
+rather than from one naming scheme: `Tool{builtin.file, edit}` gates `kj swap
+ack`/`discard`; `Editor` (new, this entry's occasion) gates `kj editor`
+writes; `RcWrite`/`ConfigWrite` are dedicated write-domain flags; `Drive`/
+`Fork`/`Drift`/`Transport`/`Operator`/`Exec` are bare-word `kj`-verb
+authorities; `Admin` is loadout-write; and facades (`shell`, `shell_write`,
+`edit_input`, `submit_input`) are a third shape again. Amy: "Director should
+only get `shell` as long as it has `kj`" — director's broad facade/exec
+grants (`assets/defaults/rc/director/create/S10-binding.kai`) are worth
+revisiting once `kj` itself can reach what a shell used to be for. Amy: "we'll
+do a cap redesign sweep soon so it's a good time to experiment" — the
+`Editor` variant is deliberately not treated as the final shape.

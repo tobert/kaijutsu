@@ -63,8 +63,16 @@ pub const KNOWN_FACADES: &[&str] = &["shell", "shell_write", "edit_input", "subm
 /// Stored as a normalized set (`ContextToolBinding::authorities`) persisted in
 /// the `context_binding_authorities` table — extensible (a future authority is
 /// a new variant + token, no schema migration).
-pub const KNOWN_AUTHORITIES: &[&str] =
-    &["drive", "fork", "drift", "transport", "operator", "config-write", "exec"];
+pub const KNOWN_AUTHORITIES: &[&str] = &[
+    "drive",
+    "fork",
+    "drift",
+    "transport",
+    "operator",
+    "config-write",
+    "exec",
+    "editor",
+];
 
 /// Builtin broker instances that are the in-kernel **projection** of a facade,
 /// as `(instance, facade)` pairs.
@@ -174,6 +182,28 @@ pub enum Capability {
     /// VFS entirely (real syscalls on the real host), so the roles that don't
     /// need it (musician, toolie) never carry the footgun.
     Exec,
+    /// May *write* through the kernel-owned interactive editor (`docs/vi.md`)
+    /// — `kj editor save`, and a `kj editor keys` batch that submits a write
+    /// (`:w`, `:w!`, `:wq`, `:x`, `ZZ`). `open`/`keys` otherwise/`state`/
+    /// `quit`/`list` stay ungated: opening and reading the buffer is benign,
+    /// like `read_input`.
+    ///
+    /// Deliberately its own authority, not a reuse of `Tool{builtin.file,
+    /// edit}`: the editor also writes rc/config documents
+    /// (`resolve_editor_target`'s config-owned branch,
+    /// `crates/kaijutsu-kernel/src/editor.rs`) that never pass through the
+    /// `builtin.file` tool at all, so gating on that tool would leave rc/
+    /// config writes through the editor ungated regardless. Like every
+    /// authority, not implied by `*`.
+    ///
+    /// Added 2026-08-20 (Amy) as a first cut, not a settled name: `kj swap
+    /// ack`/`discard` gated on the file-edit tool capability the same
+    /// morning and noted the editor's writes were an already-known gap
+    /// (`kj/swap.rs`) — this closes it. A broader capability-names/layout
+    /// sweep is coming soon (`docs/issues.md`, "Capability names and layout
+    /// need a redesign sweep"); this variant is deliberately an experiment
+    /// ahead of it, not the final shape.
+    Editor,
 }
 
 impl Capability {
@@ -191,6 +221,7 @@ impl Capability {
             Capability::Operator => "operator",
             Capability::ConfigWrite => "config-write",
             Capability::Exec => "exec",
+            Capability::Editor => "editor",
             _ => return None,
         })
     }
@@ -206,6 +237,7 @@ impl Capability {
             "operator" => Capability::Operator,
             "config-write" => Capability::ConfigWrite,
             "exec" => Capability::Exec,
+            "editor" => Capability::Editor,
             _ => return None,
         })
     }
@@ -338,7 +370,8 @@ impl ContextToolBinding {
             | Capability::Transport
             | Capability::Operator
             | Capability::ConfigWrite
-            | Capability::Exec => {
+            | Capability::Exec
+            | Capability::Editor => {
                 cap.authority_name().is_some_and(|n| self.authorities.contains(n))
             }
         }
@@ -379,7 +412,8 @@ impl ContextToolBinding {
             | Capability::Transport
             | Capability::Operator
             | Capability::ConfigWrite
-            | Capability::Exec) => {
+            | Capability::Exec
+            | Capability::Editor) => {
                 if let Some(n) = c.authority_name() {
                     self.authorities.insert(n.to_string());
                 }
@@ -409,7 +443,8 @@ impl ContextToolBinding {
             | Capability::Transport
             | Capability::Operator
             | Capability::ConfigWrite
-            | Capability::Exec => {
+            | Capability::Exec
+            | Capability::Editor => {
                 if let Some(n) = cap.authority_name() {
                     self.authorities.remove(n);
                 }
@@ -615,6 +650,7 @@ mod tests {
             Capability::Operator,
             Capability::ConfigWrite,
             Capability::Exec,
+            Capability::Editor,
         ] {
             assert!(
                 !b.allows(&cap),
@@ -634,6 +670,7 @@ mod tests {
             Capability::Operator,
             Capability::ConfigWrite,
             Capability::Exec,
+            Capability::Editor,
         ] {
             let mut b = ContextToolBinding::new();
             assert!(!b.allows(&cap), "{cap:?} granted on a fresh binding");
