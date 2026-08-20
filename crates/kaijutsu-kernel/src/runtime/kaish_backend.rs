@@ -368,7 +368,7 @@ impl KernelBackend for KaijutsuBackend {
                     blocks
                         .iter()
                         .find(|b| b.id == block_id)
-                        .map(|b| b.content.len())
+                        .map(|b| b.content.chars().count())
                         .ok_or_else(|| {
                             BackendError::NotFound(format!(
                                 "block not found: {}",
@@ -870,6 +870,61 @@ mod tests {
             .await
             .expect_err("patch must refuse, not silently succeed");
         assert!(matches!(err, BackendError::InvalidOperation(_)));
+    }
+
+    /// Overwriting a block replaces every character, not every byte: the
+    /// delete count handed to `edit_text` is in chars, so a block holding
+    /// multi-byte text must not trip the position guard or leave a tail.
+    #[tokio::test]
+    async fn overwrite_of_a_multibyte_block_replaces_the_whole_block() {
+        let ctx_id = ContextId::new();
+        let blocks = shared_block_store(PrincipalId::system());
+        blocks
+            .create_document(ctx_id, DocKind::Conversation, None)
+            .unwrap();
+        let block_id = blocks
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "改善 — kaizen",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-multibyte-overwrite").await);
+        let sid = SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, ctx_id);
+        let backend = KaijutsuBackend::new(
+            blocks.clone(),
+            kernel,
+            PrincipalId::system(),
+            session_contexts,
+            sid,
+        );
+        let path = std::path::PathBuf::from(format!(
+            "/docs/{}/{}",
+            ctx_id.to_hex(),
+            block_id.to_key()
+        ));
+
+        backend
+            .write(&path, b"plain", WriteMode::Overwrite)
+            .await
+            .expect("overwrite of a multi-byte block must succeed");
+
+        let entry = blocks.get(ctx_id).unwrap();
+        let content = entry
+            .doc
+            .blocks_ordered()
+            .iter()
+            .find(|b| b.id == block_id)
+            .map(|b| b.content.clone())
+            .unwrap();
+        assert_eq!(content, "plain");
     }
 
     /// A ranged read is likewise unreachable (`/v/docs` always passes
