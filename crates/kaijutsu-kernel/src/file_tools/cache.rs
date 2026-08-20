@@ -62,6 +62,16 @@ pub enum FlushError {
     },
     /// An unacknowledged recovered swap (rule 4, `docs/file-buffers.md`).
     UnacknowledgedSwap { path: String },
+    /// `mark_dirty`/`flush_one` was called on a path with no cache entry —
+    /// never loaded, or evicted since. P1 (`docs/issues.md` "Tech-debt
+    /// audits, 2026-08-20"; `docs/audits/2026-08-20-editor-fileio.md` "BUGS
+    /// B2"): the old code treated this as "nothing to flush" and returned
+    /// `Ok(())`, so an editor session whose entry was evicted between open
+    /// and `:w` reported success while writing nothing to disk. Callers that
+    /// hold a durable target (an editor session pins its entry; see
+    /// `docs/file-buffers.md`) should not see this in practice — it firing
+    /// means the pin didn't hold.
+    NotCached { path: String },
     /// A VFS write, a block-store read, or a swap-marker clear failed.
     Backend(String),
 }
@@ -78,6 +88,11 @@ impl std::fmt::Display for FlushError {
                 "{path}: recovered from a swap after a cold cache and not yet \
                  acknowledged — call acknowledge_swap before flushing \
                  (docs/file-buffers.md)"
+            ),
+            FlushError::NotCached { path } => write!(
+                f,
+                "{path}: not in the file-document cache — nothing to flush \
+                 (load it first)"
             ),
             FlushError::Backend(s) => write!(f, "{s}"),
         }
@@ -118,6 +133,13 @@ struct CachedFileDoc {
     /// true, `flush_one` refuses (rule 4, docs/file-buffers.md: not served
     /// as authoritative until acknowledged).
     swap_recovered: bool,
+    /// Count of callers holding this entry pinned against eviction — an
+    /// editor session pins its target for its whole lifetime (see
+    /// `docs/file-buffers.md`), so `evict_if_needed` must never drop an
+    /// entry with `pin_count > 0` even while clean. A count, not a bool,
+    /// because more than one session can bind the same path (two `vi`
+    /// windows on one file). `pin`/`unpin` maintain it; it starts at 0.
+    pin_count: u32,
 }
 
 /// Cache that maps VFS files to kernel documents.
@@ -508,6 +530,7 @@ impl FileDocumentCache {
                             loaded_generation: row.loaded_generation,
                             disk_changed_since_load: false,
                             swap_recovered: true,
+                            pin_count: 0,
                         },
                     );
                     return Ok((ctx_id, existing_block_id));
@@ -544,6 +567,7 @@ impl FileDocumentCache {
                     loaded_generation,
                     disk_changed_since_load: false,
                     swap_recovered: false,
+                    pin_count: 0,
                 },
             );
         }
@@ -641,6 +665,15 @@ impl FileDocumentCache {
     /// edit survives a cold cache — a swallowed failure here means unsaved
     /// work silently stops being recoverable, so the DB error bubbles rather
     /// than being logged and dropped.
+    ///
+    /// Errors — never silently succeeds — when `path` has no cache entry (P1,
+    /// `docs/issues.md` "Tech-debt audits, 2026-08-20"): the old code treated
+    /// a miss as "nothing to mark" and returned `Ok(())`, so an edit to an
+    /// evicted editor buffer recorded no swap row and no error, and the next
+    /// load quietly reconciled the block against disk — the edit vanished
+    /// under an open session. A caller that needs the edit to be recorded
+    /// must load the entry first (`try_get_or_load`/`get_or_load`) or, for a
+    /// target that must survive across calls, pin it (see [`pin`](Self::pin)).
     pub fn mark_dirty(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
         // Set the flag and read back what the DB row needs under one lock
@@ -654,12 +687,16 @@ impl FileDocumentCache {
                 (entry.context_id, entry.loaded_generation)
             })
         };
-        if let Some((entry_ctx_id, loaded_generation)) = entry_info {
-            self.db
-                .lock()
-                .record_dirty_file_buffer(path, entry_ctx_id, loaded_generation)
-                .map_err(|e| format!("mark_dirty({path}): failed to record swap marker: {e}"))?;
-        }
+        let (entry_ctx_id, loaded_generation) = entry_info.ok_or_else(|| {
+            format!(
+                "mark_dirty({path}): not in the file-document cache — the edit was \
+                 NOT recorded (load the file before editing it)"
+            )
+        })?;
+        self.db
+            .lock()
+            .record_dirty_file_buffer(path, entry_ctx_id, loaded_generation)
+            .map_err(|e| format!("mark_dirty({path}): failed to record swap marker: {e}"))?;
         Ok(())
     }
 
@@ -754,6 +791,14 @@ impl FileDocumentCache {
     /// [`flush_one_guarded`](Self::flush_one_guarded). This is the unguarded
     /// primitive every non-editor writer (`create_or_replace`'s callers) uses,
     /// where "flush whatever the buffer holds" is the intended meaning.
+    ///
+    /// Errors with [`FlushError::NotCached`] — never silently succeeds — when
+    /// `path` has no cache entry (P1, `docs/issues.md` "Tech-debt audits,
+    /// 2026-08-20"): the old code treated a miss as "nothing to flush" and
+    /// returned `Ok(())`, which is how an evicted editor buffer's `:w`
+    /// reported success while writing nothing to disk. A path that is cached
+    /// but clean still returns `Ok(())` — that case genuinely has nothing to
+    /// flush, and is not the bug.
     pub async fn flush_one(&self, path: &str) -> Result<(), FlushError> {
         let ctx_id = file_context_id(path);
         let block_id = {
@@ -765,8 +810,12 @@ impl FileDocumentCache {
                     });
                 }
                 Some(entry) if entry.dirty => entry.block_id,
-                Some(_) => return Ok(()), // not dirty
-                None => return Ok(()),    // not cached
+                Some(_) => return Ok(()), // cached, not dirty: nothing to flush
+                None => {
+                    return Err(FlushError::NotCached {
+                        path: path.to_string(),
+                    });
+                }
             }
         };
 
@@ -965,6 +1014,7 @@ impl FileDocumentCache {
                     loaded_generation: None,
                     disk_changed_since_load: false,
                     swap_recovered: false,
+                    pin_count: 0,
                 },
             );
         }
@@ -972,29 +1022,78 @@ impl FileDocumentCache {
         Ok((ctx_id, block_id))
     }
 
-    /// Evict oldest clean entries if cache exceeds max size.
-    /// Dirty entries are never evicted — they must be flushed first.
+    /// Evict oldest clean, unpinned entries if cache exceeds max size. Dirty
+    /// entries are never evicted — they must be flushed first. Pinned entries
+    /// (`pin_count > 0`) are never evicted either, dirty or not — an editor
+    /// session pins its target for its whole open lifetime specifically so a
+    /// clean buffer between open and its first edit can't be swept by
+    /// unrelated reads (P1, `docs/issues.md` "Tech-debt audits, 2026-08-20";
+    /// see [`pin`](Self::pin)).
     fn evict_if_needed(&self, cache: &mut HashMap<ContextId, CachedFileDoc>) {
         while cache.len() >= self.max_cached {
-            // Find oldest non-dirty entry
+            // Find oldest non-dirty, unpinned entry.
             let oldest_clean = cache
                 .iter()
-                .filter(|(_, e)| !e.dirty)
+                .filter(|(_, e)| !e.dirty && e.pin_count == 0)
                 .min_by_key(|(_, e)| e.last_access)
                 .map(|(k, _)| *k);
 
             if let Some(key) = oldest_clean {
                 cache.remove(&key);
             } else {
-                // All entries are dirty — can't evict without data loss.
-                // Allow cache to exceed max until a flush clears dirty flags.
+                // Every entry is dirty or pinned — can't evict without data
+                // loss or breaking a held reference. Allow the cache to
+                // exceed max until a flush clears dirty flags or a session
+                // unpins its entry.
                 tracing::warn!(
                     cache_size = cache.len(),
                     max = self.max_cached,
-                    "All cached file documents are dirty — skipping eviction. Call flush_dirty()."
+                    "All cached file documents are dirty or pinned — skipping eviction. \
+                     Call flush_dirty() or unpin()."
                 );
                 break;
             }
+        }
+    }
+
+    /// Pin a cached entry so [`evict_if_needed`](Self::evict_if_needed) will
+    /// never drop it, regardless of dirty state — the fix for the P1 evicted-
+    /// editor-buffer bug (`docs/issues.md` "Tech-debt audits, 2026-08-20";
+    /// `docs/file-buffers.md`). An editor session calls this once at open
+    /// (after the target is loaded, so an entry to pin actually exists) and
+    /// [`unpin`](Self::unpin) once at close; a ref count, not a bool, because
+    /// more than one session can bind the same path.
+    ///
+    /// Errors if `path` has no cache entry — pinning is meaningless without
+    /// something to protect, and a silent no-op here would recreate exactly
+    /// the bug this exists to close. Callers must load first
+    /// (`try_get_or_load`/`get_or_load`).
+    pub fn pin(&self, path: &str) -> Result<(), String> {
+        let ctx_id = file_context_id(path);
+        let mut cache = self.cache.write();
+        match cache.get_mut(&ctx_id) {
+            Some(entry) => {
+                entry.pin_count += 1;
+                Ok(())
+            }
+            None => Err(format!(
+                "pin({path}): not in the file-document cache — load it first"
+            )),
+        }
+    }
+
+    /// Release one pin taken by [`pin`](Self::pin). A no-op if `path` isn't
+    /// cached (the entry may have been dropped by [`invalidate`](Self::invalidate)
+    /// or [`invalidate_document`](Self::invalidate_document) while pinned —
+    /// those calls remove the entry outright rather than honoring the pin;
+    /// a concurrent writer racing a live editor session is out of P1's
+    /// scope, which is specifically the eviction path) or the count is
+    /// already zero.
+    pub fn unpin(&self, path: &str) {
+        let ctx_id = file_context_id(path);
+        let mut cache = self.cache.write();
+        if let Some(entry) = cache.get_mut(&ctx_id) {
+            entry.pin_count = entry.pin_count.saturating_sub(1);
         }
     }
 }
@@ -1694,6 +1793,143 @@ mod tests {
         assert!(
             matches!(err, FlushError::UnacknowledgedSwap { .. }),
             "expected UnacknowledgedSwap even when forced, got: {err:?}"
+        );
+    }
+
+    // ── P1: an evicted buffer must not make `:w` report success and write
+    // nothing (docs/issues.md "Tech-debt audits, 2026-08-20";
+    // docs/audits/2026-08-20-editor-fileio.md "BUGS B2") ─────────────────────
+
+    /// Baseline case: `mark_dirty`/`flush_one` on a path that was never
+    /// loaded at all must fail loud, not silently succeed. Before the fix
+    /// both returned `Ok(())` with no `dirty_file_buffers` row and no disk
+    /// write.
+    #[tokio::test]
+    async fn mark_dirty_and_flush_one_refuse_a_never_loaded_path() {
+        let (_vfs, cache) = tmp_cache().await;
+
+        let err = cache
+            .mark_dirty("/tmp/never_loaded.txt")
+            .expect_err("mark_dirty on an uncached path must fail, not silently succeed");
+        assert!(
+            err.contains("never_loaded.txt"),
+            "error must name the path: {err}"
+        );
+
+        let err = cache
+            .flush_one("/tmp/never_loaded.txt")
+            .await
+            .expect_err("flush_one on an uncached path must fail, not silently succeed");
+        assert!(
+            matches!(err, FlushError::NotCached { .. }),
+            "expected NotCached, got: {err:?}"
+        );
+    }
+
+    /// The actual P1 scenario, reproduced through the real eviction path
+    /// (`evict_if_needed`, the same LRU sweep every MCP read/kaish `cat`
+    /// drives via `try_get_or_load`'s cache-miss insert) rather than a
+    /// hand-rolled removal: shrink the cap so two more clean reads evict the
+    /// target, then confirm `mark_dirty`/`flush_one` on the now-evicted path
+    /// fail loud instead of quietly doing nothing.
+    #[tokio::test]
+    async fn mark_dirty_and_flush_one_refuse_after_real_eviction() {
+        let (vfs, mut cache) = tmp_cache().await;
+        cache.max_cached = 2;
+
+        vfs.write_all(p("/tmp/evictee.txt"), b"v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/evictee.txt").await.unwrap(), "v1");
+
+        // Two more clean loads push the cache past cap=2 — evict_if_needed
+        // drops the oldest clean entry each time, exactly like an unrelated
+        // MCP read/kaish `cat` would in production.
+        vfs.write_all(p("/tmp/other1.txt"), b"o1").await.unwrap();
+        cache.read_content("/tmp/other1.txt").await.unwrap();
+        vfs.write_all(p("/tmp/other2.txt"), b"o2").await.unwrap();
+        cache.read_content("/tmp/other2.txt").await.unwrap();
+
+        assert!(
+            !cache
+                .cache
+                .read()
+                .contains_key(&file_context_id("/tmp/evictee.txt")),
+            "setup: the target must actually be evicted for this test to mean anything"
+        );
+
+        let err = cache
+            .mark_dirty("/tmp/evictee.txt")
+            .expect_err("mark_dirty on an evicted path must fail, not silently succeed");
+        assert!(err.contains("evictee.txt"), "error must name the path: {err}");
+        assert!(
+            cache
+                .db
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .all(|r| r.path != "/tmp/evictee.txt"),
+            "a refused mark_dirty must not record a swap row"
+        );
+
+        let err = cache
+            .flush_one("/tmp/evictee.txt")
+            .await
+            .expect_err("flush_one on an evicted path must fail, not silently succeed");
+        assert!(
+            matches!(err, FlushError::NotCached { .. }),
+            "expected NotCached, got: {err:?}"
+        );
+        assert_eq!(
+            String::from_utf8(vfs.read_all(p("/tmp/evictee.txt")).await.unwrap()).unwrap(),
+            "v1",
+            "a refused flush must not touch disk"
+        );
+    }
+
+    /// `pin` protects a clean entry from eviction even under cache pressure
+    /// that would otherwise drop it (cap=1); `unpin` releases that
+    /// protection so ordinary LRU resumes. This is the fix editor sessions
+    /// use (`Kernel::editor_open_as`/`editor_quit`) to close the P1 hole.
+    #[tokio::test]
+    async fn pin_protects_a_clean_entry_from_eviction_then_unpin_releases_it() {
+        let (vfs, mut cache) = tmp_cache().await;
+        cache.max_cached = 1;
+
+        vfs.write_all(p("/tmp/pinned.txt"), b"v1").await.unwrap();
+        cache.read_content("/tmp/pinned.txt").await.unwrap();
+        cache.pin("/tmp/pinned.txt").expect("pin a cached entry");
+
+        // A second clean load would normally evict the only slot (cap=1) —
+        // the pin must stop it.
+        vfs.write_all(p("/tmp/other.txt"), b"o1").await.unwrap();
+        cache.read_content("/tmp/other.txt").await.unwrap();
+
+        assert!(
+            cache
+                .cache
+                .read()
+                .contains_key(&file_context_id("/tmp/pinned.txt")),
+            "a pinned entry must survive eviction pressure"
+        );
+        // mark_dirty succeeding (not NotCached) proves the entry is still
+        // the SAME one — not silently evicted and reloaded fresh.
+        cache
+            .mark_dirty("/tmp/pinned.txt")
+            .expect("pinned entry must still be cached");
+        cache.flush_one("/tmp/pinned.txt").await.unwrap();
+
+        cache.unpin("/tmp/pinned.txt");
+
+        // With the pin released, one more clean load evicts the
+        // now-least-recently-used pinned.txt under the same cap=1 pressure.
+        vfs.write_all(p("/tmp/other2.txt"), b"o2").await.unwrap();
+        cache.read_content("/tmp/other2.txt").await.unwrap();
+        assert!(
+            !cache
+                .cache
+                .read()
+                .contains_key(&file_context_id("/tmp/pinned.txt")),
+            "unpin must restore ordinary LRU eviction"
         );
     }
 }

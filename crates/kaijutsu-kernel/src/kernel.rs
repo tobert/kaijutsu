@@ -218,14 +218,37 @@ fn default_flow_capacity() -> usize {
 /// read, and three hand-copied versions drift.
 ///
 /// W12 is vim's "changed since reading it": disk moved past the buffer's load
-/// generation, so a plain `:w` refuses and `:w!` overrides. Everything else is
-/// a genuine write failure and reads as E212. See `docs/file-buffers.md`.
-fn flush_error_message(path: &str, err: &crate::file_tools::cache::FlushError) -> String {
+/// generation, so a plain `:w` refuses and `:w!` overrides.
+/// `UnacknowledgedSwap` and `NotCached` each get their own message — every
+/// non-W12 case used to collapse into one "E212: Can't open file for
+/// writing" that also interpolated the `FlushError`'s own text, which for
+/// `UnacknowledgedSwap` and `NotCached` names internal call sites
+/// (`docs/audits/2026-08-20-editor-fileio.md` "BUGS B2"). Only `Backend`
+/// (a genuine write/store failure) still reads as E212. `kernel_id` names
+/// the `/v/swap` mount this kernel's own recovered buffers live under. See
+/// `docs/file-buffers.md`.
+fn flush_error_message(
+    path: &str,
+    err: &crate::file_tools::cache::FlushError,
+    kernel_id: kaijutsu_types::KernelId,
+) -> String {
+    use crate::file_tools::cache::FlushError;
     match err {
-        crate::file_tools::cache::FlushError::DiskChanged { .. } => {
+        FlushError::DiskChanged { .. } => {
             format!("W12: {path} changed on disk since it was read (add ! to override)")
         }
-        other => format!("E212: Can't open file for writing: {path}: {other}"),
+        FlushError::UnacknowledgedSwap { .. } => format!(
+            "{path}: a recovered unsaved buffer is waiting at {}/{}{path} \
+             (docs/file-buffers.md) — `kj swap ack {path}` keeps it and allows \
+             the write, or `kj swap discard {path}` drops it",
+            kaijutsu_types::paths::SWAP_ROOT,
+            kernel_id.to_hex(),
+        ),
+        FlushError::NotCached { .. } => format!(
+            "{path}: the buffer was evicted from the file cache before this write \
+             reached it — the edit was NOT saved; reopen the file and redo the change"
+        ),
+        FlushError::Backend(_) => format!("E212: Can't open file for writing: {path}: {err}"),
     }
 }
 impl Kernel {
@@ -1298,6 +1321,16 @@ impl Kernel {
     /// on the session, so `fg` can re-foreground it for that principal and
     /// `:r !cmd` can shell out in the opener's context. The signaled front doors
     /// (`vi`/`edit`, `kj editor`, `kj rc edit`) pass the caller here.
+    ///
+    /// For a **file-backed** target (not config/rc): pins the file-document
+    /// cache entry for the session's lifetime (P1, `docs/issues.md` "Tech-debt
+    /// audits, 2026-08-20"; `docs/file-buffers.md`). Before this, a session
+    /// held no reference into the cache, so unrelated reads of *other* paths
+    /// could evict its entry while the buffer sat clean — `mark_dirty`/
+    /// `flush_one` then silently no-op'd on the now-uncached path, so `:w`
+    /// reported success and wrote nothing. `editor_keys`' `Closed` arm and
+    /// [`editor_quit`](Self::editor_quit) release the pin when the session
+    /// closes.
     pub async fn editor_open_as(
         &self,
         path: &str,
@@ -1310,7 +1343,18 @@ impl Kernel {
         // the authority on what owns the path (config-doc backend vs. file).
         let target =
             crate::editor::resolve_editor_target(path, blocks, &file_cache, self.vfs()).await?;
-        self.editor_sessions.lock().0.open(path, target, blocks, opener)
+        // Config/rc targets have no file-cache entry to pin — resolve_editor_target
+        // bound straight to the ConfigDocFs block, never touching file_cache.
+        let file_backed = !crate::editor::config_owned(path);
+        if file_backed {
+            file_cache.pin(path)?;
+        }
+        let opened = self.editor_sessions.lock().0.open(path, target, blocks, opener);
+        if opened.is_err() && file_backed {
+            // The session never came to exist — don't leak the pin.
+            file_cache.unpin(path);
+        }
+        opened
     }
 
     /// Feed keys to an open session, mirroring the edits onto the kernel block.
@@ -1434,7 +1478,7 @@ impl Kernel {
                                 // that recovers as an unacknowledged swap —
                                 // the wrong error for a player retrying a
                                 // write that just failed.
-                                state.message = Some(flush_error_message(fp, &e));
+                                state.message = Some(flush_error_message(fp, &e, self.id()));
                             } else {
                                 state = self.editor_sessions.lock().0.save(id)?;
                             }
@@ -1473,10 +1517,15 @@ impl Kernel {
                     && let Err(e) =
                         self.file_cache.flush_one_guarded(fp, update.forced).await
                 {
-                    Some(flush_error_message(fp, &e))
+                    Some(flush_error_message(fp, &e, self.id()))
                 } else {
                     None
                 };
+                // The session is gone either way — release the pin taken at
+                // open (`editor_open_as`) so eviction can reclaim the entry.
+                if let Some(fp) = file_path.as_deref() {
+                    self.file_cache.unpin(fp);
+                }
                 self.editor_flows.publish(crate::flows::EditorFlow::Closed {
                     session_id: id.as_u64(),
                 });
@@ -1591,7 +1640,7 @@ impl Kernel {
                 // plain `:w` and refuses on the W12 changed-under-us
                 // condition (docs/file-buffers.md rule 3).
                 if let Err(e) = self.file_cache.flush_one_guarded(fp, false).await {
-                    state.message = Some(flush_error_message(fp, &e));
+                    state.message = Some(flush_error_message(fp, &e, self.id()));
                 } else {
                     state = self.editor_sessions.lock().0.save(id)?;
                 }
@@ -1607,12 +1656,19 @@ impl Kernel {
     /// `ZQ` — roll the block back to the session's checkpoint and close it.
     /// Publishes `Closed` so renderers drop the session.
     pub fn editor_quit(&self, id: crate::editor::EditorSessionId) -> Result<(), String> {
-        let path = {
+        let (path, file_path) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
+            let file_path = sessions.0.file_backed_path(id);
             sessions.0.quit(id, self.blocks())?;
-            path
+            (path, file_path)
         };
+        // The session is gone — release the pin taken at open
+        // (`editor_open_as`, docs/file-buffers.md P1) so eviction can
+        // reclaim the entry.
+        if let Some(fp) = file_path.as_deref() {
+            self.file_cache.unpin(fp);
+        }
         // The rollback wrote the block; drop the file cache's stale shadow.
         if let Some(path) = path.as_deref() {
             self.invalidate_config_file_cache(path);
@@ -2804,6 +2860,103 @@ mod tests {
                 .all(|r| r.path != "/mem/note.txt"),
             "the swap row must clear once the retry lands"
         );
+    }
+
+    // ── P1: an evicted editor buffer must not make `:w` report success and
+    // write nothing (docs/issues.md "Tech-debt audits, 2026-08-20";
+    // docs/audits/2026-08-20-editor-fileio.md "BUGS B2") ─────────────────────
+
+    /// Before the fix, an editor session held no reference into the file
+    /// cache, so ordinary reads of *other* paths (every MCP read/kaish `cat`
+    /// inserts a cache entry) could evict the session's own clean entry
+    /// while it sat idle between open and its first edit. `mark_dirty` and
+    /// `flush_one` then silently no-op'd on the now-uncached path — `:w`
+    /// reported success while nothing reached disk.
+    ///
+    /// Reproduces the real eviction pressure (not a hand-rolled removal):
+    /// open a session, then read 80 unrelated files through the *same*
+    /// shared `FileDocumentCache` — well past `DEFAULT_MAX_CACHED` (64) —
+    /// exactly the "64 other files get read" scenario the bug report
+    /// describes. The fix (`editor_open_as` pins the session's entry) must
+    /// make it survive that pressure, so the eventual `:w` actually reaches
+    /// disk.
+    #[tokio::test]
+    async fn editor_session_survives_cache_pressure_that_would_have_evicted_it() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/note.txt");
+        kernel.vfs().write_all(path, b"hello").await.unwrap();
+
+        let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+
+        for i in 0..80 {
+            let other = format!("/mem/other{i}.txt");
+            kernel
+                .vfs()
+                .write_all(Path::new(&other), b"x")
+                .await
+                .unwrap();
+            kernel.file_cache().read_content(&other).await.unwrap();
+        }
+
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+
+        // The pin (not a fallback reload) is the fix: `:w` must succeed
+        // outright, never merely fail loud instead of silently no-op'ing.
+        assert!(
+            !st.dirty,
+            "the session's cache entry must survive eviction pressure from \
+             unrelated reads — :w reported a failure instead of succeeding: {:?}",
+            st.message
+        );
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
+            "Xhello",
+            ":w reported clean but the edit never reached disk — the P1 \
+             evicted-buffer bug"
+        );
+    }
+
+    /// The pin releases when the session closes: after `:wq`, the same path
+    /// is just an ordinary clean cache entry again and ordinary eviction
+    /// pressure can reclaim it. Guards against the fix leaking a pin forever.
+    #[tokio::test]
+    async fn editor_quit_releases_the_pin_so_the_entry_can_be_evicted_again() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/note.txt");
+        kernel.vfs().write_all(path, b"hello").await.unwrap();
+
+        let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id, ":wq<CR>").await.unwrap();
+
+        for i in 0..80 {
+            let other = format!("/mem/other{i}.txt");
+            kernel
+                .vfs()
+                .write_all(Path::new(&other), b"x")
+                .await
+                .unwrap();
+            kernel.file_cache().read_content(&other).await.unwrap();
+        }
+
+        // A fresh mark_dirty on the (now unpinned, possibly evicted) path
+        // must fail — proving the released entry is treated the same as any
+        // other uncached path, not left permanently pinned.
+        let err = kernel
+            .file_cache()
+            .mark_dirty("/mem/note.txt")
+            .expect_err(
+                "an uncached path (evicted after the pin released) must \
+                 refuse mark_dirty, not silently succeed",
+            );
+        assert!(err.contains("note.txt"), "error must name the path: {err}");
     }
 
     #[tokio::test]
