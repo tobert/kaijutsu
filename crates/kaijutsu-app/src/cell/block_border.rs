@@ -67,8 +67,8 @@ impl Default for BorderPadding {
 
 /// Measured label gap positions (pixel coordinates within the block texture).
 ///
-/// Computed during `build_block_scenes()` where font metrics are available.
-/// Read by `sync_block_fx()` to populate the `label_gaps` shader uniform.
+/// Computed where font metrics are available. Read by `sync_block_fx()`
+/// to populate the `label_gaps` shader uniform.
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq, Reflect)]
 #[reflect(Component)]
 pub struct BorderLabelMetrics {
@@ -101,10 +101,9 @@ pub enum BorderKind {
     /// Left + right + bottom edges, horizontal divider at top (tool result connected to call above).
     OpenTop,
     /// A single full-width horizontal rule through the node's vertical
-    /// center — no box, no insets. Used only by the role-group divider
-    /// (`view::block_render::sync_role_group_headers`); the label straddles
-    /// a gap in the line via the same `label_gaps` mechanism as fieldset
-    /// labels.
+    /// center — no box, no insets. Used only by the role-group divider; the
+    /// label straddles a gap in the line via the same `label_gaps`
+    /// mechanism as fieldset labels.
     CenterLine,
 }
 
@@ -470,7 +469,7 @@ pub fn compute_border_style(
 ///
 /// - A block that already has a border keeps its kind, labels, animation,
 ///   and — critically — its padding; only the stroke color changes.
-///   Padding feeds text layout in `build_block_scenes`.
+///   Padding feeds text layout on the surface path.
 /// - A borderless block gains a minimal ring with ZERO padding — the same
 ///   clearance as no border at all, drawn purely by the `block_fx` shader.
 pub fn apply_focus_style(

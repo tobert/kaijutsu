@@ -18,7 +18,8 @@
 //!    and a second copy is exactly the A/B difference nobody can attribute.
 //! 2. **Placement** ([`top_label_placement`], [`bottom_label_placement`],
 //!    [`checkbox_placement`]) — pure arithmetic over a measured run and a
-//!    border rect, ported from `view/block_render.rs`'s label block. The same
+//!    border rect, ported from the deleted per-block-cell renderer's label
+//!    placement (see `docs/conversation-surface.md`). The same
 //!    functions feed *both* consumers: `window::assemble_runs` positions the
 //!    glyphs, `chrome::collect_chrome_instances` cuts the stroke gap. One
 //!    arithmetic, so a label can never sit off its own gap.
@@ -57,14 +58,13 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 
 /// Clearance between the checkbox glyph and the border box's right edge.
 ///
-/// `build_block_scenes` hardcodes `4.0` (`view/block_render.rs`, the gutter
-/// checkbox block); kept as a named constant here so the two can be compared
-/// rather than grepped for.
+/// A named constant rather than a bare literal, so a future change to the
+/// clearance is a one-line diff instead of a grep for `4.0`.
 pub const CHECKBOX_RIGHT_MARGIN: f32 = 4.0;
 
 /// Alpha the checkbox draws at — dimmer when the block is *included*, because
 /// an included block is the unremarkable case and the mark is a reassurance,
-/// not a warning. Legacy's numbers, unchanged.
+/// not a warning.
 const CHECKBOX_ALPHA_INCLUDED: f32 = 0.3;
 const CHECKBOX_ALPHA_EXCLUDED: f32 = 0.5;
 
@@ -80,11 +80,9 @@ pub struct LabelSpec<'a> {
 
 /// Everything a block draws in glyphs *outside* its own text.
 ///
-/// The checkbox is not `Option`: legacy draws it on **every** block, bordered
-/// or not (the gutter block in `build_block_scenes` sits outside the
-/// `if let Some(border_style)` that guards the labels), and a checkbox that
-/// appeared only on tool calls would make exclusion invisible on exactly the
-/// blocks people exclude most.
+/// The checkbox is not `Option`: every block draws one, bordered or not, and
+/// a checkbox that appeared only on tool calls would make exclusion
+/// invisible on exactly the blocks people exclude most.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlockLabelSpec<'a> {
     pub top: Option<LabelSpec<'a>>,
@@ -102,7 +100,7 @@ pub fn checkbox_char(excluded: bool) -> &'static str {
 ///
 /// `border` is the **unfocused** style color, which already carries the
 /// exclusion dim `compute_border_style` applies — so an excluded block's
-/// checkbox is both hollow *and* dimmer, exactly as legacy draws it.
+/// checkbox is both hollow *and* dimmer.
 pub fn checkbox_color(border: Option<Color>, excluded: bool) -> Color {
     let alpha = if excluded {
         CHECKBOX_ALPHA_EXCLUDED
@@ -228,11 +226,11 @@ pub fn bottom_label_placement(
 /// Place the gutter checkbox: against the box's right edge, vertically
 /// centered on the whole block.
 ///
-/// **Right edge, not top-left.** That is where `build_block_scenes` puts it
-/// (`cb_x = width - cb_w - 4`, `cb_y = (total_height - cb_h) / 2`) and what
-/// the border's extra right padding (`base * 1.5` in `compute_border_style`)
-/// exists to reserve. It carries no gap: the checkbox sits inside the box, not
-/// on its stroke.
+/// **Right edge, not top-left.** `cb_x = width - cb_w -
+/// CHECKBOX_RIGHT_MARGIN`, `cb_y = (total_height - cb_h) / 2` — matching the
+/// border's extra right padding (`base * 1.5` in `compute_border_style`),
+/// which exists to reserve room for it. It carries no gap: the checkbox sits
+/// inside the box, not on its stroke.
 pub fn checkbox_placement(
     glyph_width: f32,
     glyph_height: f32,
@@ -685,8 +683,7 @@ mod tests {
     }
 
     /// The checkbox rides the box's right edge, vertically centered — the
-    /// gutter the border's extra right padding reserves. Position parity with
-    /// `build_block_scenes`.
+    /// gutter the border's extra right padding reserves.
     #[test]
     fn the_checkbox_sits_in_the_right_gutter() {
         let p = checkbox_placement(10.0, 12.0, 400.0, 60.0);

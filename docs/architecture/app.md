@@ -1,7 +1,12 @@
 # The app
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-app` — the Bevy
-0.18 GUI and its render pipeline. Code is truth; verified 2026-06-16.*
+GUI and its render pipeline. Code is truth; this page predates the
+conversation-surface rewrite (`docs/conversation-surface.md`) and has not been
+refreshed against it — the "Render pipeline" section below and the `view/`
+module map describe the per-block-cell texture path that editor, dock, diff
+view and the overlay still use, not the conversation surface itself (see
+`view/surface/mod.rs`'s module doc for that one).*
 
 `kaijutsu-app` connects to a remote kernel over SSH (via `kaijutsu-client`),
 maintains a multi-context document mirror, and renders conversation blocks as
@@ -33,13 +38,18 @@ background (`main.rs:181`).
   `cell/block_border.rs` (`BlockBorderStyle` and friends — per-block border data).
 - **`view/`** — the functional heart of the conversation screen:
   - `components.rs` — all ECS components/resources (`CellEditor` = per-block DTE
-    store + cursor, `BlockCell`, `BlockCellContainer` = `IndexMap<BlockId,Entity>`,
-    `FocusTarget`, `InputOverlay`, `GlobalErrorQueue`, …).
+    store + cursor, `BlockCell`, `FocusTarget`, `InputOverlay`,
+    `GlobalErrorQueue`, …). `BlockCellContainer` is gone with the deleted
+    per-block-cell conversation renderer.
   - `document.rs` — `DocumentCache` (`HashMap<ContextId, CachedDocument>`, LRU cap
     8) wrapping `SyncedDocument` + optional `SyncedInput`.
   - `block_render.rs` — `BlockScene` (now misnamed: holds version/text/color, *not*
-    a scene), `build_block_scenes` (dispatch per `RichContentKind`),
-    `resize_block_textures`, and the MSDF extract/render systems.
+    a scene), `resize_block_textures`, `render_msdf_block_textures`, and the
+    MSDF extract systems. Each still-live consumer (editor, dock, diff view,
+    overlay) now shapes and writes its own `MsdfBlockGlyphs`/`MsdfBlockGeometry`
+    directly rather than through one shared dispatch function.
+  - `surface/` — the conversation's own renderer; not covered by this page,
+    see its module doc.
   - `vello_rasterizer.rs` / `vello_ui_texture.rs` — the shared `vello::Renderer`
     (`Arc<Mutex>`) and the `VelloUiScene`/`VelloUiTexture` Scene→texture primitive.
   - `lifecycle.rs` — spawns block-cell bundles (`BlockCell, BlockScene,
@@ -94,12 +104,13 @@ background (`main.rs:181`).
 
 Block cells render in two passes sharing one `vello::Renderer`:
 
-**Pass 1 — vello rasterization.** PostUpdate `build_block_scenes` inspects each
-cell's `RichContentKind`: `Svg` (via `vello_svg`), `Abc` (via
-`kaijutsu_abc::engrave`), and `Sparkline` append to `VelloUiScene.scene` and set
-`render_method = Vello`; `Markdown`/`Output`/plain run Parley → `collect_msdf_glyphs`
-and set `render_method = Msdf` (leaving `ui_scene.version == 0` so vello extract
-skips them); `Image` draws a placeholder. Border/label glyphs always go to MSDF.
+**Pass 1 — vello rasterization.** Each consumer (editor, dock, diff view,
+overlay) inspects its cell's `RichContentKind`: `Svg` (via `vello_svg`), `Abc`
+(via `kaijutsu_abc::engrave`), and `Sparkline` append to `VelloUiScene.scene`
+and set `render_method = Vello`; `Markdown`/`Output`/plain run Parley →
+`collect_msdf_glyphs` and set `render_method = Msdf` (leaving
+`ui_scene.version == 0` so vello extract skips them); `Image` draws a
+placeholder. Border/label glyphs always go to MSDF.
 `resize_block_textures` computes physical dims and reallocates the `Image` (hard
 cap 8192 px). The render world extracts dirty scenes (version-gated) and
 `render_vello_scenes` rasterizes to texture.

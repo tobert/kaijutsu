@@ -28,9 +28,8 @@ use kaijutsu_types::{BlockId, BlockKind, Role};
 
 /// Identity of a geometry row: a block, or the role header shown before it.
 ///
-/// A header is keyed by the block it precedes (same convention as
-/// `RoleGroupBorder.block_id`), so header rows survive reconciles as long as
-/// the same block still starts its role run.
+/// A header is keyed by the block it precedes, so header rows survive
+/// reconciles as long as the same block still starts its role run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowKey {
     /// Role header preceding this block.
@@ -72,13 +71,13 @@ pub struct GeomRow {
     /// Document version when this row was first created.
     ///
     /// Currently write-only: it fed `TimelineVisibility.created_at_version`
-    /// seeding in the legacy per-block-cell path (block-cell entities carried
-    /// the timeline-dimming component; a respawned/scrolled-back-into-view
-    /// block reused this to avoid being mis-classified as new), which slice 5
-    /// deleted. The conversation surface never grew an equivalent — timeline
-    /// dimming has had no live reader since `Surface` became the default
-    /// (slice 4); see `docs/issues.md`. Kept because it costs nothing to
-    /// carry and is what a reimplementation would read from first.
+    /// seeding in the deleted per-block-cell path (block-cell entities
+    /// carried the timeline-dimming component; a respawned/scrolled-back-
+    /// into-view block reused this to avoid being mis-classified as new).
+    /// The conversation surface never grew an equivalent — timeline dimming
+    /// has had no live reader since `Surface` became the default; see
+    /// `docs/issues.md`. Kept because it costs nothing to carry and is what
+    /// a reimplementation would read from first.
     #[allow(dead_code)]
     pub created_at_version: u64,
 }
@@ -174,7 +173,6 @@ pub struct ConversationGeometry {
     /// immediately precede their block row).
     block_index: HashMap<BlockId, usize>,
     /// Total document height: `sum(height + margin_bottom)` over all rows.
-    /// Matches what `readback_block_heights` historically computed.
     pub content_height: f32,
     /// Document version at the last reconcile (the reconcile gate).
     pub last_doc_version: u64,
@@ -238,8 +236,7 @@ impl ConversationGeometry {
     /// Rows tile the document with no gaps — a row's bottom edge
     /// (`y_offset + height + margin_bottom`) *is* the next row's `y_offset`,
     /// which makes both edges of the band a binary search over a monotone
-    /// predicate rather than a walk. Margin is part of the row's extent here,
-    /// the same as in [`plan_block_band`].
+    /// predicate rather than a walk. Margin is part of the row's extent here.
     ///
     /// The band is half-open: a row whose bottom edge lands exactly on
     /// `band_top`, or whose top lands exactly on `band_bottom`, contributes
@@ -391,9 +388,9 @@ impl ConversationGeometry {
         structure_changed |= !old_headers.is_empty();
 
         // Margin pass: a ToolCall immediately followed (in block order) by a
-        // ToolResult joins seamlessly (OpenBottom → zero gap) — mirrors
-        // `update_block_cell_nodes`. Only estimated margins are touched;
-        // measured rows keep the live margin recorded at measure time.
+        // ToolResult joins seamlessly (OpenBottom → zero gap). Only
+        // estimated margins are touched; measured rows keep the live margin
+        // recorded at measure time.
         let mut prev_block: Option<usize> = None;
         for i in 0..rows.len() {
             let RowKey::Block(_) = rows[i].key else {

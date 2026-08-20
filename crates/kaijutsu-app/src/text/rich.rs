@@ -11,9 +11,9 @@
 //!   first N lines, semantically colored from the theme (`text::diff` builds
 //!   the preview; this module only maps its classes to brushes)
 //!
-//! Detection is centralized in `detect_rich_content()` — tries sparkline first
-//! (more specific fence pattern), then SVG, then a ` ```diff ` fence, then
-//! falls back to markdown.
+//! Detection is centralized in `detect_rich_content_typed()` — tries sparkline
+//! first (more specific fence pattern), then SVG, then a ` ```diff ` fence,
+//! then falls back to markdown.
 
 use bevy::prelude::*;
 use peniko::Brush;
@@ -502,18 +502,6 @@ pub(crate) fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a 
         return None;
     }
     Some(inner)
-}
-
-/// Detect rich content from a block's text.
-///
-/// When `content_type` is provided, skips heuristic detection and uses the
-/// declared type directly. Falls back to sniffing when `content_type` is `None`.
-#[allow(dead_code)]
-pub fn detect_rich_content(text: &str) -> Option<RichContent> {
-    // No block status available at this (unused) call site — `is_streaming`
-    // only changes which diagnostic a parse failure logs, not behavior, so
-    // `false` ("treat as at rest") is a safe default here.
-    detect_rich_content_typed(text, ContentType::Plain, None, false)
 }
 
 /// Fingerprint of every input the detectors above read for one block.

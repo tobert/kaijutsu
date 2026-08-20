@@ -525,7 +525,7 @@ pub struct ConversationScrollState {
     /// Set to false when user manually scrolls up.
     pub following: bool,
     /// Set when new block entities are spawned this frame.
-    /// Consumed by readback_block_heights (PostUpdate) to compute the scroll anchor.
+    /// Consumed by `apply_shaped_measurements` to compute the scroll anchor.
     pub new_blocks_added: bool,
     /// When new blocks are added, this holds the content height *before* the new
     /// blocks were measured. smooth_scroll uses min(max, anchor) so the viewport
@@ -638,18 +638,18 @@ impl ConversationScrollState {
     }
 
     /// Drop a leftover `pending_scroll_anchor` when explicitly (re-)engaging
-    /// follow (found by kaibo/qwen review, 2026-08-16). `readback_block_heights`
-    /// (`view/render.rs`) unconditionally sets the anchor whenever new blocks
-    /// are added, but `smooth_scroll` only ever drains it while `following`
-    /// is true — so blocks streaming in while the user is scrolled away
-    /// leave a stale anchor sitting here (repeatedly overwritten, never
-    /// consumed). Without this, the *next* time the user explicitly returns
-    /// to the bottom, `smooth_scroll` would consume that stale anchor and
-    /// land them at `anchor.min(max)` — partway through the conversation,
-    /// not the bottom they just asked for (they'd have to press it twice).
-    /// Every site that flips `following` on from an explicit user action
-    /// calls this; the streaming-while-following case is unaffected because
-    /// `smooth_scroll` drains a fresh anchor the same frame it's set.
+    /// follow. `apply_shaped_measurements` unconditionally sets the anchor
+    /// whenever new blocks are added, but `smooth_scroll` only ever drains
+    /// it while `following` is true — so blocks streaming in while the user
+    /// is scrolled away leave a stale anchor sitting here (repeatedly
+    /// overwritten, never consumed). Without this, the *next* time the user
+    /// explicitly returns to the bottom, `smooth_scroll` would consume that
+    /// stale anchor and land them at `anchor.min(max)` — partway through the
+    /// conversation, not the bottom they just asked for (they'd have to
+    /// press it twice). Every site that flips `following` on from an
+    /// explicit user action calls this; the streaming-while-following case
+    /// is unaffected because `smooth_scroll` drains a fresh anchor the same
+    /// frame it's set.
     fn clear_stale_scroll_anchor(&mut self) {
         self.pending_scroll_anchor = None;
     }
@@ -842,9 +842,9 @@ mod tests {
         assert!(state.following);
     }
 
-    /// Stale-anchor regression (found by kaibo/qwen review, 2026-08-16):
-    /// `readback_block_heights` (`view/render.rs`) sets `pending_scroll_anchor`
-    /// whenever new blocks are added, regardless of `following` — but
+    /// Stale-anchor regression: `apply_shaped_measurements` sets
+    /// `pending_scroll_anchor` whenever new blocks are added, regardless of
+    /// `following` — but
     /// `smooth_scroll` only ever drains it while following. Blocks streaming
     /// in while the user is scrolled away leave a stale anchor sitting here.
     /// Without clearing it, the next explicit "go to bottom" would have

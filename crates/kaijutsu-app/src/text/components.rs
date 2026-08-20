@@ -6,9 +6,8 @@ use bevy::prelude::*;
 ///
 /// When present, the text brush uses a gradient instead of a solid color.
 ///
-/// Unused as of slice 5 (conversation-surface decapitation, 2026-08-18):
-/// this and [`rainbow_brush`] were the legacy per-block-cell path's plumbing
-/// for `Theme::font_rainbow` (default **on**), and that path is gone. The
+/// Unused: this and [`rainbow_brush`] were the deleted per-block-cell
+/// path's plumbing for `Theme::font_rainbow` (default **on**). The
 /// conversation surface (`view::surface::content`) never grew an equivalent
 /// — `font_rainbow` is now a theme knob with no renderer behind it. Kept
 /// (not deleted) as the reference implementation for whoever ports it;

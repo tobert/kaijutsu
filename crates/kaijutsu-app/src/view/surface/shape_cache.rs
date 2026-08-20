@@ -13,9 +13,8 @@
 //! and atlas version most importantly — the first is a uniform, the second
 //! only re-resolves UVs).
 //!
-//! **Slice 3 scope** (slice 1 built the cache; this is what it grew into).
-//! Four rules now sit on top of the key comparison, and each one exists to
-//! keep a different cost off the frame:
+//! Four rules sit on top of the key comparison, and each one exists to keep
+//! a different cost off the frame:
 //!
 //! - **Sync only where it shows.** Rows within [`SYNC_SLACK_SCREENS`] of the
 //!   viewport shape on the main thread, because a placeholder there is a
@@ -305,8 +304,7 @@ pub struct ShapedBlock {
     pub key: ShapeKey,
     pub chunks: Vec<ShapedChunk>,
     /// The row height the geometry measures: text height **plus** the border
-    /// padding above and below it, matching legacy's
-    /// `content_height + pad_top + pad_bottom` (`build_block_scenes`).
+    /// padding above and below it — `content_height + pad_top + pad_bottom`.
     pub height: f32,
     /// Sum of the chunk heights — the text alone.
     pub text_height: f32,
@@ -377,10 +375,7 @@ pub struct ShapedBlock {
     /// j/k focus ring recolors the stroke and leaves the captions alone. The
     /// alternative — re-shaping every label in the focus color — would put
     /// focus back on the glyph path and re-upload a screenful of glyphs per
-    /// keystroke. Legacy behaves the same way for a different reason: its
-    /// labels are baked into the block texture, which only rebuilds when the
-    /// block's *content* version moves, so a focus change never repaints them
-    /// there either.
+    /// keystroke.
     pub labels: super::labels::BlockLabels,
 }
 
@@ -504,7 +499,7 @@ pub struct ShapedLabel {
     /// `role_divider::compute_role_divider_layout`).
     pub x_offset: f32,
     /// Top of the label within the header row — the label is vertically
-    /// centered on the divider line, matching `sync_role_group_headers`.
+    /// centered on the divider line.
     pub y_offset: f32,
     pub width: f32,
     /// Measured label height. Unread on the drawing path — the label is
@@ -587,7 +582,7 @@ impl HeaderLabelCache {
 /// columns (`geometry.rs:591-598`): the conversation container's
 /// **content-box width in logical px**, so every unit in this model — row
 /// heights, scroll offsets, wrap widths — comes from one source. Indent
-/// (`update_block_cell_nodes`'s left margin) comes off the top.
+/// comes off the top.
 ///
 /// This is the *column*, not the wrap width: a bordered block also loses its
 /// glow margin and its padding, which `super::chrome::surface_block_layout`
@@ -596,9 +591,7 @@ pub fn surface_wrap_width(container_width: f32, indent_level: u32, indent_width:
     (container_width - indent_level as f32 * indent_width).max(1.0)
 }
 
-/// The block-text style, matching `build_block_scenes`' plain-text arm
-/// (`view/block_render.rs:660-668`) so heights land where the legacy path
-/// puts them.
+/// The block-text style used for a block's plain text.
 pub fn block_text_style(text_metrics: &TextMetrics, brush: Brush) -> VelloTextStyle {
     VelloTextStyle {
         brush,
@@ -1384,8 +1377,7 @@ pub fn shape_visible_blocks(
                     continue;
                 };
                 // Chrome decides the wrap width: a bordered block's text is
-                // laid out inside its padding, exactly as `build_block_scenes`
-                // lays it out inside the same padding on the legacy path.
+                // laid out inside its padding.
                 let layout =
                     caches
                         .chrome
@@ -1686,10 +1678,10 @@ fn shape_tail(
 
 /// Drop least-recently-used shaped blocks until the cache fits its budget.
 ///
-/// The pinned window is `DESPAWN_MARGIN_SCREENS` on each side — the same
-/// hysteresis band the legacy entity lifecycle uses, and deliberately much
-/// wider than the shape band, so a block does not get evicted and re-shaped by
-/// scrolling one screen back and forth. Streaming blocks are pinned wherever
+/// The pinned window is `DESPAWN_MARGIN_SCREENS` on each side, deliberately
+/// much wider than the shape band, so a block does not get evicted and
+/// re-shaped by scrolling one screen back and forth. Streaming blocks are
+/// pinned wherever
 /// they sit: evicting one would throw away the frozen chunks the incremental
 /// tail is built on, and the next tick would re-shape the whole thing.
 ///
@@ -1726,7 +1718,7 @@ fn evict_shaped_blocks(
 }
 
 /// Shape (once per role per metrics epoch) the USER/ASSISTANT/… label a role
-/// header draws, positioned exactly where `sync_role_group_headers` puts it.
+/// header draws.
 fn shape_role_label(
     font: &VelloFont,
     role: Role,
@@ -1800,9 +1792,6 @@ fn shape_role_label(
 
 /// Apply a batch of row measurements and report the scroll anchor delta.
 ///
-/// The pure seam the plan calls for: everything `readback_block_heights`
-/// (`view/render.rs:693-745`) does with taffy's numbers, minus taffy.
-///
 /// `anchor_delta` accumulates the height change of every row **fully above
 /// `viewport_top`**, compared against **pre-measure** offsets — the offsets
 /// the current scroll position was itself computed against. The predicate is
@@ -1849,8 +1838,8 @@ fn row_extent(geom: &ConversationGeometry, key: RowKey) -> Option<(f32, f32)> {
 /// bookkeeping it maintains is consumed by `smooth_scroll` on the NEXT
 /// frame, the same phase relationship the legacy PostUpdate readback had.
 ///
-/// **Margins come from the geometry's own model**, not from a mirror of
-/// `update_block_cell_nodes`: `reconcile` already decides them (block
+/// **Margins come from the geometry's own model**, not from a mirrored
+/// per-block computation: `reconcile` already decides them (block
 /// spacing, the zero gap that joins a ToolCall to its ToolResult, role-header
 /// spacing) from the theme, and re-deriving them here would be a second
 /// source of truth for the same number. So each measurement passes the row's
@@ -1871,11 +1860,10 @@ pub fn apply_shaped_measurements(
         return;
     };
 
-    // Stamp `new_blocks_added` from the geometry itself: on the legacy path
-    // the sole writer is `spawn_block_cells`, which is flag-gated off here,
-    // so without this the reveal-from-top anchor for tall new blocks was
-    // dead under `Surface` — a streamed block taller than the viewport
-    // snapped follow mode to its BOTTOM (found by review, 2026-08-18). A new
+    // Stamp `new_blocks_added` from the geometry itself: the surface path has
+    // no separate writer for this field, so without this the reveal-from-top
+    // anchor for tall new blocks was dead under `Surface` — a streamed block
+    // taller than the viewport snapped follow mode to its BOTTOM. A new
     // last block row means new tail content this frame. The first
     // observation (cold start / hydrate) only initializes the tracker; a
     // false positive from tail exclusion is harmless — the anchor degrades
@@ -1959,7 +1947,7 @@ pub fn apply_shaped_measurements(
     // Anchor correction: keep the viewport visually pinned when content above
     // it changed size. Follow mode is exempt — it re-clamps to the bottom
     // every frame anyway, and correcting under it would fight the clamp
-    // during streaming. (Verbatim from `render.rs:799-802`.)
+    // during streaming.
     if anchor_delta.abs() > 0.5 && !scroll_state.following {
         scroll_state.offset = (scroll_state.offset + anchor_delta).max(0.0);
         scroll_state.target_offset = (scroll_state.target_offset + anchor_delta).max(0.0);
@@ -3209,10 +3197,9 @@ mod tests {
     }
 
     /// The surface path must stamp `new_blocks_added` ITSELF when a new tail
-    /// block row appears — its legacy writer (`spawn_block_cells`) is
-    /// flag-gated off, and without a stamp the reveal-from-top anchor is
-    /// dead: a streamed block taller than the viewport snaps follow mode to
-    /// its bottom (review find, 2026-08-18).
+    /// block row appears — it has no separate writer for this field, and
+    /// without a stamp the reveal-from-top anchor is dead: a streamed block
+    /// taller than the viewport snaps follow mode to its bottom.
     #[test]
     fn a_new_tail_block_row_stamps_the_pending_scroll_anchor() {
         let mut app = measure_app(true, 0.0);

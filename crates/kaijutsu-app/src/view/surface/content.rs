@@ -1,22 +1,19 @@
 //! Formatted block text, keyed by `BlockId` instead of by entity.
 //!
-//! [`BlockContentCache`] is the entity-free replacement for the pair
-//! `sync_block_cell_buffers` + `BlockScene` (`view/render.rs`): the same
-//! `format_single_block` / `block_color` / rich-detection flow, but the answer
-//! lands in a resource keyed by block id rather than on a spawned `BlockCell`
-//! entity. That is the whole point — the surface has no per-block entities to
-//! hang a `BlockScene` on.
+//! [`BlockContentCache`] is the entity-free replacement for the deleted
+//! per-block-cell path's formatting step: the same `format_single_block` /
+//! `block_color` / rich-detection flow, but the answer lands in a resource
+//! keyed by block id rather than on a spawned per-block entity. That is the
+//! whole point — the surface has no per-block entities to hang the result on.
 //!
-//! **No streaming debounce here** (slice 3). The legacy path suppresses
-//! re-formatting a large `Running` block that grew by fewer than 200 bytes,
-//! because on that path a re-format is a whole-block re-shape and a whole-block
-//! re-raster. On the surface path a content bump re-shapes the block's *open
-//! tail chunk* and nothing else (`super::shape_cache::incremental_prefix`), so
-//! the debounce would buy nothing and cost the one thing it was never worth:
-//! a streamed reply that visibly lags its own text. The legacy debounce stays
-//! where it is, guarding the path that still needs it.
+//! **No streaming debounce here.** A content bump re-shapes the block's
+//! *open tail chunk* and nothing else
+//! (`super::shape_cache::incremental_prefix`), so a byte-count debounce would
+//! buy nothing and cost the one thing it was never worth: a streamed reply
+//! that visibly lags its own text. Whether a streaming diff still wants
+//! throttling of its own is tracked in `docs/issues.md`.
 //!
-//! Rich content is detected **and kept** (slice 4). Detection is the
+//! Rich content is detected **and kept**. Detection is the
 //! expensive half — a markdown parse, a diff parse, a usvg tree, an ABC
 //! tune — so its answer is cached here behind an `Arc` alongside the text it
 //! describes ([`FormattedBlock::rich_content`]), and the shaper reads the
@@ -191,7 +188,7 @@ pub struct FormattedBlock {
     pub border: BorderInputs,
     /// `rich_input_fingerprint` of the inputs detection last ran on, so a
     /// streaming neighbour's version bump doesn't drag every block through a
-    /// re-parse (same gate as `view/render.rs:152-160`).
+    /// re-parse.
     fingerprint: u64,
     /// [`super::shape_cache::SurfaceThemeEpoch`] at the last detection run.
     ///
@@ -382,8 +379,7 @@ pub fn sync_block_content(
         let fingerprint = crate::text::rich::rich_input_fingerprint(&text, &block);
 
         // Detection is the expensive half. Reuse the previous answer when the
-        // inputs it reads haven't moved — the same gate `sync_block_cell_buffers`
-        // uses, and for the same reason: `doc_version` is a whole-document
+        // inputs it reads haven't moved: `doc_version` is a whole-document
         // counter, so one streaming block would otherwise drag every in-band
         // block through a re-parse every frame. The theme epoch joins the gate
         // because markdown's spans are built from theme colors, which the
@@ -497,15 +493,15 @@ struct Detected {
 /// routing:
 ///
 /// - **Markdown** shapes its `plain_text` (the source stripped of syntax)
-///   with span brushes — unchanged since slice 1.
+///   with span brushes.
 /// - **Output** shapes its whitespace-padded `plain_text` with per-cell
-///   brushes, matching `build_block_scenes`' Output arm.
+///   brushes.
 /// - **Diff** shapes the preview's `plain_text` with the diff span brushes,
 ///   because word-level highlights start *inside* a line and only parley's
 ///   ranged brushes split a shaping run there. Its bands and washes are
 ///   geometry.
 /// - **ABC / SVG / sparkline** shape **nothing** — they have no text of their
-///   own, exactly as the legacy arms clear `msdf_glyphs` for them. Drawing
+///   own, so `msdf_glyphs` stays empty for them. Drawing
 ///   them is entirely geometry (ABC's own glyphs come from the engraving IR,
 ///   not from parley) or a raster.
 /// - **Image** shapes its `[image: …]` placeholder label; the dark rectangle
@@ -594,9 +590,7 @@ fn detect(
 }
 
 /// The placeholder caption an `Image` block draws until there is a
-/// CAS→decode pipeline behind it. Verbatim from `build_block_scenes`' Image
-/// arm, which is the point — the two paths must not disagree about what an
-/// undecoded image looks like.
+/// CAS→decode pipeline behind it.
 pub fn image_placeholder_label(hash: &str) -> String {
     format!("[image: {}]", &hash[..8.min(hash.len())])
 }
@@ -756,12 +750,11 @@ mod tests {
         assert!(cache(&app).get(&ids[0]).is_some());
     }
 
-    /// The debounce is **gone** on this path, and this is the test that says
-    /// so: a 10-character append to a 10 KB `Running` block lands the same
-    /// tick. On the legacy path the same edit is suppressed, because there a
-    /// re-format means re-shaping and re-rastering the whole block; here it
-    /// means re-shaping one chunk. A streamed reply that visibly lags its own
-    /// text was the price of the old rule, and nothing pays it now.
+    /// The debounce is **gone**, and this is the test that says so: a
+    /// 10-character append to a 10 KB `Running` block lands the same tick.
+    /// A re-format here means re-shaping one chunk, not the whole block, so
+    /// there is nothing left to debounce. A streamed reply that visibly lags
+    /// its own text was the price of the old rule, and nothing pays it now.
     #[test]
     fn a_small_append_to_a_large_streaming_block_lands_immediately() {
         let mut app = content_app();
@@ -858,8 +851,7 @@ mod tests {
     }
 
     /// A diff shapes its *preview's* plain text with span brushes, not the
-    /// raw tool output — the same text and the same brushes the legacy Diff
-    /// arm lays out.
+    /// raw tool output.
     #[test]
     fn a_diff_shapes_its_preview_text_with_spans() {
         let mut app = content_app();

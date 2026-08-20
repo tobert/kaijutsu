@@ -66,8 +66,7 @@ pub const CHUNK_LINES: usize = 64;
 /// ranges. That keeps "shape every chunk and stack the heights" exactly
 /// equivalent to "shape the whole text": an empty block still gets one
 /// layout, and whatever height parley gives an empty string is the height
-/// the row measures — rather than a silent zero that would disagree with the
-/// legacy path.
+/// the row measures, rather than a silent zero.
 pub fn chunk_ranges(text: &str, chunk_lines: usize) -> Vec<Range<usize>> {
     let chunk_lines = chunk_lines.max(1);
     if text.is_empty() {
@@ -224,8 +223,7 @@ mod tests {
     }
 
     /// The block-text style `shape_cache` builds — same font size and weight
-    /// axis `build_block_scenes` uses, so the equivalence is pinned for the
-    /// styling that actually ships.
+    /// axis it ships, so the test pins the styling that actually ships.
     fn style() -> VelloTextStyle {
         VelloTextStyle {
             brush: brush(WHITE),

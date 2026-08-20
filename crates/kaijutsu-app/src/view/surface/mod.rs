@@ -19,10 +19,9 @@
 //!
 //! This is the only conversation renderer — the legacy Bevy-UI column of
 //! per-block RTT textures (and the `ConversationRenderPath` flag that used to
-//! pick between them) was deleted in slice 5 (Amy, 2026-08-18: "no reason to
-//! keep legacy in this project"). The shared spine — `sync_conversation_geometry`,
-//! `smooth_scroll`, `scroll_render_mode` — lives in `cell::plugin`/`view::scroll`
-//! and is not touched here.
+//! pick between them) has been deleted. The shared spine —
+//! `sync_conversation_geometry`, `smooth_scroll`, `scroll_render_mode` —
+//! lives in `cell::plugin`/`view::scroll` and is not touched here.
 //!
 //! # Schedule placement
 //!
@@ -37,9 +36,9 @@
 //!   load-bearing part is Shape-after-ease: the shape band must be a
 //!   function of the frame's FINAL offset, or a large ease step (G-jump,
 //!   flick) moves the window past the rows Shape prepared and the frame
-//!   draws a blank band (found in review, 2026-08-18). Anchor compensation
-//!   in Measure stays same-frame: it shifts `offset` and `target_offset` by
-//!   the same delta after the ease, preserving the eased trajectory, and
+//!   draws a blank band. Anchor compensation in Measure stays same-frame: it
+//!   shifts `offset` and `target_offset` by the same delta after the ease,
+//!   preserving the eased trajectory, and
 //!   extraction (ExtractSchedule, after all of Update) reads the corrected
 //!   value. The ease's `max_offset` clamp sees `content_height` one frame
 //!   stale — the same phase relationship the legacy path's own `PostUpdate`
@@ -56,11 +55,12 @@
 //!
 //! # Dead code
 //!
-//! This module carried a blanket `#![allow(dead_code)]` through slices 1-2,
-//! covering groundwork later slices would consume. Slice 3 consumed it —
-//! `ShapedChunk::byte_range` (the incremental tail), `ShapedBlock::glyph_count`
-//! and `ShapedBlockCache::total_glyphs` (the eviction budget),
-//! `ShapedBlock::last_used` (the LRU order) — so the blanket allow is gone.
+//! This module carried a blanket `#![allow(dead_code)]` while it was built in
+//! stages, covering groundwork later stages would consume: `ShapedChunk::byte_range`
+//! (the incremental tail), `ShapedBlock::glyph_count` and
+//! `ShapedBlockCache::total_glyphs` (the eviction budget),
+//! `ShapedBlock::last_used` (the LRU order). All four now have callers, so
+//! the blanket allow is gone.
 //! What is left is allowed **item by item**, each with its reason, which is
 //! the point: a new unused item now shows up as a warning instead of hiding
 //! under a module-wide waiver.
@@ -211,14 +211,14 @@ impl Plugin for ConversationSurfacePlugin {
         // ease. Shape's band must be a function of the frame's FINAL offset:
         // with Shape before the ease, a large ease step (G-jump, flick) moved
         // the window past the band Shape had prepared and `assemble_runs`
-        // came up empty — a one-frame blank band (gemini deliberation,
-        // 2026-08-18, merge blocker). Running Measure after the ease is
-        // order-equivalent for anchoring: compensation shifts `offset` and
-        // `target_offset` by the same delta, so the eased trajectory is
-        // preserved and extraction still reads the corrected offset this
-        // frame. The ease's `max_offset` clamp sees `content_height` one
-        // frame stale — exactly the phase relationship Legacy has with its
-        // PostUpdate `readback_block_heights`.
+        // came up empty — a one-frame blank band. Running Measure after the
+        // ease is order-equivalent for anchoring: compensation shifts
+        // `offset` and `target_offset` by the same delta, so the eased
+        // trajectory is preserved and extraction still reads the corrected
+        // offset this frame. The ease's `max_offset` clamp sees
+        // `content_height` one frame stale — the same phase relationship the
+        // deleted per-block-cell renderer's PostUpdate height readback once
+        // had.
         app.configure_sets(
             Update,
             (

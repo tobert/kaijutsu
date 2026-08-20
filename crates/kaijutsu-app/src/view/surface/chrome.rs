@@ -116,14 +116,14 @@ impl BlockLayout {
 /// most of the conversation (plain user/assistant text draws no border under
 /// the default theme).
 ///
-/// **Divergence from legacy, on purpose.** `update_block_cell_nodes` gives a
-/// bordered cell `width: 100%` *plus* a `glow_radius * 0.5` margin on each
-/// side, so the node overflows its own column by that margin and the pane's
-/// `Overflow::clip` cuts the right border. There is nothing to clip against
-/// here, so the box is symmetric: the column loses `glow_radius` of width
-/// rather than hanging 5px into the pane padding. The wrap width therefore
-/// differs from legacy by that margin on bordered blocks — visible as a
-/// slightly earlier line break, not as a layout error.
+/// **Divergence from the deleted per-block-cell renderer, on purpose.** That
+/// renderer gave a bordered cell `width: 100%` *plus* a `glow_radius * 0.5`
+/// margin on each side, so the node overflowed its own column by that margin
+/// and the pane's `Overflow::clip` cut the right border. There is nothing to
+/// clip against here, so the box is symmetric: the column loses
+/// `glow_radius` of width rather than hanging 5px into the pane padding. The
+/// wrap width therefore differs by that same margin on bordered blocks —
+/// visible as a slightly earlier line break, not as a layout error.
 pub fn surface_block_layout(
     container_width: f32,
     indent_level: u32,
@@ -534,8 +534,8 @@ pub fn block_chrome_instance(
 ///
 /// The label itself is already drawn — `window::assemble_runs` emits it as a
 /// glyph run from [`HeaderLabelCache`] — so what parity needs here is the
-/// rule, its per-role color (`sync_role_group_headers`), and the gap, whose
-/// arithmetic is `role_divider`'s and is not restated.
+/// rule, its per-role color, and the gap, whose arithmetic is
+/// `role_divider`'s and is not restated.
 pub fn divider_instance(
     role: Role,
     rect: [f32; 4],

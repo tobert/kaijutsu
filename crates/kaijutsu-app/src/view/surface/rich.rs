@@ -4,8 +4,8 @@
 //! Four of the seven [`RichContentKind`]s draw something parley cannot — an
 //! engraved staff, a diff's background bands, a sparkline plot, an image
 //! placeholder — and one (SVG) draws a CPU raster. This module is where those
-//! are built, from **exactly the builders the legacy path calls**
-//! (`view/block_render.rs`'s arms): `collect_music_geometry` /
+//! are built, using the same shared builders every rich-content renderer
+//! calls: `collect_music_geometry` /
 //! `collect_music_glyphs` / `collect_music_text_glyphs` for ABC,
 //! `build_diff_band_geometry` + `build_word_wash_geometry` for diffs,
 //! `build_sparkline_vertices` for sparklines, `rasterize_svg` for SVG. Sharing
@@ -72,11 +72,10 @@ use crate::view::ui_rtt::ui_rtt_texture_dims;
 use super::content::{BlockContentCache, RichKindInfo};
 use super::shape_cache::{SHAPE_SLACK_SCREENS, ShapeOutput, ShapedChunk, collect_fonts};
 
-/// Height of the `Image` placeholder rectangle, verbatim from
-/// `build_block_scenes`' Image arm.
+/// Height of the `Image` placeholder rectangle.
 pub const IMAGE_PLACEHOLDER_HEIGHT: f32 = 120.0;
 
-/// Padding the sparkline plot keeps inside its box (legacy passes `4.0`).
+/// Padding the sparkline plot keeps inside its box.
 pub const SPARKLINE_PADDING: f32 = 4.0;
 
 /// Everything the drawn kinds need that isn't per-block.
@@ -97,12 +96,11 @@ impl RichShaper<'_> {
     ///
     /// `text` / `spans` are what `super::content::detect` decided this kind
     /// shapes (empty for the drawn-only kinds); `wrap_width` is the block's
-    /// content width — `chrome::BlockLayout::wrap_width`, which is legacy's
+    /// content width — `chrome::BlockLayout::wrap_width`, i.e.
     /// `width - pad_left - pad_right`. Geometry and glyphs both come out in
     /// **chunk-local** coordinates (origin at the block's text origin), so
     /// assembly adds the document y and the indent x exactly as it does for
-    /// plain text; legacy bakes `(pad_left, pad_top)` in at build time
-    /// instead, which is the same placement reached from the other side.
+    /// plain text.
     pub fn shape(
         &mut self,
         kind: &RichContentKind,
@@ -169,9 +167,9 @@ impl RichShaper<'_> {
     }
 
     /// ABC: engrave the tune, scale it to the column, and emit staff geometry
-    /// + notation glyphs + text glyphs. Ported from `build_block_scenes`' Abc
-    /// arm, including its scale-to-fit (which *does* fill the width — an
-    /// engraved score has an aspect ratio, not an intrinsic pixel size).
+    /// + notation glyphs + text glyphs, scaled to fit (which *does* fill the
+    /// width — an engraved score has an aspect ratio, not an intrinsic pixel
+    /// size).
     fn shape_abc(&mut self, tune: &kaijutsu_abc::Tune, wrap_width: f32) -> ShapeOutput {
         let opts = kaijutsu_abc::engrave::EngravingOptions::default();
         let elements = kaijutsu_abc::engrave::layout::engrave(tune, &opts);
@@ -216,8 +214,7 @@ impl RichShaper<'_> {
     }
 
     /// Diff: one spanned layout, its glyphs, its per-line bands, and the
-    /// word washes on top of them — the same order and the same builders as
-    /// `build_block_scenes`' Diff arm.
+    /// word washes on top of them.
     fn shape_diff(
         &mut self,
         preview: &crate::text::diff::DiffPreview,
@@ -230,7 +227,8 @@ impl RichShaper<'_> {
         // Context is the quietest diff class, so it is the right color for any
         // byte a span somehow misses — the block's own role color (amber, or
         // error red) would be a loud thing to fall back to inside a diff.
-        // Legacy makes the same substitution for the same reason.
+        // The diff viewer (`view/diff_view/render.rs`) makes the same
+        // substitution for the same reason.
         let style = VelloTextStyle {
             brush: bevy_color_to_brush(self.theme.diff_context_fg),
             ..style.clone()
@@ -288,9 +286,8 @@ impl RichShaper<'_> {
         let layout = self
             .font
             .layout(label, style, VelloTextAlign::Left, (wrap_width > 0.0).then_some(wrap_width));
-        // Vertically centred in the placeholder, exactly as the legacy arm
-        // centres it (`pad_top + h/2 - label_height/2`, minus the padding the
-        // surface adds at assembly instead of at build time).
+        // Vertically centred in the placeholder (`h/2 - label_height/2`); the
+        // padding is added at assembly, not here.
         let label_y = ((height - layout.height()) * 0.5).max(0.0);
         let mut fonts = Vec::new();
         collect_fonts(&layout, &mut fonts);

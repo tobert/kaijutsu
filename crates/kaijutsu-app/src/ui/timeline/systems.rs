@@ -38,13 +38,12 @@ pub fn sync_timeline_version(
 ///
 /// Note: This system only updates the TimelineVisibility component.
 ///
-/// **Currently unconsumed**: the legacy per-block-cell path (deleted in
-/// slice 5, docs/conversation-surface.md) applied this opacity to text
-/// color from `sync_block_cell_buffers`; the conversation surface
-/// (`view::surface`) never grew an equivalent, and nothing spawns
-/// `TimelineVisibility` any more either. Timeline dimming has had no live
-/// effect since `Surface` became the default renderer (slice 4). Tracked in
-/// `docs/issues.md`.
+/// **Currently unconsumed**: the deleted per-block-cell path
+/// (`docs/conversation-surface.md`) applied this opacity to text color; the
+/// conversation surface (`view::surface`) never grew an equivalent, and
+/// nothing spawns `TimelineVisibility` any more either. Timeline dimming has
+/// had no live effect since `Surface` became the default renderer. Tracked
+/// in `docs/issues.md`.
 pub fn update_block_visibility(
     timeline: Res<TimelineState>,
     mut block_query: Query<&mut TimelineVisibility>,

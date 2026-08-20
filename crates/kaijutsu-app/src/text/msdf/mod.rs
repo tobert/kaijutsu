@@ -52,8 +52,8 @@ use std::sync::{Arc, OnceLock};
 
 /// Map from FontId to raw font bytes (Arc-shared for async generation).
 ///
-/// Populated during `build_block_scenes` when MSDF glyphs are collected.
-/// The generator reads from this to spawn async MSDF generation tasks.
+/// Populated whenever a renderer collects MSDF glyphs for a block. The
+/// generator reads from this to spawn async MSDF generation tasks.
 #[derive(Resource, Default)]
 pub struct FontDataMap {
     data: HashMap<FontId, Arc<Vec<u8>>>,
@@ -93,18 +93,18 @@ impl FontDataMap {
 /// Per-block MSDF glyph data.
 ///
 /// Stores positioned glyphs extracted from Parley layout for MSDF rendering.
-/// Updated during `build_block_scenes` alongside the Vello scene.
+/// Updated by the same renderer pass that rebuilds the block's Vello scene.
 #[derive(Component, Default)]
 pub struct MsdfBlockGlyphs {
     pub glyphs: Vec<PositionedGlyph>,
     /// Monotonic re-render signal for the MSDF pass. Two writers bump it —
-    /// scene rebuilds (`build_block_scenes`) and glyph arrivals
-    /// (`poll_msdf_generator`) — and BOTH must advance it from its own
-    /// previous value (`wrapping_add(1)`), never derive it from another
+    /// scene rebuilds and glyph arrivals (`poll_msdf_generator`) — and BOTH
+    /// must advance it from its own previous value (`wrapping_add(1)`),
+    /// never derive it from another
     /// counter. Deriving from `scene_version` once reset it below the
     /// extract gate's `last_rendered` high-water mark after arrival bumps,
-    /// permanently silencing the composite for that block (staff-without-
-    /// glyphs bug, msdf-music live verify 2026-07-16).
+    /// permanently silencing the composite for that block (a staff-without-
+    /// glyphs regression the music-notation live verify caught).
     pub version: u64,
     pub rainbow: bool,
 }
@@ -122,8 +122,8 @@ pub struct MsdfBlockGlyphs {
 /// already survived a real two-writers-disagree bug (see its doc comment);
 /// giving geometry a second independent counter would just be a second
 /// chance to reintroduce that class of bug. Every producer rebuilds geometry
-/// and glyphs together in one arm of `build_block_scenes`, so they ride
-/// `MsdfBlockGlyphs.version` as a single shared gate — extraction reads both
+/// and glyphs together in the same pass, so they ride `MsdfBlockGlyphs.version`
+/// as a single shared gate — extraction reads both
 /// components whenever that version fires. A new producer must hold that
 /// same rule: fill both, bump once.
 #[derive(Component, Default)]

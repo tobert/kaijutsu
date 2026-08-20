@@ -129,10 +129,8 @@ impl RenderBlockStore {
         self.version += 1;
     }
 
-    // Only `move_block` calls this; a bin crate's plain (non-test) build
-    // does not compile `#[cfg(test)]` code, so this reads as dead there even
-    // though `view/render.rs`'s `reorder_repairs_children_after_order_only_change`
-    // calls `move_block` for real.
+    // Only `move_block` calls this, and `move_block` itself currently has
+    // no caller of its own — see the note on `move_block` below.
     #[allow(dead_code)]
     fn remove_at(&mut self, position: usize) -> BlockSnapshot {
         let snapshot = self.blocks.remove(position);
@@ -306,10 +304,14 @@ impl RenderBlockStore {
 
     /// Reposition an existing block. `after: None` moves it to the front —
     /// matching `kaijutsu_kernel::blocks::BlockDocument::move_block`'s
-    /// legacy move-to-front convention for a `None` target, which
-    /// `view/render.rs`'s `reorder_repairs_children_after_order_only_change`
-    /// exercises directly.
-    #[allow(dead_code)] // test-only caller; see `remove_at`'s note above it.
+    /// move-to-front convention for a `None` target.
+    ///
+    /// Currently has no caller: the renderer that exercised it directly has
+    /// been deleted, and nothing has replaced that call site. Kept because
+    /// `RenderBlockStore` is meant to support out-of-order block moves and
+    /// deleting it would need re-adding the day something needs one; see
+    /// `docs/issues.md`.
+    #[allow(dead_code)]
     pub fn move_block(
         &mut self,
         id: &BlockId,
