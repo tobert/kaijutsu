@@ -56,9 +56,9 @@ per-slice "Build notes" sections below correct it where the build disagreed.
    duplication is fine (Amy).
 5. **Preview in conversation**: a stat header (`3 files, +42 −17`) plus the
    first N lines, collapsed by default; expand under Navigation into
-   `Screen::Diff`. Preview rows must respect the virtualization contiguity
-   invariant (`view/render.rs` two-spacer model) — expansion is a screen
-   change, never an out-of-band conversation row.
+   `Screen::Diff`. Preview rows must respect the conversation's virtualization
+   contiguity invariant — expansion is a screen change, never an out-of-band
+   conversation row.
 6. **Minimap: in scope.** `viz::scales` (invertible — click-to-jump comes free
    from `invert`) + a stack of colored rects keyed by hunk type
    (sparkline-style rect children or `MsdfBlockGeometry` quads). The

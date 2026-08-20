@@ -418,8 +418,8 @@ on its own; `kaijutsu.dj.clock_transition` flows.
 the DJ; the ALSA-decoupling constraint (push placed cues just-in-time
 within the horizon, never fire-and-forget) is recorded in `docs/issues.md`.
 The frame-cost work this surfaced (uncached markdown re-parse,
-synchronous Parley shaping in `build_block_scenes`) is a separate arc —
-`docs/issues.md`.
+synchronous Parley shaping on the then-current conversation renderer) is a
+separate arc — `docs/issues.md`.
 
 ## The topology (Amy's room, 2026-06-29)
 
