@@ -46,6 +46,13 @@ tracing-subscriber = { workspace = true }
 # Hostname detection
 hostname = { workspace = true }
 
+# Backs `AuthDb::temporary()` (auth_db.rs): both the crate's own tests AND
+# the production `--auth-db`-unset fallback in ssh.rs need a real,
+# file-backed database, so unlike kaijutsu-kernel's `tempfile` this is an
+# ordinary (non-optional) dependency rather than one gated behind a
+# `test-util` feature.
+tempfile = { workspace = true }
+
 [build-dependencies]
 capnpc.workspace = true
 
@@ -57,4 +64,3 @@ kaijutsu-types.workspace = true
 kaijutsu-hyoushigi = { workspace = true, features = ["test-util"] }
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-tempfile = { workspace = true }

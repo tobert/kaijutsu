@@ -266,8 +266,8 @@ impl SshServer {
                 AuthDb::open(path).map_err(std::io::Error::other)?
             }
             None => {
-                log::warn!("Using in-memory auth database (all keys accepted)");
-                AuthDb::in_memory().map_err(std::io::Error::other)?
+                log::warn!("Using ephemeral auth database (all keys accepted)");
+                AuthDb::temporary().map_err(std::io::Error::other)?
             }
         };
 

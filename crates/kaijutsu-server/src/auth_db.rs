@@ -14,6 +14,11 @@ use std::path::Path;
 /// Database handle for authentication.
 pub struct AuthDb {
     conn: Connection,
+    /// Owns the throwaway directory a `temporary()` database was opened
+    /// under; `None` for every `open()`. Held only for its `Drop` — removing
+    /// the directory (and the `.db` file inside it) once nothing can reach
+    /// this handle anymore.
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 /// An SSH public key record (DB columns not on Credential).
@@ -66,15 +71,34 @@ impl AuthDb {
         let conn = Connection::open(path)?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _temp_dir: None,
+        })
     }
 
-    /// Create an in-memory database (for testing).
-    pub fn in_memory() -> SqliteResult<Self> {
-        let conn = Connection::open_in_memory()?;
+    /// Open a real, file-backed database under a fresh throwaway directory,
+    /// owned by the returned handle: the directory (and the `.db` file
+    /// inside it) is removed when this `AuthDb` drops.
+    ///
+    /// Never `:memory:` — same rule as `KernelDb::temporary()`: a `:memory:`
+    /// connection is per-connection state that never touches a file, so it
+    /// never exercises real file locking or reopening the way production does.
+    ///
+    /// Unlike `KernelDb::temporary()`, this is **not** gated behind
+    /// `cfg(test)`/`test-util` — `ssh.rs` calls it unconditionally in
+    /// production as the fallback when no `--auth-db` path is configured
+    /// (ephemeral, all-keys-accepted mode), so gating it the way `KernelDb`
+    /// does would remove that mode from a production build. Tests use it too.
+    pub fn temporary() -> SqliteResult<Self> {
+        let dir = tempfile::tempdir().expect("create temporary auth db directory");
+        let conn = Connection::open(dir.path().join("auth.db"))?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _temp_dir: Some(dir),
+        })
     }
 
     /// Default database path: ~/.local/share/kaijutsu/auth.db
@@ -586,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_principal_crud() {
-        let db = AuthDb::in_memory().unwrap();
+        let db = AuthDb::temporary().unwrap();
         assert!(db.is_empty().unwrap());
 
         let id = db.create_principal("amy", "Amy Tobey").unwrap();
@@ -609,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_key_management() {
-        let mut db = AuthDb::in_memory().unwrap();
+        let mut db = AuthDb::temporary().unwrap();
         let key = make_test_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
 
@@ -641,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_add_key_with_custom_username() {
-        let mut db = AuthDb::in_memory().unwrap();
+        let mut db = AuthDb::temporary().unwrap();
         let key = make_test_key();
 
         let (principal_id, _) = db
@@ -654,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_multiple_keys_per_principal() {
-        let db = AuthDb::in_memory().unwrap();
+        let db = AuthDb::temporary().unwrap();
 
         let principal_id = db.create_principal("multikey", "Multi Key User").unwrap();
 
@@ -678,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_list_all_keys() {
-        let mut db = AuthDb::in_memory().unwrap();
+        let mut db = AuthDb::temporary().unwrap();
 
         let key1 = make_test_key();
         let key2 = make_test_key();
@@ -694,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_remove_principal_cascades_keys() {
-        let mut db = AuthDb::in_memory().unwrap();
+        let mut db = AuthDb::temporary().unwrap();
         let key = make_test_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
 
@@ -719,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_username_collision_handling() {
-        let mut db = AuthDb::in_memory().unwrap();
+        let mut db = AuthDb::temporary().unwrap();
 
         // Create a principal with username "test"
         db.create_principal("test", "Test User 1").unwrap();
@@ -745,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_principal_id_roundtrip() {
-        let db = AuthDb::in_memory().unwrap();
+        let db = AuthDb::temporary().unwrap();
         let id = db.create_principal("roundtrip", "Roundtrip Test").unwrap();
         let principal = db.get_principal(id).unwrap().unwrap();
         assert_eq!(principal.id, id);
