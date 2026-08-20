@@ -73,6 +73,13 @@ Spans are small, needed at render time, and reach the app by the feed it
 already follows. The tag is deliberately tiny: the affordance that says "an
 original exists, you can ask for it" without shipping it anywhere.
 
+A third field rides alongside the tag, kernel-side only: `pub
+edited_since_ingest: bool`, set by any edit that lands after the tag and
+cleared by a successful `kj block reproject`. It is what makes "unedited" in
+the invariant above checkable rather than assumed. It has no capnp field and
+does not reach the app — nothing there needs it, since the app already treats
+an edited block as unstyled the moment its edit clears `style_spans`.
+
 **In the kernel** (`kernel_db.rs`), map-shaped as one row per
 (block, transform):
 
@@ -102,11 +109,12 @@ kj block reproject <block-id>    # run the CURRENT parser over the original;
                                  # re-emit spans as a normal sequenced edit
 ```
 
-**Ingestion atomicity**: clean text, spans, and the provenance row commit
-together at the hook site — commit first, publish second. Streaming starts
-with buffer-until-done for the provenance bytes (text still commits per
-flush); upgrade to append-per-flush only if crash-loss of provenance ever
-bites.
+**Ingestion ordering**: the provenance row is written *before* the tag that
+references it, so durable state never claims an original that was not
+stored — not atomic with the text/spans commit (see "Reality checks" below
+for why). Streaming starts with buffer-until-done for the provenance bytes
+(text still commits per flush); upgrade to append-per-flush only if
+crash-loss of provenance ever bites.
 
 **Reality checks from the build (2026-08-19).** Three findings from reading
 the actual ingest paths, now load-bearing:
@@ -216,9 +224,12 @@ Cheapest to heaviest; the chunk-boundary property is the one that will catch
 5. **Differential SGR attribution** — corpus through a reference
    implementation (`termwiz` or the `vt100` crate), compare color/attribute
    assignment on the SGR subset.
-6. **Standing CI invariant** — for any unedited block with a provenance row:
-   `strip(original) == (content, style_spans)`. Runnable against a real
-   kernel.db, not just fixtures.
+6. **Standing CI invariant** — for any block with a provenance row where
+   `BlockSnapshot::edited_since_ingest` is `false` (the mechanical
+   discriminator for "unedited" — see "What travels where"):
+   `strip(original) == (content, style_spans)`, or `== (content minus the
+   trailing cap marker, style_spans)` for a capped background block. Runnable
+   against a real kernel.db, not just fixtures.
 
 ## Rendering: spans → instance buffer → style table
 

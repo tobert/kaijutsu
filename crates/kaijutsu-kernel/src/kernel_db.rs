@@ -11424,17 +11424,8 @@ mod tests {
         );
     }
 
-    // ── 30. insert_document constraint classification, by read-back ─────
-    //
-    // docs/issues.md:361 — `insert_document` failures used to be classified
-    // by matching `e.to_string()` against "UNIQUE constraint" / "already
-    // exists", which conflated the PRIMARY KEY conflict (same document,
-    // benign) with the `idx_documents_path` conflict (a different document
-    // claiming a taken path, divergent) and was only correct by luck of the
-    // message text. These prove the typed, read-back-based classification.
-
-    /// 1. Re-inserting a `DocumentRow` with an already-used `document_id`
-    ///    must classify as `DuplicateDocument`, carrying the right id.
+    /// Round-trips a block's provenance row and confirms it cascades away
+    /// with its document.
     #[test]
     fn block_provenance_roundtrip_and_cascade() {
         let db = KernelDb::temporary().unwrap();
@@ -11481,6 +11472,17 @@ mod tests {
         assert_eq!(db.get_block_provenance(&block_id, "ansi-strip").unwrap(), None);
     }
 
+    // ── 30. insert_document constraint classification, by read-back ─────
+    //
+    // `insert_document` failures used to be classified by matching
+    // `e.to_string()` against "UNIQUE constraint" / "already exists", which
+    // conflated the PRIMARY KEY conflict (same document, benign) with the
+    // `idx_documents_path` conflict (a different document claiming a taken
+    // path, divergent) and was only correct by luck of the message text.
+    // These prove the typed, read-back-based classification.
+
+    /// 1. Re-inserting a `DocumentRow` with an already-used `document_id`
+    ///    must classify as `DuplicateDocument`, carrying the right id.
     #[test]
     fn insert_document_duplicate_id_is_typed_duplicate_document() {
         let db = KernelDb::temporary().unwrap();

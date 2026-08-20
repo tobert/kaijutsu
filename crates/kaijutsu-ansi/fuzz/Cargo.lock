@@ -249,7 +249,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.14.1"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1deae928d8cd283d7265054d0b5aac35100cdc3217a90e373c0698d2aaa7641e"
 dependencies = [
  "base64",
  "serde",

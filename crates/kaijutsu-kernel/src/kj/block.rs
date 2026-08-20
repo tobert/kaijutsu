@@ -160,16 +160,15 @@ enum BlockCommand {
         out: Option<String>,
     },
     /// Re-run the CURRENT ingest parser over this block's stored original and
-    /// re-emit its style spans (docs/ansi-and-beyond.md). Updates *styling*
-    /// only: if the projection's text no longer matches the block's content
-    /// (the block was edited since ingest), this refuses rather than
-    /// overwriting the edit.
+    /// re-emit its style spans (docs/ansi-and-beyond.md). Only `ansi-strip`
+    /// is implemented — `kj block original --transform` names any transform
+    /// with a stored row, but this verb always re-runs the one parser this
+    /// kernel has. Updates *styling* only: refuses rather than overwriting
+    /// the block if content has moved since ingest, either because it was
+    /// edited or because a background block's output was capped.
     Reproject {
         /// Block id
         block_id: String,
-        /// Which ingest transform to re-run (default: ansi-strip)
-        #[arg(long, default_value = kaijutsu_ansi::TRANSFORM_NAME)]
-        transform: String,
     },
     /// Append text to a block (streaming-friendly). Mirrors MCP `block_append`.
     Append {
@@ -323,10 +322,7 @@ impl KjDispatcher {
                 transform,
                 out,
             } => self.block_original(&block_id, &transform, out.as_deref(), caller),
-            BlockCommand::Reproject {
-                block_id,
-                transform,
-            } => self.block_reproject(&block_id, &transform, caller),
+            BlockCommand::Reproject { block_id } => self.block_reproject(&block_id, caller),
             BlockCommand::Append { block_id, text } => {
                 self.block_append(&block_id, &text, caller)
             }
@@ -1033,21 +1029,31 @@ impl KjDispatcher {
     /// **Styling only.** The block's content is the one live document that
     /// edits, exclusions, search and hydration share, and reprojection is not
     /// allowed to become a back door that rewrites it. So the freshly stripped
-    /// text is compared against the current content first: a mismatch means
-    /// the block was edited since ingest (its provenance row records what
-    /// *arrived*, not what the document *is*) and the verb refuses rather than
-    /// clobbering the edit. Only when the text still matches byte-for-byte are
-    /// the new spans — which are addressed by offsets into exactly that text —
-    /// safe to install.
-    fn block_reproject(&self, id_str: &str, transform: &str, caller: &KjCaller) -> KjResult {
-        if transform != kaijutsu_ansi::TRANSFORM_NAME {
-            return KjResult::Err(format!(
-                "kj block reproject: no parser registered for transform '{transform}' \
-                 (this kernel implements '{}' only — `kj block original --transform \
-                 {transform}` can still read the bytes back)",
-                kaijutsu_ansi::TRANSFORM_NAME
-            ));
-        }
+    /// text is compared against the current content first, and a mismatch
+    /// refuses rather than clobbering whatever produced it. Two distinct
+    /// causes produce that mismatch, and are reported distinctly:
+    ///
+    /// - **Edited since ingest** (`snap.edited_since_ingest`): the block's
+    ///   provenance row records what *arrived*, not what the document *is*
+    ///   after `kj block edit`/`block_edit` ran. Reprojecting would overwrite
+    ///   the edit.
+    /// - **Output was capped** (`background_exec::output_cap_marker`): a
+    ///   background block that hit `DEFAULT_OUTPUT_CAP` holds `strip(original)
+    ///   + the cap marker` *by design* (docs/ansi-and-beyond.md), so this
+    ///   block can never satisfy a byte-for-byte comparison — there is
+    ///   nothing to fix, and re-running the parser would just drop the
+    ///   marker. Not an edit; refusing for a different reason.
+    ///
+    /// Only when the text still matches byte-for-byte are the new spans —
+    /// which are addressed by offsets into exactly that text — safe to
+    /// install.
+    fn block_reproject(&self, id_str: &str, caller: &KjCaller) -> KjResult {
+        // Only `ansi-strip` is implemented — see the clap `///` on
+        // `Reproject`. Hardcoded rather than a parameter: the `--transform`
+        // flag this used to take could only ever error on any other value,
+        // which the "prefer deleting a mechanism to generalizing it" stance
+        // (CLAUDE.md) says to delete rather than keep guarding.
+        let transform = kaijutsu_ansi::TRANSFORM_NAME;
         let block_id = match self.resolve_block_id(id_str, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block reproject: {e}")),
@@ -1088,6 +1094,20 @@ impl KjDispatcher {
 
         let (text, spans) = kaijutsu_ansi::strip(&original);
         if text != snap.content {
+            if !snap.edited_since_ingest
+                && snap.content == format!("{text}{}", crate::background_exec::output_cap_marker())
+            {
+                return KjResult::Err(format!(
+                    "kj block reproject: block '{id_str}' output was capped, so it \
+                     cannot be reprojected — by design, a capped block's content is \
+                     `strip(original) + the cap marker`, never `strip(original)` alone, \
+                     so reprojection would drop the marker rather than restore anything. \
+                     Nothing is wrong with this block; there is nothing to fix. (original \
+                     projects to {} bytes of text, block holds {} bytes including the marker)",
+                    text.len(),
+                    snap.content.len(),
+                ));
+            }
             return KjResult::Err(format!(
                 "kj block reproject: content has diverged from the original (edited since \
                  ingest); reproject would overwrite edits. Reprojection updates styling \
@@ -3747,10 +3767,12 @@ mod tests {
         );
     }
 
-    /// Reproject only knows `ansi-strip`; any other transform is refused by
-    /// name rather than silently reprojecting with the wrong parser.
+    /// `reproject` no longer takes `--transform` (only one transform is ever
+    /// implemented, so the flag could only error — deleted per CLAUDE.md
+    /// "prefer deleting a mechanism to generalizing it"). Passing it is now a
+    /// clap parse error, not a `KjResult::Err` from `block_reproject` itself.
     #[tokio::test]
-    async fn block_reproject_unknown_transform_errors() {
+    async fn block_reproject_rejects_the_deleted_transform_flag() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context_with_doc(&d, Some("c"), principal);
@@ -3770,10 +3792,45 @@ mod tests {
             )
             .await;
         assert!(!result.is_ok(), "expected an error, got: {}", result.message());
+    }
+
+    /// A background block whose output hit the cap holds `strip(original) +
+    /// the cap marker` by design (docs/ansi-and-beyond.md). Reproject must
+    /// name that as the cause — not "edited since ingest", which never
+    /// happened here — and must not touch the block.
+    #[tokio::test]
+    async fn block_reproject_names_a_capped_block_instead_of_blaming_an_edit() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let (text, _) = kaijutsu_ansi::strip(ANSI_ORIGINAL);
+        let capped_content = format!("{text}{}", crate::background_exec::output_cap_marker());
+        let bid = insert_projected_block(&d, ctx, ANSI_ORIGINAL, Some(&capped_content));
+
+        let result = d
+            .dispatch(&[s("block"), s("reproject"), bid.to_key()], &c)
+            .await;
+        assert!(!result.is_ok(), "expected a refusal, got: {}", result.message());
+        let msg = result.message();
+        assert!(msg.contains("capped"), "must name the cap as the cause: {msg}");
         assert!(
-            result.message().contains("no parser registered"),
-            "unexpected message: {}",
-            result.message()
+            !msg.contains("edited since ingest"),
+            "must not blame an edit that never happened: {msg}"
+        );
+
+        let after = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(after.content, capped_content, "a refused reproject must leave content untouched");
+        assert!(
+            after.style_spans.is_empty(),
+            "a refused reproject must leave spans untouched"
         );
     }
 }

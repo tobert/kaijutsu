@@ -1,9 +1,12 @@
 //! Totality fuzz target: `strip` must never panic on arbitrary bytes, and
-//! the spans it returns must always satisfy the invariants the crate
-//! documentation claims — sorted, disjoint (or at least non-overlapping in
-//! a way that respects `end <= next.start`... actually we require strictly
-//! adjacent-or-later, see below), and byte-offsets on UTF-8 char boundaries
-//! within the returned text.
+//! the spans it returns must always satisfy three invariants:
+//!
+//! - **Non-empty and well-formed**: `start < end`, strictly (an empty span
+//!   describes nothing and `push_char` never emits one).
+//! - **Sorted and disjoint**: each span starts no earlier than the previous
+//!   one ended (`start >= prev_end`).
+//! - **On UTF-8 char boundaries** within the returned text, at both
+//!   endpoints.
 
 #![no_main]
 
@@ -17,8 +20,9 @@ fuzz_target!(|data: &[u8]| {
     let mut prev_end: Option<u32> = None;
 
     for span in &spans {
-        // Well-formed range.
-        assert!(span.start <= span.end, "span start > end: {span:?}");
+        // Well-formed AND non-empty — an empty span is exactly the bug this
+        // fuzzer should be well placed to find, so the strict form.
+        assert!(span.start < span.end, "empty or inverted span: {span:?}");
         // Never past the end of the text it's describing.
         assert!(span.end <= text_len, "span end {} > text len {} : {span:?}", span.end, text_len);
 

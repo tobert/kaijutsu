@@ -1454,9 +1454,11 @@ pub struct ProvenanceTag {
     /// Transform name, e.g. `"ansi-strip"`. Keys the kernel's
     /// `block_provenance` row together with the block id.
     pub transform: String,
-    /// Version of the transform that produced `content` + `style_spans`.
-    /// The CI invariant `strip(original) == (content, spans)` only holds
-    /// when this matches the current parser version.
+    /// Version of the transform that produced `content` + `style_spans` at
+    /// ingestion. The standing invariant `strip(original) == (content,
+    /// style_spans)` holds only when this matches the current parser version
+    /// AND `BlockSnapshot::edited_since_ingest` is `false` — an edit moves
+    /// `content` away from the projection without touching this tag.
     pub version: u32,
 }
 
@@ -1658,10 +1660,26 @@ pub struct BlockSnapshot {
     /// late updates ride `BlockFlow::SpansChanged`. Invisible to hydration.
     #[serde(default)]
     pub style_spans: Vec<StyleSpan>,
-    /// Set when `content` is an ingest-transform projection and the kernel
-    /// holds the byte-exact original (`block_provenance` table).
+    /// Set when this block was produced by an ingest transform: the kernel
+    /// holds the byte-exact original (`block_provenance` table). Stays set
+    /// across an edit — the original is still there for `kj block
+    /// reproject` — so on its own this tag says only "an original exists,"
+    /// never "`content` is still that original's projection." Check
+    /// `edited_since_ingest` for the latter.
     #[serde(default)]
     pub provenance: Option<ProvenanceTag>,
+    /// True once `content` has been mutated by anything other than the
+    /// ingest transform that set `provenance` — i.e. an edit landed after
+    /// ingestion (`blocks/content.rs::edit_text`, which also drops
+    /// `style_spans`). `provenance` itself is left in place across that
+    /// edit, so this flag is what makes "unedited" a checkable fact instead
+    /// of an assumption: for any tagged block where this is `false`,
+    /// `content == strip(original)` (plus the output-cap marker, for a
+    /// capped background block). A successful `kj block reproject` clears
+    /// it, because `content` is once again exactly the current projection.
+    /// Meaningless when `provenance` is `None`.
+    #[serde(default)]
+    pub edited_since_ingest: bool,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1771,6 +1789,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -1816,6 +1835,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -1873,6 +1893,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -1930,6 +1951,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -1994,6 +2016,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2046,6 +2069,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2096,6 +2120,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2146,6 +2171,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2192,6 +2218,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2249,6 +2276,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2305,6 +2333,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2360,6 +2389,7 @@ impl BlockSnapshot {
             updated_at: 0,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
         }
     }
 
@@ -2416,11 +2446,11 @@ impl BlockSnapshot {
             && self.task_status == other.task_status
             && self.order_key == other.order_key
             && self.track == other.track
-        // style_spans and provenance deliberately do NOT participate:
-        // content identity stays text-only. A spans-only change is signaled
-        // explicitly by `BlockFlow::SpansChanged` and must not make two
-        // otherwise-identical blocks read as different content
-        // (docs/ansi-and-beyond.md; decided 2026-08-19).
+        // style_spans, provenance, and edited_since_ingest deliberately do
+        // NOT participate: content identity stays text-only. A spans-only
+        // change is signaled explicitly by `BlockFlow::SpansChanged` and
+        // must not make two otherwise-identical blocks read as different
+        // content (docs/ansi-and-beyond.md; decided 2026-08-19).
     }
 }
 
@@ -2488,6 +2518,7 @@ impl BlockSnapshotBuilder {
                 updated_at: 0,
                 style_spans: Vec::new(),
                 provenance: None,
+                edited_since_ingest: false,
             },
         }
     }
@@ -2687,6 +2718,13 @@ impl BlockSnapshotBuilder {
     /// Mark the content as an ingest-transform projection with a stored original.
     pub fn provenance(mut self, tag: ProvenanceTag) -> Self {
         self.snap.provenance = Some(tag);
+        self
+    }
+
+    /// Mark the block as edited since ingestion — test/fixture use only; live
+    /// code sets this via `BlockContent::edit_text`.
+    pub fn edited_since_ingest(mut self, val: bool) -> Self {
+        self.snap.edited_since_ingest = val;
         self
     }
 

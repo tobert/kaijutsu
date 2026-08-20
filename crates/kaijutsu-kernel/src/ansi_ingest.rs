@@ -13,13 +13,20 @@
 //! ```
 //!
 //! Keeping the policy in one function is the point. The rules below are subtle
-//! enough that six independent copies would drift within a month:
+//! enough that six independent copies would drift within a month. One site —
+//! `background_exec::AnsiDrain` — genuinely can't call [`project`] (it needs
+//! the incremental parser for chunk-boundary state), so it shares the no-op
+//! predicate ([`is_noop_projection`]) instead: one policy, two shapes.
 //!
 //! - **The fast path must stay free.** The overwhelming majority of shell
 //!   output has no `ESC` in it at all. [`project`] answers that case with a
 //!   single `memchr` (`<[u8]>::contains` specializes to `memchr` for `u8`) and
 //!   allocates nothing, sets no tag, writes no provenance row. A block with no
 //!   escape bytes is byte-identical to what it was before this feature.
+//! - **A tag whose original equals its content teaches nobody anything.**
+//!   Escape bytes present but the projection byte-identical (a lone `ESC`
+//!   that survived to `finish` with no other effect) gets the no-op
+//!   treatment too — [`is_noop_projection`], shared by both shapes.
 //! - **A tagged block always has a row.** Hook sites call [`record`], which
 //!   writes the provenance row *before* the tag, so a crash in between leaves
 //!   an orphan row (invisible, harmless) rather than a tag pointing at bytes
@@ -44,7 +51,7 @@ use kaijutsu_types::{BlockId, ContextId};
 use crate::block_store::BlockStore;
 
 /// The ESC byte that starts every sequence this transform recognizes.
-const ESC: u8 = 0x1b;
+pub(crate) const ESC: u8 = 0x1b;
 
 /// A block's ANSI projection: the clean text that becomes block content, and
 /// the spans describing how it was styled.
@@ -76,10 +83,22 @@ pub fn project(raw: &[u8]) -> Option<AnsiProjection> {
         return None;
     }
     let (text, spans) = kaijutsu_ansi::strip(raw);
-    if spans.is_empty() && text.as_bytes() == raw {
+    if is_noop_projection(&text, &spans, raw) {
         return None;
     }
     Some(AnsiProjection { text, spans })
+}
+
+/// The second guard [`project`] applies, exported so the one streaming
+/// site (`background_exec::AnsiDrain::finish`) can apply the same rule
+/// instead of re-deriving it. True when a projection is a no-op worth
+/// suppressing: no styling, and the projected text is byte-identical to what
+/// was fed in — a tag whose original equals its content teaches nobody
+/// anything. This is what keeps a stray lone `ESC` (with no other escape
+/// bytes around it) from earning a tag, a `block_provenance` row, and a
+/// `SpansChanged` event for a block nothing actually happened to.
+pub(crate) fn is_noop_projection(text: &str, spans: &[StyleSpan], raw: &[u8]) -> bool {
+    spans.is_empty() && text.as_bytes() == raw
 }
 
 /// Land the projection on a block that **already holds the clean text**.

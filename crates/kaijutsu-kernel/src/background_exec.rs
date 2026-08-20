@@ -131,6 +131,22 @@ use crate::block_store::SharedBlockStore;
 /// 10MB ephemeral ring.
 pub const DEFAULT_OUTPUT_CAP: usize = 256 * 1024;
 
+/// The text appended to a capped background block, once, in place of
+/// whatever output kept coming. A `const` (not an inline literal at the call
+/// site) for two reasons: the number in it has to stay the real cap even if
+/// `DEFAULT_OUTPUT_CAP` changes, and `kj block reproject`
+/// (`kj/block.rs::block_reproject`) needs to recognize this exact suffix to
+/// tell "this block was capped" apart from "this block was edited" — see
+/// docs/ansi-and-beyond.md "for a capped block, `content == strip(original) +
+/// the cap marker`".
+pub fn output_cap_marker() -> String {
+    format!(
+        "\n[kaijutsu: background output capped at {DEFAULT_OUTPUT_CAP} bytes — \
+         further output is discarded; the process is still running and its exit \
+         status will still be recorded]\n"
+    )
+}
+
 /// How long a terminal (`Exited`/`Killed`) entry stays queryable after
 /// finishing, before a lazy sweep reaps it. Long enough for a slow poller to
 /// see the final status; bounded so the registry can't grow forever.
@@ -824,7 +840,7 @@ impl AnsiDrain {
     /// Feed one chunk; return the newly-projected text to append (may be
     /// empty when the chunk was pure escape sequence, or ended mid-codepoint).
     fn feed(&mut self, chunk: &[u8]) -> String {
-        if chunk.contains(&0x1b) {
+        if chunk.contains(&crate::ansi_ingest::ESC) {
             self.saw_escape = true;
         }
         self.raw.extend_from_slice(chunk);
@@ -842,15 +858,18 @@ impl AnsiDrain {
 
     /// The finished projection: the original bytes to store, and the spans
     /// that describe the text actually in the block. `None` when no escape
-    /// byte was ever seen — the block is untouched by this transform.
+    /// byte was ever seen, or when the only escape bytes seen never actually
+    /// changed the committed text (the same no-op guard
+    /// [`crate::ansi_ingest::project`] applies to the whole-buffer sites —
+    /// see [`crate::ansi_ingest::is_noop_projection`]).
     fn finish(mut self) -> Option<(Vec<u8>, Vec<kaijutsu_ansi::StyleSpan>)> {
         if !self.saw_escape {
             return None;
         }
         let committed = self.cursor;
         self.raw.truncate(self.raw_committed);
-        let (_, spans) = self.parser.finish();
-        let spans = spans
+        let (text, spans) = self.parser.finish();
+        let spans: Vec<_> = spans
             .into_iter()
             .filter(|s| (s.start as usize) < committed)
             .map(|mut s| {
@@ -858,6 +877,9 @@ impl AnsiDrain {
                 s
             })
             .collect();
+        if crate::ansi_ingest::is_noop_projection(&text[..committed], &spans, &self.raw) {
+            return None;
+        }
         Some((self.raw, spans))
     }
 }
@@ -930,10 +952,7 @@ async fn drain_to_block(
                 if let Err(e) = blocks.append_text_as(
                     context_id,
                     &block_id,
-                    "\n[kaijutsu: background output capped at \
-                     DEFAULT_OUTPUT_CAP bytes — further output is discarded; \
-                     the process is still running and its exit status will \
-                     still be recorded]\n",
+                    &output_cap_marker(),
                     Some(principal_id),
                 ) {
                     tracing::warn!(
@@ -1844,6 +1863,75 @@ mod tests {
         assert_eq!(drain.feed(b"ordinary output\n"), "ordinary output\n");
         drain.commit();
         assert!(drain.finish().is_none(), "escape-free output must not project");
+    }
+
+    /// `AnsiDrain` must apply the same no-op guard as `ansi_ingest::project`
+    /// (B2 / `ansi_ingest.rs`'s `is_noop_projection`): a lone, incomplete
+    /// escape sequence with no other effect must not earn a tag, a
+    /// `block_provenance` row, or a `SpansChanged` event. Before that fix,
+    /// `finish` decided solely on `saw_escape` — true here — and would have
+    /// returned `Some((vec![], vec![]))`: an empty "original" for a block
+    /// nothing actually happened to.
+    #[test]
+    fn ansi_drain_suppresses_a_stray_esc_that_changes_nothing() {
+        let mut drain = AnsiDrain::new();
+        // vte waits for the rest of the escape sequence; it never arrives, so
+        // nothing is ever appended.
+        let appended = drain.feed(b"\x1b");
+        assert_eq!(appended, "", "an incomplete escape sequence projects nothing yet");
+        // Never committed — mirrors a real drain loop, which `continue`s on
+        // an empty projection rather than calling `commit()`.
+        assert!(
+            drain.finish().is_none(),
+            "a stray ESC with no other effect must not earn a tag or a provenance row"
+        );
+    }
+
+    /// The span-truncation branch in `AnsiDrain::finish` only runs when a
+    /// chunk was fed but never committed — the output cap tripping, or an
+    /// append failing. Every other `AnsiDrain` test in this file commits
+    /// after each chunk, so before this test the branch that guarantees
+    /// `content == strip(original)` for a capped block (the cap marker rides
+    /// on top separately) had zero coverage.
+    #[test]
+    fn ansi_drain_finish_truncates_to_the_committed_prefix() {
+        let first = b"\x1b[31mred\x1b[0m ";
+        let second = b"\x1b[32mgreen\x1b[0m tail";
+        let mut drain = AnsiDrain::new();
+
+        let appended_first = drain.feed(first);
+        assert!(!appended_first.is_empty(), "fixture must actually add text");
+        drain.commit(); // acknowledge only the first chunk reached the block
+
+        let appended_second = drain.feed(second);
+        assert!(!appended_second.is_empty(), "fixture must actually add text");
+        // Deliberately no `drain.commit()` here — the "cap tripped" / "append
+        // failed" shape this branch has to handle.
+
+        let (original, spans) = drain.finish().expect("input has escape bytes");
+
+        // `raw` must be truncated back to what was actually committed, not
+        // everything `feed` ever saw.
+        assert_eq!(original, first, "uncommitted bytes must not be kept as provenance");
+
+        // The load-bearing guarantee: stripping the (truncated) original
+        // reproduces exactly the committed text and its spans.
+        let (want_text, want_spans) = kaijutsu_ansi::strip(&original);
+        assert_eq!(
+            want_text, appended_first,
+            "committed text must match what was actually appended"
+        );
+        assert_eq!(spans, want_spans, "spans must match stripping only the committed original");
+
+        // No span may reach past the committed text's length — the
+        // filter/clamp this branch applies.
+        let committed_len = appended_first.len() as u32;
+        for span in &spans {
+            assert!(
+                span.end <= committed_len,
+                "span {span:?} extends past the committed prefix ({committed_len} bytes)"
+            );
+        }
     }
 
     /// A block-store variant whose provenance rows are real. `setup()` builds a

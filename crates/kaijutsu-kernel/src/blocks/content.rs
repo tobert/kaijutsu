@@ -258,8 +258,13 @@ pub struct BlockContent {
     /// invalidation rule.
     style_spans: Vec<kaijutsu_types::StyleSpan>,
     /// Set when `text` is an ingest-transform projection and the kernel
-    /// holds the byte-exact original.
+    /// holds the byte-exact original. Stays set across an edit — see
+    /// `edited_since_ingest`.
     provenance: Option<kaijutsu_types::ProvenanceTag>,
+    /// True once `text` has been mutated by `edit_text` after `provenance`
+    /// was set — the discriminator that makes "unedited" checkable. See
+    /// [`kaijutsu_types::BlockSnapshot::edited_since_ingest`].
+    edited_since_ingest: bool,
 
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
@@ -295,6 +300,7 @@ impl BlockContent {
             resource: None,
             style_spans: Vec::new(),
             provenance: None,
+            edited_since_ingest: false,
             deleted: false,
         }
     }
@@ -346,6 +352,7 @@ impl BlockContent {
         block.resource = snap.resource.clone();
         block.style_spans = snap.style_spans.clone();
         block.provenance = snap.provenance.clone();
+        block.edited_since_ingest = snap.edited_since_ingest;
         block
     }
 
@@ -390,6 +397,12 @@ impl BlockContent {
         if !self.style_spans.is_empty() {
             self.style_spans.clear();
         }
+        // The discriminator `provenance` alone can't be: this is the one
+        // place `text` diverges from whatever projection `provenance`
+        // describes, so it's the one place that sets the flag. Harmless when
+        // `provenance` is `None` (nothing reads it then). Cleared only by a
+        // successful reproject (`set_style_spans`).
+        self.edited_since_ingest = true;
     }
 
     /// Append text to the end. `String::push_str` is amortized O(1) and
@@ -527,11 +540,19 @@ impl BlockContent {
         self.provenance.as_ref()
     }
 
+    /// Whether `text` has been mutated since `provenance` was set. See
+    /// [`kaijutsu_types::BlockSnapshot::edited_since_ingest`].
+    pub fn edited_since_ingest(&self) -> bool {
+        self.edited_since_ingest
+    }
+
     /// Replace the styled spans and the provenance tag together (ingest
     /// projection at insert, or `kj block reproject` later). Always a
     /// whole-projection replace — spans are re-derived from the stored
     /// original, never patched in place — and the tag travels with them so a
-    /// tag can never outlive the spans it describes.
+    /// tag can never outlive the spans it describes. Either way `text` is
+    /// now exactly what this call's projection describes, so the edited
+    /// marker clears.
     pub fn set_style_spans(
         &mut self,
         spans: Vec<kaijutsu_types::StyleSpan>,
@@ -539,6 +560,7 @@ impl BlockContent {
     ) {
         self.style_spans = spans;
         self.provenance = provenance;
+        self.edited_since_ingest = false;
     }
 
     pub fn source_context(&self) -> Option<kaijutsu_types::ContextId> {
@@ -649,6 +671,7 @@ impl BlockContent {
             resource: self.resource.clone(),
             style_spans: self.style_spans.clone(),
             provenance: self.provenance.clone(),
+            edited_since_ingest: self.edited_since_ingest,
             task_status: self.header.task_status,
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
@@ -1019,5 +1042,86 @@ mod text_edit_tests {
         let after = b.snapshot();
         assert_eq!(after.content, "hello world");
         assert_eq!(after.style_spans, snap.style_spans, "end-append never invalidates earlier spans");
+    }
+
+    // The `edited_since_ingest` marker (docs/ansi-and-beyond.md; block.rs's
+    // `BlockSnapshot::edited_since_ingest` doc) is what makes "unedited" a
+    // checkable fact for a tagged block, rather than an assumption `provenance`
+    // alone can't back up (`provenance` stays set across an edit — see
+    // `edit_text_clears_style_spans_but_keeps_provenance` above).
+
+    /// A freshly-ingested tagged block — the one the standing invariant
+    /// `strip(original) == (content, style_spans)` is actually about — reads
+    /// as unedited from the moment it's built from a snapshot, with no edit
+    /// having happened yet.
+    #[test]
+    fn a_freshly_ingested_tagged_block_reads_as_unedited() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("aredb")
+            .provenance(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
+            .build();
+        let b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+        assert!(
+            !b.edited_since_ingest(),
+            "an untouched ingested block must check as unedited"
+        );
+        assert!(!b.snapshot().edited_since_ingest);
+    }
+
+    /// `edit_text` sets the marker (in addition to clearing spans) — the
+    /// fix for B1: before this field existed, nothing in durable state could
+    /// tell an edited tagged block from an unedited one.
+    #[test]
+    fn edit_text_sets_edited_since_ingest() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello world")
+            .provenance(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+        assert!(!b.edited_since_ingest(), "fixture must start unedited");
+
+        b.edit_text(5, "!", 0);
+
+        assert!(b.edited_since_ingest(), "edit_text must set the marker");
+        assert!(
+            b.snapshot().edited_since_ingest,
+            "the marker must ride the snapshot"
+        );
+    }
+
+    /// A successful reproject (`set_style_spans` with the freshly re-derived
+    /// spans + tag) clears the marker: `content` is once again exactly the
+    /// current projection, so "unedited" is true again.
+    #[test]
+    fn set_style_spans_clears_edited_since_ingest() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("hello world")
+            .provenance(ProvenanceTag {
+                transform: "ansi-strip".to_string(),
+                version: 1,
+            })
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+        b.edit_text(5, "!", 0);
+        assert!(b.edited_since_ingest(), "fixture must be edited before reproject");
+
+        b.set_style_spans(
+            Vec::new(),
+            Some(ProvenanceTag { transform: "ansi-strip".to_string(), version: 1 }),
+        );
+
+        assert!(
+            !b.edited_since_ingest(),
+            "a successful reproject must clear the marker"
+        );
     }
 }
