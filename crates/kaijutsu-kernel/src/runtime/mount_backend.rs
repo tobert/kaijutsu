@@ -307,7 +307,16 @@ impl KernelBackend for MountBackend {
             Ok(t) => t,
             Err(_) => {
                 self.raw_write(path, content, mode).await?;
-                self.file_cache.invalidate(&key);
+                // Best-effort: the disk write already landed, so a refusal
+                // here (an open editor session pins this path's entry, C —
+                // docs/audits/2026-08-20-editor-fileio.md) must not fail the
+                // whole write. It leaves a stale text shadow behind a live
+                // pinned session, which is loud (not silently swallowed) and
+                // strictly no worse than the old behavior of dropping the
+                // pinned entry out from under that session outright.
+                if let Err(e) = self.file_cache.invalidate(&key) {
+                    tracing::warn!("mount_backend write (binary): {e}");
+                }
                 return Ok(());
             }
         };
@@ -339,9 +348,14 @@ impl KernelBackend for MountBackend {
         // Write-through: external tools (cargo, git) read the real filesystem.
         // If the flush fails, roll the edit back out of the cache so a later
         // read can't serve content that never reached disk — crash, don't
-        // corrupt.
+        // corrupt. A pinned entry (an open editor session, C —
+        // docs/audits/2026-08-20-editor-fileio.md) refuses the rollback
+        // instead: the flush failure is still reported below, but a live
+        // session's buffer is never evicted to satisfy this write's cleanup.
         if let Err(e) = self.file_cache.flush_one(&key).await {
-            self.file_cache.invalidate(&key);
+            if let Err(inv_err) = self.file_cache.invalidate(&key) {
+                tracing::warn!("mount_backend write rollback: {inv_err}");
+            }
             return Err(BackendError::Io(e.to_string()));
         }
         Ok(())
@@ -358,7 +372,12 @@ impl KernelBackend for MountBackend {
             Ok(s) => s,
             Err(_) => {
                 self.raw_append(path, content).await?;
-                self.file_cache.invalidate(&key);
+                // See write()'s binary-content arm: best-effort, a refusal
+                // (pinned entry, C) leaves a stale shadow rather than
+                // failing an append that already landed on disk.
+                if let Err(e) = self.file_cache.invalidate(&key) {
+                    tracing::warn!("mount_backend append (binary): {e}");
+                }
                 return Ok(());
             }
         };
@@ -384,7 +403,11 @@ impl KernelBackend for MountBackend {
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
         if let Err(e) = self.file_cache.flush_one(&key).await {
-            self.file_cache.invalidate(&key);
+            // See write()'s flush-failure arm: a pinned entry (C) refuses the
+            // rollback; the flush failure below is still reported either way.
+            if let Err(inv_err) = self.file_cache.invalidate(&key) {
+                tracing::warn!("mount_backend append rollback: {inv_err}");
+            }
             return Err(BackendError::Io(e.to_string()));
         }
         Ok(())
@@ -397,7 +420,7 @@ impl KernelBackend for MountBackend {
         // the write cleanly).
         let writable = self.mount_table.is_writable(path).await;
         let key = self.cache_key(path)?;
-        let mut text = if writable {
+        let original = if writable {
             // For patch on a writable mount, both NotCached and Backend are
             // errors: we can't safely apply patch ops without the current content.
             // NotCached means the file is absent or binary — patching it is a
@@ -420,129 +443,16 @@ impl KernelBackend for MountBackend {
             String::from_utf8_lossy(&bytes).to_string()
         };
 
+        // Compute the WHOLE batch against an in-memory String first — no
+        // storage call happens until every op (including every `expected` CAS
+        // precondition) has validated, and every offset lands on a UTF-8 char
+        // boundary. See `compute_patch_op`'s doc: a partial-batch commit here
+        // was `3cb3ed4f`'s bug (op N's CAS failure must not leave ops 1..N-1
+        // durably applied), and a mid-char byte offset used to panic instead
+        // of erroring — `check_byte_boundary` closes that.
+        let mut text = original.clone();
         for op in ops {
-            match op {
-                PatchOp::Insert { offset, content } => {
-                    if *offset > text.len() {
-                        return Err(BackendError::InvalidOperation(format!(
-                            "insert offset {} beyond end of file ({})",
-                            offset,
-                            text.len()
-                        )));
-                    }
-                    text.insert_str(*offset, content);
-                }
-                PatchOp::Delete {
-                    offset,
-                    len,
-                    expected,
-                } => {
-                    let end = offset + len;
-                    if end > text.len() {
-                        return Err(BackendError::InvalidOperation(format!(
-                            "delete range {}..{} beyond end of file ({})",
-                            offset,
-                            end,
-                            text.len()
-                        )));
-                    }
-                    if let Some(exp) = expected {
-                        let actual = &text[*offset..end];
-                        if actual != exp.as_str() {
-                            return Err(BackendError::Conflict(ConflictError {
-                                location: format!("offset {}", offset),
-                                expected: exp.clone(),
-                                actual: actual.to_string(),
-                            }));
-                        }
-                    }
-                    text.replace_range(*offset..end, "");
-                }
-                PatchOp::Replace {
-                    offset,
-                    len,
-                    content,
-                    expected,
-                } => {
-                    let end = offset + len;
-                    if end > text.len() {
-                        return Err(BackendError::InvalidOperation(format!(
-                            "replace range {}..{} beyond end of file ({})",
-                            offset,
-                            end,
-                            text.len()
-                        )));
-                    }
-                    if let Some(exp) = expected {
-                        let actual = &text[*offset..end];
-                        if actual != exp.as_str() {
-                            return Err(BackendError::Conflict(ConflictError {
-                                location: format!("offset {}", offset),
-                                expected: exp.clone(),
-                                actual: actual.to_string(),
-                            }));
-                        }
-                    }
-                    text.replace_range(*offset..end, content);
-                }
-                PatchOp::InsertLine { line, content } => {
-                    let mut lines: Vec<&str> = text.split('\n').collect();
-                    let idx = line.saturating_sub(1).min(lines.len());
-                    lines.insert(idx, content);
-                    text = lines.join("\n");
-                }
-                PatchOp::DeleteLine { line, expected } => {
-                    let mut lines: Vec<&str> = text.split('\n').collect();
-                    let idx = line.saturating_sub(1);
-                    if idx >= lines.len() {
-                        return Err(BackendError::InvalidOperation(format!(
-                            "line {} out of range ({})",
-                            line,
-                            lines.len()
-                        )));
-                    }
-                    if let Some(exp) = expected
-                        && lines[idx] != exp.as_str()
-                    {
-                        return Err(BackendError::Conflict(ConflictError {
-                            location: format!("line {}", line),
-                            expected: exp.clone(),
-                            actual: lines[idx].to_string(),
-                        }));
-                    }
-                    lines.remove(idx);
-                    text = lines.join("\n");
-                }
-                PatchOp::ReplaceLine {
-                    line,
-                    content,
-                    expected,
-                } => {
-                    let mut lines: Vec<&str> = text.split('\n').collect();
-                    let idx = line.saturating_sub(1);
-                    if idx >= lines.len() {
-                        return Err(BackendError::InvalidOperation(format!(
-                            "line {} out of range ({})",
-                            line,
-                            lines.len()
-                        )));
-                    }
-                    if let Some(exp) = expected
-                        && lines[idx] != exp.as_str()
-                    {
-                        return Err(BackendError::Conflict(ConflictError {
-                            location: format!("line {}", line),
-                            expected: exp.clone(),
-                            actual: lines[idx].to_string(),
-                        }));
-                    }
-                    lines[idx] = content;
-                    text = lines.join("\n");
-                }
-                PatchOp::Append { content } => {
-                    text.push_str(content);
-                }
-            }
+            text = compute_patch_op(op, &text)?;
         }
 
         if writable {
@@ -552,7 +462,11 @@ impl KernelBackend for MountBackend {
                 .map_err(BackendError::Io)?;
             self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
             if let Err(e) = self.file_cache.flush_one(&key).await {
-                self.file_cache.invalidate(&key);
+                // See write()'s flush-failure arm: a pinned entry (C) refuses
+                // the rollback; the flush failure below is still reported.
+                if let Err(inv_err) = self.file_cache.invalidate(&key) {
+                    tracing::warn!("mount_backend patch rollback: {inv_err}");
+                }
                 return Err(BackendError::Io(e.to_string()));
             }
             Ok(())
@@ -738,6 +652,201 @@ impl MountBackend {
 
         self.mount_table.rmdir(path).await.map_err(vfs_to_backend)
     }
+}
+
+// =============================================================================
+// PatchOp helpers
+// =============================================================================
+//
+// Moved here from `kaish_backend.rs` (2026-08-20, see
+// `docs/audits/2026-08-20-kaish-glue.md` B2/B3): this is the ONE hardened
+// `PatchOp` implementation now, living with the live path (`MountBackend`,
+// the backend kaish actually scripts against). `KaijutsuBackend::patch` — the
+// twin these replaced there — was unreachable through any mount and is now
+// stubbed to `InvalidOperation`.
+
+/// Ensure a wire BYTE offset lands on a UTF-8 char boundary in `content`.
+///
+/// `PatchOp::Insert`/`Delete`/`Replace` offsets are BYTES by the kaish-types
+/// contract ("Insert content at byte offset", "Delete bytes …"), and the
+/// in-memory mirror ops in [`compute_patch_op`] (`insert_str`,
+/// `replace_range`) panic — rather than failing gracefully — on a
+/// non-boundary index. Every offset is checked here before it reaches them,
+/// so a mid-char offset is a loud `BackendError`, never a panic partway
+/// through a batch: the pre-fix path spliced text at a bogus position and
+/// then panicked in the byte mirror's `replace_range`, leaving the file
+/// corrupted behind the crash.
+fn check_byte_boundary(content: &str, byte: usize, what: &str) -> BackendResult<()> {
+    if byte > content.len() || !content.is_char_boundary(byte) {
+        return Err(BackendError::Io(format!(
+            "patch {what}: byte offset {byte} is not a char boundary in {}-byte content",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Compute the result of applying one patch op to `current_content` — pure,
+/// no storage access, no side effects. `patch()` folds every op in a batch
+/// through this over an in-memory `String`, so every op (including every
+/// `expected` CAS precondition, and every byte boundary) is validated before
+/// anything is committed — see `patch()`'s doc for why (`3cb3ed4f`: a CAS
+/// failure on op N must not leave ops 1..N-1 committed).
+///
+/// Byte-domain throughout: offsets are wire BYTES (kaish-types contract) and
+/// the mirror ops below operate on that domain directly. There is no
+/// char-indexed storage call in here at all.
+fn compute_patch_op(op: &PatchOp, current_content: &str) -> BackendResult<String> {
+    match op {
+        PatchOp::Insert { offset, content } => {
+            check_byte_boundary(current_content, *offset, "insert")?;
+            let mut result = current_content.to_string();
+            result.insert_str(*offset, content);
+            Ok(result)
+        }
+        PatchOp::Delete {
+            offset,
+            len,
+            expected,
+        } => {
+            // Validate boundaries BEFORE the CAS check: a bogus offset
+            // should report as the boundary error it is, not as a
+            // misleading conflict against the empty string `.get()` yields.
+            check_byte_boundary(current_content, *offset, "delete")?;
+            check_byte_boundary(current_content, offset + len, "delete")?;
+            if let Some(exp) = expected {
+                let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
+                if actual != exp {
+                    return Err(BackendError::Conflict(ConflictError {
+                        location: format!("offset {}", offset),
+                        expected: exp.clone(),
+                        actual: actual.to_string(),
+                    }));
+                }
+            }
+            let mut result = current_content.to_string();
+            result.replace_range(*offset..*offset + *len, "");
+            Ok(result)
+        }
+        PatchOp::Replace {
+            offset,
+            len,
+            content,
+            expected,
+        } => {
+            check_byte_boundary(current_content, *offset, "replace")?;
+            check_byte_boundary(current_content, offset + len, "replace")?;
+            if let Some(exp) = expected {
+                let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
+                if actual != exp {
+                    return Err(BackendError::Conflict(ConflictError {
+                        location: format!("offset {}", offset),
+                        expected: exp.clone(),
+                        actual: actual.to_string(),
+                    }));
+                }
+            }
+            let mut result = current_content.to_string();
+            result.replace_range(*offset..*offset + *len, content);
+            Ok(result)
+        }
+        PatchOp::InsertLine { line, content } => {
+            // Line starts always sit on char boundaries (see line_to_byte_offset),
+            // so no boundary check is needed here.
+            let line_offset = line_to_byte_offset(current_content, *line);
+            let mut result = current_content.to_string();
+            result.insert_str(line_offset, &format!("{}\n", content));
+            Ok(result)
+        }
+        PatchOp::DeleteLine { line, expected } => {
+            let (start, end) = line_range(current_content, *line);
+            let actual_line = current_content.get(start..end).unwrap_or("");
+
+            if let Some(exp) = expected
+                && actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n')
+            {
+                return Err(BackendError::Conflict(ConflictError {
+                    location: format!("line {}", line),
+                    expected: exp.clone(),
+                    actual: actual_line.to_string(),
+                }));
+            }
+
+            let mut result = current_content.to_string();
+            result.replace_range(start..end, "");
+            Ok(result)
+        }
+        PatchOp::ReplaceLine {
+            line,
+            content,
+            expected,
+        } => {
+            let (start, end) = line_range(current_content, *line);
+            let actual_line = current_content.get(start..end).unwrap_or("");
+
+            if let Some(exp) = expected
+                && actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n')
+            {
+                return Err(BackendError::Conflict(ConflictError {
+                    location: format!("line {}", line),
+                    expected: exp.clone(),
+                    actual: actual_line.to_string(),
+                }));
+            }
+
+            let replacement = format!("{}\n", content);
+            let mut result = current_content.to_string();
+            result.replace_range(start..end, &replacement);
+            Ok(result)
+        }
+        PatchOp::Append { content } => Ok(format!("{}{}", current_content, content)),
+    }
+}
+
+/// Get byte offset for a 1-indexed line number.
+///
+/// Kept LOCAL — deliberately NOT replaced by the shared
+/// `block_tools/translate` helpers — because the semantics differ in two
+/// load-bearing ways that are part of the kaish `PatchOp` line contract:
+/// this is **1-indexed** (kaish-types: "line number (1-indexed)") where
+/// translate.rs is 0-indexed, and this **clamps** a beyond-EOF line to
+/// end-of-content where translate.rs errors. Swapping would silently change
+/// the kaish patch surface. Outputs are BYTE offsets, consumed directly by
+/// `compute_patch_op`'s byte-domain mirror ops — no char projection happens
+/// here; `patch()` is the one place that projects byte to char, once, when
+/// it commits the whole batch's result as a single splice.
+fn line_to_byte_offset(content: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+
+    let mut offset = 0;
+    let mut current_line = 1;
+    for (i, c) in content.char_indices() {
+        if current_line >= line {
+            return i;
+        }
+        if c == '\n' {
+            current_line += 1;
+        }
+        offset = i + c.len_utf8();
+    }
+    offset
+}
+
+/// Get byte range for a 1-indexed line (includes newline if present).
+fn line_range(content: &str, line: usize) -> (usize, usize) {
+    let start = line_to_byte_offset(content, line);
+    let mut end = start;
+
+    for (i, c) in content[start..].char_indices() {
+        end = start + i + c.len_utf8();
+        if c == '\n' {
+            return (start, end);
+        }
+    }
+
+    (start, end)
 }
 
 #[cfg(test)]
@@ -1200,5 +1309,301 @@ mod tests {
             result.is_err(),
             "read must return Err on a Backend error, not serve stale disk bytes"
         );
+    }
+
+    // ── compute_patch_op × multibyte content (byte-vs-char offset regression) ──
+    //
+    // Moved from `kaish_backend.rs` (2026-08-20) along with the hardened
+    // `compute_patch_op`/`check_byte_boundary` it pins — this file's `patch()`
+    // is the only live caller now. `compute_patch_op` is pure (no storage),
+    // so these call it directly; the batch-atomicity property below can only
+    // be observed through `backend.patch()`.
+
+    #[test]
+    fn test_line_to_byte_offset() {
+        let content = "line 1\nline 2\nline 3";
+
+        assert_eq!(line_to_byte_offset(content, 1), 0);
+        assert_eq!(line_to_byte_offset(content, 2), 7); // "line 1\n" = 7 bytes
+        assert_eq!(line_to_byte_offset(content, 3), 14); // "line 1\nline 2\n" = 14 bytes
+    }
+
+    #[test]
+    fn test_line_range() {
+        let content = "line 1\nline 2\nline 3";
+
+        assert_eq!(line_range(content, 1), (0, 7)); // "line 1\n"
+        assert_eq!(line_range(content, 2), (7, 14)); // "line 2\n"
+        assert_eq!(line_range(content, 3), (14, 20)); // "line 3" (no trailing newline)
+    }
+
+    #[test]
+    fn patch_insert_line_after_multibyte_line() {
+        let content = "改善 → done\nsecond";
+
+        // 1-indexed: line 2 = before "second". `compute_patch_op` stays in
+        // the byte domain throughout, so this pins the correct line-split
+        // result rather than a char/byte mismatch landing in the wrong place.
+        let result = compute_patch_op(
+            &PatchOp::InsertLine {
+                line: 2,
+                content: "INSERTED".into(),
+            },
+            content,
+        )
+        .expect("insert line after a multibyte line must succeed");
+        assert_eq!(result, "改善 → done\nINSERTED\nsecond");
+    }
+
+    #[test]
+    fn patch_delete_line_with_multibyte_before() {
+        let content = "改善 → done\nDELETE ME\nkeep";
+
+        let result = compute_patch_op(
+            &PatchOp::DeleteLine {
+                line: 2,
+                expected: Some("DELETE ME".into()),
+            },
+            content,
+        )
+        .expect("delete line after a multibyte line must not trip bounds");
+        assert_eq!(result, "改善 → done\nkeep");
+    }
+
+    #[test]
+    fn patch_replace_line_with_multibyte_before() {
+        let content = "→ arrows ✅\nold\ntail";
+
+        let result = compute_patch_op(
+            &PatchOp::ReplaceLine {
+                line: 2,
+                content: "new".into(),
+                expected: Some("old".into()),
+            },
+            content,
+        )
+        .expect("replace line after a multibyte line must succeed");
+        assert_eq!(result, "→ arrows ✅\nnew\ntail");
+    }
+
+    /// Pins the byte-offset ruling for the positional ops: `PatchOp::Replace`'s
+    /// wire `offset`/`len` are BYTES (kaish-types contract; the CAS check
+    /// byte-slices). `compute_patch_op` stays in that byte domain end to end
+    /// — the char projection only happens once `patch()` commits the whole
+    /// batch's result.
+    #[test]
+    fn patch_byte_replace_with_multibyte_before() {
+        let content = "改善X";
+
+        // Bytes 6..7 = "X" (改善 = 6 bytes); chars 2..3 — pins that the byte
+        // offset itself, not a char projection, is what's checked and used.
+        let result = compute_patch_op(
+            &PatchOp::Replace {
+                offset: 6,
+                len: 1,
+                content: "Y".into(),
+                expected: Some("X".into()),
+            },
+            content,
+        )
+        .expect("byte-offset replace after multibyte prefix must succeed");
+        assert_eq!(result, "改善Y");
+    }
+
+    /// A wire byte offset that lands MID-CHAR is a loud error, not a panic —
+    /// `check_byte_boundary` rejects it before the mirror ops
+    /// (`insert_str`/`replace_range`) ever see it, since those panic rather
+    /// than error on a non-boundary index.
+    #[test]
+    fn patch_byte_offset_mid_char_fails_loud() {
+        let content = "改善";
+
+        let err = compute_patch_op(
+            &PatchOp::Replace {
+                offset: 1,
+                len: 1,
+                content: "z".into(),
+                expected: None,
+            },
+            content,
+        )
+        .expect_err("mid-char byte offset must be rejected");
+        assert!(
+            err.to_string().contains("char boundary"),
+            "error should name the boundary problem: {err}"
+        );
+    }
+
+    // ── batch atomicity + boundary safety through the real `patch()` path ──
+    //
+    // `patch()` computes every op in a batch against an in-memory `String`
+    // via `compute_patch_op` (pure, no storage) and commits once, only after
+    // the whole batch has succeeded — the property `3cb3ed4f` fixed on the
+    // old `KaijutsuBackend::patch` (a CAS failure on op N must not leave ops
+    // 1..N-1 durably applied) and that this file now provides for the live
+    // path.
+
+    #[tokio::test]
+    async fn patch_batch_cas_failure_leaves_content_untouched() {
+        let backend = test_mount_backend().await;
+        let path = Path::new("/tmp/atomic.txt");
+        backend
+            .write(path, b"abcdef", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // op1 would succeed alone (its CAS matches "abc"). op2's `expected`
+        // does not match what op1 actually produces at that offset ("def",
+        // not "MISMATCH") — the whole batch must fail, and op1 must not have
+        // been left applied.
+        let ops = vec![
+            PatchOp::Replace {
+                offset: 0,
+                len: 3,
+                content: "XXX".into(),
+                expected: Some("abc".into()),
+            },
+            PatchOp::Replace {
+                offset: 3,
+                len: 3,
+                content: "YYY".into(),
+                expected: Some("MISMATCH".into()),
+            },
+        ];
+
+        let err = backend
+            .patch(path, &ops)
+            .await
+            .expect_err("mid-batch CAS mismatch must fail the whole patch");
+        assert!(
+            matches!(err, BackendError::Conflict(_)),
+            "expected a Conflict error, got {err:?}"
+        );
+
+        let content = backend.read(path, None).await.unwrap();
+        assert_eq!(
+            content, b"abcdef",
+            "a failed batch must leave the file byte-identical — op1 must not have landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_successful_multi_op_batch_uses_progressive_offsets() {
+        let backend = test_mount_backend().await;
+        let path = Path::new("/tmp/progressive.txt");
+        backend
+            .write(path, b"abcdefghij", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // op2 and op3's offsets are against the content AFTER the prior op,
+        // not the original.
+        //   "abcdefghij"
+        // → "XYZdefghij"      (op1: replace [0..3) "abc" -> "XYZ")
+        // → "XYZ123defghij"   (op2: insert "123" at byte 3)
+        // → "XYZ123ghij"      (op3: delete [6..9) "def")
+        let ops = vec![
+            PatchOp::Replace {
+                offset: 0,
+                len: 3,
+                content: "XYZ".into(),
+                expected: Some("abc".into()),
+            },
+            PatchOp::Insert {
+                offset: 3,
+                content: "123".into(),
+            },
+            PatchOp::Delete {
+                offset: 6,
+                len: 3,
+                expected: Some("def".into()),
+            },
+        ];
+
+        backend
+            .patch(path, &ops)
+            .await
+            .expect("a fully valid multi-op batch must apply every op");
+
+        let content = backend.read(path, None).await.unwrap();
+        assert_eq!(content, b"XYZ123ghij");
+    }
+
+    #[tokio::test]
+    async fn patch_multibyte_multi_op_batch_char_vs_byte_splice() {
+        let backend = test_mount_backend().await;
+        let path = Path::new("/tmp/multibyte-batch.txt");
+        let original = "改善 → done";
+        backend
+            .write(path, original.as_bytes(), WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // op1 replaces the arrow (multibyte) itself; op2's offset is
+        // computed against the content AFTER op1, not the original.
+        let arrow_offset = original.find('→').unwrap();
+        let arrow_len = '→'.len_utf8();
+        let after_op1 = {
+            let mut s = original.to_string();
+            s.replace_range(arrow_offset..arrow_offset + arrow_len, "=>");
+            s
+        };
+        let append_offset = after_op1.len();
+
+        let ops = vec![
+            PatchOp::Replace {
+                offset: arrow_offset,
+                len: arrow_len,
+                content: "=>".into(),
+                expected: Some("→".into()),
+            },
+            PatchOp::Insert {
+                offset: append_offset,
+                content: " 改善".into(),
+            },
+        ];
+
+        backend
+            .patch(path, &ops)
+            .await
+            .expect("multibyte multi-op batch must apply cleanly");
+
+        let expected = format!("{} 改善", after_op1);
+        let content = backend.read(path, None).await.unwrap();
+        assert_eq!(content, expected.as_bytes());
+    }
+
+    /// A patch op with a byte offset inside a multi-byte char must return a
+    /// typed error through the real `patch()` path, never panic — the live
+    /// counterpart to `patch_byte_offset_mid_char_fails_loud` above, which
+    /// pins the same property on the pure `compute_patch_op`.
+    #[tokio::test]
+    async fn patch_mid_char_byte_offset_errors_not_panics() {
+        let backend = test_mount_backend().await;
+        let path = Path::new("/tmp/mid-char.txt");
+        backend
+            .write(path, "改善".as_bytes(), WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        let ops = vec![PatchOp::Replace {
+            offset: 1,
+            len: 1,
+            content: "z".into(),
+            expected: None,
+        }];
+        let err = backend
+            .patch(path, &ops)
+            .await
+            .expect_err("a byte offset inside a multi-byte char must error, not panic");
+        assert!(
+            err.to_string().contains("char boundary"),
+            "expected a boundary error, got {err}"
+        );
+
+        // The file must be untouched — the boundary check runs before any
+        // commit.
+        let content = backend.read(path, None).await.unwrap();
+        assert_eq!(content, "改善".as_bytes());
     }
 }

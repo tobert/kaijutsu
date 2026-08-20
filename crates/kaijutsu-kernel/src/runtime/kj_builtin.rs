@@ -109,8 +109,25 @@ impl KjBuiltin {
         }
     }
 
-    /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
-    async fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
+    /// Load context shell config (cwd + env vars) from KernelDb and apply to
+    /// ExecContext.
+    ///
+    /// Durable env is converted with [`context_env_values`] — the helper
+    /// `EmbeddedKaish::apply_context_config` (`runtime/embedded_kaish.rs`)
+    /// also uses, so a malformed key is rejected the same way on both
+    /// `apply_context_config` implementations. This side already has a live
+    /// `ExecContext` mid-dispatch, so it writes straight onto `ctx.scope`
+    /// instead of routing through a script.
+    ///
+    /// Fails loudly: a DB error or a rejected key returns `Err` instead of
+    /// the old `unwrap_or_default()` silent-empty fallback; `execute()`'s
+    /// `KjResult::Switch` arm turns that into an `ExecResult::failure`
+    /// rather than reporting the switch as successful with missing env.
+    async fn apply_context_config(
+        &self,
+        context_id: ContextId,
+        ctx: &mut ExecContext,
+    ) -> Result<(), String> {
         // Snapshot durable state and drop the DB lock before any await.
         let (persisted_cwd, env_vars) = {
             let db = self.dispatcher.kernel_db().lock();
@@ -119,7 +136,12 @@ impl KjBuiltin {
                 .ok()
                 .flatten()
                 .and_then(|shell| shell.cwd);
-            let vars = db.get_context_env(context_id).unwrap_or_default();
+            let vars = db.get_context_env(context_id).map_err(|e| {
+                format!(
+                    "get_context_env({}) failed: {e}",
+                    context_id.to_hex()
+                )
+            })?;
             (cwd, vars)
         };
 
@@ -141,11 +163,12 @@ impl KjBuiltin {
             }
         }
 
-        // Apply env vars (exported so they propagate to child processes)
-        for var in &env_vars {
-            ctx.scope
-                .set_exported(&var.key, Value::String(var.value.clone()));
+        // Apply env vars (exported so they propagate to child processes).
+        let pairs = super::embedded_kaish::context_env_values(&env_vars).map_err(|e| e.to_string())?;
+        for (key, value) in pairs {
+            ctx.scope.set_exported(&key, value);
         }
+        Ok(())
     }
 
     // ========================================================================
@@ -740,10 +763,16 @@ impl Tool for KjBuiltin {
                 // Side-effect: update the shared context ID
                 self.set_context_id(new_id);
 
-                // Apply context shell config (cwd + env vars)
-                self.apply_context_config(new_id, ctx).await;
-
-                ExecResult::success(msg)
+                // Apply context shell config (cwd + env vars). A failure here
+                // means the switch would silently leave the new context's
+                // durable env unapplied — fail the switch instead.
+                match self.apply_context_config(new_id, ctx).await {
+                    Ok(()) => ExecResult::success(msg),
+                    Err(e) => ExecResult::failure(
+                        1,
+                        format!("context switch: failed to apply context config: {e}"),
+                    ),
+                }
             }
             KjResult::Latch {
                 command,
@@ -2028,6 +2057,52 @@ mod tests {
             "confirm in a fresh shell should succeed, got code {} / err {:?}",
             confirm.code,
             confirm.err
+        );
+    }
+
+    /// A durable env value containing a single quote, a `$`, and a newline
+    /// must land on the live scope byte-for-byte after `kj context switch` —
+    /// this is `KjBuiltin::apply_context_config`'s half of the same
+    /// guarantee `EmbeddedKaish::apply_context_config`'s round-trip test pins
+    /// (`embedded_kaish.rs::test_context_env_special_chars_round_trip`); both
+    /// now share the same `context_env_values` conversion.
+    #[tokio::test]
+    async fn context_switch_applies_special_char_env_verbatim() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let source = register_context(&dispatcher, Some("switch-src"), None, principal);
+        let target = register_context(&dispatcher, Some("switch-dst"), None, principal);
+
+        let special_value = "it's a $HOME test\nwith a second line";
+        {
+            let db = dispatcher.kernel_db().lock();
+            db.set_context_env(target, "KJ_TEST_SPECIAL", special_value)
+                .unwrap();
+        }
+
+        let kaish = embedded_with_kj(dispatcher.clone(), source).await;
+        let switch = kaish
+            .execute_with_options("kj context switch switch-dst", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (switch)");
+        assert!(
+            switch.ok(),
+            "context switch must succeed: code {} / err {:?}",
+            switch.code,
+            switch.err
+        );
+
+        let exported = kaish.exported_vars().await;
+        let value = exported
+            .iter()
+            .find(|(k, _)| k == "KJ_TEST_SPECIAL")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            value,
+            Some(special_value),
+            "a value with a single quote, $, and a newline must round-trip verbatim; got {exported:?}",
         );
     }
 

@@ -346,18 +346,13 @@ impl EmbeddedKaish {
         // config's vfs_mode is moot — what matters is the cwd and the agent-grade
         // ignore/output-limit presets (gitignore-aware walks + capped output).
         // Build them explicitly via the builder chain rather than a bundled
-        // constructor so this survives kaish config-API churn. (kaish 0.9 renamed
-        // these `mcp()` presets to `agent()` — same sandboxed-agent behavior.)
+        // constructor so this survives kaish config-API churn.
         let mut config = KaishConfig::named(name)
             .with_ignore_config(IgnoreConfig::agent())
             // Output cap by consumer, not by trust — see `OutputProfile`.
             // Model-facing shells keep kaish's 8 KB agent preset; rc/hook/
             // editor-splice shells get a runaway backstop instead, so kaish's
             // `did_spill` exit-code remap never forges a failure in a script.
-            // kaish 0.14 deleted the confirmation latch and its nonce store, so
-            // there is nothing to keep alive across this per-execute shell any
-            // more: `kj`'s own confirmation gate is a bare `--confirm` flag
-            // evaluated inside a single invocation (see `kj_builtin.rs`).
             .with_output_limit(output.to_config());
         if let Some(root) = project_root {
             config = config.with_cwd(root);
@@ -596,37 +591,106 @@ impl EmbeddedKaish {
     /// post-construction by `restore_cwd_from_db`; this applies the env half.
     /// Context-setup *scripting* is RC's job now (the former
     /// `context_shell.init_script` was a leftover and has been folded into the
-    /// rc lifecycle), so this no longer runs any script.
+    /// rc lifecycle), so this no longer runs any script of its own — see
+    /// [`Self::export_env_vars`] for how the durable rows actually reach the
+    /// shell.
+    ///
+    /// Fails loudly: a DB read failure or a rejected key means this context
+    /// would run with silently wrong env, so the error returns to the caller
+    /// and materialization fails instead of continuing on a warning.
     pub async fn apply_context_config(
         &self,
         db: &parking_lot::Mutex<KernelDb>,
         context_id: ContextId,
-    ) {
+    ) -> Result<()> {
         let env_vars = {
             let db_guard = db.lock();
-            db_guard.get_context_env(context_id).unwrap_or_default()
-        };
-
-        // Export env vars so they propagate to child processes. Uses the
-        // kernel-wide kaish default timeout — exports are tiny, no override.
-        for var in &env_vars {
-            // Shell-escape value to avoid injection.
-            let escaped = var.value.replace('\'', "'\\''");
-            if let Err(e) = self
-                .execute_with_options(
-                    &format!("export {}='{}'", var.key, escaped),
-                    ExecuteOptions::default(),
+            db_guard.get_context_env(context_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "apply_context_config: get_context_env({}) failed: {e}",
+                    context_id.to_hex()
                 )
-                .await
-            {
-                tracing::warn!(
-                    key = %var.key,
-                    error = %e,
-                    "failed to apply context env var",
-                );
-            }
+            })?
+        };
+        if env_vars.is_empty() {
+            return Ok(());
         }
+        self.export_env_vars(&env_vars).await.map_err(|e| {
+            anyhow::anyhow!(
+                "apply_context_config: failed to export context {} durable env: {e:#}",
+                context_id.to_hex()
+            )
+        })
     }
+
+    /// Export `vars` durably into the shell's persistent (root-frame) scope,
+    /// in one call.
+    ///
+    /// No *value* ever becomes literal script text: each crosses into kaish
+    /// through this call's own `ExecuteOptions::vars` overlay (a typed
+    /// `Value`, not a string), referenced from the generated script by a
+    /// synthetic `$__kj_env_N__` name. Only the row's *key* is spliced into
+    /// source, as the left side of `export KEY="$…"` —
+    /// [`context_env_values`] rejects anything that is not a legal kaish
+    /// identifier before this runs, so there is nothing to shell-escape on
+    /// that side either. This is the replacement for the old hand-rolled
+    /// `value.replace('\'', "'\\''")` loop.
+    ///
+    /// `export`'s assignment form (`kaish-kernel`'s `tools/builtin/export.rs`)
+    /// writes through `Scope::set_exported_global`, which searches every
+    /// frame for an existing `KEY` and otherwise creates it in the *root*
+    /// frame — never the transient overlay frame the temp name lives in — so
+    /// the export outlives this call while the overlay frame dies with it
+    /// (`execute_with_options`'s per-call `VarsFrameGuard` pops it on return).
+    async fn export_env_vars(&self, vars: &[crate::kernel_db::ContextEnvRow]) -> Result<()> {
+        let pairs = context_env_values(vars)?;
+        let mut overlay = std::collections::HashMap::with_capacity(pairs.len());
+        let mut script = String::new();
+        for (i, (key, value)) in pairs.into_iter().enumerate() {
+            let tmp = format!("__kj_env_{i}__");
+            overlay.insert(tmp.clone(), value);
+            script.push_str(&format!("export {key}=\"${tmp}\"\n"));
+        }
+        let opts = ExecuteOptions::new().with_vars(overlay);
+        let result = self.execute_with_options(&script, opts).await?;
+        if result.code != 0 {
+            anyhow::bail!("export script exited {}: {}", result.code, result.err);
+        }
+        Ok(())
+    }
+}
+
+/// Validate and convert durable `context_env` rows into `(name, Value)`
+/// pairs ready to export. The one helper both `apply_context_config`
+/// implementations share — this file's [`EmbeddedKaish::apply_context_config`]
+/// and `kj_builtin.rs`'s `KjBuiltin::apply_context_config` — so a malformed
+/// key is rejected identically on both paths instead of silently accepted by
+/// the direct-`scope` one while corrupting the generated script on this one.
+/// The identifier rule matches kaish's own `export` builtin
+/// (`tools/builtin/export.rs::check_name`): ASCII letter/underscore first,
+/// then ASCII alphanumeric/underscore.
+pub(crate) fn context_env_values(
+    vars: &[crate::kernel_db::ContextEnvRow],
+) -> Result<Vec<(String, kaish_kernel::ast::Value)>> {
+    vars.iter()
+        .map(|v| {
+            if !is_valid_env_key(&v.key) {
+                anyhow::bail!("context_env: key {:?} is not a valid identifier", v.key);
+            }
+            Ok((
+                v.key.clone(),
+                kaish_kernel::ast::Value::String(v.value.clone()),
+            ))
+        })
+        .collect()
+}
+
+/// ASCII-identifier check mirroring kaish's `export` builtin's `check_name`:
+/// letter/underscore first, then alphanumeric/underscore.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Merge ambient W3C trace context (and a context-id baggage tag) into per-call
@@ -1340,7 +1404,10 @@ mod tests {
         .unwrap();
 
         // Apply context config (durable env vars).
-        kaish.apply_context_config(&kernel_db, context_id).await;
+        kaish
+            .apply_context_config(&kernel_db, context_id)
+            .await
+            .expect("apply context env");
 
         // Verify env vars are accessible via kaish execution.
         let result = kaish
@@ -1361,6 +1428,90 @@ mod tests {
             result.text_out().trim(),
             "42",
             "KJ_TEST_NUM should be set from context_env",
+        );
+    }
+
+    /// A durable env value containing a single quote, a `$`, and a newline
+    /// must round-trip byte-for-byte. This is what `export_env_vars`'s
+    /// temp-var indirection replaces the old `value.replace('\'', "'\\''")`
+    /// escaping loop with: the value never becomes literal script text, so
+    /// there is nothing for a shell metacharacter to break out of.
+    #[tokio::test]
+    async fn test_context_env_special_chars_round_trip() {
+        use crate::kernel_db::{ContextRow, KernelDb};
+        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
+
+        let context_id = ContextId::new();
+        let principal = PrincipalId::system();
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = db.get_or_create_default_workspace(principal).unwrap();
+        db.insert_context_with_document(
+            &ContextRow {
+                context_id,
+                label: Some("test-env-special".into()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::default(),
+                context_state: ContextState::Live,
+                forked_from: None,
+                fork_kind: None,
+                created_by: principal,
+                context_type: "default".to_string(),
+                created_at: now_millis() as i64,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+                cast_id: None,
+                origin_host: None,
+            },
+            ws_id,
+        )
+        .unwrap();
+
+        let special_value = "it's a $HOME test\nwith a second line";
+        db.set_context_env(context_id, "KJ_TEST_SPECIAL", special_value)
+            .unwrap();
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
+        let blocks = shared_block_store(principal);
+        let kernel = test_kernel("test-env-special").await;
+        let sid = SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        let kaish = EmbeddedKaish::with_identity(
+            "test-env-special",
+            blocks,
+            kernel,
+            None,
+            principal,
+            context_id,
+            sid,
+            session_contexts,
+            ExternalExec::Deny,
+            OutputProfile::Agent,
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        kaish
+            .apply_context_config(&kernel_db, context_id)
+            .await
+            .expect("apply context env");
+
+        let exported = kaish.exported_vars().await;
+        let value = exported
+            .iter()
+            .find(|(k, _)| k == "KJ_TEST_SPECIAL")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            value,
+            Some(special_value),
+            "a value with a single quote, $, and a newline must round-trip verbatim; got {exported:?}",
         );
     }
 

@@ -281,7 +281,7 @@ impl KjDispatcher {
         // Seed the env half of the context's durable state.
         kaish
             .apply_context_config(self.kernel_db(), context_id)
-            .await;
+            .await?;
 
         // Restore the persisted cwd, validated against the shell's backend (the
         // VFS namespace `cd` uses — a host-FS check would wrongly reject
