@@ -934,6 +934,35 @@ impl FileDocumentCache {
         }
     }
 
+    /// Discard a swap — the other rule-4 resolution besides
+    /// [`acknowledge_swap`](Self::acknowledge_swap): disk wins, not the
+    /// buffer. Drops the in-memory entry and its backing document (so the
+    /// next read reloads fresh from disk, same as [`invalidate_document`]),
+    /// then clears the `dirty_file_buffers` row. The document drop runs
+    /// first: if it fails, the row survives so the swap isn't declared gone
+    /// while its content still sits in the store. Refuses (does not silently
+    /// no-op) when `path` has no `dirty_file_buffers` row — a caller
+    /// discarding a path that was never dirty is a caller with the wrong
+    /// path, not a no-op. See `docs/file-buffers.md` rule 4.
+    pub fn discard_swap(&self, path: &str) -> Result<(), String> {
+        let has_row = self
+            .db
+            .lock()
+            .get_dirty_file_buffer(path)
+            .map_err(|e| format!("discard_swap({path}): failed to check swap marker: {e}"))?
+            .is_some();
+        if !has_row {
+            return Err(format!("discard_swap({path}): no swap for this path"));
+        }
+        self.invalidate_document(path)?;
+        self.db.lock().clear_dirty_file_buffer(path).map_err(|e| {
+            format!(
+                "discard_swap({path}): dropped the buffer but failed to clear its swap marker: {e}"
+            )
+        })?;
+        Ok(())
+    }
+
     /// Get the SharedBlockStore (for engines that need direct store access).
     pub fn block_store(&self) -> &SharedBlockStore {
         &self.block_store

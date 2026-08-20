@@ -114,6 +114,9 @@ roster          status <text> [--availability], list — the live roster: post
                 caller's own) or list who's around right now
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 stage           commit, status, include, exclude — curate a staged (liminal) fork
+swap            list, ack, discard — resolve a file buffer recovered after a
+                kernel restart (docs/file-buffers.md rule 4); read it first at
+                /v/swap/<kernel_id>/<path>
 transport       attach, detach, play, pause, stop, tempo <bpm>, ooda <on|off>,
                 clock <system|modeled>, rotate, delete — a track's beat clock
                 (the musician playhead)

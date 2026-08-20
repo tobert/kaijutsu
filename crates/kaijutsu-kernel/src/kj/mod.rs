@@ -49,6 +49,7 @@ pub mod refs;
 pub mod search;
 pub mod shell_gate;
 pub mod stage;
+pub mod swap;
 pub mod transport;
 pub mod vfs;
 pub mod workspace;
@@ -481,6 +482,11 @@ impl KjDispatcher {
         if cmd == "editor" {
             return self.dispatch_editor(&argv[1..], caller).await;
         }
+        // `kj swap` addresses a recovered file buffer by path, same as
+        // `kj editor`/`kj diff` — no active context needed to look one up.
+        if cmd == "swap" {
+            return self.dispatch_swap(&argv[1..], caller).await;
+        }
         if cmd == "config" {
             return self.dispatch_config(&argv[1..], caller).await;
         }
@@ -907,6 +913,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())
         .subcommand(editor::EditorArgs::command())
+        .subcommand(swap::SwapArgs::command())
         .subcommand(config::ConfigArgs::command())
         .subcommand(block::BlockArgs::command())
         .subcommand(binding::BindingArgs::command())

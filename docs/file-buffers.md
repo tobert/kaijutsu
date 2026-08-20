@@ -65,6 +65,27 @@ serving it. We do the first not at all and the third silently.
 4. **The kernel enforces, the UI explains.** A recovered swap is not served as
    authoritative until acknowledged. A `Bool` on a wire struct is ignorable by
    a renderer that does not know to look; the safety must not live there.
+   `kj swap list` shows every recovered swap the kernel knows about; `kj swap
+   ack <path>` keeps the buffer (acknowledges + flushes it to disk in one
+   move) and `kj swap discard <path>` drops it (disk wins on the next read).
+   Both refuse loudly on a path with no swap. Read the buffer first at
+   `/v/swap/<kernel_id>/<path>` before choosing.
+
+**An open editor session pins its cache entry.** Rules 2-3 protect a *dirty*
+buffer — `evict_if_needed` already skips dirty entries — but a session sits
+*clean* between `editor_open` and its first edit, and again after every
+successful `:w`. In that window an unrelated read of some other path (any MCP
+read, any kaish `cat` — each one inserts a cache entry) could evict the
+session's entry, and `mark_dirty`/`flush_one` used to treat "no entry" as
+"nothing to do" and return `Ok(())`: `:w` reported success while nothing
+reached disk (P1, `docs/issues.md` "Tech-debt audits, 2026-08-20"). The fix is
+two-sided: `mark_dirty`/`flush_one` now error (`FlushError::NotCached`) rather
+than silently no-op on an uncached path, and `Kernel::editor_open_as` pins the
+target's cache entry (`FileDocumentCache::pin`/`unpin`, ref-counted so two
+sessions on one path don't fight over the pin) for the session's whole open
+lifetime, released on close (`editor_keys`'s `Closed` arm, `editor_quit`). A
+pinned entry is never evicted, dirty or not — the loud error is the backstop
+for every *other* caller, not the editor's steady-state path.
 
 ## Tool surface: three removals
 
