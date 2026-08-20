@@ -231,6 +231,15 @@ impl KjDispatcher {
                         privileged,
                     ));
                 }
+                // `curl` — registered unconditionally, read-only shells
+                // included. The read-only contract (`EmbeddedKaish::
+                // with_identity_read_only`'s doc comment) is about the VFS
+                // and host subprocess exec; a GET is a read of the network,
+                // not of either. The allowlisted host it can reach is a
+                // single internal inference endpoint (`runtime::curl_tool`),
+                // so the exposure a read-only shell picks up here is narrow
+                // even for a non-GET method against that one host.
+                tools.register(crate::runtime::curl_tool::curl_tool());
             };
 
         let kaish = if read_only {

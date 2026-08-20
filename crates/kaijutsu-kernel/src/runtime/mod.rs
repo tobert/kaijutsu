@@ -14,9 +14,12 @@
 //! - `read_only_fs` — read-only wrapper for the `/v/*` document mounts (toolie).
 //! - `context_engine` — per-session "current context" registry.
 //! - `kj_builtin` — the `kj` kaish Tool.
+//! - `curl_tool` — the `curl` kaish Tool (kaish-extras' `kaish-tools-curl`),
+//!   one configuration shared by every materialized shell.
 
 pub mod config_doc_fs;
 pub mod context_engine;
+pub mod curl_tool;
 pub mod docs_filesystem;
 pub mod embedded_kaish;
 pub mod input_filesystem;

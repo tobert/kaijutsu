@@ -86,6 +86,17 @@ kaish-kernel.workspace = true
 # of hand-writing kaish-language prose.
 kaish-help.workspace = true
 
+# HTTP tool for kaish (`curl`, docs/kj-help/ + runtime/curl_tool.rs), from the
+# out-of-tree kaish-extras bundle (github.com/tobert/kaish-extras). Not yet on
+# crates.io, so this is a git dep — pinned by rev, never a path dep: a rev
+# resolves for anyone who clones, a path dep resolves only on a machine
+# holding that worktree (see the kaish-kernel comment above this block for
+# the cost of getting that wrong). `kaish-extras`' own workspace pins
+# kaish-tool-api/kaish-types to the same "0.15" this workspace pins above, so
+# the `Tool` trait objects unify — `cargo tree -i kaish-types` must show
+# exactly one version after this is added.
+kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "55369bf7cb33e85e92b7b7e559a01de7f756293a" }
+
 # gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
 ignore.workspace = true
 
