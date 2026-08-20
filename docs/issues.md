@@ -53,6 +53,17 @@ and the devlog. What remains:
   be the one place; `StyleEntry.effect`/`param`/`_pad` and
   `ChromeInstance.anim[1]` are unread (documented, leave with an expiry note).
 
+### rc scripts and comments
+
+- **`S50-lfm2d.kai` round-trips its hook body through a temp file** to dodge
+  a kaish quoting rule the lane read too broadly. The real rule (kaish-lead,
+  08-20): only `"$(… "…" …)"` — double quotes at both levels — fails to
+  parse. Drop the temp file and the comment that states the wrong rule; keep
+  `jq --arg` bound outside the substitution. S.
+- **Older comments still cite rulings and dates** (e.g. `kj/ledger.rs` has
+  five "Amy's ruling" mentions predating today's rule). Sweep them when the
+  file is next touched — state the rule, point at docs. S, incremental.
+
 ### Kaish glue
 
 - **The `kj` builtin flattens kaish's typed `ToolArgs` back to argv** for clap
