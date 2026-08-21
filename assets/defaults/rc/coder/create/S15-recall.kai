@@ -64,6 +64,14 @@
 # does. Recorded because the mistake is easy to repeat: "inject into the
 # system prompt" is the intuitive phrasing and the wrong mechanism for
 # anything that varies per create.
+#
+# set -e sits on top of the guards below, not in place of them: every read
+# that can legitimately return nothing (a `grep -c` on zero matches) is
+# guarded with `|| true` at its point of use, and `kj block create`'s own
+# exit is guarded the same way so a transient failure there still falls
+# through to the belt-and-suspenders `exit 0` — preserving this script's
+# NEVER-exit-nonzero contract instead of fighting it.
+set -e
 
 exo="/home/atobey/exomemory"
 fleet_file="$exo/fleet.md"
@@ -100,7 +108,7 @@ fi
 fleet_total=0
 fleet_digest="unavailable ($fleet_file not readable)"
 if test -f $fleet_file; then
-  fleet_total="$(grep -E '^- ' $fleet_file | sed -n 's/^- \*\*\([^*]*\)\*\*.*/- \1/p' | grep -c .)"
+  fleet_total="$(grep -E '^- ' $fleet_file | sed -n 's/^- \*\*\([^*]*\)\*\*.*/- \1/p' | grep -c .)" || true
   fleet_digest="$(grep -E '^- ' $fleet_file | sed -n 's/^- \*\*\([^*]*\)\*\*.*/- \1/p' | head -n 20)"
   if test -z "$fleet_digest"; then
     fleet_digest="(present but no bulleted constraints matched — fleet.md's format may have changed)"
@@ -114,7 +122,7 @@ fi
 mem_total=0
 mem_digest="unavailable ($mem_file not readable)"
 if test -f $mem_file; then
-  mem_total="$(grep -c '^- \[' $mem_file)"
+  mem_total="$(grep -c '^- \[' $mem_file)" || true
   mem_digest="$(grep '^- \[' $mem_file | head -n 20)"
   if test -z "$mem_digest"; then
     mem_digest="(present but no index lines matched — MEMORY.md's format may have changed)"
@@ -133,7 +141,7 @@ $fleet_digest
 -- MEMORY.md topic index (first 20 of $mem_total, index-line grade; full file: $mem_file) --
 $mem_digest"
 
-kj block create --role system --kind notification --content "$content"
+kj block create --role system --kind notification --content "$content" || true
 
 echo "recall: injected fleet=$fleet_total mem=$mem_total head=$head_hash stamp=$stamp"
 exit 0

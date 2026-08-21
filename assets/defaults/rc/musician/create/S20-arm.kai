@@ -14,4 +14,5 @@
 # empty/unsluggable label fails LOUD here (an rc Error block) rather than
 # attaching onto a silent shared lane. Runs privileged in the create lifecycle,
 # so it clears the Transport gate under the narrowed loadout.
+set -e
 kj transport attach

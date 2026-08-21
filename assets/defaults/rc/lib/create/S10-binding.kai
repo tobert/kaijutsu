@@ -1,4 +1,5 @@
 # Broad loadout: every instance + every facade (explicit; deny-by-default).
+set -e
 kj binding allow "*"
 kj binding allow "facade:*"
 # kj verb authorities are explicit — NOT implied by "*". Broad roles are fully

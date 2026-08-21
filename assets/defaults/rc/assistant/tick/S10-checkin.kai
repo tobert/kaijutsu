@@ -34,6 +34,13 @@
 #
 # All three are with Amy for a kaish scope call. If they are fixed, this
 # script still works; re-test before relaxing anything.
+#
+# set -e below. The two probes want the exit CODE to branch on, not a
+# fallback value, and under errexit a failing `x="$(cmd)"` aborts before
+# `rc=$?` can run — so each brackets itself in `set +e` / `set -e`. A
+# trailing `|| true` would suppress the abort but leave `$?` as the guard's
+# own 0, which is the wrong number to branch on.
+set -e
 
 # -- clock, read fresh this turn (the writer-stamps rule applies to us too)
 now="$(date '+%Y-%m-%d %H:%M %Z')"
@@ -62,16 +69,20 @@ queue_path="${KJ_ASSISTANT_QUEUE:-/home/atobey/exomemory/queue.md}"
 # quoting nicety. (Trap 4, and the proof-run below is what caught it — the
 # quoted form was in this script until the first run refused to parse.)
 # Consequence: keep the queue path space-free.
+set +e
 queue_head="$(head -20 $queue_path)"
 rc=$?
+set -e
 if [[ "$rc" -ne 0 ]]; then
   queue_head="READ-FAIL: $queue_path"
 fi
 echo "queue head: $queue_head"
 
 # roster: who is at the table right now? Trap 1 again, and trap 3 in the jq.
+set +e
 roster="$(kj context list --json | jq -r '.[]' | head -30)"
 rc=$?
+set -e
 if [[ "$rc" -ne 0 ]]; then
   roster="READ-FAIL: context list"
 fi

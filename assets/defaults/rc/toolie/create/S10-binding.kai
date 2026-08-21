@@ -6,6 +6,7 @@
 # projecting `read_only_shell`, both retired names) into the model's roster.
 # The toolie never grants `facade:shell_write` (the hot, mutating shell), so
 # it gets exactly one shell, the safe one.
+set -e
 kj binding allow "facade:shell"
 kj binding allow "builtin.file:read"
 kj binding allow "builtin.file:glob"

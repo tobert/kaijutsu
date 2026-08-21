@@ -16,5 +16,6 @@
 #
 # kaish ships a `date` builtin (chrono-backed, TZ-aware) — no new env var or
 # Rust change needed to read the clock.
+set -e
 now="$(date '+%Y-%m-%d %A %H:%M %z')"
 kj block create --role system --kind notification --content "Current date/time: $now (contexts have no other clock — use this when dating anything you write)"

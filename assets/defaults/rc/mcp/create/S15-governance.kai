@@ -11,6 +11,7 @@
 # These are deny-by-default and NOT implied by "*": a broad role must not be able
 # to rewrite a privileged lifecycle script or swap which model runs by accident.
 # Granting them here is the explicit, intentional opt-in for the producer voice.
+set -e
 kj binding allow "rc-write"      # kj rc edit/reset + file-tool writes under /etc/rc
 kj binding allow "config-write"  # kj config set/reset over /etc/config, plus
                                  # kj backend/cast/alias (which model runs)

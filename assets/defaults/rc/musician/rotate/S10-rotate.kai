@@ -24,4 +24,5 @@
 #
 # Chained with `&&`: if the fork fails (no switch), we must NOT fall through and
 # attach/play the parent the scheduler just stopped.
+set -e
 kj fork --preset spawn --switch && kj transport attach && kj transport play

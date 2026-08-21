@@ -27,6 +27,7 @@
 # KJ_FORK_INFO is {"kind":"full|shallow|compact|subtree","parent":"<hex>"}. Match
 # the kind field precisely. Runs privileged in the fork lifecycle, so it clears
 # the Operator gate `kj context hydrate` requires.
+set -e
 case "$KJ_FORK_INFO" in
   *'"kind":"full"'*)
     echo "fork: full clone — hydration window left unset (full history stays live; arm + 'kj context hydrate' to window it)"

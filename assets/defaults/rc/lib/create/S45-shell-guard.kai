@@ -29,6 +29,7 @@
 # (`x="$(printf "a")"` fails; `x=$(printf "a")` and `"$(echo 'a')"` parse).
 # An unquoted assignment does not word-split the captured value.
 
+set -e
 match_json='{"match_tool":"shell_write","hook_id":"shell-escape-guard"}'
 action_json=$(jq -n '([39]|implode) as $q | ([34]|implode) as $dq | ([10]|implode) as $nl | ([92]|implode) as $bs | {type: "kaish", body: ("cmd=" + $dq + "$(printf " + $q + "%s" + $q + " $KJ_TOOL_ARGS | jq -r " + $q + ".command" + $q + ")" + $dq + $nl + "hits=" + $dq + "$(printf " + $q + "%s" + $q + " $cmd | grep -Ec " + $q + "(^|[;&|(][[:space:]]*)(exec[[:space:]]+)?(ba|z|da)?sh[[:space:]]+-[a-z]*c" + $bs + "b" + $q + ")" + $dq + $nl + "if test " + $dq + "$hits" + $dq + " -gt 0; then" + $nl + "    echo " + $dq + "blocked: sh -c / bash -c / zsh -c / dash -c is opaque to the shell gate — run it as kaish directly, not through sh -c" + $dq + " >&2" + $nl + "    exit 1" + $nl + "fi")}')
 kj hook add pre_call "$match_json" "$action_json"

@@ -1,4 +1,5 @@
 # director: block/coordination allow-set.
+set -e
 kj binding allow "builtin.block"
 kj binding allow "builtin.file:read"
 kj binding allow "builtin.resources"

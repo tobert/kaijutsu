@@ -7,6 +7,7 @@
 # per-context override and reads `null` whenever a context inherits the
 # registry default or a cast. See the coder stance for the full story — that
 # distinction cost a 63k-token recon tour once already.
+set -e
 model="$(kj context info --json | jq -r '.resolved_model')"
 
 case "$model" in

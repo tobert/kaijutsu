@@ -11,6 +11,7 @@
 # palette (Chameleon: "ABC-only output is ideal small-local-model UX"), and it
 # sidesteps the tool-call turn path entirely (a small model handed the full
 # palette stalls the turn). Only `drive` (the tick) is granted.
+set -e
 kj binding allow "drive"
 # Deliberately NOT granted: any builtin.* tool instance (block/file/resources/
 # kernel_info/tool_search), facade:shell (the safe tool) or facade:shell_write

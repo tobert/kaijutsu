@@ -10,6 +10,7 @@
 # `create` and lands as an ordinary Role::System/BlockKind::Text block (folds
 # into the cached system prompt like S00-stance.kai — see that script's
 # comment for why S25-datetime.kai deliberately does NOT do this).
+set -e
 primer="$(kj kaish primer)"
 
 # Fail loudly on an empty primer instead of seeding an empty system block.

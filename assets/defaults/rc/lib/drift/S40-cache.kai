@@ -3,6 +3,7 @@
 # message now. Clear and re-seed the stable bits. --flag=value because
 # the kj tool schema does not declare these flag names; bare --flag args
 # otherwise parse as bool flags in kaish.
+set -e
 kj cache clear
 kj cache add --target=tools  --ttl=extended
 kj cache add --target=system --ttl=ephemeral

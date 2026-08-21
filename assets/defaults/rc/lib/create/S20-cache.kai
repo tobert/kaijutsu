@@ -3,5 +3,6 @@
 # System prompt may shift on rc edits / model swaps → 5m.
 # --flag=value because the kj tool schema does not declare these flag
 # names; bare --flag args otherwise parse as bool flags in kaish.
+set -e
 kj cache add --target=tools  --ttl=extended
 kj cache add --target=system --ttl=ephemeral

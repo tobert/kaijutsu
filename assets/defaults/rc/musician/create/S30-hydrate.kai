@@ -16,4 +16,5 @@
 #
 # Runs privileged in the create lifecycle, so it clears the Operator gate even
 # under the musician's narrowed loadout (which doesn't grant it directly).
+set -e
 kj context hydrate --window 16

@@ -28,6 +28,7 @@
 # calculator tool without stalling — see issues.md "RO-kaish for players"), do the
 # math here in kaish and hand the model spelled-out, exact fill targets. In 4/4 a
 # beat is a quarter note, so bars = beats / 4.
+set -e
 bars=$(( KJ_PHRASE_BEATS / 4 ))
 #
 # `kj drive --prompt` writes the report as a real User block, so the model
