@@ -1336,6 +1336,89 @@ mod tests {
         }
     }
 
+    /// A file mounted directly on the raw VFS backend, so `readdir` (the
+    /// walker's traversal primitive) actually sees it — unlike
+    /// `broker_with_file`, whose `cache.create_or_replace` lands content in
+    /// the block store without flushing through to the backend, which is
+    /// why the walker-based `glob`/`grep` tests elsewhere assert only that
+    /// no error fired, never that a match was found.
+    async fn broker_with_vfs_file(path: &str, content: &str) -> Arc<Broker> {
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        vfs.write_all(std::path::Path::new(path), content.as_bytes())
+            .await
+            .unwrap();
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
+        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
+        let broker = Arc::new(Broker::new());
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+    }
+
+    /// Reproduces the 2026-08-18 backlog entry, pinned as a KNOWN, UNFIXED
+    /// defect rather than a required behavior: `grep` given a `path` that
+    /// names a specific *file* (the same shape `read` and shell `grep` both
+    /// accept) silently reports no matches, even when the pattern is
+    /// present, instead of searching the file or failing loudly.
+    ///
+    /// Root cause, not the entry's "document-aware" working theory: `grep`'s
+    /// `path` is always walked as a directory root
+    /// (`crates/kaijutsu-kernel/src/mcp/servers/file.rs`, the `grep` arm's
+    /// `kaish_glob::FileWalker::new(&adapter, &search_root)` — no
+    /// file-vs-directory check precedes it). `FileWalker::collect` opens
+    /// that root with `WalkerFs::list_dir` before it ever looks at file
+    /// contents (`kaish-glob-0.15.0/src/walker.rs:233`); handed a file path,
+    /// every VFS backend's `readdir` fails — `not_a_directory` in
+    /// `crates/kaijutsu-kernel/src/vfs/backends/memory.rs:160`, ENOTDIR via
+    /// `fs::read_dir` in `crates/kaijutsu-kernel/src/vfs/backends/local.rs`
+    /// (real files, so this reaches the live-repro backend too, not just
+    /// this test's in-memory one). `FileToolsServer` never installs a
+    /// `WalkOptions::on_error` callback, and the walker's own `Err(err) => {
+    /// ...; continue }` arm on that `list_dir` call
+    /// (`kaish-glob-0.15.0/src/walker.rs:233-240`) silently drops the error
+    /// when there is no callback and treats the root as an empty directory —
+    /// so `collect()` returns `Ok(vec![])`, `grep`'s `files` list is empty,
+    /// and the tool reports "No matches found": a confident, wrong answer
+    /// masking a walk that never happened. Pattern, anchoring, and file size
+    /// are all irrelevant to this path — only whether `path` names a file.
+    ///
+    /// Not fixed here: the MCP file tools (`read`/`edit`/`write`/`glob`/`grep`
+    /// in this module) are being removed in favor of kaish (Amy, 2026-08-21)
+    /// — a fix to code slated for deletion is waste. This test exists to
+    /// document the mechanism before the tool goes away, and to falsify the
+    /// entry's "document-aware"/"different view" theory, which this shows is
+    /// not what is happening: no document view is involved, just a directory
+    /// walk over a file path.
+    #[tokio::test]
+    async fn grep_is_blind_when_path_names_a_specific_file() {
+        let path = "/tmp/issues.md";
+        let content = "intro\n## SFTP\nbody\n## Another heading\n";
+        let broker = broker_with_vfs_file(path, content).await;
+
+        let res = call(
+            &broker,
+            "grep",
+            serde_json::json!({ "pattern": "## SFTP", "path": path }),
+        )
+        .await;
+
+        assert!(!res.is_error, "the walk-empty case reports success, not an error: {}", text_of(&res));
+        assert_eq!(
+            text_of(&res),
+            "No matches found.",
+            "documents the live defect: a pattern that IS in the file comes back \
+             as no matches because `path` names a file, not a directory. If this \
+             ever starts finding \"## SFTP\", the walker/VFS behavior this test \
+             pins has changed — update or remove this test rather than treating \
+             the change as a break: {}",
+            text_of(&res)
+        );
+    }
+
     /// The guard must not over-refuse: an explicit path is let through.
     /// Without this, "refuse the root" could be satisfied by refusing
     /// everything.
