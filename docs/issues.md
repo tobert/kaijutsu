@@ -597,51 +597,6 @@ and the gutter inclusion checkbox (`view/surface/labels.rs`, the `label_gap`
   `ShapedBlock::labels`: captions derive from the *unfocused* border style so
   a j/k move never re-uploads a screenful of glyphs.
 
-## The gutter checkbox is a tofu box (2026-08-18)
-
-`☑` (U+2611) and `☐` (U+2610) are **not in NotoMono-Regular**, and nothing in
-the shaping stack falls back for them: both shape to `glyph_id: 0` — the
-`.notdef` box — at the same 6.6px advance. Measured against the shipped font
-through `collect_msdf_glyphs_deferred` while eyeballing slice 5 live on
-moltar, and visible in a screenshot as a small hollow rectangle in the right
-gutter of every block.
-
-So the inclusion indicator is currently distinguishable **only by alpha**
-(0.3 included / 0.5 excluded) — the two states draw the identical mark. This
-predates the surface port (the same two characters through the same font
-produced the same tofu on the old per-block-cell path too, before it was
-deleted); the port preserved it deliberately rather than diverging on a font
-question.
-
-**RULED 2026-08-21: substitute ASCII** (`[x]`/`[ ]`) in
-`view::surface::labels::checkbox_char`. The two rejected options stay on
-record because they remain the better-looking answers if this ever gets
-revisited: ship a symbol font and teach the fallback chain about it, or draw
-the checkbox as an SDF quad in the chrome pass (`block_fx.wgsl` already has a
-gutter-indicator flag that draws a dot/ring — `text_glow_params.y` — which the
-surface did not port).
-## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
-
-Found live on toad during the same ACP smoke-test session as the P1 entry
-below. The `grep` tool returned "No matches found" for `^## `, for the literal
-substring `## SFTP` (known to exist), and for bare `##` with no anchor at all
-— against `docs/issues.md`, a real file in the repo. In the same turn, shell
-`grep -c '## ' docs/issues.md` returned `31` and the `read`/`builtin_file__read`
-tool paged the file's contents (with hashline prefixes) without issue. Same
-file, three tools, two different answers about whether it has content.
-
-The agent's own working theory (block `2d25fb02#31` of context `4895806b`):
-*"maybe the grep tool is document-aware and treats the pattern differently...
-maybe the grep tool searches a different view (document blocks) than the
-filesystem backend the read/shell tools see."* Plausible, not confirmed — this
-needs the same treatment as the shell_write entry: reproduce against the
-`grep` tool's actual implementation rather than reasoning from behavior. Worth
-noting against `docs/issues.md`'s own 2026-07-29 "Day-job coding readiness"
-entry, which characterizes `grep` as "document-aware" and "ahead of Claude
-Code's equivalents" (line ~2829) — that claim and this blind spot are not
-obviously reconcilable, and whichever is true should be checked, not assumed.
-Full transcript: `docs/kaijutsu-feedback.md`.
-
 ## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18)
 
 **Live on toad, 11:00 today.** A turn died with the provider's own words:
