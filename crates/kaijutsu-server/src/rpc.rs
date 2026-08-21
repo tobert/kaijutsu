@@ -2724,18 +2724,71 @@ impl kernel::Server for KernelImpl {
                     // so we can persist what this command changes back to L1.
                     let state_before = snapshot_shell_state(&kaish).await;
 
+                    // Same identity `shell_pre_call_hooks` used above, rebuilt here
+                    // for `PostCall`/`OnError` — the RPC response already went out
+                    // (`results.get().set_exec_id` above), so a hook that escalates
+                    // here only delays this background task's own completion, never
+                    // the client's `execute` call.
+                    let call_ctx = {
+                        let conn = connection_bg.borrow();
+                        kaijutsu_kernel::mcp::CallContext::new(
+                            conn.principal.id,
+                            started_ctx,
+                            conn.session_id,
+                            kernel.id,
+                        )
+                    };
+
                     let exec_result = tokio::select! {
                         result = kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()) => {
                             match result {
-                                Ok(r) => r,
+                                Ok(r) => {
+                                    // PostCall — the real result this command produced,
+                                    // same pinch point `Broker::call_tool` evaluates
+                                    // after a real server call (docs/gate-and-shell-
+                                    // split.md, "The three rpc.rs shell paths take the
+                                    // hook path"). `Proceed` changes nothing. This
+                                    // streaming path has no block to rewrite and has
+                                    // already allocated `exec_id`, so `ShortCircuit`/
+                                    // `Denied` can't be synthesized into the output-
+                                    // event stream below (the same narrower-than-the-
+                                    // other-two-sites gap `shell_pre_call_hooks`'s
+                                    // ShortCircuit handling above already accepts for
+                                    // this function) — logged loudly, real output still
+                                    // delivered.
+                                    let hook_result = exec_result_to_hook_tool_result(&r);
+                                    log_shell_hook_verdict_if_unactionable(
+                                        "execute",
+                                        "PostCall",
+                                        kernel.kernel.broker()
+                                            .shell_post_call_hooks(&code, &call_ctx, &hook_result)
+                                            .await,
+                                    );
+                                    r
+                                }
                                 Err(e) => {
                                     log::error!("kaish execute error: {}", e);
+                                    let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
+                                    log_shell_hook_verdict_if_unactionable(
+                                        "execute",
+                                        "OnError",
+                                        kernel.kernel.broker()
+                                            .shell_on_error_hooks(&code, &call_ctx, &mcp_err)
+                                            .await,
+                                    );
                                     kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
                                 }
                             }
                         }
                         _ = cancel_token.cancelled() => {
                             kaish.cancel();
+                            log_shell_hook_verdict_if_unactionable(
+                                "execute",
+                                "OnError",
+                                kernel.kernel.broker()
+                                    .shell_on_error_hooks(&code, &call_ctx, &kaijutsu_kernel::mcp::McpError::Cancelled)
+                                    .await,
+                            );
                             kaish_kernel::interpreter::ExecResult::failure(130, "interrupted")
                         }
                     };
@@ -8455,6 +8508,8 @@ async fn execute_shell_command(
     let block_flows = kernel_arc.block_flows().clone();
     let connection_switch = connection.clone();
     let kernel_db_for_persist = kernel.kernel_db.clone();
+    let kernel_arc_for_hooks = kernel_arc.clone();
+    let kernel_id = kernel.id;
 
     tokio::task::spawn_local(async move {
         // Yield to let the event loop flush BlockInserted events to clients
@@ -8657,6 +8712,48 @@ async fn execute_shell_command(
                 {
                     log::error!("Failed to set command block status: {}", e);
                 }
+
+                // PostCall — hand the hook the real result this command
+                // produced (docs/gate-and-shell-split.md, "The three rpc.rs
+                // shell paths take the hook path"): mirrors `Broker::
+                // call_tool`'s own PostCall pinch point. `Proceed` changes
+                // nothing — the real output above already stands.
+                // `ShortCircuit` overrides it the same way `call_tool`'s
+                // PostCall can override a real server result; `Deny` settles
+                // both blocks to `Error` with the hook's reason, same as a
+                // `call_tool` caller getting `Denied` instead of the result
+                // it actually produced.
+                let hook_result = exec_result_to_hook_tool_result(&result);
+                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
+                    user_principal_id,
+                    context_id,
+                    connection_switch.borrow().session_id,
+                    kernel_id,
+                );
+                match kernel_arc_for_hooks
+                    .broker()
+                    .shell_post_call_hooks(&code, &call_ctx, &hook_result)
+                    .await
+                {
+                    kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
+                    kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
+                        let text = shell_hook_result_text(&sc_result);
+                        let status = if sc_result.is_error { Status::Error } else { Status::Done };
+                        if let Err(e) =
+                            overwrite_block_text(&documents_clone, context_id, &output_block_id_clone, &text)
+                        {
+                            log::error!("Failed to write PostCall short-circuited shell output: {}", e);
+                        }
+                        let _ = documents_clone.set_status(context_id, &output_block_id_clone, status);
+                        let _ = documents_clone.set_status(context_id, &command_block_id_clone, status);
+                    }
+                    kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+                        let reason = format!("shell command result denied by hook: {err}");
+                        let _ = documents_clone.set_stderr(context_id, &output_block_id_clone, Some(reason));
+                        let _ = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error);
+                        let _ = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error);
+                    }
+                }
             }
             Err(e) => {
                 let error_msg = format!("Error: {}", e);
@@ -8680,6 +8777,36 @@ async fn execute_shell_command(
                     documents_clone.set_status(context_id, &command_block_id_clone, Status::Error)
                 {
                     log::error!("Failed to set command block error status: {}", e);
+                }
+
+                // OnError — hand the hook the real failure (mirrors
+                // `call_tool`'s own OnError pinch point). `ShortCircuit` can
+                // convert the failure into a synthetic success, same as
+                // `call_tool`'s OnError; `Proceed`/`Deny` both leave the
+                // real error above standing — a failed command is already
+                // the terminal state a `Deny` would produce.
+                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
+                    user_principal_id,
+                    context_id,
+                    connection_switch.borrow().session_id,
+                    kernel_id,
+                );
+                let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
+                if let kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) =
+                    kernel_arc_for_hooks
+                        .broker()
+                        .shell_on_error_hooks(&code, &call_ctx, &mcp_err)
+                        .await
+                {
+                    let text = shell_hook_result_text(&sc_result);
+                    let status = if sc_result.is_error { Status::Error } else { Status::Done };
+                    if let Err(e) =
+                        overwrite_block_text(&documents_clone, context_id, &output_block_id_clone, &text)
+                    {
+                        log::error!("Failed to write OnError short-circuited shell output: {}", e);
+                    }
+                    let _ = documents_clone.set_status(context_id, &output_block_id_clone, status);
+                    let _ = documents_clone.set_status(context_id, &command_block_id_clone, status);
                 }
             }
         }
@@ -8740,12 +8867,197 @@ fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolResult) -> St
         .join("\n")
 }
 
+/// Real kaish `ExecResult` → the `KernelToolResult` shape a `PostCall` hook
+/// sees — the same real-result contract `shell_result_to_kernel`
+/// (`mcp/servers/shell.rs`) builds for an actual `shell_write` tool call,
+/// reduced to what a hook body needs: text output and the `is_error`
+/// channel. Judged by the real exit the way `shell_result_to_kernel`
+/// judges it — a spilled-and-remapped `code=3` reads back as its
+/// `original_code`, not as truncation-flavored success.
+fn exec_result_to_hook_tool_result(
+    result: &kaish_kernel::interpreter::ExecResult,
+) -> kaijutsu_kernel::mcp::KernelToolResult {
+    let real_code = result.original_code.unwrap_or(result.code);
+    let is_error = real_code != 0;
+    let stdout = result.text_out().into_owned();
+    let mut body = stdout.clone();
+    if !result.err.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&result.err);
+    }
+    kaijutsu_kernel::mcp::KernelToolResult {
+        is_error,
+        content: vec![kaijutsu_kernel::mcp::ToolContent::Text(body)],
+        structured: Some(serde_json::json!({
+            "stdout": stdout,
+            "stderr": result.err,
+            "exit_code": real_code,
+            "did_spill": result.did_spill,
+        })),
+    }
+}
+
+/// `rpc.rs::execute`'s narrow spot: the streaming exec path has no context
+/// block to rewrite and has already returned `exec_id` to the caller by the
+/// time `PostCall`/`OnError` run, so a `ShortCircuit`/`Denied` verdict can't
+/// be synthesized into `dispatch_output_events` the way the other two shell
+/// paths synthesize it into a block — the same gap `shell_pre_call_hooks`'s
+/// own `ShortCircuit` handling in `execute` already accepts (see the
+/// `PreCall` comment there). Logs loudly instead of silently discarding the
+/// verdict; the real command output is still what gets delivered.
+fn log_shell_hook_verdict_if_unactionable(
+    rpc_fn: &str,
+    phase: &str,
+    verdict: kaijutsu_kernel::mcp::ShellHookVerdict,
+) {
+    match verdict {
+        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
+        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(_) => {
+            log::warn!(
+                "{rpc_fn}: {phase} hook short-circuited a result on the streaming exec path \
+                 — not synthesized into the output-event stream (known gap, see \
+                 rpc.rs::execute); delivering the real command output instead",
+            );
+        }
+        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+            log::warn!(
+                "{rpc_fn}: {phase} hook denied a completed command's result on the streaming \
+                 exec path ({err}) — the command already ran; delivering the real command \
+                 output instead (known gap, see rpc.rs::execute)",
+            );
+        }
+    }
+}
+
 fn kaish_quote(word: &str) -> String {
     let escaped = word.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
         .replace('`', "\\`");
     format!("\"{}\"", escaped)
+}
+
+/// Replace a block's full text — block edits are character-addressed
+/// (`blocks/content.rs::edit_text`: "`pos` and `delete` are CHARACTER
+/// offsets, never byte offsets"), so a full replace deletes the block's
+/// current char length before inserting the replacement, rather than
+/// prepending onto what's already there. Used to let a `PostCall`/`OnError`
+/// hook's `ShortCircuit` override a real command's output the block already
+/// carries, the same override `Broker::call_tool`'s own `PostCall` grants a
+/// hook over a real server result.
+fn overwrite_block_text(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    block_id: &kaijutsu_types::BlockId,
+    text: &str,
+) -> kaijutsu_kernel::BlockStoreResult<()> {
+    let old_len = documents
+        .get_block_snapshot(context_id, block_id)?
+        .map(|s| s.content.chars().count())
+        .unwrap_or(0);
+    documents.edit_text_as(context_id, block_id, 0, text, old_len, Some(PrincipalId::system()))
+}
+
+#[cfg(test)]
+mod exec_result_to_hook_tool_result_tests {
+    use super::exec_result_to_hook_tool_result;
+    use kaijutsu_kernel::mcp::ToolContent;
+    use kaish_kernel::interpreter::ExecResult;
+
+    /// The audit item this closes: a `PostCall` hook watching a direct
+    /// kaish exec must see the REAL exit code and stdout, not a
+    /// synthesized placeholder.
+    #[test]
+    fn carries_the_real_exit_code_and_stdout() {
+        let mut result = ExecResult::success("unmistakable-real-stdout");
+        result.code = 0;
+        let hook_result = exec_result_to_hook_tool_result(&result);
+        assert!(!hook_result.is_error);
+        let text = match &hook_result.content[0] {
+            ToolContent::Text(t) => t.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(
+            text.contains("unmistakable-real-stdout"),
+            "hook body must see the real stdout: {text}",
+        );
+        assert_eq!(
+            hook_result
+                .structured
+                .as_ref()
+                .and_then(|s| s.get("exit_code"))
+                .and_then(|v| v.as_i64()),
+            Some(0),
+        );
+    }
+
+    /// A spilled result remaps `code` to 3 (kaish's output-limit contract);
+    /// the hook must be judged by the REAL exit (`original_code`), the same
+    /// rule `shell_result_to_kernel` applies ("truncation is not failure").
+    /// Falsification: read `result.code` instead of `real_code` here and
+    /// this test goes red (`is_error` flips to `true`, `exit_code` reads 3).
+    #[test]
+    fn judges_a_spilled_result_by_its_real_original_exit_code() {
+        let mut result = ExecResult::success("partial output");
+        result.code = 3;
+        result.did_spill = true;
+        result.original_code = Some(0);
+        let hook_result = exec_result_to_hook_tool_result(&result);
+        assert!(
+            !hook_result.is_error,
+            "a spilled-but-successful command must not read back as an error to the hook",
+        );
+        assert_eq!(
+            hook_result
+                .structured
+                .as_ref()
+                .and_then(|s| s.get("exit_code"))
+                .and_then(|v| v.as_i64()),
+            Some(0),
+        );
+    }
+}
+
+#[cfg(test)]
+mod overwrite_block_text_tests {
+    use super::{overwrite_block_text, SharedBlockStore};
+    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
+    use kaijutsu_types::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
+
+    /// `edit_text` is character-addressed, so a naive `pos=0, delete=0`
+    /// second write PREPENDS onto the block's real output instead of
+    /// replacing it. This locks that a `PostCall`/`OnError` override
+    /// actually replaces the real command output, not concatenates onto
+    /// it. Falsification: hardcode `delete: 0` in `overwrite_block_text`
+    /// and this test goes red (content becomes
+    /// "synthetic-hook-resultthe-real-command-output").
+    #[test]
+    fn replaces_the_real_output_rather_than_prepending_onto_it() {
+        let store: SharedBlockStore = std::sync::Arc::new(BlockStore::new(PrincipalId::new()));
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::System,
+                BlockKind::ToolResult,
+                "the-real-command-output",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        overwrite_block_text(&store, ctx, &block_id, "synthetic-hook-result").unwrap();
+
+        let snapshot = store.get_block_snapshot(ctx, &block_id).unwrap().unwrap();
+        assert_eq!(snapshot.content, "synthetic-hook-result");
+    }
 }
 
 /// Execute exactly one `kj` builtin against an addressed context. This is a
@@ -8827,6 +9139,33 @@ async fn execute_kj_command(
                 .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
             documents.set_status(context_id, &command_block_id, Status::Error)
                 .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+
+            // OnError — hand the hook the real failure (mirrors
+            // `call_tool`'s own OnError pinch point). `ShortCircuit` can
+            // convert the failure into a synthetic success, same as
+            // `call_tool`'s OnError; `Proceed`/`Deny` both leave the real
+            // error above standing — a failed command is already the
+            // terminal state a `Deny` would produce.
+            let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
+            if let kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) = kernel
+                .kernel
+                .broker()
+                .shell_on_error_hooks(&code, &call_ctx, &mcp_err)
+                .await
+            {
+                let text = shell_hook_result_text(&sc_result);
+                let status = if sc_result.is_error { Status::Error } else { Status::Done };
+                if let Err(e) = overwrite_block_text(&documents, context_id, &output_block_id, &text) {
+                    log::error!("Failed to write OnError short-circuited kj output: {}", e);
+                }
+                let _ = documents.set_status(context_id, &output_block_id, status);
+                let _ = documents.set_status(context_id, &command_block_id, status);
+                let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
+                return Ok(ExecutedKj {
+                    exit_code: sc_exit_code, stdout: text, stderr: String::new(),
+                    command_block_id, latch: None, data: None,
+                });
+            }
             return Ok(ExecutedKj {
                 exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None, data: None,
             });
@@ -8890,7 +9229,51 @@ async fn execute_kj_command(
     documents.set_status(context_id, &command_block_id, status)
         .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
     let data = output_data.and_then(|od| od.rich_json);
-    Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch, data })
+
+    // PostCall — hand the hook the real result this command produced
+    // (docs/gate-and-shell-split.md, "The three rpc.rs shell paths take
+    // the hook path"): mirrors `Broker::call_tool`'s own PostCall pinch
+    // point. `Proceed` changes nothing — the real output above already
+    // stands. `ShortCircuit` overrides it the same way `call_tool`'s
+    // PostCall can override a real server result; `Deny` settles both
+    // blocks to `Error` and reports the hook's reason instead of the real
+    // output, same as a `call_tool` caller getting `Denied` instead of the
+    // result it actually produced.
+    let hook_result = exec_result_to_hook_tool_result(&result);
+    match kernel
+        .kernel
+        .broker()
+        .shell_post_call_hooks(&code, &call_ctx, &hook_result)
+        .await
+    {
+        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {
+            Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch, data })
+        }
+        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
+            let text = shell_hook_result_text(&sc_result);
+            let status = if sc_result.is_error { Status::Error } else { Status::Done };
+            if let Err(e) = overwrite_block_text(&documents, context_id, &output_block_id, &text) {
+                log::error!("Failed to write PostCall short-circuited kj output: {}", e);
+            }
+            let _ = documents.set_status(context_id, &output_block_id, status);
+            let _ = documents.set_status(context_id, &command_block_id, status);
+            let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
+            Ok(ExecutedKj {
+                exit_code: sc_exit_code, stdout: text, stderr: String::new(),
+                command_block_id, latch: None, data: None,
+            })
+        }
+        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+            let reason = format!("kj command result denied by hook: {err}");
+            let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
+            let _ = documents.set_status(context_id, &output_block_id, Status::Error);
+            let _ = documents.set_status(context_id, &command_block_id, Status::Error);
+            Ok(ExecutedKj {
+                exit_code: 1, stdout: String::new(), stderr: reason,
+                command_block_id, latch: None, data: None,
+            })
+        }
+    }
 }
 
 #[cfg(test)]

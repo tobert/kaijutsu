@@ -1343,3 +1343,40 @@ erroring on the id collision or leaving a stale duplicate. `kaish_script_id`
 (provenance metadata, not evaluated behavior) is deliberately excluded from
 the shape comparison. Tests: `add_with_same_id_and_shape_is_a_noop`,
 `add_with_same_id_and_different_action_replaces`.
+
+---
+
+## The three rpc.rs shell paths take the hook path
+
+`execute`, `execute_shell_command` and `execute_kj_command` in
+`kaijutsu-server/src/rpc.rs` run kaish directly rather than through
+`Broker::call_tool`, so hooks reach them through their own pinch points rather
+than through the tool broker. All three evaluate **PreCall**, **PostCall** and
+**OnError**.
+
+**A human's interactive shell is gated exactly like a model's tool call, and
+that is deliberate.** These are the paths a person's typing arrives on, so a
+hook such as the shell-escape guard denies a human at their own keyboard the
+same way it denies a coder seat. Someone who hits a denial they did not expect
+is not looking at a bug. Softening it for interactive seats is an rc decision
+to make once a conditional Ask outcome exists, not a carve-out in the paths.
+
+**Deny is enforced on all three paths.** A PreCall `Denied` returns an error
+and the command never runs.
+
+**ShortCircuit — substituting a result — is enforced on two of the three.**
+`execute` streams its output and has already returned its `exec_id` to the
+client by the time PostCall runs, so there is no result left to replace and no
+event-stream synthesis to carry a substituted one. On that path a
+`ShortCircuit` or a `Denied` verdict from PostCall/OnError is logged loudly and
+the real output is still delivered. `execute_shell_command` and
+`execute_kj_command` rewrite the block, so both verdicts take effect there.
+
+**Escalate blocks.** A body that escalates in any phase on these paths waits up
+to the gate wait timeout, as it already does inside `Broker::call_tool`. That
+is the separately-tracked open question about whether escalate is meaningful
+outside PreCall, not a property of these paths.
+
+`execute_kj_command` is synchronous, so a slow hook there delays the RPC caller
+directly. The other two evaluate PostCall/OnError on a background task, where a
+slow hook delays only that task's own completion.

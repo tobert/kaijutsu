@@ -2140,8 +2140,8 @@ impl Broker {
     // and `execute_kj_command` run `EmbeddedKaish::execute_with_options`
     // directly — never through `Broker::call_tool` — so no `PreCall`/
     // `PostCall`/`OnError` hook ever sees a human typing at the shell. These
-    // two methods give `rpc.rs` the same PreCall/PostCall verdict a
-    // `shell_write` tool call gets, matched as `instance: builtin.shell_write,
+    // three methods give `rpc.rs` the same PreCall/PostCall/OnError verdict
+    // a `shell_write` tool call gets, matched as `instance: builtin.shell_write,
     // tool: shell_write, args: {command}` — the identity every
     // `match_tool: "shell_write"` hook (the sh -c guard, a future lfm2d
     // scorer) already expects, so one hook fires on both the tool-call path
@@ -2233,6 +2233,48 @@ impl Broker {
             }
             Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+            }
+            Err(e) => ShellHookVerdict::Denied(e),
+        }
+    }
+
+    /// Run `OnError` against `command`'s real execution failure, same
+    /// identity as [`Self::shell_pre_call_hooks`]. Lets a hook observe (or
+    /// convert) what a direct kaish exec actually failed with, the way
+    /// `OnError` observes a real `shell_write` tool call's failure in
+    /// `call_tool`. `ShortCircuit` converts the failure into a synthetic
+    /// result the caller should report in place of the error — the same
+    /// override `call_tool`'s own `OnError` grants.
+    ///
+    /// Shares `evaluate_phase` with every other phase call in this file, so
+    /// an `Escalate` in a kaish hook body blocks this call for up to the
+    /// gate's wait timeout exactly as it already does for `PreCall` on
+    /// these same shell paths and for `PostCall`/`OnError` inside
+    /// `call_tool` — this method adds no new Escalate wiring, it reuses
+    /// what's already there.
+    pub async fn shell_on_error_hooks(
+        &self,
+        command: &str,
+        ctx: &CallContext,
+        err: &McpError,
+    ) -> ShellHookVerdict {
+        let params = Self::shell_write_hook_params(command);
+        match self
+            .evaluate_phase(McpHookPhase::OnError, &params, ctx, PhasePayload::Error(err))
+            .await
+        {
+            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
+            Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
+                emit_short_circuit_attribution(McpHookPhase::OnError, &hook_id);
+                ShellHookVerdict::ShortCircuit(result)
+            }
+            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                emit_deny_attribution(McpHookPhase::OnError, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::Denied { by_hook: hook_id })
+            }
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                emit_gate_unavailable_attribution(McpHookPhase::OnError, &hook_id, &reason);
                 ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
             }
             Err(e) => ShellHookVerdict::Denied(e),
@@ -7645,6 +7687,171 @@ mod tests {
             matches!(err, McpError::Protocol(_)),
             "expected original Protocol error to propagate (hook saw KJ_TOOL_ERROR and exited 0); got {err:?}",
         );
+    }
+
+    // -------------------------------------------------------------------
+    // shell_post_call_hooks / shell_on_error_hooks: PostCall/OnError on the
+    // rpc.rs direct-exec paths. `shell_pre_call_hooks` already had callers;
+    // these two did not (`shell_post_call_hooks` had zero, and
+    // `shell_on_error_hooks` didn't exist) until this pass wired them into
+    // `rpc.rs::execute`/`execute_shell_command`/`execute_kj_command`.
+    // -------------------------------------------------------------------
+
+    /// A PostCall hook watching a direct kaish exec must see the REAL exit
+    /// code and stdout the command produced, not a synthesized
+    /// placeholder — the gap this pass closes.
+    #[tokio::test]
+    async fn shell_post_call_hooks_delivers_the_real_exit_code_and_output() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("shell-post-call-real-result").await;
+
+        let body = "case \"$KJ_TOOL_RESULT\" in \
+            *'unmistakable-real-stdout'*'\"exit_code\":7'*) exit 0 ;; \
+            *) exit 1 ;; esac";
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("shell-post-call-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(body.into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let real_result = KernelToolResult {
+            is_error: true,
+            content: vec![ToolContent::Text("unmistakable-real-stdout".into())],
+            structured: Some(json!({"exit_code": 7})),
+        };
+        let verdict = broker
+            .shell_post_call_hooks(
+                "echo unmistakable-real-stdout; exit 7",
+                &CallContext::test(),
+                &real_result,
+            )
+            .await;
+        assert!(
+            matches!(verdict, ShellHookVerdict::Proceed),
+            "hook saw the real exit code + stdout (KJ_TOOL_RESULT) and exited 0; \
+             expected Proceed, got {verdict:?}",
+        );
+    }
+
+    /// An OnError hook watching a direct kaish exec must see the REAL
+    /// failure, not a synthesized one.
+    #[tokio::test]
+    async fn shell_on_error_hooks_delivers_the_real_error() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("shell-on-error-real-error").await;
+
+        let body = "case \"$KJ_TOOL_ERROR\" in \
+            *'\"kind\":\"Protocol\"'*'unmistakable-real-failure'*) exit 0 ;; \
+            *) exit 1 ;; esac";
+        broker.hooks().write().await.on_error.entries.push(HookEntry {
+            id: hook_id("shell-on-error-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(body.into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let real_err = McpError::Protocol("unmistakable-real-failure".into());
+        let verdict = broker
+            .shell_on_error_hooks("false", &CallContext::test(), &real_err)
+            .await;
+        assert!(
+            matches!(verdict, ShellHookVerdict::Proceed),
+            "hook saw the real error (KJ_TOOL_ERROR) and exited 0; expected Proceed, got {verdict:?}",
+        );
+    }
+
+    /// `PostCall` on the shell paths is not merely advisory: a
+    /// `ShortCircuit` action can replace the real result with a synthetic
+    /// one, exactly as `call_tool`'s own `PostCall` can (`call_tool_inner`,
+    /// `PhaseOutcome::ShortCircuit { .. } => Ok(r2)`). This locks that the
+    /// shell paths grant the same override, not a weaker "observe only"
+    /// version of it.
+    #[tokio::test]
+    async fn shell_post_call_short_circuit_overrides_the_result_like_call_tool_does() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("shell-post-call-short-circuit").await;
+
+        let synthetic = KernelToolResult::text("synthetic-hook-result");
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("shell-post-call-short-circuit"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::ShortCircuit(synthetic),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let real_result = KernelToolResult::text("the-real-command-output");
+        let verdict = broker
+            .shell_post_call_hooks(
+                "echo the-real-command-output",
+                &CallContext::test(),
+                &real_result,
+            )
+            .await;
+        match verdict {
+            ShellHookVerdict::ShortCircuit(r) => {
+                let text = match &r.content[0] {
+                    ToolContent::Text(t) => t.clone(),
+                    other => panic!("expected text content, got {other:?}"),
+                };
+                assert_eq!(
+                    text, "synthetic-hook-result",
+                    "PostCall ShortCircuit must be able to override the real result on the \
+                     shell path, matching `call_tool`'s own PostCall — not merely advisory",
+                );
+            }
+            other => panic!("expected ShortCircuit, got {other:?}"),
+        }
+    }
+
+    /// A PostCall hook body that fails must surface as an explicit
+    /// `Denied` verdict the caller has to act on — never silently folded
+    /// into `Proceed` (which would let the real result through
+    /// unexamined) and never swallowed into an empty/default result.
+    /// Falsification: flip the hook body to `exit 0` and this test goes
+    /// red (`Proceed` instead of `Denied`), confirming the assertion is
+    /// actually exercising the failing-hook path.
+    #[tokio::test]
+    async fn shell_post_call_denying_hook_is_reported_as_denied_not_proceeded() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("shell-post-call-deny").await;
+
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("shell-post-call-always-fails"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish("exit 1".into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let real_result = KernelToolResult::text("the-real-command-output");
+        let verdict = broker
+            .shell_post_call_hooks(
+                "echo the-real-command-output",
+                &CallContext::test(),
+                &real_result,
+            )
+            .await;
+        match verdict {
+            ShellHookVerdict::Denied(McpError::Denied { by_hook }) => {
+                assert_eq!(by_hook, hook_id("shell-post-call-always-fails"));
+            }
+            other => panic!(
+                "a failing PostCall hook body must surface as an explicit Denied verdict; \
+                 got {other:?}"
+            ),
+        }
     }
 
     // -------------------------------------------------------------------
