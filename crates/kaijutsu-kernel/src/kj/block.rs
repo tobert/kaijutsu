@@ -96,6 +96,11 @@ enum BlockCommand {
     Inspect {
         /// Block id: context_hex_principal_hex_seq (or legacy : form)
         block_id: String,
+        /// Context a short block id resolves against: . (default) | .parent
+        /// | <label> | <hex prefix>. Ignored for the full form, which
+        /// already names its own context.
+        #[arg(long, short = 'c')]
+        context: Option<String>,
         /// Emit a single JSON object instead of a labelled table
         #[arg(long)]
         json: bool,
@@ -117,6 +122,11 @@ enum BlockCommand {
     Read {
         /// Block id
         block_id: String,
+        /// Context a short block id resolves against: . (default) | .parent
+        /// | <label> | <hex prefix>. Ignored for the full form, which
+        /// already names its own context.
+        #[arg(long, short = 'c')]
+        context: Option<String>,
         /// Suppress line numbers (default: show them)
         #[arg(long = "no-line-numbers")]
         no_line_numbers: bool,
@@ -174,6 +184,11 @@ enum BlockCommand {
     Append {
         /// Block id to append to
         block_id: String,
+        /// Context a short block id resolves against: . (default) | .parent
+        /// | <label> | <hex prefix>. Ignored for the full form, which
+        /// already names its own context.
+        #[arg(long, short = 'c')]
+        context: Option<String>,
         /// Text to append
         #[arg(long)]
         text: String,
@@ -182,6 +197,11 @@ enum BlockCommand {
     History {
         /// Block id
         block_id: String,
+        /// Context a short block id resolves against: . (default) | .parent
+        /// | <label> | <hex prefix>. Ignored for the full form, which
+        /// already names its own context.
+        #[arg(long, short = 'c')]
+        context: Option<String>,
     },
     /// Unified line-by-line diff of block content against original text.
     /// Mirrors MCP `block_diff`. Without --original, prints current content.
@@ -292,9 +312,11 @@ impl KjDispatcher {
                 status,
                 json,
             } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), json, caller),
-            BlockCommand::Inspect { block_id, json } => {
-                self.block_inspect(&block_id, json, caller)
-            }
+            BlockCommand::Inspect {
+                block_id,
+                context,
+                json,
+            } => self.block_inspect(&block_id, context.as_deref(), json, caller),
             BlockCommand::Count {
                 context,
                 kind,
@@ -302,9 +324,16 @@ impl KjDispatcher {
             } => self.block_count(context.as_deref(), kind.as_deref(), role.as_deref(), caller),
             BlockCommand::Read {
                 block_id,
+                context,
                 no_line_numbers,
                 range,
-            } => self.block_read(&block_id, !no_line_numbers, range.as_deref(), caller),
+            } => self.block_read(
+                &block_id,
+                context.as_deref(),
+                !no_line_numbers,
+                range.as_deref(),
+                caller,
+            ),
             BlockCommand::Cat {
                 block_id,
                 latest,
@@ -323,15 +352,19 @@ impl KjDispatcher {
                 out,
             } => self.block_original(&block_id, &transform, out.as_deref(), caller),
             BlockCommand::Reproject { block_id } => self.block_reproject(&block_id, caller),
-            BlockCommand::Append { block_id, text } => {
-                self.block_append(&block_id, &text, caller)
-            }
+            BlockCommand::Append {
+                block_id,
+                context,
+                text,
+            } => self.block_append(&block_id, context.as_deref(), &text, caller),
             BlockCommand::Edit { block_id, op } => self.block_edit(&block_id, op, caller),
             BlockCommand::Status {
                 block_id,
                 new_status,
             } => self.block_status(&block_id, &new_status, caller),
-            BlockCommand::History { block_id } => self.block_history(&block_id, caller),
+            BlockCommand::History { block_id, context } => {
+                self.block_history(&block_id, context.as_deref(), caller)
+            }
             BlockCommand::Diff {
                 block_id,
                 original,
@@ -360,11 +393,13 @@ impl KjDispatcher {
     ///
     /// - the full `context_hex_principal_hex_seq` key (`BlockId::to_key()`)
     ///   — what `--json`/the for-loop `data` payload emit, and what every
-    ///   verb accepted before this existed;
+    ///   verb accepted before this existed. Already names its own context,
+    ///   so `ctx_ref` is ignored for this form.
     /// - the short `<principal8>#<seq>` form (`short_key()`) — what the
-    ///   plain-text `kj block list` table prints. Resolved against the
-    ///   caller's current context, since that's what `block list` itself
-    ///   defaults to and none of these verbs take an explicit `--context`.
+    ///   plain-text `kj block list` table prints. Resolved against `ctx_ref`
+    ///   (`. (default) | .parent | <label> | <hex prefix>`, same parser as
+    ///   `block list`'s `-c`) via `resolve_context_arg` — the caller's
+    ///   current context when `ctx_ref` is `None`.
     ///
     /// "A tool's output should be accepted as that tool family's input"
     /// (Amy, `docs/issues.md` 2026-08-16) — this closes the
@@ -379,6 +414,7 @@ impl KjDispatcher {
     fn resolve_block_id(
         &self,
         id_str: &str,
+        ctx_ref: Option<&str>,
         caller: &KjCaller,
     ) -> Result<kaijutsu_types::BlockId, String> {
         if let Some(id) = kaijutsu_types::BlockId::from_key(id_str) {
@@ -412,9 +448,11 @@ impl KjDispatcher {
                 "malformed id '{id_str}': '{seq_str}' is not a valid sequence number"
             ));
         };
-        let ctx_id = caller.context_id.ok_or_else(|| {
-            "no active context joined — short block ids resolve against it".to_string()
-        })?;
+        let ctx_id = {
+            let db = self.kernel_db().lock();
+            resolve_context_arg(ctx_ref, caller, &db)
+                .map_err(|e| format!("resolving short id '{id_str}': {e}"))?
+        };
         let snapshots = self
             .blocks
             .block_snapshots(ctx_id)
@@ -426,9 +464,9 @@ impl KjDispatcher {
             .collect();
         match matches.len() {
             0 => Err(format!(
-                "no block matches '{id_str}' in context {} (short ids resolve against the \
-                 caller's current context — pass the full id from `--json`/the for-loop \
-                 payload to target a different one)",
+                "no block matches '{id_str}' in context {} (short ids resolve against -c/\
+                 --context, defaulting to the caller's current context — pass -c to target \
+                 a different one, or the full id from `--json`/the for-loop payload)",
                 ctx_id.short()
             )),
             1 => Ok(matches[0]),
@@ -525,14 +563,20 @@ impl KjDispatcher {
         KjResult::ok_with_data(out, id_array)
     }
 
-    fn block_inspect(&self, id_str: &str, json: bool, caller: &KjCaller) -> KjResult {
+    fn block_inspect(
+        &self,
+        id_str: &str,
+        ctx_ref: Option<&str>,
+        json: bool,
+        caller: &KjCaller,
+    ) -> KjResult {
         // Round-trip with the keys `block list` emits: `BlockId::to_key()`
         // uses `_` (legacy `:` still accepted by from_key), and now also the
         // short `<principal8>#<seq>` form the plain-text table prints — see
         // `resolve_block_id`. Without this, `for b in $(kj block list); do
         // kj block inspect $b; done` would reject every iteration as
         // malformed.
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, ctx_ref, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block inspect: {e}")),
         };
@@ -626,11 +670,12 @@ impl KjDispatcher {
     fn block_read(
         &self,
         id_str: &str,
+        ctx_ref: Option<&str>,
         line_numbers: bool,
         range: Option<&str>,
         caller: &KjCaller,
     ) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, ctx_ref, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block read: {e}")),
         };
@@ -752,7 +797,7 @@ impl KjDispatcher {
     ) -> KjResult {
         let (ctx_id, snap) = match (block_id_arg, latest_mime) {
             (Some(id_str), None) => {
-                let block_id = match self.resolve_block_id(id_str, caller) {
+                let block_id = match self.resolve_block_id(id_str, None, caller) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
                 };
@@ -935,7 +980,7 @@ impl KjDispatcher {
         out: Option<&str>,
         caller: &KjCaller,
     ) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, None, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block original: {e}")),
         };
@@ -1054,7 +1099,7 @@ impl KjDispatcher {
         // which the "prefer deleting a mechanism to generalizing it" stance
         // (CLAUDE.md) says to delete rather than keep guarding.
         let transform = kaijutsu_ansi::TRANSFORM_NAME;
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, None, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block reproject: {e}")),
         };
@@ -1151,8 +1196,14 @@ impl KjDispatcher {
 
     /// Append text to an existing block. Mirrors MCP `block_append`. Returns
     /// the new content length so callers can confirm the write took.
-    fn block_append(&self, id_str: &str, text: &str, caller: &KjCaller) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+    fn block_append(
+        &self,
+        id_str: &str,
+        ctx_ref: Option<&str>,
+        text: &str,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, ctx_ref, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block append: {e}")),
         };
@@ -1192,7 +1243,7 @@ impl KjDispatcher {
     /// string via `Status::from_str`, which already accepts the lenient set
     /// of synonyms (active→running, completed→done, etc.).
     fn block_status(&self, id_str: &str, new_status: &str, caller: &KjCaller) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, None, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block status: {e}")),
         };
@@ -1229,7 +1280,7 @@ impl KjDispatcher {
     /// positions — byte offsets from multibyte content splice at the wrong
     /// place or trip that check spuriously (the June file-tools bug class).
     fn block_edit(&self, id_str: &str, op: EditOp, caller: &KjCaller) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, None, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block edit: {e}")),
         };
@@ -1358,8 +1409,8 @@ impl KjDispatcher {
     }
 
     /// Version / creation info for a block. Mirrors MCP `block_history`.
-    fn block_history(&self, id_str: &str, caller: &KjCaller) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+    fn block_history(&self, id_str: &str, ctx_ref: Option<&str>, caller: &KjCaller) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, ctx_ref, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block history: {e}")),
         };
@@ -1417,7 +1468,7 @@ impl KjDispatcher {
     /// Unified line-by-line diff against an original. Mirrors MCP
     /// `block_diff`. Without --original, prints current content.
     fn block_diff(&self, id_str: &str, original: Option<&str>, caller: &KjCaller) -> KjResult {
-        let block_id = match self.resolve_block_id(id_str, caller) {
+        let block_id = match self.resolve_block_id(id_str, None, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block diff: {e}")),
         };
@@ -1823,6 +1874,38 @@ mod tests {
         );
     }
 
+    /// `-c`/`--context` lets `inspect` resolve a short id against a context
+    /// other than the caller's own — the same `-c` `block list`/`block cat
+    /// --latest` already take.
+    #[tokio::test]
+    async fn block_inspect_dash_c_resolves_against_other_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx_a = register_context_with_doc(&d, Some("ctx-a"), principal);
+        let ctx_b = register_context_with_doc(&d, Some("ctx-b"), principal);
+        let bid = insert_text_block(&d, ctx_b, "in b");
+        let c = caller_with_context(ctx_a);
+
+        let short = super::short_key(&bid);
+        let result = d
+            .dispatch(
+                &[s("block"), s("inspect"), s(&short), s("-c"), s("ctx-b")],
+                &c,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "inspect with -c into another context failed: {}",
+            result.message()
+        );
+        match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["context_id"], ctx_b.to_hex());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
     /// `kj block list` must populate `KjResult::Ok::data` with a JSON array
     /// of block-id strings so kaish's command-substitution path can iterate
     /// in `for b in $(kj block list)`. The text output is independent.
@@ -2059,6 +2142,131 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// `-c`/`--context` lets `read` resolve a short id against a context
+    /// other than the caller's own, and it must actually redirect the
+    /// search — not silently keep resolving against the caller's context
+    /// (docs/issues.md, "short id has no flag to point it elsewhere").
+    ///
+    /// Setup forces a genuine same-numbered collision: the same principal
+    /// authors the first block in two different contexts, so both blocks
+    /// share the identical short id `<principal8>#0` (`seq_lanes` starts at
+    /// 0 per document per principal — `blocks/block_store.rs::new_block_id`).
+    /// Without `-c`, the short id must resolve to context A's own block
+    /// (unchanged default). With `-c ctx-b`, it must resolve to context B's
+    /// block — proving the flag actually changed which context was
+    /// searched, not just that a lookup succeeded.
+    #[tokio::test]
+    async fn block_read_dash_c_redirects_short_id_to_another_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx_a = register_context_with_doc(&d, Some("ctx-a"), principal);
+        let ctx_b = register_context_with_doc(&d, Some("ctx-b"), principal);
+
+        let bid_a = d
+            .block_store()
+            .insert_block_as(
+                ctx_a,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                "in a",
+                Status::Done,
+                ContentType::Plain,
+                Some(principal),
+            )
+            .expect("insert in ctx_a");
+        let bid_b = d
+            .block_store()
+            .insert_block_as(
+                ctx_b,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                "in b",
+                Status::Done,
+                ContentType::Plain,
+                Some(principal),
+            )
+            .expect("insert in ctx_b");
+        assert_eq!(
+            super::short_key(&bid_a),
+            super::short_key(&bid_b),
+            "test setup requires a genuine short-id collision across contexts"
+        );
+        let short = super::short_key(&bid_a);
+
+        let c = caller_with_context(ctx_a);
+
+        // No -c: resolves against the caller's own context (A) — unchanged
+        // default, and must NOT silently reach into B.
+        let default_result = d
+            .dispatch(
+                &[s("block"), s("read"), s(&short), s("--no-line-numbers")],
+                &c,
+            )
+            .await;
+        assert!(
+            default_result.is_ok(),
+            "default read failed: {}",
+            default_result.message()
+        );
+        assert_eq!(
+            default_result.message(),
+            "in a\n",
+            "no -c must resolve against the caller's own context"
+        );
+
+        // -c ctx-b: must actually redirect to B's block, not A's.
+        let explicit_result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("read"),
+                    s(&short),
+                    s("-c"),
+                    s("ctx-b"),
+                    s("--no-line-numbers"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            explicit_result.is_ok(),
+            "-c read into another context failed: {}",
+            explicit_result.message()
+        );
+        assert_eq!(
+            explicit_result.message(),
+            "in b\n",
+            "-c ctx-b must resolve to ctx_b's block, not silently stay on ctx_a's"
+        );
+    }
+
+    /// Without `-c`, a short id that exists only in another context must
+    /// fail loudly and name the context it actually searched — never a
+    /// silent not-found that leaves the caller guessing which context was
+    /// checked (CLAUDE.md: "Silent fallbacks are often a mistake").
+    #[tokio::test]
+    async fn block_read_short_id_not_in_default_context_names_the_context_searched() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx_a = register_context_with_doc(&d, Some("ctx-a"), principal);
+        let ctx_b = register_context_with_doc(&d, Some("ctx-b"), principal);
+        let bid_b = insert_text_block(&d, ctx_b, "only in b");
+        let c = caller_with_context(ctx_a);
+
+        let short = super::short_key(&bid_b);
+        let result = d.dispatch(&[s("block"), s("read"), s(&short)], &c).await;
+        assert!(!result.is_ok(), "short id from B must not be found in A");
+        assert!(
+            result.message().contains(&ctx_a.short()),
+            "error must name the context actually searched: {}",
+            result.message()
+        );
     }
 
     /// A bare 8-hex word is the kaish mid-word-comment trap, and the error has
@@ -3325,6 +3533,60 @@ mod tests {
         assert!(result.message().contains("malformed"));
     }
 
+    /// `-c`/`--context` lets `append` target a block by short id in a
+    /// context other than the caller's own. This is not a new mutation
+    /// path — a full block id already routes `append` cross-context
+    /// (`ctx_id` comes from the resolved `BlockId`, not `caller.context_id`)
+    /// — so this only extends short-id resolution to match, the same as
+    /// `read`/`inspect`/`history`. The write lands in ctx_b; ctx_a, where
+    /// the caller is attached, gets nothing.
+    #[tokio::test]
+    async fn block_append_dash_c_writes_into_other_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx_a = register_context_with_doc(&d, Some("ctx-a"), principal);
+        let ctx_b = register_context_with_doc(&d, Some("ctx-b"), principal);
+        let bid = insert_text_block(&d, ctx_b, "hello");
+        let mut c = caller_with_context(ctx_a);
+        c.principal_id = principal;
+
+        let short = super::short_key(&bid);
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("append"),
+                    s(&short),
+                    s("-c"),
+                    s("ctx-b"),
+                    s("--text"),
+                    s(" world"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "append with -c into another context failed: {}",
+            result.message()
+        );
+
+        let snap_b = d
+            .block_store()
+            .block_snapshots(ctx_b)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap_b.content, "hello world", "content not appended to ctx_b");
+
+        let a_blocks = d.block_store().block_snapshots(ctx_a).unwrap();
+        assert!(
+            a_blocks.is_empty(),
+            "append with -c must not touch the caller's own context: {a_blocks:?}"
+        );
+    }
+
     // ── New: block history ────────────────────────────────────────────
 
     #[tokio::test]
@@ -3370,6 +3632,38 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("malformed"));
+    }
+
+    /// `-c`/`--context` lets `history` resolve a short id against a context
+    /// other than the caller's own.
+    #[tokio::test]
+    async fn block_history_dash_c_resolves_against_other_context() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx_a = register_context_with_doc(&d, Some("ctx-a"), principal);
+        let ctx_b = register_context_with_doc(&d, Some("ctx-b"), principal);
+        let bid = insert_text_block(&d, ctx_b, "in b");
+        let c = caller_with_context(ctx_a);
+
+        let short = super::short_key(&bid);
+        let result = d
+            .dispatch(
+                &[s("block"), s("history"), s(&short), s("-c"), s("ctx-b")],
+                &c,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "history with -c into another context failed: {}",
+            result.message()
+        );
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["context_id"], ctx_b.to_hex());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     // ── New: block diff ───────────────────────────────────────────────
@@ -3832,5 +4126,34 @@ mod tests {
             after.style_spans.is_empty(),
             "a refused reproject must leave spans untouched"
         );
+    }
+
+    // ── Published help: -c/--context on read/inspect/append/history ──────
+
+    /// The reflected `--help` output is what a model reads (CLAUDE.md
+    /// "Published text"); assert against it directly rather than the
+    /// `///` source, since a clap attribute typo would pass a source grep.
+    #[tokio::test]
+    async fn read_inspect_append_history_help_document_dash_c() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        for verb in ["read", "inspect", "append", "history"] {
+            let result = d
+                .dispatch(&[s("block"), s(verb), s("--help")], &c)
+                .await;
+            let help = result.message();
+            assert!(
+                help.contains("-c, --context") || help.contains("--context"),
+                "`kj block {verb} --help` must document -c/--context: {help}"
+            );
+            assert!(
+                help.contains("short block id resolves against"),
+                "`kj block {verb} --help` should explain the flag scopes short-id \
+                 resolution, not just list it: {help}"
+            );
+        }
     }
 }
