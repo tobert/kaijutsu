@@ -1787,6 +1787,15 @@ mod tests {
         );
     }
 
+    /// `context_type = "nonexistent"` has no `/etc/rc/nonexistent/` directory
+    /// at all — not even the type-level ancestor — under `test_dispatcher()`'s
+    /// host-backed `LocalBackend` mount. `dispatch`'s own `Ok` and an empty
+    /// context alone don't distinguish "load_rc_scripts correctly saw zero
+    /// scripts" from "load_rc_scripts errored and `context.rs` swallowed it"
+    /// (`context create` logs-and-continues on an rc-lifecycle `Err`, per the
+    /// comment at its call site) — both leave the same block-free context and
+    /// the same `Ok` dispatch result. The run row's typed outcome is what
+    /// actually tells them apart, so assert on it directly.
     #[tokio::test]
     async fn rc_no_scripts_for_type_is_noop() {
         let d = test_dispatcher().await;
@@ -1804,6 +1813,14 @@ mod tests {
         assert!(
             kinds.is_empty(),
             "no scripts should leave context block-free, got: {kinds:?}"
+        );
+
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert!(run.finished_at.is_some());
+        assert_eq!(
+            run.outcome,
+            Some(RcOutcome::Ok),
+            "a genuinely absent rc directory is zero scripts, not a failed run"
         );
     }
 
@@ -2950,24 +2967,13 @@ esac
         assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Failed));
     }
 
-    /// A verb whose directory exists but has no `.kai`/`.md` scripts in it
+    /// A verb whose directory EXISTS but has no `.kai`/`.md` scripts in it
     /// still leaves a finished `Ok` run — the empty case is legitimate, not
-    /// a gap in the log.
-    ///
-    /// Deliberately installs a non-script file (`.txt`) rather than using a
-    /// type with NO rc directory at all (the way `rc_no_scripts_for_type_is_
-    /// noop` does): under `test_dispatcher()`'s host-backed `LocalBackend`,
-    /// a genuinely absent directory's `readdir` fails with `VfsError::Io`
-    /// wrapping `io::ErrorKind::NotFound`, which `load_rc_scripts`'s "missing
-    /// dir → empty" match arms (only `VfsError::NotFound`/`NoMountPoint`)
-    /// do NOT catch — so that shape hits the Err branch, not the empty-
-    /// scripts branch, and asserting `Ok` against it would be testing the
-    /// wrong path. (Production never hits this: `/etc/rc` is always
-    /// `ConfigDocFs`, never `LocalBackend`, there — `kj/mod.rs`'s
-    /// `test_dispatcher` doc says as much. Filed as a documented gap here
-    /// rather than fixed, since it is a test-harness-only backend
-    /// inconsistency, out of scope for this run-log slice — see the
-    /// handoff report.)
+    /// a gap in the log. Distinct from `rc_no_scripts_for_type_is_noop`,
+    /// which covers a type with no rc directory at all: this one installs a
+    /// non-script file so the directory is real and non-empty, exercising
+    /// "readdir succeeds, nothing matches `.kai`/`.md`" rather than "readdir
+    /// reports the directory missing."
     #[tokio::test]
     async fn a_verb_with_no_scripts_still_finishes_as_ok() {
         let d = test_dispatcher().await;

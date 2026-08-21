@@ -62,9 +62,11 @@ pub enum VfsError {
     #[error("file name too long")]
     NameTooLong,
 
-    /// I/O error.
+    /// I/O error other than "not found" (see the `From<io::Error>` impl
+    /// below — a not-found `io::Error` is normalized to [`VfsError::NotFound`]
+    /// before it ever reaches this variant).
     #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
+    Io(io::Error),
 
     /// A `/r` client share's session is gone (never registered, or the
     /// channel dropped — `docs/slash-r.md`). Distinct from [`VfsError::Io`]
@@ -168,6 +170,24 @@ impl VfsError {
     }
 }
 
+/// Convert a host `io::Error` into a `VfsError`, normalizing absence at this
+/// one chokepoint. Every backend that reports path-not-there via a host
+/// syscall (`LocalBackend`'s `resolve`/`readdir`/`read_all`/…, all routed
+/// through `.map_err(VfsError::from)`) goes through here, so `ENOENT`
+/// surfaces as the same typed [`VfsError::NotFound`] a document- or
+/// memory-backed backend already constructs directly — a caller matching on
+/// "is this path missing" never has to know which backend it asked.
+/// Anything else stays wrapped as [`VfsError::Io`].
+impl From<io::Error> for VfsError {
+    fn from(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::NotFound {
+            VfsError::NotFound(e.to_string())
+        } else {
+            VfsError::Io(e)
+        }
+    }
+}
+
 impl kaijutsu_types::IntoErrorPayload for VfsError {
     fn into_error_payload(self) -> kaijutsu_types::ErrorPayload {
         use kaijutsu_types::{ErrorCategory, ErrorPayload, ErrorSeverity};
@@ -227,3 +247,34 @@ impl From<VfsError> for io::Error {
 
 /// VFS result type.
 pub type VfsResult<T> = Result<T, VfsError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chokepoint this whole module exists for: a host `ENOENT` must
+    /// come out typed as `NotFound`, not wrapped as `Io`, so a caller
+    /// matching `VfsError::NotFound(_)` catches a `LocalBackend` miss the
+    /// same way it catches a document/memory backend's miss.
+    #[test]
+    fn not_found_io_error_normalizes_to_typed_not_found() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "no such file or directory");
+        let vfs_err: VfsError = io_err.into();
+        assert!(
+            matches!(vfs_err, VfsError::NotFound(_)),
+            "expected VfsError::NotFound, got {vfs_err:?}"
+        );
+    }
+
+    /// Any other io::ErrorKind still wraps as `Io` — normalization is
+    /// specific to "not found", not a blanket erasure of `Io`.
+    #[test]
+    fn other_io_error_kinds_stay_wrapped_as_io() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let vfs_err: VfsError = io_err.into();
+        assert!(
+            matches!(vfs_err, VfsError::Io(_)),
+            "expected VfsError::Io, got {vfs_err:?}"
+        );
+    }
+}

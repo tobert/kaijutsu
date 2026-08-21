@@ -471,7 +471,7 @@ impl VfsOps for LocalBackend {
         {
             use rustix::fs::statvfs;
 
-            let stat = statvfs(&self.root).map_err(|e| VfsError::Io(e.into()))?;
+            let stat = statvfs(&self.root).map_err(|e| VfsError::from(std::io::Error::from(e)))?;
 
             Ok(StatFs {
                 blocks: stat.f_blocks,
@@ -587,6 +587,43 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!LocalBackend::new(dir.path()).opaque_to_sweeps());
         assert!(LocalBackend::new(dir.path()).opaque(true).opaque_to_sweeps());
+    }
+
+    /// A `readdir` on a directory that was never created — not even its
+    /// parent — must report the typed `VfsError::NotFound`, not
+    /// `VfsError::Io` wrapping `ENOENT`. This is the exact shape
+    /// `kj::lifecycle::load_rc_scripts` matches on to treat "no rc
+    /// directory for this (type, verb)" as zero scripts rather than a
+    /// failure; a host-backed mount reporting absence any other way defeats
+    /// that match silently.
+    #[tokio::test]
+    async fn readdir_on_a_directory_with_no_ancestor_reports_typed_not_found() {
+        let (backend, _dir) = setup().await;
+
+        let result = backend.readdir(Path::new("nonexistent-type/create")).await;
+
+        assert!(
+            matches!(result, Err(VfsError::NotFound(_))),
+            "expected VfsError::NotFound, got {result:?}"
+        );
+    }
+
+    /// `statfs` builds its error by hand rather than through `?`, so it is
+    /// the one place a host `ENOENT` can miss the `From<io::Error>`
+    /// normalization and surface as `VfsError::Io`. A backend whose root has
+    /// gone away must report absence the same way every other path does.
+    #[tokio::test]
+    async fn statfs_on_a_missing_root_reports_typed_not_found() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path().join("never-created");
+        let backend = LocalBackend::new(&root);
+
+        let result = backend.statfs().await;
+
+        assert!(
+            matches!(result, Err(VfsError::NotFound(_))),
+            "expected VfsError::NotFound, got {result:?}"
+        );
     }
 
     #[tokio::test]

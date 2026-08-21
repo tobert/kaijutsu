@@ -856,19 +856,16 @@ impl VfsOps for MountTable {
         // its backend AND the parent of deeper mounts. Backend misses are
         // tolerated only when synthetic children exist AND the miss is
         // NotFound (the intermediate dir has no real backing); any other
-        // backend error still surfaces.
+        // backend error still surfaces. Every `VfsOps` backend reports a
+        // missing path as the typed `VfsError::NotFound` (host-backed
+        // `LocalBackend` included — normalized once at the `From<io::Error>`
+        // conversion in `vfs::error`), so one arm covers every backend here.
         let normalized = Self::normalize_mount_path(path.to_path_buf());
         let synthetic = self.mount_children(&normalized).await;
         let backend_entries = match self.find_mount(path).await {
             Ok((fs, relative)) => match fs.readdir(&relative).await {
                 Ok(entries) => entries,
                 Err(VfsError::NotFound(_)) if !synthetic.is_empty() => Vec::new(),
-                Err(e)
-                    if !synthetic.is_empty()
-                        && matches!(&e, VfsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    Vec::new()
-                }
                 Err(e) => return Err(e),
             },
             Err(_) if !synthetic.is_empty() => Vec::new(),
@@ -2160,6 +2157,33 @@ mod tests {
         let entries = table.readdir(Path::new("/v")).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["cas", "docs"], "next components of the mounts under /v");
+    }
+
+    /// Same intermediate-mount-dir case as above, but the prefix's own miss
+    /// comes from a HOST-backed `LocalBackend` root mount rather than
+    /// `MemoryBackend` — `/v` genuinely does not exist on disk. Regression:
+    /// `LocalBackend::readdir` used to report that absence as
+    /// `VfsError::Io` wrapping `ENOENT`, a shape the merge logic's NotFound
+    /// tolerance didn't (fully) recognize; normalizing `Io(NotFound)` to the
+    /// typed `VfsError::NotFound` centrally (`vfs::error`) fixes it for
+    /// every caller, this one included.
+    #[tokio::test]
+    async fn intermediate_mount_dir_over_a_local_backend_root_is_synthesized() {
+        use crate::vfs::backends::LocalBackend;
+        let dir = tempfile::TempDir::new().unwrap();
+        // Deliberately do NOT create `dir/v` — the mount root exists, its
+        // "/v" child does not, matching the real "/etc/rc" shape this
+        // guards.
+        let table = MountTable::new();
+        table.mount("/", LocalBackend::new(dir.path())).await;
+        table.mount("/v/cas", MemoryBackend::new()).await;
+
+        let attr = table.getattr(Path::new("/v")).await.unwrap();
+        assert!(attr.kind.is_dir(), "/v exists as a synthetic directory");
+
+        let entries = table.readdir(Path::new("/v")).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["cas"], "synthetic mount child, despite no real /v on disk");
     }
 
     #[tokio::test]

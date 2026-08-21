@@ -218,10 +218,7 @@ impl VfsOps for CasFs {
             Resolved::Object(hash) => {
                 use std::io::{Read, Seek, SeekFrom};
                 let p = self.object_disk_path(&hash);
-                let mut f = std::fs::File::open(&p).map_err(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound => VfsError::not_found(hash.to_string()),
-                    _ => VfsError::Io(e),
-                })?;
+                let mut f = std::fs::File::open(&p).map_err(VfsError::from)?;
                 // Bound the allocation to the bytes actually available from
                 // `offset`: `size` is a caller-supplied u32 (up to ~4 GiB), so a
                 // huge request must not pre-allocate gigabytes for a small
