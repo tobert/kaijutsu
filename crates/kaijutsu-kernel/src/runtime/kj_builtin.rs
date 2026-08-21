@@ -2504,7 +2504,7 @@ mod tests {
         {
             let blocks = dispatcher.block_store();
             let cache = dispatcher.kernel().file_cache().clone();
-            let (ctx, block) = cache.get_or_load("/mnt/wire/w.txt").await.expect("load");
+            let (ctx, block) = cache.try_get_or_load("/mnt/wire/w.txt").await.expect("load");
             blocks
                 .edit_text(ctx, &block, 0, "after\n", "before\n".chars().count())
                 .expect("edit");

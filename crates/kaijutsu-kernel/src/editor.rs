@@ -20,10 +20,10 @@
 //!   ([`ConfigDocFs`](crate::runtime::ConfigDocFs)). The kernel *is* the owner —
 //!   there is no host file. We resolve straight to that document's block.
 //! - **ordinary files** resolve through
-//!   [`FileDocumentCache::get_or_load`](crate::file_tools::FileDocumentCache),
+//!   [`FileDocumentCache::try_get_or_load`](crate::file_tools::FileDocumentCache),
 //!   which mints/loads a working-copy file-doc.
 //!
-//! Running a config path through `get_or_load` would create a *second* document
+//! Running a config path through `try_get_or_load` would create a *second* document
 //! (a `FileDocumentCache` copy) shadowing the ConfigDocFs original —
 //! reintroducing the dual-ownership write-through bug class the kernel-owned-config
 //! work (`docs/config-ownership.md`) deleted by construction. So the branch
@@ -114,7 +114,7 @@ pub async fn resolve_editor_target(
         });
     }
     let (context_id, block_id) = file_cache
-        .get_or_load(path)
+        .try_get_or_load(path)
         .await
         .map_err(|e| format!("open editor: cannot open '{path}': {e}"))?;
     Ok(EditorTarget {

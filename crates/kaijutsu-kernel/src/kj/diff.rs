@@ -492,7 +492,7 @@ mod tests {
         // `kj diff <path>` exists to reveal: an edit disk has not seen.
         let blocks = dispatcher.block_store();
         let cache = dispatcher.kernel().file_cache().clone();
-        let (ctx, block) = cache.get_or_load("/mnt/diff/a.txt").await.expect("load");
+        let (ctx, block) = cache.try_get_or_load("/mnt/diff/a.txt").await.expect("load");
         blocks
             .edit_text(ctx, &block, 4, "TWO\n", 4)
             .expect("edit the document copy");
@@ -615,7 +615,7 @@ mod tests {
 
         let blocks = dispatcher.block_store();
         let cache = dispatcher.kernel().file_cache().clone();
-        let (ctx, block) = cache.get_or_load("/mnt/hist/h.txt").await.expect("load");
+        let (ctx, block) = cache.try_get_or_load("/mnt/hist/h.txt").await.expect("load");
 
         // The point in history we will diff back to.
         let (_, before_edit) = blocks.oplog_seq_range(ctx).expect("seq range");

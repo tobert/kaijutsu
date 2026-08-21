@@ -1614,9 +1614,11 @@ impl Kernel {
         opener: Option<crate::editor::EditorOpener>,
     ) -> Result<String, String> {
         match io {
-            kaijutsu_editor::EditorIo::ReadFile(path) => {
-                self.file_cache().read_content(&path).await
-            }
+            kaijutsu_editor::EditorIo::ReadFile(path) => self
+                .file_cache()
+                .try_read_content(&path)
+                .await
+                .map_err(|e| e.to_string()),
             kaijutsu_editor::EditorIo::ReadShell(cmd) => {
                 // No opener (a headless driver / wire open) → no context to run
                 // in. Fail loud pointing at the interactive shell, as before.
@@ -2388,7 +2390,7 @@ mod tests {
         let cache = kernel.file_cache().clone();
 
         // Populate the shadow from the source.
-        let (sctx, sblock) = cache.get_or_load(path).await.unwrap();
+        let (sctx, sblock) = cache.try_get_or_load(path).await.unwrap();
         assert_eq!(
             block_content(&blocks, sctx, &sblock),
             "hello",
@@ -2402,7 +2404,7 @@ mod tests {
         // The next read must reflect the edit — proving the shadow was dropped and
         // reloaded, not re-served stale. (With a plain cache-entry invalidate the
         // surviving shadow doc would re-serve "hello" and this fails.)
-        let (sctx2, sblock2) = cache.get_or_load(path).await.unwrap();
+        let (sctx2, sblock2) = cache.try_get_or_load(path).await.unwrap();
         assert_eq!(
             block_content(&blocks, sctx2, &sblock2),
             "Xhello",
@@ -2413,7 +2415,7 @@ mod tests {
     #[tokio::test]
     async fn editor_colon_r_reads_a_file_into_the_buffer() {
         // `:r <file>` slurps a file's contents at the cursor — the async fetch
-        // (read_content via the FileDocumentCache) happens inside Kernel::editor_keys
+        // (try_read_content via the FileDocumentCache) happens inside Kernel::editor_keys
         // *outside* the session lock; the result mirrors onto the editor's block.
         use crate::runtime::config_doc_fs::ConfigDocFs;
         use crate::vfs::VfsOps as _;
@@ -2625,7 +2627,7 @@ mod tests {
 
     /// Mount a `MemoryBackend` (an ordinary, non-config VFS backend — no
     /// `owns_config_docs`) so `resolve_editor_target` routes through
-    /// `FileDocumentCache::get_or_load`, the "ordinary file" branch, not the
+    /// `FileDocumentCache::try_get_or_load`, the "ordinary file" branch, not the
     /// config-doc branch the other editor tests in this module exercise.
     async fn kernel_with_mem_fs() -> Kernel {
         use crate::vfs::backends::MemoryBackend;
@@ -2960,7 +2962,7 @@ mod tests {
         // Mint the FileDocumentCache shadow the same way a kaish `cat` or an
         // MCP read would — this is the precondition B1 names as "one shell
         // read away".
-        kernel.file_cache().get_or_load(path).await.unwrap();
+        kernel.file_cache().try_get_or_load(path).await.unwrap();
 
         let (id, st) = kernel.editor_open(path).await.unwrap();
         assert_eq!(st.text, "orig");
@@ -3240,7 +3242,7 @@ mod tests {
                 .write_all(Path::new(&other), b"x")
                 .await
                 .unwrap();
-            kernel.file_cache().read_content(&other).await.unwrap();
+            kernel.file_cache().try_read_content(&other).await.unwrap();
         }
 
         kernel.editor_keys(id, "iX<Esc>").await.unwrap();
@@ -3285,7 +3287,7 @@ mod tests {
                 .write_all(Path::new(&other), b"x")
                 .await
                 .unwrap();
-            kernel.file_cache().read_content(&other).await.unwrap();
+            kernel.file_cache().try_read_content(&other).await.unwrap();
         }
 
         // A fresh mark_dirty on the (now unpinned, possibly evicted) path

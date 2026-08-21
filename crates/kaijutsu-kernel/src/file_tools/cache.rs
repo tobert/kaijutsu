@@ -47,6 +47,8 @@ impl std::fmt::Display for CacheReadError {
     }
 }
 
+impl std::error::Error for CacheReadError {}
+
 /// Why a flush to disk did not happen. Typed because the editor layer picks a
 /// different vi message for each, and because a caller matching on a message
 /// substring is a test that passes for the wrong reason.
@@ -179,16 +181,6 @@ impl FileDocumentCache {
         }
     }
 
-    /// Get the context_id and block_id for a path, loading from VFS on cache miss.
-    ///
-    /// Legacy wrapper: collapses the typed [`CacheReadError`] to an opaque
-    /// `String` for callers that already handle errors generically. New call
-    /// sites should prefer [`try_get_or_load`](Self::try_get_or_load) so they
-    /// can distinguish benign misses from real backend failures.
-    pub async fn get_or_load(&self, path: &str) -> Result<(ContextId, BlockId), String> {
-        self.try_get_or_load(path).await.map_err(|e| e.to_string())
-    }
-
     /// Replace a cached block's content with the current on-disk bytes. Used to
     /// pick up external edits when a clean entry's file mtime has advanced.
     /// Only emits an edit when the content actually differs.
@@ -313,21 +305,9 @@ impl FileDocumentCache {
         self.vfs.exists(std::path::Path::new(path)).await
     }
 
-    /// Read the current content of a file (reflects any edits applied since load).
-    ///
-    /// This is the legacy opaque-error wrapper kept for call sites that already
-    /// have an appropriate error context (e.g. `ExecResult::failure`). New call
-    /// sites that need to distinguish a benign miss from a real failure should
-    /// use [`try_read_content`](Self::try_read_content) instead.
-    pub async fn read_content(&self, path: &str) -> Result<String, String> {
-        self.try_read_content(path)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Like [`read_content`](Self::read_content) but returns a typed
-    /// [`CacheReadError`] so callers can distinguish benign misses from real
-    /// failures.
+    /// Read the current content of a file (reflects any edits applied since
+    /// load), classifying a failure so callers can distinguish a benign miss
+    /// from a real one.
     ///
     /// Error classification:
     /// - VFS "not found" → [`CacheReadError::NotCached`] (file absent; benign)
@@ -358,14 +338,14 @@ impl FileDocumentCache {
             })
     }
 
-    /// Typed variant of [`get_or_load`](Self::get_or_load): classifies errors at
-    /// the source so callers can act on benign misses separately from real
-    /// backend failures.
+    /// Get the context_id and block_id for a path, loading from VFS on cache
+    /// miss. Classifies errors at the source so callers can act on benign
+    /// misses separately from real backend failures.
     pub(crate) async fn try_get_or_load(&self, path: &str) -> Result<(ContextId, BlockId), CacheReadError> {
         let ctx_id = file_context_id(path);
         let vfs_path = std::path::Path::new(path);
 
-        // Fast path: already cached — same as get_or_load.
+        // Fast path: already cached.
         let cached = {
             let mut cache = self.cache.write();
             cache.get_mut(&ctx_id).map(|e| {
@@ -717,7 +697,7 @@ impl FileDocumentCache {
     ///
     /// Plain `invalidate` only removes the in-memory entry; the shadow document
     /// (at `file_context_id(path)`) survives in the block store. The next
-    /// `get_or_load` hits `create_document`'s `DocumentAlreadyExists` arm, which
+    /// `try_get_or_load` hits `create_document`'s `DocumentAlreadyExists` arm, which
     /// reconciles that shadow's content against a fresh VFS read before serving
     /// it — so for a **self-contained file** (the doc *is* the truth, and "VFS
     /// read" means "read disk"), plain `invalidate` is already enough to pick up
@@ -758,7 +738,7 @@ impl FileDocumentCache {
     /// evicted editor buffer recorded no swap row and no error, and the next
     /// load quietly reconciled the block against disk — the edit vanished
     /// under an open session. A caller that needs the edit to be recorded
-    /// must load the entry first (`try_get_or_load`/`get_or_load`) or, for a
+    /// must load the entry first (`try_get_or_load`) or, for a
     /// target that must survive across calls, pin it (see [`pin`](Self::pin)).
     pub fn mark_dirty(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
@@ -1109,7 +1089,7 @@ impl FileDocumentCache {
     /// Errors if `path` has no cache entry — pinning is meaningless without
     /// something to protect, and a silent no-op here would recreate exactly
     /// the bug this exists to close. Callers must load first
-    /// (`try_get_or_load`/`get_or_load`).
+    /// (`try_get_or_load`).
     pub fn pin(&self, path: &str) -> Result<(), String> {
         let ctx_id = file_context_id(path);
         let mut cache = self.cache.write();
@@ -1248,7 +1228,7 @@ mod tests {
         // First write loads the doc into the cache (new-file path).
         let original = "改善 — the standard we accept …\nline two";
         cache.create_or_replace("/tmp/s.md", original).await.unwrap();
-        assert_eq!(cache.read_content("/tmp/s.md").await.unwrap(), original);
+        assert_eq!(cache.try_read_content("/tmp/s.md").await.unwrap(), original);
 
         // Replace the now-cached doc with different multi-byte content of a
         // *shorter* char length — the byte-vs-char bug overran here.
@@ -1258,7 +1238,7 @@ mod tests {
             .await
             .expect("replace cached multi-byte doc must not panic");
         assert_eq!(
-            cache.read_content("/tmp/s.md").await.unwrap(),
+            cache.try_read_content("/tmp/s.md").await.unwrap(),
             replacement
         );
     }
@@ -1281,7 +1261,7 @@ mod tests {
             .create_or_replace("/tmp/r.kai", "改善 v2 …")
             .await
             .expect("replace a store-resident doc after a cold cache");
-        assert_eq!(cache.read_content("/tmp/r.kai").await.unwrap(), "改善 v2 …");
+        assert_eq!(cache.try_read_content("/tmp/r.kai").await.unwrap(), "改善 v2 …");
     }
 
     /// `get_or_load_with_content`'s cold-cache fallback must discriminate
@@ -1359,7 +1339,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/f.txt"), b"v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/f.txt").await.unwrap(), "v1");
+        assert_eq!(cache.try_read_content("/tmp/f.txt").await.unwrap(), "v1");
 
         // External writer changes the file — the backend bumps its generation,
         // which is what marks the clean cache entry stale (no mtime fiddling
@@ -1367,7 +1347,7 @@ mod tests {
         vfs.write_all(p("/tmp/f.txt"), b"v2").await.unwrap();
 
         // Clean entry must reload and serve the new content.
-        assert_eq!(cache.read_content("/tmp/f.txt").await.unwrap(), "v2");
+        assert_eq!(cache.try_read_content("/tmp/f.txt").await.unwrap(), "v2");
     }
 
     #[tokio::test]
@@ -1375,7 +1355,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/g.txt"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/g.txt").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/g.txt").await.unwrap(), "disk-v1");
 
         // Local uncommitted edit (dirty, not flushed).
         cache.create_or_replace("/tmp/g.txt", "local-edit").await.unwrap();
@@ -1385,7 +1365,7 @@ mod tests {
         vfs.write_all(p("/tmp/g.txt"), b"disk-v2").await.unwrap();
 
         // Local edits win — we must not clobber uncommitted work with disk state.
-        assert_eq!(cache.read_content("/tmp/g.txt").await.unwrap(), "local-edit");
+        assert_eq!(cache.try_read_content("/tmp/g.txt").await.unwrap(), "local-edit");
     }
 
     #[test]
@@ -1419,7 +1399,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache.read_content("/tmp/backend_err.txt").await.unwrap(),
+            cache.try_read_content("/tmp/backend_err.txt").await.unwrap(),
             "content"
         );
 
@@ -1510,7 +1490,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache.read_content("/tmp/stale_reload.txt").await.unwrap(),
+            cache.try_read_content("/tmp/stale_reload.txt").await.unwrap(),
             "original"
         );
 
@@ -1558,7 +1538,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache.read_content("/tmp/incident.md").await.unwrap(),
+            cache.try_read_content("/tmp/incident.md").await.unwrap(),
             "stale content"
         );
 
@@ -1576,7 +1556,7 @@ mod tests {
         // Cold cache + doc-already-exists must reconcile against disk, not
         // serve the stale pre-existing block.
         assert_eq!(
-            cache.read_content("/tmp/incident.md").await.unwrap(),
+            cache.try_read_content("/tmp/incident.md").await.unwrap(),
             "newer content on disk",
             "must serve disk content, not the stale pre-existing document"
         );
@@ -1592,17 +1572,17 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/incident2.md"), b"v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v1");
+        assert_eq!(cache.try_read_content("/tmp/incident2.md").await.unwrap(), "v1");
 
         cache.invalidate("/tmp/incident2.md").unwrap();
         vfs.write_all(p("/tmp/incident2.md"), b"v2").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v2");
+        assert_eq!(cache.try_read_content("/tmp/incident2.md").await.unwrap(), "v2");
 
         // A further external write after the reconcile must still be
         // observed — proves loaded_generation tracks real disk state, not a
         // value poisoned during reconcile.
         vfs.write_all(p("/tmp/incident2.md"), b"v3").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/incident2.md").await.unwrap(), "v3");
+        assert_eq!(cache.try_read_content("/tmp/incident2.md").await.unwrap(), "v3");
     }
 
     /// A dirty buffer is unsaved work and must still be served as-is (rule 2,
@@ -1613,7 +1593,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/dirty.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/dirty.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/dirty.md").await.unwrap(), "disk-v1");
 
         cache
             .create_or_replace("/tmp/dirty.md", "local-edit")
@@ -1629,7 +1609,7 @@ mod tests {
         vfs.write_all(p("/tmp/dirty.md"), b"disk-v2").await.unwrap();
 
         assert_eq!(
-            cache.read_content("/tmp/dirty.md").await.unwrap(),
+            cache.try_read_content("/tmp/dirty.md").await.unwrap(),
             "local-edit",
             "a dirty buffer is unsaved work and must still be served"
         );
@@ -1650,7 +1630,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/swap.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/swap.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/swap.md").await.unwrap(), "disk-v1");
 
         // Local uncommitted edit — dirty, never flushed to disk.
         cache
@@ -1659,7 +1639,7 @@ mod tests {
             .unwrap();
         cache.mark_dirty("/tmp/swap.md").unwrap();
         assert_eq!(
-            cache.read_content("/tmp/swap.md").await.unwrap(),
+            cache.try_read_content("/tmp/swap.md").await.unwrap(),
             "unsaved-edit"
         );
 
@@ -1671,7 +1651,7 @@ mod tests {
         // The unsaved edit comes back, not disk content — recovered as a
         // swap, not silently discarded.
         assert_eq!(
-            cache.read_content("/tmp/swap.md").await.unwrap(),
+            cache.try_read_content("/tmp/swap.md").await.unwrap(),
             "unsaved-edit",
             "unsaved edit must survive a cold cache as a recovered swap"
         );
@@ -1692,14 +1672,14 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/clean.md"), b"v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/clean.md").await.unwrap(), "v1");
+        assert_eq!(cache.try_read_content("/tmp/clean.md").await.unwrap(), "v1");
         // Never dirtied — no dirty_file_buffers row.
 
         cache.invalidate("/tmp/clean.md").unwrap();
         vfs.write_all(p("/tmp/clean.md"), b"v2").await.unwrap();
 
         assert_eq!(
-            cache.read_content("/tmp/clean.md").await.unwrap(),
+            cache.try_read_content("/tmp/clean.md").await.unwrap(),
             "v2",
             "a clean document with no swap marker must still reconcile against disk"
         );
@@ -1717,7 +1697,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/flushed.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/flushed.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/flushed.md").await.unwrap(), "disk-v1");
 
         cache
             .create_or_replace("/tmp/flushed.md", "saved-edit")
@@ -1734,7 +1714,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            cache.read_content("/tmp/flushed.md").await.unwrap(),
+            cache.try_read_content("/tmp/flushed.md").await.unwrap(),
             "disk-v2-external",
             "a flushed buffer's marker must be cleared, so a later cold load reconciles"
         );
@@ -1748,7 +1728,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/ack.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/ack.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/ack.md").await.unwrap(), "disk-v1");
 
         cache
             .create_or_replace("/tmp/ack.md", "unsaved-edit")
@@ -1758,7 +1738,7 @@ mod tests {
         cache.invalidate("/tmp/ack.md").unwrap();
 
         // Reload recovers the swap.
-        assert_eq!(cache.read_content("/tmp/ack.md").await.unwrap(), "unsaved-edit");
+        assert_eq!(cache.try_read_content("/tmp/ack.md").await.unwrap(), "unsaved-edit");
         assert!(cache.swap_recovered("/tmp/ack.md"));
 
         let err = cache
@@ -1801,7 +1781,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/swap2.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/swap2.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/swap2.md").await.unwrap(), "disk-v1");
 
         cache
             .create_or_replace("/tmp/swap2.md", "unsaved-edit")
@@ -1812,7 +1792,7 @@ mod tests {
 
         // Reload recovers the swap.
         assert_eq!(
-            cache.read_content("/tmp/swap2.md").await.unwrap(),
+            cache.try_read_content("/tmp/swap2.md").await.unwrap(),
             "unsaved-edit"
         );
         assert!(cache.swap_recovered("/tmp/swap2.md"));
@@ -1835,7 +1815,7 @@ mod tests {
 
         // The swap's content must be untouched — not the failed write's text.
         assert_eq!(
-            cache.read_content("/tmp/swap2.md").await.unwrap(),
+            cache.try_read_content("/tmp/swap2.md").await.unwrap(),
             "unsaved-edit",
             "a refused write must not have mutated the recovered buffer"
         );
@@ -1884,7 +1864,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache1.read_content("/tmp/cold_swap.md").await.unwrap(),
+            cache1.try_read_content("/tmp/cold_swap.md").await.unwrap(),
             "disk-v1"
         );
         cache1
@@ -1899,7 +1879,7 @@ mod tests {
 
         let cache2 = FileDocumentCache::new(blocks, vfs, db);
 
-        // The cold-path call itself: no `read_content`/`get_or_load` on
+        // The cold-path call itself: no `try_read_content`/`try_get_or_load` on
         // `cache2` before this — exactly the shape a fresh `write_file`/`kj
         // swap`-adjacent call would take against a just-restarted kernel.
         let err = cache2
@@ -1917,7 +1897,7 @@ mod tests {
 
         // The recovered swap's content must be untouched.
         assert_eq!(
-            cache2.read_content("/tmp/cold_swap.md").await.unwrap(),
+            cache2.try_read_content("/tmp/cold_swap.md").await.unwrap(),
             "unsaved-edit",
             "a refused cold write must not have mutated the recovered buffer"
         );
@@ -1944,7 +1924,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/w12.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/w12.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/w12.md").await.unwrap(), "disk-v1");
 
         cache
             .create_or_replace("/tmp/w12.md", "local-edit")
@@ -1989,7 +1969,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/w12_ok.md"), b"disk-v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/w12_ok.md").await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content("/tmp/w12_ok.md").await.unwrap(), "disk-v1");
 
         cache
             .create_or_replace("/tmp/w12_ok.md", "local-edit")
@@ -2013,7 +1993,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache.read_content("/tmp/w12_ok.md").await.unwrap(),
+            cache.try_read_content("/tmp/w12_ok.md").await.unwrap(),
             "disk-v2-external"
         );
         assert!(!cache.swap_recovered("/tmp/w12_ok.md"));
@@ -2029,7 +2009,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache.read_content("/tmp/w12_swap.md").await.unwrap(),
+            cache.try_read_content("/tmp/w12_swap.md").await.unwrap(),
             "disk-v1"
         );
 
@@ -2042,7 +2022,7 @@ mod tests {
 
         // Reload recovers the swap.
         assert_eq!(
-            cache.read_content("/tmp/w12_swap.md").await.unwrap(),
+            cache.try_read_content("/tmp/w12_swap.md").await.unwrap(),
             "unsaved-edit"
         );
         assert!(cache.swap_recovered("/tmp/w12_swap.md"));
@@ -2099,15 +2079,15 @@ mod tests {
         cache.max_cached = 2;
 
         vfs.write_all(p("/tmp/evictee.txt"), b"v1").await.unwrap();
-        assert_eq!(cache.read_content("/tmp/evictee.txt").await.unwrap(), "v1");
+        assert_eq!(cache.try_read_content("/tmp/evictee.txt").await.unwrap(), "v1");
 
         // Two more clean loads push the cache past cap=2 — evict_if_needed
         // drops the oldest clean entry each time, exactly like an unrelated
         // MCP read/kaish `cat` would in production.
         vfs.write_all(p("/tmp/other1.txt"), b"o1").await.unwrap();
-        cache.read_content("/tmp/other1.txt").await.unwrap();
+        cache.try_read_content("/tmp/other1.txt").await.unwrap();
         vfs.write_all(p("/tmp/other2.txt"), b"o2").await.unwrap();
-        cache.read_content("/tmp/other2.txt").await.unwrap();
+        cache.try_read_content("/tmp/other2.txt").await.unwrap();
 
         assert!(
             !cache
@@ -2157,13 +2137,13 @@ mod tests {
         cache.max_cached = 1;
 
         vfs.write_all(p("/tmp/pinned.txt"), b"v1").await.unwrap();
-        cache.read_content("/tmp/pinned.txt").await.unwrap();
+        cache.try_read_content("/tmp/pinned.txt").await.unwrap();
         cache.pin("/tmp/pinned.txt").expect("pin a cached entry");
 
         // A second clean load would normally evict the only slot (cap=1) —
         // the pin must stop it.
         vfs.write_all(p("/tmp/other.txt"), b"o1").await.unwrap();
-        cache.read_content("/tmp/other.txt").await.unwrap();
+        cache.try_read_content("/tmp/other.txt").await.unwrap();
 
         assert!(
             cache
@@ -2184,7 +2164,7 @@ mod tests {
         // With the pin released, one more clean load evicts the
         // now-least-recently-used pinned.txt under the same cap=1 pressure.
         vfs.write_all(p("/tmp/other2.txt"), b"o2").await.unwrap();
-        cache.read_content("/tmp/other2.txt").await.unwrap();
+        cache.try_read_content("/tmp/other2.txt").await.unwrap();
         assert!(
             !cache
                 .cache
@@ -2205,7 +2185,7 @@ mod tests {
         let (vfs, cache) = tmp_cache().await;
 
         vfs.write_all(p("/tmp/held.txt"), b"v1").await.unwrap();
-        cache.read_content("/tmp/held.txt").await.unwrap();
+        cache.try_read_content("/tmp/held.txt").await.unwrap();
         cache.pin("/tmp/held.txt").expect("pin a cached entry");
 
         let err = cache
@@ -2232,7 +2212,7 @@ mod tests {
             "a refused invalidate_document must not remove the entry"
         );
         assert_eq!(
-            cache.read_content("/tmp/held.txt").await.unwrap(),
+            cache.try_read_content("/tmp/held.txt").await.unwrap(),
             "v1",
             "the pinned entry's content must be untouched"
         );

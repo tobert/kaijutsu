@@ -1021,7 +1021,7 @@ mod tests {
 
         // ...and the MCP surface (same shared cache) sees it immediately.
         assert_eq!(
-            file_cache.read_content("/tmp/shared.rs").await.unwrap(),
+            file_cache.try_read_content("/tmp/shared.rs").await.unwrap(),
             "fn main() {}"
         );
 

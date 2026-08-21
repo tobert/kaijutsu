@@ -3,7 +3,7 @@
 //!
 //! `docs/file-buffers.md` rule 2 makes a dirty buffer a swap: it survives a
 //! cold cache, but it is only reachable through `KernelDb::list_dirty_file_buffers`
-//! and `FileDocumentCache::read_content`, both kernel-internal. This mount is
+//! and `FileDocumentCache::try_read_content`, both kernel-internal. This mount is
 //! the discoverable read side — `ls`/`cat`/`grep` over `/v/swap` reach the
 //! same durable swap-marker table and file cache every other surface uses,
 //! with no separate storage and no separate `kj` verb.
@@ -145,7 +145,7 @@ impl SwapFilesystem {
             components.push(name.clone());
             let size = match self
                 .file_cache
-                .read_content(&Self::real_path(&components))
+                .try_read_content(&Self::real_path(&components))
                 .await
             {
                 Ok(content) => content.len() as u64,
@@ -196,12 +196,12 @@ impl Filesystem for SwapFilesystem {
             ));
         }
 
-        // The unsaved buffer, not disk — read_content resolves through the
-        // same FileDocumentCache the editor and file tools use, which
+        // The unsaved buffer, not disk — try_read_content resolves through
+        // the same FileDocumentCache the editor and file tools use, which
         // serves a dirty entry's in-memory content (or a cold-recovered
         // swap's block-store content) rather than re-reading the file.
         self.file_cache
-            .read_content(&real)
+            .try_read_content(&real)
             .await
             .map(|s| s.into_bytes())
             .map_err(io::Error::other)
@@ -281,7 +281,7 @@ impl Filesystem for SwapFilesystem {
         if let Some(buf) = dirty.iter().find(|d| d.path == real) {
             let content = self
                 .file_cache
-                .read_content(&real)
+                .try_read_content(&real)
                 .await
                 .map_err(io::Error::other)?;
             return Ok(DirEntry {
@@ -412,7 +412,7 @@ mod tests {
             .unwrap();
         // Load through the cache but never mark dirty — a clean cache entry,
         // not a swap.
-        file_cache.read_content("/tmp/clean.txt").await.unwrap();
+        file_cache.try_read_content("/tmp/clean.txt").await.unwrap();
 
         let vfs_path = format!("{}/tmp/clean.txt", kernel_id.to_hex());
         assert!(!swap_fs.exists(Path::new(&vfs_path)).await);

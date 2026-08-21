@@ -1255,7 +1255,7 @@ mod tests {
         // Create the script, then read it through the cache to populate a shadow.
         d.dispatch(&[s("rc"), s("add"), s(path), s("--content"), s("echo old")], &c)
             .await;
-        let (sctx, sblock) = cache.get_or_load(path).await.unwrap();
+        let (sctx, sblock) = cache.try_get_or_load(path).await.unwrap();
         assert_eq!(block_content(d.block_store(), sctx, &sblock), "echo old");
 
         // Edit the config block directly via kj rc.
@@ -1266,7 +1266,7 @@ mod tests {
 
         // The next cache read must reflect the edit — the dispatch hook dropped
         // the stale shadow (without it the surviving shadow re-serves "echo old").
-        let (sctx2, sblock2) = cache.get_or_load(path).await.unwrap();
+        let (sctx2, sblock2) = cache.try_get_or_load(path).await.unwrap();
         assert_eq!(
             block_content(d.block_store(), sctx2, &sblock2),
             "echo new",
@@ -1532,7 +1532,7 @@ mod tests {
         let _ = d
             .kernel()
             .file_cache()
-            .read_content("/etc/rc/mcp/create/S00-stance.md")
+            .try_read_content("/etc/rc/mcp/create/S00-stance.md")
             .await
             .expect("seeded stance is readable");
 

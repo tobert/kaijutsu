@@ -265,7 +265,7 @@ mod tests {
         let err = d
             .kernel()
             .file_cache()
-            .read_content("/tmp/ack.txt")
+            .try_read_content("/tmp/ack.txt")
             .await
             .unwrap();
         assert_eq!(err, "unsaved-ack", "recovered content is served, not disk");
@@ -308,7 +308,7 @@ mod tests {
         let content = d
             .kernel()
             .file_cache()
-            .read_content("/tmp/discard.txt")
+            .try_read_content("/tmp/discard.txt")
             .await
             .unwrap();
         assert_eq!(content, "disk-v1");
@@ -459,7 +459,7 @@ mod tests {
         // must account for.
         d.kernel().editor_quit(id).unwrap();
         assert_eq!(
-            d.kernel().file_cache().read_content(path).await.unwrap(),
+            d.kernel().file_cache().try_read_content(path).await.unwrap(),
             "unsaved-edit",
             "the rollback restored the checkpoint"
         );

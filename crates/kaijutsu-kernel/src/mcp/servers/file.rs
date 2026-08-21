@@ -595,12 +595,15 @@ impl FileToolsServer {
             );
         }
 
-        let (ctx_id, block_id) = match self.cache.get_or_load(&path).await {
+        let (ctx_id, block_id) = match self.cache.try_get_or_load(&path).await {
             Ok(ids) => ids,
-            Err(e) => return ExecResult::failure(1, e),
+            Err(CacheReadError::NotCached) => {
+                return ExecResult::failure(1, format!("{}: not found or not a text file", path));
+            }
+            Err(CacheReadError::Backend(e)) => return ExecResult::failure(1, e),
         };
 
-        // `get_or_load` above may have just recovered an unacknowledged swap
+        // `try_get_or_load` above may have just recovered an unacknowledged swap
         // into the cache (`docs/file-buffers.md` rule 4). Unlike `write_file`
         // (which goes through `create_or_replace`, already gated), this path
         // mutates the block directly via `store.edit_text` below — refuse
@@ -613,9 +616,19 @@ impl FileToolsServer {
             return ExecResult::failure(1, e);
         }
 
-        let content = match self.cache.read_content(&path).await {
+        let content = match self.cache.try_read_content(&path).await {
             Ok(c) => c,
-            Err(e) => return ExecResult::failure(1, e),
+            Err(CacheReadError::NotCached) => {
+                // Unreachable in practice: `try_get_or_load` just cached this
+                // path above. Named rather than folded into Backend so a
+                // future caller reordering these two calls gets a message
+                // that still points at the right cause.
+                return ExecResult::failure(
+                    1,
+                    format!("{}: not found or not a text file", path),
+                );
+            }
+            Err(CacheReadError::Backend(e)) => return ExecResult::failure(1, e),
         };
 
         let plan = if let Some(anchor) = &p.anchor {
@@ -1367,7 +1380,7 @@ mod tests {
         .await;
         assert!(!res.is_error, "edit failed: {}", text_of(&res));
         assert_eq!(
-            cache.read_content(path).await.unwrap(),
+            cache.try_read_content(path).await.unwrap(),
             "# 改善\n\n- α bullet\n- REPLACED\n"
         );
     }
@@ -1398,8 +1411,42 @@ mod tests {
         .await;
         assert!(!res.is_error, "anchor edit failed: {}", text_of(&res));
         assert_eq!(
-            cache.read_content(path).await.unwrap(),
+            cache.try_read_content(path).await.unwrap(),
             "# 改善\n\n- α bullet\n- done\n"
+        );
+    }
+
+    /// `apply_edit_plan` converts `try_get_or_load`/`try_read_content`'s typed
+    /// [`CacheReadError`] into an `ExecResult` at two call sites. A missing
+    /// path is [`CacheReadError::NotCached`] — benign — and must report a
+    /// "not found" message, distinct from what a real
+    /// [`CacheReadError::Backend`] failure would say. Before this typed
+    /// conversion both call sites collapsed through the opaque `get_or_load`/
+    /// `read_content` wrappers, which would still name the file here (the
+    /// wrapper's `Display` text says so), but gave a caller no way to act on
+    /// the distinction — this test pins the message this call site now picks
+    /// for the benign case specifically, not just that it fails.
+    #[tokio::test]
+    async fn edit_missing_file_reports_not_found() {
+        let (broker, _cache) = broker_with_file("/tmp/other.txt", "unrelated").await;
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": "/tmp/does-not-exist.txt",
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        )
+        .await;
+
+        assert!(res.is_error, "edit on a missing file must fail");
+        let msg = text_of(&res);
+        assert_eq!(
+            msg,
+            "/tmp/does-not-exist.txt: not found or not a text file",
+            "a missing file must report NotCached's message, not a raw backend string: {msg}"
         );
     }
 
@@ -1420,11 +1467,11 @@ mod tests {
         .await;
         assert!(res.is_error, "stale anchor should fail");
         assert!(text_of(&res).contains("stale"), "got: {}", text_of(&res));
-        assert_eq!(cache.read_content(path).await.unwrap(), "one\ntwo\nthree\n");
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "one\ntwo\nthree\n");
     }
 
     /// BUG 3 regression (kaibo review of `d45e0484`/`4369bd77`/`f02f3688`):
-    /// `apply_edit_plan` called `get_or_load` (which recovers a swap into the
+    /// `apply_edit_plan` called `try_get_or_load` (which recovers a swap into the
     /// cache with `swap_recovered: true`) and then mutated the block directly
     /// via `store.edit_text` — bypassing `create_or_replace`'s swap check
     /// entirely. `flush_one` refused afterward, but by then the recovered
@@ -1447,7 +1494,7 @@ mod tests {
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), db.clone()));
 
         // Load, then dirty it with an unsaved edit.
-        assert_eq!(cache.read_content(path).await.unwrap(), "disk-v1");
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
         cache.create_or_replace(path, "unsaved-edit").await.unwrap();
         cache.mark_dirty(path).unwrap();
         // No flush — this is the unsaved edit. Drop the in-memory entry
@@ -1461,7 +1508,7 @@ mod tests {
 
         // Recovers the swap into the cache — same as a fresh `vi`/`read`
         // after restart would.
-        assert_eq!(cache.read_content(path).await.unwrap(), "unsaved-edit");
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "unsaved-edit");
         assert!(cache.swap_recovered(path), "must have recovered as a swap");
 
         let res = call(
@@ -1488,7 +1535,7 @@ mod tests {
         // The block must be untouched by the refused edit — still exactly
         // the recovered swap content, not "CLOBBERED" and not "disk-v1".
         assert_eq!(
-            cache.read_content(path).await.unwrap(),
+            cache.try_read_content(path).await.unwrap(),
             "unsaved-edit",
             "a refused edit must not have mutated the recovered buffer"
         );
