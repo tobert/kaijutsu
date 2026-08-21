@@ -992,8 +992,12 @@ impl FileDocumentCache {
         // The kernel block store persists file documents across restarts while
         // this in-memory cache starts cold. So a cache miss does NOT imply the
         // document is new — it may already exist in the store (e.g. after a
-        // kernel restart). create_document fails in that case; fall back to
-        // replacing the existing block's content rather than erroring.
+        // kernel restart). create_document's DocumentAlreadyExists is that
+        // case; fall back to replacing the existing block's content rather
+        // than erroring. Any other create_document failure (a real DB error,
+        // or DocumentDiverged — a persisted row under this path that does not
+        // match what we intended to create) is a genuine backend failure and
+        // must propagate, matching try_get_or_load's classification.
         let block_id = match self
             .block_store
             .create_document(ctx_id, DocKind::File, language)
@@ -1011,7 +1015,7 @@ impl FileDocumentCache {
                     ContentType::Plain,
                 )
                 .map_err(|e| format!("failed to insert block for {}: {}", path, e))?,
-            Err(_) => {
+            Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
                 // Doc already in the store (cold cache). Replace its block's
                 // content with the new bytes (char-indexed delete, like the
                 // cached-hit path).
@@ -1032,6 +1036,9 @@ impl FileDocumentCache {
                     )
                     .map_err(|e| e.to_string())?;
                 existing.id
+            }
+            Err(e) => {
+                return Err(format!("failed to create document for {}: {}", path, e));
             }
         };
 
@@ -1275,6 +1282,76 @@ mod tests {
             .await
             .expect("replace a store-resident doc after a cold cache");
         assert_eq!(cache.read_content("/tmp/r.kai").await.unwrap(), "改善 v2 …");
+    }
+
+    /// `get_or_load_with_content`'s cold-cache fallback must discriminate
+    /// `create_document`'s error the same way `try_get_or_load` does:
+    /// `DocumentAlreadyExists` is the benign "doc already in the store"
+    /// case, but a persisted row that diverges (different `doc_kind`,
+    /// `workspace_id`, or `path` than the one being created) is
+    /// `BlockStoreError::DocumentDiverged` — a real backend failure that
+    /// must propagate, not be swallowed into "replace the existing block".
+    /// Swallowing it would run `block_snapshots`/`edit_text` against a
+    /// document that was never actually created in memory, masking the
+    /// divergence behind a misleading "document not found"/"has no blocks"
+    /// message.
+    #[tokio::test]
+    async fn create_or_replace_propagates_diverged_document_on_cold_cache() {
+        use crate::block_store::{shared_block_store_with_db, BlockStoreError};
+        use crate::kernel_db::DocumentRow;
+
+        let db = tmp_db();
+        let creator = PrincipalId::system();
+        let ws_id = db
+            .lock()
+            .get_or_create_default_workspace(creator)
+            .unwrap();
+
+        let path = "/tmp/diverged.md";
+        let ctx_id = file_context_id(path);
+
+        // A document row already persisted at this path's ContextId, but
+        // with a DIFFERENT doc_kind than the File document
+        // `get_or_load_with_content` is about to create — never inserted
+        // into the in-memory BlockStore, only in the DB, the way a document
+        // created by a different subsystem sharing the same hash namespace
+        // would be found on a cold start.
+        db.lock()
+            .insert_document(&DocumentRow {
+                document_id: ctx_id,
+                workspace_id: ws_id,
+                doc_kind: DocKind::Conversation,
+                language: None,
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: creator,
+            })
+            .unwrap();
+
+        let blocks = shared_block_store_with_db(db.clone(), ws_id, creator);
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = FileDocumentCache::new(blocks, vfs, db);
+
+        let expected_typed = BlockStoreError::DocumentDiverged {
+            id: ctx_id,
+            detail: format!(
+                "doc_kind: persisted={:?} intended={:?}",
+                DocKind::Conversation,
+                DocKind::File
+            ),
+        };
+
+        let err = cache
+            .create_or_replace(path, "new content")
+            .await
+            .expect_err("a diverged document must not be treated as a benign already-exists");
+        assert_eq!(
+            err,
+            format!("failed to create document for {}: {}", path, expected_typed),
+            "must propagate the typed DocumentDiverged failure, not silently \
+             fall through to the already-exists replace path"
+        );
     }
 
     #[tokio::test]

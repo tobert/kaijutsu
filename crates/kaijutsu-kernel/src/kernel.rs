@@ -2950,10 +2950,32 @@ mod tests {
             st.dirty,
             "a flush that failed must not let the buffer read clean"
         );
+
+        // `st.message` is the formatted status line, not the typed error —
+        // `starts_with("E212")` alone can't tell a genuine write failure
+        // apart from another `FlushError` variant whose formatting happens
+        // to share the prefix. Reproduce the same failure through
+        // `flush_one_guarded` directly (idempotent: the earlier `:w` never
+        // reached disk, so retrying sees the identical read-only mount) to
+        // get the typed value and assert on that.
+        let typed_err = kernel
+            .file_cache()
+            .flush_one_guarded("/mem/note.txt", false)
+            .await
+            .expect_err("the read-only mount must still refuse the retry");
         assert!(
-            st.message.as_deref().unwrap_or_default().starts_with("E212"),
-            "got: {:?}",
-            st.message
+            matches!(typed_err, crate::file_tools::cache::FlushError::Backend(_)),
+            "expected the typed Backend failure, got: {:?}",
+            typed_err
+        );
+        assert_eq!(
+            st.message,
+            Some(flush_error_message(
+                "/mem/note.txt",
+                &typed_err,
+                kernel.id()
+            )),
+            "the status line must be exactly the Backend-variant formatting"
         );
 
         // The swap row must survive the failed flush — a following `:q`

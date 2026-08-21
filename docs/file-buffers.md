@@ -46,7 +46,7 @@ We had already built most of vim's *write* side and none of its *read* side.
 | `:w` / `ZZ` | `editor_save`, `flush_one`, `flush_dirty` |
 | last-written state | `EditorSession.saved_content` (the checkpoint) |
 | swap file | durable file document — but **silent**, which is the bug |
-| `W12` changed-under-us | designed, **not implemented** (`vi.md`: "`:w!` == `:w` today") |
+| `W12` changed-under-us | `flush_one_guarded` — `:w` refuses when disk moved past the buffer's load generation, `:w!` overrides |
 
 Vim reads the file from disk into the buffer every time you open it, keeps
 unsaved work in a swap file, and *announces* a recovered swap rather than

@@ -69,11 +69,13 @@ pub enum CloseRequest {
 /// Substitute / shell / read / edit are later passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandRequest {
-    /// `:w` / `:w!` — checkpoint (save) the buffer; **stay open**. `force` (`!`)
-    /// is recorded but presently a no-op distinction: `:w!` == `:w`. The intended
-    /// future use is an overwrite-the-overwrite override — once the kernel detects
-    /// the block changed under us since open (a concurrent writer), a plain `:w`
-    /// refuses and `:w!` forces (vim's "file has changed since editing started").
+    /// `:w` / `:w!` — checkpoint (save) the buffer; **stay open**. `force`
+    /// (`!`) is not a no-op: a plain `:w` refuses when disk moved past the
+    /// buffer's load generation since it was opened (vim's W12, "file
+    /// changed since editing started"); `:w!` overrides that refusal.
+    /// `EditorCore` is pure and only carries `force` as parsed intent — the
+    /// kernel owns the load-generation check and enforces it
+    /// (`docs/file-buffers.md`).
     Write { force: bool },
     /// `:q` / `:q!` — quit. `force` (`!`) discards changes since the last
     /// checkpoint; without it a *dirty* buffer must refuse (vim's "No write
