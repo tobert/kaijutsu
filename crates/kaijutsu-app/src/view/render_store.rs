@@ -13,7 +13,7 @@
 //! local toggle survives streaming elsewhere in the document.
 //! `RenderBlockStore` keeps the methods the app calls — `blocks_ordered`,
 //! `block_ids_ordered`, `get_block_snapshot`, `full_text`, `is_empty`,
-//! `version`, `set_version`, `principal_id`, `set_collapsed`, `move_block`,
+//! `version`, `set_version`, `principal_id`, `set_collapsed`,
 //! `insert_block`, `insert_from_snapshot`, `rebuild` — over a `Vec` plus an
 //! id-to-index map.
 
@@ -27,15 +27,15 @@ use kaijutsu_types::{
 
 /// A reference to a block this store does not hold.
 ///
-/// `insert_from_snapshot` and `move_block` fail loud on an unresolvable
-/// `after`/target id rather than silently falling back to append-at-end —
-/// a caller passing a stale id is a bug in the caller, and the render
-/// buffer rebuilds from scratch on the next sync regardless.
+/// `insert_from_snapshot` fails loud on an unresolvable `after`/target id
+/// rather than silently falling back to append-at-end — a caller passing a
+/// stale id is a bug in the caller, and the render buffer rebuilds from
+/// scratch on the next sync regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderStoreError {
     /// `insert_from_snapshot` was given an id it already holds.
     DuplicateBlock(BlockId),
-    /// `move_block` or `set_collapsed` targets an id not in the store.
+    /// `set_collapsed` targets an id not in the store.
     BlockNotFound(BlockId),
     /// `after` does not name a block in the store.
     UnknownAfter(BlockId),
@@ -127,16 +127,6 @@ impl RenderBlockStore {
         self.blocks.insert(position, snapshot);
         self.reindex_from(position);
         self.version += 1;
-    }
-
-    // Only `move_block` calls this, and `move_block` itself currently has
-    // no caller of its own — see the note on `move_block` below.
-    #[allow(dead_code)]
-    fn remove_at(&mut self, position: usize) -> BlockSnapshot {
-        let snapshot = self.blocks.remove(position);
-        self.index.remove(&snapshot.id);
-        self.reindex_from(position);
-        snapshot
     }
 
     pub fn principal_id(&self) -> PrincipalId {
@@ -302,41 +292,6 @@ impl RenderBlockStore {
         Ok(())
     }
 
-    /// Reposition an existing block. `after: None` moves it to the front —
-    /// matching `kaijutsu_kernel::blocks::BlockDocument::move_block`'s
-    /// move-to-front convention for a `None` target.
-    ///
-    /// Currently has no caller: the renderer that exercised it directly has
-    /// been deleted, and nothing has replaced that call site. Kept because
-    /// `RenderBlockStore` is meant to support out-of-order block moves and
-    /// deleting it would need re-adding the day something needs one; see
-    /// `docs/issues.md`.
-    #[allow(dead_code)]
-    pub fn move_block(
-        &mut self,
-        id: &BlockId,
-        after: Option<&BlockId>,
-    ) -> Result<(), RenderStoreError> {
-        let &current = self
-            .index
-            .get(id)
-            .ok_or(RenderStoreError::BlockNotFound(*id))?;
-        let snapshot = self.remove_at(current);
-        let position = match after {
-            None => 0,
-            Some(after_id) => {
-                let Some(&i) = self.index.get(after_id) else {
-                    // Put the removed block back before failing — a failed
-                    // move must not lose it.
-                    self.insert_at(current, snapshot);
-                    return Err(RenderStoreError::UnknownAfter(*after_id));
-                };
-                i + 1
-            }
-        };
-        self.insert_at(position, snapshot);
-        Ok(())
-    }
 }
 
 #[cfg(test)]

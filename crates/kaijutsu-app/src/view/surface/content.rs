@@ -223,9 +223,12 @@ fn spans_fingerprint(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     spans.len().hash(&mut hasher);
     for span in spans {
-        span.start.hash(&mut hasher);
-        span.end.hash(&mut hasher);
-        crate::text::msdf::layout_bridge::brush_to_rgba8(&span.brush).hash(&mut hasher);
+        // No `..` — a new field on `SpanBrush` must fail to compile here
+        // until someone decides whether it belongs in the fingerprint.
+        let SpanBrush { start, end, brush } = span;
+        start.hash(&mut hasher);
+        end.hash(&mut hasher);
+        crate::text::msdf::layout_bridge::brush_to_rgba8(brush).hash(&mut hasher);
     }
     crate::text::ansi::styled_spans_fingerprint(style_spans, &mut hasher);
     hasher.finish()

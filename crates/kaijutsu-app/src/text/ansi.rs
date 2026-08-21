@@ -286,17 +286,33 @@ pub fn styled_spans_fingerprint<H: std::hash::Hasher>(spans: &[StyledSpan], hash
     use std::hash::Hash;
     hasher.write_usize(spans.len());
     for span in spans {
-        span.start.hash(hasher);
-        span.end.hash(hasher);
-        span.brush.color.hash(hasher);
-        span.brush.style_index.hash(hasher);
+        // No `..` — a new field on `StyledSpan` must fail to compile here
+        // until someone decides whether it belongs in the fingerprint.
+        let StyledSpan {
+            start,
+            end,
+            brush,
+            bg,
+            ink,
+            underline,
+            strikethrough,
+        } = span;
+        let StyledBrush {
+            color,
+            style_index,
+            importance,
+        } = brush;
+        start.hash(hasher);
+        end.hash(hasher);
+        color.hash(hasher);
+        style_index.hash(hasher);
         // f32 has no `Hash`; its bits do, and `importance` is one of three
         // constants, so bit equality is exactly value equality here.
-        hasher.write_u32(span.brush.importance.to_bits());
-        span.bg.hash(hasher);
-        span.ink.hash(hasher);
-        span.underline.hash(hasher);
-        span.strikethrough.hash(hasher);
+        hasher.write_u32(importance.to_bits());
+        bg.hash(hasher);
+        ink.hash(hasher);
+        underline.hash(hasher);
+        strikethrough.hash(hasher);
     }
 }
 
