@@ -193,10 +193,15 @@ lifted.
 
 What is left:
 
-- **Slice 4, the tool surface.** Remove `write` and `grep`, make `edit`
-  hashline-only, add `create_file`. Note this now interacts with kaish's
-  forthcoming `edit` builtin — decide whether the MCP tool is retired in favor of
-  it rather than trimmed, so we do not keep two CAS mechanisms.
+- **Slice 4 — RULED 2026-08-21: remove the MCP file tools outright**, `grep`
+  and `edit` included, and lean on kaish. Amy: *"It's ok if we don't have them
+  for a short period while we finish the kaish upgrade."* So this is a
+  deletion, not the trim originally planned — no `create_file`, no
+  hashline-only `edit`, one CAS mechanism instead of two. A gap between the
+  removal and kaish's `edit` builtin is accepted. This also retires the `grep`
+  blind-spot entry below as a *fix* target; what still matters there is whether
+  kaish's `grep` shares the defect, since that is the one we come to depend
+  on.
 - **Slice 5, the wire fields.** `swapRecovered` and `diskChangedSinceLoad` on
   `EditorState`, both additive, plus the renderer work.
 
@@ -608,12 +613,13 @@ produced the same tofu on the old per-block-cell path too, before it was
 deleted); the port preserved it deliberately rather than diverging on a font
 question.
 
-Three ways out, none of them obviously right: substitute ASCII (`[x]`/`[ ]`)
-in `view::surface::labels::checkbox_char`; ship a symbol font and teach the
-fallback chain about it; or draw the checkbox as an SDF quad in the chrome
-pass (`block_fx.wgsl` already has a gutter-indicator flag that draws a
-dot/ring — `text_glow_params.y` — which the surface did not port). Amy's
-call.
+**RULED 2026-08-21: substitute ASCII** (`[x]`/`[ ]`) in
+`view::surface::labels::checkbox_char`. The two rejected options stay on
+record because they remain the better-looking answers if this ever gets
+revisited: ship a symbol font and teach the fallback chain about it, or draw
+the checkbox as an SDF quad in the chrome pass (`block_fx.wgsl` already has a
+gutter-indicator flag that draws a dot/ring — `text_glow_params.y` — which the
+surface did not port).
 ## The `grep` MCP tool is blind on `docs/issues.md` while `read` and shell `grep` see it fine (2026-08-18)
 
 Found live on toad during the same ACP smoke-test session as the P1 entry

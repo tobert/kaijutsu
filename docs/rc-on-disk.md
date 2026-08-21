@@ -1,4 +1,4 @@
-# rc on disk — melting the kernel-owned rc tree to real files
+# Config on disk — melting the kernel-owned trees to real files
 
 **Status: ruled, unbuilt.** Amy ruled the shape on 2026-08-21; no code has
 moved. `docs/config-ownership.md` still describes the live system.
@@ -82,12 +82,25 @@ one most tests run on.
    hooks is the *point*, and `hooks.action_kaish_body` stops being the source of
    truth. Retire the snapshot rule and its comment in the same change.
 
+## All four roots, and `ConfigDocFs` goes away
+
+**Ruled 2026-08-21.** `ConfigDocFs` serves `/etc/rc`, `/etc/config`,
+`/etc/client` and `/etc/midi`. All four become host directories under
+`~/.config/kaijutsu/etc/`, and `ConfigDocFs` is deleted rather than left
+serving a shrinking set of roots.
+
+rc is the one with executable semantics and a lifecycle, so it is the harder
+melt and the one this document details. The other three are plain data on a
+write surface that already has no `config-write` capability and no `kj config
+set`/`edit` — for them the melt is close to just changing what backs the
+mount.
+
+Sequence rc first anyway: it is the one that can go wrong in an interesting
+way, and getting it right teaches the other three.
+
 ## Open
 
-**The three sibling roots.** `ConfigDocFs` serves `/etc/rc`, `/etc/config`,
-`/etc/client` and `/etc/midi`. Only rc is ruled. The chosen path implies
-`~/.config/kaijutsu/etc/{config,client,midi}` and `ConfigDocFs` going away
-entirely, but that is inference, not a ruling — ask before building it.
+Nothing is waiting on a ruling. The work is unbuilt.
 
 **Multi-machine.** kaijutsu runs on moltar, zorak and a MacBook Pro, each with
 its own kernel documents today. A shared `~/.config` checkout is the first
