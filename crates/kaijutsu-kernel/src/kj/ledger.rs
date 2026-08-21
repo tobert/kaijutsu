@@ -28,9 +28,9 @@
 //! in one transaction — either every statement's rule is written, or none
 //! are (see that function's doc for why a partial rule set is worse than no
 //! rule at all). `approval_ledger::rules::learn_from_approval` refuses to
-//! create an `allow` rule for a statement with any free variable (Amy's
-//! 2026-08-17 ruling, `docs/gate-and-shell-split.md` ruling 3); this module
-//! never re-implements that check, only reports what the ledger said. Once
+//! create an `allow` rule for a statement with any free variable
+//! (`docs/gate-and-shell-split.md`, "Rulings"); this module never
+//! re-implements that check, only reports what the ledger said. Once
 //! a rule exists, [`crate::kj::gate::run_gate`]'s `rules::redeem` step
 //! auto-decides the next identical ask without asking anyone —
 //! `kj ledger forget` is how that stops.
@@ -187,8 +187,8 @@ fn parse_verb_arg(s: &str) -> Result<String, String> {
 
 /// Parse `--since <duration>` — `30m`, `2h`, `7d`. One integer immediately
 /// followed by exactly one unit letter; no absolute timestamps, no
-/// fractional numbers, no combined units (Amy's ruling: one format, no
-/// ambiguity). Garbage is rejected loudly — CLAUDE.md's stance against
+/// fractional numbers, no combined units — one format, no ambiguity.
+/// Garbage is rejected loudly — CLAUDE.md's stance against
 /// silent fallbacks applies just as much to a mistyped flag as to
 /// anything else; `--since 5x` must be an error, never "no filter".
 fn parse_since_duration_ms(s: &str) -> Result<i64, String> {
@@ -223,9 +223,9 @@ fn since_cutoff_ms(duration_ms: i64) -> i64 {
 }
 
 /// The "showing N of TOTAL" line every `kj ledger` listing prints when
-/// `--limit` cut real rows off the end — Amy's ruling: a silently
-/// truncated list is the quiet fallback CLAUDE.md treats as a defect, so
-/// the line only appears when something was actually cut (`None`
+/// `--limit` cut real rows off the end. A silently truncated list is the
+/// quiet fallback CLAUDE.md treats as a defect, so the line only appears
+/// when something was actually cut (`None`
 /// otherwise; an untruncated listing stays uncluttered). `extra_flags` is
 /// the command-specific narrowing flags beyond `--since`/`--limit` to
 /// mention (asks have `--origin`/`--status`; runs have `--context`/
@@ -313,7 +313,7 @@ enum LedgerCommand {
         request_id: String,
         // Why an `allow` rule is refused over a free variable, and why the
         // ask's own decision survives that refusal: `docs/gate-and-shell-split.md`,
-        // "Rulings". Published help states the behavior, not the ruling.
+        // "Digest-keyed allow-always: refuse on free variables".
         /// Remember this decision as a standing rule, so future identical
         /// asks decide without asking anyone. Refused when any covered
         /// statement has a free variable; the decision on THIS ask still
@@ -505,9 +505,7 @@ impl KjDispatcher {
     /// terminal, in which case it's history-style (newest first) — its own
     /// terminality decides that, so `--status allowed` alone switches to
     /// history and `--status claimed` alone stays queue-style, and
-    /// `--history` never needs to be passed alongside either (Amy's
-    /// ruling: "`--status allowed` clearly implies history; make that
-    /// work sensibly rather than making the user pass both"). Without
+    /// `--history` never needs to be passed alongside either. Without
     /// `--status`, the bare `--history` flag picks between the two modes
     /// this command has always had: the default pending-only queue, or
     /// the four-terminal-status history view.
@@ -828,9 +826,8 @@ impl KjDispatcher {
                             }
                             Err(e) => {
                                 // The offending variable is the whole point of
-                                // this arm (Amy's 2026-08-17 ruling) — surface
-                                // `LedgerError::FreeVariableRule`'s fields
-                                // rather than flattening to `{e}`'s prose, so
+                                // this arm — surface `LedgerError::FreeVariableRule`'s
+                                // fields rather than flattening to `{e}`'s prose, so
                                 // a caller parsing `.data` can act on it too.
                                 message.push_str(&format!(
                                     "; NOT remembered: {e} — the {verb} on THIS ask still stands"
@@ -1885,10 +1882,10 @@ mod tests {
         assert_eq!(ask2.status, approval_ledger::types::ApprovalStatus::Allowed);
     }
 
-    /// Amy's 2026-08-17 ruling pinned at the CLI seam: a `kj cc send`-shaped
-    /// ask has a free `MESSAGE` variable, so `--remember` must refuse to
-    /// create a rule for it — while the decision on THIS ask still goes
-    /// through exactly as if `--remember` had never been passed.
+    /// A `kj cc send`-shaped ask has a free `MESSAGE` variable, so
+    /// `--remember` must refuse to create a rule for it — while the
+    /// decision on THIS ask still goes through exactly as if `--remember`
+    /// had never been passed.
     #[tokio::test]
     async fn remembering_an_allow_is_refused_when_a_statement_has_a_free_variable() {
         let d = test_dispatcher().await;
@@ -2190,8 +2187,8 @@ mod tests {
 
     // ── `--limit`/`--since`/`--origin`/`--status`/`--context`/`--verb` ──
     //
-    // Amy's ruling: cap the pending queue too (default 20), and say so
-    // loudly when rows are cut. These tests seed rows DIRECTLY through
+    // The pending queue is capped too (default 20), and truncation is
+    // reported loudly when rows are cut. These tests seed rows DIRECTLY through
     // `approval_ledger`'s own write API (bypassing `run_gate`/kaish
     // entirely) so a 25-row queue doesn't mean 25 real gate round trips —
     // this is a CLI listing test, not another exercise of the gate.
@@ -2276,7 +2273,7 @@ mod tests {
         assert_eq!(data_ids(&result).len(), 20, "default limit must cap the pending queue at 20");
         assert!(
             result.message().contains("showing 20 of 25"),
-            "a truncated listing must say so loudly, per Amy's ruling: {}",
+            "a truncated listing must say so loudly: {}",
             result.message()
         );
     }
@@ -2430,7 +2427,7 @@ mod tests {
         assert!(result.message().contains("pending") && result.message().contains("allowed"), "{}", result.message());
     }
 
-    /// Amy's ruling: `--status allowed` alone (no `--history`) must show
+    /// `--status allowed` alone (no `--history`) must show
     /// allowed asks — the user should never have to pass both.
     #[tokio::test]
     async fn ledger_list_status_allowed_implies_history_without_the_flag() {
