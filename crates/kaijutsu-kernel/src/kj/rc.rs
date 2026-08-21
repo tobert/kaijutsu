@@ -11,6 +11,7 @@
 //! dispatch reads the same files; see `kj/lifecycle.rs`.
 
 use clap::{Parser, Subcommand};
+use kaijutsu_diff::{DiffModel, DiffOptions, FileSpec, diff_file, format as format_diff};
 use kaijutsu_types::ContentType;
 use kaijutsu_types::paths;
 use regex::Regex;
@@ -99,6 +100,21 @@ enum RcCommand {
         /// Canonical rc path to restore from the embedded default
         path: String,
     },
+    /// Install every path whose embedded seed never landed — repair a kernel
+    /// lagging several seeds without resetting them one at a time. Prints a
+    /// unified diff of every change; read it before overwriting for real,
+    /// because an overwritten path cannot be recovered afterward. A no-seed
+    /// path is never touched, only reported.
+    Reseed {
+        /// Also restore every path that differs from its embedded seed, not
+        /// just paths with nothing installed.
+        #[arg(long)]
+        overwrite: bool,
+        /// Report what would change; write nothing. Valid with or without
+        /// --overwrite.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Staleness classification for `kj rc list`'s per-entry seed comparison
@@ -151,6 +167,84 @@ impl RcSeedStatus {
             RcSeedStatus::NotInstalled => "not_installed",
             RcSeedStatus::Dangling => "dangling",
         }
+    }
+}
+
+/// What `kj rc reseed` does with one path, derived from its [`RcSeedStatus`]
+/// and the `--overwrite` flag. Kept as its own type (rather than branching on
+/// `RcSeedStatus` inline at each call site) so the decision table lives in
+/// exactly one place and the report's `action` field and the write loop can
+/// never read it differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RcReseedAction {
+    /// Nothing lives at this path; the seed installs it.
+    Install,
+    /// Something lives at this path and differs from its seed; `--overwrite`
+    /// restores it.
+    Overwrite,
+    /// Live and matches its seed already — nothing to do.
+    SkipInSync,
+    /// Differs from its seed, but `--overwrite` was not given.
+    SkipDiffers,
+    /// No embedded seed ships for this path — nothing to reseed it to.
+    SkipNoSeed,
+    /// A dangling link is repaired by reinstalling its **target**, which (if
+    /// seeded) is its own row classified `NotInstalled` above — not by any
+    /// action on the link path itself.
+    SkipDangling,
+}
+
+impl RcReseedAction {
+    /// The plan for one path under the given `--overwrite` setting.
+    fn for_status(status: RcSeedStatus, overwrite: bool) -> Self {
+        match status {
+            RcSeedStatus::NotInstalled => RcReseedAction::Install,
+            RcSeedStatus::Differs if overwrite => RcReseedAction::Overwrite,
+            RcSeedStatus::Differs => RcReseedAction::SkipDiffers,
+            RcSeedStatus::InSync => RcReseedAction::SkipInSync,
+            RcSeedStatus::NoSeed => RcReseedAction::SkipNoSeed,
+            RcSeedStatus::Dangling => RcReseedAction::SkipDangling,
+        }
+    }
+
+    /// Whether this action installs a seed body (and so needs a before/after
+    /// diff and a live write when not a dry run).
+    fn writes(&self) -> bool {
+        matches!(self, RcReseedAction::Install | RcReseedAction::Overwrite)
+    }
+
+    /// snake_case token for the `.data` structured record.
+    fn as_json_str(&self) -> &'static str {
+        match self {
+            RcReseedAction::Install => "install",
+            RcReseedAction::Overwrite => "overwrite",
+            RcReseedAction::SkipInSync => "skip_in_sync",
+            RcReseedAction::SkipDiffers => "skip_differs",
+            RcReseedAction::SkipNoSeed => "skip_no_seed",
+            RcReseedAction::SkipDangling => "skip_dangling",
+        }
+    }
+}
+
+/// The body a path's embedded seed would show once any composition link is
+/// followed — a single hop, matching the shipped seed format (a per-type path
+/// links straight to a `lib/` literal body; `seed_scripts::
+/// every_bare_path_seed_body_resolves_to_a_seeded_target` guards that no
+/// shipped seed nests deeper). Resolved purely from the embedded seed set,
+/// never from a live VFS read: this is what makes a `kj rc reseed --dry-run`
+/// preview and the real write describe the identical outcome regardless of
+/// which order the paths in a batch get installed in — a not-yet-installed
+/// symlink's target may itself be not-yet-installed in the same batch, and
+/// this never has to wait for that write to land.
+fn seed_resolved_body(path: &str) -> Option<&'static str> {
+    let body = crate::seed_scripts::seed_body(path)?;
+    let known: std::collections::HashSet<String> = crate::seed_scripts::seed_files()
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    match crate::runtime::config_doc_fs::seed_link_target(path, body, &known) {
+        Some(target) => crate::seed_scripts::seed_body(&target),
+        None => Some(body),
     }
 }
 
@@ -228,14 +322,16 @@ impl KjDispatcher {
         // Writing /etc/rc lifecycle scripts is gated on `rc-write`. `kj rc`
         // writes go through the admin-only rc_cache (not builtin.file:write), so
         // this is the *only* place the rc-write capability is enforced for the
-        // kj surface. Reads (list/show) stay ungated.
-        if matches!(
-            parsed.command,
-            RcCommand::Add { .. }
-                | RcCommand::Rm { .. }
-                | RcCommand::Edit { .. }
-                | RcCommand::Reset { .. }
-        ) && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc")
+        // kj surface. Reads (list/show, and a `reseed --dry-run`) stay ungated.
+        let writes = match &parsed.command {
+            RcCommand::Add { .. } | RcCommand::Rm { .. } | RcCommand::Edit { .. } | RcCommand::Reset { .. } => {
+                true
+            }
+            RcCommand::Reseed { dry_run, .. } => !*dry_run,
+            _ => false,
+        };
+        if writes
+            && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc")
         {
             return denied;
         }
@@ -243,7 +339,9 @@ impl KjDispatcher {
         // FileDocumentCache shadow that backs kaish `cat`/file tools — capture
         // the path so we can drop that stale shadow after a successful write.
         // (The `edit`-opens-editor branch is covered too: invalidation is a
-        // harmless reload there, and the editor self-invalidates on its writes.)
+        // harmless reload there, and the editor self-invalidates on its writes.
+        // `reseed` touches an arbitrary set of paths decided at run time, so it
+        // invalidates each one itself rather than reporting a single path here.)
         let write_path = match &parsed.command {
             RcCommand::Add { path, .. }
             | RcCommand::Rm { path }
@@ -269,6 +367,7 @@ impl KjDispatcher {
                 self.rc_edit(&path, content.as_deref(), caller).await
             }
             RcCommand::Reset { path } => self.rc_reset(&path).await,
+            RcCommand::Reseed { overwrite, dry_run } => self.rc_reseed(overwrite, dry_run).await,
         };
         if let Some(path) = write_path
             && matches!(result, KjResult::Ok { .. })
@@ -366,16 +465,19 @@ impl KjDispatcher {
             .map(|t| t.to_string_lossy().into_owned())
     }
 
-    async fn rc_list(
+    /// Build the `(path, live_link, seed_status)` triple for every rc path
+    /// this kernel knows about — every live path under `/etc/rc` (`type_filter`/
+    /// `verb_filter` narrow the walk, as `kj rc list` does) plus every embedded
+    /// seed with nothing live at its path (reported as [`RcSeedStatus::NotInstalled`]
+    /// rather than silently omitted — the anti-join `kj rc list` has always
+    /// done). Shared by `kj rc list` and `kj rc reseed`, which classify a path
+    /// identically and must never be allowed to drift on how.
+    async fn rc_status_rows(
         &self,
         type_filter: Option<&str>,
         verb_filter: Option<&str>,
-        json: bool,
-    ) -> KjResult {
-        let mut paths = match self.walk_rc_paths().await {
-            Ok(p) => p,
-            Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
-        };
+    ) -> Result<Vec<(String, Option<String>, RcSeedStatus)>, String> {
+        let mut paths = self.walk_rc_paths().await?;
         let matches_filters = |p: &str| {
             let parts = match parse_rc_path(p) {
                 Ok(parts) => parts,
@@ -392,7 +494,8 @@ impl KjDispatcher {
         // script added to the embedded set after this kernel was first seeded
         // never lands on its own and is otherwise invisible here — the listing
         // walks live paths, and a path with nothing at it has no entry to walk.
-        // Reporting it is the whole point: `kj rc reset <path>` is the install.
+        // Reporting it is the whole point: `kj rc reset <path>`/`kj rc reseed`
+        // is the install.
         let live: std::collections::HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
         let mut missing: Vec<String> = crate::seed_scripts::seed_files()
             .into_iter()
@@ -401,25 +504,8 @@ impl KjDispatcher {
             .collect();
         missing.sort();
 
-        if paths.is_empty() && missing.is_empty() {
-            return KjResult::ok_with_data(
-                "(no rc scripts)".to_string(),
-                serde_json::Value::Array(Vec::new()),
-            );
-        }
-
-        // `data` stays an array of full path strings (the resolver keys for
-        // `kj rc rm`/`show`) per the kj structured-data convention
-        // (`project_kj_structured_data.md`: list commands emit an array of
-        // identifier strings so `for x in $(kj …)` iterates handles) — the
-        // per-entry seed status below rides `--json`'s message instead of
-        // reshaping `data` into an array of records.
-        let data = serde_json::Value::Array(
-            paths.iter().cloned().map(serde_json::Value::String).collect(),
-        );
-
-        // One pass: resolve each path's live symlink target (if any) and its
-        // seed staleness, shared by both the human listing and `--json`.
+        // One pass: resolve each live path's symlink target (if any) and its
+        // seed staleness.
         let mut rows: Vec<(String, Option<String>, RcSeedStatus)> =
             Vec::with_capacity(paths.len() + missing.len());
         for p in &paths {
@@ -435,6 +521,40 @@ impl KjDispatcher {
                 .map(|p| (p, None, RcSeedStatus::NotInstalled)),
         );
         rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(rows)
+    }
+
+    async fn rc_list(
+        &self,
+        type_filter: Option<&str>,
+        verb_filter: Option<&str>,
+        json: bool,
+    ) -> KjResult {
+        let rows = match self.rc_status_rows(type_filter, verb_filter).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
+        };
+
+        if rows.is_empty() {
+            return KjResult::ok_with_data(
+                "(no rc scripts)".to_string(),
+                serde_json::Value::Array(Vec::new()),
+            );
+        }
+
+        // `data` stays an array of full path strings (the resolver keys for
+        // `kj rc rm`/`show`) per the kj structured-data convention
+        // (`project_kj_structured_data.md`: list commands emit an array of
+        // identifier strings so `for x in $(kj …)` iterates handles) — the
+        // per-entry seed status below rides `--json`'s message instead of
+        // reshaping `data` into an array of records. A not-installed row has
+        // nothing live to resolve to, so it's excluded here same as before.
+        let data = serde_json::Value::Array(
+            rows.iter()
+                .filter(|(_, _, status)| *status != RcSeedStatus::NotInstalled)
+                .map(|(p, _, _)| serde_json::Value::String(p.clone()))
+                .collect(),
+        );
 
         if json {
             let scripts: Vec<serde_json::Value> = rows
@@ -674,31 +794,27 @@ impl KjDispatcher {
     /// bulk reseed, it touches exactly the path you name, and create-or-replace
     /// means it also recovers a file you `rm`'d. Errors (no silent no-op) when
     /// the path ships no embedded seed — there is nothing to reset it to.
-    async fn rc_reset(&self, path: &str) -> KjResult {
+    /// Install `body` (an embedded seed) at `path`: create-or-replace, and a
+    /// seed whose body is itself a path to another seeded script installs as
+    /// a symlink (init.d composition) rather than a literal file, mirroring
+    /// how fresh-tree seeding does it. Shared by `rc_reset` (one path, on
+    /// demand) and `rc_reseed` (many paths, decided from `RcSeedStatus`) so
+    /// the actual write dance — drop any existing doc first so a write never
+    /// accidentally follows a live symlink into its target, then write the
+    /// literal body or recreate the link — lives in exactly one place.
+    /// Returns the symlink target when the seed installed as a link.
+    async fn write_seed_body(&self, path: &str, body: &'static str) -> Result<Option<String>, String> {
         use crate::vfs::VfsOps;
-        if let Err(e) = parse_rc_path(path) {
-            return KjResult::Err(format!("kj rc reset: {e}"));
-        }
-        let Some(body) = crate::seed_scripts::seed_body(path) else {
-            return KjResult::Err(format!(
-                "kj rc reset: '{path}' has no built-in seed (nothing to reset to)\n\
-                 only paths shipped under assets/defaults/rc can be reset"
-            ));
-        };
-        // A seed whose body is a path to another seeded script restores as a
-        // symlink (init.d composition), not a literal file — mirror seeding.
         let known: std::collections::HashSet<String> = crate::seed_scripts::seed_files()
             .into_iter()
             .map(|(p, _)| p)
             .collect();
         let link = crate::runtime::config_doc_fs::seed_link_target(path, body, &known);
 
-        // create-or-replace: drop any existing doc (file OR link) first, so a
-        // write never accidentally follows a live symlink into its target.
         if self.rc_exists(path).await
             && let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(path)).await
         {
-            return KjResult::Err(format!("kj rc reset: unlink '{path}': {e}"));
+            return Err(format!("unlink '{path}': {e}"));
         }
 
         let outcome = match &link {
@@ -711,15 +827,177 @@ impl KjDispatcher {
                 .map_err(|e| e.to_string()),
             None => self.write_rc_file(path, body).await,
         };
-        if let Err(e) = outcome {
+        outcome.map(|()| link)
+    }
+
+    async fn rc_reset(&self, path: &str) -> KjResult {
+        if let Err(e) = parse_rc_path(path) {
             return KjResult::Err(format!("kj rc reset: {e}"));
         }
-        match link {
-            Some(target) => KjResult::ok(format!(
+        let Some(body) = crate::seed_scripts::seed_body(path) else {
+            return KjResult::Err(format!(
+                "kj rc reset: '{path}' has no built-in seed (nothing to reset to)\n\
+                 only paths shipped under assets/defaults/rc can be reset"
+            ));
+        };
+        match self.write_seed_body(path, body).await {
+            Ok(Some(target)) => KjResult::ok(format!(
                 "reset rc script '{path}' to its embedded seed (symlink → {target})"
             )),
-            None => KjResult::ok(format!("reset rc script '{path}' to its embedded seed")),
+            Ok(None) => KjResult::ok(format!("reset rc script '{path}' to its embedded seed")),
+            Err(e) => KjResult::Err(format!("kj rc reset: {e}")),
         }
+    }
+
+    /// Bulk-install every path missing its embedded seed
+    /// (`RcSeedStatus::NotInstalled`), and — with `overwrite` — also restore
+    /// every path that differs from its seed (`RcSeedStatus::Differs`).
+    /// `dry_run` computes and reports the identical plan without writing
+    /// anything (and, per the caller, is never gated on `rc-write`). A
+    /// no-seed path is never touched either way.
+    ///
+    /// The plan (action + before/after text) is computed once, before any
+    /// write happens, from [`seed_resolved_body`] rather than a live VFS
+    /// read — so a dry run's diff and a real run's actual result describe
+    /// the identical outcome, and installing several paths in one call needs
+    /// no target-before-link write ordering: a not-yet-installed symlink's
+    /// target may itself be not-yet-installed in the same batch, and the
+    /// preview never depends on that other write having landed yet. The VFS
+    /// symlink primitive agrees — a dangling target is accepted at create
+    /// time, exactly as a real symlink(2) would.
+    async fn rc_reseed(&self, overwrite: bool, dry_run: bool) -> KjResult {
+        let rows = match self.rc_status_rows(None, None).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj rc reseed: {e}")),
+        };
+
+        struct Plan {
+            path: String,
+            status: RcSeedStatus,
+            action: RcReseedAction,
+            old: Option<String>,
+            new: Option<String>,
+        }
+
+        let mut plans = Vec::with_capacity(rows.len());
+        for (path, _link, status) in &rows {
+            let action = RcReseedAction::for_status(*status, overwrite);
+            let (old, new) = if action.writes() {
+                let old = match self.read_rc_content(path).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return KjResult::Err(format!("kj rc reseed: reading '{path}': {e}"));
+                    }
+                };
+                (old, seed_resolved_body(path).map(str::to_string))
+            } else {
+                (None, None)
+            };
+            plans.push(Plan {
+                path: path.clone(),
+                status: *status,
+                action,
+                old,
+                new,
+            });
+        }
+
+        // Build every diff before writing anything. The diff is the only record
+        // of what an overwrite replaced — the rc oplog is compacted and keeps no
+        // usable history — so a plan we cannot diff is refused whole rather than
+        // applied silently.
+        let mut files = Vec::new();
+        let mut undiffed = Vec::new();
+        for plan in &plans {
+            if !plan.action.writes() {
+                continue;
+            }
+            let label = plan.path.trim_start_matches('/');
+            let spec = match (plan.old.as_deref(), plan.new.as_deref()) {
+                (None, Some(after)) => Some(FileSpec::added(label, after)),
+                (Some(before), Some(after)) if before != after => {
+                    Some(FileSpec::modified(label, before, after))
+                }
+                _ => None,
+            };
+            if let Some(spec) = spec {
+                match diff_file(&spec, &DiffOptions::default()) {
+                    Ok(file) => files.push(file),
+                    Err(e) => undiffed.push(format!("{}: {e}", plan.path)),
+                }
+            }
+        }
+        if !undiffed.is_empty() {
+            return KjResult::Err(format!(
+                "kj rc reseed: refusing to write — {} path(s) changed but could not be \
+                 diffed, and the diff is the only record of what an overwrite replaces: {}",
+                undiffed.len(),
+                undiffed.join("; ")
+            ));
+        }
+
+        if !dry_run {
+            for plan in &plans {
+                if !plan.action.writes() {
+                    continue;
+                }
+                let Some(body) = crate::seed_scripts::seed_body(&plan.path) else {
+                    // Can't happen: `writes()` only holds for NotInstalled/Differs,
+                    // and `rc_seed_status` only assigns either after finding a seed.
+                    return KjResult::Err(format!(
+                        "kj rc reseed: '{}' was planned for install but carries no \
+                         embedded seed — rc_seed_status/seed_body disagree",
+                        plan.path
+                    ));
+                };
+                if let Err(e) = self.write_seed_body(&plan.path, body).await {
+                    return KjResult::Err(format!("kj rc reseed: {}: {e}", plan.path));
+                }
+                self.kernel().invalidate_config_file_cache(&plan.path);
+            }
+        }
+
+        let (mut installed, mut overwritten, mut skipped_no_seed, mut skipped_differs) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut records = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            match plan.action {
+                RcReseedAction::Install => installed += 1,
+                RcReseedAction::Overwrite => overwritten += 1,
+                RcReseedAction::SkipNoSeed => skipped_no_seed += 1,
+                RcReseedAction::SkipDiffers => skipped_differs += 1,
+                RcReseedAction::SkipInSync | RcReseedAction::SkipDangling => {}
+            }
+            records.push(serde_json::json!({
+                "path": plan.path,
+                "action": plan.action.as_json_str(),
+                "status_before": plan.status.as_json_str(),
+            }));
+        }
+
+        let mut header = if dry_run {
+            "dry run — nothing written\n".to_string()
+        } else {
+            String::new()
+        };
+        header.push_str(&format!(
+            "install {installed}, overwrite {overwritten}, skip {skipped_no_seed} no-seed",
+        ));
+        if overwrite {
+            header.push('\n');
+        } else {
+            header.push_str(&format!(
+                ", skip {skipped_differs} differs (add --overwrite to include)\n"
+            ));
+        }
+
+        let (message, content_type) = if files.is_empty() {
+            (header, ContentType::Plain)
+        } else {
+            let model = DiffModel::new(files);
+            (format!("{header}\n{}", format_diff(&model)), ContentType::Diff)
+        };
+        KjResult::ok_typed_with_data(message, content_type, serde_json::Value::Array(records))
     }
 
     async fn rc_rm(&self, path: &str) -> KjResult {
@@ -1832,6 +2110,281 @@ mod tests {
                 "an unseeded dangling link must report dangling, not no-seed: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    // ── New: `kj rc reseed` ─────────────────────────────────────────────
+
+    /// The gap this verb exists to close: a partially-populated tree (every
+    /// seed installed except one). Default `kj rc reseed` installs exactly the
+    /// missing path and leaves every other seeded script — in-sync or not —
+    /// untouched.
+    #[tokio::test]
+    async fn rc_reseed_default_installs_exactly_the_missing_path() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let gap = "/etc/rc/coder/create/S00-stance.kai";
+        let untouched = "/etc/rc/coder/create/S05-kaish.kai";
+
+        d.dispatch(&[s("rc"), s("rm"), s(gap)], &c).await;
+        assert!(read_rc(&d, gap).await.is_none(), "precondition: gap removed");
+        let untouched_before = read_rc(&d, untouched).await;
+
+        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
+
+        let restored = read_rc(&d, gap).await.expect("gap must be installed");
+        assert!(restored.contains("coder stance"), "wrong content: {restored}");
+        assert_eq!(
+            read_rc(&d, untouched).await, untouched_before,
+            "an untouched seeded path must not move"
+        );
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let records = v.as_array().expect("array of records");
+                let installs: Vec<_> = records
+                    .iter()
+                    .filter(|r| r["action"] == "install")
+                    .collect();
+                assert_eq!(
+                    installs.len(),
+                    1,
+                    "exactly one path was missing, expected exactly one install: {records:?}"
+                );
+                assert_eq!(installs[0]["path"], gap);
+                assert_eq!(installs[0]["status_before"], "not_installed");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// Without `--overwrite` a differing path survives `kj rc reseed`
+    /// untouched (reported `skip_differs`); with `--overwrite` the same path
+    /// is restored to its seed (reported `overwrite`), and the diff shows the
+    /// override text going away.
+    #[tokio::test]
+    async fn rc_reseed_leaves_differs_untouched_by_default_and_restores_with_overwrite() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let path = "/etc/rc/coder/create/S00-stance.kai";
+
+        d.dispatch(
+            &[s("rc"), s("edit"), s(path), s("--content"), s("# user override")],
+            &c,
+        )
+        .await;
+
+        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
+        assert_eq!(
+            read_rc(&d, path).await.as_deref(),
+            Some("# user override"),
+            "default reseed must not touch a differing path"
+        );
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let records = v.as_array().unwrap();
+                let entry = records.iter().find(|r| r["path"] == path).unwrap();
+                assert_eq!(entry["action"], "skip_differs");
+                assert_eq!(entry["status_before"], "differs");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        let result2 = d.dispatch(&[s("rc"), s("reseed"), s("--overwrite")], &c).await;
+        assert!(matches!(result2, KjResult::Ok { .. }), "reseed --overwrite failed: {result2:?}");
+        let restored = read_rc(&d, path).await.expect("still present after overwrite");
+        assert!(restored.contains("coder stance"), "not restored: {restored}");
+        assert!(
+            result2.message().contains("-# user override"),
+            "the diff must show the override text being removed: {}",
+            result2.message()
+        );
+        match result2 {
+            KjResult::Ok { data: Some(v), .. } => {
+                let records = v.as_array().unwrap();
+                let entry = records.iter().find(|r| r["path"] == path).unwrap();
+                assert_eq!(entry["action"], "overwrite");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// `--dry-run` (with or without `--overwrite`) reports the plan and
+    /// writes nothing: neither a missing path nor an edited one moves, byte
+    /// for byte, even though the report says they would.
+    #[tokio::test]
+    async fn rc_reseed_dry_run_changes_nothing() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let gap = "/etc/rc/coder/create/S00-stance.kai";
+        let edited = "/etc/rc/mcp/create/S00-stance.md";
+
+        d.dispatch(&[s("rc"), s("rm"), s(gap)], &c).await;
+        d.dispatch(
+            &[s("rc"), s("edit"), s(edited), s("--content"), s("# edited")],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(&[s("rc"), s("reseed"), s("--dry-run"), s("--overwrite")], &c)
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "dry-run reseed failed: {result:?}");
+        assert!(result.message().contains("dry run"), "msg: {}", result.message());
+
+        assert!(read_rc(&d, gap).await.is_none(), "dry run must not install");
+        assert_eq!(
+            read_rc(&d, edited).await.as_deref(),
+            Some("# edited"),
+            "dry run must not overwrite"
+        );
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let records = v.as_array().unwrap();
+                assert!(
+                    records.iter().any(|r| r["path"] == gap && r["action"] == "install"),
+                    "plan must still say the gap would be installed: {records:?}"
+                );
+                assert!(
+                    records
+                        .iter()
+                        .any(|r| r["path"] == edited && r["action"] == "overwrite"),
+                    "plan must still say the edited path would be overwritten: {records:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// `--dry-run` is a read: it must succeed for a caller that holds no
+    /// `rc-write` capability at all, while the same command without
+    /// `--dry-run` is denied for that caller.
+    #[tokio::test]
+    async fn rc_reseed_dry_run_does_not_require_rc_write_capability() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+        use kaijutsu_types::ContextId;
+
+        let d = test_dispatcher_rc().await;
+        let unprivileged = caller_with_context(ContextId::new());
+        let s = |v: &str| v.to_string();
+
+        let dry = d
+            .dispatch(&[s("rc"), s("reseed"), s("--dry-run")], &unprivileged)
+            .await;
+        assert!(
+            matches!(dry, KjResult::Ok { .. }),
+            "a dry-run read must not be denied: {dry:?}"
+        );
+
+        let real = d.dispatch(&[s("rc"), s("reseed")], &unprivileged).await;
+        assert!(
+            matches!(real, KjResult::Err(_)),
+            "a real reseed write must still require rc-write: {real:?}"
+        );
+    }
+
+    /// A live-only, user-authored path (`no seed`) is never touched by
+    /// `kj rc reseed`, not even under `--overwrite` — there is nothing to
+    /// reset it to.
+    #[tokio::test]
+    async fn rc_reseed_never_touches_a_no_seed_path() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let mine = "/etc/rc/mine/create/S00-custom.kai";
+
+        d.dispatch(&[s("rc"), s("add"), s(mine), s("--content"), s("true")], &c)
+            .await;
+
+        let result = d.dispatch(&[s("rc"), s("reseed"), s("--overwrite")], &c).await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
+        assert_eq!(
+            read_rc(&d, mine).await.as_deref(),
+            Some("true"),
+            "a no-seed path must never be modified"
+        );
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let records = v.as_array().unwrap();
+                let entry = records.iter().find(|r| r["path"] == mine).unwrap();
+                assert_eq!(entry["action"], "skip_no_seed");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// A composed (symlinked) seed installs correctly even when its target is
+    /// *also* missing in the same reseed call — the ordering case. Both rows
+    /// classify `not_installed` independently; the plan is computed from the
+    /// embedded seed set rather than a live read, so which one gets written
+    /// first never matters.
+    #[tokio::test]
+    async fn rc_reseed_installs_a_composed_symlink_when_its_target_is_also_missing() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let link = "/etc/rc/default/create/S20-cache.kai";
+        let target = "/etc/rc/lib/create/S20-cache.kai";
+
+        d.dispatch(&[s("rc"), s("rm"), s(link)], &c).await;
+        d.dispatch(&[s("rc"), s("rm"), s(target)], &c).await;
+        assert!(read_rc(&d, link).await.is_none(), "precondition: link removed");
+        assert!(read_rc(&d, target).await.is_none(), "precondition: target removed");
+
+        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
+
+        let restored = read_rc(&d, link).await.expect("link installed (followed)");
+        assert!(
+            restored.contains("kj cache add --target=tools"),
+            "link should follow to the canonical cache body: {restored}"
+        );
+
+        let shown = d.dispatch(&[s("rc"), s("show"), s(link)], &c).await;
+        match shown {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(
+                    v["symlink"].as_str(),
+                    Some(target),
+                    "reseed must restore the seed symlink, not a literal copy"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let records = v.as_array().unwrap();
+                for p in [link, target] {
+                    let entry = records.iter().find(|r| r["path"] == p).unwrap_or_else(|| {
+                        panic!("missing record for {p} in {records:?}")
+                    });
+                    assert_eq!(entry["action"], "install", "for {p}");
+                }
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
         }
     }
 }
