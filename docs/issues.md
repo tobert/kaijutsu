@@ -120,41 +120,25 @@ and the devlog. What remains:
   production callers — two APIs, not a deprecation. Pick one. S.
 - **`dirty_file_buffers.context_id` is written and never read** — a second
   source of truth for `file_context_id(path)`. S.
-- **The `kj swap ack`-then-`ZQ` mark-dirty fix only covers `Kernel::editor_quit`,
-  not the same discard closing through `editor_keys`** (a batched
-  `iEdit<Esc>ZQ`, or a separate `editor_keys(id, "ZQ")`/`":q<CR>"` call). Both
-  reach the same `EditorSessions::quit` and get the same `rolled_back` bool
-  back, but `editor_keys_checked`'s `Closed` arm only ever calls
-  `mark_dirty`/`flush_one_guarded` when `update.saved` (a `ZZ`/`:wq`/`:x`-style
-  write), never for a bare discard — plumbing `rolled_back` through
-  `KeysOutcome::Closed`'s `KeysUpdate` (a new field) is the fix, deferred
-  because it touches every `KeysUpdate` construction site for a gap only
-  `Kernel::editor_quit` was directly demonstrated to hit. M.
 
 ### ANSI + surface
 
-- **`shape_visible_blocks` (330 lines) has no test**; two bugs already lived in
-  its bookkeeping. M.
 - **`docs/architecture/app.md` predates the conversation surface** (says
   Bevy 0.18, omits `view/surface/`); carries a top-of-file note. Refresh. M.
-- Six copies of `(x.clamp(0,1)*255.0) as u8` while `layout_bridge.rs` claims to
-  be the one place; `StyleEntry.effect`/`param`/`_pad` and
-  `ChromeInstance.anim[1]` are unread (documented, leave with an expiry note).
+- `StyleEntry.effect`/`param`/`_pad` and `ChromeInstance.anim[1]` are unread
+  (documented, leave with an expiry note). The six clamp copies shipped —
+  `layout_bridge::unit_to_u8` is the one place now.
 
 ### Hooks (kaibo review of the 08-20 hook work, DeepSeek)
 
-- **PostCall/OnError are not evaluated on the rpc.rs shell paths.**
-  `Broker::shell_post_call_hooks` exists with zero callers and there is no
-  OnError counterpart; only PreCall landed in `execute`,
-  `execute_shell_command`, `execute_kj_command`. A PostCall hook never sees a
-  direct-exec command's result. Wire both with the real result/error. M.
 - **Escalate in PostCall/OnError/OnNotification blocks the path up to the
   gate wait (300 s) and leaves an Expired ask per call** when a body exits 3
   every time. Decide whether escalate is meaningful outside PreCall; at least
   OnNotification should not block the emission loop. M, design.
-- **A human's interactive shell is gated by the guard too** (by design: the
-  rpc paths take the hook path) — say so in `docs/gate-and-shell-split.md`
-  and let rc soften it for interactive seats when the Ask outcome lands.
+- **Let rc soften the shell guard for interactive seats** once the Ask outcome
+  lands. That a human's interactive shell takes the hook path is now written
+  down (`docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
+  hook path"); what is missing is the softening.
 
 ### rc scripts and comments
 
@@ -185,9 +169,9 @@ and the devlog. What remains:
   repo seed, a cast slot in every band, and cited throughout
   `docs/chameleon.md` — so a fresh checkout could not find it. Melted into
   `assets/defaults/rc/bassist/` 2026-08-21.
-- **Older comments still cite rulings and dates** (e.g. `kj/ledger.rs` has
-  five "Amy's ruling" mentions predating today's rule). Sweep them when the
-  file is next touched — state the rule, point at docs. S, incremental.
+- **Older comments still cite rulings and dates.** Sweep them when the file is
+  next touched — state the rule, point at docs. `kj/ledger.rs` is done (ten
+  citations). S, incremental.
 
 ### Kaish glue
 
