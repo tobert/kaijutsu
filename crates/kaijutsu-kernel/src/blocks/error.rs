@@ -21,6 +21,14 @@ pub enum BlockDocumentError {
     #[error("edit position {pos} out of bounds for block with length {len}")]
     PositionOutOfBounds { pos: usize, len: usize },
 
+    /// A style span does not address the block's own text.
+    ///
+    /// Spans must be derived from the block's stored original; one that
+    /// falls outside `text`, inverts, or splits a UTF-8 character came
+    /// from somewhere else.
+    #[error("style span {start}..{end} does not address block text of length {len}")]
+    StyleSpanOutOfRange { start: usize, end: usize, len: usize },
+
     /// Invalid reference block for insertion.
     #[error("reference block not found: {0:?}")]
     InvalidReference(BlockId),

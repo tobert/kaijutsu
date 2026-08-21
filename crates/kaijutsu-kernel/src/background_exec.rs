@@ -9,33 +9,27 @@
 //!
 //! # Why not kaish's own `&`/`JobManager`?
 //!
-//! kaish 0.13 ships real job control (`&`, `bg`/`fg`/`jobs`/`kill`, a
-//! `JobManager`, `/v/jobs/{id}/{stdout,stderr,status}`). It is NOT reusable
-//! here for two independent reasons:
+//! kaish (`kaish-kernel`, pinned in `Cargo.lock`) ships real job control:
+//! `&`, `bg`/`fg`/`jobs`/`kill`, a `JobManager`, and
+//! `/v/jobs/{id}/{stdout,stderr,status}` streamed live as the child emits
+//! output — the job's `stdout`/`stderr` are "written as the bytes arrive"
+//! (`kaish-kernel-0.15.0/src/scheduler/job.rs`). It is NOT reusable here, for
+//! two reasons independent of that liveness:
 //!
 //! 1. **Lifetime mismatch.** Every `shell` tool call materializes a throwaway
 //!    [`crate::runtime::embedded_kaish::EmbeddedKaish`] — a fresh
 //!    `kaish_kernel::Kernel` (and thus a fresh `JobManager`) per call
 //!    (`kj/context_shell.rs`). A job started with `cmd &` would be invisible
 //!    to the *next* `shell` call — its `JobManager` is gone.
-//! 2. **The job layer discards liveness.** kaish's `execute_background`
-//!    (`kaish-kernel-0.13.0/src/kernel.rs`) awaits `runner.run(...)` to
-//!    completion inside the spawned task and only then writes the aggregate
-//!    `result.text_out()` into the job's `BoundedStream` — so
-//!    `/v/jobs/{id}/stdout` reads empty while a command is still running.
+//! 2. **The wrong storage.** kaish's job streams are an ephemeral,
+//!    in-process `BoundedStream` — real memory, but discarded the moment the
+//!    per-call `EmbeddedKaish` (and the `Kernel` inside it) drops. A
+//!    backgrounded command here needs its output in a persistent kernel
+//!    block, replicated to every connected viewer — see "Output bounding"
+//!    below.
 //!
-//!    NOT because the bytes are unavailable: `try_execute_external`'s capture
-//!    path spawns `drain_to_stream(child.stdout, …)`
-//!    (`kaish-kernel-0.13.0/src/scheduler/stream.rs:223`), which appends to a
-//!    `BoundedStream` per 8 KiB chunk *as the child emits it*. The live bytes
-//!    exist one layer down; `execute_background` just doesn't forward them.
-//!    (An earlier revision of this comment claimed "no per-chunk write
-//!    anywhere in kaish's external-command spawn path" — that was wrong for
-//!    0.13 and is corrected here, because it undersold how small the upstream
-//!    fix is.)
-//!
-//! Both are load-bearing for what a "poll a still-running build" tool needs:
-//! a registry that outlives a single call, and output visible before exit.
+//! Both would have to be solved before kaish's own job control could serve
+//! this module; solving liveness alone (already true upstream) would not.
 //! So this module spawns the host process directly (mirroring kaish's own
 //! external-command spawn conventions — own process group via `setpgid`,
 //! `env_clear()` + explicit vars, piped stdout/stderr) rather than routing
@@ -592,7 +586,8 @@ pub fn spawn_background(
         // async-signal-safe per POSIX; safe to call between fork and exec.
         // Own process group so `kill_process_group` reaches the whole tree
         // (matches kaish's own external-command spawn convention —
-        // `kaish-kernel-0.13.0/src/dispatch.rs`).
+        // `kaish-kernel-0.15.0/src/dispatch.rs`'s `pre_exec` calling
+        // `setpgid(0, 0)` before exec).
         #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(|| {
@@ -779,7 +774,7 @@ pub fn spawn_background(
 
 /// Map a `sh -c` child's exit status to a shell-style code: the normal exit
 /// code, or `128 + signal` for a signal death (matches kaish's own
-/// `exit_code_from_status` convention — `kaish-kernel-0.13.0/src/kernel.rs`).
+/// `exit_code_from_status` convention — `kaish-kernel-0.15.0/src/kernel.rs:7083`).
 fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
@@ -1662,9 +1657,9 @@ mod tests {
 
     /// Preserve-across-the-swap item: output must land in the kernel block
     /// WHILE the process is still running, not buffered until it exits.
-    /// This is exactly the defect the module docs call out in kaish 0.13's
-    /// own `execute_background` ("Why not kaish's own `&`/`JobManager`?",
-    /// point 2) — the swap must not reintroduce it here.
+    /// This module's own live-streaming property, independent of whatever
+    /// kaish's job layer does or doesn't buffer (see the module docs' "Why
+    /// not kaish's own `&`/`JobManager`?") — the swap must not regress it.
     ///
     /// Uses a file sentinel rather than a sleep so the assertion window is
     /// deterministic: the child echoes a marker, then polls for the

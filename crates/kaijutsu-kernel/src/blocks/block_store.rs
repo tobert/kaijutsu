@@ -1127,7 +1127,7 @@ impl BlockDocument {
             .get_mut(id)
             .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
-        block.set_style_spans(spans, provenance);
+        block.set_style_spans(spans, provenance)?;
         self.version += 1;
         Ok(())
     }

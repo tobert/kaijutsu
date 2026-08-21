@@ -245,13 +245,38 @@ enum KaishHookOutcome {
 /// `Err`, so it is classified here with the other exit codes.
 const KAISH_TIMEOUT_EXIT: i64 = 124;
 
+/// Escape control characters in a hook body's stderr before it can reach a
+/// human as an ask description (`kj ledger`) or a denial reason — both are
+/// hook-body-controlled text that can otherwise carry ANSI escapes, CR, NUL,
+/// and the like straight into whatever terminal reads them. `\n` passes
+/// through unescaped: a stderr tail is legitimately multi-line, and a bare
+/// newline cannot reposition a cursor or hide prior output the way `\r` or an
+/// escape sequence can. Every other control character becomes its Rust debug
+/// escape, with ESC rendered as the visible `␛` (matching `kj block
+/// original`'s convention for showing bytes without replaying them).
+fn sanitize_control_chars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\x1b' => out.push('␛'),
+            '\n' => out.push('\n'),
+            c if c.is_control() => out.extend(c.escape_debug()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Map a hook body's exit to an outcome: 0 continues; 3 escalates with the
 /// stderr tail as the ask description (`fallback` when stderr is empty);
 /// 124 — the body timed out — escalates, because a body that could not
-/// finish is a fault, not a verdict; any other non-zero exit denies.
+/// finish is a fault, not a verdict; any other non-zero exit denies. The tail
+/// is control-char-sanitized before it reaches any of the three outcomes —
+/// see [`sanitize_control_chars`].
 fn classify_kaish_hook_exit(code: i64, stderr: &str, fallback: &str) -> KaishHookOutcome {
     let stderr_tail: String = stderr.chars().take(512).collect();
-    let tail = stderr_tail.trim();
+    let tail = sanitize_control_chars(stderr_tail.trim());
+    let tail = tail.as_str();
     match code {
         0 => KaishHookOutcome::Continue,
         3 => KaishHookOutcome::Escalate(if tail.is_empty() {
@@ -6426,6 +6451,47 @@ mod tests {
         ));
         assert!(matches!(classify_kaish_hook_exit(1, "no", "i.t"), KaishHookOutcome::Deny(_)));
         assert!(matches!(classify_kaish_hook_exit(2, "", "i.t"), KaishHookOutcome::Deny(_)));
+    }
+
+    /// The exit-3 stderr tail becomes an ask description a human reads
+    /// through `kj ledger` — a hook body controlling raw ANSI escapes or NUL
+    /// bytes in that text must not reach the reader's terminal unescaped.
+    #[test]
+    fn kaish_hook_exit_sanitizes_control_chars_in_stderr_tail() {
+        use super::{classify_kaish_hook_exit, KaishHookOutcome};
+        let stderr = "before\x1b[31mred\x1b[0m\0after";
+        let KaishHookOutcome::Escalate(description) = classify_kaish_hook_exit(3, stderr, "i.t") else {
+            panic!("exit 3 must escalate");
+        };
+        assert!(
+            !description.contains('\x1b'),
+            "raw ESC must not reach the ask description, got {description:?}"
+        );
+        assert!(
+            !description.contains('\0'),
+            "raw NUL must not reach the ask description, got {description:?}"
+        );
+        assert!(
+            description.contains('␛'),
+            "ESC should render as the visible marker, got {description:?}"
+        );
+        assert!(
+            description.contains("before") && description.contains("after"),
+            "the surrounding text must survive sanitization, got {description:?}"
+        );
+    }
+
+    /// `\n` in the stderr tail passes through unescaped: a hook body's
+    /// stderr is legitimately multi-line, unlike the cursor-manipulating
+    /// control characters the sanitizer escapes.
+    #[test]
+    fn kaish_hook_exit_keeps_newlines_in_stderr_tail() {
+        use super::{classify_kaish_hook_exit, KaishHookOutcome};
+        let stderr = "line one\nline two\nline three";
+        let KaishHookOutcome::Escalate(description) = classify_kaish_hook_exit(3, stderr, "i.t") else {
+            panic!("exit 3 must escalate");
+        };
+        assert_eq!(description, stderr, "newlines must not be escaped or otherwise altered");
     }
 
     /// `KJ_TOOL_PLAN` (`docs/gate-and-shell-split.md`): a shell hook body

@@ -79,12 +79,19 @@ fi
 echo "queue head: $queue_head"
 
 # roster: who is at the table right now? Trap 1 again, and trap 3 in the jq.
+# `rc=$?` after a PIPELINE takes the last stage's status (`head`, which
+# never fails on empty input) — not `kj`'s or `jq`'s — so a failing `kj`
+# would go unnoticed. Capture `kj`'s own status first, then shape the
+# already-captured output. `$raw_roster` is deliberately UNQUOTED in the
+# echo below — trap 4, same reason as `$queue_path` above.
 set +e
-roster="$(kj context list --json | jq -r '.[]' | head -30)"
+raw_roster="$(kj context list --json)"
 rc=$?
 set -e
 if [[ "$rc" -ne 0 ]]; then
   roster="READ-FAIL: context list"
+else
+  roster="$(echo $raw_roster | jq -r '.[]' | head -30)"
 fi
 echo "roster: $roster"
 

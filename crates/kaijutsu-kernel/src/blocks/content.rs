@@ -559,14 +559,40 @@ impl BlockContent {
     /// tag can never outlive the spans it describes. Either way `text` is
     /// now exactly what this call's projection describes, so the edited
     /// marker clears.
+    ///
+    /// `BlockContent` never holds the original bytes spans are supposed to be
+    /// derived from — only `text` — so this cannot itself re-derive `spans`
+    /// to check them. It checks the one thing it CAN check: every span must
+    /// address a real byte range of `text` (in bounds, non-inverted, on char
+    /// boundaries). A span that fails this could not have come from
+    /// projecting this block's own content, so it returns
+    /// `StyleSpanOutOfRange` and leaves the block untouched rather than
+    /// silently clearing `edited_since_ingest` over a lie. It does not panic:
+    /// the ingest path above degrades a block to unstyled-but-correct rather
+    /// than failing a command over styling metadata (`ansi_ingest::record`).
     pub fn set_style_spans(
         &mut self,
         spans: Vec<kaijutsu_types::StyleSpan>,
         provenance: Option<kaijutsu_types::ProvenanceTag>,
-    ) {
+    ) -> Result<(), crate::blocks::error::BlockDocumentError> {
+        for s in &spans {
+            let (start, end) = (s.start as usize, s.end as usize);
+            if start > end
+                || end > self.text.len()
+                || !self.text.is_char_boundary(start)
+                || !self.text.is_char_boundary(end)
+            {
+                return Err(crate::blocks::error::BlockDocumentError::StyleSpanOutOfRange {
+                    start,
+                    end,
+                    len: self.text.len(),
+                });
+            }
+        }
         self.style_spans = spans;
         self.provenance = provenance;
         self.edited_since_ingest = false;
+        Ok(())
     }
 
     pub fn source_context(&self) -> Option<kaijutsu_types::ContextId> {
@@ -1154,11 +1180,86 @@ mod text_edit_tests {
         b.set_style_spans(
             Vec::new(),
             Some(ProvenanceTag { transform: "ansi-strip".to_string(), version: 1 }),
-        );
+        )
+        .expect("an empty span set always addresses the text");
 
         assert!(
             !b.edited_since_ingest(),
             "a successful reproject must clear the marker"
+        );
+    }
+
+    /// A span that does not address this block's own text (here: past its
+    /// end) cannot have come from projecting this block's original — the
+    /// "spans from elsewhere" defect `set_style_spans` exists to catch. It
+    /// is refused as a typed error and the block is left untouched, because
+    /// the ingest path above degrades rather than failing the command.
+    #[test]
+    fn set_style_spans_rejects_span_out_of_bounds_for_this_blocks_text() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("short")
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+        b.edit_text(5, "!", 0);
+
+        let err = b
+            .set_style_spans(
+                vec![StyleSpan {
+                    start: 0,
+                    end: 999,
+                    fg: None,
+                    bg: None,
+                    attrs: StyleAttrs::default(),
+                }],
+                Some(ProvenanceTag { transform: "ansi-strip".to_string(), version: 1 }),
+            )
+            .expect_err("a span past the end of the text must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::blocks::error::BlockDocumentError::StyleSpanOutOfRange {
+                    start: 0,
+                    end: 999,
+                    len: 6
+                }
+            ),
+            "expected the typed span-range refusal, got: {err:?}"
+        );
+        assert!(
+            b.edited_since_ingest(),
+            "a refused projection must leave the edited marker standing"
+        );
+    }
+
+    /// A span splitting a multi-byte character is refused for the same
+    /// reason: a projection over this block's own text never lands mid-char.
+    #[test]
+    fn set_style_spans_rejects_a_span_that_splits_a_character() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("かに")
+            .build();
+        let mut b = BlockContent::from_snapshot(&snap, id.principal_id, "V".to_string());
+
+        let err = b
+            .set_style_spans(
+                vec![StyleSpan {
+                    start: 0,
+                    end: 1,
+                    fg: None,
+                    bg: None,
+                    attrs: StyleAttrs::default(),
+                }],
+                None,
+            )
+            .expect_err("a span ending mid-character must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::blocks::error::BlockDocumentError::StyleSpanOutOfRange { end: 1, .. }
+            ),
+            "expected the typed span-range refusal, got: {err:?}"
         );
     }
 }
