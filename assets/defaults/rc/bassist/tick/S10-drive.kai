@@ -1,0 +1,12 @@
+# Bassist beat — the OODA cadence hook for the bass chair.
+#
+# Same transport report as musician/tick/S10-drive.kai (KJ_TICK, KJ_PHRASE,
+# KJ_TEMPO, KJ_PHRASE_BEATS, KJ_HEARD, KJ_PULSE, KJ_EPOCH_NS) — see that
+# script for the full variable notes. This chair differs in the fill grammar:
+# the bass plays HALF NOTES, so precompute the half-note fill target here
+# (small models must not do bar math in their weights) and spell the duration
+# convention exactly.
+set -e
+bars=$(( KJ_PHRASE_BEATS / 4 ))
+halves=$(( KJ_PHRASE_BEATS / 2 ))
+kj drive --prompt "Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4 in C. Recently played (oldest→newest JSON): $KJ_HEARD. Play the NEXT phrase, continuing seamlessly from what you just played. Write exactly $halves half notes — each is a letter followed by 2 (like C,2 or G,2), TWO notes per bar, a barline | every 2 notes, $bars bars total — so the line is continuous with no gap. You MAY replace at most ONE half note in the phrase with two bare quarter-note letters as a passing figure; every bar must still total 4 beats. Low register — every note carries a comma (C, G, A,). Output ONE complete ABC tune: X:1, then T:bass, M:4/4, L:1/4, K:C, then the body. Raw ABC only — no prose, no code fences."
