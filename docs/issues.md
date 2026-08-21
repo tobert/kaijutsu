@@ -73,6 +73,36 @@ decision only after checking the reply's principal is a human.
 
 ---
 
+## `kj context set` applies its fields one write at a time (2026-08-21)
+
+`kj/context.rs:358-450` writes `--model`/`--cast`/`--consent`/`--cwd`/`--env`/
+`--type` as separate sequential DB writes with no transaction around them. A
+failure on a later field leaves the earlier ones durably committed — a
+partially-applied `set`, with no error path that says which half landed. Now
+reachable on purpose: `--env` validates its key at write time as of today, so a
+`kj context set --model x --env 1BAD=y` commits the model and then fails. One
+transaction or nothing. Found by the lane that added the env validation. S.
+
+## rc moves to real files on disk (RULED 2026-08-21, unbuilt)
+
+Amy ruled the shape; `docs/rc-on-disk.md` carries the design, the evidence, and
+five slices. The short version: rc scripts become host files under
+`~/.config/kaijutsu/etc/rc/` mounted at `/etc/rc` via `LocalBackend`, bodies
+keep being stored on use in `script_bodies`, `rc-write` is dropped, and hook
+bodies become path references read at call time.
+
+> *"if we're doing a cas of the script bodies anyways it's fine, let's store 'em
+> on use… Users can always use git there, or they can remap. defaults should
+> just work with or without git."*
+
+This is mostly deletion, not construction — `load_rc_scripts` is already
+backend-agnostic and `LocalBackend` is already what the broadly-used test
+dispatcher mounts. It **retires `kj rc reseed --overwrite`'s diff machinery**,
+shipped the same morning: on disk, `git diff` is the diff.
+
+Not ruled: whether `/etc/config`, `/etc/client` and `/etc/midi` follow, which
+would delete `ConfigDocFs` entirely. Ask before building it.
+
 ## Tech-debt audits, 2026-08-20 — what is still open (lead-verified)
 
 Three read-only audits (editor + file I/O, ANSI/provenance/surface, kaish glue)
@@ -88,17 +118,8 @@ and the devlog. What remains:
   tool's cap for now. S.
 - **`get_or_load`/`read_content` are "legacy, prefer `try_*`"** with eight
   production callers — two APIs, not a deprecation. Pick one. S.
-- **`cache.rs` keeps an `Err(_)` catch-all** in the sibling of the function
-  slice 1 fixed. S.
-- **`kernel.rs` asserts on an `E212` prefix** that two `FlushError` variants
-  share — the substring trap `FlushError` was typed to avoid. S.
 - **`dirty_file_buffers.context_id` is written and never read** — a second
   source of truth for `file_context_id(path)`. S.
-- **`kaijutsu-editor/src/lib.rs` still says `:w!` is a no-op**; W12 shipped in
-  that code path. S.
-- **`kj context set --env` does not validate keys at write time**; a malformed
-  key is stored and only refused at the next shell materialization (found by
-  kaibo's review of the glue refactor). Validate where it is written. S.
 - **The `kj swap ack`-then-`ZQ` mark-dirty fix only covers `Kernel::editor_quit`,
   not the same discard closing through `editor_keys`** (a batched
   `iEdit<Esc>ZQ`, or a separate `editor_keys(id, "ZQ")`/`":q<CR>"` call). Both
@@ -112,18 +133,8 @@ and the devlog. What remains:
 
 ### ANSI + surface
 
-- **`set_style_spans` clears `edited_since_ingest` for any caller.** Both
-  callers today derive spans from the stored original, but nothing enforces
-  it; a future caller passing spans from elsewhere makes the marker lie
-  (kaibo review). Make the method take the original and derive, or assert.
-  S.
-- **`styled_spans_fingerprint`/`SpanBrush`** in the app should destructure
-  exhaustively so a new `StyledSpan` field is a compile error. S.
 - **`shape_visible_blocks` (330 lines) has no test**; two bugs already lived in
   its bookkeeping. M.
-- **`render_store.rs` `move_block`/`remove_at` have zero callers**, including
-  tests — their `#[allow(dead_code)]` notes cited a deleted function. Delete.
-  S.
 - **`docs/architecture/app.md` predates the conversation surface** (says
   Bevy 0.18, omits `view/surface/`); carries a top-of-file note. Refresh. M.
 - Six copies of `(x.clamp(0,1)*255.0) as u8` while `layout_bridge.rs` claims to
@@ -137,43 +148,15 @@ and the devlog. What remains:
   OnError counterpart; only PreCall landed in `execute`,
   `execute_shell_command`, `execute_kj_command`. A PostCall hook never sees a
   direct-exec command's result. Wire both with the real result/error. M.
-- **`kj hook add` idempotency has a TOCTOU and a non-atomic replace.** The
-  lookup releases its lock before the durable insert (`kj/hook.rs`); two
-  concurrent creates re-adding `shell-escape-guard` race to a UNIQUE
-  violation — a spurious rc failure instead of the intended no-op — and a
-  replace is delete-then-insert, so a failed insert loses the hook. Make the
-  add an upsert in one transaction. S–M.
 - **Escalate in PostCall/OnError/OnNotification blocks the path up to the
   gate wait (300 s) and leaves an Expired ask per call** when a body exits 3
   every time. Decide whether escalate is meaningful outside PreCall; at least
   OnNotification should not block the emission loop. M, design.
-- **The exit-3 stderr tail is length-capped but not control-char-sanitized**
-  before it becomes the ask description a human reads. S.
-- **The `sh -c` guard is a grep over raw text:** `sh \`+newline+`-c`,
-  `if sh -c …`, and `fish -c`/`ksh -c` pass; a heredoc line starting `sh -c`
-  is denied; and it fails **open** whenever `jq` cannot extract `.command` —
-  malformed input exits 1 with empty output, an absent key yields the literal
-  `null` — because a false `if` with no `else` returns 0 and the broker reads
-  that as Continue. (Not "a missing `jq`/`grep`", as this entry said until
-  2026-08-21: both are kaish builtins, so that case is unreachable. The defect
-  and its fix are unchanged.) The honest successor scores
-  `KJ_TOOL_PLAN.commands[]` by `name` instead of regexing the blob. S once
-  `plan` is the input.
 - **A human's interactive shell is gated by the guard too** (by design: the
   rpc paths take the hook path) — say so in `docs/gate-and-shell-split.md`
   and let rc soften it for interactive seats when the Ask outcome lands.
 
 ### rc scripts and comments
-
-- **`S10-checkin.kai`'s roster probe cannot detect the failure it checks for.**
-  `roster="$(kj context list --json | jq -r '.[]' | head -30)"` followed by
-  `rc=$?` captures **`head`'s** status, not `kj`'s or `jq`'s, so the
-  `READ-FAIL: context list` branch never fires — `head` succeeds on empty input.
-  Pre-existing, found during the 2026-08-21 `set -e` audit and deliberately not
-  fixed there (out of that lane's scope). kaish has no `pipefail`
-  (`set -o pipefail` exits 1), so the fix is to capture the producer's status
-  before piping: assign `kj context list --json` first, check it, then shape it.
-  S.
 
 - **The rc bootstrap gate is untested, and installing a missing seed is
   path-by-path.** `rpc.rs:1640` seeds only `if rc_fs.is_empty()`, so a script
@@ -214,8 +197,6 @@ and the devlog. What remains:
   words. M.
 - **`OutputProfile::Internal`** becomes deletable when kaish ships a spill knob
   that does not remap the exit code.
-- Stale kaish-version comments in `background_exec.rs` (cites 0.13 file:lines
-  that are unverifiable against 0.15). S.
 
 ---
 

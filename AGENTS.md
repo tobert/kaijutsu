@@ -31,6 +31,13 @@ not as host files. Melting them to real files on disk is unbuilt. **Single
 kernel ownership is the invariant that survives that change** — whatever the
 storage, config must never have two competing sources of truth.
 
+**rc's melt is ruled and not yet built** (2026-08-21): rc scripts become host
+files under `~/.config/kaijutsu/etc/rc/` mounted at `/etc/rc`, `rc-write` is
+dropped, and hook bodies become path references read at call time. Everything
+above about `/etc/rc` describes the live system and stays true until that
+lands — but do not build new machinery on the parts it deletes. Design,
+evidence, and slices: `docs/rc-on-disk.md`.
+
 **Permission to get simpler** (Amy, 2026-08-15): *"If the agent can see the
 files and edit them, that's fine, we don't need to complicate it just because
 it's config."* Config is not a special category deserving its own machinery. If
