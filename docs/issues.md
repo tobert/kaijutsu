@@ -116,8 +116,6 @@ and the devlog. What remains:
 - **`kj editor save` has no capability gate.** Decide the editor's write cap
   and apply it in one place; `kj swap ack|discard` gate on the MCP `edit`
   tool's cap for now. S.
-- **`get_or_load`/`read_content` are "legacy, prefer `try_*`"** with eight
-  production callers — two APIs, not a deprecation. Pick one. S.
 - **`dirty_file_buffers.context_id` is written and never read** — a second
   source of truth for `file_context_id(path)`. S.
 
@@ -637,56 +635,6 @@ entry, which characterizes `grep` as "document-aware" and "ahead of Claude
 Code's equivalents" (line ~2829) — that claim and this blind spot are not
 obviously reconcilable, and whichever is true should be checked, not assumed.
 Full transcript: `docs/kaijutsu-feedback.md`.
-
-## `kj block read`/`inspect`/`append`/`history` have no `-c`/`--context` flag, so cross-context reads silently resolve against the wrong context (2026-08-18)
-
-`kj block list` (`crates/kaijutsu-kernel/src/kj/block.rs:78-94`) and `kj block
-cat --latest` (`:133-147`) both take `-c`/`--context`. `Read` (`:117-126`),
-`Inspect` (`:96-102`), `Append` (`:148-155`), and `History` (`:156-159`) take
-none — a short id like `2d25fb02#67` always resolves against
-`caller.context_id`, the currently-attached context
-(`resolve_block_id`, `:340-378`), with no flag to point it elsewhere. The
-fully-qualified `context_hex_principal_hex_seq` form (`BlockId::from_key`,
-`:345-347`) does route around this, but nothing in the CLI ever hands you
-that id — `block list`'s own display only ever shows the short
-`<principal8>#<seq>` form, so there's no way to discover the qualifying
-context/principal hex short of already having a raw JSON blob (e.g. a
-`task_create` result) that happens to contain one.
-
-Found independently, twice, on 2026-08-18: by a second ACP context
-(`0d9765f5`) trying to read a dead sibling context's blocks to recover its
-findings, and by the Sonnet subagent that wrote this entry, doing the same
-thing. Both burned several tool calls on `-c` on `read`, on quoting/unquoting
-the `#`, and on the wrong-context short form, before landing on "switch
-context first, then read" as the only reliable path. The fix is either wiring
-`-c` through the remaining four verbs the same way `list`/`cat` already have
-it, or making `block list`'s short-id display resolvable on its own (print or
-accept the qualifying context prefix). Full transcript:
-`docs/kaijutsu-feedback.md`.
-
----
-
-## `load_rc_scripts` reads "directory absent" differently per backend (2026-08-18)
-
-`load_rc_scripts` treats a missing rc directory as "no scripts" — correct,
-since a context type with no scripts for a verb is ordinary. But the match
-only catches `VfsError::NotFound` and `VfsError::NoMountPoint`. A host-backed
-`LocalBackend` reports a genuinely absent directory as
-`VfsError::Io(io::ErrorKind::NotFound)`, which falls through to the error
-branch instead.
-
-Production is unaffected: `/etc/rc` is always mounted `ConfigDocFs`, which
-returns the typed variants. It bites the **test harness** — `test_dispatcher()`
-mounts `LocalBackend` — which means any test exercising the no-scripts path
-was quietly asserting something other than what it looked like.
-
-Found while wiring the rc run log (`0a3cc566`) and documented in that test
-rather than fixed, to keep the slice honest. The fix is either widening the
-match to include `Io(NotFound)` or making the backends agree on how absence
-is reported — the second is better and bigger: two backends disagreeing about
-"not there" will keep producing this shape of surprise.
-
----
 
 ## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18)
 
