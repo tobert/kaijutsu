@@ -63,6 +63,12 @@ pub enum KernelDbError {
     #[error("invalid label: {0}")]
     InvalidLabel(String),
 
+    /// A `context_env` key is not a legal shell identifier — refused at the
+    /// durable write so a bad key is never discovered only when a shell
+    /// later tries to materialize it.
+    #[error("invalid env key: {0}")]
+    InvalidEnvKey(String),
+
     /// Structural edge would create a cycle.
     #[error("cycle detected: adding this edge would create a cycle")]
     CycleDetected,
@@ -1614,6 +1620,25 @@ fn validate_label(label: &str) -> KernelDbResult<()> {
         return Err(KernelDbError::InvalidLabel(
             "label must not be empty".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a `context_env` key against the shell identifier rule
+/// `EmbeddedKaish::apply_context_config`/`KjBuiltin::apply_context_config`
+/// require when they later export the row (`is_valid_env_key`,
+/// `runtime/embedded_kaish.rs`, mirroring kaish's own `export` builtin): an
+/// ASCII letter or underscore first, then ASCII alphanumeric or underscore.
+/// Anything else can never become `export KEY=...`, so it is refused here
+/// rather than only discovered at the next shell materialization.
+fn validate_env_key(key: &str) -> KernelDbResult<()> {
+    let mut chars = key.chars();
+    let starts_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
+    if !starts_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(KernelDbError::InvalidEnvKey(format!(
+            "env key {key:?} is not a valid shell identifier — must start with an ASCII \
+             letter or underscore, and contain only ASCII letters, digits, or underscores"
+        )));
     }
     Ok(())
 }
@@ -4356,6 +4381,17 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Force every subsequent write on this connection to fail with
+    /// SQLite's read-only error, without touching schema or data — used to
+    /// prove a write path leaves prior state untouched when the write
+    /// itself fails partway. Never compiled outside test builds.
+    #[cfg(test)]
+    pub(crate) fn set_query_only_for_test(&self, on: bool) -> KernelDbResult<()> {
+        let pragma = if on { "PRAGMA query_only = ON;" } else { "PRAGMA query_only = OFF;" };
+        self.conn.execute_batch(pragma)?;
+        Ok(())
+    }
+
     /// Delete one oplog row, simulating the two states `block_content_at_seq`
     /// must refuse to paper over: a journal write that has claimed its seq but
     /// not yet committed (the TOCTOU window in `journal_op`), and a row lost
@@ -4442,6 +4478,85 @@ impl KernelDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// Insert a hook entry, or replace it in place if `hook_id` already
+    /// exists anywhere in the table (including under a different phase).
+    /// One SQL statement, so the write either lands completely or not at
+    /// all — unlike a caller-driven delete followed by an insert, a
+    /// mid-write failure can never leave a previously persisted hook gone.
+    /// Returns whether an existing row was replaced.
+    pub fn upsert_hook(&self, row: &HookRow) -> KernelDbResult<bool> {
+        let existed: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hooks WHERE hook_id = ?1)",
+            params![row.hook_id],
+            |r| r.get(0),
+        )?;
+        let is_error: Option<i64> = row.action_is_error.map(|b| if b { 1 } else { 0 });
+        let match_context_bytes: Option<Vec<u8>> =
+            row.match_context.map(|c| c.as_bytes().to_vec());
+        let match_principal_str: Option<String> =
+            row.match_principal.map(|p| p.to_string());
+        self.conn.execute(
+            "INSERT INTO hooks (
+                hook_id, phase, priority, insertion_idx,
+                match_instance, match_tool, match_context, match_principal,
+                action_kind,
+                action_builtin_name, action_kaish_body, action_kaish_script_id,
+                action_result_text, action_is_error,
+                action_deny_reason,
+                action_log_target, action_log_level,
+                action_ask_description
+             ) VALUES (
+                ?1, ?2, ?3,
+                (SELECT COALESCE(MAX(insertion_idx), -1) + 1 FROM hooks WHERE phase = ?2),
+                ?4, ?5, ?6, ?7,
+                ?8,
+                ?9, ?10, ?11,
+                ?12, ?13,
+                ?14,
+                ?15, ?16,
+                ?17
+             )
+             ON CONFLICT(hook_id) DO UPDATE SET
+                phase = excluded.phase,
+                priority = excluded.priority,
+                insertion_idx = excluded.insertion_idx,
+                match_instance = excluded.match_instance,
+                match_tool = excluded.match_tool,
+                match_context = excluded.match_context,
+                match_principal = excluded.match_principal,
+                action_kind = excluded.action_kind,
+                action_builtin_name = excluded.action_builtin_name,
+                action_kaish_body = excluded.action_kaish_body,
+                action_kaish_script_id = excluded.action_kaish_script_id,
+                action_result_text = excluded.action_result_text,
+                action_is_error = excluded.action_is_error,
+                action_deny_reason = excluded.action_deny_reason,
+                action_log_target = excluded.action_log_target,
+                action_log_level = excluded.action_log_level,
+                action_ask_description = excluded.action_ask_description",
+            params![
+                row.hook_id,
+                row.phase,
+                row.priority,
+                row.match_instance,
+                row.match_tool,
+                match_context_bytes,
+                match_principal_str,
+                row.action_kind,
+                row.action_builtin_name,
+                row.action_kaish_body,
+                row.action_kaish_script_id,
+                row.action_result_text,
+                is_error,
+                row.action_deny_reason,
+                row.action_log_target,
+                row.action_log_level,
+                row.action_ask_description,
+            ],
+        )?;
+        Ok(existed != 0)
     }
 
     /// Delete a hook by id. Returns true if a row existed.
@@ -4634,6 +4749,7 @@ impl KernelDb {
         key: &str,
         value: &str,
     ) -> KernelDbResult<()> {
+        validate_env_key(key)?;
         conn.execute(
             "INSERT INTO context_env (context_id, key, value)
              VALUES (?1, ?2, ?3)
@@ -9318,6 +9434,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn upsert_hook_inserts_a_fresh_row() {
+        let db = KernelDb::temporary().unwrap();
+        let replaced = db.upsert_hook(&minimal_hook_row("new", "pre_call", 0)).unwrap();
+        assert!(!replaced, "a fresh id must report replaced=false");
+        let loaded = db.load_all_hooks().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].hook_id, "new");
+    }
+
+    #[test]
+    fn upsert_hook_replaces_an_existing_row_in_place() {
+        // The bug this closes: a bare INSERT errors on the PRIMARY KEY
+        // collision (locked in by `hook_insert_same_id_errors`); `upsert_hook`
+        // must instead replace the row's content atomically, in one
+        // statement, with no separate delete step.
+        let db = KernelDb::temporary().unwrap();
+        db.upsert_hook(&minimal_hook_row("dup", "pre_call", 0)).unwrap();
+
+        let mut second = minimal_hook_row("dup", "post_call", 7);
+        second.action_log_level = Some("error".into());
+        let replaced = db.upsert_hook(&second).unwrap();
+        assert!(replaced, "re-adding an existing id must report replaced=true");
+
+        let loaded = db.load_all_hooks().unwrap();
+        assert_eq!(loaded.len(), 1, "upsert must not leave a duplicate row");
+        assert_eq!(loaded[0].phase, "post_call");
+        assert_eq!(loaded[0].priority, 7);
+        assert_eq!(loaded[0].action_log_level.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn upsert_hook_failed_write_does_not_lose_the_existing_row() {
+        // Falsifies the delete-then-insert replace this upsert replaces:
+        // under that shape, a write that fails after the delete step but
+        // before the insert step loses the hook outright. `upsert_hook` is
+        // one statement, so a failed write must leave the prior row exactly
+        // as it was.
+        let db = KernelDb::temporary().unwrap();
+        db.upsert_hook(&minimal_hook_row("keep", "pre_call", 3)).unwrap();
+
+        db.set_query_only_for_test(true).unwrap();
+        let mut attempt = minimal_hook_row("keep", "post_call", 99);
+        attempt.action_log_level = Some("error".into());
+        let err = db.upsert_hook(&attempt).unwrap_err();
+        match err {
+            KernelDbError::Db(_) => {}
+            other => panic!("expected a DB error from the read-only write, got {other:?}"),
+        }
+        db.set_query_only_for_test(false).unwrap();
+
+        let loaded = db.load_all_hooks().unwrap();
+        assert_eq!(loaded.len(), 1, "the failed write must not have removed the row");
+        assert_eq!(loaded[0].hook_id, "keep");
+        assert_eq!(loaded[0].phase, "pre_call", "the failed write must not have changed the row");
+        assert_eq!(loaded[0].priority, 3);
+    }
+
     // ── 24. Context env CRUD ──────────────────────────────────────────
 
     #[test]
@@ -9380,6 +9554,48 @@ mod tests {
         assert!(db.delete_context_env(ctx.context_id, "FOO").unwrap());
         assert!(!db.delete_context_env(ctx.context_id, "FOO").unwrap()); // already gone
         assert!(!db.delete_context_env(ctx.context_id, "NEVER_SET").unwrap());
+    }
+
+    /// A key that can never become `export KEY=...` must be refused at the
+    /// durable write — not stored and only discovered the next time a shell
+    /// materializes the context. `1BAD` starts with a digit, which
+    /// `is_valid_env_key` (`runtime/embedded_kaish.rs`) also rejects since
+    /// it can't lead a shell identifier.
+    #[test]
+    fn context_env_rejects_a_key_that_is_not_a_shell_identifier() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-bad-key"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let err = db.set_context_env(ctx.context_id, "1BAD", "x").unwrap_err();
+        match err {
+            KernelDbError::InvalidEnvKey(msg) => {
+                assert!(msg.contains("1BAD"), "error must name the offending key: {msg}");
+            }
+            other => panic!("expected InvalidEnvKey, got {other:?}"),
+        }
+        assert!(
+            db.get_context_env(ctx.context_id).unwrap().is_empty(),
+            "a rejected key must never reach the table"
+        );
+    }
+
+    /// The permissive edge: an underscore-led key with digits and mixed
+    /// case is a legal shell identifier and must be accepted — this is the
+    /// same rule `is_valid_env_key` applies, not a stricter one.
+    #[test]
+    fn context_env_accepts_underscore_led_alnum_key() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-good-key"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.set_context_env(ctx.context_id, "_Kaiju_2", "ok").unwrap();
+        let vars = db.get_context_env(ctx.context_id).unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "_Kaiju_2");
+        assert_eq!(vars[0].value, "ok");
     }
 
     #[test]

@@ -3317,6 +3317,42 @@ mod tests {
         );
     }
 
+    /// `KEY=VALUE` shape passes the upfront check, but a key that can never
+    /// become a shell identifier must still be refused — at the durable
+    /// write (`kernel_db.rs::validate_env_key`), not merely at the next
+    /// shell materialization. Falsifies the bug this closes: before that
+    /// write-time check existed, this same command stored the row and only
+    /// failed later, inside `apply_context_config`'s `export`.
+    #[tokio::test]
+    async fn context_set_env_rejects_key_that_is_not_a_shell_identifier() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal);
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--env"), s("1BAD=x")],
+                &c,
+            )
+            .await;
+        assert!(
+            matches!(result, KjResult::Err(_)),
+            "a key starting with a digit must be refused, got {result:?}"
+        );
+        assert!(
+            result.message().contains("1BAD"),
+            "error must name the offending key: {}",
+            result.message()
+        );
+
+        let db = d.kernel_db().lock();
+        assert!(
+            db.get_context_env(ctx).unwrap().is_empty(),
+            "a rejected key must never reach the durable table"
+        );
+    }
+
     #[tokio::test]
     async fn context_unset_env() {
         let d = test_dispatcher().await;

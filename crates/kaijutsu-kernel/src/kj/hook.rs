@@ -54,7 +54,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 use crate::mcp::broker::Broker;
-use crate::mcp::hook_persist::{parse_phase, phase_to_str};
+use crate::mcp::hook_persist::{entry_to_row, parse_phase, phase_to_str};
 use crate::mcp::servers::hooks_builtin::HookActionWire;
 use crate::mcp::{
     AskSpec, Capability, GlobPattern, HookAction, HookBody, HookEntry, HookId, HookTable,
@@ -97,9 +97,11 @@ enum HookCommand {
     /// Register a new hook entry. Idempotent on `hook_id` (in `match_json`,
     /// or a generated one if omitted): re-adding the SAME id with an
     /// otherwise identical phase/match/priority/action is a no-op success —
-    /// safe to run from rc on every context create. Re-adding the same id
-    /// with anything different REPLACES the existing entry (durable delete,
-    /// then insert) rather than erroring on the id collision or leaving a
+    /// safe to run from rc on every context create, including from two
+    /// concurrent context creates racing the same id. Re-adding the same id
+    /// with anything different REPLACES the existing entry via a single
+    /// atomic upsert (no delete step, so a failed write can never lose the
+    /// existing row) rather than erroring on the id collision or leaving a
     /// stale duplicate behind.
     Add {
         /// pre_call | post_call | on_error | on_notification | list_tools
@@ -322,60 +324,52 @@ impl KjDispatcher {
             priority: m.priority.unwrap_or(0),
         };
 
-        // Idempotency on `hook_id` (Amy's ruling, 2026-08-20,
-        // `docs/gate-and-shell-split.md` item 4): `hooks.hook_id` is the
-        // DB's PRIMARY KEY (`kernel_db.rs`), and `insert_hook` is a bare
-        // `INSERT`, not an upsert — re-adding the same id today fails the
-        // DB write outright, and even if it didn't, the in-memory
-        // `entries.push` would leave a duplicate that fires the SAME guard
-        // twice per call. rc re-running `kj hook add` with a stable id on
-        // every context create needs this to be a no-op, not a growing
-        // pile or a loud failure.
-        let existing = {
-            let hooks = broker.hooks().read().await;
-            find_entry_by_id(&hooks, &id).map(|(p, e)| (p, e.clone()))
-        };
-        let replaced = match &existing {
-            Some((existing_phase, existing_entry)) => {
-                if *existing_phase == phase && hook_entry_equivalent(existing_entry, &entry) {
-                    let data = serde_json::json!({ "hook_id": id, "replaced": false });
-                    return KjResult::ok_with_data(
-                        format!(
-                            "hook '{id}' already present on phase {phase_str} with the same \
-                             shape (no-op)"
-                        ),
-                        data,
-                    );
-                }
-                // Different shape (or a different phase) under the same id:
-                // replace rather than error or duplicate. Durable delete
-                // first — same discipline as `hook_remove` — then the
-                // insert below re-adds it fresh; an UPDATE would need a
-                // second SQL shape for what delete+insert already covers.
-                if let Err(e) = broker.persist_hook_delete(&id).await {
-                    return KjResult::Err(format!(
-                        "kj hook add: failed to replace hook {id} (delete step): {e}"
-                    ));
-                }
-                let mut hooks_w = broker.hooks().write().await;
-                hooks_w.pre_call.entries.retain(|e| e.id.0 != id);
-                hooks_w.post_call.entries.retain(|e| e.id.0 != id);
-                hooks_w.on_error.entries.retain(|e| e.id.0 != id);
-                hooks_w.on_notification.entries.retain(|e| e.id.0 != id);
-                hooks_w.list_tools.entries.retain(|e| e.id.0 != id);
-                true
+        // Idempotency on `hook_id`: `hooks.hook_id` is the DB's PRIMARY KEY
+        // (`kernel_db.rs`). Hold the in-memory table's write lock across the
+        // WHOLE check-decide-persist-mirror sequence below rather than
+        // releasing it between the lookup and the write — two concurrent
+        // `add`s for the same id (an ordinary event: rc re-runs `kj hook
+        // add` on every context create) would otherwise both observe "no
+        // existing entry" before either has written, and the second
+        // durable write would collide with the first instead of resolving
+        // to a no-op or a clean replace.
+        let mut hooks_w = broker.hooks().write().await;
+        let existing = find_entry_by_id(&hooks_w, &id).map(|(p, e)| (p, e.clone()));
+        if let Some((existing_phase, existing_entry)) = &existing {
+            if *existing_phase == phase && hook_entry_equivalent(existing_entry, &entry) {
+                let data = serde_json::json!({ "hook_id": id, "replaced": false });
+                return KjResult::ok_with_data(
+                    format!(
+                        "hook '{id}' already present on phase {phase_str} with the same \
+                         shape (no-op)"
+                    ),
+                    data,
+                );
             }
-            None => false,
-        };
+        }
+        let replaced = existing.is_some();
 
-        // Durable store FIRST — same contract as the MCP `hook_add` tool.
-        if let Err(e) = broker.persist_hook_insert(phase, &entry).await {
+        // Durable store is a single atomic upsert — not
+        // `Broker::persist_hook_insert` (a bare INSERT that errors on a
+        // PRIMARY KEY collision), and not a delete followed by an insert
+        // (a write that fails midway would lose a row that was already
+        // there). Either the whole write lands or nothing changes.
+        let row = entry_to_row(phase, &entry);
+        if let Err(e) = self.kernel_db().lock().upsert_hook(&row) {
             return KjResult::Err(format!("kj hook add: failed to persist hook {id}: {e}"));
         }
-        {
-            let mut hooks = broker.hooks().write().await;
-            phase_table_mut(&mut hooks, phase).entries.push(entry);
-        }
+
+        // Mirror update, still under the same write lock: drop any stale
+        // entry for this id from every phase table (it may have lived under
+        // a different phase before this replace) and push the fresh one.
+        hooks_w.pre_call.entries.retain(|e| e.id.0 != id);
+        hooks_w.post_call.entries.retain(|e| e.id.0 != id);
+        hooks_w.on_error.entries.retain(|e| e.id.0 != id);
+        hooks_w.on_notification.entries.retain(|e| e.id.0 != id);
+        hooks_w.list_tools.entries.retain(|e| e.id.0 != id);
+        phase_table_mut(&mut hooks_w, phase).entries.push(entry);
+        drop(hooks_w);
+
         let data = serde_json::json!({ "hook_id": id, "replaced": replaced });
         let verb = if replaced { "replaced" } else { "added" };
         KjResult::ok_with_data(format!("hook '{id}' {verb} on phase {phase_str}"), data)
@@ -897,6 +891,65 @@ mod tests {
             matches!(&matches[0].action, HookAction::Deny(r) if r == "v2"),
             "replace must land the NEW action, got {:?}",
             matches[0].action
+        );
+    }
+
+    /// Two concurrent `kj hook add` calls for the SAME id must not race:
+    /// no PRIMARY KEY collision surfaced as a spurious error, and exactly
+    /// one entry survives — in both the durable table and the mirror.
+    /// Falsifies the bug this fix closes: before holding the mirror's
+    /// write lock across the whole check-decide-persist sequence, both
+    /// tasks could observe "id absent" before either had written, and the
+    /// second durable write collided with the first's `hooks.hook_id`
+    /// PRIMARY KEY.
+    #[tokio::test]
+    async fn concurrent_add_same_id_does_not_race() {
+        let d = Arc::new(test_helpers::test_dispatcher().await);
+        let caller = test_helpers::test_caller();
+        let match_json = r#"{"match_tool":"shell_write","hook_id":"racey-guard"}"#.to_string();
+
+        let (d1, caller1, match_json1) = (d.clone(), caller.clone(), match_json.clone());
+        let t1 = tokio::spawn(async move {
+            d1.dispatch_hook(
+                &[s("add"), s("pre_call"), match_json1, s(r#"{"type":"deny","reason":"v1"}"#)],
+                &caller1,
+            )
+            .await
+        });
+
+        let (d2, caller2, match_json2) = (d.clone(), caller.clone(), match_json.clone());
+        let t2 = tokio::spawn(async move {
+            d2.dispatch_hook(
+                &[s("add"), s("pre_call"), match_json2, s(r#"{"type":"deny","reason":"v2"}"#)],
+                &caller2,
+            )
+            .await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("task 1 panicked");
+        let r2 = r2.expect("task 2 panicked");
+        assert!(r1.is_ok(), "concurrent add (task 1) must not error, got {r1:?}");
+        assert!(r2.is_ok(), "concurrent add (task 2) must not error, got {r2:?}");
+
+        let hooks = d.kernel().broker().hooks().read().await;
+        let mirror_matches = hooks
+            .pre_call
+            .entries
+            .iter()
+            .filter(|e| e.id.0 == "racey-guard")
+            .count();
+        drop(hooks);
+        assert_eq!(
+            mirror_matches, 1,
+            "concurrent adds of the same id must not duplicate the mirror entry"
+        );
+
+        let rows = d.kernel_db().lock().load_all_hooks().unwrap();
+        let db_matches = rows.iter().filter(|r| r.hook_id == "racey-guard").count();
+        assert_eq!(
+            db_matches, 1,
+            "concurrent adds of the same id must not duplicate the durable row"
         );
     }
 
