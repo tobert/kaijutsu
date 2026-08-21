@@ -1959,9 +1959,13 @@ mod tests {
     use super::*;
     use kaijutsu_types::{BlockKind, ContextId, PrincipalId};
 
+    use crate::cell::block_border::BorderInputs;
     use crate::text::msdf::layout_bridge::collect_msdf_glyphs_deferred;
     use crate::text::shaping::load_into_font_context;
     use crate::view::geometry::{EstimateParams, RowSeed};
+    use crate::view::surface::chrome::{BlockChrome, BlockChromeCache};
+    use crate::view::surface::content::BlockContentCache;
+    use crate::view::surface::labels::LabelRunCache;
 
     fn bid(seq: u64) -> BlockId {
         use std::sync::OnceLock;
@@ -3236,5 +3240,565 @@ mod tests {
             "a new tail block must anchor the reveal at the pre-growth height",
         );
         assert!(!state.new_blocks_added, "the stamp is consumed same-frame");
+    }
+
+    // ---- shape_visible_blocks (the system) --------------------------------
+    //
+    // The pass itself had no test before this section: every case above
+    // exercises a helper it calls, never the walk, the band math, or the
+    // mutation bookkeeping that decides whether the GPU sees a change.
+
+    /// A headless `App` with every resource [`shape_visible_blocks`] reads or
+    /// writes, and nothing else. No render plugins — the atlas and the font
+    /// map are built by hand the same way `block_render.rs`'s tests do.
+    fn shape_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<Theme>();
+        app.init_resource::<ConversationScrollState>();
+        app.init_resource::<TextMetrics>();
+        app.init_resource::<SurfaceMetricsEpoch>();
+        app.init_resource::<SurfaceThemeEpoch>();
+        app.init_resource::<BlockContentCache>();
+        app.init_resource::<BlockChromeCache>();
+        app.init_resource::<ShapedBlockCache>();
+        app.init_resource::<HeaderLabelCache>();
+        app.init_resource::<LabelRunCache>();
+        app.init_resource::<ShapeTasks>();
+        app.init_resource::<FontDataMap>();
+
+        let mut images = Assets::<Image>::default();
+        let atlas = MsdfAtlas::new(&mut images, 256, 256);
+        app.insert_resource(images);
+        app.insert_resource(atlas);
+
+        let mut fonts = Assets::<VelloFont>::default();
+        let handle = fonts.add(mono());
+        app.insert_resource(fonts);
+        app.insert_resource(ShapingFonts { mono: handle, ..default() });
+
+        app.add_systems(Update, shape_visible_blocks);
+        app
+    }
+
+    /// The pane's `ComputedNode`, in **physical** px, at `inverse_scale`
+    /// (0.5 = 2x HiDPI). `shape_visible_blocks` must read it through
+    /// `logical_content_size`, never raw — see the HiDPI test below.
+    fn install_container(app: &mut App, width: f32, height: f32, inverse_scale: f32) -> Entity {
+        let ent = app
+            .world_mut()
+            .spawn(ComputedNode {
+                size: Vec2::new(width, height),
+                inverse_scale_factor: inverse_scale,
+                ..default()
+            })
+            .id();
+        app.world_mut()
+            .resource_mut::<EditorEntities>()
+            .conversation_container = Some(ent);
+        ent
+    }
+
+    fn set_scroll(app: &mut App, offset: f32, visible_height: f32) {
+        let mut s = app.world_mut().resource_mut::<ConversationScrollState>();
+        s.offset = offset;
+        s.target_offset = offset;
+        s.visible_height = visible_height;
+    }
+
+    fn border_inputs(id: BlockId, status: Status, excluded: bool) -> BorderInputs {
+        BorderInputs {
+            id,
+            kind: BlockKind::Text,
+            role: Role::User,
+            status,
+            tool_kind: None,
+            tool_call_id: None,
+            content_empty: false,
+            has_output: false,
+            is_error: false,
+            collapsed: false,
+            excluded,
+            drift_kind: None,
+            error: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_content(
+        app: &mut App,
+        id: BlockId,
+        text: &str,
+        color: Color,
+        spans: Vec<SpanBrush>,
+        status: Status,
+        excluded: bool,
+        version: u64,
+    ) {
+        app.world_mut().resource_mut::<BlockContentCache>().insert_text_for_test(
+            id,
+            text,
+            color,
+            spans,
+            border_inputs(id, status, excluded),
+            version,
+        );
+    }
+
+    /// An empty document must shape nothing and must not panic — the guard
+    /// on `geom.rows()[band.clone()]` for a zero-row geometry.
+    ///
+    /// Falsified by widening the slice to `geom.rows()[0..1]`: with zero
+    /// rows that is an out-of-bounds slice and the test goes from green to
+    /// a panic, confirming this test would catch a regression in the
+    /// empty-geometry guard.
+    #[test]
+    fn shaping_an_empty_document_touches_nothing_and_does_not_panic() {
+        let mut app = shape_app();
+        install_geometry(&mut app, ConversationGeometry::default());
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+
+        app.update();
+
+        assert_eq!(app.world().resource::<ShapedBlockCache>().len(), 0);
+    }
+
+    /// The ordinary case: one block, fully in view, gets a real shaping
+    /// stamped with the content version it was shaped from.
+    #[test]
+    fn a_single_in_view_block_gets_shaped_and_cached() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, false, 1);
+
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        let block = shaped.get(&bid(1)).expect("an in-view block must be shaped");
+        assert_eq!(block.key.content_version, 1);
+        assert!(block.glyph_count > 0, "must have shaped real glyphs");
+        assert!(block.text_height > 0.0);
+    }
+
+    /// A block many times taller than the viewport still shapes end to end
+    /// in one pass — there is no lazy "just the visible lines" path.
+    ///
+    /// Falsified by shaping only `&formatted.text[..formatted.text.len() /
+    /// 2]` at the reshape call site: the chunk tiling assertion catches the
+    /// truncation immediately.
+    #[test]
+    fn a_block_taller_than_the_viewport_is_still_fully_shaped() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 100.0);
+        let text = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        seed_content(&mut app, bid(1), &text, Color::WHITE, vec![], Status::Done, false, 1);
+
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        let block = shaped.get(&bid(1)).expect("must be shaped despite dwarfing the viewport");
+        assert!(block.chunks.len() > 1, "premise: 200 lines must chunk");
+        assert_eq!(
+            block.chunks.last().unwrap().byte_range.end,
+            text.len(),
+            "the whole block must be shaped, not just what's visible",
+        );
+    }
+
+    /// The shape band's own edges: rows the band covers get touched, rows it
+    /// doesn't are left alone. Every block is `Running` so the sync/backlog
+    /// split (a different boundary, covered separately below) never enters
+    /// the picture — this test is purely about [`SHAPE_SLACK_SCREENS`].
+    ///
+    /// Falsified by computing `band` from `SYNC_SLACK_SCREENS` instead of
+    /// `SHAPE_SLACK_SCREENS`: the band shrinks and rows this test expects
+    /// shaped are left untouched.
+    #[test]
+    fn only_rows_the_shape_band_actually_covers_get_touched() {
+        let mut app = shape_app();
+        let geom = strip(12);
+        let expected = geom.visible_rows(500.0, 60.0, SHAPE_SLACK_SCREENS * 60.0);
+        let block_rows: Vec<(usize, BlockId)> = geom
+            .rows()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r.key {
+                RowKey::Block(id) => Some((i, id)),
+                RowKey::Header(_) => None,
+            })
+            .collect();
+        install_geometry(&mut app, geom);
+        install_container(&mut app, 800.0, 60.0, 1.0);
+        set_scroll(&mut app, 500.0, 60.0);
+        for (_, id) in &block_rows {
+            seed_content(&mut app, *id, "hello", Color::WHITE, vec![], Status::Running, false, 1);
+        }
+
+        app.update();
+
+        // Premise: the band must actually exclude something and include
+        // something, or every assertion below passes vacuously.
+        assert!(block_rows.iter().any(|(i, _)| !expected.contains(i)));
+        assert!(block_rows.iter().any(|(i, _)| expected.contains(i)));
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        for (i, id) in &block_rows {
+            let want = expected.contains(i);
+            assert_eq!(
+                shaped.get(id).is_some(),
+                want,
+                "row {i} block {id:?}: expected shaped={want}",
+            );
+        }
+    }
+
+    /// A row inside the shape band but outside [`SYNC_SLACK_SCREENS`] of the
+    /// viewport must queue on the backlog rather than shape on the main
+    /// thread. `bid(19)` sits at exactly that distance for this
+    /// offset/viewport pair (checked against `visible_rows` by hand: inside
+    /// `[800, 1400)`, outside `[900, 1300)`).
+    ///
+    /// Falsified by inverting `!sync_band.contains(&row_index)` to
+    /// `sync_band.contains(&row_index)`: the row then shapes synchronously
+    /// and the "not shaped" assertion fails.
+    #[test]
+    fn a_row_inside_the_shape_band_but_outside_sync_distance_goes_to_the_backlog() {
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(20));
+        install_container(&mut app, 800.0, 200.0, 1.0);
+        set_scroll(&mut app, 1000.0, 200.0);
+        seed_content(&mut app, bid(19), "hello world", Color::WHITE, vec![], Status::Done, false, 1);
+
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        assert!(
+            shaped.get(&bid(19)).is_none(),
+            "a row outside sync distance must not shape synchronously",
+        );
+
+        let expected_key = ShapeKey {
+            content_version: 1,
+            wrap_width_bits: surface_wrap_width(800.0, 0, Theme::default().indent_width).to_bits(),
+            collapsed: false,
+            indent_level: 0,
+            metrics_epoch: 0,
+            baked_theme_epoch: 0,
+        };
+        let tasks = app.world().resource::<ShapeTasks>();
+        assert!(
+            tasks.is_pending(&bid(19), &expected_key),
+            "it must be queued on the backlog instead",
+        );
+    }
+
+    /// The generation-counter regression this module actually shipped once
+    /// (slice 3, deepseek review): a placement-only refresh (padding moved,
+    /// wrap width didn't) has to bump [`ShapedBlockCache::generation`] or
+    /// `WindowKey` never notices and the GPU keeps drawing the old rect.
+    ///
+    /// Falsified by deleting the `if mutated { caches.shaped.touch(); }`
+    /// call: the placement still lands (`y_offset` assertion still passes)
+    /// but the generation no longer moves, and this test catches exactly
+    /// that split.
+    #[test]
+    fn a_padding_only_placement_move_bumps_the_cache_generation() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, false, 1);
+
+        let layout_a = BlockLayout {
+            rect_x: 0.0,
+            rect_width: 800.0,
+            text_x: 0.0,
+            text_y: 0.0,
+            pad_bottom: 0.0,
+            wrap_width: 800.0,
+        };
+        app.world_mut()
+            .resource_mut::<BlockChromeCache>()
+            .insert_for_test(bid(1), BlockChrome { style: None, layout: layout_a });
+        app.update();
+        let gen1 = app.world().resource::<ShapedBlockCache>().generation();
+        assert_eq!(
+            app.world().resource::<ShapedBlockCache>().get(&bid(1)).unwrap().y_offset,
+            0.0,
+        );
+
+        // Same wrap width (same ShapeKey) — only the top padding moved, the
+        // way a ToolResult joining the call above it loses padding without
+        // its wrap width changing.
+        let layout_b = BlockLayout { text_y: 20.0, ..layout_a };
+        app.world_mut()
+            .resource_mut::<BlockChromeCache>()
+            .insert_for_test(bid(1), BlockChrome { style: None, layout: layout_b });
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        let gen2 = shaped.generation();
+        assert_eq!(shaped.get(&bid(1)).unwrap().y_offset, 20.0, "the new placement must land");
+        assert_eq!(
+            gen2,
+            gen1 + 1,
+            "a placement move must bump the generation, or the GPU never re-uploads it",
+        );
+    }
+
+    /// The negative control for the test above, and the opposite failure
+    /// mode: a pass over an unchanged block must NOT bump the generation
+    /// either, or every frame re-uploads a window that didn't change.
+    ///
+    /// Falsified by touching the cache unconditionally instead of only when
+    /// `mutated`: the generation moves every pass and this test goes red.
+    #[test]
+    fn two_identical_passes_leave_the_cache_generation_untouched() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, false, 1);
+
+        app.update();
+        let gen1 = app.world().resource::<ShapedBlockCache>().generation();
+
+        app.update();
+        let gen2 = app.world().resource::<ShapedBlockCache>().generation();
+
+        assert_eq!(gen2, gen1, "an unchanged block must not bump the generation every pass");
+    }
+
+    /// The recolor branch's own generation bookkeeping: a span-free block
+    /// whose color moved must repaint in place (not reshape) AND still bump
+    /// the generation, or a theme swap draws the old color until something
+    /// else happens to touch the cache.
+    ///
+    /// Falsified by dropping the `mutated = true;` inside the recolor arm
+    /// (keeping the `recolor_block` call itself): the glyphs still repaint
+    /// correctly, but the generation assertion catches the untracked
+    /// mutation.
+    #[test]
+    fn recoloring_a_span_free_block_through_the_pass_bumps_the_generation() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, false, 1);
+        app.update();
+        let gen1 = app.world().resource::<ShapedBlockCache>().generation();
+
+        let red = Color::srgb(1.0, 0.0, 0.0);
+        seed_content(&mut app, bid(1), "hello there", red, vec![], Status::Done, false, 1);
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        let block = shaped.get(&bid(1)).unwrap();
+        let want = color_to_rgba8(red);
+        for chunk in &block.chunks {
+            for glyph in chunk.glyphs.iter() {
+                assert_eq!(glyph.color, want, "every glyph must repaint to the new color");
+            }
+        }
+        assert_eq!(
+            shaped.generation(),
+            gen1 + 1,
+            "an in-place recolor must bump the generation, or the GPU keeps the old color",
+        );
+    }
+
+    /// The label branch's own generation bookkeeping: toggling exclusion
+    /// changes the gutter checkbox glyph without changing a byte of the
+    /// block's own text, and that has to bump the generation too.
+    ///
+    /// Falsified by dropping the `mutated = true;` inside the
+    /// `!existing.labels.same_runs(&labels)` arm: the checkbox still
+    /// updates, but untracked, and the generation assertion catches it.
+    #[test]
+    fn a_checkbox_label_change_bumps_the_generation() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, false, 1);
+        app.update();
+        let gen1 = app.world().resource::<ShapedBlockCache>().generation();
+
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, true, 1);
+        app.update();
+
+        let gen2 = app.world().resource::<ShapedBlockCache>().generation();
+        assert_eq!(
+            gen2,
+            gen1 + 1,
+            "a caption/checkbox change must bump the generation, or the window keeps stale glyphs",
+        );
+    }
+
+    /// The historical review-fix this module shipped with slice 3: a spanned
+    /// block's color move must NOT take the in-place recolor path (it would
+    /// flatten every span to one uniform color), it must fall through to a
+    /// full reshape that re-derives each span's own color.
+    ///
+    /// Falsified by relaxing the recolor guard from `existing.color == color
+    /// || !complex` to always allow recolor: the span's red survives the
+    /// base-color change in this test's expectation, but the perturbed code
+    /// paints every glyph blue, including the spanned ones.
+    #[test]
+    fn a_spanned_blocks_base_color_change_forces_a_reshape_that_keeps_its_span_colors() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+
+        let text = "aaabbb";
+        let red = Color::srgb(1.0, 0.0, 0.0);
+        let span = SpanBrush { start: 3, end: 6, brush: bevy_color_to_brush(red) };
+        seed_content(&mut app, bid(1), text, Color::WHITE, vec![span.clone()], Status::Done, false, 1);
+        app.update();
+
+        let white = color_to_rgba8(Color::WHITE);
+        let redc = color_to_rgba8(red);
+        {
+            let shaped = app.world().resource::<ShapedBlockCache>();
+            let glyphs: Vec<_> =
+                shaped.get(&bid(1)).unwrap().chunks.iter().flat_map(|c| c.glyphs.iter().cloned()).collect();
+            assert_eq!(glyphs.len(), 6, "premise: one glyph per letter, no wrapping");
+            assert_eq!(glyphs[0].color, white);
+            assert_eq!(glyphs[3].color, redc);
+        }
+
+        let blue = Color::srgb(0.0, 0.0, 1.0);
+        seed_content(&mut app, bid(1), text, blue, vec![span], Status::Done, false, 1);
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        let glyphs: Vec<_> =
+            shaped.get(&bid(1)).unwrap().chunks.iter().flat_map(|c| c.glyphs.iter().cloned()).collect();
+        let bluec = color_to_rgba8(blue);
+        assert_eq!(glyphs[0].color, bluec, "the new base color must reach the unspanned glyphs");
+        assert_eq!(glyphs[3].color, redc, "the span's own color must survive the base-color change");
+    }
+
+    /// The HiDPI trap CLAUDE.md warns about: `ComputedNode` is physical px,
+    /// so the wrap width fed to the shaper must come from
+    /// `logical_content_size`, not the raw node size, or a 2x display wraps
+    /// text at twice the width it should.
+    ///
+    /// Falsified by reading `c.size().x` (physical) instead of
+    /// `logical_content_size(c).x` at the container-width call site: the
+    /// wrap width jumps to the 1600-physical-px answer instead of the
+    /// 800-logical-px one this test expects.
+    #[test]
+    fn container_width_is_derived_from_logical_not_physical_pixels() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        // 1600 physical px at 2x scale (inverse_scale_factor 0.5) is 800
+        // logical px.
+        install_container(&mut app, 1600.0, 600.0, 0.5);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, false, 1);
+
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        let block = shaped.get(&bid(1)).unwrap();
+        let expected = surface_wrap_width(800.0, 0, Theme::default().indent_width).to_bits();
+        assert_eq!(
+            block.key.wrap_width_bits, expected,
+            "a 2x-scaled container must wrap at its LOGICAL width (800), not its physical one (1600)",
+        );
+    }
+
+    /// A block the document dropped must not linger in the shaped cache —
+    /// the `shaped.len() > content.len()` retain pass at the end of the
+    /// function.
+    ///
+    /// Falsified by deleting that retain block: the dropped block's glyphs
+    /// (and its claim on the glyph budget) never get freed.
+    #[test]
+    fn a_block_the_document_drops_is_evicted_from_the_shaped_cache_next_pass() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(2));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(&mut app, bid(1), "first", Color::WHITE, vec![], Status::Running, false, 1);
+        seed_content(&mut app, bid(2), "second", Color::WHITE, vec![], Status::Running, false, 1);
+        app.update();
+        {
+            let shaped = app.world().resource::<ShapedBlockCache>();
+            assert!(shaped.get(&bid(1)).is_some());
+            assert!(shaped.get(&bid(2)).is_some());
+        }
+
+        app.world_mut().resource_mut::<BlockContentCache>().remove_for_test(&bid(2));
+        app.update();
+
+        let shaped = app.world().resource::<ShapedBlockCache>();
+        assert!(shaped.get(&bid(1)).is_some(), "the still-live block must stay cached");
+        assert!(
+            shaped.get(&bid(2)).is_none(),
+            "a block the document dropped must not linger in the shaped cache",
+        );
+    }
+
+    /// The reuse half of the cache/reuse accounting: a pass over an
+    /// unchanged block must not reshape it — the render world is still
+    /// holding these `Arc`s, and a silent reshape would orphan them for no
+    /// visible change.
+    ///
+    /// Falsified by forcing the key-match branch to never fire (`&&
+    /// existing.key == key` becomes `&& false`): the block reshapes every
+    /// pass and the `Arc::ptr_eq` checks fail.
+    #[test]
+    fn an_unchanged_block_keeps_its_glyph_allocation_across_passes() {
+        let mut app = shape_app();
+        install_geometry(&mut app, strip(1));
+        install_container(&mut app, 800.0, 600.0, 1.0);
+        set_scroll(&mut app, 0.0, 600.0);
+        seed_content(
+            &mut app,
+            bid(1),
+            "hello there, this is a block of text",
+            Color::WHITE,
+            vec![],
+            Status::Done,
+            false,
+            1,
+        );
+
+        app.update();
+        let before: Vec<Arc<Vec<PositionedGlyph>>> = app
+            .world()
+            .resource::<ShapedBlockCache>()
+            .get(&bid(1))
+            .unwrap()
+            .chunks
+            .iter()
+            .map(|c| c.glyphs.clone())
+            .collect();
+
+        app.update();
+        let after: Vec<Arc<Vec<PositionedGlyph>>> = app
+            .world()
+            .resource::<ShapedBlockCache>()
+            .get(&bid(1))
+            .unwrap()
+            .chunks
+            .iter()
+            .map(|c| c.glyphs.clone())
+            .collect();
+
+        assert_eq!(before.len(), after.len());
+        for (i, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+            assert!(Arc::ptr_eq(a, b), "chunk {i} was reshaped even though nothing changed");
+        }
     }
 }

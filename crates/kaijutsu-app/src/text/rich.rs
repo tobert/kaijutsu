@@ -345,12 +345,7 @@ pub fn diff_minimap_colors(theme: &crate::ui::theme::Theme) -> super::diff::Mini
         // The same violet the block cursor draws in, so the strip's marker and
         // the cursor on the page are visibly the same thing. `cursor_normal`
         // is already linear RGBA for the shader, so it converts directly.
-        cursor: [
-            (theme.cursor_normal.x.clamp(0.0, 1.0) * 255.0) as u8,
-            (theme.cursor_normal.y.clamp(0.0, 1.0) * 255.0) as u8,
-            (theme.cursor_normal.z.clamp(0.0, 1.0) * 255.0) as u8,
-            (theme.cursor_normal.w.clamp(0.0, 1.0) * 255.0) as u8,
-        ],
+        cursor: super::msdf::layout_bridge::rgba_unit_to_u8(theme.cursor_normal.to_array()),
     }
 }
 

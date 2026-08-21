@@ -33,6 +33,7 @@ use kaijutsu_abc::engrave::EngravingElement;
 use super::atlas::MsdfAtlas;
 use super::geometry::{self, GeometryVertex};
 use super::glyph::{FontId, GlyphKey, PositionedGlyph};
+use super::layout_bridge::brush_to_rgba8;
 use super::music_glyph_id;
 
 /// Codepoints already warned about missing from the music cmap — caps the
@@ -301,24 +302,6 @@ fn warn_once_missing(codepoint: u32) {
              skipping this glyph (render continues without it)",
             codepoint
         );
-    }
-}
-
-/// Convert a Brush to RGBA8. Duplicated from `layout_bridge::brush_to_rgba8`
-/// (private there) rather than shared — trivial and this module has no
-/// other reason to depend on `layout_bridge`.
-fn brush_to_rgba8(brush: &Brush) -> [u8; 4] {
-    match brush {
-        Brush::Solid(color) => {
-            let [r, g, b, a] = color.components;
-            [
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-                (a.clamp(0.0, 1.0) * 255.0) as u8,
-            ]
-        }
-        _ => [255, 255, 255, 255],
     }
 }
 

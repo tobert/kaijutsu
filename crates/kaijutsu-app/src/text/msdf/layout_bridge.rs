@@ -214,23 +214,32 @@ fn collect_with<B: parley::Brush>(
     (glyphs, keys)
 }
 
+/// Clamp one color component to `0.0..=1.0` and scale it to a `u8` byte —
+/// the shared core of every straight-alpha RGBA8 conversion in this crate,
+/// no matter what the four floats started out as (an sRGB `Color`, a
+/// `Brush`, an ANSI palette entry, an MSDF pixel, a raw shader `Vec4`).
+/// Truncating, not rounding, so every caller agrees bit-for-bit.
+pub(crate) fn unit_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0) as u8
+}
+
+/// [`unit_to_u8`] over all four RGBA channels at once.
+pub(crate) fn rgba_unit_to_u8(rgba: [f32; 4]) -> [u8; 4] {
+    rgba.map(unit_to_u8)
+}
+
 /// Convert a Brush to RGBA8.
 ///
 /// `pub(crate)` because it is the one place that decides what color a brush
 /// *is* for this renderer, and the conversation surface fingerprints span
 /// colors against exactly that decision — a second copy of the match would be
-/// a second answer.
+/// a second answer. The clamp-and-scale itself is shared further still, via
+/// [`rgba_unit_to_u8`] — every other RGBA8 conversion in the crate routes
+/// through it too, so there is exactly one place that decides what a
+/// straight-alpha byte is.
 pub(crate) fn brush_to_rgba8(brush: &Brush) -> [u8; 4] {
     match brush {
-        Brush::Solid(color) => {
-            let [r, g, b, a] = color.components;
-            [
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-                (a.clamp(0.0, 1.0) * 255.0) as u8,
-            ]
-        }
+        Brush::Solid(color) => rgba_unit_to_u8(color.components),
         _ => [255, 255, 255, 255],
     }
 }

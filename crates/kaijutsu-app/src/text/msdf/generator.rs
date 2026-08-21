@@ -302,14 +302,7 @@ fn generate_glyph(
     let data: Vec<u8> = bitmap
         .pixels()
         .iter()
-        .flat_map(|p| {
-            [
-                (p.r.clamp(0.0, 1.0) * 255.0) as u8,
-                (p.g.clamp(0.0, 1.0) * 255.0) as u8,
-                (p.b.clamp(0.0, 1.0) * 255.0) as u8,
-                (p.a.clamp(0.0, 1.0) * 255.0) as u8,
-            ]
-        })
+        .flat_map(|p| super::layout_bridge::rgba_unit_to_u8([p.r, p.g, p.b, p.a]))
         .collect();
 
     // Calculate anchor (offset from bitmap origin to glyph pen origin, in

@@ -112,12 +112,7 @@ impl StyledSpan {
 
 /// Straight-alpha RGBA8 from a palette entry's sRGB floats.
 fn palette_rgba8(entry: [f32; 4]) -> [u8; 4] {
-    [
-        (entry[0].clamp(0.0, 1.0) * 255.0) as u8,
-        (entry[1].clamp(0.0, 1.0) * 255.0) as u8,
-        (entry[2].clamp(0.0, 1.0) * 255.0) as u8,
-        (entry[3].clamp(0.0, 1.0) * 255.0) as u8,
-    ]
+    crate::text::msdf::layout_bridge::rgba_unit_to_u8(entry)
 }
 
 /// What a resolved foreground came out as: the color a glyph carries, the

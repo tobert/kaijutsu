@@ -268,6 +268,15 @@ impl BlockContentCache {
         self.blocks.is_empty()
     }
 
+    /// Drop one block, simulating the document removing it. Test-only:
+    /// `super::shape_cache`'s retain-on-drop bookkeeping (`shaped.len() >
+    /// content.len()`) needs the content cache to shrink out from under an
+    /// already-shaped block.
+    #[cfg(test)]
+    pub(crate) fn remove_for_test(&mut self, id: &BlockId) {
+        self.blocks.remove(id);
+    }
+
     /// Ids whose last known status was `Running`. These are refreshed
     /// wherever they sit in the document — a streaming block scrolled out of
     /// the band still has to reach its final text, or its measured height
@@ -300,6 +309,42 @@ impl BlockContentCache {
                 fingerprint: 0,
                 theme_epoch: 0,
                 spans_fingerprint: 0,
+            },
+        );
+    }
+
+    /// Seed a formatted block with real text and spans. Test-only:
+    /// `super::shape_cache`'s system tests need something for
+    /// `shape_visible_blocks` to actually shape, which `insert_for_test`
+    /// above (empty text) cannot exercise.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_text_for_test(
+        &mut self,
+        id: BlockId,
+        text: &str,
+        color: Color,
+        spans: Vec<SpanBrush>,
+        border: BorderInputs,
+        version: u64,
+    ) {
+        let style_spans = Vec::new();
+        let fp = spans_fingerprint(&spans, &style_spans);
+        self.blocks.insert(
+            id,
+            FormattedBlock {
+                version,
+                text: text.to_string(),
+                color,
+                spans,
+                style_spans,
+                rich: None,
+                rich_content: None,
+                status: border.status,
+                border,
+                fingerprint: 0,
+                theme_epoch: 0,
+                spans_fingerprint: fp,
             },
         );
     }

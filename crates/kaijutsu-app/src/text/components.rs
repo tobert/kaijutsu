@@ -41,12 +41,7 @@ pub fn bevy_color_to_brush(color: Color) -> peniko::Brush {
 /// shared so every geometry producer agrees bit-for-bit.
 pub fn color_to_rgba8(color: Color) -> [u8; 4] {
     let c = color.to_srgba();
-    [
-        (c.red.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.green.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
-    ]
+    super::msdf::layout_bridge::rgba_unit_to_u8([c.red, c.green, c.blue, c.alpha])
 }
 
 /// Build a scrolling rainbow gradient brush.
