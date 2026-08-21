@@ -183,11 +183,22 @@ pub enum KeysOutcome {
 /// moved under the buffer since it was loaded; `:w!` (`forced: true`)
 /// overrides that refusal. This pure registry has no file cache to check
 /// against, so it only carries the bit — the kernel layer is what acts on it.
+///
+/// `rolled_back` mirrors [`EditorSessions::quit`]'s return: `true` when a
+/// `ZQ`/`:q!`-style discard in this batch actually rewrote the block (the
+/// buffer held unsaved changes at the moment of quit), `false` for a `ZZ`
+/// close (which checkpoints before quitting, so quit's rewrite is always a
+/// no-op) and for every `Updated` outcome (no quit ran). The kernel layer
+/// marks a file-backed entry dirty whenever this is `true`, on top of
+/// `saved` — a discard's rollback writes the block via a raw `edit_text`
+/// call the file cache's own flush pipeline never sees, so the block can end
+/// up disagreeing with disk with nothing tracking it (docs/file-buffers.md).
 #[derive(Debug)]
 pub struct KeysUpdate {
     pub state: EditorState,
     pub saved: bool,
     pub forced: bool,
+    pub rolled_back: bool,
 }
 
 impl KeysOutcome {
@@ -454,7 +465,7 @@ impl EditorSessions {
         // `ZZ`/`ZQ` close the session. The returned state is informational (the
         // last view before close); renderers react to the `Closed` push.
         if let Some(close) = close {
-            let (final_state, saved) = match close {
+            let (final_state, saved, rolled_back) = match close {
                 CloseRequest::Write => {
                     if !can_write {
                         return self.refuse_write(id);
@@ -463,22 +474,24 @@ impl EditorSessions {
                     // to that just-taken checkpoint is a no-op. `saved: true`
                     // tells the kernel layer to flush a file-backed session.
                     let state = self.save(id)?;
-                    self.quit(id, blocks)?;
-                    (state, true)
+                    let rolled_back = self.quit(id, blocks)?;
+                    (state, true, rolled_back)
                 }
                 CloseRequest::Discard => {
                     // ZQ: snapshot the view, then roll back to the last
                     // checkpoint. Nothing to flush — the discard never advanced
-                    // the checkpoint.
+                    // the checkpoint. `rolled_back` tells the kernel layer
+                    // whether that rollback actually rewrote the block.
                     let state = self.state(id)?;
-                    self.quit(id, blocks)?;
-                    (state, false)
+                    let rolled_back = self.quit(id, blocks)?;
+                    (state, false, rolled_back)
                 }
             };
             return Ok(KeysOutcome::Closed(KeysUpdate {
                 state: final_state,
                 saved,
                 forced: false,
+                rolled_back,
             }));
         }
 
@@ -499,6 +512,7 @@ impl EditorSessions {
                         state,
                         saved: false,
                         forced: false,
+                        rolled_back: false,
                     }));
                 }
             }
@@ -510,6 +524,7 @@ impl EditorSessions {
             state: state_of(&mut session.core, &checkpoint),
             saved: false,
             forced: false,
+            rolled_back: false,
         }))
     }
 
@@ -526,6 +541,7 @@ impl EditorSessions {
             state,
             saved: false,
             forced: false,
+            rolled_back: false,
         }))
     }
 
@@ -601,16 +617,19 @@ impl EditorSessions {
                             state,
                             saved: false,
                             forced: false,
+                            rolled_back: false,
                         }));
                     }
-                    self.quit(id, blocks)?;
+                    let rolled_back = self.quit(id, blocks)?;
                     // `write_requested` covers `:wq`/`:x` (Write ran earlier
                     // in this same batch); a bare `:q`/`:q!` never set it, so
-                    // nothing to flush.
+                    // nothing to flush. `rolled_back` is independent of that —
+                    // a `:q!` discard can still have rewritten the block.
                     return Ok(KeysOutcome::Closed(KeysUpdate {
                         state,
                         saved: write_requested,
                         forced,
+                        rolled_back,
                     }));
                 }
             }
@@ -634,6 +653,7 @@ impl EditorSessions {
             state,
             saved: write_requested,
             forced,
+            rolled_back: false,
         }))
     }
 

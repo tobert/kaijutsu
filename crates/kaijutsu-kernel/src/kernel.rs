@@ -1556,7 +1556,16 @@ impl Kernel {
                 // below still must run, so a `mark_dirty` failure here folds
                 // into the same reported-error path as a flush failure
                 // rather than an early `?` return.
-                let mark_err = if update.saved
+                //
+                // `update.rolled_back` marks dirty on top of `update.saved`:
+                // a discard (`ZQ`, `:q!`) that actually rewrote the block —
+                // it held unsaved changes at quit time — rolls back via a
+                // raw `edit_text` call the file cache's flush pipeline never
+                // sees, so the block can end up disagreeing with disk with
+                // nothing tracking it (docs/file-buffers.md). A discard
+                // never flushes, only writes: nothing to send to disk, but
+                // the entry must become a recoverable swap.
+                let mark_err = if (update.saved || update.rolled_back)
                     && let Some(fp) = file_path.as_deref()
                     && let Err(e) = self.file_cache.mark_dirty(fp)
                 {
@@ -2732,6 +2741,156 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "both sessions flushed cleanly — no swap rows left"
+        );
+    }
+
+    // ── A discard through `editor_keys` must mark a content-changing
+    // rollback dirty, same as `Kernel::editor_quit` already does
+    // (docs/file-buffers.md, the `kj swap ack`-then-`ZQ` divergence)
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Opens `/mem/note.txt` = "hello", edits it to "Xhello", then flushes
+    /// the file cache directly — bypassing the session's own checkpoint —
+    /// the way `kj swap ack` does: the cache entry and its swap row go
+    /// clean, but the *session*'s checkpoint stays at "hello" because
+    /// nothing routed through `EditorSessions::save`. Disk now holds
+    /// "Xhello" while the still-open session believes it is discarding back
+    /// to "hello". Returns the session id; the caller drives the ZQ.
+    async fn kernel_with_a_session_diverged_from_an_acked_flush() -> (Kernel, crate::editor::EditorSessionId) {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        let path = Path::new("/mem/note.txt");
+        kernel.vfs().write_all(path, b"hello").await.unwrap();
+
+        let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "precondition: the edit must have recorded a swap row"
+        );
+
+        // `kj swap ack` flushes whatever the cache entry currently holds and
+        // clears the row — same primitive, called directly rather than
+        // through the `kj` verb, exactly as the existing `editor_quit`
+        // fix's doc comment already names.
+        kernel
+            .file_cache()
+            .flush_one_guarded("/mem/note.txt", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
+            "Xhello",
+            "precondition: the ack-flush must have reached disk"
+        );
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .is_empty(),
+            "precondition: the ack-flush must have cleared the swap row"
+        );
+
+        (kernel, id)
+    }
+
+    /// A separate `editor_keys(id, "ZQ")` call, after the divergence above:
+    /// the session still thinks it is discarding "Xhello" back to "hello",
+    /// but disk (and the swap row) no longer agree. `EditorSessions::quit`
+    /// reports `rolled_back: true` (the block content the discard rewrote
+    /// really did change), and that must reach the file cache as a fresh
+    /// dirty mark — a block that now disagrees with disk needs a swap row
+    /// to be recoverable. Without the fix, `saved` on a discard is always
+    /// `false`, so `Kernel::editor_keys_checked`'s `Closed` arm never calls
+    /// `mark_dirty`, and the divergence is left untracked.
+    #[tokio::test]
+    async fn editor_keys_zq_after_an_acked_flush_marks_the_rolled_back_buffer_dirty() {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let (kernel, id) = kernel_with_a_session_diverged_from_an_acked_flush().await;
+
+        kernel.editor_keys(id, "ZQ").await.unwrap();
+
+        assert_eq!(
+            String::from_utf8(
+                kernel
+                    .vfs()
+                    .read_all(Path::new("/mem/note.txt"))
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            "Xhello",
+            "the discard must not itself touch disk — only the block rolls back"
+        );
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "a ZQ that rolled the block back past what disk holds must leave a \
+             recoverable swap row — the block ('hello') and disk ('Xhello') now \
+             disagree with nothing tracking it"
+        );
+    }
+
+    /// The batched form: the edit and the `ZQ` arrive in one `editor_keys`
+    /// call, after the same divergence — so the kernel layer never sees an
+    /// intermediate `Updated` outcome to mark dirty on; the whole batch
+    /// resolves straight to `Closed`.
+    #[tokio::test]
+    async fn editor_keys_batched_edit_then_zq_after_an_acked_flush_marks_the_rolled_back_buffer_dirty()
+    {
+        let (kernel, id) = kernel_with_a_session_diverged_from_an_acked_flush().await;
+
+        kernel.editor_keys(id, "aY<Esc>ZQ").await.unwrap();
+
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "a batched edit+ZQ that rolled the block back past what disk holds \
+             must leave a recoverable swap row"
+        );
+    }
+
+    /// The `:q!<CR>` form: reaches `EditorSessions::quit` through
+    /// `run_commands`'s `Quit` arm, a different `KeysUpdate` construction
+    /// site than the raw `ZQ` close-request arm above.
+    #[tokio::test]
+    async fn editor_keys_colon_q_bang_after_an_acked_flush_marks_the_rolled_back_buffer_dirty() {
+        let (kernel, id) = kernel_with_a_session_diverged_from_an_acked_flush().await;
+
+        kernel.editor_keys(id, ":q!<CR>").await.unwrap();
+
+        assert!(
+            kernel
+                .kernel_db()
+                .lock()
+                .list_dirty_file_buffers()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/mem/note.txt"),
+            "a :q! that rolled the block back past what disk holds must leave a \
+             recoverable swap row"
         );
     }
 
