@@ -157,6 +157,43 @@ player role exactly the shape small models are good at.
   contexts are **side channels** — they tweak the gear while the band plays,
   never on the beat (`docs/midi-next.md`).
 
+## When a player needs permission (2026-08-21, designed not built)
+
+The beat model has an answer for a turn that is *slow* — the grid fires anyway,
+the vamp covers, `UseLastGood` holds the floor. It has no answer for a turn that
+is *stopped*, waiting on a human. That gap stops mattering the moment players
+run continuously outside the band, which is where this is heading.
+
+The mechanism a stopped turn hits is the approval gate: a `pre_call` hook body
+that exits 3 escalates to a ledger ask and **blocks the caller** up to
+`gate_wait_timeout` (300 s), then Expires. Three rules, from Amy:
+
+- **Expiry is an error, not silence.** The waiting call should come back as a
+  tool error the player can read and act on — retry and block again, or set the
+  task aside and pick up other work. A player that stalls with no signal cannot
+  route around it.
+- **The bound belongs to the ask, not to a constant.** 300 s is tuned for a
+  human already at the keyboard. Some asks should wait indefinitely — the useful
+  case is a human who has walked away and wants the work still standing when
+  they return.
+- **Expiry never grants.** A timed-out ask fails closed. It is the one path
+  where failing open would be invisible.
+
+Why the ledger rather than per-context state: one board, many contexts. A human
+working across a dozen players answers them in one place, which is also what
+makes an unbounded wait tolerable rather than lost.
+
+Where a model fits: a seat built like `musician` — narrow loadout, rc-driven,
+no human turn — that reads the tool plan and the classifier's signals and
+*prepares* the ask, writing a clear description and a recommendation. It does
+not decide; a human still answers. A cast slot is keyed by `context_type`, so
+casting that seat is a config line, exactly like casting a chair. Full record
+and the open pieces: `docs/issues.md`, "The escalation seat".
+
+Nothing here contradicts the beat doctrine — a musician on the grid should
+never hold a capability that can escalate in the first place. This is for
+players whose work is not quantized.
+
 ## Open items (the honest list)
 
 - **Per-track MIDI channel + per-track flush** — the sink is whole-queue today:

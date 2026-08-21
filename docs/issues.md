@@ -6,6 +6,73 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## An expired approval should become a tool error, not a silent stall (2026-08-21)
+
+Amy's direction, and the shape the escalation path is being built toward:
+
+> *"it can turn a blocker into a tool error. So if model is trudging along,
+> needs to `rm -rf` something and that catches, it should block for me, maybe an
+> hour or longer, but it would eventually get a tool call error and then another
+> turn to respond and either try again and block again or defer that and do
+> other tasks. But the operation would not go through without approval."*
+
+Three things follow, and the third is the one that makes it safe:
+
+1. **Expiry returns an error to the caller, not silence.** Today an escalated
+   ask blocks up to `gate_wait_timeout` (300 s) and Expires with nothing
+   informative reaching the model. It should arrive as a tool error the model
+   can read and act on — retry and block again, or set the task aside and do
+   other work.
+2. **The wait is situational, and some waits are unbounded.** 300 s is tuned
+   for a human at the keyboard. Amy: *"some of those blocks should be eternal;
+   block on the user indefinitely, possibly useful when I've wandered off to do
+   errands."* So the bound belongs to the ask, not to one global constant.
+3. **Expiry is never permission.** *"The operation would not go through without
+   approval."* An expired ask must fail closed, every time — a timeout is the
+   one path where a fail-open would be invisible.
+
+Why the ledger is the right home rather than per-context state: *"the ledger
+keeps the score in one place so I can work across lots of contexts."* One
+board, many contexts — which is also what makes an unbounded wait tolerable.
+
+Start simple. The first step is deciding what Expired *means* and returning it
+as an error; the per-ask bound comes after. Related: the escalation seat below,
+and `docs/chameleon.md` for what this means once players run continuously.
+
+## The escalation seat: a small model that prepares the ask (2026-08-21)
+
+Direction, not a spec — Amy, 2026-08-21: *"we'll use a standard model, like
+haiku, gemma 4, something smaller and fast, that can do moderate reasoning
+beyond what the classifier can do but still fail through to user approval if
+it's not certain… let's go incrementally and discover how they should fit
+together."*
+
+A seat built like `musician` — narrow loadout, driven by rc rather than by a
+human turn — that receives an escalated call, reads `KJ_TOOL_PLAN` and the
+lfm2d signals, and writes a clear description and a recommendation. **It does
+not decide.** A human still answers through `kj ledger`.
+
+What already exists, so the build is smaller than it looks: cast slots are
+keyed by `context_type` (`kj cast show house` lists one slot per seat), so a new
+seat gets its model from config with no code; rc gives it a stance and a
+loadout; the ledger gives it a durable place to write.
+
+What is missing is one thing, and enforcing lfm2d needs the same thing: **a
+structured return path.** A hook body's stdout is discarded — only the exit code
+and 512 bytes of stderr are read — and `approval_signals.stmt_seq`/`cmd_seq` are
+nullable and never populated, so nothing records which clause was judged. Widen
+that row and both lanes unblock.
+
+**Replying inline is a real option and worth designing for.** Blocks carry an
+author principal, so a reply in the seat's own context is *attributable* — which
+matters because contexts are multi-writer, and "someone said ok in the channel"
+is not authorization while "this principal said ok" is. Shape: the conversation
+is where deliberation happens and can be joined; `kj ledger` stays where the
+decision commits. A seat may relay a human's inline reply into a ledger
+decision only after checking the reply's principal is a human.
+
+---
+
 ## Tech-debt audits, 2026-08-20 — what is still open (lead-verified)
 
 Three read-only audits (editor + file I/O, ANSI/provenance/surface, kaish glue)
@@ -84,7 +151,12 @@ and the devlog. What remains:
   before it becomes the ask description a human reads. S.
 - **The `sh -c` guard is a grep over raw text:** `sh \`+newline+`-c`,
   `if sh -c …`, and `fish -c`/`ksh -c` pass; a heredoc line starting `sh -c`
-  is denied; a missing `jq`/`grep` fails open. The honest successor scores
+  is denied; and it fails **open** whenever `jq` cannot extract `.command` —
+  malformed input exits 1 with empty output, an absent key yields the literal
+  `null` — because a false `if` with no `else` returns 0 and the broker reads
+  that as Continue. (Not "a missing `jq`/`grep`", as this entry said until
+  2026-08-21: both are kaish builtins, so that case is unreachable. The defect
+  and its fix are unchanged.) The honest successor scores
   `KJ_TOOL_PLAN.commands[]` by `name` instead of regexing the blob. S once
   `plan` is the input.
 - **A human's interactive shell is gated by the guard too** (by design: the
@@ -92,6 +164,16 @@ and the devlog. What remains:
   and let rc soften it for interactive seats when the Ask outcome lands.
 
 ### rc scripts and comments
+
+- **`S10-checkin.kai`'s roster probe cannot detect the failure it checks for.**
+  `roster="$(kj context list --json | jq -r '.[]' | head -30)"` followed by
+  `rc=$?` captures **`head`'s** status, not `kj`'s or `jq`'s, so the
+  `READ-FAIL: context list` branch never fires — `head` succeeds on empty input.
+  Pre-existing, found during the 2026-08-21 `set -e` audit and deliberately not
+  fixed there (out of that lane's scope). kaish has no `pipefail`
+  (`set -o pipefail` exits 1), so the fix is to capture the producer's status
+  before piping: assign `kj context list --json` first, check it, then shape it.
+  S.
 
 - **The rc bootstrap gate is untested, and installing a missing seed is
   path-by-path.** `rpc.rs:1640` seeds only `if rc_fs.is_empty()`, so a script
@@ -104,7 +186,22 @@ and the devlog. What remains:
   partially-populated case (namespace non-empty, one seed path absent) has no
   coverage, and there is no bulk `kj rc reseed` for a kernel missing several.
   Order matters when installing by hand: a symlink seed's target must exist
-  first. S–M.
+  first. S–M. *`kj rc reseed` is in flight 2026-08-21.*
+- **A third link in the same chain, found 2026-08-21 and fixed the same day:**
+  `cargo` did not rebuild when `assets/defaults/rc/` changed. `include_dir!` is
+  not a tracked build input, so an edit to a seed file was invisible until some
+  `.rs` in `kaijutsu-kernel` changed — the seed tests passed against the
+  *previously embedded* copy while the binary carried the old script. Proved by
+  falsification: pointing a seed symlink at a nonexistent target left
+  `every_bare_path_seed_body_resolves_to_a_seeded_target` green, and the same
+  edit failed it correctly once a rebuild was forced. `crates/kaijutsu-kernel/
+  build.rs` now emits `rerun-if-changed=assets/defaults`. Worth remembering as a
+  method, not just a fix: **a green test proved nothing because the input under
+  test was never rebuilt.**
+- **`bassist` was a live-only `context_type`** — 11 rc paths in the kernel, no
+  repo seed, a cast slot in every band, and cited throughout
+  `docs/chameleon.md` — so a fresh checkout could not find it. Melted into
+  `assets/defaults/rc/bassist/` 2026-08-21.
 - **Older comments still cite rulings and dates** (e.g. `kj/ledger.rs` has
   five "Amy's ruling" mentions predating today's rule). Sweep them when the
   file is next touched — state the rule, point at docs. S, incremental.
