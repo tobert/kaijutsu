@@ -723,6 +723,84 @@ fn load_vars(conn: &Connection, statement_digest: &str) -> Result<(Vec<String>, 
     Ok((free, bound))
 }
 
+/// Find an ask that is redeemable RIGHT NOW for `statement_digests` +
+/// `presented_label` (`docs/gate-resume.md`'s "an answered ask is
+/// redeemable" half) — `status = 'allowed'`, no `approval_redemptions` row
+/// yet, `authorized_label` equal to `presented_label`, `context_id`/
+/// `principal_id` matching when supplied, and its own statement set (via
+/// `approval_ask_statements`) EXACTLY equal to `statement_digests` — not a
+/// subset and not a superset. Exactness matters: the gate never applies a
+/// submission partially (`AskCoverage::verdict`'s doc — a partially covered
+/// ask escalates rather than running part of itself), so an ask covering
+/// three statements must never authorize a call presenting only two of
+/// them, and a call presenting a fourth must never be waved through by an
+/// ask that only ever saw three. Both sides are compared as sets (not
+/// multisets): a statement digest repeating within one ask's own list is
+/// collapsed the same way `statement_digests` would be.
+///
+/// **Only a human's answer is redeemable.** A row with `auto_reason` set was
+/// decided by a rule or a classifier, never by a person: it is an audit
+/// record of a call that already completed, not an offer waiting to be
+/// taken. Including those would leave every rule-covered call minting a
+/// latent authorization — and the moment the rule was forgotten, the next
+/// identical request would silently redeem one instead of asking anybody.
+/// Declared here as a property of the row rather than left to each caller
+/// to remember after deciding.
+///
+/// Ties on `created_at` aside, returns the OLDEST match — mirrors
+/// [`crate::rules::redeem`]'s scoping (same label/context/principal
+/// parameters) so a backlog of equally-shaped allowed asks drains in the
+/// order they were created, not newest-first.
+pub fn find_redeemable(
+    conn: &Connection,
+    statement_digests: &[&str],
+    presented_label: &str,
+    context_id: Option<&[u8]>,
+    principal_id: Option<&[u8]>,
+) -> Result<Option<(String, crate::types::ApprovalStatus)>> {
+    use std::collections::BTreeSet;
+
+    let wanted: BTreeSet<&str> = statement_digests.iter().copied().collect();
+
+    let mut candidates_q = conn.prepare(
+        "SELECT request_id, status FROM approvals
+         WHERE status IN ('allowed', 'denied')
+           AND auto_reason IS NULL
+           AND authorized_label = ?1
+           AND (?2 IS NULL OR context_id = ?2)
+           AND (?3 IS NULL OR principal_id = ?3)
+           AND request_id NOT IN (SELECT request_id FROM approval_redemptions)
+         ORDER BY created_at ASC",
+    )?;
+    let candidates: Vec<(String, String)> = candidates_q
+        .query_map(params![presented_label, context_id, principal_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    for (request_id, status) in candidates {
+        let mut digest_q =
+            conn.prepare("SELECT statement_digest FROM approval_ask_statements WHERE request_id = ?1")?;
+        let has: BTreeSet<String> = digest_q
+            .query_map(params![request_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .collect();
+        let has_ref: BTreeSet<&str> = has.iter().map(String::as_str).collect();
+        if has_ref == wanted {
+            // Total because the query above admits exactly these two
+            // statuses; widening that `IN` clause without widening this
+            // is a compile error, not a silent misread.
+            let status = match status.as_str() {
+                "allowed" => crate::types::ApprovalStatus::Allowed,
+                _ => crate::types::ApprovalStatus::Denied,
+            };
+            return Ok(Some((request_id, status)));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
@@ -1216,5 +1294,226 @@ mod tests {
         let asc_filter = AskListFilter { newest_first: false, ..desc_filter };
         let (rows, _) = list_asks_filtered(&conn, &asc_filter).unwrap();
         assert_eq!(rows.iter().map(|r| r.request_id.clone()).collect::<Vec<_>>(), vec![first, second]);
+    }
+
+    // ── `find_redeemable` (locating a single-use redemption candidate) ────
+
+    /// A two-statement ask, both statements sharing `label` — the fixture
+    /// [`find_redeemable_requires_an_exact_statement_set_match`] is built
+    /// on: a partial digest presentation (just one of the two) must not
+    /// match, only the exact pair does.
+    fn two_statement_ask(label: &str) -> NewAsk {
+        let mut ask = ask_with_statement("fr-digest-a", VarBinding::Bound, label);
+        ask.statements.push(NewPlanStatement {
+            statement_digest: "fr-digest-b".into(),
+            rendered: "pwd".into(),
+            statement_kind: "command".into(),
+            commands: vec![crate::types::NewPlanCommand {
+                name: "pwd".into(),
+                args: vec![],
+                redirects: vec![],
+                backgrounded: false,
+            }],
+            vars: vec![],
+        });
+        ask
+    }
+
+    fn allow(conn: &Connection, request_id: &str) {
+        crate::decide::decide(conn, request_id, crate::decide::DecideInput { allow: true, ..Default::default() })
+            .unwrap();
+    }
+
+    /// Pins the redemption-fast-path's whole point: an allowed, unredeemed
+    /// ask whose statement set and label match is found; once
+    /// `decide::redeem_ask` consumes it, the identical query must no
+    /// longer find it. Falsified by deleting the `AND request_id NOT IN
+    /// (SELECT request_id FROM approval_redemptions)` clause from the
+    /// candidate query: the second `find_redeemable` call then still
+    /// returned `Some(request_id)` instead of the expected `None`,
+    /// confirming the assertion actually depends on that clause; reverted
+    /// afterward.
+    #[test]
+    fn find_redeemable_ignores_an_already_redeemed_ask() {
+        let conn = open_memory();
+        let ask = ask_with_statement("fr-redeemed", VarBinding::Bound, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &request_id);
+
+        assert_eq!(
+            find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None).unwrap(),
+            Some((request_id.clone(), crate::types::ApprovalStatus::Allowed)),
+            "an allowed, unredeemed ask matching label+digests must be found"
+        );
+
+        assert!(crate::decide::redeem_ask(&conn, &request_id).unwrap());
+
+        assert_eq!(
+            find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None).unwrap(),
+            None,
+            "an already-redeemed ask must not be found again"
+        );
+    }
+
+    /// The guarantee most likely to regress into a subset match by
+    /// accident: an ask covering TWO statements must not be redeemable by
+    /// a call presenting only one of their digests, and must not be
+    /// redeemable by a call presenting a digest the ask never covered
+    /// either — only the exact pair matches. Falsified by changing the
+    /// match condition from set equality (`has_ref == wanted`) to subset
+    /// containment (`wanted.is_subset(&has_ref)`): the single-digest
+    /// lookup then incorrectly returned `Some(request_id)` instead of the
+    /// expected `None`; reverted afterward.
+    #[test]
+    fn find_redeemable_requires_an_exact_statement_set_match() {
+        let conn = open_memory();
+        let ask = two_statement_ask("two statements");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &request_id);
+
+        assert_eq!(
+            find_redeemable(&conn, &["fr-digest-a"], "two statements", None, None).unwrap(),
+            None,
+            "presenting only one of the ask's two statements must not match"
+        );
+        assert_eq!(
+            find_redeemable(&conn, &["fr-digest-a", "fr-digest-c"], "two statements", None, None).unwrap(),
+            None,
+            "presenting one real digest plus one the ask never covered must not match either"
+        );
+        assert_eq!(
+            find_redeemable(&conn, &["fr-digest-a", "fr-digest-b"], "two statements", None, None).unwrap(),
+            Some((request_id, crate::types::ApprovalStatus::Allowed)),
+            "presenting the exact pair must match"
+        );
+    }
+
+    /// Guarantee 4's shape, carried into the redemption fast-path: a
+    /// digest match alone is not enough — the presented label must equal
+    /// what the ask actually authorized. Falsified by dropping the
+    /// `authorized_label = ?1` clause from the candidate query (matching
+    /// on digest set alone): the mismatched-label lookup then incorrectly
+    /// returned `Some(request_id)` instead of the expected `None`;
+    /// reverted afterward.
+    #[test]
+    fn find_redeemable_respects_authorized_label_mismatch() {
+        let conn = open_memory();
+        let ask = ask_with_statement("fr-label", VarBinding::Bound, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &request_id);
+
+        assert_eq!(find_redeemable(&conn, &["fr-label"], "rm /etc", None, None).unwrap(), None);
+        assert_eq!(find_redeemable(&conn, &["fr-label"], "rm target", None, None).unwrap(), Some((request_id, crate::types::ApprovalStatus::Allowed)));
+    }
+
+    /// When two allowed, unredeemed asks are both eligible, the backlog
+    /// must drain oldest-first, not newest-first — the same ordering
+    /// [`crate::claim::claim_next`] uses for its own queue. Falsified by
+    /// changing the candidate query's `ORDER BY created_at ASC` to `DESC`:
+    /// the lookup then returned `second` instead of the expected `first`;
+    /// reverted afterward.
+    #[test]
+    fn find_redeemable_returns_the_oldest_match_first() {
+        let conn = open_memory();
+        let ask = ask_with_statement("fr-oldest", VarBinding::Bound, "rm target");
+        let first = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &first);
+        // `created_at` has millisecond resolution — see claim.rs's own
+        // `claim_next_picks_the_oldest_pending_first` for why this sleep
+        // is load-bearing, not cosmetic.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &second);
+
+        assert_eq!(find_redeemable(&conn, &["fr-oldest"], "rm target", None, None).unwrap(), Some((first, crate::types::ApprovalStatus::Allowed)));
+    }
+
+    /// A `session`-scoped redemption boundary — not required by the task's
+    /// minimum list, but the same context/principal parameters
+    /// [`crate::rules::redeem`] takes deserve at least one round-trip test
+    /// each: a context/principal that doesn't match the ask's own must not
+    /// find it, and the ask's own context/principal must.
+    /// The gate hands a denial back to the caller that asked, then spends
+    /// it — so `find_redeemable` has to surface a denied ask, not only an
+    /// allowed one. Without this the caller would retry, find nothing, and
+    /// mint a duplicate ask forever (`docs/gate-resume.md`, rule 2).
+    /// Returning the status alongside the id is what lets the caller tell
+    /// the two answers apart; this function never interprets them.
+    ///
+    /// Falsified by narrowing the query's `status IN ('allowed','denied')`
+    /// back to `status = 'allowed'`: the denied ask was then not found and
+    /// the first assertion tripped. Reverted.
+    #[test]
+    fn find_redeemable_finds_a_denied_ask_and_says_it_was_denied() {
+        let conn = open_memory();
+        let ask = ask_with_statement("fr-denied", VarBinding::Free, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        crate::decide::decide(
+            &conn,
+            &request_id,
+            crate::decide::DecideInput { allow: false, ..Default::default() },
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_redeemable(&conn, &["fr-denied"], "rm target", None, None).unwrap(),
+            Some((request_id.clone(), crate::types::ApprovalStatus::Denied)),
+            "a denied ask carries an answer and must be found, marked denied"
+        );
+
+        crate::decide::redeem_ask(&conn, &request_id).unwrap();
+        assert_eq!(
+            find_redeemable(&conn, &["fr-denied"], "rm target", None, None).unwrap(),
+            None,
+            "once delivered, a denial is spent like an approval"
+        );
+    }
+
+    /// A rule-decided ask is an audit record, not an offer. Every call a
+    /// rule covers mints one of these; if they were redeemable, forgetting
+    /// the rule would hand the next identical request a stale
+    /// authorization nobody was asked for. Found when `kj ledger forget`
+    /// failed to take effect (kaijutsu `docs/gate-resume.md`).
+    ///
+    /// Falsified by dropping the `auto_reason IS NULL` clause: the
+    /// auto-allowed ask was found and the assertion tripped. Reverted.
+    #[test]
+    fn find_redeemable_ignores_an_ask_a_rule_decided() {
+        let conn = open_memory();
+        let ask = ask_with_statement("fr-auto", VarBinding::Free, "rm target");
+        let request_id = create_auto_allowed_ask(&conn, &ask, "rule:always").unwrap();
+
+        assert_eq!(
+            get_approval(&conn, &request_id).unwrap().unwrap().status,
+            ApprovalStatus::Allowed,
+            "fixture check: the ask really is allowed"
+        );
+        assert_eq!(
+            find_redeemable(&conn, &["fr-auto"], "rm target", None, None).unwrap(),
+            None,
+            "a rule's own decision must never be handed to a later request as an answer"
+        );
+    }
+
+    #[test]
+    fn find_redeemable_matches_only_the_supplied_context_and_principal() {
+        let conn = open_memory();
+        // `minimal_ask()` (via `ask_with_statement`) fixes context_id =
+        // [1,2,3,4], principal_id = [9,9,9].
+        let ask = ask_with_statement("fr-scope", VarBinding::Bound, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &request_id);
+
+        let other_context = vec![9, 8, 7, 6];
+        assert_eq!(
+            find_redeemable(&conn, &["fr-scope"], "rm target", Some(&other_context), Some(&[9, 9, 9])).unwrap(),
+            None,
+            "a different context must not match"
+        );
+        assert_eq!(
+            find_redeemable(&conn, &["fr-scope"], "rm target", Some(&[1, 2, 3, 4]), Some(&[9, 9, 9])).unwrap(),
+            Some((request_id, crate::types::ApprovalStatus::Allowed)),
+            "the ask's own context/principal must match"
+        );
     }
 }

@@ -159,6 +159,20 @@ pub enum McpError {
     #[error("gate for {by_hook} had nothing to answer it: {reason}")]
     GateUnavailable { by_hook: HookId, reason: String },
 
+    /// An `Ask` hook fired, a durable ask was recorded, and **nothing ran**
+    /// — a human has not answered yet. The third state the other two need
+    /// to be read against: `Denied` means someone said no, `GateUnavailable`
+    /// means the control was broken, and this means the question is open.
+    ///
+    /// Nothing here is a timeout. The call returns immediately and the ask
+    /// stays answerable for as long as it takes; the action runs when the
+    /// answer lands, not when this call returned. A model reading this
+    /// should do other work and come back, not retry in a loop — and above
+    /// all not learn "that action is refused", which is what collapsing this
+    /// into either neighbour would teach. See `docs/gate-resume.md`.
+    #[error("gate for {by_hook} is waiting on a human: {reason}")]
+    GatePending { by_hook: HookId, reason: String },
+
     #[error("tool `{tool}` on instance {instance} is not in this context's capability allow-set")]
     CapabilityDenied { instance: InstanceId, tool: String },
 

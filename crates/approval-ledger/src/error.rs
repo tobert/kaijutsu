@@ -105,6 +105,16 @@ pub enum LedgerError {
     /// a finished run's outcome does not silently get overwritten either.
     #[error("rc run {0} was already finished")]
     RunAlreadyFinished(String),
+
+    /// `redeem_ask` was asked to redeem a request that carries no answer —
+    /// it is still `pending`/`claimed`, or it ended `expired`/`abandoned`
+    /// without anyone deciding. A distinct variant from the plain
+    /// `Ok(false)` `redeem_ask` returns for an ask already redeemed:
+    /// conflating them would leave a caller unable to tell "nobody ever
+    /// answered this" from "the answer was already delivered", and the two
+    /// call for different responses (keep waiting vs. treat as spent).
+    #[error("approval request {request_id} carries no answer to redeem: status is `{status}`, not `allowed` or `denied`")]
+    NotDecided { request_id: String, status: String },
 }
 
 pub type Result<T> = std::result::Result<T, LedgerError>;

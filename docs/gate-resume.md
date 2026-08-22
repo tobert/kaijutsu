@@ -86,10 +86,40 @@ Three rules this has to keep, and the third is what makes it safe:
 
 1. **The action is persisted with the ask, not held in a stack frame.** A
    suspended call cannot survive a restart; a row can.
-2. **Approval is single-use.** An allowed ask authorizes exactly one
-   execution. It is not a rule and must not become one — a standing
-   permission is a different decision with a different UX (see
-   `gate-and-shell-split.md`, "Digest-keyed allow-always").
+2. **An answer is single-use, and a denial is an answer.** A decided ask —
+   allowed *or* denied — is delivered to exactly one retry and is then
+   spent. Allowed authorizes one execution and never becomes a standing
+   permission; that is what rules are for (see `gate-and-shell-split.md`,
+   "Digest-keyed allow-always").
+
+   Denied has to be redeemable for the same reason, found while writing
+   slice 1: if only allowed asks were consumable, a model whose request was
+   denied would retry, find nothing to redeem, create a *second* identical
+   ask, and be told `Pending` again — forever, with a human watching
+   duplicate rows pile up in `kj ledger list` and no way to make it stop by
+   answering. Today denial reaches the model as `Denied`; losing that would
+   be a regression, and the loop would be worse than the regression. One
+   question, one answer, delivered once.
+   **Only a human's undelivered answer is redeemable**, and both halves of
+   that were learned the hard way while building slice 1 — each found by a
+   test that refused to be weakened into passing.
+
+   A rule-decided ask (`auto_reason` set) is an *audit record of a call that
+   already completed*, not an offer. Every rule-covered call mints one. If
+   they were redeemable, `kj ledger forget` would not take effect: the next
+   identical request would find a stale authorization and silently use it
+   instead of asking anybody. Enforced in `find_redeemable`'s query — a
+   property of the row, not something each caller must remember after
+   deciding.
+
+   And **learning a rule spends the answer it was learned from.** `kj ledger
+   allow --remember always` decides an ask *and* mints a rule; the human said
+   yes once. While the rule stands, every covered call is answered by the
+   rule and never reaches the redemption step, so without this the source ask
+   would sit decided-and-unredeemed indefinitely — and would be the first
+   thing found the moment the rule was forgotten. One decision, one use,
+   whether the use is running the action or minting the rule.
+
 3. **Absence of an answer is never permission.** Unchanged from today, and
    now easier to hold: nothing times out into a verdict, because nothing
    times out at all. An ask sits `Pending` until a human moves it.
@@ -107,10 +137,25 @@ Prefer deleting a mechanism to generalizing it. With nothing blocking:
   distill-verb hold stays; it is a different problem.
 - `run_gate`'s poll loop and its `expire` call.
 
-`Slice 4.8`'s "a killed caller abandons its ask" needs rethinking rather
-than deleting: with no blocking caller, there is no death to detect.
-Abandonment becomes a property of the *context* (archived, concluded), not
-of a caller's liveness.
+`Slice 4.8`'s `AbandonOnDrop` goes too. It took the abandon signal from the
+wait being dropped, and there is no wait to drop.
+
+**Amy's ruling on what replaces it, 2026-08-22: nothing automatic.**
+
+> *"I think abandoned asks are kinda difficult to determine consistently so
+> we let them go stale and maybe have a janitor pick it up someday. So maybe
+> asks should have an abandoned state it's just not automatic, it's like
+> archive, we set it manually and when we have good evidence… that way an ask
+> from a context I abandoned hangs around, mostly just annoys me, I can mark
+> it abandoned, or when we archive we can sweep and mark asks abandoned.
+> that'll be like 90% of the solution."*
+
+So `Abandoned` stays in the ledger and loses its automatic caller. It becomes
+a state a human sets, the way archive is — plus a sweep at context-archive
+time later. A stale ask sitting in `kj ledger list` is an annoyance with an
+obvious manual fix, which is a better failure than a heuristic that marks the
+wrong asks abandoned and is hard to notice. Nothing here needs the guess, and
+guessing consistently is the part we cannot do.
 
 ## Open questions, with recommendations
 

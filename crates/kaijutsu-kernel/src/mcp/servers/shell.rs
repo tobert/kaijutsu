@@ -489,24 +489,29 @@ impl McpServerLike for ShellServer {
             // citing "Gate slice 1a, finding #1" — "passes tests, dies in
             // production"); the MCP path has no such hold, so it leans on
             // the ladder instead.
-            let wait = dispatcher.kernel().timeouts().effective_gate_wait();
             let outcome = crate::kj::gate::run_gate(
                 dispatcher.kernel_db(),
                 &caller,
                 spec,
-                wait,
                 dispatcher.kernel().ledger_flows(),
             )
             .await;
             if !outcome.allowed() {
-                // Both refusals fail closed, and both surface as `Protocol`
-                // here — `McpError::GateUnavailable` carries a `HookId` and
-                // this gate has no hook behind it. The distinction a model
-                // needs still arrives, in the reason `run_gate` wrote: a
-                // ledger fault says so in words rather than being dressed
+                // Every non-allowed outcome fails closed and all of them
+                // surface as `Protocol` here — the gate variants of
+                // `McpError` carry a `HookId` and this gate has no hook
+                // behind it. The distinction a model needs arrives in the
+                // words: a pending ask says it is waiting and how to answer,
+                // a ledger fault says it is broken, and neither is dressed
                 // up as somebody's decision.
+                let headline = match outcome.verdict {
+                    crate::kj::gate::GateVerdict::Pending => {
+                        "shell_write: waiting for approval"
+                    }
+                    _ => "shell_write: approval gate refused",
+                };
                 return Err(McpError::Protocol(format!(
-                    "shell_write: approval gate refused [{}]: {} — nothing was run",
+                    "{headline} [{}]: {} — nothing was run",
                     outcome.ask_description(),
                     outcome.reason
                 )));
@@ -764,44 +769,38 @@ mod tests {
         }
     }
 
-    /// `shell_write` is gated (`docs/gate-and-shell-split.md`, "Slice 4") —
-    /// a test that calls it synchronously now leaves a pending approval
-    /// ledger ask and must answer its own ask (the way a human running `kj
-    /// ledger allow` would) or the call blocks until `gate_wait_timeout`.
-    /// Spawn this BEFORE the call it answers, mirroring `kj::gate`'s own
-    /// test pattern (`an_answer_from_another_principal_is_honored`).
-    fn spawn_gate_answerer(
+    /// `shell_write` is gated (`docs/gate-and-shell-split.md`, "Slice 4"),
+    /// and `run_gate` never waits (`docs/gate-resume.md`): a test that calls
+    /// it synchronously gets `Pending`/`GatePending` back immediately, with
+    /// nothing run, and a durable ask already sitting in the ledger. Answer
+    /// that ask directly — no poll loop, no spawned task — the way a human
+    /// running `kj ledger allow` would from another shell, then retry the
+    /// same call to redeem it.
+    fn answer_pending_ask(
         db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
         allow: bool,
-    ) -> tokio::task::JoinHandle<String> {
-        tokio::spawn(async move {
-            for _ in 0..200 {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                let pending = {
-                    let db = db.lock();
-                    approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap()
-                };
-                if let Some(row) = pending.into_iter().next() {
-                    let db = db.lock();
-                    let conn = db.conn_for_ledger();
-                    approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
-                    approval_ledger::decide::decide(
-                        conn,
-                        &row.request_id,
-                        approval_ledger::decide::DecideInput {
-                            allow,
-                            decided_by: Some(b"test-approver"),
-                            decided_option: Some(if allow { "allow_once" } else { "deny" }),
-                            remember_scope: None,
-                            auto_reason: None,
-                        },
-                    )
-                    .unwrap();
-                    return row.request_id;
-                }
-            }
-            panic!("no pending gate ask appeared within 4s");
-        })
+    ) -> String {
+        let db = db.lock();
+        let conn = db.conn_for_ledger();
+        let row = approval_ledger::ask::list_pending(conn)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the gate must have left exactly one pending ask");
+        approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
+        approval_ledger::decide::decide(
+            conn,
+            &row.request_id,
+            approval_ledger::decide::DecideInput {
+                allow,
+                decided_by: Some(b"test-approver"),
+                decided_option: Some(if allow { "allow_once" } else { "deny" }),
+                remember_scope: None,
+                auto_reason: None,
+            },
+        )
+        .unwrap();
+        row.request_id
     }
 
     /// End-to-end through `broker.call_tool`: `facade:shell` alone (no `*`, no
@@ -848,12 +847,25 @@ mod tests {
         broker.set_binding(ctx_id, binding).await;
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let answerer = spawn_gate_answerer(d.kernel_db().clone(), true);
+        let pending = broker
+            .call_tool(call_write("echo hello-shell-write"), &cc, CancellationToken::new())
+            .await
+            .expect_err("an uncovered shell_write submission must escalate and return \
+                         immediately, nothing run");
+        match pending {
+            McpError::Protocol(ref msg) => assert!(
+                msg.contains("waiting for approval"),
+                "expected the pending headline, got: {msg}"
+            ),
+            other => panic!("expected a Protocol pending refusal, got {other:?}"),
+        }
+
+        answer_pending_ask(d.kernel_db().clone(), true);
+
         let result = broker
             .call_tool(call_write("echo hello-shell-write"), &cc, CancellationToken::new())
             .await
-            .expect("shell_write call should succeed");
-        answerer.await.unwrap();
+            .expect("shell_write call should succeed once the pending ask is answered");
 
         assert!(!result.is_error, "echo should not be an error");
         match result.content.first().expect("content") {
@@ -862,35 +874,6 @@ mod tests {
             }
             other => panic!("expected text content, got {other:?}"),
         }
-    }
-
-    /// A dispatcher variant with a SHORT `gate_wait_timeout`, for the tests
-    /// below that need an unanswered gate to expire quickly rather than
-    /// wait the production default.
-    async fn wired_with_short_gate_timeout() -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
-        let policy = kaijutsu_types::TimeoutPolicy {
-            gate_wait_timeout: std::time::Duration::from_millis(300),
-            ..kaijutsu_types::TimeoutPolicy::default()
-        };
-        let d = Arc::new(crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await);
-        d.set_self_arc();
-        let broker = Arc::new(Broker::new());
-        broker.set_kj_dispatcher(&d).await;
-        broker
-            .register(
-                Arc::new(ShellServer::new(Arc::downgrade(&broker))),
-                InstancePolicy::default(),
-            )
-            .await
-            .unwrap();
-        broker
-            .register(
-                Arc::new(ShellServer::new_read_only(Arc::downgrade(&broker))),
-                InstancePolicy::default(),
-            )
-            .await
-            .unwrap();
-        (broker, d)
     }
 
     /// The gate's deadline must be ordered under the broker's, so an
@@ -926,38 +909,39 @@ mod tests {
         );
     }
 
-    /// **Slice 4 spec test.** An uncovered `shell_write` submission escalates
-    /// and blocks on `gate_wait_timeout` — proven through the real
+    /// **Slice 1 spec test.** An uncovered `shell_write` submission escalates
+    /// and returns IMMEDIATELY, refusing — proven through the real
     /// `ShellServer` → `build_shell_gate_spec` → `run_gate` wiring, not just
     /// `run_gate` in isolation (`kj::gate`'s own
-    /// `an_uncovered_multi_statement_submission_escalates_and_expires`
-    /// covers the underlying mechanism).
+    /// `an_uncovered_multi_statement_submission_escalates` covers the
+    /// underlying mechanism). Nothing here times out (`docs/gate-resume.md`
+    /// — `run_gate` never waits): a rename of the old
+    /// `shell_write_with_no_answer_escalates_and_times_out_refusing_the_call`,
+    /// which pinned a wait that no longer exists.
     #[tokio::test]
-    async fn shell_write_with_no_answer_escalates_and_times_out_refusing_the_call() {
-        let (broker, d) = wired_with_short_gate_timeout().await;
+    async fn shell_write_with_no_answer_escalates_and_returns_pending_refusing_the_call() {
+        let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("timeout-shw"), None, principal);
+        let ctx_id = register_context(&d, Some("pending-shw"), None, principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
-        let start = std::time::Instant::now();
         let err = broker
             .call_tool(call_write("echo nobody-answers"), &cc, CancellationToken::new())
             .await
-            .expect_err("an unanswered gate must refuse, never hang forever or silently run");
-        assert!(start.elapsed() >= std::time::Duration::from_millis(300));
+            .expect_err("an unanswered gate must refuse immediately, never hang or silently run");
         match err {
             McpError::Protocol(msg) => assert!(
-                msg.to_lowercase().contains("expired"),
-                "an unanswered gate must expire, distinguishably from a hard denial: {msg}"
+                msg.contains("waiting for approval"),
+                "an unanswered gate must say it is waiting, distinguishably from a hard denial: {msg}"
             ),
             other => panic!("expected a Protocol refusal, got {other:?}"),
         }
     }
 
-    /// **Slice 4 spec test.** A multi-statement `shell_write` submission a
+    /// **Slice 1 spec test.** A multi-statement `shell_write` submission a
     /// human denies refuses the WHOLE call — the gate runs entirely before
     /// `execute_with_options` is ever called for this submission, so there
     /// is no partial-execution window to prove separately; this asserts the
@@ -965,6 +949,8 @@ mod tests {
     /// RULE-covered "one denied statement denies the whole ask" composition
     /// is unit-tested directly against `run_gate` in `kj::gate`
     /// (`a_denied_statement_among_several_refuses_the_whole_submission_and_names_it`).
+    /// First call escalates and returns immediately (nothing run); the
+    /// retry after a human denies is the one that carries the verdict.
     #[tokio::test]
     async fn shell_write_deny_refuses_the_whole_multi_statement_submission() {
         let (broker, d) = wired().await;
@@ -975,7 +961,21 @@ mod tests {
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
-        let answerer = spawn_gate_answerer(d.kernel_db().clone(), false);
+        let pending = broker
+            .call_tool(
+                call_write("echo one\necho two"),
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an uncovered submission must escalate and return immediately, nothing run");
+        assert!(
+            matches!(pending, McpError::Protocol(ref msg) if msg.contains("waiting for approval")),
+            "expected the pending headline, got {pending:?}"
+        );
+
+        answer_pending_ask(d.kernel_db().clone(), false);
+
         let err = broker
             .call_tool(
                 call_write("echo one\necho two"),
@@ -984,7 +984,6 @@ mod tests {
             )
             .await
             .expect_err("a denied gate must refuse the whole submission, not run any of it");
-        answerer.await.unwrap();
         match err {
             McpError::Protocol(msg) => assert!(
                 msg.to_lowercase().contains("denied"),
@@ -994,10 +993,12 @@ mod tests {
         }
     }
 
-    /// **Slice 4 spec test — required.** `kj ledger` (the SAME verb `kj cc
+    /// **Slice 1 spec test — required.** `kj ledger` (the SAME verb `kj cc
     /// send`'s ask is answered through) must see and answer a `shell_write`
     /// ask with no special-casing by origin: one answering surface for
-    /// every gated producer.
+    /// every gated producer. No concurrency needed any more: the first call
+    /// escalates and returns with the ask already durable, `kj ledger`
+    /// answers it directly, and the retry redeems the answer.
     #[tokio::test]
     async fn kj_ledger_answers_a_shell_write_ask_like_a_cc_send_ask() {
         let (broker, d) = wired().await;
@@ -1008,36 +1009,32 @@ mod tests {
         broker.set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
-        let broker2 = broker.clone();
-        let gate_call = tokio::spawn(async move {
-            broker2
-                .call_tool(
-                    call_write("echo answered-like-cc-send"),
-                    &cc,
-                    CancellationToken::new(),
-                )
-                .await
-        });
+        let pending = broker
+            .call_tool(
+                call_write("echo answered-like-cc-send"),
+                &cc,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an uncovered submission must escalate and return immediately, nothing run");
+        assert!(matches!(pending, McpError::Protocol(_)));
 
         let ledger_caller = test_caller();
-        let mut request_id = String::new();
-        for _ in 0..200 {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            let listing = d
-                .dispatch(&["ledger".to_string(), "list".to_string()], &ledger_caller)
-                .await;
-            if listing.message().contains("shell_gate") {
-                request_id = listing
-                    .message()
-                    .lines()
-                    .find(|l| l.contains("shell_gate"))
-                    .and_then(|l| l.split_whitespace().next())
-                    .expect("request id is the first column")
-                    .to_string();
-                break;
-            }
-        }
-        assert!(!request_id.is_empty(), "kj ledger list must show the shell_write ask");
+        let listing = d
+            .dispatch(&["ledger".to_string(), "list".to_string()], &ledger_caller)
+            .await;
+        assert!(
+            listing.message().contains("shell_gate"),
+            "kj ledger list must show the shell_write ask: {}",
+            listing.message()
+        );
+        let request_id = listing
+            .message()
+            .lines()
+            .find(|l| l.contains("shell_gate"))
+            .and_then(|l| l.split_whitespace().next())
+            .expect("request id is the first column")
+            .to_string();
 
         let allow = d
             .dispatch(
@@ -1047,9 +1044,13 @@ mod tests {
             .await;
         assert!(allow.is_ok(), "kj ledger allow must answer a shell_write ask: {allow:?}");
 
-        let result = gate_call
+        let result = broker
+            .call_tool(
+                call_write("echo answered-like-cc-send"),
+                &cc,
+                CancellationToken::new(),
+            )
             .await
-            .unwrap()
             .expect("shell_write call should succeed once kj ledger allows it");
         assert!(!result.is_error);
         match result.content.first().expect("content") {
@@ -1478,12 +1479,18 @@ mod tests {
         d.kernel().broker().set_binding(ctx_id, binding).await;
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
-        let answerer = spawn_gate_answerer(d.kernel_db().clone(), true);
+        let pending = broker
+            .call_tool(call_write("id"), &cc, CancellationToken::new())
+            .await
+            .expect_err("an uncovered submission must escalate and return immediately, nothing run");
+        assert!(matches!(pending, McpError::Protocol(_)));
+
+        answer_pending_ask(d.kernel_db().clone(), true);
+
         let result = broker
             .call_tool(call_write("id"), &cc, CancellationToken::new())
             .await
-            .expect("shell_write call should succeed");
-        answerer.await.unwrap();
+            .expect("shell_write call should succeed once the pending ask is answered");
         assert!(!result.is_error, "`id` should run and exit 0: {result:?}");
         match result.content.first().expect("content") {
             ToolContent::Text(s) => assert!(

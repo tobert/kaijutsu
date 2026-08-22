@@ -656,6 +656,15 @@ where that decision gets made.
 Sequenced so each lands with its own tests and nothing downstream depends
 on an unreleased kaish. Slice 6 is explicitly not scheduled.
 
+> **Slices 4.6 and 4.8 are SUPERSEDED (Amy, 2026-08-22).** The gate no longer
+> blocks: it records a durable ask, returns `GateVerdict::Pending`, and the
+> kernel runs the action when a human answers. 4.6's timeout ladder existed
+> only to keep an RPC alive across human think time, and 4.8's `AbandonOnDrop`
+> took its signal from a wait being dropped — there is no wait. `Abandoned`
+> survives as a state a human sets, never one the kernel infers. Read
+> `docs/gate-resume.md` before changing anything in this area; everything else
+> below still describes the live system.
+
 **Slice 1 — `kj hook`.** `list`/`show`/`remove`/`add`, wired to
 `Broker::persist_hook_insert`/`persist_hook_delete` + the matching in-memory
 `HookTables` mutation, gated by `KjDispatcher::require_cap` against a new

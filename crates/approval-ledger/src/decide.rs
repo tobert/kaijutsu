@@ -185,6 +185,68 @@ fn transition(
     }
 }
 
+/// Redeem a single-use, already-`allowed` ask (`docs/gate-resume.md`'s
+/// "an answered ask is redeemable" half). Returns `Ok(true)` if THIS call
+/// performed the redemption, `Ok(false)` if the answer was already
+/// delivered to an earlier call. Errors with [`LedgerError::NotDecided`]
+/// if the ask carries no answer at all — see that variant's doc for why
+/// this must not collapse into `Ok(false)`.
+///
+/// **A denial is an answer, and is redeemed like an approval.** An allowed
+/// ask authorizes one execution; a denied ask delivers one refusal. Both
+/// are spent afterward. Redeeming only approvals would leave a denied
+/// caller retrying, finding nothing to redeem, and creating a second
+/// identical ask — forever, with the answer already given and no way for a
+/// human to stop it by answering again. One question, one answer,
+/// delivered once. `docs/gate-resume.md` in kaijutsu carries the reasoning.
+///
+/// The caller decides what an answer *means*; this function only records
+/// that it was delivered. Read the status (via
+/// [`crate::ask::find_redeemable`] or `get_approval`) to know which it was.
+///
+/// Atomicity is the `approval_redemptions.request_id` PRIMARY KEY, not a
+/// SELECT-then-INSERT: the `INSERT OR IGNORE` below either changes one row
+/// (this call won) or zero (someone else's redemption already exists), and
+/// that row count — not a prior read — is the decision. `BEGIN IMMEDIATE`
+/// (`claim.rs`'s pattern) is not needed to arbitrate this race: unlike a
+/// `pending → claimed` transition, there is no window where two callers
+/// could each believe they are about to win before either writes, because
+/// SQLite itself, not this function, is what decides the `INSERT`'s
+/// outcome. The transaction below exists only so the redemption row and
+/// its `approval_events` row commit together, not to win a race.
+///
+/// The status check runs on `conn` directly, before the transaction opens,
+/// deliberately not re-checked inside it: `allowed` and `denied` are both
+/// terminal (`approvals_decided_is_immutable` in `schema.rs`), so a row
+/// read as either here can never read as anything else later — there is no
+/// staleness window to close.
+pub fn redeem_ask(conn: &Connection, request_id: &str) -> Result<bool> {
+    let status: Option<String> = conn
+        .query_row("SELECT status FROM approvals WHERE request_id = ?1", params![request_id], |row| row.get(0))
+        .optional()?;
+    let status = status.ok_or_else(|| LedgerError::NotFound(request_id.to_string()))?;
+    if status != "allowed" && status != "denied" {
+        return Err(LedgerError::NotDecided { request_id: request_id.to_string(), status });
+    }
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO approval_redemptions (request_id) VALUES (?1)",
+        params![request_id],
+    )?;
+    if inserted == 0 {
+        // Lost the race (or a plain repeat call) — no event, same
+        // reasoning as claim.rs's losing side: only a successful
+        // redemption writes anything.
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    events::append(&tx, request_id, EventKind::Redeemed, None, None, None, None, None)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ask::{create_ask, get_approval, list_events};
@@ -318,5 +380,96 @@ mod tests {
         crate::claim::claim(&conn, &request_id, b"alice").unwrap();
         let row = expire(&conn, &request_id).unwrap();
         assert_eq!(row.status, ApprovalStatus::Expired);
+    }
+
+    // ── `redeem_ask` (single-use consumption of an allowed ask) ──────────
+
+    /// Pins the single-use guarantee: the first redemption of an allowed
+    /// ask wins (`Ok(true)`) and writes exactly one `Redeemed` event; a
+    /// second call against the SAME request_id must NOT win a second time.
+    /// Falsified by deleting the `if inserted == 0 { return Ok(false) }`
+    /// early return so every call always appended an event and returned
+    /// `true` — with that change, `second` read `true` (expected `false`)
+    /// and `redeemed_count` read `2` (expected `1`), so both assertions
+    /// failed as expected; reverted afterward.
+    #[test]
+    fn redeeming_an_allowed_ask_twice_only_the_first_call_wins() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &request_id, DecideInput { allow: true, ..Default::default() }).unwrap();
+
+        let first = redeem_ask(&conn, &request_id).unwrap();
+        assert!(first, "the first redemption of an allowed ask must win");
+
+        let second = redeem_ask(&conn, &request_id).unwrap();
+        assert!(!second, "a second redemption of the same ask must NOT win");
+
+        let events = list_events(&conn, &request_id).unwrap();
+        let redeemed_count = events.iter().filter(|e| e.kind == EventKind::Redeemed).count();
+        assert_eq!(redeemed_count, 1, "only the winning redemption may write a Redeemed event");
+    }
+
+    /// Pins the distinction `LedgerError::NotDecided` exists to protect:
+    /// redeeming an ask that carries NO answer — still `pending`, or ended
+    /// `expired`/`abandoned` with nobody deciding — must be a loud error
+    /// naming the real status, never the `Ok(false)` an already-redeemed
+    /// ask returns. A caller that only checked for `Ok(false)` could
+    /// otherwise not tell "nobody answered" from "the answer was already
+    /// delivered", and those call for opposite next moves.
+    ///
+    /// Falsified by deleting the status pre-check so every call fell
+    /// through to the `INSERT OR IGNORE`: both `unwrap_err()` calls then
+    /// panicked on an `Ok(true)`, i.e. an unanswered ask got silently
+    /// redeemed. Reverted afterward.
+    #[test]
+    fn redeeming_an_unanswered_ask_errors_distinctly_from_already_redeemed() {
+        let conn = open_memory();
+
+        let pending = create_ask(&conn, &minimal_ask()).unwrap();
+        let err = redeem_ask(&conn, &pending).unwrap_err();
+        assert!(matches!(&err, LedgerError::NotDecided { status, .. } if status == "pending"));
+
+        let expired = create_ask(&conn, &minimal_ask()).unwrap();
+        expire(&conn, &expired).unwrap();
+        let err = redeem_ask(&conn, &expired).unwrap_err();
+        assert!(matches!(&err, LedgerError::NotDecided { status, .. } if status == "expired"));
+    }
+
+    /// **A denial is an answer, and is spent like an approval.** This is
+    /// the test that stops the loop described in `docs/gate-resume.md`: if
+    /// only approvals were redeemable, a denied caller would retry, find
+    /// nothing to redeem, and mint a second identical ask forever, while a
+    /// human watched duplicates pile up with no way to stop it by
+    /// answering. Redeeming does not *interpret* the answer — the caller
+    /// reads the status to learn which it was — it only records that the
+    /// answer was delivered, once.
+    ///
+    /// Falsified by restoring the `status != "allowed"` check that this
+    /// contract replaced: the first redemption then failed with
+    /// `NotDecided { status: "denied" }` instead of winning. Reverted.
+    #[test]
+    fn a_denied_ask_is_redeemable_exactly_once() {
+        let conn = open_memory();
+        let denied = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &denied, DecideInput { allow: false, ..Default::default() }).unwrap();
+
+        assert!(redeem_ask(&conn, &denied).unwrap(), "a denial must be deliverable once");
+        assert!(
+            !redeem_ask(&conn, &denied).unwrap(),
+            "a denial already delivered must not be delivered twice"
+        );
+
+        let events = list_events(&conn, &denied).unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.kind == EventKind::Redeemed).count(),
+            1,
+            "only the winning redemption may write a Redeemed event"
+        );
+    }
+
+    #[test]
+    fn redeeming_an_unknown_request_is_not_found() {
+        let conn = open_memory();
+        assert!(matches!(redeem_ask(&conn, "nope").unwrap_err(), LedgerError::NotFound(_)));
     }
 }

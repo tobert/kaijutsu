@@ -1302,6 +1302,14 @@ mod tests {
         panic!("no ask ever went pending");
     }
 
+    /// Run the gate once. It never blocks, so an escalation returns
+    /// `Pending` immediately and the caller comes back after answering
+    /// (`docs/gate-resume.md`). Most tests below call this twice: once to
+    /// raise the ask, once after a human answers to redeem it.
+    async fn gate_once(d: &crate::kj::KjDispatcher, c: &KjCaller, spec: GateSpec) -> crate::kj::gate::GateOutcome {
+        run_gate(&d.kernel_db.clone(), c, spec, d.kernel.ledger_flows()).await
+    }
+
     #[tokio::test]
     async fn ledger_list_is_empty_then_shows_a_gated_ask() {
         let d = test_dispatcher().await;
@@ -1311,27 +1319,19 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.message().contains("no pending approvals"));
 
-        // Fire a gate with a long budget in the background, leaving a
-        // pending ask; it must appear in the list.
-        let db = d.kernel_db.clone();
-        let caller = c.clone();
-        let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
-        });
-        let mut listed = String::new();
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
-            if result.message().contains("test ask") {
-                listed = result.message().to_string();
-                break;
-            }
-        }
+        // The gate escalates and returns immediately, leaving a pending
+        // ask; it must appear in the list.
+        let first = gate_once(&d, &c, spec()).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+
+        let listed = d.dispatch(&[s("ledger"), s("list")], &c).await;
+        assert!(listed.is_ok(), "{listed:?}");
+        let listed = listed.message().to_string();
         assert!(listed.contains("test ask"), "list must show the ask: {listed}");
         assert!(listed.contains("kj ledger allow"));
 
-        // Deny it through the verb; the gate must observe the refusal.
+        // Deny it through the verb; the next attempt must observe the
+        // refusal.
         let request_id = listed
             .lines()
             .find(|l| l.contains("test ask"))
@@ -1342,12 +1342,13 @@ mod tests {
             .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
             .await;
         assert!(result.is_ok(), "deny must succeed: {result:?}");
-        let outcome = gate.await.unwrap();
-        assert!(!outcome.allowed());
+
+        let second = gate_once(&d, &c, spec()).await;
+        assert!(!second.allowed());
         // A human said no. That IS a verdict — distinct from the gate
         // being unable to reach one.
-        assert_eq!(outcome.verdict, crate::kj::gate::GateVerdict::Denied);
-        assert_eq!(outcome.ask.expect("a denied ask has a row").request_id, request_id);
+        assert_eq!(second.verdict, crate::kj::gate::GateVerdict::Denied);
+        assert_eq!(second.ask.expect("a denied ask has a row").request_id, request_id);
     }
 
     #[tokio::test]
@@ -1355,26 +1356,9 @@ mod tests {
         let d = test_dispatcher().await;
         let c = test_caller();
 
-        let db = d.kernel_db.clone();
-        let caller = c.clone();
-        let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
-        });
-
-        let mut request_id = String::new();
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let db = d.kernel_db.lock();
-            if let Some(row) = approval_ledger::ask::list_pending(db.conn_for_ledger())
-                .unwrap()
-                .first()
-            {
-                request_id = row.request_id.clone();
-                break;
-            }
-        }
-        assert!(!request_id.is_empty());
+        let first = gate_once(&d, &c, spec()).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
         let result = d
             .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c)
@@ -1390,8 +1374,10 @@ mod tests {
         assert!(!again.is_ok());
         assert!(again.message().contains("not `pending`") || again.message().contains("already"));
 
-        let outcome = gate.await.unwrap();
-        assert!(outcome.allowed());
+        // The answer already given is redeemed by the next attempt.
+        let second = gate_once(&d, &c, spec()).await;
+        assert!(second.allowed());
+        assert_eq!(second.ask.expect("a redeemed ask has a row").request_id, request_id);
     }
 
     #[tokio::test]
@@ -1403,7 +1389,7 @@ mod tests {
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
+            run_gate(&db, &caller, spec(), &flows).await
         });
 
         let mut request_id = String::new();
@@ -1461,14 +1447,18 @@ mod tests {
         let d = test_dispatcher().await;
         let c = test_caller();
 
+        // A distinct label per verb, or the `deny` iteration's ask would
+        // collide with the `allow` iteration's (same digest + label) and get
+        // REDEEMED instead of freshly created — each iteration wants its own
+        // ask to decide.
+        fn spec_for(label: &str) -> GateSpec {
+            GateSpec { authorized_label: label.to_string(), ..spec() }
+        }
+
         for (verb, expected) in [("allow", "allowed ask"), ("deny", "denied ask")] {
-            let db = d.kernel_db.clone();
-            let flows = d.kernel.ledger_flows().clone();
-            let caller = c.clone();
-            let gate = tokio::spawn(async move {
-                run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
-            });
-            let request_id = wait_for_pending(&d).await;
+            let first = gate_once(&d, &c, spec_for(verb)).await;
+            assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+            let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
             let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], &c).await;
             assert!(result.is_ok(), "{verb} must succeed: {result:?}");
@@ -1477,7 +1467,6 @@ mod tests {
                 "`kj ledger {verb}` must report \"{expected}\", got: {}",
                 result.message()
             );
-            let _ = gate.await;
         }
     }
 
@@ -1724,7 +1713,7 @@ mod tests {
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
+            run_gate(&db, &caller, spec(), &flows).await
         });
         let request_id = wait_for_pending(&d).await;
 
@@ -1774,25 +1763,29 @@ mod tests {
         let d = test_dispatcher().await;
         let c = test_caller();
 
-        async fn decide_one(d: &crate::kj::KjDispatcher, c: &KjCaller, allow: bool) -> String {
-            let db = d.kernel_db.clone();
-            let caller = c.clone();
-            let flows = d.kernel.ledger_flows().clone();
-            let gate =
-                tokio::spawn(async move { run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await });
-            let request_id = wait_for_pending(d).await;
+        // A distinct label per decision, or the second ask would collide
+        // with the first's (same digest + label) and get REDEEMED instead
+        // of freshly created — this test wants two independent decided
+        // asks.
+        fn spec_for(label: &str) -> GateSpec {
+            GateSpec { authorized_label: label.to_string(), ..spec() }
+        }
+
+        async fn decide_one(d: &crate::kj::KjDispatcher, c: &KjCaller, label: &str, allow: bool) -> String {
+            let first = gate_once(d, c, spec_for(label)).await;
+            assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+            let request_id = first.ask.expect("an escalated ask has a row").request_id;
             let verb = if allow { "allow" } else { "deny" };
             let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], c).await;
             assert!(result.is_ok(), "{verb} must succeed: {result:?}");
-            let _ = gate.await;
             request_id
         }
 
-        let first = decide_one(&d, &c, false).await;
+        let first = decide_one(&d, &c, "first-target", false).await;
         // Force a distinct `created_at` millisecond so "newest first" is
         // asserting real ordering, not a coincidence.
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let second = decide_one(&d, &c, true).await;
+        let second = decide_one(&d, &c, "second-target", true).await;
 
         let capped = d
             .dispatch(&[s("ledger"), s("list"), s("--history"), s("--limit"), s("1")], &c)
@@ -1834,14 +1827,10 @@ mod tests {
         let label = "kaish-source";
         let rendered = "ls -la /srv/builds";
 
-        let db = d.kernel_db.clone();
-        let caller = c.clone();
-        let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, shell_spec(label, rendered), Duration::from_secs(30), &flows).await
-        });
+        let first = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
-        let request_id = wait_for_pending(&d).await;
         let result = d
             .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
             .await;
@@ -1851,35 +1840,30 @@ mod tests {
             "message must say what was remembered: {}",
             result.message()
         );
-        let outcome = gate.await.unwrap();
-        assert!(outcome.allowed(), "the answered ask itself must still be allowed");
 
-        // A rule now exists. Fire an IDENTICAL ask (same origin, label,
-        // rendered text) and let it run unattended, on a short budget —
-        // nobody calls `kj ledger allow` this time.
-        let db2 = d.kernel_db.clone();
-        let flows2 = d.kernel.ledger_flows().clone();
-        let outcome2 = run_gate(
-            &db2,
-            &c,
-            shell_spec(label, rendered),
-            Duration::from_millis(400),
-            &flows2,
-        )
-        .await;
+        // The next attempt at the same request redeems what just happened —
+        // here, since `--remember` just taught a rule, it is the rule
+        // matching rather than the specific ask being redeemed, but either
+        // way the answered ask must come back allowed.
+        let second = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert!(second.allowed(), "the answered ask itself must still be allowed");
+
+        // A rule now exists. Fire another IDENTICAL, wholly unattended ask —
+        // nobody calls `kj ledger allow` this time — and it must auto-allow.
+        let third = gate_once(&d, &c, shell_spec(label, rendered)).await;
 
         assert!(
-            outcome2.allowed(),
-            "a remembered allow rule must auto-allow the next identical ask: {outcome2:?}"
+            third.allowed(),
+            "a remembered allow rule must auto-allow the next identical ask: {third:?}"
         );
-        assert_eq!(outcome2.verdict, crate::kj::gate::GateVerdict::Allowed);
+        assert_eq!(third.verdict, crate::kj::gate::GateVerdict::Allowed);
         assert!(
-            outcome2.reason.contains("rule"),
+            third.reason.contains("rule"),
             "the reason must show this was a RULE decision, not a human one: {}",
-            outcome2.reason
+            third.reason
         );
-        let ask2 = outcome2.ask.expect("an auto-decided ask still gets a durable row");
-        assert_eq!(ask2.status, approval_ledger::types::ApprovalStatus::Allowed);
+        let ask3 = third.ask.expect("an auto-decided ask still gets a durable row");
+        assert_eq!(ask3.status, approval_ledger::types::ApprovalStatus::Allowed);
     }
 
     /// A `kj cc send`-shaped ask has a free `MESSAGE` variable, so
@@ -1891,14 +1875,10 @@ mod tests {
         let d = test_dispatcher().await;
         let c = test_caller();
 
-        let db = d.kernel_db.clone();
-        let caller = c.clone();
-        let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await
-        });
+        let first = gate_once(&d, &c, spec()).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
-        let request_id = wait_for_pending(&d).await;
         let result = d
             .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
             .await;
@@ -1922,8 +1902,11 @@ mod tests {
             result.message()
         );
 
-        let outcome = gate.await.unwrap();
-        assert!(outcome.allowed(), "the ask itself was allowed, independent of the refused rule");
+        // No rule was learned (refused above), so this redeems the answer
+        // on THIS ask, not a rule shortcut — the same request id comes back.
+        let second = gate_once(&d, &c, spec()).await;
+        assert!(second.allowed(), "the ask itself was allowed, independent of the refused rule");
+        assert_eq!(second.ask.expect("a redeemed ask has a row").request_id, request_id);
 
         let db = d.kernel_db.lock();
         let count: i64 = db
@@ -1944,19 +1927,17 @@ mod tests {
         let label = "kaish-source";
         let rendered = "echo session-scoped";
 
-        let db = d.kernel_db.clone();
-        let caller = c.clone();
-        let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, shell_spec(label, rendered), Duration::from_secs(30), &flows).await
-        });
-        let request_id = wait_for_pending(&d).await;
+        let first = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
         let result = d
             .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("session")], &c)
             .await;
         assert!(result.is_ok(), "{result:?}");
         assert!(result.message().contains("session"), "{}", result.message());
-        assert!(gate.await.unwrap().allowed());
+
+        let second = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert!(second.allowed());
 
         let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
         assert!(rules.is_ok(), "{rules:?}");
@@ -1980,16 +1961,13 @@ mod tests {
         let label = "kaish-source";
         let rendered = "echo forget-me";
 
-        let db = d.kernel_db.clone();
-        let caller = c.clone();
-        let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, shell_spec(label, rendered), Duration::from_secs(30), &flows).await
-        });
-        let request_id = wait_for_pending(&d).await;
+        let first = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
         d.dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
             .await;
-        assert!(gate.await.unwrap().allowed());
+        let second = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert!(second.allowed());
 
         let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
         let data = match &rules {
@@ -2008,18 +1986,17 @@ mod tests {
             rules_after.message()
         );
 
-        // The next identical ask must escalate — no rule left to auto-allow
-        // it, so an unattended short budget must expire, not allow.
-        let outcome = run_gate(
-            &d.kernel_db.clone(),
-            &c,
-            shell_spec(label, rendered),
-            Duration::from_millis(400),
-            d.kernel.ledger_flows(),
-        )
-        .await;
+        // The next identical ask must escalate again — no rule left to
+        // auto-allow it, and no prior answer left to redeem, so it lands
+        // back on a human exactly like a first-time ask: `Pending`, not a
+        // fault and not an allow.
+        let outcome = gate_once(&d, &c, shell_spec(label, rendered)).await;
         assert!(!outcome.allowed(), "a forgotten rule must not keep auto-allowing: {outcome:?}");
-        assert_eq!(outcome.verdict, crate::kj::gate::GateVerdict::Unavailable);
+        assert_eq!(
+            outcome.verdict,
+            crate::kj::gate::GateVerdict::Pending,
+            "a forgotten rule sends the next ask back to a human waiting, not a ledger fault"
+        );
     }
 
     #[tokio::test]
@@ -2437,7 +2414,7 @@ mod tests {
         let db = d.kernel_db.clone();
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await });
+        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows).await });
         let request_id = wait_for_pending(&d).await;
         let allow = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c).await;
         assert!(allow.is_ok(), "{allow:?}");
@@ -2468,7 +2445,7 @@ mod tests {
         let db = d.kernel_db.clone();
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), Duration::from_secs(30), &flows).await });
+        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows).await });
         let request_id = wait_for_pending(&d).await;
         {
             let db = d.kernel_db.lock();

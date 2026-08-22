@@ -252,6 +252,12 @@ pub enum EventKind {
     /// terminal status — guarantee 6's "recorded, never silently dropped
     /// or applied".
     LateDecision,
+    /// A single-use redemption of an already-`allowed` ask
+    /// (`decide::redeem_ask`) — the ask authorized exactly one execution,
+    /// and this is the record of the one call that consumed it. Never
+    /// written for a losing redemption attempt (an ask already redeemed),
+    /// the same way `claim`'s losing side writes no `Claimed` row.
+    Redeemed,
 }
 
 impl EventKind {
@@ -262,6 +268,7 @@ impl EventKind {
             Self::Expired => "expired",
             Self::Abandoned => "abandoned",
             Self::LateDecision => "late_decision",
+            Self::Redeemed => "redeemed",
         }
     }
 }

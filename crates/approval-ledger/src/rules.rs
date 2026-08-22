@@ -86,6 +86,26 @@ pub fn learn_from_approval(
         }
     }
 
+    // Learning a rule SPENDS the answer it was learned from. One human
+    // decision, one use — here the use is minting the rule rather than
+    // running the action once, and the action still proceeds because the
+    // rule now covers it.
+    //
+    // Without this the source ask sits decided and unredeemed for as long
+    // as the rule stands, because a covered call is answered by the rule
+    // and never reaches the redemption step at all. Forget the rule and
+    // that stale answer is the first thing the next identical call finds —
+    // so "forget" would not take effect, and a human decision from any
+    // time in the past would silently authorize a fresh request. Found by
+    // a test that refused to be weakened into passing.
+    //
+    // `INSERT OR IGNORE`: an ask whose answer was already delivered stays
+    // spent, and learning a rule from it is not a second use.
+    conn.execute(
+        "INSERT OR IGNORE INTO approval_redemptions (request_id) VALUES (?1)",
+        params![request_id],
+    )?;
+
     let rule_id = uuid::Uuid::now_v7().to_string();
     let now = now_millis();
     conn.execute(

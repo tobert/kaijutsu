@@ -388,7 +388,7 @@ CREATE TABLE IF NOT EXISTS approval_events (
     request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
     seq            INTEGER NOT NULL,
     kind           TEXT    NOT NULL
-        CHECK (kind IN ('claimed', 'decided', 'expired', 'abandoned', 'late_decision')),
+        CHECK (kind IN ('claimed', 'decided', 'expired', 'abandoned', 'late_decision', 'redeemed')),
     actor          BLOB,
     decided_option TEXT,
     remember_scope TEXT,
@@ -397,6 +397,28 @@ CREATE TABLE IF NOT EXISTS approval_events (
     created_at     INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     PRIMARY KEY (request_id, seq)
+);
+
+-- ── Approval redemptions (single-use consumption of an ALLOWED ask) ────
+-- Whether an `allowed` ask has already authorized its one execution
+-- (`docs/gate-resume.md`'s single-use redemption: an allowed ask must
+-- never become a standing permission — that is what `approval_rules` is
+-- for). A separate table, not an `approvals.redeemed_at` column, on
+-- purpose: `migrate()` above is built entirely from `CREATE ... IF NOT
+-- EXISTS` and has no ALTER-TABLE path (see the file header), so a new
+-- column on an existing table would silently never appear in a database
+-- that already ran an earlier `migrate()`. A new table needs no migration
+-- machinery at all. The PRIMARY KEY is also what makes redemption
+-- single-use in the concurrent case: a second `INSERT` for the same
+-- `request_id` is decided by SQLite itself (a PRIMARY KEY conflict, or a
+-- silent no-op under `INSERT OR IGNORE`), not by a read-then-write the
+-- caller has to get right — see `decide::redeem_ask`. CASCADE is correct
+-- here (unlike `approval_statement_*`): a redemption row is wholly owned
+-- by the one ask it marks spent, never shared.
+CREATE TABLE IF NOT EXISTS approval_redemptions (
+    request_id  TEXT    NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    redeemed_at INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
 -- ── Approval rules (standing "remember this" policy) ────────────────
@@ -659,6 +681,7 @@ mod tests {
             "approval_options",
             "approval_signals",
             "approval_events",
+            "approval_redemptions",
             "approval_rules",
             "ledger_generation",
             "rc_runs",

@@ -205,6 +205,11 @@ impl std::fmt::Debug for Broker {
 /// producer, one consumer, both in this file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PermissionAskOutcome {
+    /// A durable ask is recorded and nobody has answered yet. Nothing ran,
+    /// and nothing is waiting — the call returns now and the action runs
+    /// when the answer lands. Distinct from `Denied` and `Unavailable`
+    /// because the three teach a model three different next moves.
+    Pending(String),
     /// The gate resolved `Allowed`. The call proceeds.
     Proceed,
     /// The gate resolved `Denied` — a real verdict. `reason` is
@@ -1504,6 +1509,10 @@ impl Broker {
                         emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                         Err(McpError::GateUnavailable { by_hook: hook_id, reason })
                     }
+                    PhaseOutcome::GatePending { hook_id, reason } => {
+                        emit_gate_pending_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                        Err(McpError::GatePending { by_hook: hook_id, reason })
+                    }
                 };
             }
             PhaseOutcome::Deny { hook_id, reason } => {
@@ -1513,6 +1522,10 @@ impl Broker {
             PhaseOutcome::GateUnavailable { hook_id, reason } => {
                 emit_gate_unavailable_attribution(McpHookPhase::PreCall, &hook_id, &reason);
                 return Err(McpError::GateUnavailable { by_hook: hook_id, reason });
+            }
+            PhaseOutcome::GatePending { hook_id, reason } => {
+                emit_gate_pending_attribution(McpHookPhase::PreCall, &hook_id, &reason);
+                return Err(McpError::GatePending { by_hook: hook_id, reason });
             }
         }
 
@@ -1579,6 +1592,10 @@ impl Broker {
                         emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                         Err(McpError::GateUnavailable { by_hook: hook_id, reason })
                     }
+                    PhaseOutcome::GatePending { hook_id, reason } => {
+                        emit_gate_pending_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                        Err(McpError::GatePending { by_hook: hook_id, reason })
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -1620,6 +1637,10 @@ impl Broker {
             Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::OnError, &hook_id, &reason);
                 Err(McpError::GateUnavailable { by_hook: hook_id, reason })
+            }
+            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                emit_gate_pending_attribution(McpHookPhase::OnError, &hook_id, &reason);
+                Err(McpError::GatePending { by_hook: hook_id, reason })
             }
             Err(eval_err) => {
                 tracing::warn!(
@@ -1763,6 +1784,12 @@ impl Broker {
                                 reason,
                             });
                         }
+                        PermissionAskOutcome::Pending(reason) => {
+                            return Ok(PhaseOutcome::GatePending {
+                                hook_id: entry.id,
+                                reason,
+                            });
+                        }
                     }
                 }
                 HookAction::Invoke(body) => match body {
@@ -1809,6 +1836,12 @@ impl Broker {
                                     }
                                     PermissionAskOutcome::Unavailable(reason) => {
                                         return Ok(PhaseOutcome::GateUnavailable {
+                                            hook_id: entry.id,
+                                            reason,
+                                        });
+                                    }
+                                    PermissionAskOutcome::Pending(reason) => {
+                                        return Ok(PhaseOutcome::GatePending {
                                             hook_id: entry.id,
                                             reason,
                                         });
@@ -1902,7 +1935,6 @@ impl Broker {
             dispatcher.kernel_db(),
             &caller,
             gate_spec,
-            dispatcher.kernel().timeouts().effective_gate_wait(),
             dispatcher.kernel().ledger_flows(),
         )
         .await;
@@ -1949,6 +1981,22 @@ impl Broker {
                 );
                 PermissionAskOutcome::Unavailable(format!(
                     "permission ask: gate unavailable [{}]: {}",
+                    outcome.ask_description(),
+                    outcome.reason
+                ))
+            }
+            crate::kj::gate::GateVerdict::Pending => {
+                tracing::debug!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    ask = %outcome.ask_description(),
+                    "permission ask recorded; waiting for a human (nothing ran)",
+                );
+                PermissionAskOutcome::Pending(format!(
+                    "permission ask: waiting for a human [{}]: {}",
                     outcome.ask_description(),
                     outcome.reason
                 ))
@@ -2198,6 +2246,10 @@ impl Broker {
                 emit_gate_unavailable_attribution(McpHookPhase::PreCall, &hook_id, &reason);
                 ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
             }
+            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                emit_gate_pending_attribution(McpHookPhase::PreCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::GatePending { by_hook: hook_id, reason })
+            }
             Err(e) => ShellHookVerdict::Denied(e),
         }
     }
@@ -2234,6 +2286,10 @@ impl Broker {
             Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                 ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+            }
+            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                emit_gate_pending_attribution(McpHookPhase::PostCall, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::GatePending { by_hook: hook_id, reason })
             }
             Err(e) => ShellHookVerdict::Denied(e),
         }
@@ -2276,6 +2332,10 @@ impl Broker {
             Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::OnError, &hook_id, &reason);
                 ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+            }
+            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                emit_gate_pending_attribution(McpHookPhase::OnError, &hook_id, &reason);
+                ShellHookVerdict::Denied(McpError::GatePending { by_hook: hook_id, reason })
             }
             Err(e) => ShellHookVerdict::Denied(e),
         }
@@ -2521,6 +2581,10 @@ impl Broker {
                 emit_gate_unavailable_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
                 return;
             }
+            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                emit_gate_pending_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     context_id = %ctx,
@@ -2659,6 +2723,12 @@ enum PhaseOutcome {
     /// must be distinguishable to a model — `docs/gate-and-shell-split.md`).
     /// `reason` is tracing-only, same discipline as `Deny`.
     GateUnavailable { hook_id: HookId, reason: String },
+    /// An `Ask` hook fired, its ask committed, and nobody has answered yet.
+    /// Nothing ran and nothing waited — the gate does not block. Distinct
+    /// from both neighbours because the three answer different questions:
+    /// somebody said no, the control is broken, the question is open.
+    /// LLM-visible as `McpError::GatePending`; `reason` is tracing-only.
+    GatePending { hook_id: HookId, reason: String },
 }
 
 /// Per-phase payload for hook evaluation. Carries the data a phase observes
@@ -2741,6 +2811,10 @@ fn error_to_hook_json(e: &McpError) -> String {
         ),
         McpError::GateUnavailable { by_hook, reason } => (
             "GateUnavailable",
+            serde_json::json!({"by_hook": by_hook.to_string(), "reason": reason}),
+        ),
+        McpError::GatePending { by_hook, reason } => (
+            "GatePending",
             serde_json::json!({"by_hook": by_hook.to_string(), "reason": reason}),
         ),
         McpError::CapabilityDenied { instance, tool } => (
@@ -2915,6 +2989,18 @@ fn emit_gate_unavailable_attribution(phase: McpHookPhase, hook_id: &HookId, reas
         phase = ?phase,
         reason = %reason,
         "hook.gate_unavailable",
+    );
+}
+
+/// Attribution for a call that recorded an ask and returned without running.
+/// Its own event name, not `hook.gate_unavailable`: an operator counting
+/// broken gates must not be counting open questions.
+fn emit_gate_pending_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
+    tracing::info!(
+        hook_id = %format!("hook:{hook_id}"),
+        phase = ?phase,
+        reason = %reason,
+        "hook.gate_pending",
     );
 }
 
@@ -3174,6 +3260,14 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
+                    Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                        emit_gate_pending_attribution(
+                            McpHookPhase::OnNotification,
+                            &hook_id,
+                            &reason,
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             context_id = %ctx_id,
@@ -3246,6 +3340,14 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     }
                     Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
                         emit_gate_unavailable_attribution(
+                            McpHookPhase::OnNotification,
+                            &hook_id,
+                            &reason,
+                        );
+                        continue;
+                    }
+                    Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                        emit_gate_pending_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
                             &reason,
@@ -6358,7 +6460,10 @@ mod tests {
     /// escalate to an ask"): a `HookBody::Kaish` body that exits 3 does not
     /// deny outright — it escalates through the same ledger ask round trip
     /// `HookAction::Ask` uses, with the body's stderr tail as the ask's
-    /// description. Answered `allow`, the call proceeds.
+    /// description. The first call returns `GatePending` immediately
+    /// (`docs/gate-resume.md` — nothing blocks, nothing ran); once a human
+    /// answers `allow`, the SAME retried call redeems that answer and
+    /// proceeds.
     #[tokio::test]
     async fn kaish_hook_exit_3_escalates_and_allow_answer_proceeds() {
         let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-exit3-allow").await;
@@ -6382,22 +6487,29 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let answerer = spawn_gate_answerer(kj.kernel_db().clone(), true);
-        let result = broker
-            .call_tool(
-                params("svc", "t"),
-                &CallContext::test(),
-                CancellationToken::new(),
-            )
+        let cc = CallContext::test();
+        let pending = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
-            .expect("an allowed escalation must let the call proceed");
-        answerer.await.unwrap();
+            .expect_err("an exit-3 escalation must return immediately with nothing run");
+        assert!(
+            matches!(pending, McpError::GatePending { .. }),
+            "expected GatePending, got {pending:?}"
+        );
+
+        answer_pending_ask(kj.kernel_db().clone(), true);
+
+        let result = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
+            .await
+            .expect("the answered ask must let the retried call proceed");
         assert!(!result.is_error);
     }
 
     /// Same escalation, answered `deny` — a REAL verdict this time
     /// (`McpError::Denied`, not `GateUnavailable`), because a human actually
-    /// looked at it and said no.
+    /// looked at it and said no. Same "call, answer, call again" shape as
+    /// the allow case above.
     #[tokio::test]
     async fn kaish_hook_exit_3_escalates_and_deny_answer_denies() {
         let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-exit3-deny").await;
@@ -6419,16 +6531,22 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let answerer = spawn_gate_answerer(kj.kernel_db().clone(), false);
+        let cc = CallContext::test();
+        let pending = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
+            .await
+            .expect_err("an exit-3 escalation must return immediately with nothing run");
+        assert!(
+            matches!(pending, McpError::GatePending { .. }),
+            "expected GatePending, got {pending:?}"
+        );
+
+        answer_pending_ask(kj.kernel_db().clone(), false);
+
         let err = broker
-            .call_tool(
-                params("svc", "t"),
-                &CallContext::test(),
-                CancellationToken::new(),
-            )
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
             .expect_err("a denied escalation must deny the call");
-        answerer.await.unwrap();
         assert!(
             matches!(err, McpError::Denied { .. }),
             "expected Denied, got {err:?}"
@@ -8002,9 +8120,10 @@ mod tests {
 
     /// Wire a broker for hook-`Ask` tests: documents, kernel, and a real
     /// `kj` dispatcher — `run_permission_ask` now needs one to reach
-    /// `run_gate` (mirrors `wired_kaish_broker` above, plus a caller-supplied
-    /// `TimeoutPolicy` so the unanswered-ask test can shrink `gate_wait_timeout`
-    /// instead of waiting the real default).
+    /// `run_gate` (mirrors `wired_kaish_broker` above). Takes a
+    /// caller-supplied `TimeoutPolicy` for generality; `run_gate` itself
+    /// never waits (`docs/gate-resume.md`), so every caller here passes
+    /// the default.
     async fn wired_hook_ask_broker(
         name: &str,
         policy: kaijutsu_types::TimeoutPolicy,
@@ -8037,48 +8156,43 @@ mod tests {
         (broker, kj_dispatcher)
     }
 
-    /// A hook `Ask` is gated (like `shell_write`) — a test that calls it
-    /// synchronously leaves a pending ledger ask and must answer its own
-    /// ask (the way `kj ledger allow/deny` would from another shell) or
-    /// the call blocks until `gate_wait_timeout`. Spawn this BEFORE the
-    /// call it answers. Mirrors `mcp/servers/shell.rs`'s
-    /// `spawn_gate_answerer`.
-    fn spawn_gate_answerer(
+    /// Answer the one pending gate ask directly, the way `kj ledger
+    /// allow|deny <id>` would from another shell. No poll loop and no
+    /// spawned task: the ask row commits before `run_gate` returns
+    /// (`docs/gate-resume.md`), so by the time a test's first `call_tool`
+    /// has returned `GatePending`, the row is already there to answer.
+    /// Mirrors `mcp/servers/shell.rs`'s `answer_pending_ask`.
+    fn answer_pending_ask(
         db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
         allow: bool,
-    ) -> tokio::task::JoinHandle<String> {
-        tokio::spawn(async move {
-            for _ in 0..200 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                let pending = {
-                    let db = db.lock();
-                    approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap()
-                };
-                if let Some(row) = pending.into_iter().next() {
-                    let db = db.lock();
-                    let conn = db.conn_for_ledger();
-                    approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
-                    approval_ledger::decide::decide(
-                        conn,
-                        &row.request_id,
-                        approval_ledger::decide::DecideInput {
-                            allow,
-                            decided_by: Some(b"test-approver"),
-                            decided_option: Some(if allow { "allow_once" } else { "deny" }),
-                            remember_scope: None,
-                            auto_reason: None,
-                        },
-                    )
-                    .unwrap();
-                    return row.request_id;
-                }
-            }
-            panic!("no pending gate ask appeared within 4s");
-        })
+    ) -> String {
+        let db = db.lock();
+        let conn = db.conn_for_ledger();
+        let row = approval_ledger::ask::list_pending(conn)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the gate must have left exactly one pending ask");
+        approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
+        approval_ledger::decide::decide(
+            conn,
+            &row.request_id,
+            approval_ledger::decide::DecideInput {
+                allow,
+                decided_by: Some(b"test-approver"),
+                decided_option: Some(if allow { "allow_once" } else { "deny" }),
+                remember_scope: None,
+                auto_reason: None,
+            },
+        )
+        .unwrap();
+        row.request_id
     }
 
     /// A hook `Ask` answered **allow** through the ledger lets the call
-    /// proceed — the melt's happy path.
+    /// proceed — the melt's happy path. The first call escalates and
+    /// returns `GatePending` immediately (nothing run); once a human
+    /// answers, the SAME retried call redeems that answer.
     #[tokio::test]
     async fn a_hook_ask_answered_allow_lets_the_call_proceed() {
         let (broker, d) =
@@ -8096,17 +8210,28 @@ mod tests {
             .entries
             .push(ask_entry("ask-allow", None));
 
-        let answerer = spawn_gate_answerer(d.kernel_db().clone(), true);
-        let ok = broker
-            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+        let cc = CallContext::test();
+        let pending = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
-            .unwrap();
-        answerer.await.unwrap();
+            .expect_err("an uncovered ask must escalate and return immediately, nothing run");
+        assert!(
+            matches!(pending, McpError::GatePending { .. }),
+            "expected GatePending, got {pending:?}"
+        );
+
+        answer_pending_ask(d.kernel_db().clone(), true);
+
+        let ok = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
+            .await
+            .expect("the answered ask must let the retried call proceed");
         assert!(!ok.is_error);
     }
 
     /// A hook `Ask` answered **deny** through the ledger blocks the call
-    /// as `McpError::Denied` — a real verdict, not `GateUnavailable`.
+    /// as `McpError::Denied` — a real verdict, not `GateUnavailable`. Same
+    /// "call, answer, call again" shape as the allow case above.
     #[tokio::test]
     async fn a_hook_ask_answered_deny_blocks_the_call_as_denied() {
         let (broker, d) =
@@ -8124,27 +8249,40 @@ mod tests {
             .entries
             .push(ask_entry("ask-deny", Some("about to do something risky")));
 
-        let answerer = spawn_gate_answerer(d.kernel_db().clone(), false);
+        let cc = CallContext::test();
+        let pending = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
+            .await
+            .expect_err("an uncovered ask must escalate and return immediately, nothing run");
+        assert!(
+            matches!(pending, McpError::GatePending { .. }),
+            "expected GatePending, got {pending:?}"
+        );
+
+        answer_pending_ask(d.kernel_db().clone(), false);
+
         let err = broker
-            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
             .unwrap_err();
-        answerer.await.unwrap();
         assert!(matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "ask-deny"));
     }
 
-    /// Nobody answers, the (shrunk) `gate_wait_timeout` elapses, the ask
-    /// row expires — refused as `McpError::GateUnavailable`, distinguishably
-    /// from a human's `Denied` (Amy's ruling, 2026-08-17,
-    /// `docs/gate-and-shell-split.md`: "gate unavailable" and "denied"
-    /// must be distinguishable to a model).
+    /// Nobody answers — the call returns immediately as
+    /// `McpError::GatePending`, distinguishable from both a human's
+    /// `Denied` and a broken control's `GateUnavailable` (Amy's ruling,
+    /// 2026-08-22, `docs/gate-resume.md`): the question is open and
+    /// nothing ran. There is nothing left to time out — `run_gate` never
+    /// waits — so this is a rename of the old
+    /// `an_unanswered_hook_ask_expires_as_gate_unavailable`, not a new
+    /// behavior.
     #[tokio::test]
-    async fn an_unanswered_hook_ask_expires_as_gate_unavailable() {
-        let policy = kaijutsu_types::TimeoutPolicy {
-            gate_wait_timeout: Duration::from_millis(400),
-            ..kaijutsu_types::TimeoutPolicy::default()
-        };
-        let (broker, _d) = wired_hook_ask_broker("ask-timeout", policy).await;
+    async fn an_unanswered_hook_ask_returns_gate_pending_immediately() {
+        let (broker, _d) = wired_hook_ask_broker(
+            "ask-pending",
+            kaijutsu_types::TimeoutPolicy::default(),
+        )
+        .await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
             .register_silently(server, InstancePolicy::default())
@@ -8156,20 +8294,15 @@ mod tests {
             .await
             .pre_call
             .entries
-            .push(ask_entry("ask-timeout", None));
+            .push(ask_entry("ask-pending", None));
 
-        let started = std::time::Instant::now();
         let err = broker
             .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(
-            started.elapsed() >= Duration::from_millis(400),
-            "must actually wait out the gate's own budget, not resolve early",
-        );
         match err {
-            McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-timeout"),
-            other => panic!("expected GateUnavailable, got {other:?}"),
+            McpError::GatePending { by_hook, .. } => assert_eq!(by_hook.0, "ask-pending"),
+            other => panic!("expected GatePending, got {other:?}"),
         }
     }
 
@@ -8201,27 +8334,25 @@ mod tests {
         let target_ctx = ContextId::new();
         ctx.context_id = target_ctx;
 
-        let broker2 = broker.clone();
-        let gate_call = tokio::spawn(async move {
-            broker2
-                .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
-                .await
-        });
+        // The first call escalates and returns immediately — no waiting, no
+        // spawned task needed: the row is already durable by the time this
+        // returns (`docs/gate-resume.md`).
+        let pending = broker
+            .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
+            .await
+            .expect_err("an uncovered ask must escalate and return immediately, nothing run");
+        assert!(matches!(pending, McpError::GatePending { .. }));
 
         let db = d.kernel_db().clone();
-        let mut request_id = String::new();
-        for _ in 0..200 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let pending = {
-                let db = db.lock();
-                approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap()
-            };
-            if let Some(row) = pending.into_iter().next() {
-                request_id = row.request_id;
-                break;
-            }
-        }
-        assert!(!request_id.is_empty(), "no pending ask appeared within 4s");
+        let request_id = {
+            let db = db.lock();
+            approval_ledger::ask::list_pending(db.conn_for_ledger())
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("the escalated ask must be pending")
+                .request_id
+        };
 
         let row = {
             let db = db.lock();
@@ -8236,7 +8367,8 @@ mod tests {
         assert_eq!(row.description, "carries the row");
         assert_eq!(row.origin, approval_ledger::types::Origin::Hook);
 
-        // Let the spawned call finish so the test doesn't leak the task.
+        // The retry redeems the answer, proving the row isn't just shaped
+        // right but actually authorizes the retried call.
         {
             let db = db.lock();
             let conn = db.conn_for_ledger();
@@ -8254,10 +8386,10 @@ mod tests {
             )
             .unwrap();
         }
-        let result = gate_call
+        let result = broker
+            .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
             .await
-            .unwrap()
-            .expect("an allowed call must proceed");
+            .expect("an allowed retry must proceed");
         assert!(!result.is_error);
     }
 
