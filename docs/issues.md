@@ -38,17 +38,109 @@ quiet window (track when idleness was first observed, re-read at the end of it)
 rather than resolving on the first idle sample. An instantaneous read of a
 multi-writer log cannot distinguish "finished" from "between two blocks".
 
-## The coder's shell has no `git` (2026-08-22)
+## `command not found` hides "this shell refuses external commands" (2026-08-22)
 
-Found by a delegated coder, which reported it itself: *"`git` isn't installed
-here."* A coder asked to inspect a worktree cannot run `git log`, `git diff`,
-or `git status`. Related to the rc-shell/interactive-shell tool-set difference
-above; worth establishing deliberately what a coder is supposed to have, rather
-than discovering each gap from a model's confusion.
+**Corrected from an earlier reading of this entry, which blamed a missing
+binary.** A delegated coder reported *"`git` isn't installed here"* and
+abandoned a viable path. It was wrong, and the error message taught it the
+wrong thing.
 
-Also seen in the same run: `tool error: mcp protocol error: shell execution
-failed: vali…` — a kaish validation error surfacing to the model as an MCP
-protocol error, which is the wrong altitude for the reader.
+Confirmed against the live kernel and the archived context's own blocks:
+
+- `git` IS present — `/bin/git`, on the running kernel's `PATH`, the same PATH
+  that resolves `cargo`.
+- The coder's loadout DOES grant exec: `assets/defaults/rc/lib/create/
+  S10-binding.kai` runs `kj binding allow "exec"`, and its comment names git
+  explicitly.
+- The `shell` tool is structurally `ExternalExec::Deny` **regardless of the
+  exec capability** (`kernel/src/mcp/servers/shell.rs:148`). `shell_write` is
+  the exec-capable one. That split is deliberate — the constraint lives in the
+  tool *name* so a model does not waste a turn attempting a refused write — and
+  the tool's own schema says so honestly.
+- The runtime error throws that away. kaish's `try_execute_external` returns
+  `Ok(None)` identically for "external commands are disabled on this shell" and
+  "the binary is not in PATH", and both collapse into
+  `command not found: <name>`.
+
+So the model cannot tell "you are on the wrong shell tool" from "that program
+does not exist", even though kaish knows which happened. It concluded the
+binary was missing and stopped.
+
+**Fix is kaish-side and small**: when `try_execute_external` bails because
+external commands are disabled, say that, rather than returning the
+indistinguishable not-found path. kaish is the conservative repo, so this is
+proposed there rather than worked around here. No `ExternalExec` policy change
+and no second exec site — host exec has one owner.
+
+## Tool errors reach the model wearing broker-internal clothes (2026-08-22)
+
+Two independent defects, found tracing `tool error: mcp protocol error: shell
+execution failed: vali…`:
+
+**`ErrorPayload::summary_line()` drops everything after the first line.**
+`kaijutsu-types/src/block.rs:506` does `detail.lines().next()`. kaish's
+validator output is deliberately multi-line — line 1 is `validation failed:`
+and the *useful* part (the command named, the valid forms) is below it. So the
+human-facing block content keeps only the useless line. This is general, not
+kaish-specific: any multi-line error detail loses everything but its first
+line.
+
+**Every kaish failure is wrapped as a protocol error.**
+`kernel/src/mcp/servers/shell.rs:542` maps *all* `execute_with_options` errors
+— parse, validation, genuine IO fault — to `McpError::Protocol`, whose
+`Display` prepends `mcp protocol error:`. That type's own doc comment says it
+is broker-internal control flow meant to be converted at the LLM boundary; here
+it leaks verbatim. `ErrorCategory::Validation` already exists
+(`kaijutsu-types/src/block.rs:415`) and is never used for this.
+
+The model does still receive kaish's full text — `format_error_for_llm()` uses
+the whole `detail` — but behind two layers of internal vocabulary that suggest
+a plumbing fault rather than "your command was rejected, fix it and retry".
+
+Fix in two parts. `summary_line()` is small, local, and fixes every category at
+once. The altitude fix needs kaish to distinguish validation/parse failures
+from execution faults in its return type — cross-repo, and proposed there. A
+string-match stopgap at `shell.rs:542` is possible but fragile.
+
+Also noted while in there: on rehydrate (`llm/hydrate.rs:350`) the Error
+block's envelope is folded onto a `ToolResult.content` that already carries the
+same message, so after a fork the model can see it twice.
+
+## Blocks orphaned in `Running` have no supervisor (2026-08-22)
+
+Distinct from the mid-turn `kj wait` bug above — that one is a transient false
+positive from an instantaneous sample; this is a permanent stuck status.
+
+Every *returning* path finalizes correctly. `dispatch_and_map_tool_result`
+covers success, tool failure, cancellation and timeout, and a hard interrupt is
+cooperative — the cancellation token is threaded into the broker's own
+`select!`, so an interrupted tool call returns an `Err` rather than dropping a
+future. The gap is the writer dying:
+
+- `process_llm_stream` is `spawn_local`'d with **no retained `JoinHandle` and
+  no `catch_unwind`** (`kaijutsu-server/src/llm_stream.rs:492`). A panic between
+  "insert Running" and "set terminal status" silently kills the task; nothing
+  publishes `TurnFlow::Failed`, nothing finalizes the blocks.
+- **A kernel restart mid-turn leaves them forever.** `create_shared_kernel`'s
+  context recovery (`rpc.rs:1841`) re-bootstraps contexts, drift and
+  lost+found, and never touches block `Status`.
+- The existing reaper (`background_exec.rs:366`) sweeps only `background:true`
+  shell jobs — a structurally separate path that knows nothing about
+  `model/tool_call` / `tool/tool_result` blocks.
+- `hydrate`'s orphaned-tool_use repair (`llm/hydrate.rs:474`) synthesizes a
+  tool result into the in-memory `Vec<Message>` only; it never calls
+  `set_status`. So "exclude, then fork" fixes the next conversation's shape and
+  leaves the durable blocks wrong.
+
+Two fixes, independent. A **boot-time sweep** is the safe one: at cold start no
+live writer can exist, so any `Running`/`Pending` block is known-stale and can
+be failed with a reason — the same shape as the existing swap/file-buffer
+restart recovery. A **`catch_unwind` around the turn body** covers the panic
+case, and needs care that the mailbox lock releases on unwind.
+
+Note: once `kj wait` stops inferring liveness from block status, orphans no
+longer poison future waits — but the blocks are still wrong for anything that
+reads them, including the app.
 
 ## Asks vs forms — brief written, decision open (2026-08-22)
 
