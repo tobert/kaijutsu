@@ -1623,7 +1623,7 @@ interface World {
 }
 
 interface Kernel {
-  # Next free ordinal: 102. Ordinals are dense and permanent — never
+  # Next free ordinal: 103. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -1869,6 +1869,16 @@ interface Kernel {
   # Projected revision of a context's block document, with no oplog bytes:
   # clients use it for staleness/gap detection without decoding DTE.
   getContextVersion @35 (contextId :Data, trace :TraceContext) -> (version :UInt64);
+
+  # Whether a context has a turn executing right now. An agentic turn
+  # alternates model block → tool_call(running) → tool_result(done) → model
+  # block; between a tool result landing and the next model block appearing
+  # is a live LLM round trip during which nothing is Running or Pending, so
+  # block status alone cannot answer this (`Kernel::turn_in_flight`). A
+  # frontend without access to the kernel's turn-liveness registry — ACP's
+  # quiet-poll fallback, once per quiet window — asks here instead of
+  # inferring liveness from block state.
+  turnInFlight @102 (contextId :Data, trace :TraceContext) -> (inFlight :Bool);
 
   # Compact a context's oplog, bumping sync generation. Server-side
   # maintenance only (docs/change-feed.md "Deleted by this change") — a

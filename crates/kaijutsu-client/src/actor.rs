@@ -454,6 +454,10 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<u64, CallError>>,
     },
+    TurnInFlight {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<bool, CallError>>,
+    },
     CompactContext {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(u64, u64), CallError>>,
@@ -774,6 +778,7 @@ impl RpcCommand {
             Self::GetBlocksVersioned { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubscribeContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::TurnInFlight { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Execute { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ShellExecute { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1281,6 +1286,16 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn get_context_version(&self, context_id: ContextId) -> Result<u64, CallError> {
         self.send(|reply| RpcCommand::GetContextVersion { context_id, reply })
+            .await
+    }
+
+    /// Whether a context has a turn executing right now
+    /// (`Kernel::turn_in_flight`). A fallback poll for a caller that cannot
+    /// reach the kernel's turn-liveness registry directly, not a primary
+    /// signal — the change feed and turn events answer faster.
+    #[tracing::instrument(skip(self))]
+    pub async fn turn_in_flight(&self, context_id: ContextId) -> Result<bool, CallError> {
+        self.send(|reply| RpcCommand::TurnInFlight { context_id, reply })
             .await
     }
 
@@ -3397,6 +3412,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetContextVersion { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_context_version(context_id));
+        }
+        RpcCommand::TurnInFlight { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.turn_in_flight(context_id));
         }
         RpcCommand::CompactContext { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.compact_context(context_id));

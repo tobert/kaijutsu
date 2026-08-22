@@ -6434,6 +6434,31 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    /// Reads `Kernel::turn_in_flight` directly. A frontend that cannot reach
+    /// the kernel's turn-liveness registry (ACP's quiet-poll fallback) polls
+    /// this once per quiet window instead of inferring liveness from block
+    /// status, which is blind to the model round trip between a tool result
+    /// landing and the next model block.
+    fn turn_in_flight(
+        self: Rc<Self>,
+        params: kernel::TurnInFlightParams,
+        mut results: kernel::TurnInFlightResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "turn_in_flight").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        results
+            .get()
+            .set_in_flight(self.kernel.kernel.turn_in_flight(context_id));
+
+        Promise::ok(())
+    }
+
     fn subscribe_blocks_filtered(
         self: Rc<Self>,
         params: kernel::SubscribeBlocksFilteredParams,

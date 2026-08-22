@@ -1128,6 +1128,24 @@ impl KernelHandle {
         Ok(response.get()?.get_version())
     }
 
+    /// Whether a context has a turn executing right now
+    /// (`Kernel::turn_in_flight`). For a caller that cannot reach the
+    /// kernel's turn-liveness registry directly — a fallback poll, not a
+    /// primary signal; the change feed and turn events answer faster.
+    #[tracing::instrument(skip(self), name = "rpc_client.turn_in_flight")]
+    pub async fn turn_in_flight(&self, context_id: ContextId) -> Result<bool, RpcError> {
+        let mut request = self.kernel.turn_in_flight_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_in_flight())
+    }
+
     // =========================================================================
     // LLM operations
     // =========================================================================

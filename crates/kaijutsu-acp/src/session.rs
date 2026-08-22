@@ -492,26 +492,22 @@ pub enum TurnOutcome {
 /// lag-gated recovery never armed — second stuck toad same day.
 const TURN_WAIT_QUIET: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Whether a context's block state says no turn is executing: nothing
-/// `Running` and nothing `Pending`. Half of the quiet-poll fallback — the
-/// live signal is [`ServerEvent::TurnCompleted`]; this is the durable
-/// check when that signal was dropped.
-fn turn_is_idle(blocks: &[kaijutsu_types::BlockSnapshot]) -> bool {
-    use kaijutsu_types::Status;
-    !blocks
-        .iter()
-        .any(|b| matches!(b.status, Status::Running | Status::Pending))
-}
-
 /// The full quiet-poll verdict: the turn both RAN (a model-authored block
-/// exists at-or-after our prompt block) and SETTLED (nothing running or
-/// pending). The ran-guard is what makes unconditional quiet-polling safe:
-/// between `submit_input` and the model's first block the context is idle
-/// but the turn hasn't happened yet — resolving there would answer the
-/// prompt with `end_turn` before the model ever spoke.
-fn turn_ran_and_settled(blocks: &[kaijutsu_types::BlockSnapshot], prompt: &BlockId) -> bool {
+/// exists at-or-after our prompt block) and the kernel confirms no turn is
+/// in flight (`ActorHandle::turn_in_flight`, backed by
+/// `Kernel::turn_in_flight` — block status alone can't see the live LLM
+/// round trip between a tool result landing and the next model block). The
+/// ran-guard is what makes trusting the kernel's answer safe on its own:
+/// between `submit_input` and the model's first block the flag can read
+/// settled for an instant — resolving there would answer the prompt with
+/// `end_turn` before the model ever spoke.
+fn turn_ran_and_settled(
+    blocks: &[kaijutsu_types::BlockSnapshot],
+    prompt: &BlockId,
+    turn_in_flight: bool,
+) -> bool {
     use kaijutsu_types::Role;
-    if !turn_is_idle(blocks) {
+    if turn_in_flight {
         return false;
     }
     let Some(prompt_at) = blocks.iter().find(|b| b.id == *prompt).map(|b| b.created_at) else {
@@ -533,12 +529,13 @@ fn turn_ran_and_settled(blocks: &[kaijutsu_types::BlockSnapshot], prompt: &Block
 /// Dropped-completion recovery: the completion event can be lost anywhere
 /// on the lossy path (the kernel FlowBus overflowed live on 2026-08-05 —
 /// upstream of SSH, invisible to this side's `Lagged`), so waiting on the
-/// stream alone is not an option. Every quiet window triggers a poll of
-/// the context's block state; a turn that both ran and settled
-/// ([`turn_ran_and_settled`]) resolves as `EndTurn`. That stop reason is
-/// honest-best-effort, not exact — the true reason has no block-log shadow
-/// (`flows.rs`, "A subscriber that missed the push…"), which is the same
-/// gap the tracked turn-id/catch-up work will close properly.
+/// stream alone is not an option. Every quiet window triggers a poll of the
+/// kernel's turn-liveness flag and the context's block state; a turn that
+/// both ran and settled ([`turn_ran_and_settled`]) resolves as `EndTurn`.
+/// That stop reason is honest-best-effort, not exact — the true reason has
+/// no block-log shadow (`flows.rs`, "A subscriber that missed the push…"),
+/// which is the same gap the tracked turn-id/catch-up work will close
+/// properly.
 pub async fn run_turn(
     bridge: &KernelBridge,
     session: &Arc<Session>,
@@ -558,15 +555,31 @@ pub async fn run_turn(
         let incoming = match tokio::time::timeout(TURN_WAIT_QUIET, events.recv()).await {
             Ok(r) => r,
             Err(_quiet) => {
-                // Stream is quiet — poll ground truth.
-                match bridge.actor().get_all_blocks(context_id).await {
-                    Ok(blocks) if turn_ran_and_settled(&blocks, &block_id) => {
+                // Stream is quiet — poll ground truth: the kernel's
+                // turn-liveness flag (the model round trip block status
+                // can't see) and the block log (the ran-guard). A failed
+                // poll of either means "keep waiting", never "turn ended" —
+                // a wedged RPC must not end someone's turn.
+                let turn_in_flight = match bridge.actor().turn_in_flight(context_id).await {
+                    Ok(in_flight) => in_flight,
+                    Err(e) => {
                         tracing::warn!(
                             context = %context_id.short(),
-                            "turn wait resolved by quiet-poll: turn ran and settled \
-                             but no completion event arrived (dropped on the lossy \
-                             bus); reporting end_turn (exact stop reason \
-                             unrecoverable until the kernel catch-up story)"
+                            error = %e,
+                            "quiet-poll turn-liveness check failed; continuing to wait"
+                        );
+                        continue;
+                    }
+                };
+                match bridge.actor().get_all_blocks(context_id).await {
+                    Ok(blocks) if turn_ran_and_settled(&blocks, &block_id, turn_in_flight) => {
+                        tracing::warn!(
+                            context = %context_id.short(),
+                            "turn wait resolved by quiet-poll: the kernel reports \
+                             no turn in flight and the model has replied, but no \
+                             completion event arrived (dropped on the lossy bus); \
+                             reporting end_turn (exact stop reason unrecoverable \
+                             until the kernel catch-up story)"
                         );
                         settle_delivery(bridge, session, context_id).await;
                         emit_usage_update(bridge, session, session_id, cx).await;
@@ -819,42 +832,14 @@ mod tests {
         );
     }
 
-    /// Lag recovery's ground-truth check: a context with any Running or
-    /// Pending block is still executing; only a fully-settled block set
-    /// (done/error) counts as idle. First live hit 2026-08-05 — FlowBus
-    /// overflow dropped the TurnCompleted and toad spun over a finished
-    /// answer.
+    /// The quiet-poll's full verdict. The ran-guard is what makes trusting
+    /// the kernel's `turn_in_flight` answer safe: idle-before-the-model-
+    /// speaks must NOT resolve, and the prompt block alone is not evidence
+    /// the turn ran. A turn the kernel reports as in flight never resolves,
+    /// regardless of what the block log shows — block status is blind to
+    /// the live LLM round trip the kernel flag exists to catch.
     #[test]
-    fn lag_recovery_idle_means_no_running_or_pending_blocks() {
-        use kaijutsu_types::Status;
-        let c = ctx();
-        let p = PrincipalId::new();
-        let block = |seq: u64, status: Status| {
-            BlockSnapshotBuilder::new(BlockId::new(c, p, seq), BlockKind::Text)
-                .role(Role::Model)
-                .status(status)
-                .build()
-        };
-
-        assert!(turn_is_idle(&[]), "an empty context is idle");
-        assert!(turn_is_idle(&[block(0, Status::Done), block(1, Status::Error)]));
-        assert!(
-            !turn_is_idle(&[block(0, Status::Done), block(1, Status::Running)]),
-            "a streaming block means the turn is live — never resolve early"
-        );
-        assert!(
-            !turn_is_idle(&[block(0, Status::Pending)]),
-            "a queued tool call means the turn is live — never resolve early"
-        );
-    }
-
-    /// The quiet-poll's full verdict. The ran-guard is what makes polling
-    /// on EVERY quiet window safe (the drop can happen kernel-side, where
-    /// no client `Lagged` ever fires — second stuck toad, 2026-08-05):
-    /// idle-before-the-model-speaks must NOT resolve, and the prompt block
-    /// alone is not evidence the turn ran.
-    #[test]
-    fn quiet_poll_requires_a_model_response_and_a_settled_context() {
+    fn quiet_poll_requires_a_model_response_and_no_turn_in_flight() {
         use kaijutsu_types::Status;
         let c = ctx();
         let bridge_p = PrincipalId::new();
@@ -870,19 +855,28 @@ mod tests {
         let prompt = mk(bridge_p, 1, Role::User, Status::Done, 100);
         let prompt_id = prompt.id;
 
-        // Submitted but the model hasn't spoken: idle, yet NOT settled.
-        assert!(!turn_ran_and_settled(std::slice::from_ref(&prompt), &prompt_id));
+        // Submitted but the model hasn't spoken: no turn in flight, yet NOT
+        // settled — a model block after the prompt is required.
+        assert!(!turn_ran_and_settled(std::slice::from_ref(&prompt), &prompt_id, false));
         // Prompt not even visible yet: not settled.
-        assert!(!turn_ran_and_settled(&[], &prompt_id));
-        // Model replied and everything is done: settled.
+        assert!(!turn_ran_and_settled(&[], &prompt_id, false));
+        // Model replied and the kernel confirms no turn in flight: settled.
         let reply = mk(model_p, 1, Role::Model, Status::Done, 200);
-        assert!(turn_ran_and_settled(&[prompt.clone(), reply.clone()], &prompt_id));
-        // Model replied but a tool call is still running: not settled.
-        let tool = mk(model_p, 2, Role::Model, Status::Running, 300);
-        assert!(!turn_ran_and_settled(&[prompt.clone(), reply.clone(), tool], &prompt_id));
+        assert!(turn_ran_and_settled(
+            &[prompt.clone(), reply.clone()],
+            &prompt_id,
+            false
+        ));
+        // Model replied, but the kernel reports a turn in flight (a tool
+        // call still running, or a follow-up round trip in progress): not
+        // settled, regardless of block state.
+        assert!(!turn_ran_and_settled(
+            &[prompt.clone(), reply.clone()],
+            &prompt_id,
+            true
+        ));
         // A model block from BEFORE our prompt (prior turn) is not evidence.
         let stale = mk(model_p, 0, Role::Model, Status::Done, 50);
-        assert!(!turn_ran_and_settled(&[prompt, stale], &prompt_id));
+        assert!(!turn_ran_and_settled(&[prompt, stale], &prompt_id, false));
     }
-
 }
