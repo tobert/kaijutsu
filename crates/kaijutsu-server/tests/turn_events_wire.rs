@@ -197,8 +197,14 @@ fn cancelled_turn_pushes_a_cancelled_stop_reason() {
 /// with a seed has, until now, had no way to learn the child acted
 /// (`request_child_turn` is fire-and-forget); it can now wait on this push
 /// instead of polling the child's block log.
+///
+/// This is also the ONE path that actually publishes `turn.requested` — an
+/// interactive `prompt()` calls `spawn_llm_for_prompt` directly and never
+/// touches the bus, so `onTurnStarted` can only be observed on the autonomous
+/// (`kj fork`/`kj drive`/drift) path. Hence this test, not the interactive
+/// one above, is where `TurnStarted` gets exercised.
 #[test]
-fn autonomous_fork_turn_pushes_completed_for_the_child() {
+fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
     run_local(async {
         let addr = start_server_with_mock_llm().await;
         let client = connect_client(addr).await;
@@ -221,38 +227,40 @@ fn autonomous_fork_turn_pushes_completed_for_the_child() {
             .expect("kj fork accepted");
         let _ = block_id;
 
-        // Wait for the child's turn outcome. We don't know the child's context
-        // id up front, so accept the first Autonomous outcome that isn't the
-        // parent's.
+        // The child's context id is not known up front, so the FIRST signal
+        // this test can key on is `TurnStarted` for a context that isn't the
+        // parent's. `TurnFlow::Requested` carries no `origin` field, so this
+        // is the only filter available — and it is enough, since nothing
+        // else in this test drives a turn on any other context.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let outcome = loop {
+        let child_ctx = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
                 !remaining.is_zero(),
-                "no autonomous turn outcome arrived — the fork's turn never announced"
+                "no TurnStarted arrived — the fork's turn request never announced"
             );
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(
-                    ev @ (ServerEvent::TurnCompleted {
-                        origin: TurnOrigin::Autonomous,
-                        ..
-                    }
-                    | ServerEvent::TurnFailed {
-                        origin: TurnOrigin::Autonomous,
-                        ..
-                    }),
-                )) => break ev,
+                Ok(Ok(ServerEvent::TurnStarted { context_id, .. })) if context_id != main_ctx => {
+                    break context_id;
+                }
                 Ok(Ok(_)) => continue,
                 Ok(Err(e)) => panic!("turn push channel error: {e}"),
-                Err(_) => panic!("timed out waiting for the child's turn outcome"),
+                Err(_) => panic!("timed out waiting for the child's TurnStarted"),
             }
         };
 
-        match outcome {
-            ServerEvent::TurnCompleted { context_id, .. } => {
-                assert_ne!(
-                    context_id, main_ctx,
-                    "the CHILD took the turn; the parent is untouched (POSIX fork)"
+        // Now that the child's context is known, the outcome push must name
+        // that SAME context and be tagged Autonomous.
+        match recv_turn_event(&mut rx, child_ctx).await {
+            ServerEvent::TurnCompleted { context_id, origin, .. } => {
+                assert_eq!(
+                    context_id, child_ctx,
+                    "TurnStarted and TurnCompleted must name the same child context"
+                );
+                assert_eq!(
+                    origin,
+                    TurnOrigin::Autonomous,
+                    "a `kj fork --prompt` turn is autonomous"
                 );
             }
             ServerEvent::TurnFailed { error, .. } => {

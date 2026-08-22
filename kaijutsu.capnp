@@ -736,9 +736,12 @@ interface EditorEvents {
 # status — a heuristic that cannot tell "finished" from "cancelled" from "still
 # thinking", and that gets slower and less certain as a turn gets longer.
 #
-# Mirrors kernel `TurnFlow::Completed`/`Failed` (kaijutsu-kernel/src/flows.rs);
-# `TurnFlow::Requested` deliberately stays in-process (it is a request TO the
-# server's turn driver, which nothing outside the process can serve).
+# Mirrors kernel `TurnFlow::Completed`/`Failed`/`Requested`
+# (kaijutsu-kernel/src/flows.rs). `Requested` itself stays in-process — it is
+# a request TO the server's turn driver, which nothing outside the process
+# can serve — but onTurnStarted forwards the fact that one was accepted, so a
+# client can widen its block-event subscription before the turn's blocks
+# start landing rather than only after the outcome arrives.
 
 # Why a turn stopped. 1:1 with kernel `TurnStopReason` and with the ACP v1
 # `stopReason` vocabulary — end_turn / cancelled / max_tokens /
@@ -764,7 +767,7 @@ enum TurnOrigin {
 # `subscribeEditor` — the event names its context rather than the subscription
 # filtering to one, so a client watching several contexts needs one channel.
 interface TurnEvents {
-  # Next free ordinal: 2. Ordinals are dense and permanent — never
+  # Next free ordinal: 3. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -778,6 +781,17 @@ interface TurnEvents {
   # a cancelled turn arrives as onTurnCompleted with a cancelled stopReason.
   onTurnFailed @1 (contextId :Data, principalId :Data, error :Text,
                    origin :TurnOrigin);
+  # A turn was REQUESTED for contextId — the driver has accepted it but has
+  # not produced anything yet. The early signal a client widening its
+  # block-event subscription needs: by the time onTurnCompleted/onTurnFailed
+  # arrives, the turn is already over.
+  #
+  # Autonomous turns only — `kj drive`, `kj fork --prompt`, and drift are
+  # the paths that publish a request. An interactive prompt drives the LLM
+  # directly and fires no onTurnStarted, so this is not a general "a turn
+  # is beginning" signal and a client must not treat its absence as "no
+  # turn is running". Every turn still reports onTurnCompleted/onTurnFailed.
+  onTurnStarted @2 (contextId :Data, principalId :Data);
 }
 
 # ============================================================================

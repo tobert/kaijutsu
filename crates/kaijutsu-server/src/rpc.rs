@@ -3430,18 +3430,22 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    /// Push channel: bridges the kernel's `TurnFlow` outcome bus onto the
-    /// client's `TurnEvents` callback — the wire half of turn completion.
+    /// Push channel: bridges the kernel's `TurnFlow` bus onto the client's
+    /// `TurnEvents` callback — the wire half of turn lifecycle.
     ///
     /// Same shape as `subscribe_editor` (FlowBus subscribe → spawn_local bridge
-    /// → per-callback timeout → health reaping → dies with the connection), and
-    /// kernel-wide for the same reason: the event names its own context, so one
-    /// subscription serves a client watching many.
+    /// → per-callback timeout → health reaping), and kernel-wide for the same
+    /// reason: the event names its own context, so one subscription serves a
+    /// client watching many.
     ///
-    /// It subscribes to `turn.completed`/`turn.failed` and NOT `turn.*` on
-    /// purpose. `turn.requested` is a request *to* this server's turn driver;
-    /// forwarding it would tell a client about work it cannot do and cannot
-    /// observe the result of any other way.
+    /// Subscribes to all three `TurnFlow` topics. `turn.completed`/`turn.failed`
+    /// are the outcome and a dropped one is CRITICAL, so `FlowRecv::Terminated`
+    /// disconnects the client to force a resync. `turn.requested` only feeds
+    /// `onTurnStarted` — an early heads-up so a client can widen its block
+    /// subscription before the turn writes anything — and a dropped one costs
+    /// only that early warning, not a fact: the outcome push (or polling)
+    /// still lands the truth once the turn ends. Its `Terminated` case logs
+    /// and keeps the connection rather than disconnecting.
     fn subscribe_turn_events(
         self: Rc<Self>,
         params: kernel::SubscribeTurnEventsParams,
@@ -3461,14 +3465,17 @@ impl kernel::Server for KernelImpl {
             };
 
             tokio::task::spawn_local(async move {
-                // Two subscriptions, two independent queues. Turn outcomes are
-                // rare and CRITICAL — a dropped `Completed` is what left an ACP
-                // prompt promise unresolved forever on 2026-08-05 — and the
+                // Three subscriptions, three independent queues. Turn outcomes
+                // are rare and CRITICAL — a dropped `Completed` is what left an
+                // ACP prompt promise unresolved forever on 2026-08-05 — and the
                 // per-subscription queues mean bulk block/text pressure cannot
                 // evict, delay, or terminate them: those ride a different bus
-                // entirely.
+                // entirely. `requested` is not in that class (see its arm
+                // below) but still gets its own queue so it can't starve or be
+                // starved by the outcome subscriptions.
                 let mut completed = turn_flows.subscribe("turn.completed");
                 let mut failed = turn_flows.subscribe("turn.failed");
+                let mut requested = turn_flows.subscribe("turn.requested");
                 let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
                 const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
                 log::debug!("Started turn-events subscription for kernel {}", kernel_id);
@@ -3585,6 +3592,52 @@ impl kernel::Server for KernelImpl {
                                 ref other => {
                                     log::error!(
                                         "turn.failed subscription delivered {}: bus routing bug",
+                                        other.subject()
+                                    );
+                                    true
+                                }
+                            }
+                        }
+                        Some(ev) = requested.recv_event() => {
+                            let msg = match ev {
+                                kaijutsu_kernel::flows::FlowRecv::Message(m) => m,
+                                // Unlike `completed`/`failed`, a dropped
+                                // `Requested` is not a lost fact: it only costs
+                                // a client the early widen-my-subscription
+                                // signal, and the outcome push (or the
+                                // client's own polling) still lands the truth
+                                // about the turn once it ends. Log and keep
+                                // the connection, rather than disconnecting
+                                // over a missed heads-up.
+                                kaijutsu_kernel::flows::FlowRecv::Terminated(info) => {
+                                    tracing::warn!(
+                                        kernel = %kernel_id,
+                                        topic = info.topic,
+                                        delivered = info.delivered,
+                                        "turn-started subscriber fell behind — a client \
+                                         may widen its block subscription late, but the \
+                                         turn's own outcome push still lands"
+                                    );
+                                    continue;
+                                }
+                            };
+                            match msg.payload {
+                                TurnFlow::Requested {
+                                    context_id,
+                                    principal_id,
+                                    ..
+                                } => {
+                                    let mut req = callback.on_turn_started_request();
+                                    {
+                                        let mut p = req.get();
+                                        p.set_context_id(context_id.as_bytes());
+                                        p.set_principal_id(principal_id.as_bytes());
+                                    }
+                                    await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
+                                }
+                                other => {
+                                    log::error!(
+                                        "turn.requested subscription delivered {}: bus routing bug",
                                         other.subject()
                                     );
                                     true

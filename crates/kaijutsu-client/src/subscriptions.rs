@@ -200,6 +200,17 @@ pub enum ServerEvent {
         /// Who asked for the turn.
         origin: TurnOrigin,
     },
+    /// A turn was requested for `context_id` — the driver has accepted it but
+    /// has not produced anything yet. The early signal for a client that isn't
+    /// already watching this context: widen the block-event subscription now,
+    /// before [`ServerEvent::TurnCompleted`]/[`ServerEvent::TurnFailed`]
+    /// arrives too late to observe what the turn wrote.
+    TurnStarted {
+        /// The context the turn will run in.
+        context_id: ContextId,
+        /// The principal the turn will run as.
+        principal_id: kaijutsu_types::PrincipalId,
+    },
 }
 
 /// Why a turn stopped — client-owned mirror of the wire `TurnStopReason` enum
@@ -525,8 +536,9 @@ pub(crate) struct TurnEventsForwarder {
 /// Build a `TurnEvents` callback client plus the receiver its pushes land on.
 ///
 /// Pass the returned client to [`KernelHandle::subscribe_turn_events`](crate::rpc::KernelHandle::subscribe_turn_events);
-/// drain the receiver for [`ServerEvent::TurnCompleted`] /
-/// [`ServerEvent::TurnFailed`]. Shaped exactly like [`editor_events_channel`] —
+/// drain the receiver for [`ServerEvent::TurnStarted`] /
+/// [`ServerEvent::TurnCompleted`] / [`ServerEvent::TurnFailed`]. Shaped
+/// exactly like [`editor_events_channel`] —
 /// one place builds the push callback, and the headless e2e tests, the app, and
 /// a future ACP adapter all share that wiring.
 ///
@@ -705,6 +717,50 @@ impl turn_events::Server for TurnEventsForwarder {
             .is_err()
         {
             tracing::warn!("Event channel closed, dropping TurnFailed event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_turn_started(
+        self: Rc<Self>,
+        params: turn_events::OnTurnStartedParams,
+        _results: turn_events::OnTurnStartedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let context_id = match params.get_context_id() {
+            Ok(bytes) => match ContextId::try_from_slice(bytes) {
+                Some(id) => id,
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "invalid context_id on TurnStarted".into(),
+                    ));
+                }
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let principal_id = match params.get_principal_id() {
+            Ok(bytes) => match kaijutsu_types::PrincipalId::try_from_slice(bytes) {
+                Some(id) => id,
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "invalid principal_id on TurnStarted".into(),
+                    ));
+                }
+            },
+            Err(e) => return Promise::err(e),
+        };
+        if self
+            .event_tx
+            .send(ServerEvent::TurnStarted {
+                context_id,
+                principal_id,
+            })
+            .is_err()
+        {
+            tracing::warn!("Event channel closed, dropping TurnStarted event");
         }
         Promise::ok(())
     }
@@ -1735,6 +1791,63 @@ mod turn_events_tests {
                 }
                 other => panic!("expected TurnFailed, got {other:?}"),
             }
+        });
+    }
+
+    /// A requested turn round-trips its context and principal ids.
+    #[test]
+    fn started_round_trips() {
+        run_local(async {
+            let (client, mut rx) = turn_events_channel(16);
+            let ctx = ContextId::new();
+            let principal = PrincipalId::new();
+
+            let mut req = client.on_turn_started_request();
+            {
+                let mut p = req.get();
+                p.set_context_id(ctx.as_bytes());
+                p.set_principal_id(principal.as_bytes());
+            }
+            req.send().promise.await.expect("callback delivered");
+
+            match rx.try_recv().expect("a TurnStarted event arrived") {
+                ServerEvent::TurnStarted {
+                    context_id,
+                    principal_id,
+                } => {
+                    assert_eq!(context_id, ctx);
+                    assert_eq!(principal_id, principal);
+                }
+                other => panic!("expected TurnStarted, got {other:?}"),
+            }
+        });
+    }
+
+    /// A malformed context id on `onTurnStarted` fails the callback loudly,
+    /// same as the outcome events — a swapped/short id here would tell a
+    /// client to widen its subscription on the wrong context.
+    #[test]
+    fn started_malformed_context_id_is_an_error_not_a_guess() {
+        run_local(async {
+            let (client, mut rx) = turn_events_channel(16);
+            let mut req = client.on_turn_started_request();
+            {
+                let mut p = req.get();
+                p.set_context_id(&[0u8; 3]); // not 16 bytes
+                p.set_principal_id(PrincipalId::new().as_bytes());
+            }
+            let err = match req.send().promise.await {
+                Ok(_) => panic!("a 3-byte context id must not decode"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("context_id"),
+                "the error should name the bad field, got: {err}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be published from a malformed push"
+            );
         });
     }
 
