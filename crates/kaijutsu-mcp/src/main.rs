@@ -2,20 +2,22 @@
 //!
 //! Exposes the kaijutsu kernel to MCP clients (Claude Code, opencode).
 //!
-//! ## Subcommands
+//! ## Usage
 //!
-//!   # MCP stdio server (default when no subcommand given)
+//!   # MCP stdio server — the default, and the only way to run it
 //!   cargo run -p kaijutsu-mcp
-//!   cargo run -p kaijutsu-mcp -- serve --connect
+//!   cargo run -p kaijutsu-mcp -- --connect
 //!
 //!   # One-shot hook client — reads stdin, sends to daemon socket
 //!   cargo run -p kaijutsu-mcp -- hook
 //!   cargo run -p kaijutsu-mcp -- hook --socket /tmp/kj-hook.sock
 //!
-//! ## Backward Compatibility
-//!
-//! The old flags (`--connect`, `--host`, `--port`, etc.) still work when no
-//! subcommand is specified — they default to `serve`.
+//! There is no `serve` subcommand. It used to exist alongside these
+//! top-level flags, declaring the same six options a second time, so
+//! `--connect serve` set the top-level copy while the subcommand read its
+//! own — and ran local while the caller believed it had connected. One
+//! declaration means that cannot happen; `serve` is now a loud parse error
+//! rather than a quiet wrong mode.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,21 +41,20 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    // Top-level flags for backward compatibility (same as ServeArgs).
-    // When no subcommand is given, these are used directly.
+    // The server's options live here and ONLY here. Declaring them a second
+    // time on a subcommand gives clap two fields for one flag, and the one
+    // the caller sets is not necessarily the one the code reads.
     #[command(flatten)]
     serve: ServeArgs,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// MCP stdio server with optional hook socket.
-    Serve(ServeArgs),
     /// One-shot hook client: reads stdin JSON, sends to daemon socket, prints response.
     Hook(HookArgs),
 }
 
-/// Connection and server arguments — shared shape for top-level + serve subcommand.
+/// Connection and server arguments. Declared once, at the top level.
 #[derive(Args, Debug, Clone)]
 struct ServeArgs {
     /// Connect to kaijutsu-server via SSH (uses ssh-agent for auth)
@@ -123,7 +124,6 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Hook(args)) => run_hook_client(args).await,
-        Some(Command::Serve(args)) => run_serve(args).await,
         None => run_serve(cli.serve).await,
     }
 }
@@ -493,6 +493,29 @@ mod tests {
     use super::*;
 
     // -- normalize_hook_input (item 1) --
+
+    #[test]
+    fn connect_is_declared_once_so_it_cannot_be_read_from_the_wrong_field() {
+        // `--connect` with no subcommand is what both live MCP configs pass.
+        let cli = Cli::try_parse_from(["kaijutsu-mcp", "--connect"]).expect("bare --connect parses");
+        assert!(cli.serve.connect, "the flag must reach the field run_serve reads");
+        assert!(cli.command.is_none(), "no subcommand means serve");
+    }
+
+    /// `--connect serve` used to set the top-level copy of the flag while
+    /// `run_serve` read the subcommand's own — so it ran local and answered
+    /// "requires --connect" to a caller that had passed exactly that. With one
+    /// declaration the same input is a parse error instead of a wrong mode.
+    #[test]
+    fn the_old_silently_local_invocation_is_now_a_parse_error() {
+        let err = Cli::try_parse_from(["kaijutsu-mcp", "--connect", "serve"])
+            .expect_err("`serve` is not a subcommand any more");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "an unrecognized positional must be refused, never absorbed"
+        );
+    }
 
     #[test]
     fn normalize_hook_input_reformats_pretty_json() {
