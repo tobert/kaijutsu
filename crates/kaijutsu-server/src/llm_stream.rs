@@ -489,6 +489,19 @@ pub(crate) async fn spawn_llm_for_prompt(
 
     let after_block_id = *after_block_id;
 
+    // Mark the turn begun before spawning — synchronously, on this call's own
+    // stack, not inside the spawned task. This is the interactive counterpart
+    // of `publish_turn_request`'s mark (kaijutsu-kernel/src/kj/fork.rs): the
+    // autonomous path is already marked by the time this function runs (the
+    // turn driver only gets here after consuming a `Requested` that marked
+    // it), so this mark is a harmless re-insert there. For the two
+    // interactive callers (`prompt`/`submit_input` in rpc.rs), which publish
+    // no `TurnFlow::Requested`, this is the only mark — and it lands before
+    // this function returns to its RPC caller, so a `kj wait` issued right
+    // after the RPC response cannot race it. `process_llm_stream` always
+    // publishes exactly one terminal `TurnFlow` (§7 above), which clears it.
+    kernel_arc.mark_turn_begun(context_id);
+
     tokio::task::spawn_local(process_llm_stream(
         provider,
         documents,
@@ -1226,6 +1239,7 @@ async fn process_llm_stream(
                 error: format!("hydration policy unreadable: {e}"),
                 origin,
             });
+            kernel.mark_turn_ended(context_id);
             return;
         }
     };
@@ -1250,6 +1264,7 @@ async fn process_llm_stream(
                 error: "hydration failed: could not read conversation history".to_string(),
                 origin,
             });
+            kernel.mark_turn_ended(context_id);
             return;
         }
     };
@@ -1501,6 +1516,7 @@ async fn process_llm_stream(
                             error: format!("LLM stream failed to start: {e}"),
                             origin,
                         });
+                        kernel.mark_turn_ended(context_id);
                         return;
                     }
                 }
@@ -1821,6 +1837,7 @@ async fn process_llm_stream(
                             error: detail,
                             origin,
                         });
+                        kernel.mark_turn_ended(context_id);
                         return;
                     }
                 }
@@ -2068,6 +2085,7 @@ async fn process_llm_stream(
                         error: format!("LLM stream error: {err}"),
                         origin,
                     });
+                    kernel.mark_turn_ended(context_id);
                     return;
                 }
             }
@@ -2369,6 +2387,7 @@ async fn process_llm_stream(
         reason: stop_reason_out,
         origin,
     });
+    kernel.mark_turn_ended(context_id);
 }
 
 #[cfg(test)]

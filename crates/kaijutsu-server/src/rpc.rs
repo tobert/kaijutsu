@@ -603,6 +603,13 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                             error: err,
                             origin: TurnOrigin::Autonomous,
                         });
+                        // spawn_llm_for_prompt failed before it could mark
+                        // the turn begun itself (see its doc comment) — but
+                        // publish_turn_request already marked it when this
+                        // Requested was published, and no process_llm_stream
+                        // will ever run to clear it. Clear it here so the
+                        // context doesn't read "in flight" forever.
+                        kernel.kernel.mark_turn_ended(context_id);
                     }
                 }
             }

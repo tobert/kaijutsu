@@ -1370,6 +1370,17 @@ impl KjDispatcher {
     /// turn by publishing on the FlowBus. A `delivered == 0` return means no
     /// driver is listening; callers decide how to surface that (fork writes an
     /// Error block; `kj drive` returns an error to the user directly).
+    ///
+    /// Marks the context's turn begun (`Kernel::mark_turn_begun`) before
+    /// publishing — synchronously, in this call, not in the turn driver that
+    /// later consumes the request. See that method's doc for why the ordering
+    /// matters: a caller that publishes and immediately `kj wait`s must
+    /// already observe the turn as in flight.
+    ///
+    /// `delivered == 0` means no turn driver will ever consume this request,
+    /// so no `Completed`/`Failed` will ever follow to clear the mark — this
+    /// clears it right back before returning, rather than leaving the context
+    /// stuck "in flight" until the kernel restarts.
     pub(crate) fn publish_turn_request(
         &self,
         context_id: ContextId,
@@ -1377,15 +1388,21 @@ impl KjDispatcher {
         content: &str,
         principal_id: kaijutsu_types::PrincipalId,
     ) -> usize {
-        self.kernel()
-            .turn_flows()
-            .publish(crate::flows::TurnFlow::Requested {
-                context_id,
-                after_block_id,
-                content: content.to_string(),
-                principal_id,
-                model: None,
-            })
+        self.kernel().mark_turn_begun(context_id);
+        let delivered =
+            self.kernel()
+                .turn_flows()
+                .publish(crate::flows::TurnFlow::Requested {
+                    context_id,
+                    after_block_id,
+                    content: content.to_string(),
+                    principal_id,
+                    model: None,
+                });
+        if delivered == 0 {
+            self.kernel().mark_turn_ended(context_id);
+        }
+        delivered
     }
 
     /// Ask the server to drive one autonomous turn in the freshly forked child,

@@ -11,9 +11,12 @@
 //!   it is lossy and un-journaled — a completion published before the
 //!   subscription lands is gone with no catch-up. So the subscription is taken
 //!   **before** the first state read, never after.
-//! * The **block log** is the durable truth. Every quiet window re-reads it and
-//!   resolves the wait when the turn both ran and settled. This is what makes a
-//!   dropped completion cost a few seconds instead of the whole timeout.
+//! * Every quiet window re-reads the **block log** (did the turn produce a
+//!   model block) against the kernel's **turn-liveness registry**
+//!   (`Kernel::turn_in_flight` — process-lifetime, not block status; see its
+//!   doc) and resolves the wait when the turn both ran and is no longer in
+//!   flight. This is what makes a dropped completion cost a few seconds
+//!   instead of the whole timeout.
 //!
 //! `.data.resolved_by` says which of the two ended the wait, so a lossy bus
 //! shows up as an observation rather than a mystery.
@@ -24,7 +27,7 @@
 //! in-memory ring would lose both properties.
 
 use clap::{Parser, ValueEnum};
-use kaijutsu_types::{BlockKind, BlockSnapshot, ContentType, Role, Status};
+use kaijutsu_types::{BlockKind, BlockSnapshot, ContentType, Role};
 
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -99,14 +102,6 @@ fn is_turn_input(role: Role) -> bool {
     matches!(role, Role::User | Role::System)
 }
 
-/// Whether the block log says no turn is executing: nothing `Running`, nothing
-/// `Pending`.
-fn turn_is_idle(blocks: &[BlockSnapshot]) -> bool {
-    !blocks
-        .iter()
-        .any(|b| matches!(b.status, Status::Running | Status::Pending))
-}
-
 /// Index of the block the current turn hangs off — the last turn input in the
 /// log. `None` when the log holds no input at all, which reads as "anchor
 /// before everything".
@@ -115,14 +110,15 @@ fn derive_anchor(blocks: &[BlockSnapshot]) -> Option<usize> {
 }
 
 /// The durable verdict: the turn both **ran** (a model block sits after
-/// `floor`) and **settled** (nothing running or pending).
+/// `floor`) and **settled** (no turn in flight, per `Kernel::turn_in_flight` —
+/// not block status; see that method's doc for why).
 ///
 /// The ran-guard is what makes unconditional quiet-polling safe. Between the
 /// seed landing and the model's first block the context is idle but the turn
 /// has not happened yet; resolving there would report a finished turn before
 /// the model ever spoke.
-fn turn_ran_and_settled(blocks: &[BlockSnapshot], floor: Option<usize>) -> bool {
-    if !turn_is_idle(blocks) {
+fn turn_ran_and_settled(blocks: &[BlockSnapshot], floor: Option<usize>, in_flight: bool) -> bool {
+    if in_flight {
         return false;
     }
     let start = floor.map_or(0, |i| i + 1);
@@ -259,7 +255,15 @@ impl KjDispatcher {
                 (a, s) => a.or(s),
             };
 
-            if turn_ran_and_settled(&blocks, floor) {
+            // Liveness comes from the kernel's turn registry, not block
+            // status: a block left `Running` by a killed or timed-out tool
+            // call would otherwise poison every future wait on this context
+            // (block status never returns to idle on its own), and the gap
+            // between a tool result landing and the next model block is a
+            // live LLM round trip during which nothing is `Running` even
+            // though the turn is very much still going.
+            let in_flight = self.kernel().turn_in_flight(target);
+            if turn_ran_and_settled(&blocks, floor, in_flight) {
                 return self.wait_report(
                     target, &blocks, since_idx, &parsed, "completed", None, None, "log", started,
                 );
@@ -409,7 +413,7 @@ mod tests {
             other => panic!("expected structured data, got: {}", other.message()),
         }
     }
-    use kaijutsu_types::{BlockId, ContextId, PrincipalId};
+    use kaijutsu_types::{BlockId, ContextId, PrincipalId, Status};
 
     /// A snapshot with just the fields the wait predicates read.
     fn snap(role: Role, kind: BlockKind, status: Status, content: &str) -> BlockSnapshot {
@@ -431,19 +435,6 @@ mod tests {
         snap(Role::Model, BlockKind::Text, Status::Done, content)
     }
 
-    #[test]
-    fn idle_is_false_while_anything_runs_or_pends() {
-        assert!(turn_is_idle(&[user("hi"), model("there")]));
-        assert!(!turn_is_idle(&[
-            user("hi"),
-            snap(Role::Model, BlockKind::Text, Status::Running, "")
-        ]));
-        assert!(!turn_is_idle(&[
-            user("hi"),
-            snap(Role::Tool, BlockKind::ToolCall, Status::Pending, "")
-        ]));
-    }
-
     /// The anchor must skip the model AND tool blocks a turn produces — a tool
     /// result is not a new seed, and anchoring on one would let the very next
     /// model block resolve the wait mid-turn.
@@ -461,21 +452,21 @@ mod tests {
     #[test]
     fn a_seed_with_no_model_answer_has_not_run() {
         let blocks = vec![user("do the thing")];
-        assert!(!turn_ran_and_settled(&blocks, derive_anchor(&blocks)));
+        assert!(!turn_ran_and_settled(&blocks, derive_anchor(&blocks), false));
     }
 
     #[test]
-    fn a_seed_answered_and_settled_has_run() {
+    fn not_in_flight_with_a_model_block_after_the_floor_is_completed() {
         let blocks = vec![user("do the thing"), model("done")];
-        assert!(turn_ran_and_settled(&blocks, derive_anchor(&blocks)));
+        assert!(turn_ran_and_settled(&blocks, derive_anchor(&blocks), false));
     }
 
-    /// The ran-guard's whole job: an idle context whose model block predates
+    /// The ran-guard's whole job: a settled context whose model block predates
     /// the seed must not read as a finished turn.
     #[test]
     fn a_previous_turns_answer_does_not_satisfy_a_fresh_seed() {
         let blocks = vec![user("first"), model("answer"), user("second")];
-        assert!(!turn_ran_and_settled(&blocks, derive_anchor(&blocks)));
+        assert!(!turn_ran_and_settled(&blocks, derive_anchor(&blocks), false));
     }
 
     /// `--since` floors the ran-guard so a seedless `kj drive` is waitable:
@@ -484,23 +475,45 @@ mod tests {
     fn since_floors_the_ran_guard_when_no_fresh_seed_exists() {
         let blocks = vec![user("first"), model("answer")];
         assert!(
-            turn_ran_and_settled(&blocks, derive_anchor(&blocks)),
+            turn_ran_and_settled(&blocks, derive_anchor(&blocks), false),
             "anchor alone sees the old answer"
         );
         assert!(
-            !turn_ran_and_settled(&blocks, Some(1)),
+            !turn_ran_and_settled(&blocks, Some(1), false),
             "a cursor past the old answer must not resolve"
         );
     }
 
+    /// The regression test for the actual live bug: a Model block already
+    /// sits after the anchor and nothing in the log is `Running` — the old
+    /// block-status inference (`turn_is_idle`, now deleted) read exactly this
+    /// shape as a finished turn. It is the ordinary gap between a tool result
+    /// landing and the model's next block appearing (an LLM round trip), and
+    /// the turn is still in flight, so it must not settle.
     #[test]
-    fn a_running_block_blocks_the_verdict_even_after_a_model_answer() {
+    fn a_turn_in_flight_is_not_settled_even_with_nothing_running() {
+        let blocks = vec![
+            user("go"),
+            model("Still compiling. Polling again:"),
+            snap(Role::Tool, BlockKind::ToolCall, Status::Done, "call"),
+            snap(Role::Tool, BlockKind::ToolResult, Status::Done, "result"),
+        ];
+        assert!(!turn_ran_and_settled(&blocks, derive_anchor(&blocks), true));
+    }
+
+    /// The orphaned-block fix, for free: a block left `Running` forever by a
+    /// killed or timed-out tool call used to poison every future wait on this
+    /// context (block status never returns to idle on its own). Liveness now
+    /// comes from the turn registry, so once the turn is not in flight the
+    /// stale `Running` block no longer blocks the verdict.
+    #[test]
+    fn an_orphaned_running_block_does_not_block_the_verdict_once_not_in_flight() {
         let blocks = vec![
             user("go"),
             model("partial"),
             snap(Role::Tool, BlockKind::ToolCall, Status::Running, ""),
         ];
-        assert!(!turn_ran_and_settled(&blocks, derive_anchor(&blocks)));
+        assert!(turn_ran_and_settled(&blocks, derive_anchor(&blocks), false));
     }
 
     #[test]
@@ -618,7 +631,9 @@ mod tests {
     }
 
     /// The bus is the fast path and must resolve a wait the log alone never
-    /// would — here the log keeps a `Running` block forever.
+    /// would — here the turn is marked in flight, exactly as
+    /// `publish_turn_request`/`spawn_llm_for_prompt` mark a real one, so the
+    /// log-poll leg can never resolve it on its own.
     #[tokio::test]
     async fn a_completion_event_resolves_a_wait_the_log_would_never_settle() {
         let d = std::sync::Arc::new(test_dispatcher().await);
@@ -633,6 +648,7 @@ mod tests {
                 (Role::Model, BlockKind::Text, Status::Running, "working"),
             ],
         );
+        d.kernel().mark_turn_begun(ctx);
         let c = caller_with_context(ctx);
 
         let d2 = std::sync::Arc::clone(&d);
@@ -650,6 +666,7 @@ mod tests {
                 reason: crate::flows::TurnStopReason::EndTurn,
                 origin: Default::default(),
             });
+        d.kernel().mark_turn_ended(ctx);
 
         let r = waiter.await.unwrap();
         let data = data_of(&r);
@@ -672,6 +689,7 @@ mod tests {
                 (Role::Model, BlockKind::Text, Status::Running, ""),
             ],
         );
+        d.kernel().mark_turn_begun(ctx);
         let c = caller_with_context(ctx);
 
         let d2 = std::sync::Arc::clone(&d);
@@ -688,6 +706,7 @@ mod tests {
                 error: "provider stream broke".to_string(),
                 origin: Default::default(),
             });
+        d.kernel().mark_turn_ended(ctx);
 
         let r = waiter.await.unwrap();
         let data = data_of(&r);
