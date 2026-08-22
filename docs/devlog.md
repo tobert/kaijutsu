@@ -2116,3 +2116,119 @@ produced an error, a warning, or a wrong answer anyone could see. The recurring
 work was not fixing behavior but building the surface that would have said
 something was wrong, and the recurring lesson is that a system which cannot
 report an absence will keep the absence.
+
+## The turn that said it had finished (August 22)
+
+The coder became something you could hand a job to. `kj fork` makes the
+context, `kj drive` starts its turn, `kj wait` joins it — three verbs that
+compose, so a context can delegate to a child and block on the answer the way
+a caller blocks on a function. It was driven end to end against a real
+worktree, and the first thing it produced was not code. It was a bug that
+reading had never found.
+
+`kj wait` reported `completed` while the model was still working. Not once, and
+not late: three seconds into one turn, thirty-nine into another, both mid
+flight. The tail it returned looked like an answer. The last thing the model
+had said was "Still compiling. Polling again:".
+
+The mechanism is the shape of an agentic turn. A turn alternates: the model
+writes, calls a tool, the tool result lands, the model writes again. Between
+the tool result reaching `Done` and the next model block being inserted, there
+is a live round trip to the provider during which **nothing anywhere is
+Running** — and a model block already sits after the anchor, because the model
+spoke before it called the tool. The resolver asked "is anything running, and
+has the model said something?" Both answers were yes-shaped at exactly the
+wrong instant. An instantaneous read of a multi-writer log cannot tell
+"finished" from "between two blocks," and no amount of care in the reading
+fixes that, because the information is not in the log.
+
+The existing test covered the case where a block *is* running. Nothing covered
+the gap between two. That is the honest description of the whole class: the
+guard protected the start of a turn, and the middle had never been considered
+a place where a turn could be.
+
+Amy's ruling was to stop inferring: *"probably very old code,"* and it was
+wrong in two places. The kernel now owns a registry of which turns are in
+flight, and both `kj wait` and the ACP bridge ask it instead of reading
+statuses. Two decisions inside that are worth keeping. The flag is set where a
+turn is **committed**, in `publish_turn_request`, never in the driver that
+consumes the request — so "drive returned" implies "the flag is set," and a
+`kj wait` issued immediately after cannot win a race against it. And there is
+no single choke point for clearing it: the stream processor is documented as
+publishing exactly one terminal event and does so from six different exits,
+all six now paired, plus two more for a request no driver consumes and a
+driver that fails to spawn. A cross-model review found four more windows of
+the original shape — thinking-end to text-start, text-end to tool-use,
+stream-done to tool-start, tool-only iterations — and all four were already
+closed, because covering the whole turn is not the same as covering a list of
+gaps.
+
+The ACP bridge could not reuse any of it; it depends on the client and types
+crates, not the kernel, so it asks over the wire. Deriving liveness from
+events was considered and rejected for a reason that generalizes: the quiet
+poll exists *because* a completion event can go missing, so event-derived
+state is stale in precisely the case the poll was built for, and would hang
+forever instead of firing early.
+
+The afternoon found the same class twice more, and neither came from a failing
+test. Both came from reading a claim against the code it described.
+
+A relay narrating a delegated turn's progress refcounts a shared watch set.
+One relay releasing the last reference decremented to zero and *spawned* its
+narrowing call; another relay acquiring the same context sent its widening
+inline. The actor applies those in arrival order, so the widen could overtake
+the narrow it had to follow, and the second relay lost a watch it still
+needed. The fix reserves each transition a place in a chain under the same
+lock that changes the count, so arrival order and count order cannot disagree.
+The test pins what the actor sees — add, remove, add — and falsifying it
+reproduces the original bug exactly.
+
+The other was a comment that reasoned correctly from a false premise. It said
+a dropped early-warning event costs "no fact," because the outcome still
+arrives on its own push or by polling. Nothing that consumes that callback
+polls, and the loss is larger than the comment allowed: a client that never
+widens its subscription gets none of that turn's blocks pushed and has to read
+them back. The conclusion — do not disconnect over it — survived. The reasoning
+did not.
+
+That turned into the day's rule, sharpened with kaish's lead, who found the
+same shape twice in their own tree the same afternoon. The dangerous comment
+is not the stale one. It is the comment that is **the reason something else is
+switched off**: an append path excluded from a safety gate because "append
+never destroys prior content"; a handler that keeps a connection because "the
+loss costs no fact." A test asserts behavior at one point. A load-bearing
+comment asserts reachability — a claim about everything that does *not*
+happen — and nothing in any repository checks those. Green tests are not
+evidence about them; green tests are the condition under which they rot
+unnoticed. Reading three branches' contract comments adversarially found one
+more defect, in a claim that turned out to be true: verifying it was what
+exposed the thing next to it that nobody had claimed at all.
+
+The day closed on a delegated coder that had read `command not found: git`,
+concluded git was not installed, and abandoned a path it could have finished.
+git was on `PATH` the whole time. It was on a shell that refuses external
+execution, and the shell reported both conditions with one sentence. Fixing it
+took both projects and neither named the other's half: the shell now says the
+condition it owns, and the tool description says the binary is installed and
+names the tool that can run it. A structural signal was offered and declined —
+going to look for the call site that would consume it, and reporting back that
+there wasn't one, was cheaper than the field would have been.
+
+Everything the day found was in a seam that reports state: is this turn
+running, is this watch held, is this program here. A system that answers those
+questions wrongly is worse than one that declines to answer, because the
+caller acts on the answer. Delegation is what made them visible, because a
+delegating caller is a consumer that believes what it is told.
+
+Which is where the gate went next. A gated call had been holding an RPC open
+while a human decided — verified live at eighty-one seconds four days earlier
+— and the ask was asked to last longer than that: an hour, an errand, a night.
+It cannot, and the reason is not a number. The client's deadline is a
+compile-time constant in a process that, by its own documentation, cannot read
+the kernel's configuration, because they communicate only over the wire that
+deadline bounds. Amy's answer removed the question: *"perhaps we should
+consider a state machine and not actually having anything block on the wire."*
+The kernel announces, the client may block locally, and when the answer lands
+the kernel performs the action itself. An approval at 3am runs at 3am. The
+four-hop ladder built to keep a call alive across human thinking time becomes
+dead code, four days after it shipped.
