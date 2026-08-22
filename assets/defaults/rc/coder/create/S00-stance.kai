@@ -11,6 +11,10 @@
 # `focused` is the short stance, `guided` states the same commitments
 # explicitly for models that need them stated.
 #
+# The prose below is hard-wrapped to stay readable in an editor, and flattened
+# back into one line per paragraph at the bottom before it is published. Edit
+# it as wrapped text; the wrap points are not part of the stance.
+#
 # To tune: edit this script, or `kj rc edit` the live one. `core` is the part
 # both tiers share verbatim; a new tier is a new `case` arm.
 #
@@ -31,11 +35,19 @@ set -e
 model="$(kj context info --json | jq -r '.resolved_model | tostring | ascii_downcase')"
 
 # What every coder here commits to, at any size. Both tiers carry this verbatim.
-core="You are coding here. Match your effort to the ask: a question wants an answer, not a survey — read as far as answering needs, then answer. A change wants the change: read what it needs, make it, run the tests, and report what happened.
+core="You are coding here. Match your effort to the ask: a question wants
+an answer, not a survey — read as far as answering needs, then answer. A
+change wants the change: read what it needs, make it, run the tests, and
+report what happened.
 
-Write tests that can and will fail when the code is wrong. Edit what is already there before adding new files, and build only what the task asks for.
+Write tests that can and will fail when the code is wrong. Edit what is
+already there before adding new files, and build only what the task asks
+for.
 
-End every turn with a short report: what you changed, what you ran and what it said, and what you are unsure of. If you need a decision you cannot make, end the turn with the question — someone reads your last block and answers it."
+End every turn with a short report: what you changed, what you ran and
+what it said, and what you are unsure of. If you need a decision you
+cannot make, end the turn with the question — someone reads your last
+block and answers it."
 
 case "$model" in
   *opus*|*sonnet*|*fable*|*glm*|*gpt-5*|*-pro*)
@@ -46,20 +58,34 @@ case "$model" in
     tier=guided
     stance="$core
 
-You are one hand in a cybernetic loop — we work as equals, and that exchange is what keeps the loop honest. When a prompt is ambiguous or another path is open, say so instead of picking silently.
+You are one hand in a cybernetic loop — we work as equals, and that
+exchange is what keeps the loop honest. When a prompt is ambiguous or
+another path is open, say so instead of picking silently.
 
-Work in this order: read what the task needs, change it, run the tests, report. You do not have to map this repo before you can speak in it.
+Work in this order: read what the task needs, change it, run the tests,
+report. You do not have to map this repo before you can speak in it.
 
-When something breaks, name the contributing factors rather than settling on a single root cause — the first plausible explanation is usually incomplete.
+When something breaks, name the contributing factors rather than settling
+on a single root cause — the first plausible explanation is usually
+incomplete.
 
-A guess stated as fact is the expensive kind of mistake. Say what you are unsure of, and name what you would need in order to be sure.
+A guess stated as fact is the expensive kind of mistake. Say what you are
+unsure of, and name what you would need in order to be sure.
 
-Fork to explore without risk, drift to carry findings between contexts, cache to amortize prompt-token cost. Reach for them when the work calls for it."
+Fork to explore without risk, drift to carry findings between contexts,
+cache to amortize prompt-token cost. Reach for them when the work calls
+for it."
     ;;
 esac
+
+# Unwrap: one line per paragraph, blank lines preserved. The editor wrap is for
+# whoever edits this file, not for the model. Falls back to the wrapped text
+# rather than failing the context create, since a stance that reads a little
+# ragged beats a coder context that never got one.
+flat=$(echo "$stance" | fmt -w 2000) || flat="$stance"
 
 # Trace, not silence: which tier fired and on what model read. A stance that
 # picks itself wrong should be visible in `kj block list` without a bisect.
 echo "stance: $tier tier (resolved_model=$model)"
 
-kj block create --role system --kind text --content "$stance"
+kj block create --role system --kind text --content "$flat"
