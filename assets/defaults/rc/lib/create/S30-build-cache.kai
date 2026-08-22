@@ -1,0 +1,24 @@
+# Point cargo at one shared build cache instead of a per-checkout target/.
+#
+# A coder handed a fresh git worktree starts with a cold target/, so its first
+# task is a full build: minutes of its turn, and ~7 GiB of disk per worktree.
+# One shared directory makes every run after the first incremental, and cargo
+# keys artifacts by package so several projects can share it.
+#
+# Deliberately NOT the main checkout's target/. Sharing that would put a
+# coder's build behind the same lock a human's build takes, so one would
+# stall the other. A separate directory costs one cold build, once.
+#
+# Only set when the caller has not already chosen one — an operator pointing a
+# context at a specific target dir outranks this default.
+set -e
+existing="$(kj context info --json | jq -r '.env.CARGO_TARGET_DIR | tostring')"
+case "$existing" in
+  null|"")
+    kj context set . --env CARGO_TARGET_DIR=$HOME/.cache/kaijutsu/cargo-target
+    echo "build cache: $HOME/.cache/kaijutsu/cargo-target"
+    ;;
+  *)
+    echo "build cache: left at caller's CARGO_TARGET_DIR=$existing"
+    ;;
+esac
