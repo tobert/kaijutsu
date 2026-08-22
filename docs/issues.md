@@ -1630,10 +1630,50 @@ in local mode**. `whoami` then answers `{"mode":"local"}` and `register_session`
 replies "requires --connect to kaijutsu-server", while the caller believes it
 passed exactly that.
 
-Found while probing the live kernel after the wire flag day. Costs a few minutes
-of confusion each time, and it is a silent fallback of the kind we treat as a
-defect: it should either honour the flag under `serve` or refuse the
-combination, not quietly do the other thing.
+**Confirmed and diagnosed 2026-08-22** — this entry previously carried
+conflicting evidence (one pass called it fixed, another reproduced it). It is
+real, and the cause is a **duplicate flag**: `serve` declares its own
+`-c/--connect` (see `kaijutsu-mcp serve --help`) alongside the identical
+top-level one. `kaijutsu-mcp --connect serve` therefore sets the *top-level*
+flag, which `run_serve` never reads — it reads `ServeArgs.connect`. Same for
+`--host`, `--port`, `--kernel`, `--context-name`, `--hook-socket`, which are
+all declared twice.
+
+**The working invocation is `kaijutsu-mcp serve --connect`** (flag AFTER the
+subcommand). Verified live: with it, `register_session` returns a real context
+id; without it, "requires --connect to kaijutsu-server".
+
+It is a silent fallback of the kind we treat as a defect: it should either
+honour the flag under `serve` or refuse the combination. The fix is a design
+call rather than a patch — which of the two declarations wins, or whether the
+top-level copies are deleted outright — so it is recorded rather than changed.
+
+## `kj rc reseed` seeds from the BINARY, not the repo (2026-08-22)
+
+`assets/defaults/rc/` is the in-repo seed, but `kj rc reseed` installs the
+defaults **embedded in the running `kaijutsu-server`**. Editing the repo file
+and reseeding reports `install 0, overwrite 0` and changes nothing, because the
+live document already matches the binary's (stale) copy.
+
+Editing a shipped default therefore needs: edit → **rebuild** → **restart** →
+`kj rc reseed --overwrite`. Missing the rebuild looks exactly like a successful
+no-op. Related: `docs/config-ownership.md`, and the rc-on-disk melt
+(`docs/rc-on-disk.md`) removes this trap by making rc real files.
+
+## The rc lifecycle shell has a narrower tool set than the interactive one (2026-08-22)
+
+An rc `create` script calling `fmt` fails with `command not found: fmt`, while
+the same command in the MCP `shell` tool succeeds. So a `.kai` verified in the
+interactive shell — or in the standalone `kaish` CLI, which has `fmt` — can
+still fail at context create.
+
+Two consequences. Verify rc scripts by *creating a context*, not by running the
+command in a shell. And a create-path script under `set -e` should degrade
+rather than abort: a failed helper takes down the whole context create, and a
+context with no stance is worse than a stance that reads a little ragged.
+
+Unknown and worth establishing: what the rc shell's tool set actually is, and
+whether the difference is deliberate (a narrower rc loadout) or incidental.
 
 ## The config git worktree has no index — `git status` will lie to an operator
 
