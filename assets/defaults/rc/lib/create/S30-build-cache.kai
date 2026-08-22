@@ -15,7 +15,10 @@ set -e
 existing="$(kj context info --json | jq -r '.env.CARGO_TARGET_DIR | tostring')"
 case "$existing" in
   null|"")
-    kj context set . --env CARGO_TARGET_DIR=$HOME/.cache/kaijutsu/cargo-target
+    # Quote the WHOLE word: kaish does no token pasting, so an unquoted
+    # `KEY=$VAR/tail` splits into three arguments and `kj context set` sees
+    # the tail as a stray positional.
+    kj context set . --env "CARGO_TARGET_DIR=$HOME/.cache/kaijutsu/cargo-target"
     echo "build cache: $HOME/.cache/kaijutsu/cargo-target"
     ;;
   *)
