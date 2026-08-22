@@ -6,6 +6,80 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Asks vs forms: the ledger is three layers, and only one is shell-shaped (2026-08-22)
+
+**Open design question, awaiting Amy's call.** She asked whether an agent
+asking a *question* wants the approval gate, a drift, or a distinct concept:
+
+> *"I'm curious if we should have a unique feature for, well, basically
+> abstract forms, vs the approval gates, which have different needs. They block
+> in similar ways but the data seems pretty different? Maybe a form tool /
+> tools? Is there some prior art we should riff on?"*
+
+The data is different, and the split is visible in the schema:
+
+1. **The envelope is already generic.** `approvals` (`approval-ledger/src/
+   schema.rs:269`) — request_id, context_id, principal_id, origin,
+   description, pending/claimed/allowed/denied/expired/abandoned with a
+   one-way ratchet trigger, claim-so-exactly-one-answerer-wins, plus
+   `approval_events` and `approval_signals`. Nothing here is about shells.
+2. **`approval_options` (`schema.rs:346`) is already a single-select field** —
+   `(request_id, seq, option_id, label, kind)` in presentation order. It cannot
+   express free text, multi-select, typed values, or more than one field.
+3. **`approval_statements` + commands/args/vars + `approval_rules` cannot
+   serve a form and should not try.** Content-addressed kaish plan trees exist
+   so a decision *generalizes* to future identical statements. A question has
+   no statement, no digest, nothing to generalize.
+
+**We have both halves of a form system, wrongly split.** The ledger is durable
+with the wrong payload. MCP elicitation is already on our wire
+(`kaijutsu.capnp:1509`: `message` + JSON Schema → `accept`/`decline`/`cancel`,
+a better fit than allow/deny) with the right payload and **no durability** — it
+is `onRequest -> response`, synchronous and connection-bound.
+
+Prior art worth riffing on: **debconf** splits the *template* (question, type,
+choices, default) from the *answer store* and adds a **priority** so
+low-priority questions take defaults without asking — the same lever lfm2d
+pulls on approval fatigue. **systemd-ask-password** generalizes our claim
+semantics to multiple presenters of one ask (we will have app + MCP
+orchestrator + ACP). **MCP elicitation**'s deliberately flat, primitive-only
+schema subset is restraint worth copying.
+
+Cheapest true step if we go: widen `origin` past
+`('hook','shell_gate','kj_verb')`, let an ask carry a schema-shaped answer
+alongside `decided_option`, and project it onto the elicitation wire — riding
+layers 1+2 without touching layer 3. The per-ask wait budget above then serves
+both kinds of ask.
+
+## `onTurnStarted` fires for autonomous turns only (2026-08-22)
+
+`TurnFlow::Requested` is published by `kj drive` (`kj/drive.rs:253`) and
+`kj fork --prompt` (`kj/fork.rs:1382`); interactive `prompt()` calls
+`spawn_llm_for_prompt` directly and publishes nothing. So the new
+`onTurnStarted` wire event names a delegated turn and stays silent for an
+interactive one.
+
+That is correct for what it was built for — a client widening its block-event
+subscription to observe a delegated coder. It is **not** a general "a turn is
+beginning" signal, and absence must never be read as "no turn is running". The
+schema comment says so. If a client ever needs the general signal, `prompt()`
+has to publish a request too — which is a real change, since the in-process
+turn driver consumes `turn.requested` and would then try to serve it.
+
+## The app can stop taking the kernel-wide firehose (2026-08-22)
+
+`ActorHandle::watch_contexts` landed, so a block-event subscription can name a
+*set* of contexts rather than one-or-all. The app still sets
+`scope_blocks_to_context = false` (`connection/bootstrap.rs:130`) and takes
+every context's block events, because one-context was previously the only
+alternative and it genuinely draws several.
+
+It could now watch exactly the contexts it renders (the time well's visible
+rays, the active context) and re-issue as that set changes. Worth doing only if
+event volume actually shows up in a profile — the firehose is a known cost, not
+a known problem, and the 2026-06-17 starvation it caused was on the MCP's
+single-threaded LocalSet, not the app's.
+
 ## An expired approval should become a tool error, not a silent stall (2026-08-21)
 
 Amy's direction, and the shape the escalation path is being built toward:
