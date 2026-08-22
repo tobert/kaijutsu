@@ -131,16 +131,24 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
 // makes it read-only (no mutation, no external commands) and the document views
 // it can still read (`/v/docs`, `/v/input`) that a host-only read-only shell
 // wouldn't have.
+//
+// Names `shell_write` as where external commands live. The refusal a model
+// meets at runtime states its condition and stops there, deliberately — the
+// remedy belongs to the layer that configured the condition, which is this
+// description. Without it a model reads "command not found" and concludes the
+// binary is missing.
 static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Run a READ-ONLY command in your current kernel context using kaish \
          (会sh). This shell cannot mutate anything: every file write/delete/\
-         move and every external command is refused. Use it to inspect — \
-         read files, `grep`, `find`, walk the tree, and read the kernel \
-         document/input views under `/v/docs` and `/v/input`; `kj` is in \
-         scope for read-only context introspection. Returns combined stdout \
-         (stderr appended when present); a nonzero exit code is reported as \
-         an error.\n\n{}",
+         move and every external command is refused — the binary is still \
+         installed and on PATH, so reach for `shell_write` when you need to \
+         run one, rather than concluding it is missing. Use this tool to \
+         inspect — read files, `grep`, `find`, walk the tree, and read the \
+         kernel document/input views under `/v/docs` and `/v/input`; `kj` is \
+         in scope for read-only context introspection. Returns combined \
+         stdout (stderr appended when present); a nonzero exit code is \
+         reported as an error.\n\n{}",
         &*COMPOSED_TOOL_DESCRIPTION
     )
 });
