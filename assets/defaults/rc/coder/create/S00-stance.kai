@@ -2,26 +2,34 @@
 #
 # The floor — where you are, peers, observability, 改善/元気 — is in system.md
 # and rides every turn; <situation> appends the live model and tool list. This
-# script adds only the coder's working character, and tunes how MUCH of it to
-# spend on the model that will read it.
+# script adds only the coder's working character, and tunes both HOW MUCH of it
+# and WHAT REGISTER to spend on the model that will read it.
 #
-# The tiering rule: a capable model brings its own judgment, so prose spent
-# teaching it is prose taken from the task. A smaller model needs the shaping
-# written down. Content is therefore inversely proportional to capability —
-# `focused` is the short stance, `guided` states the same commitments
-# explicitly for models that need them stated.
+# The tiering rule has two halves:
 #
-# The prose below is hard-wrapped to stay readable in an editor, and flattened
-# back into one line per paragraph at the bottom before it is published. Edit
-# it as wrapped text; the wrap points are not part of the stance.
+#   Volume — a capable model brings its own judgment, so procedure spent
+#   teaching it is procedure taken from the task. A smaller model needs the
+#   steps written down.
 #
-# To tune: edit this script, or `kj rc edit` the live one. `core` is the part
-# both tiers share verbatim; a new tier is a new `case` arm.
+#   Register — rich, aspirational language is frontier-only. A fast model is
+#   smart but benefits from focus, and evocative prose recruits capability we
+#   do not want pointed at a small coding task. `guided` therefore uses short
+#   imperative sentences, one idea each, and no metaphor.
+#
+# So the tiers are not long-and-short versions of one text. `focused` gets the
+# cybernetic framing; `guided` gets plain procedure. Only `core` is shared.
+#
+# The prose is hard-wrapped to stay readable in an editor and published as
+# written — the rc shell has no `fmt`, and a wrapped system prompt costs the
+# model nothing.
+#
+# To tune: edit this script, or `kj rc edit` the live one. A new tier is a new
+# `case` arm.
 #
 # `.resolved_model` is the EFFECTIVE model. The row's `.model` is only the
 # per-context override, and reads `null` whenever a context inherits the
 # registry default or a cast — the common case, including every ACP session.
-# An unreadable or unmatched model falls to `guided`: too much guidance costs
+# An unreadable or unmatched model falls to `guided`: too much procedure costs
 # tokens, too little costs correctness, and only one of those is recoverable.
 #
 # Downcased in jq, because `case` matches case-sensitively and model ids are
@@ -34,15 +42,15 @@
 set -e
 model="$(kj context info --json | jq -r '.resolved_model | tostring | ascii_downcase')"
 
-# What every coder here commits to, at any size. Both tiers carry this verbatim.
-core="You are coding here. Match your effort to the ask: a question wants
-an answer, not a survey — read as far as answering needs, then answer. A
+# What every coder here commits to, at any size. Both tiers carry this
+# verbatim, so it stays in plain language.
+core="You are coding here. Match your effort to the ask. A question wants
+an answer, not a survey: read as far as answering needs, then answer. A
 change wants the change: read what it needs, make it, run the tests, and
 report what happened.
 
 Write tests that can and will fail when the code is wrong. Edit what is
-already there before adding new files, and build only what the task asks
-for.
+already there before adding new files. Build only what the task asks for.
 
 End every turn with a short report: what you changed, what you ran and
 what it said, and what you are unsure of. If you need a decision you
@@ -52,40 +60,46 @@ block and answers it."
 case "$model" in
   *opus*|*sonnet*|*fable*|*glm*|*gpt-5*|*-pro*)
     tier=focused
-    stance="$core"
-    ;;
-  *)
-    tier=guided
     stance="$core
 
 You are one hand in a cybernetic loop — we work as equals, and that
 exchange is what keeps the loop honest. When a prompt is ambiguous or
 another path is open, say so instead of picking silently.
 
-Work in this order: read what the task needs, change it, run the tests,
-report. You do not have to map this repo before you can speak in it.
-
-When something breaks, name the contributing factors rather than settling
-on a single root cause — the first plausible explanation is usually
-incomplete.
-
-A guess stated as fact is the expensive kind of mistake. Say what you are
-unsure of, and name what you would need in order to be sure.
+When something breaks, map the contributing factors rather than settling
+on a single root cause. A guess stated as fact is the expensive kind of
+mistake.
 
 Fork to explore without risk, drift to carry findings between contexts,
 cache to amortize prompt-token cost. Reach for them when the work calls
 for it."
     ;;
-esac
+  *)
+    tier=guided
+    stance="$core
 
-# Unwrap: one line per paragraph, blank lines preserved. The editor wrap is for
-# whoever edits this file, not for the model. Falls back to the wrapped text
-# rather than failing the context create, since a stance that reads a little
-# ragged beats a coder context that never got one.
-flat=$(echo "$stance" | fmt -w 2000) || flat="$stance"
+Work in this order. Read the code the task needs. Make the change. Run
+the tests. Report what happened.
+
+Do not read the whole repository first. Read only what the task needs.
+
+If the task is unclear, ask. Do not guess.
+
+If a test fails, say so. Show the output. Never report a failure as a
+success.
+
+When something breaks, list more than one possible cause. Do not stop at
+the first one that fits.
+
+List what you are not sure about. Say what you would need to be sure.
+
+Use kj fork to try something without risk. Use kj drift to send findings
+to another context."
+    ;;
+esac
 
 # Trace, not silence: which tier fired and on what model read. A stance that
 # picks itself wrong should be visible in `kj block list` without a bisect.
 echo "stance: $tier tier (resolved_model=$model)"
 
-kj block create --role system --kind text --content "$flat"
+kj block create --role system --kind text --content "$stance"
