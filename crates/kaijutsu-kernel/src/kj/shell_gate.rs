@@ -43,7 +43,7 @@
 //! model that types a destructive kaish command directly gets stopped and a
 //! human sees exactly what would run before it does.
 //!
-//! ## Heredocs: honest, once, against the real surface
+//! ## Heredocs: what the body shows, and what the command reads
 //!
 //! `kaish_types::plan::PlannedHeredoc::literal` says whether a heredoc body
 //! is what the command actually reads (`<<'EOF'`, quoted delimiter — no
@@ -51,14 +51,14 @@
 //! substitution can land inside a string literal in the language the body
 //! is written in). kaish's own `Plan::rendered` already carries every
 //! heredoc body **verbatim and unexpanded**
-//! (`kaish-kernel/src/ast/plan.rs::render_redirect`), so the raw rendered
-//! text is never itself a lie — it always shows exactly what was submitted.
+//! (`kaish-kernel/src/ast/plan.rs::render_redirect`), so the rendered text
+//! always shows exactly what was submitted.
 //!
-//! What raw text alone does NOT communicate is that an unquoted delimiter
-//! means the bytes shown are not the bytes the command will read.
-//! [`honest_render`] closes that gap by appending an explicit note, naming
-//! every free variable ([`PlannedHeredoc::free_variables`]) a non-literal
-//! heredoc will substitute, for every heredoc where `literal` is false.
+//! What that text alone does not say is that an unquoted delimiter means
+//! the bytes shown are not the bytes the command will read.
+//! [`render_for_review`] closes that gap by appending a note, naming every
+//! free variable ([`PlannedHeredoc::free_variables`]) a non-literal heredoc
+//! will substitute, for every heredoc where `literal` is false.
 //!
 //! **Deliberately not used here: `kaish_kernel::expand_fragment`.** It can
 //! compute the ACTUAL substituted body given a scope, but doing that at
@@ -67,9 +67,9 @@
 //! (the gate cannot pause mid-run — see above). A preview that goes stale
 //! between "what was shown" and "what ran" is exactly the kind of quiet
 //! mismatch a gate exists to prevent, not a feature worth the risk. Showing
-//! the free-variable names instead of a guessed value is the honest
-//! version of "say what will be substituted" that
-//! `docs/gate-and-shell-split.md` asks for.
+//! the free-variable names instead of a guessed value is the form of "say
+//! what will be substituted" that `docs/gate-and-shell-split.md` asks for
+//! and the only one that cannot go stale.
 
 use approval_ledger::types::{Origin, VarBinding};
 
@@ -122,7 +122,7 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
     let statements: Vec<GatedStatement> = planned
         .iter()
         .map(|ps| GatedStatement {
-            rendered: honest_render(ps),
+            rendered: render_for_review(ps),
             statement_kind: ps.plan.statement_kind.clone(),
             vars: ps
                 .plan
@@ -162,11 +162,15 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
     })
 }
 
-/// Render one planned statement's text for a human deciding a gate ask,
-/// honest about `literal` (module docs). kaish's `Plan::rendered` already
-/// carries every heredoc body verbatim; this only APPENDS a caveat for a
-/// non-literal heredoc, it never rewrites or hides the raw text.
-fn honest_render(ps: &kaish_kernel::PlannedStatement) -> String {
+/// Render one planned statement for a human deciding a gate ask, with the
+/// `literal` caveat spelled out (module docs). kaish's `Plan::rendered`
+/// already carries every heredoc body verbatim; this only APPENDS a note
+/// for a non-literal heredoc, and never rewrites or hides the raw text.
+///
+/// Built to be read, not re-run: the appended notes are prose. The
+/// executable form of a gated statement is stored separately — see
+/// `docs/gate-resume.md`.
+fn render_for_review(ps: &kaish_kernel::PlannedStatement) -> String {
     let mut out = ps.plan.rendered.clone();
     let mut notes = Vec::new();
     for cmd in &ps.plan.commands {

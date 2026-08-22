@@ -62,6 +62,87 @@ rule on a statement with a free variable, which the gate's statement
 deliberately has. That is why everything escalates today, and it is why an
 answered ask cannot currently authorize anything.
 
+## Where the pieces live
+
+Two layers, and the split is the thing to hold onto: **`approval-ledger` knows
+nothing about kaijutsu.** It stores asks, decisions and rules, and enforces its
+own guarantees. It has never heard of a tool, a context, or a shell. The
+kaijutsu meaning lives one layer up, in `kj/gate.rs`.
+
+```text
+  WHO ASKS                          crates/kaijutsu-kernel/src/kj/
+  ─────────                         ──────────────────────────────
+  shell_write ──┐                   shell_gate.rs ┐
+  a hook's Ask ─┼── builds a ──────  hook_gate.rs  ├─→ GateSpec
+  kj cc send  ──┘    GateSpec        cc.rs         ┘   { origin, instance, tool,
+                                                        authorized_label,
+                                                        statements[] }
+                                          │
+                                          ▼
+                                   gate.rs :: run_gate        ← ALL the policy
+                                     1. rules cover it?        (deny wins)
+                                     2. answer already given?  (single-use)
+                                     3. else record + Pending  (never waits)
+                                          │
+  ════════ crate boundary ═══════════════ │ ══════════════════════════════════
+                                          ▼
+  crates/approval-ledger/  — storage + guarantees, no kaijutsu vocabulary
+    ask.rs      create_ask, find_redeemable      decide.rs  decide/expire/
+    claim.rs    claim (one winner)                          abandon/redeem_ask
+    rules.rs    learn_from_approval, redeem      events.rs  append
+```
+
+### The tables, and which way the arrows point
+
+```text
+                    approval_statements          ← CONTENT-ADDRESSED, SHARED
+                    (statement_digest PK,           the same statement body is
+                     rendered, kind)                ONE row however many asks
+                        ▲        ▲                  reference it
+      ┌─────────────────┘        └──────────────┐
+      │ digest                            digest │
+  approval_ask_statements                  approval_rules
+  (request_id, stmt_seq, digest)           (rule_id PK, digest,
+      │  the ORDERED list; stmt_seq         authorized_label, scope,
+      │  is ask-relative, so the same       allow, learned_from ──┐
+      │  statement can be #0 here and       … matched against     │
+      ▼  #2 there                           FUTURE asks           │
+  ╔══════════════════════════════╗                                │
+  ║  approvals   (request_id PK) ║ ◄──────────────────────────────┘
+  ║                              ║   learned_from: the ask a rule grew from
+  ║  status: pending → claimed   ║
+  ║        → allowed | denied    ║   auto_reason set  ⇒ a RULE decided it.
+  ║        | expired | abandoned ║   That row is an audit record, never an
+  ║  authorized_label            ║   offer — find_redeemable excludes it.
+  ║  auto_reason, decided_by     ║
+  ╚══════════════════════════════╝
+      │            │            │
+      │            │            └────────────► approval_options   (the choices
+      │            │                                               offered)
+      │            └───────────────────────► approval_signals  (lfm2d /
+      │                                                         classifier reads)
+      ├──────────────────────────────────► approval_events   (append-only audit:
+      │                                     created/claimed/decided/expired/
+      │                                     abandoned/redeemed)
+      │                                          │
+      │                                          ▼  trigger on insert
+      │                                     ledger_generation ──→ LedgerFlow::
+      │                                     (one counter)         Changed → clients
+      │
+      └──────────────────────────────────► approval_redemptions  (request_id PK)
+                                            "this answer has been delivered".
+                                            The PK is the single-use guarantee;
+                                            the row, not any return value.
+```
+
+**One file, one connection.** `KernelDb::conn_for_ledger` returns `&self.conn`
+— every table above lives in the kernel's own SQLite database, so an ask and
+anything kaijutsu wants to commit alongside it share a transaction.
+
+**Who a human talks to.** `kj/ledger.rs` — `kj ledger list` / `show` / `allow`
+/ `deny` / `rules` / `forget`. That is the only surface that decides an ask,
+and it writes through the same `decide`/`claim` functions the gate reads.
+
 ## The shape
 
 ```text
@@ -160,8 +241,8 @@ guessing consistently is the part we cannot do.
 ## Open questions, with recommendations
 
 **Do not reconstruct the action from the ask.** Settled while sizing slice 2.
-An ask's statements carry `honest_render(ps)` — a rendering built for a human
-to read in `kj ledger show`, not re-executable source. Re-running it would be
+An ask's statements carry `render_for_review(ps)` — a rendering built for a
+human to read in `kj ledger show`, not re-executable source. Re-running it would be
 re-deriving intent from a display string, which is the same mistake as a
 client decoding storage to learn what happened (CLAUDE.md, "Durable state and
 the wire"). The action is its own durable fact and gets its own row.
