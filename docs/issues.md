@@ -6,6 +6,50 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kj wait` reports `completed` in the middle of an agentic turn (2026-08-22)
+
+**A real defect in the delegation join, found by delegating.** `kj wait`
+returned `status: completed, resolved_by: log` on a context whose
+`model/tool_call` and `tool/tool_result` blocks were `[running]` at that
+moment, and whose last model text was "Still compiling. Polling again:".
+
+The mechanism is in `turn_ran_and_settled` (`kj/wait.rs:124`), which resolves
+when *nothing anywhere is Running or Pending* AND *some Model block sits after
+the anchor*. An agentic turn alternates model → tool_call(running) →
+tool_result(done) → model. **Between a tool_result reaching Done and the next
+model block being inserted, nothing is Running and a model block already exists
+after the anchor**, so an unlucky sample declares the turn over.
+
+The ran-guard protects the *start* of a turn — the window between the seed
+landing and the model's first block. Nothing protects the *middle*, and the
+existing test (`a_running_block_blocks_the_verdict_even_after_a_model_answer`)
+covers only the case where a block IS running, never the gap between two.
+
+Why it matters more than a cosmetic wrong status: a delegating orchestrator
+reads the tail and acts on it. Reporting `completed` mid-turn hands it a
+partial answer that looks final — the one failure mode delegation cannot
+tolerate. It also fires early enough to be common, not rare: observed at 3s on
+one turn and 39s on another, both mid-flight.
+
+**The shape of the fix.** `TurnFlow::Completed` on the bus stays the fast,
+authoritative path. The log path exists only as the fallback for a dropped
+event, so it should be conservative: require idleness to *persist* for the
+quiet window (track when idleness was first observed, re-read at the end of it)
+rather than resolving on the first idle sample. An instantaneous read of a
+multi-writer log cannot distinguish "finished" from "between two blocks".
+
+## The coder's shell has no `git` (2026-08-22)
+
+Found by a delegated coder, which reported it itself: *"`git` isn't installed
+here."* A coder asked to inspect a worktree cannot run `git log`, `git diff`,
+or `git status`. Related to the rc-shell/interactive-shell tool-set difference
+above; worth establishing deliberately what a coder is supposed to have, rather
+than discovering each gap from a model's confusion.
+
+Also seen in the same run: `tool error: mcp protocol error: shell execution
+failed: vali…` — a kaish validation error surfacing to the model as an MCP
+protocol error, which is the wrong altitude for the reader.
+
 ## Asks vs forms — brief written, decision open (2026-08-22)
 
 Amy asked whether an agent asking a *question* wants the approval gate, a
