@@ -90,10 +90,10 @@ async fn register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json::Valu
 
 async fn run_shell(mcp: &KaijutsuMcp, command: &str) -> serde_json::Value {
     let out = mcp
-        .shell(Parameters(ShellRequest {
+        .shell_impl(ShellRequest {
             command: command.to_string(),
             timeout_secs: Some(30),
-        }))
+        }, None)
         .await;
     out.structured_content
         .clone()

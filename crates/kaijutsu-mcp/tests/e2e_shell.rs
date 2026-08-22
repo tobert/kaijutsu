@@ -104,10 +104,10 @@ fn shell_returns_stdout() {
         );
 
         let out = mcp
-            .shell(Parameters(ShellRequest {
+            .shell_impl(ShellRequest {
                 command: "echo hello".to_string(),
                 timeout_secs: Some(30),
-            }))
+            }, None)
             .await;
         // `shell` returns a 2026-07-28 tool result; the envelope rides as
         // `structuredContent` (and, for older clients, as content text).
@@ -175,7 +175,7 @@ fn shell_survives_dead_event_feed() {
 
         let started = std::time::Instant::now();
         let out = mcp
-            .shell(Parameters(ShellRequest {
+            .shell_impl(ShellRequest {
                 // MUST be slow enough that the first completion poll misses.
                 // This test was `echo still-alive` and went VACUOUS the moment
                 // the poll started querying the server instead of the local
@@ -192,7 +192,7 @@ fn shell_survives_dead_event_feed() {
                 // actually proves the stall fallback fired; a bare pass
                 // under a slack timeout would prove nothing.
                 timeout_secs: Some(60),
-            }))
+            }, None)
             .await;
         let elapsed = started.elapsed();
         // `shell` returns a 2026-07-28 tool result; the envelope rides as
@@ -256,10 +256,10 @@ fn shell_returns_full_nontrivial_stdout() {
         // inequality a truncation bug could still satisfy.
         const WANT_BYTES: usize = 4096;
         let out = mcp
-            .shell(Parameters(ShellRequest {
+            .shell_impl(ShellRequest {
                 command: format!("head -c {WANT_BYTES} /dev/zero | tr '\\0' 'a'"),
                 timeout_secs: Some(30),
-            }))
+            }, None)
             .await;
         let env: serde_json::Value = out
             .structured_content
@@ -297,10 +297,10 @@ fn shell_returns_nonzero_exit_code() {
         register_with_retry(&mcp, "e2e-exit-code").await;
 
         let out = mcp
-            .shell(Parameters(ShellRequest {
+            .shell_impl(ShellRequest {
                 command: "exit 17".to_string(),
                 timeout_secs: Some(30),
-            }))
+            }, None)
             .await;
         let env: serde_json::Value = out
             .structured_content
@@ -333,10 +333,10 @@ fn shell_sequential_commands() {
 
         for n in 1..=3 {
             let out = mcp
-                .shell(Parameters(ShellRequest {
+                .shell_impl(ShellRequest {
                     command: format!("echo line{n}"),
                     timeout_secs: Some(30),
-                }))
+                }, None)
                 .await;
             // `shell` returns a 2026-07-28 tool result; the envelope rides as
         // `structuredContent` (and, for older clients, as content text).

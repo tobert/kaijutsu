@@ -51,12 +51,16 @@ use rmcp::{
         GetPromptResult,
         ListResourcesResult,
         PaginatedRequestParams,
+        // Progress notifications (delegated-turn narration on `shell`)
+        ProgressNotificationParam,
+        ProgressToken,
         PromptMessage,
         ReadResourceRequestParams,
         ReadResourceResponse,
         ReadResourceResult,
         Resource,
         ResourceContents,
+        RequestMetaObject,
         Role,
         // Protocol negotiation
         ProtocolVersion,
@@ -66,7 +70,7 @@ use rmcp::{
     },
     prompt, prompt_handler, prompt_router,
     schemars::JsonSchema,
-    service::{NotificationContext, RequestContext},
+    service::{NotificationContext, Peer, RequestContext},
     tool, tool_handler, tool_router,
 };
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kaijutsu still wants to
@@ -79,9 +83,14 @@ use rmcp::model::{LoggingLevel, SetLevelRequestParams};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use kaijutsu_client::{ActorHandle, PeerConfig, PeerInvocation, SshConfig, connect_ssh, spawn_actor};
-use kaijutsu_types::{BlockId, ContextId, ConversationDAG, PrincipalId};
+use kaijutsu_client::{
+    ActorHandle, CallError, PeerConfig, PeerInvocation, ServerEvent, SshConfig,
+    TurnCompletedStopReason, connect_ssh, spawn_actor,
+};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, watch};
 
 // Re-export public types
@@ -624,6 +633,13 @@ pub(crate) async fn stabilize_context_label(
 pub struct McpServerState {
     /// Current logging level (default: info)
     pub log_level: Arc<Mutex<LoggingLevel>>,
+    /// Process-wide count of progress relays currently widened onto each
+    /// context. Two concurrent `shell` calls delegating into the same
+    /// context each hold a reference; the watch is added on the 0→1
+    /// transition and removed on the 1→0 transition, so neither call's
+    /// narrowing can kill a watch the other still relies on. See
+    /// `ProgressWatchGuard`.
+    pub progress_watch_refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>,
 }
 
 #[allow(deprecated)]
@@ -631,6 +647,7 @@ impl Default for McpServerState {
     fn default() -> Self {
         Self {
             log_level: Arc::new(Mutex::new(LoggingLevel::Info)),
+            progress_watch_refs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -1214,6 +1231,408 @@ impl KaijutsuMcp {
             elapsed_ms,
         }
     }
+
+    /// The whole of `shell`'s behavior, minus the `#[tool]` machinery that
+    /// resolves a progress token from `RequestMetaObject` and requires a
+    /// live `Peer` to do it. Split out so integration tests — which cannot
+    /// construct a `Peer<RoleServer>` — can call this directly with
+    /// `progress: None`, exactly as a caller that never opted into progress
+    /// notifications would experience it.
+    pub async fn shell_impl(
+        &self,
+        req: ShellRequest,
+        progress: Option<(Peer<RoleServer>, ProgressToken)>,
+    ) -> CallToolResult {
+        // These three are *pre-execution* failures: the tool never ran. They
+        // now carry `isError: true` instead of returning an error string as a
+        // successful result, which is what "Error: ..." text used to do — a
+        // client had to string-match to notice. A command that runs and exits
+        // non-zero is NOT this case and stays a success envelope (see
+        // `to_tool_result`).
+        let (ctx_id, actor) = match self.require_joined().await {
+            Ok(v) => v,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
+        };
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Error: shell requires --connect to server",
+                )]);
+            }
+        };
+
+        // Live progress narration, only when the caller opted in by sending
+        // a progressToken (MCP's own opt-in, not a `shell` parameter — the
+        // whole point is that a delegated turn's context is discovered from
+        // `ServerEvent::TurnStarted`, not named up front). Held for exactly
+        // this call: the `AbortOnDrop` guard tears the relay down when
+        // `shell` returns, win or lose — and the relay's own
+        // `ProgressWatchGuard` releases whatever it widened onto even when
+        // torn down mid-delegation, since `AbortOnDrop` drops the task's
+        // future at its await point rather than running the loop's own
+        // cleanup.
+        let _progress_relay = progress.map(|(peer, token)| {
+            let handle = tokio::spawn(run_progress_relay(
+                remote.clone(),
+                ctx_id,
+                peer,
+                token,
+                self.server_state.progress_watch_refs.clone(),
+            ));
+            AbortOnDrop(handle.abort_handle())
+        });
+
+        // Execute command — creates ToolCall + ToolResult blocks in the document.
+        // The output block starts as Status::Running and transitions to Done/Error
+        // when execution completes.
+        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
+            Ok(id) => id,
+            Err(e) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error starting command: {e}"
+                ))]);
+            }
+        };
+
+        tracing::info!(
+            command = %req.command,
+            cmd_block = %cmd_block_id.to_key(),
+            ctx = %ctx_id,
+            "Shell command dispatched"
+        );
+
+        let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
+        self.execute_and_poll_shell(
+            remote,
+            ctx_id,
+            cmd_block_id,
+            &req.command,
+            timeout_secs,
+            "Shell command",
+        )
+        .await
+        .to_tool_result()
+    }
+}
+
+// ============================================================================
+// Delegated-turn progress narration
+//
+// `shell` runs a command that may itself delegate (`kj fork --prompt`,
+// `kj drive`, `kj wait`) — the caller then sits inside one MCP call while a
+// coder turn runs, possibly in a context this process never joined. When the
+// caller opted into MCP progress notifications (sent a `progressToken`), a
+// relay task narrates that work as `notifications/progress` for the call's
+// duration. The relay is purely decorative: `kj wait`'s durable, cursored
+// tail is what `shell` actually returns, and a failure here must never touch
+// that result.
+// ============================================================================
+
+/// A progress line's byte cap. Keeps one narrated event to roughly a
+/// terminal line, and bounds the cost of a very large `tool_input` or
+/// `content` value riding a notification.
+const PROGRESS_LINE_MAX_BYTES: usize = 200;
+
+/// Truncate `s` at a UTF-8 character boundary at or below `max` bytes.
+///
+/// Byte-slicing a `String` at an arbitrary index panics when it lands
+/// mid-codepoint; flooring to the nearest boundary keeps this safe on
+/// non-ASCII text.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max)
+        .last()
+        .unwrap_or(0);
+    &s[..end]
+}
+
+/// Render one block as a live progress line, or `None` for a block that
+/// should not narrate.
+///
+/// The narrating kinds — `Text`, `ToolCall`, `ToolResult`, `Error` — are
+/// exactly `kj wait`'s `TailFilter::Tools` admit set
+/// (`crates/kaijutsu-kernel/src/kj/wait.rs`): what streams live and what
+/// `kj wait` returns describe the same turn. Every other kind (`Thinking`
+/// and `Trace` included) opts out rather than guessing at a rendering.
+fn progress_line(context_id: ContextId, snap: &BlockSnapshot) -> Option<String> {
+    let kind_label = match snap.kind {
+        BlockKind::Text => "text",
+        BlockKind::ToolCall => "tool_call",
+        BlockKind::ToolResult => "tool_result",
+        BlockKind::Error => "error",
+        _ => return None,
+    };
+    let detail = match snap.kind {
+        // A ToolCall's `content` streams as plain text while it runs — the
+        // name plus its input is the useful summary, not that stream.
+        BlockKind::ToolCall => {
+            let name = snap.tool_name.as_deref().unwrap_or("tool");
+            match snap.tool_input.as_deref() {
+                Some(input) if !input.trim().is_empty() => format!("{name} {input}"),
+                _ => name.to_string(),
+            }
+        }
+        _ => snap.content.lines().next().unwrap_or("").to_string(),
+    };
+    let line = format!("context {} [{kind_label}] {detail}", context_id.short());
+    Some(truncate_at_char_boundary(&line, PROGRESS_LINE_MAX_BYTES).to_string())
+}
+
+/// Fire one progress notification and forget it. `seq` is the call-scoped
+/// monotonic counter the MCP spec wants ("should increase every time
+/// progress is made"); the send happens on a detached task so a slow or
+/// dead client transport never stalls the relay loop — and, by the same
+/// property, never stalls the `shell` call it is narrating.
+fn emit_progress(
+    peer: &Peer<RoleServer>,
+    token: &ProgressToken,
+    seq: &AtomicU64,
+    message: String,
+) {
+    let n = seq.fetch_add(1, Ordering::Relaxed);
+    let param = ProgressNotificationParam::new(token.clone(), n as f64).with_message(message);
+    let peer = peer.clone();
+    tokio::spawn(async move {
+        let _ = peer.notify_progress(param).await;
+    });
+}
+
+/// Increments the process-wide reference count for `ctx` in `refs`. Returns
+/// `true` exactly on the 0→1 transition — the caller must issue the
+/// widening `watch_contexts` RPC. Any other transition returns `false`:
+/// somebody else already holds the watch.
+fn progress_watch_acquire(
+    refs: &Mutex<std::collections::HashMap<ContextId, usize>>,
+    ctx: ContextId,
+) -> bool {
+    let mut refs = refs.lock().unwrap();
+    let count = refs.entry(ctx).or_insert(0);
+    *count += 1;
+    *count == 1
+}
+
+/// Decrements the process-wide reference count for `ctx` in `refs`. Returns
+/// `true` exactly on the 1→0 transition — the caller must issue the
+/// narrowing `watch_contexts` RPC. Any other transition returns `false`:
+/// another holder still relies on the watch. Releasing a context with no
+/// recorded holder is a no-op (returns `false`) rather than underflowing —
+/// defensive against a bug elsewhere double-releasing, not a path this
+/// module's own callers should ever take.
+fn progress_watch_release(
+    refs: &Mutex<std::collections::HashMap<ContextId, usize>>,
+    ctx: ContextId,
+) -> bool {
+    let mut refs = refs.lock().unwrap();
+    match refs.get_mut(&ctx) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        Some(_) => {
+            refs.remove(&ctx);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The slice of `ActorHandle` that `ProgressWatchGuard` needs. Abstracted
+/// out so the guard's refcounting — including its `Drop` cleanup — is
+/// unit-testable against a recording double instead of a live actor
+/// connection. `ActorHandle` is the only production implementor.
+trait WatchContextsRpc: Clone + Send + 'static {
+    fn watch_contexts(
+        &self,
+        add: Vec<ContextId>,
+        remove: Vec<ContextId>,
+    ) -> impl std::future::Future<Output = Result<Vec<ContextId>, CallError>> + Send;
+}
+
+impl WatchContextsRpc for ActorHandle {
+    fn watch_contexts(
+        &self,
+        add: Vec<ContextId>,
+        remove: Vec<ContextId>,
+    ) -> impl std::future::Future<Output = Result<Vec<ContextId>, CallError>> + Send {
+        ActorHandle::watch_contexts(self, add, remove)
+    }
+}
+
+/// One relay's share of the process-wide progress-watch reference counts.
+/// `acquire`/`release` track which contexts *this* guard is currently
+/// holding open (`held`) separately from the shared counts (`refs`), so
+/// `Drop` knows exactly what to release without re-deriving it.
+///
+/// `Drop` cannot `.await` the narrowing RPC, so it decrements the shared
+/// counts synchronously (an ordinary mutex lock — no async needed for that)
+/// and spawns a detached task only for the contexts that hit zero, to issue
+/// their `watch_contexts` removal. The synchronous decrement is what makes
+/// the guarantee real even if the spawned task is slow, fails, or (in a
+/// test with no reactor to run it on) never polls at all: the refcount
+/// itself is already correct the instant `drop` returns.
+struct ProgressWatchGuard<A: WatchContextsRpc = ActorHandle> {
+    refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>,
+    actor: A,
+    held: HashSet<ContextId>,
+}
+
+impl<A: WatchContextsRpc> ProgressWatchGuard<A> {
+    fn new(refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>, actor: A) -> Self {
+        Self {
+            refs,
+            actor,
+            held: HashSet::new(),
+        }
+    }
+
+    /// Acquire `ctx` for this guard; issues the widening RPC if this guard's
+    /// acquisition is the process's first.
+    async fn acquire(&mut self, ctx: ContextId) {
+        if self.held.insert(ctx) && progress_watch_acquire(&self.refs, ctx) {
+            if let Err(e) = self.actor.watch_contexts(vec![ctx], vec![]).await {
+                tracing::debug!("progress relay: watch_contexts add for {ctx} failed: {e}");
+            }
+        }
+    }
+
+    /// Release `ctx` from this guard; issues the narrowing RPC if this
+    /// guard's release is the process's last.
+    async fn release(&mut self, ctx: ContextId) {
+        if self.held.remove(&ctx) && progress_watch_release(&self.refs, ctx) {
+            if let Err(e) = self.actor.watch_contexts(vec![], vec![ctx]).await {
+                tracing::debug!("progress relay: watch_contexts remove for {ctx} failed: {e}");
+            }
+        }
+    }
+}
+
+impl<A: WatchContextsRpc> Drop for ProgressWatchGuard<A> {
+    fn drop(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        let refs = self.refs.clone();
+        let actor = self.actor.clone();
+        let held = std::mem::take(&mut self.held);
+        // Decrement every held context synchronously (`progress_watch_release`
+        // is a plain mutex lock, not async) so the refcount is correct the
+        // instant `drop` returns; only the narrowing RPC itself needs the
+        // detached task, for whichever contexts hit zero.
+        let to_remove: Vec<ContextId> = held
+            .into_iter()
+            .filter(|ctx| progress_watch_release(&refs, *ctx))
+            .collect();
+        if !to_remove.is_empty() {
+            tokio::spawn(async move {
+                if let Err(e) = actor.watch_contexts(vec![], to_remove.clone()).await {
+                    tracing::debug!(
+                        "progress relay: watch_contexts remove on drop for {to_remove:?} failed: {e}"
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// The relay loop backing a `shell` call's progress narration. Runs for the
+/// life of one call (the caller holds its `AbortOnDrop`), widening the
+/// actor's watch set onto a delegated turn's context as soon as it starts
+/// and narrowing back once that turn ends.
+///
+/// A failure anywhere in here — a lagged event stream, a `watch_contexts`
+/// RPC error, a dead notification transport — is logged at most and never
+/// propagated: this task's only job is decoration, and `kj wait`'s durable
+/// tail is unaffected by anything that happens to it.
+async fn run_progress_relay(
+    remote: RemoteState,
+    joined_ctx: ContextId,
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+    watch_refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>,
+) {
+    let mut event_rx = remote.actor.subscribe_events();
+    let seq = AtomicU64::new(0);
+    // This relay's share of the process-wide watch reference counts —
+    // released automatically (and safely, across concurrent relays) when
+    // the guard drops. See `ProgressWatchGuard`.
+    let mut watched = ProgressWatchGuard::new(watch_refs, remote.actor.clone());
+
+    loop {
+        let event = match event_rx.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!("progress relay: lagged by {n} events, continuing");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+
+        match event {
+            ServerEvent::TurnStarted { context_id, .. } if context_id != joined_ctx => {
+                let was_held = watched.held.contains(&context_id);
+                watched.acquire(context_id).await;
+                if !was_held {
+                    emit_progress(
+                        &peer,
+                        &token,
+                        &seq,
+                        format!("context {} — turn started", context_id.short()),
+                    );
+                }
+            }
+            ServerEvent::BlockInserted { context_id, block } => {
+                if let Some(line) = progress_line(context_id, &block) {
+                    emit_progress(&peer, &token, &seq, line);
+                }
+            }
+            ServerEvent::TurnCompleted {
+                context_id,
+                stop_reason,
+                ..
+            } => {
+                emit_progress(
+                    &peer,
+                    &token,
+                    &seq,
+                    format!(
+                        "context {} — turn completed ({})",
+                        context_id.short(),
+                        turn_stop_reason_label(stop_reason)
+                    ),
+                );
+                watched.release(context_id).await;
+            }
+            ServerEvent::TurnFailed { context_id, error, .. } => {
+                emit_progress(
+                    &peer,
+                    &token,
+                    &seq,
+                    format!("context {} — turn failed: {error}", context_id.short()),
+                );
+                watched.release(context_id).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Human label for a stop reason in a progress line. Not `Debug` — this text
+/// reaches a connected client's UI.
+fn turn_stop_reason_label(reason: TurnCompletedStopReason) -> &'static str {
+    match reason {
+        TurnCompletedStopReason::EndTurn => "ended",
+        TurnCompletedStopReason::CancelledSoft | TurnCompletedStopReason::CancelledImmediate => {
+            "cancelled"
+        }
+        TurnCompletedStopReason::MaxTokens => "hit max tokens",
+        TurnCompletedStopReason::MaxIterations => "hit max iterations",
+    }
 }
 
 impl Default for KaijutsuMcp {
@@ -1324,55 +1743,19 @@ impl KaijutsuMcp {
         output_schema = shell_output_schema()
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
-    pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> CallToolResult {
-        // These three are *pre-execution* failures: the tool never ran. They
-        // now carry `isError: true` instead of returning an error string as a
-        // successful result, which is what "Error: ..." text used to do — a
-        // client had to string-match to notice. A command that runs and exits
-        // non-zero is NOT this case and stays a success envelope (see
-        // `to_tool_result`).
-        let (ctx_id, actor) = match self.require_joined().await {
-            Ok(v) => v,
-            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
-        };
-        let remote = match self.remote() {
-            Some(r) => r,
-            None => {
-                return CallToolResult::error(vec![ContentBlock::text(
-                    "Error: shell requires --connect to server",
-                )]);
-            }
-        };
-        // Execute command — creates ToolCall + ToolResult blocks in the document.
-        // The output block starts as Status::Running and transitions to Done/Error
-        // when execution completes.
-        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
-            Ok(id) => id,
-            Err(e) => {
-                return CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Error starting command: {e}"
-                ))]);
-            }
-        };
-
-        tracing::info!(
-            command = %req.command,
-            cmd_block = %cmd_block_id.to_key(),
-            ctx = %ctx_id,
-            "Shell command dispatched"
-        );
-
-        let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
-        self.execute_and_poll_shell(
-            remote,
-            ctx_id,
-            cmd_block_id,
-            &req.command,
-            timeout_secs,
-            "Shell command",
-        )
-        .await
-        .to_tool_result()
+    pub async fn shell(
+        &self,
+        Parameters(req): Parameters<ShellRequest>,
+        peer: Peer<RoleServer>,
+        meta: RequestMetaObject,
+    ) -> CallToolResult {
+        // Progress narration is MCP's own opt-in (a `progressToken` on the
+        // call), not a `shell` parameter — resolving it needs the live
+        // `Peer` this `#[tool]` wrapper is handed and an integration test
+        // cannot construct. `shell_impl` carries the entire behavior and
+        // takes the resolved `(peer, token)` pair directly.
+        let progress = meta.get_progress_token().map(|token| (peer, token));
+        self.shell_impl(req, progress).await
     }
 
     // ========================================================================
@@ -3207,5 +3590,208 @@ mod tests {
         assert_eq!(json["status"], "stream_closed");
         assert_eq!(json["exit_code"], -1);
         assert!(json["error"].is_string());
+    }
+
+    // ------------------------------------------------------------------
+    // progress_line — the pure render at the core of `shell`'s live
+    // narration. See `run_progress_relay` for how these lines reach the
+    // wire; this is the falsifiable part.
+    // ------------------------------------------------------------------
+
+    fn block_id(ctx: ContextId) -> BlockId {
+        BlockId {
+            context_id: ctx,
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn progress_line_tool_call_names_the_tool() {
+        let ctx = ContextId::new();
+        let snap = kaijutsu_types::BlockSnapshotBuilder::new(block_id(ctx), BlockKind::ToolCall)
+            .tool_name("shell")
+            .tool_input("{\"command\":\"cargo check\"}")
+            .build();
+        let line = progress_line(ctx, &snap).expect("a ToolCall block narrates");
+        assert!(line.contains("shell"), "line should name the tool: {line}");
+        assert!(line.contains("tool_call"), "line should say what kind of block this is: {line}");
+    }
+
+    #[test]
+    fn progress_line_text_carries_first_line_of_content() {
+        let ctx = ContextId::new();
+        let snap = kaijutsu_types::BlockSnapshotBuilder::new(block_id(ctx), BlockKind::Text)
+            .content("building the thing")
+            .build();
+        let line = progress_line(ctx, &snap).expect("a Text block narrates");
+        assert!(line.contains("building the thing"), "line should carry the content: {line}");
+    }
+
+    #[test]
+    fn progress_line_hides_thinking_and_trace() {
+        let ctx = ContextId::new();
+        let thinking = kaijutsu_types::BlockSnapshotBuilder::new(block_id(ctx), BlockKind::Thinking)
+            .content("reasoning about the next step...")
+            .build();
+        assert!(progress_line(ctx, &thinking).is_none(), "Thinking must never narrate");
+
+        let trace = kaijutsu_types::BlockSnapshotBuilder::new(block_id(ctx), BlockKind::Trace)
+            .content("rc lifecycle ran S00-stance.kai")
+            .build();
+        assert!(progress_line(ctx, &trace).is_none(), "Trace must never narrate");
+    }
+
+    #[test]
+    fn progress_line_truncates_non_ascii_at_a_char_boundary() {
+        let ctx = ContextId::new();
+        // Every character here is 3 bytes in UTF-8 and the prefix
+        // ("context XXXXXXXX [text] ") is a fixed 24 ASCII bytes, so byte
+        // 200 of the formatted line falls inside a character, not on its
+        // boundary — the case a raw `&s[..200]` slice would panic on.
+        let content = "日本語のテキスト".repeat(20);
+        let snap = kaijutsu_types::BlockSnapshotBuilder::new(block_id(ctx), BlockKind::Text)
+            .content(content)
+            .build();
+        let line = progress_line(ctx, &snap).expect("a Text block narrates");
+        assert!(
+            line.len() <= PROGRESS_LINE_MAX_BYTES,
+            "line exceeds the byte cap: {} bytes",
+            line.len()
+        );
+        // A `String` is valid UTF-8 by construction — re-validate explicitly
+        // so a future change to the truncation can't silently start
+        // producing a lossy conversion instead of a clean cut.
+        assert!(std::str::from_utf8(line.as_bytes()).is_ok(), "line must stay valid UTF-8");
+    }
+
+    #[test]
+    fn progress_line_keeps_only_the_first_line() {
+        let ctx = ContextId::new();
+        let snap = kaijutsu_types::BlockSnapshotBuilder::new(block_id(ctx), BlockKind::Text)
+            .content("first line\nsecond line\nthird line")
+            .build();
+        let line = progress_line(ctx, &snap).expect("a Text block narrates");
+        assert!(line.contains("first line"), "line should carry the first line: {line}");
+        assert!(!line.contains("second line"), "line must not carry later lines: {line}");
+        assert!(!line.contains("third line"), "line must not carry later lines: {line}");
+    }
+
+    // ------------------------------------------------------------------
+    // Progress-watch reference counting — the fix for two concurrent
+    // `shell` calls' relays racing to narrow a watch the other still
+    // relies on. Pure `HashMap<ContextId, usize>` state, no actor or
+    // runtime needed for `progress_watch_acquire`/`progress_watch_release`
+    // themselves; the guard-drop test needs `#[tokio::test]` only because
+    // `Drop` spawns a detached task, matching `AbortOnDrop`'s established
+    // pattern in this file.
+    // ------------------------------------------------------------------
+
+    /// Two acquirers of the same context: only the first reports "must add
+    /// the watch" (the 0→1 transition); the second finds it already held.
+    ///
+    /// Falsified with: `progress_watch_acquire` always returning `true`
+    /// (report add on every acquire) — confirmed failing (second assertion
+    /// tripped), then reverted.
+    #[test]
+    fn progress_watch_second_acquirer_does_not_re_add() {
+        let refs = Mutex::new(std::collections::HashMap::new());
+        let ctx = ContextId::new();
+        assert!(
+            progress_watch_acquire(&refs, ctx),
+            "first acquirer must add the watch"
+        );
+        assert!(
+            !progress_watch_acquire(&refs, ctx),
+            "second acquirer must not re-add a watch the first one already holds"
+        );
+    }
+
+    /// After two acquirers, the first release must not report "must
+    /// remove" (another holder still relies on the watch); the second
+    /// release — the 1→0 transition — must.
+    ///
+    /// Falsified with: `progress_watch_release` always returning `true`
+    /// (report remove on every release) — confirmed failing (first
+    /// assertion tripped), then reverted.
+    #[test]
+    fn progress_watch_only_last_release_removes() {
+        let refs = Mutex::new(std::collections::HashMap::new());
+        let ctx = ContextId::new();
+        progress_watch_acquire(&refs, ctx);
+        progress_watch_acquire(&refs, ctx);
+        assert!(
+            !progress_watch_release(&refs, ctx),
+            "first release must not remove the watch — a second holder still relies on it"
+        );
+        assert!(
+            progress_watch_release(&refs, ctx),
+            "second (last) release must remove the watch"
+        );
+    }
+
+    /// A context acquired once and released once round-trips: add, then
+    /// remove.
+    #[test]
+    fn progress_watch_single_acquire_release_round_trips() {
+        let refs = Mutex::new(std::collections::HashMap::new());
+        let ctx = ContextId::new();
+        assert!(progress_watch_acquire(&refs, ctx), "sole acquirer must add the watch");
+        assert!(progress_watch_release(&refs, ctx), "sole release must remove the watch");
+    }
+
+    /// A recording double for `WatchContextsRpc`, standing in for
+    /// `ActorHandle` so the guard's `Drop` behavior is testable without a
+    /// live actor connection.
+    #[derive(Clone, Default)]
+    struct RecordingActor {
+        calls: Arc<Mutex<Vec<(Vec<ContextId>, Vec<ContextId>)>>>,
+    }
+
+    impl WatchContextsRpc for RecordingActor {
+        fn watch_contexts(
+            &self,
+            add: Vec<ContextId>,
+            remove: Vec<ContextId>,
+        ) -> impl std::future::Future<Output = Result<Vec<ContextId>, CallError>> + Send {
+            let calls = self.calls.clone();
+            async move {
+                calls.lock().unwrap().push((add, remove));
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// Dropping the guard while it still holds a context releases that
+    /// context's reference: a fresh `progress_watch_acquire` afterward
+    /// reports "must add" again, proving the shared count really returned
+    /// to zero rather than being stranded (the leak `AbortOnDrop` used to
+    /// cause, since abort drops the relay's future at its await point and
+    /// skips the loop's own release code).
+    ///
+    /// Falsified with: `Drop for ProgressWatchGuard` reduced to an empty
+    /// body (`fn drop(&mut self) {}`) — confirmed failing (the post-drop
+    /// acquire returned `false`, i.e. the count was still 1), then
+    /// reverted.
+    #[tokio::test]
+    async fn progress_watch_guard_drop_releases_held_refs() {
+        let refs = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let ctx = ContextId::new();
+        let actor = RecordingActor::default();
+
+        {
+            let mut guard = ProgressWatchGuard::new(refs.clone(), actor.clone());
+            guard.acquire(ctx).await;
+            // Guard drops here via a bare block, with no explicit
+            // `release()` call — exactly the `AbortOnDrop` shape in
+            // `shell_impl`, where the relay task is aborted rather than
+            // run to a clean exit.
+        }
+
+        assert!(
+            progress_watch_acquire(&refs, ctx),
+            "acquiring after the guard dropped must report the watch needs adding again \
+             — the count did not return to zero"
+        );
     }
 }
