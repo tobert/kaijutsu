@@ -20,12 +20,15 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
+use rusqlite::{
+    Connection, OptionalExtension, Result as SqliteResult, Transaction, TransactionBehavior,
+    params,
+};
 use tracing::{info, warn};
 
 use kaijutsu_types::{
     BackendId, BlockId, CastId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
-    KernelId, PresetId, PrincipalId, WorkspaceId,
+    KernelId, PresetId, PrincipalId, SessionId, WorkspaceId,
 };
 
 use crate::llm::stream::{CacheTarget, CacheTtl};
@@ -448,6 +451,123 @@ pub struct ContextEdgeRow {
     pub kind: EdgeKind,
     pub metadata: Option<String>,
     pub created_at: i64,
+}
+
+// ── Gate actions (docs/gate-resume.md) ──────────────────────────────────────
+
+/// What a gated call would have performed, and the payload that says it.
+///
+/// The variants are the `gate_actions.kind` values, and each carries exactly
+/// the columns that table's CHECK accepts for its kind — a combination the
+/// database refuses cannot be built here either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateActionPayload {
+    /// kaish source, to run through the originating context's shell.
+    Shell { source: String },
+    /// One MCP tool call. The params are an arbitrary document by MCP's own
+    /// definition, so they travel as one JSON text.
+    Tool { params_json: String },
+    /// One `kj` verb as argv, in submission order. Never empty: `argv[0]` is
+    /// the verb.
+    KjVerb { argv: Vec<String> },
+}
+
+impl GateActionPayload {
+    /// The `gate_actions.kind` value this payload writes.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Shell { .. } => "shell",
+            Self::Tool { .. } => "tool",
+            Self::KjVerb { .. } => "kj_verb",
+        }
+    }
+}
+
+/// Where one gate action sits: `waiting` → `claimed` → `done` | `failed`.
+/// Nothing moves backwards, and only a `claimed` action may finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateActionStatus {
+    /// Recorded, nobody has taken it. The state every action starts in.
+    Waiting,
+    /// Taken by exactly one caller, which has not reported back yet.
+    Claimed,
+    /// Ran, and its result was authored as `result_block_id`.
+    Done,
+    /// Did not produce a result; `error` says what stopped it.
+    Failed,
+}
+
+impl GateActionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Claimed => "claimed",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored status. An unknown string is corruption, not a state to
+    /// guess at — reading it as anything would risk re-running an action that
+    /// already ran.
+    fn from_sql(s: &str) -> KernelDbResult<Self> {
+        match s {
+            "waiting" => Ok(Self::Waiting),
+            "claimed" => Ok(Self::Claimed),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            other => Err(KernelDbError::Validation(format!(
+                "gate action status {other:?} is not one of waiting/claimed/done/failed — corrupt"
+            ))),
+        }
+    }
+}
+
+/// How a claimed gate action ended. See [`KernelDb::finish_gate_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateActionOutcome {
+    /// The action ran and its result was authored as this block.
+    Done { result_block_id: BlockId },
+    /// The action produced no result. `error` is the text the model reads.
+    Failed { error: String },
+}
+
+/// A gate action ready to record. `request_id` must already name an
+/// `approvals` row — the foreign key refuses anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewGateAction {
+    pub request_id: String,
+    /// Ledger `instance` column, e.g. `"builtin.shell_write"`.
+    pub instance: String,
+    /// Ledger `tool` column, e.g. `"shell_write"`.
+    pub tool: String,
+    /// The context the result is authored back into.
+    pub context_id: ContextId,
+    /// Who asked. The action runs as this principal or not at all.
+    pub principal_id: PrincipalId,
+    /// The connection session that asked, when there was one.
+    pub session_id: Option<SessionId>,
+    pub payload: GateActionPayload,
+}
+
+/// One recorded gate action, read back whole — argv included, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateAction {
+    pub request_id: String,
+    pub instance: String,
+    pub tool: String,
+    pub context_id: ContextId,
+    pub principal_id: PrincipalId,
+    pub session_id: Option<SessionId>,
+    pub payload: GateActionPayload,
+    pub status: GateActionStatus,
+    pub created_at: i64,
+    pub claimed_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    /// The block the result was authored as. Set only by a `done` finish.
+    pub result_block_id: Option<BlockId>,
+    /// Why the action produced no result. Set only by a `failed` finish.
+    pub error: Option<String>,
 }
 
 // ============================================================================
@@ -1260,6 +1380,63 @@ CREATE TABLE IF NOT EXISTS dirty_file_buffers (
     dirtied_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
+
+-- ── Gate actions (docs/gate-resume.md) ──────────────────────────
+-- What a gated call would have done, stored beside the ask that stopped it.
+-- A suspended call cannot survive a restart and a row can, so the kernel
+-- performs the action itself once a human answers.
+--
+-- The row is a TAGGED UNION: `kind` says which payload column carries the
+-- action, and the trailing CHECK turns a wrong combination into a loud
+-- SQLite error rather than a malformed row nobody notices. A `kj_verb`
+-- keeps its payload in `gate_action_argv` because a list of strings
+-- normalizes cleanly; a `tool` call's params are an arbitrary document by
+-- MCP's own definition, so a JSON column is the honest storage for them
+-- rather than a shortcut.
+--
+-- The `approvals(request_id)` foreign key resolves because the ledger's
+-- tables live in this database on this connection, so an ask and its
+-- action can commit in one transaction.
+--
+-- status: waiting → claimed → done | failed, and nothing moves backwards.
+-- Exactly one caller may take a row from `waiting` to `claimed`. A row
+-- still `claimed` at startup ran or did not run, and nothing on disk says
+-- which — it must be failed closed, never re-run.
+CREATE TABLE IF NOT EXISTS gate_actions (
+    request_id      TEXT    NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    kind            TEXT    NOT NULL CHECK (kind IN ('shell', 'tool', 'kj_verb')),
+    instance        TEXT    NOT NULL,
+    tool            TEXT    NOT NULL,
+    context_id      BLOB    NOT NULL,
+    principal_id    BLOB    NOT NULL,
+    session_id      BLOB,
+    source          TEXT,
+    params_json     TEXT,
+    status          TEXT    NOT NULL DEFAULT 'waiting'
+        CHECK (status IN ('waiting', 'claimed', 'done', 'failed')),
+    created_at      INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    claimed_at      INTEGER,
+    finished_at     INTEGER,
+    result_block_id TEXT,
+    error           TEXT,
+    CHECK (
+        (kind = 'shell'   AND source IS NOT NULL AND params_json IS NULL) OR
+        (kind = 'tool'    AND params_json IS NOT NULL AND source IS NULL) OR
+        (kind = 'kj_verb' AND source IS NULL AND params_json IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_gate_actions_status ON gate_actions(status, created_at);
+
+-- One `kj` verb argument per row; `seq` is its position in the submitted
+-- argv, counted from 0. Read back with ORDER BY seq — the order of an argv
+-- is part of what it means.
+CREATE TABLE IF NOT EXISTS gate_action_argv (
+    request_id TEXT    NOT NULL REFERENCES gate_actions(request_id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    arg        TEXT    NOT NULL,
+    PRIMARY KEY (request_id, seq)
+);
 "#;
 
 // ============================================================================
@@ -1360,6 +1537,100 @@ fn read_dirty_file_buffer(row: &rusqlite::Row<'_>) -> SqliteResult<DirtyFileBuff
         loaded_generation: loaded_generation.map(|g| g as u64),
         dirtied_at,
     })
+}
+
+/// One `gate_actions` row exactly as stored, before the tag and its payload
+/// are checked against each other. Kept separate because that check produces a
+/// [`KernelDbError`], which a rusqlite row mapper cannot return.
+struct RawGateAction {
+    kind: String,
+    instance: String,
+    tool: String,
+    context_id: ContextId,
+    principal_id: PrincipalId,
+    session_id: Option<SessionId>,
+    source: Option<String>,
+    params_json: Option<String>,
+    status: String,
+    created_at: i64,
+    claimed_at: Option<i64>,
+    finished_at: Option<i64>,
+    result_block_id: Option<String>,
+    error: Option<String>,
+}
+
+fn read_raw_gate_action(row: &rusqlite::Row<'_>) -> SqliteResult<RawGateAction> {
+    let principal_bytes: Vec<u8> = row.get(4)?;
+    let principal_id = PrincipalId::try_from_slice(&principal_bytes).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Blob,
+            "invalid PrincipalId bytes".into(),
+        )
+    })?;
+    let session_bytes: Option<Vec<u8>> = row.get(5)?;
+    let session_id = match session_bytes {
+        None => None,
+        Some(bytes) => Some(SessionId::try_from_slice(&bytes).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Blob,
+                "invalid SessionId bytes".into(),
+            )
+        })?),
+    };
+    Ok(RawGateAction {
+        kind: row.get(0)?,
+        instance: row.get(1)?,
+        tool: row.get(2)?,
+        context_id: read_context_id(row, 3)?,
+        principal_id,
+        session_id,
+        source: row.get(6)?,
+        params_json: row.get(7)?,
+        status: row.get(8)?,
+        created_at: row.get(9)?,
+        claimed_at: row.get(10)?,
+        finished_at: row.get(11)?,
+        result_block_id: row.get(12)?,
+        error: row.get(13)?,
+    })
+}
+
+/// Refuse a gate action the table could not represent, or could store but
+/// never run. The schema's CHECK backs the tag/payload pairing up, but a
+/// caller deserves to be told which field is wrong rather than which
+/// constraint fired.
+fn validate_gate_action(action: &NewGateAction) -> KernelDbResult<()> {
+    if action.request_id.is_empty() {
+        return Err(KernelDbError::Validation(
+            "gate action has an empty request_id — it must name an existing ask".to_string(),
+        ));
+    }
+    match &action.payload {
+        GateActionPayload::Shell { source } if source.is_empty() => {
+            Err(KernelDbError::Validation(format!(
+                "gate action {} is a shell action with empty source — there is nothing to run",
+                action.request_id
+            )))
+        }
+        GateActionPayload::Tool { params_json } => {
+            serde_json::from_str::<serde_json::Value>(params_json).map_err(|e| {
+                KernelDbError::Validation(format!(
+                    "gate action {} has params that are not JSON: {e}",
+                    action.request_id
+                ))
+            })?;
+            Ok(())
+        }
+        GateActionPayload::KjVerb { argv } if argv.is_empty() => {
+            Err(KernelDbError::Validation(format!(
+                "gate action {} is a kj_verb action with empty argv — argv[0] is the verb",
+                action.request_id
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A persisted track clock domain — the restart-recovery row for a `TrackState`.
@@ -5780,6 +6051,273 @@ impl KernelDb {
             .query_map([], read_dirty_file_buffer)?
             .collect::<SqliteResult<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    // ========================================================================
+    // Gate actions (docs/gate-resume.md — "The persisted action")
+    // ========================================================================
+
+    /// Record what a gated call would have done, beside the ask that stopped
+    /// it. The row is what makes a resume possible: a suspended call dies with
+    /// the process, and this survives it.
+    ///
+    /// `request_id` must already name an `approvals` row; the foreign key
+    /// refuses anything else. A payload the table could not represent — an
+    /// empty `kj` argv, an empty shell source, `tool` params that are not JSON
+    /// — is refused here, so the error names the field instead of the
+    /// constraint that would have caught it next.
+    pub fn record_gate_action(&self, action: &NewGateAction) -> KernelDbResult<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::write_gate_action(&tx, action)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The transaction-free write behind [`Self::record_gate_action`], for a
+    /// caller that already holds one — committing an ask and its action
+    /// together is the point of them sharing a connection.
+    pub(crate) fn write_gate_action(
+        conn: &Connection,
+        action: &NewGateAction,
+    ) -> KernelDbResult<()> {
+        validate_gate_action(action)?;
+        let (source, params_json) = match &action.payload {
+            GateActionPayload::Shell { source } => (Some(source.as_str()), None),
+            GateActionPayload::Tool { params_json } => (None, Some(params_json.as_str())),
+            GateActionPayload::KjVerb { .. } => (None, None),
+        };
+        conn.execute(
+            "INSERT INTO gate_actions
+                 (request_id, kind, instance, tool, context_id, principal_id,
+                  session_id, source, params_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                action.request_id,
+                action.payload.kind(),
+                action.instance,
+                action.tool,
+                blob_param(action.context_id.as_bytes()),
+                blob_param(action.principal_id.as_bytes()),
+                action.session_id.map(|s| s.as_bytes().to_vec()),
+                source,
+                params_json,
+            ],
+        )?;
+        if let GateActionPayload::KjVerb { argv } = &action.payload {
+            let mut stmt = conn.prepare(
+                "INSERT INTO gate_action_argv (request_id, seq, arg) VALUES (?1, ?2, ?3)",
+            )?;
+            for (seq, arg) in argv.iter().enumerate() {
+                stmt.execute(params![action.request_id, seq as i64, arg])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take `request_id` from `waiting` to `claimed`, returning whether THIS
+    /// caller won. Exactly one can: `BEGIN IMMEDIATE` takes the write lock
+    /// before the `UPDATE` reads anything, so the changed-row count is the
+    /// decision and there is no read-then-write window for a second claimer to
+    /// land in (the shape `approval_ledger::claim` uses for the same problem).
+    ///
+    /// `Ok(false)` means the row was not `waiting` — somebody else holds it,
+    /// or it already finished. A `request_id` with no row at all is
+    /// [`KernelDbError::NotFound`], never a quiet `false`.
+    pub fn claim_gate_action(&self, request_id: &str) -> KernelDbResult<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE gate_actions SET status = 'claimed', claimed_at = ?1
+             WHERE request_id = ?2 AND status = 'waiting'",
+            params![now_millis(), request_id],
+        )?;
+        if changed == 0 {
+            // Nothing changed under this transaction, so there is nothing to
+            // commit; dropping rolls back, which keeps "only a winning claim
+            // writes" true by construction rather than by the UPDATE happening
+            // to match no rows.
+            drop(tx);
+            return match self.gate_action_status(request_id)? {
+                None => Err(KernelDbError::NotFound(format!(
+                    "gate action {request_id}"
+                ))),
+                Some(_) => Ok(false),
+            };
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// End a claimed action: `done` records the block its result was authored
+    /// as, `failed` records why there is none. Both stamp `finished_at`.
+    ///
+    /// Only a `claimed` action may finish. Any other status is refused as
+    /// [`KernelDbError::Validation`] naming what the status actually is — a
+    /// finish against a `waiting` row would mean a result exists for work
+    /// nobody took, and against a terminal row it would overwrite an outcome
+    /// already recorded.
+    pub fn finish_gate_action(
+        &self,
+        request_id: &str,
+        outcome: &GateActionOutcome,
+    ) -> KernelDbResult<()> {
+        let (status, result_block_id, error) = match outcome {
+            GateActionOutcome::Done { result_block_id } => {
+                (GateActionStatus::Done, Some(result_block_id.to_key()), None)
+            }
+            GateActionOutcome::Failed { error } => {
+                (GateActionStatus::Failed, None, Some(error.as_str()))
+            }
+        };
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE gate_actions
+                SET status = ?1, finished_at = ?2, result_block_id = ?3, error = ?4
+              WHERE request_id = ?5 AND status = 'claimed'",
+            params![
+                status.as_str(),
+                now_millis(),
+                result_block_id,
+                error,
+                request_id
+            ],
+        )?;
+        if changed == 0 {
+            drop(tx);
+            return Err(match self.gate_action_status(request_id)? {
+                None => KernelDbError::NotFound(format!("gate action {request_id}")),
+                Some(actual) => KernelDbError::Validation(format!(
+                    "gate action {request_id} is {}, not claimed — only a claimed action \
+                     can finish",
+                    actual.as_str()
+                )),
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read one gate action back whole, argv included and in `seq` order, or
+    /// `None` when no such row exists.
+    ///
+    /// A stored row that no longer parses — an unknown `kind` or status, a
+    /// payload column missing for its kind, an unreadable id — is corruption
+    /// and returns [`KernelDbError::Validation`]. Approximating it would mean
+    /// running something other than what a human approved.
+    pub fn gate_action(&self, request_id: &str) -> KernelDbResult<Option<GateAction>> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT kind, instance, tool, context_id, principal_id, session_id,
+                        source, params_json, status, created_at, claimed_at,
+                        finished_at, result_block_id, error
+                 FROM gate_actions WHERE request_id = ?1",
+                params![request_id],
+                read_raw_gate_action,
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+
+        let missing = |column: &str| {
+            KernelDbError::Validation(format!(
+                "gate action {request_id} is kind {:?} with no {column} — corrupt",
+                raw.kind
+            ))
+        };
+        let payload = match raw.kind.as_str() {
+            "shell" => GateActionPayload::Shell {
+                source: raw.source.clone().ok_or_else(|| missing("source"))?,
+            },
+            "tool" => GateActionPayload::Tool {
+                params_json: raw.params_json.clone().ok_or_else(|| missing("params_json"))?,
+            },
+            "kj_verb" => {
+                let argv = self.gate_action_argv(request_id)?;
+                if argv.is_empty() {
+                    return Err(KernelDbError::Validation(format!(
+                        "gate action {request_id} is a kj_verb with no argv — corrupt"
+                    )));
+                }
+                GateActionPayload::KjVerb { argv }
+            }
+            other => {
+                return Err(KernelDbError::Validation(format!(
+                    "gate action {request_id} has kind {other:?}, not shell/tool/kj_verb \
+                     — corrupt"
+                )));
+            }
+        };
+
+        let result_block_id = match &raw.result_block_id {
+            None => None,
+            Some(key) => Some(BlockId::from_key(key).ok_or_else(|| {
+                KernelDbError::Validation(format!(
+                    "gate action {request_id} result block {key:?} is unparseable — corrupt"
+                ))
+            })?),
+        };
+
+        Ok(Some(GateAction {
+            request_id: request_id.to_string(),
+            instance: raw.instance,
+            tool: raw.tool,
+            context_id: raw.context_id,
+            principal_id: raw.principal_id,
+            session_id: raw.session_id,
+            payload,
+            status: GateActionStatus::from_sql(&raw.status)?,
+            created_at: raw.created_at,
+            claimed_at: raw.claimed_at,
+            finished_at: raw.finished_at,
+            result_block_id,
+            error: raw.error,
+        }))
+    }
+
+    /// Every gate action still `claimed`, oldest first.
+    ///
+    /// **Never re-run one of these.** A row is still `claimed` at startup
+    /// because the kernel died between taking the action and recording what
+    /// happened, so nothing on disk says whether it ran — and an approved
+    /// action can be destructive, which makes running it a second time worse
+    /// than not running it at all. The recovery is to fail each one closed and
+    /// tell the model, so a human can decide to ask again.
+    pub fn gate_actions_claimed_at_boot(&self) -> KernelDbResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id FROM gate_actions
+             WHERE status = 'claimed' ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// One action's argv in submission order, empty for every other kind.
+    fn gate_action_argv(&self, request_id: &str) -> KernelDbResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT arg FROM gate_action_argv WHERE request_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![request_id], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// One action's stored status, or `None` when the row does not exist —
+    /// the read that lets a refused claim or finish say which of the two it
+    /// was.
+    fn gate_action_status(&self, request_id: &str) -> KernelDbResult<Option<GateActionStatus>> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM gate_actions WHERE request_id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        status.map(|s| GateActionStatus::from_sql(&s)).transpose()
     }
 }
 
@@ -12125,6 +12663,430 @@ mod tests {
         assert!(
             !dir.exists(),
             "the temp directory must be removed once the KernelDb handle drops"
+        );
+    }
+
+    // ── Gate actions (docs/gate-resume.md) ──────────────────────────────
+
+    /// Create the `approvals` row a gate action's foreign key needs, and
+    /// return its `request_id`. The gate's own policy lives a layer up in
+    /// `kj/gate.rs`; all this table needs is that the ask exists.
+    fn seed_ask(db: &KernelDb) -> String {
+        approval_ledger::ask::create_ask(
+            db.conn_for_ledger(),
+            &approval_ledger::types::NewAsk {
+                context_id: ContextId::new().as_bytes().to_vec(),
+                principal_id: PrincipalId::new().as_bytes().to_vec(),
+                origin: approval_ledger::types::Origin::KjVerb,
+                instance: None,
+                tool: None,
+                hook_id: None,
+                description: "gate action test ask".into(),
+                statements: vec![],
+                authorized_label: None,
+                rc_run_id: None,
+                expires_at: None,
+                options: vec![],
+                signals: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    fn new_gate_action(request_id: &str, payload: GateActionPayload) -> NewGateAction {
+        NewGateAction {
+            request_id: request_id.to_string(),
+            instance: "builtin.shell_write".into(),
+            tool: "shell_write".into(),
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            session_id: Some(SessionId::new()),
+            payload,
+        }
+    }
+
+    /// A `shell` action round-trips with its source byte-for-byte. The source
+    /// is the whole action — the ask only carries a rendering built for a
+    /// human to read, so anything lost here cannot be recovered from it.
+    ///
+    /// Falsified by writing `source` as `Some("")` regardless of the payload:
+    /// the source assertion tripped. Reverted.
+    #[test]
+    fn a_shell_gate_action_round_trips_with_its_source() {
+        let db = KernelDb::temporary().unwrap();
+        let request_id = seed_ask(&db);
+        let source = "rm -rf /v/scratch/*.tmp && echo done";
+        let action = new_gate_action(&request_id, GateActionPayload::Shell {
+            source: source.into(),
+        });
+        db.record_gate_action(&action).unwrap();
+
+        let read = db.gate_action(&request_id).unwrap().expect("the row must exist");
+        assert_eq!(read.payload, GateActionPayload::Shell { source: source.into() });
+        assert_eq!(read.status, GateActionStatus::Waiting);
+        assert_eq!(read.context_id, action.context_id);
+        assert_eq!(read.principal_id, action.principal_id);
+        assert_eq!(read.session_id, action.session_id);
+        assert_eq!(read.instance, action.instance);
+        assert_eq!(read.tool, action.tool);
+        assert!(read.claimed_at.is_none());
+        assert!(read.finished_at.is_none());
+        assert!(read.result_block_id.is_none());
+        assert!(read.error.is_none());
+    }
+
+    /// A `kj_verb` action round-trips its argv IN ORDER. Argv order is what
+    /// an argv means: the same words in another order are another command,
+    /// and re-running a reordered one is not the action a human approved.
+    /// The words below sort differently than they were submitted, so a read
+    /// that ordered by anything but `seq` would be caught.
+    ///
+    /// A `kj_verb` action round-trips its argv IN ORDER. Argv order is what
+    /// an argv means: the same words in another order are another command,
+    /// and re-running a reordered one is not the action a human approved.
+    ///
+    /// **This test cannot falsify the query's `ORDER BY seq`, and the reason
+    /// is worth knowing.** `gate_action_argv`'s `PRIMARY KEY (request_id,
+    /// seq)` is a unique index, so a lookup by `request_id` walks that index
+    /// and hands back `seq` order whether or not anybody asked for it —
+    /// dropping the `ORDER BY`, reordering the physical rows by
+    /// delete-and-rewrite, and `ORDER BY arg` were all tried, and only the
+    /// last one failed. The clause stays regardless: the ordering is a
+    /// contract this code depends on, and a contract inherited from a query
+    /// planner's index choice is one a later schema change can take away
+    /// silently. What this test does pin is that the words come back
+    /// unmangled and in the submitted sequence.
+    #[test]
+    fn a_kj_verb_gate_action_round_trips_its_argv_in_order() {
+        let db = KernelDb::temporary().unwrap();
+        let request_id = seed_ask(&db);
+        // Submitted order is neither alphabetical nor its reverse, so an
+        // `ORDER BY arg` read is caught.
+        let argv = vec![
+            "block".to_string(),
+            "exclude".to_string(),
+            "a1b2c3d4".to_string(),
+            "--reason".to_string(),
+            "poisoned turn".to_string(),
+        ];
+        db.record_gate_action(&new_gate_action(
+            &request_id,
+            GateActionPayload::KjVerb { argv: argv.clone() },
+        ))
+        .unwrap();
+
+        let read = db.gate_action(&request_id).unwrap().expect("the row must exist");
+        assert_eq!(read.payload, GateActionPayload::KjVerb { argv });
+    }
+
+    /// Exactly one caller takes an action from `waiting` to `claimed`. The
+    /// second is told `false` rather than handed the same job — running an
+    /// approved action twice is the failure the claim exists to prevent.
+    ///
+    /// Falsified by dropping `AND status = 'waiting'` from the claim UPDATE:
+    /// the second claim returned `true`. Reverted.
+    #[test]
+    fn exactly_one_claimer_wins_a_gate_action() {
+        let db = KernelDb::temporary().unwrap();
+        let request_id = seed_ask(&db);
+        db.record_gate_action(&new_gate_action(&request_id, GateActionPayload::Shell {
+            source: "echo hi".into(),
+        }))
+        .unwrap();
+
+        assert!(db.claim_gate_action(&request_id).unwrap(), "the first claim wins");
+        assert!(
+            !db.claim_gate_action(&request_id).unwrap(),
+            "a second claim on the same action must lose"
+        );
+
+        let read = db.gate_action(&request_id).unwrap().unwrap();
+        assert_eq!(read.status, GateActionStatus::Claimed);
+        assert!(read.claimed_at.is_some(), "a winning claim stamps claimed_at");
+    }
+
+    /// Claiming an action that was never recorded is [`KernelDbError::NotFound`],
+    /// not a quiet `false` — "somebody else has it" and "there is no such job"
+    /// are different facts and a caller acts differently on each.
+    ///
+    /// Falsified by returning `Ok(false)` for the missing-row case: the error
+    /// assertion tripped. Reverted.
+    #[test]
+    fn claiming_an_unknown_gate_action_is_not_found() {
+        let db = KernelDb::temporary().unwrap();
+        let err = db.claim_gate_action("no-such-request").unwrap_err();
+        assert!(
+            matches!(&err, KernelDbError::NotFound(m) if m.contains("no-such-request")),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// Only a `claimed` action may finish. Finishing a `waiting` one would
+    /// record a result for work nobody took; finishing a terminal one would
+    /// overwrite an outcome already on disk. Both are refused loudly, and the
+    /// error names the status that was actually found.
+    ///
+    /// Falsified by dropping `AND status = 'claimed'` from the finish UPDATE:
+    /// both refusals became `Ok(())`. Reverted.
+    #[test]
+    fn finishing_a_gate_action_that_is_not_claimed_is_refused() {
+        let db = KernelDb::temporary().unwrap();
+        let request_id = seed_ask(&db);
+        db.record_gate_action(&new_gate_action(&request_id, GateActionPayload::Shell {
+            source: "echo hi".into(),
+        }))
+        .unwrap();
+        let outcome = GateActionOutcome::Failed { error: "nope".into() };
+
+        // waiting → refused, and the message says so.
+        let err = db.finish_gate_action(&request_id, &outcome).unwrap_err();
+        assert!(
+            matches!(&err, KernelDbError::Validation(m) if m.contains("is waiting, not claimed")),
+            "expected a Validation naming the status, got {err:?}"
+        );
+
+        // claimed → allowed, once.
+        assert!(db.claim_gate_action(&request_id).unwrap());
+        db.finish_gate_action(&request_id, &outcome).unwrap();
+        let read = db.gate_action(&request_id).unwrap().unwrap();
+        assert_eq!(read.status, GateActionStatus::Failed);
+        assert_eq!(read.error.as_deref(), Some("nope"));
+        assert!(read.finished_at.is_some());
+
+        // failed → refused; a recorded outcome is not overwritable.
+        let err = db.finish_gate_action(&request_id, &outcome).unwrap_err();
+        assert!(
+            matches!(&err, KernelDbError::Validation(m) if m.contains("is failed, not claimed")),
+            "expected a Validation naming the status, got {err:?}"
+        );
+    }
+
+    /// A `done` finish stores the block its result was authored as, and the
+    /// key survives the round trip through TEXT.
+    ///
+    /// Falsified by writing `None` into `result_block_id` for the `Done`
+    /// outcome: the block assertion tripped. Reverted.
+    #[test]
+    fn a_done_gate_action_remembers_its_result_block() {
+        let db = KernelDb::temporary().unwrap();
+        let request_id = seed_ask(&db);
+        db.record_gate_action(&new_gate_action(&request_id, GateActionPayload::Tool {
+            params_json: r#"{"path":"/v/notes.md"}"#.into(),
+        }))
+        .unwrap();
+        assert!(db.claim_gate_action(&request_id).unwrap());
+
+        let block = BlockId::new(ContextId::new(), PrincipalId::new(), 12);
+        db.finish_gate_action(&request_id, &GateActionOutcome::Done {
+            result_block_id: block,
+        })
+        .unwrap();
+
+        let read = db.gate_action(&request_id).unwrap().unwrap();
+        assert_eq!(read.status, GateActionStatus::Done);
+        assert_eq!(read.result_block_id, Some(block));
+        assert!(read.error.is_none());
+        assert_eq!(
+            read.payload,
+            GateActionPayload::Tool { params_json: r#"{"path":"/v/notes.md"}"#.into() }
+        );
+    }
+
+    /// Boot recovery finds every action still `claimed` and nothing else. A
+    /// `claimed` row is the one ambiguous state — the kernel died between
+    /// taking the action and recording what happened — so it must be visible;
+    /// a `waiting` row is still safe to run and a terminal row is finished
+    /// business, and reporting either would push the recovery toward re-running
+    /// work that already ran.
+    ///
+    /// Falsified by widening the query to `WHERE status != 'waiting'`: the
+    /// count assertion tripped with the `done` and `failed` rows included.
+    /// Reverted.
+    #[test]
+    fn boot_recovery_finds_claimed_gate_actions_only() {
+        let db = KernelDb::temporary().unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let request_id = seed_ask(&db);
+            db.record_gate_action(&new_gate_action(&request_id, GateActionPayload::Shell {
+                source: "echo hi".into(),
+            }))
+            .unwrap();
+            ids.push(request_id);
+        }
+        // ids[0] stays waiting.
+        assert!(db.claim_gate_action(&ids[1]).unwrap());
+        assert!(db.claim_gate_action(&ids[2]).unwrap());
+        db.finish_gate_action(&ids[2], &GateActionOutcome::Done {
+            result_block_id: BlockId::new(ContextId::new(), PrincipalId::new(), 1),
+        })
+        .unwrap();
+        assert!(db.claim_gate_action(&ids[3]).unwrap());
+        db.finish_gate_action(&ids[3], &GateActionOutcome::Failed { error: "boom".into() })
+            .unwrap();
+
+        assert_eq!(
+            db.gate_actions_claimed_at_boot().unwrap(),
+            vec![ids[1].clone()],
+            "only the still-claimed action is ambiguous after a restart"
+        );
+    }
+
+    /// The tagged union is enforced by the table, not only by the Rust enum
+    /// that happens to build the rows today. A `shell` row carrying
+    /// `params_json`, or a `tool` row carrying `source`, is rejected by SQLite
+    /// — so a future writer that reaches this table by another path still
+    /// cannot store an action nobody could run.
+    ///
+    /// Written as raw SQL on purpose: [`GateActionPayload`] makes the bad
+    /// combination unrepresentable, which is exactly why the schema-level
+    /// guard needs its own test.
+    ///
+    /// Falsified by deleting the trailing CHECK from the `gate_actions` DDL:
+    /// both inserts succeeded. Reverted.
+    #[test]
+    fn the_gate_action_tagged_union_check_rejects_a_mismatched_payload() {
+        let db = KernelDb::temporary().unwrap();
+        let insert = |request_id: &str, kind: &str, source: Option<&str>, params: Option<&str>| {
+            db.conn.execute(
+                "INSERT INTO gate_actions
+                     (request_id, kind, instance, tool, context_id, principal_id,
+                      source, params_json)
+                 VALUES (?1, ?2, 'builtin.kj', 'kj', ?3, ?4, ?5, ?6)",
+                params![
+                    request_id,
+                    kind,
+                    blob_param(ContextId::new().as_bytes()),
+                    blob_param(PrincipalId::new().as_bytes()),
+                    source,
+                    params,
+                ],
+            )
+        };
+
+        let shell_id = seed_ask(&db);
+        let err = insert(&shell_id, "shell", Some("echo hi"), Some("{}")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(e, _)
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation
+            ),
+            "a shell action carrying tool params must be refused, got {err:?}"
+        );
+
+        let tool_id = seed_ask(&db);
+        let err = insert(&tool_id, "tool", Some("echo hi"), Some("{}")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(e, _)
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation
+            ),
+            "a tool action carrying shell source must be refused, got {err:?}"
+        );
+
+        // The same insert without the extra column is accepted, so the two
+        // refusals above are the CHECK talking and not some other fault.
+        insert(&shell_id, "shell", Some("echo hi"), None).unwrap();
+    }
+
+    /// A payload the row could store but nobody could run is refused before
+    /// it reaches SQLite, and the error names the field. An empty argv has no
+    /// verb; `tool` params that are not JSON cannot be handed to an MCP call.
+    ///
+    /// Falsified by returning `Ok(())` from `validate_gate_action` for every
+    /// payload: the empty-argv insert then succeeded (the schema has no
+    /// opinion on argv at all), which is the row this test exists to keep out.
+    /// Reverted.
+    #[test]
+    fn an_unrunnable_gate_action_payload_is_refused_by_name() {
+        let db = KernelDb::temporary().unwrap();
+        let request_id = seed_ask(&db);
+
+        let err = db
+            .record_gate_action(&new_gate_action(
+                &request_id,
+                GateActionPayload::KjVerb { argv: vec![] },
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelDbError::Validation(m) if m.contains("empty argv")),
+            "expected a Validation naming argv, got {err:?}"
+        );
+
+        let err = db
+            .record_gate_action(&new_gate_action(&request_id, GateActionPayload::Tool {
+                params_json: "not json".into(),
+            }))
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelDbError::Validation(m) if m.contains("not JSON")),
+            "expected a Validation naming the params, got {err:?}"
+        );
+
+        assert!(
+            db.gate_action(&request_id).unwrap().is_none(),
+            "a refused action must leave no row behind"
+        );
+    }
+
+    /// An action whose `request_id` names no ask is refused by the foreign
+    /// key. The action row exists to be run once an ask is answered, so a row
+    /// with no ask is one nothing could ever decide.
+    ///
+    /// Falsified by dropping `REFERENCES approvals(request_id)` from the
+    /// `gate_actions` DDL: the insert succeeded, leaving an unanswerable row.
+    /// Reverted. (Dropping `PRAGMA foreign_keys = ON` from `init_connection`
+    /// does NOT falsify it — the bundled SQLite is built with
+    /// `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so that pragma is a restatement.)
+    #[test]
+    fn a_gate_action_without_an_ask_is_refused() {
+        let db = KernelDb::temporary().unwrap();
+        let err = db
+            .record_gate_action(&new_gate_action("not-a-request-id", GateActionPayload::Shell {
+                source: "echo hi".into(),
+            }))
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelDbError::Db(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation),
+            "expected a foreign-key constraint violation, got {err:?}"
+        );
+    }
+
+    /// A recorded action survives closing and reopening the database — the
+    /// whole reason the action is a row and not a stack frame.
+    ///
+    /// Falsified by pointing the reopen at a different filename in the same
+    /// directory: the row was gone, which is what a non-durable action would
+    /// look like. Reverted.
+    #[test]
+    fn a_gate_action_survives_a_reopen() {
+        // Take ownership of the directory away from the handle first: a
+        // `temporary()` KernelDb removes its directory on drop, so a reopen
+        // after a plain drop would be reading a file that no longer exists.
+        let mut db = KernelDb::temporary().unwrap();
+        let dir = db._temp_dir.take().expect("temporary() owns a directory");
+        let path = dir.path().join("kernel.db");
+        let request_id = seed_ask(&db);
+        let argv = vec!["cc".to_string(), "send".to_string(), "hello".to_string()];
+        db.record_gate_action(&new_gate_action(
+            &request_id,
+            GateActionPayload::KjVerb { argv: argv.clone() },
+        ))
+        .unwrap();
+        assert!(db.claim_gate_action(&request_id).unwrap());
+        drop(db);
+
+        let reopened = KernelDb::open(&path).unwrap();
+        let read = reopened.gate_action(&request_id).unwrap().expect("the row must survive");
+        assert_eq!(read.payload, GateActionPayload::KjVerb { argv });
+        assert_eq!(read.status, GateActionStatus::Claimed);
+        assert_eq!(
+            reopened.gate_actions_claimed_at_boot().unwrap(),
+            vec![request_id],
+            "a claim that outlived the process is exactly what boot recovery must see"
         );
     }
 }
