@@ -258,6 +258,21 @@ instance and a tool call are would put kaijutsu's domain inside a crate that
 does not have it. The ledger owns the decision; the kernel owns what to do
 about it. Normalized columns, not a JSON blob.
 
+**The ask and its action cannot commit together, and that is survivable.**
+Found while specifying slice 2, after the atomicity note above turned out to
+be only half true. They share a connection, so one transaction is *physically*
+possible — but `create_ask` opens its own transaction and returns the
+`request_id` the action row's foreign key needs, and SQLite has no nested
+transactions. So the order is: commit the ask, then write the action.
+
+The window is real and its failure is the safe one. A crash in between leaves
+a `Pending` ask with no action, which is inert: nothing runs from a pending
+ask. It only matters when a human answers it, and then the executor finds an
+allowed ask with no action row — which **must fail loudly and author an error
+block**, never silently succeed and never guess. Recorded here rather than
+papered over, because the tempting fix (drop the foreign key so the action can
+be written first) trades a detectable gap for an undetectable one.
+
 **Exactly-once.** A resumed job must not run twice if the kernel dies
 between running and recording. Claim the job the way the ledger claims an
 ask — a status column plus `BEGIN IMMEDIATE` — and record the terminal state
@@ -271,6 +286,12 @@ archived, the cwd is gone — the resume must refuse loudly and author an
 error block, never approximate. Amy's rule: *"the operation would not go
 through without approval"*; the converse is that an approval authorizes
 *that* operation, not a similar one.
+
+**A `claimed` row at boot is the one state nobody can resolve.** The kernel
+died between claiming an action and recording its result, so whether it ran is
+unknowable from the row. It must not be re-run — an approved destructive action
+executed twice is the worst outcome this design can produce. Fail it closed and
+author an error naming the request id; a human can look and decide.
 
 **Per-ask TTL.** Nullable, `NULL` = eternal. Expiry becomes a janitor's job
 over the ledger, decoupled from every caller. A first pass may ship with no
