@@ -200,8 +200,8 @@ enum ShellCompletion {
 }
 
 impl ShellCompletion {
-    /// Render this completion as the JSON envelope returned by `shell` and
-    /// `context_shell`. The shape is documented on the tool descriptions —
+    /// Render this completion as the JSON envelope returned by `shell`.
+    /// The shape is documented on the tool description —
     /// agents parse this to extract `stdout`, `exit_code`, structured `data`,
     /// and the result block id for follow-up reads.
     ///
@@ -297,8 +297,7 @@ impl ShellCompletion {
     }
 }
 
-/// Declared result shape for `shell` / `context_shell` (`Tool.outputSchema`,
-/// 2026-07-28).
+/// Declared result shape for `shell` (`Tool.outputSchema`, 2026-07-28).
 ///
 /// Hand-written rather than derived: the envelope is assembled with
 /// `serde_json::json!` from several sources (`BlockSnapshot`, `OutputData`,
@@ -327,7 +326,7 @@ fn shell_output_schema() -> std::sync::Arc<rmcp::model::JsonObject> {
             "ephemeral": { "type": "boolean" },
             "data": { "description": "kj structured payload when present" },
             "elapsed_ms": { "type": "integer" },
-            "error": { "type": "string", "description": "present on timeout / stream_closed" }
+            "error": { "type": "string", "description": "why the command's outcome never reached the tool; present only when exit_code is -1" }
         },
         "required": ["stdout", "exit_code", "status", "block_id", "elapsed_ms"]
     });
@@ -1066,11 +1065,11 @@ impl KaijutsuMcp {
 
     /// Shared polling loop for shell command completion.
     ///
-    /// Both `shell()` and `context_shell()` dispatch a command via `shell_execute`
-    /// then wait for the ToolResult child block to reach Done/Error status.
-    /// Returns the completed ToolResult block snapshot (or a synthetic one
-    /// describing timeout/event-stream errors). The caller serializes the
-    /// JSON envelope so each tool can shape its own response.
+    /// `shell()` dispatches a command via `shell_execute`, then waits for the
+    /// ToolResult child block to reach Done/Error status. Returns the
+    /// completed ToolResult block snapshot (or a synthetic one describing
+    /// timeout/event-stream errors); the caller serializes the JSON
+    /// envelope.
     async fn execute_and_poll_shell(
         &self,
         remote: &RemoteState,
@@ -1362,6 +1361,9 @@ fn progress_line(context_id: ContextId, snap: &BlockSnapshot) -> Option<String> 
         return None;
     }
     let kind_label = snap.kind.as_str();
+    // Exhaustive over the narrating kinds, matching `narrates_turn`'s own
+    // match: a kind newly admitted there must choose a rendering here rather
+    // than falling into a default that may not suit it.
     let detail = match snap.kind {
         // A ToolCall's `content` streams as plain text while it runs — the
         // name plus its input is the useful summary, not that stream.
@@ -1372,7 +1374,17 @@ fn progress_line(context_id: ContextId, snap: &BlockSnapshot) -> Option<String> 
                 _ => name.to_string(),
             }
         }
-        _ => snap.content.lines().next().unwrap_or("").to_string(),
+        BlockKind::Text | BlockKind::ToolResult | BlockKind::Error => {
+            snap.content.lines().next().unwrap_or("").to_string()
+        }
+        // Unreachable: `narrates_turn` refused every other kind above.
+        BlockKind::Thinking
+        | BlockKind::Drift
+        | BlockKind::File
+        | BlockKind::Notification
+        | BlockKind::Resource
+        | BlockKind::Trace
+        | BlockKind::Task => return None,
     };
     let line = format!("context {} [{kind_label}] {detail}", context_id.short());
     Some(truncate_at_char_boundary(&line, PROGRESS_LINE_MAX_BYTES).to_string())
@@ -1695,7 +1707,7 @@ impl KaijutsuMcp {
     //
     // The following 16 tools previously duplicated kernel-side functionality
     // that now lives in `kj` (clap_derive). Agents drive them through
-    // `context_shell "kj …"`:
+    // `shell "kj …"`:
     //
     //   doc_create | doc_list | doc_delete | doc_tree     → kj doc
     //   block_create | block_read | block_append | block_edit |
@@ -1704,8 +1716,8 @@ impl KaijutsuMcp {
     //   kernel_search                                      → kj search
     //   stage_commit                                       → kj stage commit
     //
-    // The narrow MCP surface that remains: shell/context_shell as the rich
-    // entry points, register_session/whoami/invoke_peer for peer-and-session
+    // The narrow MCP surface that remains: shell as the rich entry point,
+    // register_session/whoami/invoke_peer for peer-and-session
     // concerns, list_kernel_tools/kaish_exec as the escape hatches,
     // {read,write,edit,submit}_input for the shared scratchpad.
     // ========================================================================
@@ -1810,7 +1822,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell, context_shell, read_input/write_input/submit_input). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell, read_input/write_input/submit_input). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
@@ -3365,7 +3377,7 @@ mod tests {
     // ========================================================================
     // ShellCompletion JSON envelope
     //
-    // Locks in the wire contract returned by `shell` and `context_shell`.
+    // Locks in the wire contract returned by `shell`.
     // Agents parse this JSON to extract `stdout`, `exit_code`, structured
     // `data`, and `block_id` for follow-up reads. Changing the shape is
     // an agent-visible break — start here when you do.
