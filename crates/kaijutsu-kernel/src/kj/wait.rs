@@ -57,10 +57,9 @@ impl TailFilter {
     fn admits(self, kind: BlockKind) -> bool {
         match self {
             Self::All => true,
-            Self::Tools => matches!(
-                kind,
-                BlockKind::Text | BlockKind::Error | BlockKind::ToolCall | BlockKind::ToolResult
-            ),
+            // Shared with the MCP progress relay's `progress_line`, so a
+            // streamed turn and its tail admit the same kinds.
+            Self::Tools => kind.narrates_turn(),
             Self::Text => matches!(kind, BlockKind::Text | BlockKind::Error),
         }
     }

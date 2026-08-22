@@ -1150,6 +1150,30 @@ impl BlockKind {
         }
     }
 
+    /// Whether a block of this kind narrates a turn — what the turn said,
+    /// what it did, and what broke. One source for live progress narration
+    /// and for `kj wait`'s tail, so what streams while a turn runs and what
+    /// the tail reports afterward describe the same turn.
+    ///
+    /// `Thinking` and `Trace` are excluded deliberately: neither is the
+    /// turn's account of itself. The match is exhaustive so a new kind has
+    /// to decide, rather than defaulting to silence.
+    pub fn narrates_turn(&self) -> bool {
+        match self {
+            BlockKind::Text
+            | BlockKind::Error
+            | BlockKind::ToolCall
+            | BlockKind::ToolResult => true,
+            BlockKind::Thinking
+            | BlockKind::Drift
+            | BlockKind::File
+            | BlockKind::Notification
+            | BlockKind::Resource
+            | BlockKind::Trace
+            | BlockKind::Task => false,
+        }
+    }
+
     /// Check if this is a tool-related block (call or result).
     pub fn is_tool(&self) -> bool {
         matches!(self, BlockKind::ToolCall | BlockKind::ToolResult)

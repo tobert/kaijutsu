@@ -3449,10 +3449,12 @@ impl kernel::Server for KernelImpl {
     /// are the outcome and a dropped one is CRITICAL, so `FlowRecv::Terminated`
     /// disconnects the client to force a resync. `turn.requested` only feeds
     /// `onTurnStarted` — an early heads-up so a client can widen its block
-    /// subscription before the turn writes anything — and a dropped one costs
-    /// only that early warning, not a fact: the outcome push (or polling)
-    /// still lands the truth once the turn ends. Its `Terminated` case logs
-    /// and keeps the connection rather than disconnecting.
+    /// subscription before the turn writes anything. A dropped one still
+    /// costs something real: a client that never widens sees none of that
+    /// turn's blocks pushed, and has to read them back from the kernel. It
+    /// does not cost the outcome, which arrives on its own push. Recoverable
+    /// by reading, so its `Terminated` case logs and keeps the connection
+    /// rather than disconnecting.
     fn subscribe_turn_events(
         self: Rc<Self>,
         params: kernel::SubscribeTurnEventsParams,
@@ -3609,21 +3611,23 @@ impl kernel::Server for KernelImpl {
                             let msg = match ev {
                                 kaijutsu_kernel::flows::FlowRecv::Message(m) => m,
                                 // Unlike `completed`/`failed`, a dropped
-                                // `Requested` is not a lost fact: it only costs
-                                // a client the early widen-my-subscription
-                                // signal, and the outcome push (or the
-                                // client's own polling) still lands the truth
-                                // about the turn once it ends. Log and keep
-                                // the connection, rather than disconnecting
-                                // over a missed heads-up.
+                                // `Requested` does not lose the outcome —
+                                // that arrives on its own push. It costs the
+                                // early widen-my-subscription signal, so a
+                                // client that misses it gets none of that
+                                // turn's blocks pushed and has to read them
+                                // back from the kernel. Recoverable by
+                                // reading, so log and keep the connection
+                                // rather than disconnecting.
                                 kaijutsu_kernel::flows::FlowRecv::Terminated(info) => {
                                     tracing::warn!(
                                         kernel = %kernel_id,
                                         topic = info.topic,
                                         delivered = info.delivered,
                                         "turn-started subscriber fell behind — a client \
-                                         may widen its block subscription late, but the \
-                                         turn's own outcome push still lands"
+                                         may widen its block subscription late and miss \
+                                         that turn's pushed blocks; the outcome push \
+                                         still lands"
                                     );
                                     continue;
                                 }

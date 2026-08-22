@@ -633,13 +633,12 @@ pub(crate) async fn stabilize_context_label(
 pub struct McpServerState {
     /// Current logging level (default: info)
     pub log_level: Arc<Mutex<LoggingLevel>>,
-    /// Process-wide count of progress relays currently widened onto each
-    /// context. Two concurrent `shell` calls delegating into the same
-    /// context each hold a reference; the watch is added on the 0→1
-    /// transition and removed on the 1→0 transition, so neither call's
-    /// narrowing can kill a watch the other still relies on. See
-    /// `ProgressWatchGuard`.
-    pub progress_watch_refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>,
+    /// Process-wide state for progress relays' watch set. Two concurrent
+    /// `shell` calls delegating into the same context each hold a
+    /// reference; the watch is added on the 0→1 transition and removed on
+    /// the 1→0 transition, so neither call's narrowing can kill a watch the
+    /// other still relies on. See `ProgressWatchState`.
+    pub progress_watch_refs: Arc<Mutex<ProgressWatchState>>,
 }
 
 #[allow(deprecated)]
@@ -647,7 +646,7 @@ impl Default for McpServerState {
     fn default() -> Self {
         Self {
             log_level: Arc::new(Mutex::new(LoggingLevel::Info)),
-            progress_watch_refs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            progress_watch_refs: Arc::new(Mutex::new(ProgressWatchState::default())),
         }
     }
 }
@@ -1355,19 +1354,14 @@ fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
 /// Render one block as a live progress line, or `None` for a block that
 /// should not narrate.
 ///
-/// The narrating kinds — `Text`, `ToolCall`, `ToolResult`, `Error` — are
-/// exactly `kj wait`'s `TailFilter::Tools` admit set
-/// (`crates/kaijutsu-kernel/src/kj/wait.rs`): what streams live and what
-/// `kj wait` returns describe the same turn. Every other kind (`Thinking`
-/// and `Trace` included) opts out rather than guessing at a rendering.
+/// `BlockKind::narrates_turn` decides which kinds narrate, and `kj wait`'s
+/// `TailFilter::Tools` admits the same set from the same predicate — what
+/// streams live and what `kj wait` returns describe the same turn.
 fn progress_line(context_id: ContextId, snap: &BlockSnapshot) -> Option<String> {
-    let kind_label = match snap.kind {
-        BlockKind::Text => "text",
-        BlockKind::ToolCall => "tool_call",
-        BlockKind::ToolResult => "tool_result",
-        BlockKind::Error => "error",
-        _ => return None,
-    };
+    if !snap.kind.narrates_turn() {
+        return None;
+    }
+    let kind_label = snap.kind.as_str();
     let detail = match snap.kind {
         // A ToolCall's `content` streams as plain text while it runs — the
         // name plus its input is the useful summary, not that stream.
@@ -1403,39 +1397,86 @@ fn emit_progress(
     });
 }
 
-/// Increments the process-wide reference count for `ctx` in `refs`. Returns
-/// `true` exactly on the 0→1 transition — the caller must issue the
-/// widening `watch_contexts` RPC. Any other transition returns `false`:
-/// somebody else already holds the watch.
-fn progress_watch_acquire(
-    refs: &Mutex<std::collections::HashMap<ContextId, usize>>,
-    ctx: ContextId,
-) -> bool {
-    let mut refs = refs.lock().unwrap();
-    let count = refs.entry(ctx).or_insert(0);
+/// Process-wide state behind the progress relays' watch set: how many
+/// relays hold each context, plus the tail of the chain that keeps the
+/// `watch_contexts` RPCs arriving in the order the counts changed.
+///
+/// The order matters because the actor is FIFO and the counts are the only
+/// record of who still needs a watch. Relay A releasing the last reference
+/// and relay B acquiring the first one otherwise interleave freely, so B's
+/// widen can reach the actor before A's narrow and the actor then removes a
+/// watch B is relying on. Every transition reserves its place in the chain
+/// under the same lock that changes the count, and waits for its
+/// predecessor before sending.
+#[derive(Default)]
+pub struct ProgressWatchState {
+    counts: std::collections::HashMap<ContextId, usize>,
+    /// Fires once the most recently reserved transition has sent its RPC.
+    /// `None` before the first transition.
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// One transition's place in the watch-RPC chain: wait for `prev`, send the
+/// RPC, then signal `done` to release the next transition.
+struct WatchSlot {
+    prev: Option<tokio::sync::oneshot::Receiver<()>>,
+    done: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Reserve this transition's place in the chain. Call while holding the
+/// state lock, so that chain order and count order cannot disagree.
+fn reserve_watch_slot(state: &mut ProgressWatchState) -> WatchSlot {
+    let (done, rx) = tokio::sync::oneshot::channel();
+    WatchSlot {
+        prev: state.tail.replace(rx),
+        done,
+    }
+}
+
+/// Send one watch-set change in chain order, then release the next
+/// transition. A predecessor whose task died without signalling drops its
+/// sender, and the `Err` that produces means "nobody will signal" — go
+/// rather than stall the chain.
+async fn send_watch_change<A: WatchContextsRpc>(
+    actor: A,
+    slot: WatchSlot,
+    add: Vec<ContextId>,
+    remove: Vec<ContextId>,
+) {
+    if let Some(prev) = slot.prev {
+        let _ = prev.await;
+    }
+    if let Err(e) = actor.watch_contexts(add.clone(), remove.clone()).await {
+        tracing::debug!("progress relay: watch_contexts add={add:?} remove={remove:?} failed: {e}");
+    }
+    let _ = slot.done.send(());
+}
+
+/// Increments the reference count for `ctx`. Returns `true` exactly on the
+/// 0→1 transition — the caller must issue the widening `watch_contexts`
+/// RPC. Any other transition returns `false`: somebody else already holds
+/// the watch.
+fn progress_watch_acquire(state: &mut ProgressWatchState, ctx: ContextId) -> bool {
+    let count = state.counts.entry(ctx).or_insert(0);
     *count += 1;
     *count == 1
 }
 
-/// Decrements the process-wide reference count for `ctx` in `refs`. Returns
-/// `true` exactly on the 1→0 transition — the caller must issue the
-/// narrowing `watch_contexts` RPC. Any other transition returns `false`:
-/// another holder still relies on the watch. Releasing a context with no
-/// recorded holder is a no-op (returns `false`) rather than underflowing —
-/// defensive against a bug elsewhere double-releasing, not a path this
-/// module's own callers should ever take.
-fn progress_watch_release(
-    refs: &Mutex<std::collections::HashMap<ContextId, usize>>,
-    ctx: ContextId,
-) -> bool {
-    let mut refs = refs.lock().unwrap();
-    match refs.get_mut(&ctx) {
+/// Decrements the reference count for `ctx`. Returns `true` exactly on the
+/// 1→0 transition — the caller must issue the narrowing `watch_contexts`
+/// RPC. Any other transition returns `false`: another holder still relies
+/// on the watch. Releasing a context with no recorded holder is a no-op
+/// (returns `false`) rather than underflowing — defensive against a bug
+/// elsewhere double-releasing, not a path this module's own callers should
+/// ever take.
+fn progress_watch_release(state: &mut ProgressWatchState, ctx: ContextId) -> bool {
+    match state.counts.get_mut(&ctx) {
         Some(count) if *count > 1 => {
             *count -= 1;
             false
         }
         Some(_) => {
-            refs.remove(&ctx);
+            state.counts.remove(&ctx);
             true
         }
         None => false,
@@ -1466,24 +1507,25 @@ impl WatchContextsRpc for ActorHandle {
 
 /// One relay's share of the process-wide progress-watch reference counts.
 /// `acquire`/`release` track which contexts *this* guard is currently
-/// holding open (`held`) separately from the shared counts (`refs`), so
+/// holding open (`held`) separately from the shared state (`refs`), so
 /// `Drop` knows exactly what to release without re-deriving it.
 ///
 /// `Drop` cannot `.await` the narrowing RPC, so it decrements the shared
-/// counts synchronously (an ordinary mutex lock — no async needed for that)
-/// and spawns a detached task only for the contexts that hit zero, to issue
-/// their `watch_contexts` removal. The synchronous decrement is what makes
-/// the guarantee real even if the spawned task is slow, fails, or (in a
-/// test with no reactor to run it on) never polls at all: the refcount
-/// itself is already correct the instant `drop` returns.
+/// counts and reserves its chain slot synchronously (an ordinary mutex
+/// lock — no async needed for either) and spawns a detached task only to
+/// send the RPC. The synchronous half is what makes the guarantee real even
+/// if the spawned task is slow, fails, or (in a test with no reactor to run
+/// it on) never polls at all: the count is already correct the instant
+/// `drop` returns, and any later transition is already queued behind this
+/// one.
 struct ProgressWatchGuard<A: WatchContextsRpc = ActorHandle> {
-    refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>,
+    refs: Arc<Mutex<ProgressWatchState>>,
     actor: A,
     held: HashSet<ContextId>,
 }
 
 impl<A: WatchContextsRpc> ProgressWatchGuard<A> {
-    fn new(refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>, actor: A) -> Self {
+    fn new(refs: Arc<Mutex<ProgressWatchState>>, actor: A) -> Self {
         Self {
             refs,
             actor,
@@ -1494,21 +1536,33 @@ impl<A: WatchContextsRpc> ProgressWatchGuard<A> {
     /// Acquire `ctx` for this guard; issues the widening RPC if this guard's
     /// acquisition is the process's first.
     async fn acquire(&mut self, ctx: ContextId) {
-        if self.held.insert(ctx) && progress_watch_acquire(&self.refs, ctx) {
-            if let Err(e) = self.actor.watch_contexts(vec![ctx], vec![]).await {
-                tracing::debug!("progress relay: watch_contexts add for {ctx} failed: {e}");
-            }
+        if !self.held.insert(ctx) {
+            return;
         }
+        let slot = {
+            let mut state = self.refs.lock().unwrap();
+            if !progress_watch_acquire(&mut state, ctx) {
+                return;
+            }
+            reserve_watch_slot(&mut state)
+        };
+        send_watch_change(self.actor.clone(), slot, vec![ctx], vec![]).await;
     }
 
     /// Release `ctx` from this guard; issues the narrowing RPC if this
     /// guard's release is the process's last.
     async fn release(&mut self, ctx: ContextId) {
-        if self.held.remove(&ctx) && progress_watch_release(&self.refs, ctx) {
-            if let Err(e) = self.actor.watch_contexts(vec![], vec![ctx]).await {
-                tracing::debug!("progress relay: watch_contexts remove for {ctx} failed: {e}");
-            }
+        if !self.held.remove(&ctx) {
+            return;
         }
+        let slot = {
+            let mut state = self.refs.lock().unwrap();
+            if !progress_watch_release(&mut state, ctx) {
+                return;
+            }
+            reserve_watch_slot(&mut state)
+        };
+        send_watch_change(self.actor.clone(), slot, vec![], vec![ctx]).await;
     }
 }
 
@@ -1517,25 +1571,18 @@ impl<A: WatchContextsRpc> Drop for ProgressWatchGuard<A> {
         if self.held.is_empty() {
             return;
         }
-        let refs = self.refs.clone();
         let actor = self.actor.clone();
         let held = std::mem::take(&mut self.held);
-        // Decrement every held context synchronously (`progress_watch_release`
-        // is a plain mutex lock, not async) so the refcount is correct the
-        // instant `drop` returns; only the narrowing RPC itself needs the
-        // detached task, for whichever contexts hit zero.
-        let to_remove: Vec<ContextId> = held
-            .into_iter()
-            .filter(|ctx| progress_watch_release(&refs, *ctx))
-            .collect();
-        if !to_remove.is_empty() {
-            tokio::spawn(async move {
-                if let Err(e) = actor.watch_contexts(vec![], to_remove.clone()).await {
-                    tracing::debug!(
-                        "progress relay: watch_contexts remove on drop for {to_remove:?} failed: {e}"
-                    );
-                }
-            });
+        let queued = {
+            let mut state = self.refs.lock().unwrap();
+            let to_remove: Vec<ContextId> = held
+                .into_iter()
+                .filter(|ctx| progress_watch_release(&mut state, *ctx))
+                .collect();
+            (!to_remove.is_empty()).then(|| (reserve_watch_slot(&mut state), to_remove))
+        };
+        if let Some((slot, to_remove)) = queued {
+            tokio::spawn(send_watch_change(actor, slot, vec![], to_remove));
         }
     }
 }
@@ -1554,7 +1601,7 @@ async fn run_progress_relay(
     joined_ctx: ContextId,
     peer: Peer<RoleServer>,
     token: ProgressToken,
-    watch_refs: Arc<Mutex<std::collections::HashMap<ContextId, usize>>>,
+    watch_refs: Arc<Mutex<ProgressWatchState>>,
 ) {
     let mut event_rx = remote.actor.subscribe_events();
     let seq = AtomicU64::new(0);
@@ -1738,7 +1785,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as kernel blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 rather than text-matching. exit_code is null when it has not replicated yet — treat null as unknown, not success — and -1 when the command's outcome never reached the tool, where `status` and `error` say what went wrong. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as kernel blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]
@@ -3695,14 +3742,14 @@ mod tests {
     /// tripped), then reverted.
     #[test]
     fn progress_watch_second_acquirer_does_not_re_add() {
-        let refs = Mutex::new(std::collections::HashMap::new());
+        let mut state = ProgressWatchState::default();
         let ctx = ContextId::new();
         assert!(
-            progress_watch_acquire(&refs, ctx),
+            progress_watch_acquire(&mut state, ctx),
             "first acquirer must add the watch"
         );
         assert!(
-            !progress_watch_acquire(&refs, ctx),
+            !progress_watch_acquire(&mut state, ctx),
             "second acquirer must not re-add a watch the first one already holds"
         );
     }
@@ -3716,16 +3763,16 @@ mod tests {
     /// assertion tripped), then reverted.
     #[test]
     fn progress_watch_only_last_release_removes() {
-        let refs = Mutex::new(std::collections::HashMap::new());
+        let mut state = ProgressWatchState::default();
         let ctx = ContextId::new();
-        progress_watch_acquire(&refs, ctx);
-        progress_watch_acquire(&refs, ctx);
+        progress_watch_acquire(&mut state, ctx);
+        progress_watch_acquire(&mut state, ctx);
         assert!(
-            !progress_watch_release(&refs, ctx),
+            !progress_watch_release(&mut state, ctx),
             "first release must not remove the watch — a second holder still relies on it"
         );
         assert!(
-            progress_watch_release(&refs, ctx),
+            progress_watch_release(&mut state, ctx),
             "second (last) release must remove the watch"
         );
     }
@@ -3734,10 +3781,10 @@ mod tests {
     /// remove.
     #[test]
     fn progress_watch_single_acquire_release_round_trips() {
-        let refs = Mutex::new(std::collections::HashMap::new());
+        let mut state = ProgressWatchState::default();
         let ctx = ContextId::new();
-        assert!(progress_watch_acquire(&refs, ctx), "sole acquirer must add the watch");
-        assert!(progress_watch_release(&refs, ctx), "sole release must remove the watch");
+        assert!(progress_watch_acquire(&mut state, ctx), "sole acquirer must add the watch");
+        assert!(progress_watch_release(&mut state, ctx), "sole release must remove the watch");
     }
 
     /// A recording double for `WatchContextsRpc`, standing in for
@@ -3757,6 +3804,9 @@ mod tests {
             let calls = self.calls.clone();
             async move {
                 calls.lock().unwrap().push((add, remove));
+                // A real RPC yields before it resolves; so does this, so a
+                // test can observe the order calls reach the actor.
+                tokio::task::yield_now().await;
                 Ok(vec![])
             }
         }
@@ -3775,7 +3825,7 @@ mod tests {
     /// reverted.
     #[tokio::test]
     async fn progress_watch_guard_drop_releases_held_refs() {
-        let refs = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let refs = Arc::new(Mutex::new(ProgressWatchState::default()));
         let ctx = ContextId::new();
         let actor = RecordingActor::default();
 
@@ -3789,9 +3839,46 @@ mod tests {
         }
 
         assert!(
-            progress_watch_acquire(&refs, ctx),
+            progress_watch_acquire(&mut refs.lock().unwrap(), ctx),
             "acquiring after the guard dropped must report the watch needs adding again \
              — the count did not return to zero"
+        );
+    }
+
+    /// The actor is FIFO, so a widen that overtakes the narrow it must
+    /// follow leaves the new relay without the watch it just asked for.
+    /// Relay A drops (spawning its narrowing RPC); relay B immediately
+    /// acquires the same context. The actor must see add, remove, add — B's
+    /// widen last — not add, add, remove.
+    ///
+    /// `RecordingActor` records on entry and yields afterward, so an
+    /// implementation that does not chain the transitions records B's add
+    /// before A's spawned task ever runs.
+    ///
+    /// Falsified with: `send_watch_change` skipping its `prev.await` —
+    /// confirmed failing (`[add, add, remove]`), then reverted.
+    #[tokio::test]
+    async fn progress_watch_widen_waits_for_the_narrow_it_follows() {
+        let refs = Arc::new(Mutex::new(ProgressWatchState::default()));
+        let ctx = ContextId::new();
+        let actor = RecordingActor::default();
+
+        {
+            let mut a = ProgressWatchGuard::new(refs.clone(), actor.clone());
+            a.acquire(ctx).await;
+        }
+        let mut b = ProgressWatchGuard::new(refs.clone(), actor.clone());
+        b.acquire(ctx).await;
+
+        let calls = actor.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                (vec![ctx], vec![]),
+                (vec![], vec![ctx]),
+                (vec![ctx], vec![]),
+            ],
+            "the second relay's widen must reach the actor after the first relay's narrow"
         );
     }
 }
