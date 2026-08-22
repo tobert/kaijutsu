@@ -147,11 +147,13 @@ it on rehydrate.
 
 ## Slices
 
-1. **The call stops blocking.** `GateVerdict::Pending { request_id }`, a
-   third `PermissionAskOutcome`, and a tool result that says "pending, ask
-   `<id>`, nothing was run." The ask stops being expired by the caller.
-   No resumption yet — the model can already retry after answering, because
-   nothing has run. Deletes the poll loop; keeps the ladder for one slice.
+1. **The call stops blocking, and an answered ask is redeemable.** Two
+   halves, and they cannot be separated — see below. `GateVerdict::Pending
+   { request_id }`, a third `PermissionAskOutcome`, a tool result that says
+   "pending, ask `<id>`, nothing was run"; the ask stops being expired by
+   the caller; and `run_gate` looks for an existing allowed-and-unredeemed
+   ask matching this statement *before* creating a new one, redeeming it
+   single-use when it finds one. Deletes the poll loop; keeps the ladder.
 2. **The persisted action.** The `KernelDb` table, written in the same
    transaction as the ask's creation, plus the claim protocol. No executor
    yet; a test proves the row round-trips and survives a restart.
@@ -160,7 +162,20 @@ it on rehydrate.
    without a result. This is where exactly-once earns its tests.
 4. **Notifications and the ladder deletion.** Terminal transitions author
    `Notification` blocks; `timeout::gate` and the patient hold come out.
+   **After the executor, never before** — between "stops blocking" and "the
+   kernel resumes," the ladder is what still makes a retry work.
 5. **TTL and the janitor**, if evidence says it is wanted.
 
-Slice 1 is worth landing alone: it is the whole behavior change from a
-model's point of view, and it is what an unattended coder needs first.
+**Why slice 1 has two halves.** An earlier draft of this doc said slice 1
+could ship alone because "the model can retry after answering, since nothing
+has run." That is wrong, and the reason is the verified-absent finding above:
+`create_ask` does no deduplication. A retry would build the same
+free-variable statement, find no rule covering it (guarantee 3 forbids one),
+create a *second* ask, and return `Pending` again — a loop that never
+terminates however many times a human says yes. The redemption check is not
+an optimization on top of the state machine; it is the edge that closes it.
+
+With both halves, slice 1 is worth landing alone: an approved action runs on
+the model's next attempt, which is the whole behavior change from a model's
+point of view, and slices 2–3 upgrade "next attempt" to "immediately, even
+with nothing running."
