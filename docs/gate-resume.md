@@ -159,8 +159,19 @@ guessing consistently is the part we cannot do.
 
 ## Open questions, with recommendations
 
+**Do not reconstruct the action from the ask.** Settled while sizing slice 2.
+An ask's statements carry `honest_render(ps)` — a rendering built for a human
+to read in `kj ledger show`, not re-executable source. Re-running it would be
+re-deriving intent from a display string, which is the same mistake as a
+client decoding storage to learn what happened (CLAUDE.md, "Durable state and
+the wire"). The action is its own durable fact and gets its own row.
+
 **Where does the persisted action live?** Recommend a new table in
-`KernelDb`, keyed by `request_id`, **not** in `approval-ledger`. The ledger
+`KernelDb`, keyed by `request_id`, **not** in `approval-ledger`. Good news for
+atomicity, verified: `KernelDb::conn_for_ledger` returns `&self.conn` — the
+ledger and the kernel share one SQLite connection and one file, so the ask row
+and the action row can commit in a single transaction rather than needing a
+two-phase dance between two databases. The ledger
 crate is deliberately free of MCP and tool vocabulary; teaching it what an
 instance and a tool call are would put kaijutsu's domain inside a crate that
 does not have it. The ledger owns the decision; the kernel owns what to do
