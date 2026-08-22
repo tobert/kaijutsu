@@ -58,7 +58,7 @@
 //!    every `join_context` and every `subscribe_*` call. The server uses
 //!    `(principal, instance)` to dedupe subscriptions across reconnects.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -694,6 +694,16 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<(), CallError>>,
     },
 
+    // ── Watched contexts (inline — updates actor state) ──────────────────
+    /// Add/remove contexts from the extra watch set layered on top of the
+    /// joined context, then re-issue the block-events subscription to match.
+    /// Replies with the resulting watched set.
+    WatchContexts {
+        add: Vec<ContextId>,
+        remove: Vec<ContextId>,
+        reply: oneshot::Sender<Result<Vec<ContextId>, CallError>>,
+    },
+
     // ── Peers ────────────────────────────────────────────────────────────
     AttachPeer {
         config: PeerConfig,
@@ -808,6 +818,7 @@ impl RpcCommand {
             Self::ListKernels { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::JoinContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ResubscribeBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::WatchContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::AttachPeer { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::InvokePeer { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListPeers { reply } => { let _ = reply.send(Err(err)); }
@@ -1780,6 +1791,28 @@ impl ActorHandle {
             .await
     }
 
+    /// Add or remove contexts from this client's extra block-event watch
+    /// set — on top of whatever context is joined — and re-issue the
+    /// subscription to match. Lets a single-context client (the MCP server)
+    /// pick up events from a forked child context mid-delegation and drop
+    /// it again once the delegation completes, without switching which
+    /// context it is joined to.
+    ///
+    /// No effect on a kernel-wide client (`scope_blocks_to_context ==
+    /// false`): its delivery is already unconstrained, so there is nothing
+    /// to narrow or widen. Returns the resulting watched set (empty for a
+    /// kernel-wide client) so a caller can assert what actually took
+    /// effect.
+    #[tracing::instrument(skip(self))]
+    pub async fn watch_contexts(
+        &self,
+        add: Vec<ContextId>,
+        remove: Vec<ContextId>,
+    ) -> Result<Vec<ContextId>, CallError> {
+        self.send(|reply| RpcCommand::WatchContexts { add, remove, reply })
+            .await
+    }
+
     // ── World-level ──────────────────────────────────────────────────────
 
     #[tracing::instrument(skip(self))]
@@ -1944,6 +1977,14 @@ struct RpcActor {
     /// `context_id` into a per-context `DocumentCache`, so it genuinely needs
     /// kernel-wide delivery.
     scope_blocks_to_context: bool,
+    /// Contexts a `scope_blocks_to_context` client watches in addition to
+    /// `context_id` — a forked child context a delegated turn needs block
+    /// events from, for example. Set by `WatchContexts` and persisted like
+    /// `context_id`, so a reconnect restores the full watched set, not just
+    /// the joined context. Ignored (the resulting filter is always empty)
+    /// when `scope_blocks_to_context` is false; see
+    /// `watched_filter_contexts`.
+    extra_watched_contexts: BTreeSet<ContextId>,
     /// Context returned by the most recent `join_context`.
     joined_context_id: Option<ContextId>,
     /// Peer registration the actor re-establishes on every reconnect. Set by
@@ -2062,6 +2103,7 @@ impl RpcActor {
             bound_kernel_id: None,
             context_id,
             scope_blocks_to_context,
+            extra_watched_contexts: BTreeSet::new(),
             joined_context_id: None,
             peer_registration: None,
             peer_attach_pending: false,
@@ -2136,11 +2178,16 @@ impl RpcActor {
         // This handshake now owns the replay for the snapshot above. An
         // AttachPeer arriving while it runs sets this back to true, and the
         // Connected transition replays that newer intent.
+        let watched = watched_filter_contexts(
+            self.scope_blocks_to_context,
+            self.context_id,
+            &self.extra_watched_contexts,
+        );
         let task = spawn_handshake(
             self.config.clone(),
             self.context_id,
             self.instance.clone(),
-            self.scope_blocks_to_context,
+            watched,
             self.event_tx.clone(),
             peer_registration,
             self.vfs_activity_interval_ms,
@@ -2452,6 +2499,25 @@ impl RpcActor {
                 self.resubscribe_blocks();
                 let _ = reply.send(Ok(()));
             }
+            RpcCommand::WatchContexts { add, remove, reply } => {
+                for ctx in remove {
+                    self.extra_watched_contexts.remove(&ctx);
+                }
+                for ctx in add {
+                    self.extra_watched_contexts.insert(ctx);
+                }
+                let watched = watched_filter_contexts(
+                    self.scope_blocks_to_context,
+                    self.context_id,
+                    &self.extra_watched_contexts,
+                );
+                // Re-issuing carries the same `instance`, so the server
+                // replaces the prior subscription for this (principal,
+                // instance) instead of stacking one — that is what makes
+                // re-issuing on every watch-set change safe.
+                self.resubscribe_blocks();
+                let _ = reply.send(Ok(watched));
+            }
             RpcCommand::SubscribeVfsActivity { interval_ms, reply } => {
                 // Guard duplicate subscribes: only the first ask on a live
                 // connection actually issues the RPC. There is no wire method
@@ -2540,13 +2606,6 @@ impl RpcActor {
         }
     }
 
-    /// (Re)issue the block-events subscription on the live connection, scoped
-    /// to the actor's current `context_id`. Best-effort and fire-and-forget: a
-    /// failure logs and leaves the prior subscription in place (the server
-    /// keeps it until replaced or the connection drops). No-op when not
-    /// Connected. Used both to re-scope after a `JoinContext` and to recover a
-    /// subscription the server may have reaped after a sustained callback stall
-    /// (the client-side half of the 2026-06-17 shell-timeout fix).
     /// Issue one context feed's `subscribeContext` on the live connection.
     ///
     /// Fire-and-forget on the wire, like the block re-subscribe beside it: a
@@ -2609,6 +2668,15 @@ impl RpcActor {
         }
     }
 
+    /// (Re)issue the block-events subscription on the live connection, scoped
+    /// to the actor's current watched set (`context_id` plus
+    /// `extra_watched_contexts`, via `watched_filter_contexts`). Best-effort
+    /// and fire-and-forget: a failure logs and leaves the prior subscription
+    /// in place (the server keeps it until replaced or the connection
+    /// drops). No-op when not Connected. Used to re-scope after a
+    /// `JoinContext` or a `WatchContexts`, and to recover a subscription the
+    /// server may have reaped after a sustained callback stall (the
+    /// client-side half of the 2026-06-17 shell-timeout fix).
     fn resubscribe_blocks(&self) {
         let Some(conn) = self.connection.as_ref() else {
             return;
@@ -2617,17 +2685,14 @@ impl RpcActor {
         let event_tx = self.event_tx.clone();
         let instance = self.instance.clone();
         let midi_exchange = self.midi_exchange.clone();
-        // Scope to the joined context only for single-context clients; a
-        // kernel-wide client re-subscribes kernel-wide (None), matching its
-        // handshake subscription.
-        let context_id = if self.scope_blocks_to_context {
-            self.context_id
-        } else {
-            None
-        };
+        let contexts = watched_filter_contexts(
+            self.scope_blocks_to_context,
+            self.context_id,
+            &self.extra_watched_contexts,
+        );
         tokio::task::spawn_local(async move {
             let (block_client, filter) =
-                block_events_client_and_filter(&event_tx, context_id, midi_exchange);
+                block_events_client_and_filter(&event_tx, contexts, midi_exchange);
             match tokio::time::timeout(
                 SUBSCRIBE_TIMEOUT,
                 kernel.subscribe_blocks_filtered(block_client, &filter, &instance),
@@ -2635,7 +2700,10 @@ impl RpcActor {
             .await
             {
                 Ok(Ok(())) => {
-                    log::debug!("Re-subscribed block events scoped to {context_id:?}")
+                    log::debug!(
+                        "Re-subscribed block events scoped to {:?}",
+                        filter.context_ids
+                    )
                 }
                 Ok(Err(e)) => log::warn!("Block re-subscribe failed (non-fatal): {e}"),
                 Err(_) => log::warn!("Block re-subscribe timed out (non-fatal)"),
@@ -2830,6 +2898,32 @@ impl RpcActor {
 // Handshake task
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The set of contexts a block-events subscription should filter to, given
+/// the actor's scoping policy, its joined context, and any extra contexts a
+/// caller has asked to watch on top of it (`ActorHandle::watch_contexts` —
+/// e.g. a forked child context a delegated turn needs events from).
+///
+/// A kernel-wide client (`scope_blocks_to_context == false`) always gets an
+/// empty result: empty is the wire's "unconstrained" filter, and no extra
+/// watch can narrow delivery for a client that already gets everything. A
+/// scoped client's result is `joined` (when set) plus every id in `extra`,
+/// deduplicated and in a stable (sorted) order — stable so the log line and
+/// the wire filter don't jitter between equivalent calls.
+fn watched_filter_contexts(
+    scope_blocks_to_context: bool,
+    joined: Option<ContextId>,
+    extra: &BTreeSet<ContextId>,
+) -> Vec<ContextId> {
+    if !scope_blocks_to_context {
+        return Vec::new();
+    }
+    let mut watched = extra.clone();
+    if let Some(ctx) = joined {
+        watched.insert(ctx);
+    }
+    watched.into_iter().collect()
+}
+
 /// Spawn the connect-handshake task. Returns a JoinHandle the actor can
 /// select on. The task runs each step with its own per-phase deadline so
 /// the failure mode names the slow phase.
@@ -2838,7 +2932,7 @@ fn spawn_handshake(
     config: SshConfig,
     context_id: Option<ContextId>,
     instance: String,
-    scope_blocks_to_context: bool,
+    watched: Vec<ContextId>,
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
@@ -2850,7 +2944,7 @@ fn spawn_handshake(
             config,
             context_id,
             instance,
-            scope_blocks_to_context,
+            watched,
             event_tx,
             peer_registration,
             vfs_activity_interval_ms,
@@ -2861,16 +2955,17 @@ fn spawn_handshake(
     })
 }
 
-/// Build the block-events callback client + its filter, scoped to
-/// `context_id` when known. Empty filter = kernel-wide delivery (every
-/// context's block events), which floods a single-context client and can starve
-/// its single-threaded RPC executor past the server's 5s callback deadline (the
-/// 2026-06-17 MCP shell-timeout stall). Same `instance` on re-subscribe ⇒ the
-/// server replaces the prior subscription for this (principal, instance) rather
-/// than stacking, so re-scoping is safe.
+/// Build the block-events callback client + its filter for `contexts`.
+/// Empty filter = kernel-wide delivery (every context's block events), which
+/// floods a single-context client and can starve its single-threaded RPC
+/// executor past the server's 5s callback deadline (the 2026-06-17 MCP
+/// shell-timeout stall). Same `instance` on re-subscribe ⇒ the server
+/// replaces the prior subscription for this (principal, instance) rather
+/// than stacking, so re-scoping — including changing the watched set — is
+/// safe to just re-issue.
 fn block_events_client_and_filter(
     event_tx: &broadcast::Sender<ServerEvent>,
-    context_id: Option<ContextId>,
+    contexts: Vec<ContextId>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
 ) -> (
     crate::kaijutsu_capnp::block_events::Client,
@@ -2884,12 +2979,14 @@ fn block_events_client_and_filter(
     };
     let block_client: crate::kaijutsu_capnp::block_events::Client =
         capnp_rpc::new_client(block_fwd);
-    let filter = context_id
-        .map(|ctx| kaijutsu_types::BlockEventFilter {
-            context_ids: vec![ctx],
+    let filter = if contexts.is_empty() {
+        kaijutsu_types::BlockEventFilter::default()
+    } else {
+        kaijutsu_types::BlockEventFilter {
+            context_ids: contexts,
             ..Default::default()
-        })
-        .unwrap_or_default();
+        }
+    };
     (block_client, filter)
 }
 
@@ -2898,7 +2995,7 @@ async fn connect_handshake(
     config: SshConfig,
     context_id: Option<ContextId>,
     instance: String,
-    scope_blocks_to_context: bool,
+    watched: Vec<ContextId>,
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
@@ -3049,22 +3146,19 @@ async fn connect_handshake(
     //    deadline. If either fails, the whole handshake fails — we don't
     //    want to enter Connected without subscriptions.
     //
-    //    Scope block events to the joined context. An empty filter is
-    //    kernel-wide delivery — every context's block events firehosed at a
+    //    `watched` is precomputed by the caller (`watched_filter_contexts`,
+    //    from `context_id` and any extra watches) before this handshake was
+    //    spawned. It is not re-derived from `joined_context` here: on a
+    //    first connect (no context joined yet, before register_session) it
+    //    is empty or extras-only, and the `JoinedContext` handler re-scopes
+    //    once the join above completes. An empty filter is kernel-wide
+    //    delivery — every context's block events firehosed at a
     //    single-context client. On a single-threaded RPC LocalSet that
     //    foreign-context volume can starve the executor past the server's 5s
     //    callback deadline (the 2026-06-17 MCP "every shell call times out"
-    //    stall). When no context is joined yet (first connect before
-    //    register_session), we fall back to kernel-wide and re-scope on the
-    //    JoinedContext that follows. Multi-context clients (the app) leave
-    //    `scope_blocks_to_context` false and always subscribe kernel-wide.
-    let filter_context = if scope_blocks_to_context {
-        joined_context
-    } else {
-        None
-    };
+    //    stall).
     let (block_client, filter) =
-        block_events_client_and_filter(&event_tx, filter_context, midi_exchange);
+        block_events_client_and_filter(&event_tx, watched, midi_exchange);
 
     let resource_fwd = ResourceEventsForwarder {
         event_tx: event_tx.clone(),
@@ -3599,6 +3693,14 @@ async fn dispatch_kernel_command(
             )));
         }
 
+        // ── WatchContexts handled inline by RpcActor::dispatch (mutates
+        //    extra_watched_contexts, which this dispatcher never sees) ──
+        RpcCommand::WatchContexts { reply, .. } => {
+            let _ = reply.send(Err(CallError::Rpc(
+                "watch_contexts leaked into kernel dispatch (bug)".into(),
+            )));
+        }
+
         // ── SubscribeVfsActivity handled inline by RpcActor::dispatch (needs event_tx) ──
         RpcCommand::SubscribeVfsActivity { reply, .. } => {
             let _ = reply.send(Err(CallError::Rpc(
@@ -3762,6 +3864,86 @@ pub fn spawn_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kernel-wide client's filter stays empty regardless of a joined
+    /// context or extra watches — an unscoped client's delivery is already
+    /// unconstrained, so nothing can narrow it.
+    #[test]
+    fn watched_filter_kernel_wide_client_stays_empty() {
+        let joined = ContextId::new();
+        let mut extra = BTreeSet::new();
+        extra.insert(ContextId::new());
+        assert_eq!(watched_filter_contexts(false, Some(joined), &extra), Vec::new());
+    }
+
+    /// A scoped client with a joined context and no extras watches exactly
+    /// the joined context.
+    #[test]
+    fn watched_filter_scoped_client_with_no_extras_watches_joined_only() {
+        let joined = ContextId::new();
+        let extra = BTreeSet::new();
+        assert_eq!(
+            watched_filter_contexts(true, Some(joined), &extra),
+            vec![joined]
+        );
+    }
+
+    /// Adding an extra context watches both the joined context and the
+    /// extra, deduplicated and in a stable (sorted) order.
+    #[test]
+    fn watched_filter_adding_an_extra_watches_joined_plus_extra() {
+        let joined = ContextId::new();
+        let other = ContextId::new();
+        let mut extra = BTreeSet::new();
+        extra.insert(other);
+
+        let mut expected = vec![joined, other];
+        expected.sort();
+        assert_eq!(watched_filter_contexts(true, Some(joined), &extra), expected);
+    }
+
+    /// Removing an extra takes it back out of the watched set — modeled here
+    /// as the caller's `BTreeSet` no longer containing it (the actor-level
+    /// `remove` semantics live in `RpcCommand::WatchContexts`'s handler,
+    /// which this pure helper doesn't own).
+    #[test]
+    fn watched_filter_removing_an_extra_drops_it() {
+        let joined = ContextId::new();
+        let removed = ContextId::new();
+        let mut extra = BTreeSet::new();
+        extra.insert(removed);
+        assert!(watched_filter_contexts(true, Some(joined), &extra).contains(&removed));
+
+        extra.remove(&removed);
+        assert!(!watched_filter_contexts(true, Some(joined), &extra).contains(&removed));
+    }
+
+    /// Adding the joined context as an extra does not duplicate it in the
+    /// watched set.
+    #[test]
+    fn watched_filter_extra_matching_joined_does_not_duplicate() {
+        let joined = ContextId::new();
+        let mut extra = BTreeSet::new();
+        extra.insert(joined);
+        assert_eq!(
+            watched_filter_contexts(true, Some(joined), &extra),
+            vec![joined]
+        );
+    }
+
+    /// The joined context is watched by virtue of being joined, not by
+    /// membership in `extra` — so it can never be dropped by removing it
+    /// from `extra` (there is nothing to remove; `remove` only ever mutates
+    /// the extra set, never `context_id`).
+    #[test]
+    fn watched_filter_joined_context_is_not_extra_and_cannot_be_removed_via_extra() {
+        let joined = ContextId::new();
+        let extra = BTreeSet::new(); // "removing" joined from extra is a no-op: it was never there
+        assert_eq!(
+            watched_filter_contexts(true, Some(joined), &extra),
+            vec![joined]
+        );
+    }
 
     /// The exponential-capped *shape* of the schedule, isolated from jitter
     /// by pinning the jitter source at its top (`1.0` ⇒ `factor == 1.0`, no
