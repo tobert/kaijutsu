@@ -411,7 +411,7 @@ impl KjDispatcher {
     /// tail). If it ever happens, this errors loudly with every full-id
     /// candidate rather than silently picking one (CLAUDE.md: "Silent
     /// fallbacks are often a mistake").
-    fn resolve_block_id(
+    pub(crate) fn resolve_block_id(
         &self,
         id_str: &str,
         ctx_ref: Option<&str>,

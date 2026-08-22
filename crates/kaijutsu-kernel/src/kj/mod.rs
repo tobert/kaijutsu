@@ -52,6 +52,7 @@ pub mod stage;
 pub mod swap;
 pub mod transport;
 pub mod vfs;
+pub mod wait;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -578,6 +579,7 @@ impl KjDispatcher {
         match cmd {
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
             "drive" => self.dispatch_drive(&argv[1..], caller).await,
+            "wait" => self.dispatch_wait(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "cache" => self.dispatch_cache(&argv[1..], caller),
@@ -929,6 +931,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(kaish::KaishArgs::command())
         .subcommand(fork::ForkArgs::command())
         .subcommand(drive::DriveArgs::command())
+        .subcommand(wait::WaitArgs::command())
         .subcommand(stage::StageArgs::command())
         .subcommand(drift::DriftArgs::command())
         .subcommand(cache::CacheArgs::command())
