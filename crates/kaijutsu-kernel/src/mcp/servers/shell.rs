@@ -698,6 +698,24 @@ mod tests {
             ro_text.contains("combined stdout") && ro_text.contains("nonzero exit"),
             "return contract must survive on the read-only variant too: {ro_text}"
         );
+        // The runtime refusal names its condition and stops, by design, so
+        // this description is the only place a model learns where external
+        // commands live. Without it, `command not found` reads as a missing
+        // binary and a model abandons a viable path.
+        assert!(
+            ro_text.contains("`shell_write`") && ro_text.contains("on PATH"),
+            "the read-only description must name `shell_write` as where \
+             external commands run, and say the binary is still installed: {ro_text}"
+        );
+    }
+
+    /// Prints the read-only tool description as the model receives it —
+    /// `cargo test -p kaijutsu-kernel read_only_description -- --nocapture`.
+    /// Published text is read, not grepped: the asserts above pin phrases,
+    /// this shows the whole thing.
+    #[test]
+    fn read_only_description_as_the_model_reads_it() {
+        println!("\n--- shell (read-only) description ---\n{}\n--- end ---", DESCRIPTION_READ_ONLY.as_str());
     }
 
     /// An `Arc<KjDispatcher>` wired into a fresh broker with BOTH the writable
