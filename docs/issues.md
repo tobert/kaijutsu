@@ -6,50 +6,20 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Asks vs forms: the ledger is three layers, and only one is shell-shaped (2026-08-22)
+## Asks vs forms — brief written, decision open (2026-08-22)
 
-**Open design question, awaiting Amy's call.** She asked whether an agent
-asking a *question* wants the approval gate, a drift, or a distinct concept:
+Amy asked whether an agent asking a *question* wants the approval gate, a
+drift, or a distinct concept. Full analysis in **`docs/asks-and-forms.md`**:
+the ledger is three layers and only the bottom is shell-shaped; we already have
+both halves of a form system split the wrong way (the ledger is durable with
+the wrong payload, MCP elicitation has the right payload and no durability);
+prior art is debconf, systemd-ask-password, and elicitation's own restraint.
 
-> *"I'm curious if we should have a unique feature for, well, basically
-> abstract forms, vs the approval gates, which have different needs. They block
-> in similar ways but the data seems pretty different? Maybe a form tool /
-> tools? Is there some prior art we should riff on?"*
-
-The data is different, and the split is visible in the schema:
-
-1. **The envelope is already generic.** `approvals` (`approval-ledger/src/
-   schema.rs:269`) — request_id, context_id, principal_id, origin,
-   description, pending/claimed/allowed/denied/expired/abandoned with a
-   one-way ratchet trigger, claim-so-exactly-one-answerer-wins, plus
-   `approval_events` and `approval_signals`. Nothing here is about shells.
-2. **`approval_options` (`schema.rs:346`) is already a single-select field** —
-   `(request_id, seq, option_id, label, kind)` in presentation order. It cannot
-   express free text, multi-select, typed values, or more than one field.
-3. **`approval_statements` + commands/args/vars + `approval_rules` cannot
-   serve a form and should not try.** Content-addressed kaish plan trees exist
-   so a decision *generalizes* to future identical statements. A question has
-   no statement, no digest, nothing to generalize.
-
-**We have both halves of a form system, wrongly split.** The ledger is durable
-with the wrong payload. MCP elicitation is already on our wire
-(`kaijutsu.capnp:1509`: `message` + JSON Schema → `accept`/`decline`/`cancel`,
-a better fit than allow/deny) with the right payload and **no durability** — it
-is `onRequest -> response`, synchronous and connection-bound.
-
-Prior art worth riffing on: **debconf** splits the *template* (question, type,
-choices, default) from the *answer store* and adds a **priority** so
-low-priority questions take defaults without asking — the same lever lfm2d
-pulls on approval fatigue. **systemd-ask-password** generalizes our claim
-semantics to multiple presenters of one ask (we will have app + MCP
-orchestrator + ACP). **MCP elicitation**'s deliberately flat, primitive-only
-schema subset is restraint worth copying.
-
-Cheapest true step if we go: widen `origin` past
-`('hook','shell_gate','kj_verb')`, let an ask carry a schema-shaped answer
-alongside `decided_option`, and project it onto the elicitation wire — riding
-layers 1+2 without touching layer 3. The per-ask wait budget above then serves
-both kinds of ask.
+**Nothing is decided and no code is proposed.** The brief's own conclusion is
+that the next step is to run several delegated turns and see whether the
+questions coders actually ask are allow/deny in disguise. The per-ask wait
+budget (above) should land first either way — it is what makes any ask survive
+an unattended coder.
 
 ## `onTurnStarted` fires for autonomous turns only (2026-08-22)
 
