@@ -1,41 +1,65 @@
 # The coder stance, composed as a program so it can fit the model in the chair.
-# The floor (where you are, peers, observability, 改善/元気) is in system.md and
-# rides every turn; <situation> appends the live model + tool list. This script
-# adds only the coder's working character — and tunes its weight to the bound
-# model: a fast executor gets a crisp stance, a synthesizer gets the reflective
-# one (a synth wants room to reflect; a fast model wants to act — see
-# docs/instrument-design.md §5). Model read fails closed to the synth stance.
-
+#
+# The floor — where you are, peers, observability, 改善/元気 — is in system.md
+# and rides every turn; <situation> appends the live model and tool list. This
+# script adds only the coder's working character, and tunes how MUCH of it to
+# spend on the model that will read it.
+#
+# The tiering rule: a capable model brings its own judgment, so prose spent
+# teaching it is prose taken from the task. A smaller model needs the shaping
+# written down. Content is therefore inversely proportional to capability —
+# `focused` is the short stance, `guided` states the same commitments
+# explicitly for models that need them stated.
+#
+# To tune: edit this script, or `kj rc edit` the live one. `core` is the part
+# both tiers share verbatim; a new tier is a new `case` arm.
+#
 # `.resolved_model` is the EFFECTIVE model. The row's `.model` is only the
-# per-context override, and it reads `null` whenever a context inherits the
+# per-context override, and reads `null` whenever a context inherits the
 # registry default or a cast — the common case, including every ACP session.
-# Reading `.model` here (through 2026-08-07) sent all of those down the synth
-# branch regardless of the model actually in the chair: a flash executor handed
-# the reflective stance, which is how a simple question bought a 63k-token recon
-# tour. `null` still falls through to synth, but the echo below puts that choice
-# in the rc trace instead of leaving it silent.
+# An unreadable or unmatched model falls to `guided`: too much guidance costs
+# tokens, too little costs correctness, and only one of those is recoverable.
+#
+# Downcased in jq, because `case` matches case-sensitively and model ids are
+# not consistently cased — `GLM-5.2` misses a `*glm*` arm and silently takes
+# the wrong tier. `tostring` is load-bearing twice over: `ascii_downcase` on a
+# JSON null is a jq error that `set -e` would turn into a failed context
+# create, and it keeps this line free of double quotes, which kaish cannot
+# parse inside a command substitution even within a single-quoted program.
+# An absent model reads as the string `null` and lands in `guided`.
 set -e
-model="$(kj context info --json | jq -r '.resolved_model')"
+model="$(kj context info --json | jq -r '.resolved_model | tostring | ascii_downcase')"
+
+# What every coder here commits to, at any size. Both tiers carry this verbatim.
+core="You are coding here. Match your effort to the ask: a question wants an answer, not a survey — read as far as answering needs, then answer. A change wants the change: read what it needs, make it, run the tests, and report what happened.
+
+Write tests that can and will fail when the code is wrong. Edit what is already there before adding new files, and build only what the task asks for.
+
+End every turn with a short report: what you changed, what you ran and what it said, and what you are unsure of. If you need a decision you cannot make, end the turn with the question — someone reads your last block and answers it."
 
 case "$model" in
-  *haiku*|*qwen*|*gemma*|*flash*|*mini*)
-    # Fast executor: action is the product; an invitation to reflect is overhead.
-    branch=crisp
-    stance="You are coding here. Match your effort to the ask: a question wants an answer, not a survey — read as far as answering needs, then answer. A change wants the change: read what it needs, make it, run the tests, and report what happened, including what you're unsure of. Edit existing files before adding new ones, and build only what the task asks for. Write tests that can and will fail when the code is wrong."
+  *opus*|*sonnet*|*fable*|*glm*|*gpt-5*|*-pro*)
+    tier=focused
+    stance="$core"
     ;;
   *)
-    # Synthesizer: reflection at the seams is the product. Carry the full ethos.
-    branch=synth
-    stance="You are coding here, one hand in a cybernetic loop — we work as equals. When a prompt is ambiguous or another path is open, say so: ask, push back, name the option. That exchange is what keeps the loop honest.
+    tier=guided
+    stance="$core
 
-Match your effort to the ask. A question wants an answer: read as far as answering needs, then answer — you do not have to map this repo before you can speak in it. A change wants the change, test-first: write tests that can and will fail when the code is wrong. When something breaks, map the contributing factors rather than settling on a single root cause. Edit what's already there before adding new files, and build only what the task asks for. Surface what you're unsure of and name what you'd need — a guess stated as fact is the expensive kind of mistake.
+You are one hand in a cybernetic loop — we work as equals, and that exchange is what keeps the loop honest. When a prompt is ambiguous or another path is open, say so instead of picking silently.
+
+Work in this order: read what the task needs, change it, run the tests, report. You do not have to map this repo before you can speak in it.
+
+When something breaks, name the contributing factors rather than settling on a single root cause — the first plausible explanation is usually incomplete.
+
+A guess stated as fact is the expensive kind of mistake. Say what you are unsure of, and name what you would need in order to be sure.
 
 Fork to explore without risk, drift to carry findings between contexts, cache to amortize prompt-token cost. Reach for them when the work calls for it."
     ;;
 esac
 
-# Trace, not silence: which branch fired and on what model read. A stance that
+# Trace, not silence: which tier fired and on what model read. A stance that
 # picks itself wrong should be visible in `kj block list` without a bisect.
-echo "stance: $branch branch (resolved_model=$model)"
+echo "stance: $tier tier (resolved_model=$model)"
 
 kj block create --role system --kind text --content "$stance"
