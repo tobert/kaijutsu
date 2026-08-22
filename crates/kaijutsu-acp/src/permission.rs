@@ -25,18 +25,18 @@
 //!    `session/request_permission` call to the client, and on answer, `kj
 //!    ledger allow|deny <id>` to write the decision back.
 //!
-//! # The kernel is the authority and the timeout
+//! # The kernel is the authority, and nothing expires
 //!
-//! There is no `PERMISSION_ASK_TIMEOUT` budget owned by this module anymore.
-//! The gate expires the ask itself at `effective_gate_wait()`
-//! (`kaijutsu-kernel`'s `kj::gate`) — if the ACP client never answers,
-//! the ask expires kernel-side and `kj ledger allow|deny` on it fails
-//! loudly on its own. [`REQUEST_PERMISSION_TIMEOUT`] below bounds only the
-//! outgoing `session/request_permission` call itself, so a wedged ACP
-//! client (stdio never reads the request) can't leave one of this pump's
-//! spawned tasks parked forever; it is not a substitute for the kernel's
-//! own budget and answering late (or not at all) here just means the
-//! kernel's own expiry wins instead.
+//! There is no `PERMISSION_ASK_TIMEOUT` budget owned by this module, and
+//! there is no kernel-side one either: the gate records an ask and returns,
+//! and an unanswered ask stays answerable indefinitely
+//! (`docs/gate-resume.md`). An ask this pump offers and nobody answers is
+//! not a leak — it is the open question it looks like, cleared by a human
+//! marking it abandoned. [`REQUEST_PERMISSION_TIMEOUT`] below bounds only
+//! the outgoing `session/request_permission` call, so a wedged ACP client
+//! (stdio never reads the request) cannot leave one of this pump's spawned
+//! tasks parked forever. Answering late still works; there is no deadline
+//! to beat.
 //!
 //! # Racing is fine and expected
 //!

@@ -3478,9 +3478,10 @@ async fn dispatch_kernel_command(
         // Applied to the whole verb surface rather than just the gated
         // ones: the client cannot tell a gated argv from an ungated one
         // without duplicating `is_gated_verb` here, and a second copy of
-        // that policy would drift from the kernel's. The kernel is what
-        // bounds the wait (`effective_gate_wait()`); this side's only job
-        // is to not fire first.
+        // that policy would drift from the kernel's. A gated verb no
+        // longer waits on a human at all (`docs/gate-resume.md`), so this
+        // deadline now bounds an ordinary short call; it stays generous
+        // until the ladder comes out with that design's slice 4.
         RpcCommand::ExecuteKj { context_id, argv, reply } => {
             dispatch_deadline!(
                 kernel, reply, close_tx, k,

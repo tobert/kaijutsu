@@ -19,9 +19,11 @@
 //! Amy, 2026-08-16: *"yeah kj cc send should go through the ledger."*
 //! Injecting a turn into another agent's session is exactly the action a
 //! human should authorize, so every real send first leaves a durable ask
-//! row ([`crate::kj::gate`]) and waits for an answer (`kj ledger`) until
-//! `gate_wait_timeout` — fail-closed on elapse. `--dry-run` writes nothing
-//! and is exempt.
+//! row ([`crate::kj::gate`]) and returns without sending. Nothing waits: a
+//! human answers from `kj ledger` whenever they answer, and the next
+//! identical `kj cc send` redeems that answer once. Fail-closed throughout —
+//! an unanswered ask sends nothing. `--dry-run` writes nothing and is
+//! exempt.
 
 use std::path::Path;
 

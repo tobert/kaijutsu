@@ -1886,9 +1886,10 @@ impl Broker {
     /// instantly because there was genuinely nothing durable to point at;
     /// now the ask row exists before this function even returns, so
     /// `kj ledger list` shows it from any shell even if every connected
-    /// client is looking the other way — only a missing dispatcher (this
-    /// function's own misconfiguration case) or the gate's own
-    /// `gate_wait_timeout` elapsing still refuse.
+    /// client is looking the other way. Two paths still refuse: a missing
+    /// dispatcher (this function's own misconfiguration case), and an ask
+    /// nobody has answered yet — the latter as `GatePending`, which says
+    /// the question is open rather than that anything failed.
     ///
     /// Both refusal paths log at `warn!` (not the plain `debug!` other
     /// hook denials use) — a stuck ask usually means either a

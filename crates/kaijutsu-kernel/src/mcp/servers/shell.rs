@@ -451,44 +451,15 @@ impl McpServerLike for ShellServer {
                 rc_depth: 0,
                 privileged: false,
             };
-            // **The gate's own deadline must fire before the broker's — and
-            // the broker's before the client's.**
+            // Nothing here waits. `run_gate` records a durable ask and
+            // returns; a human answers from `kj ledger` whenever they
+            // answer, and the next attempt at this same command redeems
+            // that answer once. See `docs/gate-resume.md`.
             //
-            // `run_gate` blocks on a human answering from another surface
-            // (`kj ledger`). This call runs *inside* a broker `call_tool`,
-            // which is itself the answer to an RPC dispatched by a client
-            // with its own per-call deadline. One logical wait, enforced at
-            // three more hops outside this function, and each outer hop
-            // must give up STRICTLY LATER than the one inside it — otherwise
-            // the outermost hop (closest to the model) fires first and the
-            // gate's honest "nobody answered ask `<id>`, nothing was run"
-            // — the ask id a human needs — gets replaced by a generic
-            // timeout that knows nothing about the gate. That is exactly
-            // what used to happen here: the client's RPC deadline was
-            // SHORTER than this function's own wait, so it won the race.
-            //
-            // This used to be a locally-computed clamp (`min(gate_wait,
-            // mcp_call_timeout_default - 5s)`) with a comment ending "if a
-            // third caller ever needs this, lift it into one place rather
-            // than copying the arithmetic." A third caller (the client RPC
-            // hop) did need it, so the arithmetic now lives in exactly one
-            // place: `kaijutsu_types::timeout::gate`. `effective_gate_wait()`
-            // is this hop's half of that ladder — the broker's `call_tool`
-            // cap for this instance (`InstancePolicy::for_kernel_gated`,
-            // `gate::BROKER_CALL`) and the client's per-call override
-            // (`gate::CLIENT_CALL`, `kaijutsu-client::actor::dispatch_deadline!`)
-            // are the other two rungs, ordered by construction and pinned by
-            // a test (`gate_ladder_fires_caller_first`) instead of by three
-            // independently-tuned numbers agreeing by luck.
-            //
-            // Fail-closed is preserved regardless of which hop times out;
-            // what the ladder protects is the *reason*, which is exactly the
-            // fault-reads-as-something-else family this project keeps
-            // filing. This is the same hazard `runtime::kj_builtin` solves
-            // for gated `kj` verbs with a patient hold (see its comment
-            // citing "Gate slice 1a, finding #1" — "passes tests, dies in
-            // production"); the MCP path has no such hold, so it leans on
-            // the ladder instead.
+            // The four-hop timeout ladder this call used to sit inside
+            // still exists (`kaijutsu_types::timeout::gate`) and is now
+            // load-bearing for nothing here — it comes out with slice 4,
+            // after the kernel can resume an approved action on its own.
             let outcome = crate::kj::gate::run_gate(
                 dispatcher.kernel_db(),
                 &caller,

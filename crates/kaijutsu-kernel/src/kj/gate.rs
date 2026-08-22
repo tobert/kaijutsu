@@ -1027,8 +1027,9 @@ mod tests {
     }
 
     /// Multi-statement composition, escalate branch: no rule covers either
-    /// statement, so the whole submission escalates and blocks on the
-    /// shared `gate_wait_timeout`, same as the single-statement case.
+    /// statement, so the whole submission escalates as one — never applied
+    /// in half — and comes back `Pending`, same as the single-statement
+    /// case.
     #[tokio::test]
     async fn an_uncovered_multi_statement_submission_escalates() {
         let d = gate_dispatcher().await;
