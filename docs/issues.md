@@ -6,71 +6,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## `kj wait` reports `completed` in the middle of an agentic turn (2026-08-22)
+## `command not found` hides "this shell refuses external commands" — waiting on kaish 0.16
 
-**A real defect in the delegation join, found by delegating.** `kj wait`
-returned `status: completed, resolved_by: log` on a context whose
-`model/tool_call` and `tool/tool_result` blocks were `[running]` at that
-moment, and whose last model text was "Still compiling. Polling again:".
+**kaijutsu's half SHIPPED 2026-08-22** (`465b0d71`, `9217d6a8`). A delegated
+coder read `command not found: git`, concluded git was not installed, and
+abandoned a viable path. git was on PATH; it was on a shell whose external
+execution is structurally denied, and kaish returned the same message for both.
 
-The mechanism is in `turn_ran_and_settled` (`kj/wait.rs:124`), which resolves
-when *nothing anywhere is Running or Pending* AND *some Model block sits after
-the anchor*. An agentic turn alternates model → tool_call(running) →
-tool_result(done) → model. **Between a tool_result reaching Done and the next
-model block being inserted, nothing is Running and a model block already exists
-after the anchor**, so an unlucky sample declares the turn over.
+The read-only `shell` description now says the binary is still installed and on
+PATH and names `shell_write`, with an assertion pinning both phrases. The
+condition itself is kaish's to report, and it accepted the change: 0.16 says
+"git: external commands are disabled on this shell", carrying the reason as an
+`ExternalCommandOutcome` through dispatch rather than rebuilding it per site.
 
-The ran-guard protects the *start* of a turn — the window between the seed
-landing and the model's first block. Nothing protects the *middle*, and the
-existing test (`a_running_block_blocks_the_verdict_even_after_a_model_answer`)
-covers only the case where a block IS running, never the gap between two.
+**What remains: take kaish 0.16 when it is on crates.io** (not when it tags).
+Two things ride along, agreed with kaish-lead:
 
-Why it matters more than a cosmetic wrong status: a delegating orchestrator
-reads the tail and acts on it. Reporting `completed` mid-turn hands it a
-partial answer that looks final — the one failure mode delegation cannot
-tolerate. It also fires early enough to be common, not rare: observed at 3s on
-one turn and 39s on another, both mid-flight.
-
-**The shape of the fix.** `TurnFlow::Completed` on the bus stays the fast,
-authoritative path. The log path exists only as the fallback for a dropped
-event, so it should be conservative: require idleness to *persist* for the
-quiet window (track when idleness was first observed, re-read at the end of it)
-rather than resolving on the first idle sample. An instantaneous read of a
-multi-writer log cannot distinguish "finished" from "between two blocks".
-
-## `command not found` hides "this shell refuses external commands" (2026-08-22)
-
-**Corrected from an earlier reading of this entry, which blamed a missing
-binary.** A delegated coder reported *"`git` isn't installed here"* and
-abandoned a viable path. It was wrong, and the error message taught it the
-wrong thing.
-
-Confirmed against the live kernel and the archived context's own blocks:
-
-- `git` IS present — `/bin/git`, on the running kernel's `PATH`, the same PATH
-  that resolves `cargo`.
-- The coder's loadout DOES grant exec: `assets/defaults/rc/lib/create/
-  S10-binding.kai` runs `kj binding allow "exec"`, and its comment names git
-  explicitly.
-- The `shell` tool is structurally `ExternalExec::Deny` **regardless of the
-  exec capability** (`kernel/src/mcp/servers/shell.rs:148`). `shell_write` is
-  the exec-capable one. That split is deliberate — the constraint lives in the
-  tool *name* so a model does not waste a turn attempting a refused write — and
-  the tool's own schema says so honestly.
-- The runtime error throws that away. kaish's `try_execute_external` returns
-  `Ok(None)` identically for "external commands are disabled on this shell" and
-  "the binary is not in PATH", and both collapse into
-  `command not found: <name>`.
-
-So the model cannot tell "you are on the wrong shell tool" from "that program
-does not exist", even though kaish knows which happened. It concluded the
-binary was missing and stopped.
-
-**Fix is kaish-side and small**: when `try_execute_external` bails because
-external commands are disabled, say that, rather than returning the
-indistinguishable not-found path. kaish is the conservative repo, so this is
-proposed there rather than worked around here. No `ExternalExec` policy change
-and no second exec site — host exec has one owner.
+- `execute_with_options` grows a `#[non_exhaustive]` error enum. Display is
+  preserved exactly. **Do the `EmbeddedKaish` error routing in the same change**
+  rather than bolting it on after — kaish has this written down as an owed item.
+- We asked them NOT to widen `ExecResult` with the refusal reason. We went
+  looking for the call site that would consume it and found none: their message
+  kills the wrong belief, our description names the remedy, and neither half
+  depends on the other's wording holding still.
 
 ## Tool errors reach the model wearing broker-internal clothes (2026-08-22)
 
@@ -186,38 +144,24 @@ event volume actually shows up in a profile — the firehose is a known cost, no
 a known problem, and the 2026-06-17 starvation it caused was on the MCP's
 single-threaded LocalSet, not the app's.
 
-## An expired approval should become a tool error, not a silent stall (2026-08-21)
+## The gate stops blocking; the kernel resumes the action (RULED 2026-08-22)
 
-Amy's direction, and the shape the escalation path is being built toward:
+**Design: `docs/gate-resume.md`.** Amy ruled that a gated tool call must not
+hold an RPC open while a human thinks — the kernel announces, the client may
+block locally, and when the answer lands the *kernel* performs the action and
+authors the result. Supersedes the blocking wait that shipped in Slice 4.6.
+Unbuilt; five slices in the design, slice 1 worth landing alone.
 
-> *"it can turn a blocker into a tool error. So if model is trudging along,
-> needs to `rm -rf` something and that catches, it should block for me, maybe an
-> hour or longer, but it would eventually get a tool call error and then another
-> turn to respond and either try again and block again or defer that and do
-> other tasks. But the operation would not go through without approval."*
-
-Three things follow, and the third is the one that makes it safe:
-
-1. **Expiry returns an error to the caller, not silence.** Today an escalated
-   ask blocks up to `gate_wait_timeout` (300 s) and Expires with nothing
-   informative reaching the model. It should arrive as a tool error the model
-   can read and act on — retry and block again, or set the task aside and do
-   other work.
-2. **The wait is situational, and some waits are unbounded.** 300 s is tuned
-   for a human at the keyboard. Amy: *"some of those blocks should be eternal;
-   block on the user indefinitely, possibly useful when I've wandered off to do
-   errands."* So the bound belongs to the ask, not to one global constant.
-3. **Expiry is never permission.** *"The operation would not go through without
-   approval."* An expired ask must fail closed, every time — a timeout is the
-   one path where a fail-open would be invisible.
-
-Why the ledger is the right home rather than per-context state: *"the ledger
-keeps the score in one place so I can work across lots of contexts."* One
-board, many contexts — which is also what makes an unbounded wait tolerable.
-
-Start simple. The first step is deciding what Expired *means* and returning it
-as an error; the per-ask bound comes after. Related: the escalation seat below,
-and `docs/chameleon.md` for what this means once players run continuously.
+**Corrects the entry this replaces**, which claimed an expired ask reached the
+model with "nothing informative." It does not, and has not since the
+2026-08-17 gate/shell split: expiry returns `McpError::GateUnavailable`
+carrying the request id, distinct from `Denied`, proven by
+`an_unanswered_hook_ask_expires_as_gate_unavailable` (`mcp/broker.rs`), and
+`format_error_for_llm()` hands the model the whole text. Two of that entry's
+three points were already satisfied; the third — per-ask bounds, some of them
+eternal — turned out to be unreachable by tuning, because `timeout::gate::
+CLIENT_CALL` is a compile-time constant in a process that cannot read kernel
+config. That is what forced the redesign rather than a bigger number.
 
 ## The escalation seat: a small model that prepares the ask (2026-08-21)
 
