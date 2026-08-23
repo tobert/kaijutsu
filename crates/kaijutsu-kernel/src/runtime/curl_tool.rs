@@ -122,6 +122,16 @@ mod tests {
 
     /// `-k` is a parse-time refusal: `insecure_permitted` is never turned on
     /// in our config, so the flag is rejected before egress is consulted.
+    ///
+    /// **The host here is deliberate.** `example.com` is NOT
+    /// [`ALLOWED_HOST`] — it is the same non-allowlisted host
+    /// `curl_is_refused_for_a_host_outside_the_allowlist` uses to assert the
+    /// egress refusal. Same URL, two different refusal reasons, so this test
+    /// passes only while flag parsing runs BEFORE the allowlist: if that
+    /// order ever flipped, this would see "egress allowlist" instead. The
+    /// ordering coverage was accidental when written (the host was picked
+    /// only for obviously not being allowlisted); it is load-bearing now, so
+    /// do not "simplify" this to an allowlisted host.
     #[tokio::test]
     async fn insecure_flag_is_refused() {
         let kaish = embedded_with_curl("test-curl-insecure-refused").await;

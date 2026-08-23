@@ -517,6 +517,13 @@ impl Tool for KjBuiltin {
         //
         // Declared here rather than by suppressing kj's text output, because
         // the text is what a human reads in the shell.
+        // Falsifiable only because kj actually attaches `.data`: the flag
+        // and the payload are INDEPENDENTLY INERT. Setting this on a tool
+        // whose `.data` is `None` changes nothing, and attaching `.data`
+        // with the flag off changes nothing — only both together move the
+        // binding. So a one-variable-at-a-time mutation on a subcommand that
+        // sets no data shows green and proves nothing. Mutate against a
+        // subcommand that does (`kj context list` attaches the id array).
         let schema = schema.with_typed_substitution();
 
         schema
