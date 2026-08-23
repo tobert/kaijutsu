@@ -133,12 +133,32 @@ impl KjDispatcher {
     }
 }
 
-/// Build the gate's ask for one send. The statement marks the message body
-/// a FREE variable, so the ledger's guarantee 3 keeps allow-always rules
-/// structurally impossible for this verb — every send stays human-approved
-/// until that policy changes deliberately. `authorized_label` is the target
-/// exactly as typed (gate research-pass finding #3: the raw reference,
-/// never a resolved label).
+/// Build the gate's ask for one send.
+///
+/// `rendered` carries the ACTUAL target and message text (`{target:?}` /
+/// `{message:?}`, Rust's `Debug` string escaping — unambiguous and
+/// injective, so two different messages can never render identically).
+/// `statement_digest` (`gate.rs`) is a pure function of `rendered`, and
+/// `find_redeemable` (`approval-ledger`) matches a stored answer on that
+/// digest plus `authorized_label` — never on the message text itself. A
+/// `rendered` that did not vary with the message (the old
+/// `"kj cc send ${TARGET} ${MESSAGE}"` literal template) let an approval for
+/// one message redeem a send of any other message to the same target; a
+/// human reading `kj ledger show` before answering never saw what would
+/// actually be sent. Rendering the concrete text closes that.
+///
+/// The statement still marks the message body a FREE variable — not because
+/// the digest needs it any more (it now carries the message), but because
+/// `Free` is guarantee 3's OTHER job: it blocks `learn_from_approval` from
+/// ever minting a standing ALLOW rule for this statement, regardless of
+/// what the digest contains (`rules.rs`, `schema.rs`'s
+/// `approval_rules_reject_free_variable_allow_rules` trigger). That is a
+/// deliberate, separate policy — every `kj cc send` stays human-approved,
+/// even for a byte-for-byte repeated message, until the policy changes on
+/// purpose (module docs) — and this fix does not touch it.
+///
+/// `authorized_label` is the target exactly as typed (gate research-pass
+/// finding #3: the raw reference, never a resolved label).
 fn gate_spec_for_send(
     target: &str,
     message: &str,
@@ -172,7 +192,7 @@ fn gate_spec_for_send(
         ),
         authorized_label: target.to_string(),
         statements: vec![crate::kj::gate::GatedStatement {
-            rendered: "kj cc send ${TARGET} ${MESSAGE}".into(),
+            rendered: format!("kj cc send {target:?} {message:?}"),
             statement_kind: "kj_verb".into(),
             vars: vec![
                 ("TARGET".into(), approval_ledger::types::VarBinding::Bound),
@@ -479,6 +499,53 @@ mod tests {
         let result = cc_send_inner(dir.path(), "kaijutsu", "no-such-target", "hi", false);
         assert!(!result.is_ok());
         assert!(!result.message().contains(FIXTURE_TOKEN));
+    }
+
+    // ── the gate statement must carry what will actually be sent ───────
+    //
+    // `statement_digest` (`gate.rs`) is a pure function of `origin` +
+    // `rendered`, so pinning the property on `rendered` pins the digest too
+    // — `gate.rs::statement_digest` is module-private and unreachable from
+    // here, so `rendered` is the only observable surface these two tests
+    // can assert on, and it is the exact input the digest is derived from.
+
+    /// The defect this module existed to fix: two different messages to the
+    /// SAME target must never render identically, or an approval given for
+    /// one message's `kj ledger show` preview redeems a send of any other
+    /// message to that target (`find_redeemable` matches on digest +
+    /// `authorized_label`, never on message content).
+    ///
+    /// Falsified by reverting `rendered` to the literal template
+    /// `"kj cc send ${TARGET} ${MESSAGE}".into()` (dropping the `target`/
+    /// `message` args entirely): both specs rendered the identical template
+    /// string and the `assert_ne!` failed. Reverted.
+    #[test]
+    fn different_messages_to_the_same_target_render_differently() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let a = gate_spec_for_send("bob", "please review PR 42", dir.path());
+        let b = gate_spec_for_send("bob", "rm -rf the entire repo", dir.path());
+        assert_ne!(
+            a.statements[0].rendered, b.statements[0].rendered,
+            "two different messages to the same target must not share a rendered \
+             statement — a shared `rendered` is a shared digest, and a shared digest \
+             is a shared authorization"
+        );
+    }
+
+    /// The other half of the same property: an identical repeat to the same
+    /// target must still render identically, or a rule/approval keyed to the
+    /// exact same request is never redeemable and every retry escalates to a
+    /// fresh, duplicate ask forever.
+    #[test]
+    fn the_same_message_to_the_same_target_renders_identically() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let a = gate_spec_for_send("bob", "please review PR 42", dir.path());
+        let b = gate_spec_for_send("bob", "please review PR 42", dir.path());
+        assert_eq!(
+            a.statements[0].rendered, b.statements[0].rendered,
+            "the same target and message must still render identically, or an \
+             identical repeat could never redeem the same approval"
+        );
     }
 
     // ── clap wiring: pure argv parsing, no filesystem touch ────────────
