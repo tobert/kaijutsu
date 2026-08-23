@@ -6,6 +6,85 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Both narrowing verbs report success and do not narrow (2026-08-23)
+
+From a kaibo binding review (deepseek-v4-pro), **both verified by the lead
+against the code**. These are the highest-value class the instrument-design
+stance names: a fence that says it moved when it did not.
+
+**1. `kj binding reset` is non-durable.** `Broker::clear_binding` drains
+subscriptions and `resource_parents` and removes the in-memory entry — and
+never persists. Its whole body ends at
+`self.bindings.write().await.remove(context_id)`. `KernelDb::
+delete_context_binding` exists (`kernel_db.rs:4439`) and is not called. In
+production the broker is DB-wired, so the pre-reset row survives and the very
+next cache miss re-hydrates it (`broker.rs` `binding()`/`binding_checked()`).
+`kj/binding.rs` reports *"reset context X — now denies all"* regardless.
+
+Worse, there are **two independent readers of the same data**: the broker's
+cache, and `require_cap`, which reads the `KernelDb` row directly for `kj`
+verb gates (`kj/mod.rs:660`). The `kj` gates never saw the reset at all. Same
+two-sources-of-truth shape as the subscriptions bug, one layer up.
+
+**2. Granular `revoke` is a silent no-op under `"*"`.** `allows` short-circuits
+on `self.all_instances ||` for both `Instance` and `Tool` (`binding.rs:345`),
+and `revoke` touches `allowed_instances`/`allowed_tools`/`name_map` but never
+`all_instances` (`binding.rs:461`). Every broad role grants `"*"`
+(`/etc/rc/lib/create/S10-binding.kai`), so `kj binding revoke builtin.file` on
+a coder prints "revoked" and changes nothing. Self-narrowing is explicitly
+invited (`authorize_binding_write`), which makes this the common path, not an
+edge. The MCP `unbind` tool has the same no-op and promises tool-removed
+notifications it will not send.
+
+Note the asymmetry nothing surfaces: `revoke "*"` DOES narrow (it flips the
+flag). Only granular revokes under a live broad flag are inert.
+
+**Recommended order:** make `clear_binding` delete the row (one call), or
+better, make the broker the single reader by routing `require_cap` through
+`binding_checked` — that removes the whole class. Then either teach `revoke`
+under `"*"` to materialize the explicit list first, or refuse loudly with
+"`*` covers every instance; reset to an explicit loadout first."
+
+## Binding review: four more, unfixed (2026-08-23)
+
+Same review. **Not independently verified by the lead** — check before acting.
+
+- **The bind/unbind diff omits everything under `"*"`.**
+  `binding_visible_tool_pairs` iterates `candidate_instances()`, which returns
+  only explicitly named instances; its own doc says a caller must query the
+  full registry when `all_instances` is set. So `kj binding allow "*"` fires
+  ToolAdded only for the facade projections, never for `builtin.block`,
+  `builtin.file`, etc. Widening is not legible for the default role.
+- **`binding_checked` is wired to one of three enforcement points.** It exists
+  so a storage fault is not reported as a capability decision, and only
+  `kernel.rs:572` uses it. `check_facade` and `call_tool_inner` still use
+  `binding()`, so a DB read error surfaces as `FacadeDenied` /
+  `CapabilityDenied` — "not in this context's capability allow-set" — for what
+  is actually an unreadable loadout. Same class as the `resources_builtin`
+  string, at two more sites.
+- **Sticky `name_map` defeats the collision resolver when grants arrive
+  sequentially.** The isotest documents the invariant that colliding names are
+  *both* qualified rather than leaving one bare-callable
+  (`kaijutsu-isotest/tests/filesystem.rs:74`). That holds only when both
+  appear in one pass on an empty map. Bind `builtin.file` first and
+  `builtin.resources` later and you get one bare `read` and one qualified —
+  the state the resolver exists to prevent. Names also never unqualify after a
+  narrow, never sweep on an upstream rename, and `copy_context_binding` makes
+  a fork inherit all of it.
+- **Background jobs are per-context state not cleaned on narrowing.** Keyed by
+  context, started under `shell_write`, streaming into a block outside the
+  broker's binding-checked path. `kill_all_for_context` is wired to context
+  removal only. Revoke `shell_write` and a job keeps streaming into a
+  conversation that can no longer list, read, or kill it. Killing on narrow
+  would destroy work, so this needs a decision, not just a patch.
+
+**Checked and clean** (so nobody re-audits): concurrency semaphores and
+`tool_snapshots` are per-instance, not per-context; the coalescer is keyed by
+`(instance, kind, uri)` and re-checks the binding at flush; hooks are global
+tables matched at evaluation time. On the broker, `subscriptions` and
+`resource_parents` were the only context-keyed state besides `bindings`
+itself, and both are now swept.
+
 ## A quiesce flag for graceful restart (Amy, 2026-08-23)
 
 Amy: *"I've also been thinking about a quiesce flag too, so we could have a
