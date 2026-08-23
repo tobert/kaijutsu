@@ -117,56 +117,27 @@ Ranked low if true: an admin verb, human-run, short window, and the content is
 recoverable from the embedded seeds. Listed because it is the same
 capture-then-write-without-recheck shape as the cwd defect fixed today.
 
-## kaish 0.16 is published; the bump waits on kaish-extras (2026-08-23)
+## Two silent kaish 0.16 behavior changes, adapted (2026-08-23)
 
-**0.16.0 is on crates.io and both proposals we made shipped.** Measured by
-bumping the four pins, compiling, and reading the vendored source at
-`~/.cargo/registry/src/*/kaish-kernel-0.16.0`. The bump was reverted; the tree
-is on 0.15 and green.
+The bump shipped (`10d80f63`). Recorded because the shape generalizes to
+every future kaish bump: **it compiled clean and five behavior tests broke.**
+The kaish lead predicted exactly this — about a dozen `Changed` entries no
+compiler can see.
 
-**Exactly one thing blocks it, and it is not ours.** `kaish-tools-curl` (the
-`kaish-extras` git rev in `crates/kaijutsu-kernel/Cargo.toml`) still depends on
-`kaish-tool-api` 0.15, so the graph carries 0.15 **and** 0.16 and
-`CurlTool: kaish_kernel::Tool` stops being satisfied at
-`kj/context_shell.rs:242`. Checked `kaish-extras` main (`52950050`, ahead of
-our pinned `55369bf7`) — still 0.15, so waiting is correct. Amy 2026-08-23:
-*"we'll have a kaish-extras update soon so we can wait for that if it's
-easier."*
+- **`$(cmd)` binds `.data` only when the tool declares it.** A tool that
+  prints text *and* attaches data must now call `.with_typed_substitution()`;
+  otherwise the substitution binds the printed text. kj renders a human table
+  and attaches the id array, so `for h in $(kj context list)` silently
+  iterated rendered rows instead of ids. **A conclusion from another repo does
+  not transfer**: kaish-extras checked the same change and correctly found
+  curl unaffected, because their results leave `.data` at `None`.
+- **`PlannedStatement::index` now means "position in the returned list."** It
+  used to number before empty statements were dropped. Our gate tests pinned
+  the old rule; kaish ships a test pinning the new one.
 
-**The whole work order, so the eventual change is short:**
-
-1. Bump `kaish-kernel`/`-glob`/`-types`/`-help` to `"0.16"` in the workspace
-   `Cargo.toml`, and move the `kaish-tools-curl` rev to whichever
-   `kaish-extras` commit targets 0.16.
-2. **`OutputNode` is `#[non_exhaustive]` and grew a `line` field.**
-   `kaijutsu-client/src/rpc.rs`'s `parse_output_node` builds it with a struct
-   literal, which no longer compiles. Use `OutputNode::new(name)` +
-   `.with_entry_type()` / `.with_cells()` / `.with_children()`, and keep
-   `with_text` conditional — `None` (a named entry) and `Some("")` (an empty
-   text node) are different things to kaish.
-3. **Error routing, the item we owe.** `Kernel::execute_with_options` now
-   returns `Result<ExecResult, KernelError>` instead of `anyhow::Error`
-   (`runtime/embedded_kaish.rs:464`). `KernelError` is three variants:
-   `Parse { errors, message }` and `Validation { issues, message }` both mean
-   *nothing ran*, and `Execution(anyhow::Error)` means *a statement started and
-   failed*. Display is byte-identical to before, hand-written specifically so
-   `{:#}` still walks the cause chain.
-4. **That closes the broker-clothes issue below.** `mcp/servers/shell.rs:542`
-   maps every kaish failure to `McpError::Protocol`, whose Display prepends
-   `mcp protocol error:` — broker-internal vocabulary leaking to the model for
-   what is usually "your command was rejected, fix it and retry". With the
-   split, `Parse`/`Validation` route to `ErrorCategory::Validation` and only
-   `Execution` is a genuine fault. No string matching needed.
-5. **And it closes the `command not found` issue.** 0.16 has
-   `ExternalCommandOutcome::{Ran, NotFound, Unavailable(reason)}`
-   (`dispatch.rs:662-670`) with a distinct
-   `external_commands_unavailable_error`, so a shell whose external execution
-   is disabled no longer reports the same text as a missing binary. A small
-   model read `command not found: git`, concluded git was not installed, and
-   abandoned a task it could have finished.
-
-**Also found, and independent of the bump:** the wire carries no `line` for an
-output node — see the entry below.
+**The lesson for the next bump: a clean build proves nothing.** Run the
+behavior suite and read the changelog's `Changed` section against the tools
+we register, especially anything that sets `.data`.
 
 ## The wire drops kaish's output line anchor (2026-08-23)
 
@@ -185,39 +156,21 @@ it is its own decision, not a rider on the version bump.
 Worth doing when something wants it: `grep -n` output, an editor jumping to a
 match, and the vi surface are all line-anchored already.
 
-## Tool errors reach the model wearing broker-internal clothes (2026-08-22)
+## An Error block is shown twice after a fork (2026-08-22)
 
-Two independent defects, found tracing `tool error: mcp protocol error: shell
-execution failed: vali…`:
+What is left of the "broker-internal clothes" entry; both of its own halves
+shipped (`812a47ca` flattened `summary_line`, `10d80f63` routed rejections off
+the fault channel).
 
-**`ErrorPayload::summary_line()` drops everything after the first line.**
-`kaijutsu-types/src/block.rs:506` does `detail.lines().next()`. kaish's
-validator output is deliberately multi-line — line 1 is `validation failed:`
-and the *useful* part (the command named, the valid forms) is below it. So the
-human-facing block content keeps only the useless line. This is general, not
-kaish-specific: any multi-line error detail loses everything but its first
-line.
+On rehydrate, `llm/hydrate.rs` folds an `Error` block's envelope onto a
+`ToolResult.content` that already carries the same message, so after a fork
+the model reads it twice. Small, but it costs tokens on every hydrate and
+teaches nothing the first copy did not.
 
-**Every kaish failure is wrapped as a protocol error.**
-`kernel/src/mcp/servers/shell.rs:542` maps *all* `execute_with_options` errors
-— parse, validation, genuine IO fault — to `McpError::Protocol`, whose
-`Display` prepends `mcp protocol error:`. That type's own doc comment says it
-is broker-internal control flow meant to be converted at the LLM boundary; here
-it leaks verbatim. `ErrorCategory::Validation` already exists
-(`kaijutsu-types/src/block.rs:415`) and is never used for this.
-
-The model does still receive kaish's full text — `format_error_for_llm()` uses
-the whole `detail` — but behind two layers of internal vocabulary that suggest
-a plumbing fault rather than "your command was rejected, fix it and retry".
-
-Fix in two parts. `summary_line()` is small, local, and fixes every category at
-once. The altitude fix needs kaish to distinguish validation/parse failures
-from execution faults in its return type — cross-repo, and proposed there. A
-string-match stopgap at `shell.rs:542` is possible but fragile.
-
-Also noted while in there: on rehydrate (`llm/hydrate.rs:350`) the Error
-block's envelope is folded onto a `ToolResult.content` that already carries the
-same message, so after a fork the model can see it twice.
+Not a pure deletion: the fold exists so a standalone error still reaches the
+model when its parent's tool result was already flushed. The fix has to keep
+that path and skip only the duplicate, which is a judgment call about what the
+model should see rather than a mechanical change.
 
 ## A dying turn still orphans its blocks mid-run (2026-08-22, half shipped)
 
