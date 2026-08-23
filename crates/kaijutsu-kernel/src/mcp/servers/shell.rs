@@ -440,6 +440,13 @@ impl McpServerLike for ShellServer {
         // program handed to an interpreter as a string argument or over
         // `parsed.stdin`, and it does not cover `start_background` above —
         // see `kj::shell_gate`'s module docs for the full, honest list.
+        // Populated only when `run_gate` redeems an escalated ask: the cwd
+        // the human's approval was actually asked about. `None` on every
+        // other path (the safe read-only tool, a rule-matched auto-allow,
+        // or a synthetic caller the gate never pinned) — those all keep
+        // running in the context's current cwd, unchanged from before this
+        // pin existed.
+        let mut pinned_cwd: Option<std::path::PathBuf> = None;
         if !self.read_only {
             let spec = crate::kj::shell_gate::build_shell_gate_spec(&parsed.command)
                 .map_err(|e| McpError::Protocol(format!("shell_write: {e} — nothing was run")))?;
@@ -487,6 +494,13 @@ impl McpServerLike for ShellServer {
                     outcome.reason
                 )));
             }
+            // An approval authorizes THAT operation, not a similar one run
+            // wherever the context's cwd has drifted to since the ask was
+            // asked (`docs/gate-resume.md`, "Staleness"). `outcome.cwd` is
+            // the pin `run_gate` captured at escalation time; carry it
+            // through so the command below runs there, not in whatever
+            // directory `materialize_context_kaish` would otherwise land in.
+            pinned_cwd = outcome.cwd;
         }
 
         let semantic_index = dispatcher.semantic_index();
@@ -516,9 +530,31 @@ impl McpServerLike for ShellServer {
         }
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
+        // The pinned directory is validated against the shell's own backend
+        // (host paths and VFS-only paths like `/v/docs` alike — the same
+        // namespace `cd` resolves against, exactly what
+        // `EmbeddedKaish::try_set_cwd` checks). A pin that no longer
+        // resolves — the directory was removed, or was VFS-only and this
+        // context's mounts changed — fails closed and loud here: it never
+        // falls back to the context's current cwd, because that fallback is
+        // the exact bug this pin exists to close (approve in directory A,
+        // run in directory B).
+        if let Some(cwd) = &pinned_cwd {
+            if !kaish.try_set_cwd(cwd.clone()).await {
+                return Err(McpError::Protocol(format!(
+                    "shell_write: the approved directory ({}) no longer resolves — \
+                     refusing rather than running elsewhere — nothing was run",
+                    cwd.display()
+                )));
+            }
+        }
+
         let mut opts = kaish_kernel::ExecuteOptions::default();
         if let Some(stdin) = parsed.stdin {
             opts = opts.with_stdin(stdin);
+        }
+        if let Some(cwd) = pinned_cwd {
+            opts = opts.with_cwd(cwd);
         }
         let result = kaish
             .execute_with_options(&parsed.command, opts)
@@ -613,6 +649,7 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel_db::ContextShellRow;
     use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher};
     use crate::mcp::binding::{Capability, ContextToolBinding};
     use crate::mcp::{InstancePolicy, KernelCallParams};
@@ -1029,6 +1066,66 @@ mod tests {
                 assert!(s.contains("answered-like-cc-send"), "stdout missing, got: {s:?}")
             }
             other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// **The unresolvable-pin refusal.** The context's cwd at ask time is a
+    /// directory that does not exist. The ask escalates and is approved
+    /// exactly as normal, but redemption must refuse LOUDLY rather than
+    /// fall back to running in the context's current cwd — an approval
+    /// authorizes the operation it was asked about, and a pin that no
+    /// longer resolves means that operation cannot honestly be run at all.
+    ///
+    /// Falsified by deleting the `kaish.try_set_cwd` check in `call_tool`
+    /// (letting `opts.with_cwd` carry the dead pin straight into
+    /// `execute_with_options` unchecked): the call succeeded instead of
+    /// refusing — `kaish` accepted the nonexistent cwd silently and ran
+    /// `echo` anyway, which is precisely the silent-fallback failure this
+    /// refusal exists to prevent. Reverted.
+    #[tokio::test]
+    async fn a_pin_that_no_longer_resolves_refuses_loudly_not_a_fallback() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("dead-pin"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_context_shell(&ContextShellRow {
+                context_id: ctx_id,
+                cwd: Some("/this/directory/does/not/exist/kaijutsu-gate-pin-test".to_string()),
+                updated_at: 0,
+            })
+            .unwrap();
+        }
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let pending = broker
+            .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
+            .await
+            .expect_err("an uncovered submission must escalate and return immediately, nothing run");
+        assert!(matches!(pending, McpError::Protocol(_)));
+
+        answer_pending_ask(d.kernel_db().clone(), true);
+
+        let err = broker
+            .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
+            .await
+            .expect_err("a pin that no longer resolves must refuse, never fall back to the \
+                         context's current cwd");
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(
+                    msg.contains("no longer resolves"),
+                    "refusal must name the unresolvable-pin condition: {msg}"
+                );
+                assert!(
+                    msg.contains("nothing was run"),
+                    "refusal must say nothing ran: {msg}"
+                );
+            }
+            other => panic!("expected a Protocol refusal, got {other:?}"),
         }
     }
 

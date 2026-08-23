@@ -52,7 +52,9 @@
 //! wins, losers read a loud `AlreadyDecided`/claim failure, never a silent
 //! no-op.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use approval_ledger::types::{
     ApprovalStatus, AskCoverage, AskVerdict, NewAsk, NewOption, NewPlanCommand, NewPlanStatement,
@@ -120,6 +122,15 @@ pub(crate) struct GateOutcome {
     /// Human-readable reason, always populated — on refusal it says exactly
     /// why (denied by whom, expired after how long, which rule fired).
     pub reason: String,
+    /// The context's cwd at the moment its ask escalated, handed back
+    /// exactly once — on the redemption that spends the answer and turns
+    /// `Allowed`. An approval authorizes the operation it was asked about,
+    /// not a similar one run wherever the context's cwd has since moved to
+    /// (see [`pin_cwd`]). `None` on every other outcome: a rule-matched
+    /// auto-allow never escalated, so nothing was pinned; a denial does not
+    /// need a directory to run in; and a caller with no `context_id` had
+    /// nothing to pin in the first place.
+    pub cwd: Option<PathBuf>,
 }
 
 impl GateOutcome {
@@ -141,7 +152,7 @@ impl GateOutcome {
 
     /// A fault before anything durable existed.
     fn unavailable_without_row(reason: String) -> Self {
-        Self { verdict: GateVerdict::Unavailable, ask: None, reason }
+        Self { verdict: GateVerdict::Unavailable, ask: None, reason, cwd: None }
     }
 }
 
@@ -232,6 +243,61 @@ fn caller_context_bytes(caller: &KjCaller) -> Vec<u8> {
         .context_id
         .map(|c| c.as_bytes().to_vec())
         .unwrap_or_default()
+}
+
+/// The cwd an escalated ask was asked in, keyed by `request_id` and living
+/// for exactly the process's lifetime — not a table, and not durable.
+///
+/// A pending ask is swept to `abandoned` at kernel boot (nothing durable
+/// carries a pending ask across a restart), so a pin tied to an ask's
+/// lifetime can never outlive it either: a `HashMap` behind a `Mutex` is
+/// exactly the right shape, with no persistence layer to keep coherent with
+/// the ledger. `request_id` is a UUID, so entries from different kernels
+/// sharing one test process cannot collide.
+fn cwd_pins() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static PINS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    PINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock the pin map, recovering from poisoning rather than propagating it
+/// forever. `insert`/`remove`/`get` on a `HashMap` have no cross-entry
+/// invariant a panic partway through could leave broken, so a panic
+/// elsewhere while this lock was held costs at most the one pin in flight —
+/// not every `shell_write` gate for the rest of this kernel process's life.
+/// A lost pin is already a handled case (`GateOutcome::cwd` is `None`,
+/// unpinned, same as before this mechanism existed), so recovering here
+/// degrades to that, never to a wrong directory.
+fn lock_pins() -> std::sync::MutexGuard<'static, HashMap<String, PathBuf>> {
+    cwd_pins().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Capture the caller's persisted cwd under `request_id` at the moment its
+/// ask escalates — read the same way `EmbeddedKaish::restore_cwd_from_db`
+/// reads it, so the pin matches what a human sees echoed in `kj ledger
+/// show`. An approval given later must run in this directory, not wherever
+/// the context has `cd`ed to by the time a human answers.
+///
+/// A caller with no `context_id` (a synthetic or internal caller) has no
+/// persisted cwd to protect, so nothing is pinned; its later redemption
+/// runs without a directory override, same as before this pin existed.
+fn pin_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller, request_id: &str) {
+    let Some(context_id) = caller.context_id else {
+        return;
+    };
+    let cwd = {
+        let db = db.lock();
+        db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
+    };
+    if let Some(cwd) = cwd {
+        lock_pins().insert(request_id.to_string(), PathBuf::from(cwd));
+    }
+}
+
+/// Take (remove) the cwd pinned for `request_id`, if any. Single-use like
+/// the answer it belongs to: a second call for the same `request_id`
+/// returns `None`, never the stale value.
+fn take_pinned_cwd(request_id: &str) -> Option<PathBuf> {
+    lock_pins().remove(request_id)
 }
 
 fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
@@ -460,9 +526,15 @@ pub(crate) async fn run_gate(
             Ok(Some((request_id, status))) => {
                 announce_ledger_change(db, ledger_flows);
                 let allowed = status.is_allowed();
+                // Take the pin unconditionally — it is single-use like the
+                // answer it belongs to, spent whether the answer was yes or
+                // no — but surface it only on an allow; a denial runs
+                // nothing, so it has no directory to run in.
+                let cwd = take_pinned_cwd(&request_id).filter(|_| allowed);
                 return GateOutcome {
                     verdict: if allowed { GateVerdict::Allowed } else { GateVerdict::Denied },
                     ask: Some(AskRef { request_id, status }),
+                    cwd,
                     reason: if allowed {
                         "an approval was already given for this exact request; \
                          it is now spent"
@@ -524,6 +596,9 @@ pub(crate) async fn run_gate(
         // Both the ask row and its auto-decision have committed by now.
         announce_ledger_change(db, ledger_flows);
         return match row {
+            // A rule match never escalates, so there was never a pin to
+            // hand back — `cwd: None` here is not a gap, it is the honest
+            // fact that no ask (and no directory) was ever recorded.
             Ok(row) => GateOutcome {
                 verdict: if row.status.is_allowed() {
                     GateVerdict::Allowed
@@ -531,6 +606,7 @@ pub(crate) async fn run_gate(
                     GateVerdict::Denied
                 },
                 ask: Some(AskRef { request_id, status: row.status }),
+                cwd: None,
                 reason: auto_reason.to_string(),
             },
             // The ask committed and its decision did not, so the row exists
@@ -539,6 +615,7 @@ pub(crate) async fn run_gate(
             Err(e) => GateOutcome {
                 verdict: GateVerdict::Unavailable,
                 ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
+                cwd: None,
                 reason: format!(
                     "approval gate could not record the rule decision: {e} (fail-closed — \
                      this is a ledger fault, not a decision)"
@@ -551,6 +628,10 @@ pub(crate) async fn run_gate(
     //    client learns an answer is wanted the moment the row commits — an
     //    ask nothing points at is answerable and undiscoverable at once.
     announce_ledger_change(db, ledger_flows);
+    // Pin the cwd this ask was asked in — before anyone can answer it, so
+    // there is no window where an answer could redeem against a pin that
+    // was never taken. See `pin_cwd` for what happens with no `context_id`.
+    pin_cwd(db, caller, &request_id);
     // The waiter can vanish without warning, and tuning budgets will never
     // stop that: a harness kills its hook on its own schedule (Claude Code
     // at five seconds, Codex at three for `SessionEnd`), a user interrupts,
@@ -567,6 +648,7 @@ pub(crate) async fn run_gate(
     GateOutcome {
         verdict: GateVerdict::Pending,
         ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
+        cwd: None,
         reason: format!(
             "waiting for a human to answer; nothing was run. Answer with \
              `kj ledger allow <id>` or `kj ledger deny <id>`, then run the \
@@ -578,7 +660,10 @@ pub(crate) async fn run_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kj::test_helpers::{test_caller, test_dispatcher_with_timeouts};
+    use crate::kernel_db::ContextShellRow;
+    use crate::kj::test_helpers::{
+        caller_with_context, register_context, test_caller, test_dispatcher_with_timeouts,
+    };
     use kaijutsu_types::TimeoutPolicy;
 
     fn cc_spec(target: &str) -> GateSpec {
@@ -1089,5 +1174,161 @@ mod tests {
             "nothing durable was recorded, so there is no ask id to hand anyone"
         );
         assert_eq!(outcome.ask_description(), "no ask was recorded");
+    }
+
+    /// Persist `cwd` for `context_id` the way `context_shell.cwd` is
+    /// normally written (through `EmbeddedKaish::set_cwd` + a durable
+    /// flush) — directly via `upsert_context_shell`, since these tests only
+    /// need the row on disk, not a live shell to write it.
+    fn seed_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, context_id: kaijutsu_types::ContextId, cwd: &str) {
+        db.lock()
+            .upsert_context_shell(&ContextShellRow {
+                context_id,
+                cwd: Some(cwd.to_string()),
+                updated_at: 0,
+            })
+            .unwrap();
+    }
+
+    /// An escalating gate records a pin for its `request_id` — the fact
+    /// [`pin_cwd`] exists to establish. Read back through the same
+    /// process-local map `run_gate` writes, since that map (not a durable
+    /// row) is the pin's only home.
+    ///
+    /// Falsified by commenting out the `pin_cwd(db, caller, &request_id)`
+    /// call in the escalate tail: `take_pinned_cwd` returned `None` instead
+    /// of the seeded directory. Reverted.
+    #[tokio::test]
+    async fn an_escalating_gate_records_a_pin_for_its_request_id() {
+        let d = gate_dispatcher().await;
+        let ctx_id = register_context(&d, Some("pin-capture"), None, kaijutsu_types::PrincipalId::new());
+        seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
+        let caller = caller_with_context(ctx_id);
+
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+        let request_id = outcome.ask.expect("an escalated ask has a row").request_id;
+
+        // Read the pin into an owned value BEFORE asserting — an assert
+        // that panics while still holding the guard would poison this
+        // process-global lock for every OTHER test sharing the process, an
+        // unrelated cascade this test must not risk causing.
+        let pinned = lock_pins().get(&request_id).cloned();
+        assert_eq!(
+            pinned,
+            Some(PathBuf::from("/original/dir")),
+            "the ask's cwd must be pinned under its own request_id the moment it escalates"
+        );
+    }
+
+    /// The whole point: an approval redeemed later returns the cwd captured
+    /// AT ASK TIME, even though the context's persisted cwd moved in
+    /// between escalation and redemption — a human approving a command in
+    /// `/original/dir` must not have it run in `/moved/dir` because the
+    /// context `cd`ed there while the ask sat waiting.
+    ///
+    /// Falsified by reading `caller`/`context_id`'s CURRENT cwd at
+    /// redemption time instead of the pinned one (i.e. deleting the pin
+    /// entirely and re-reading `db.get_context_shell` in the redeem
+    /// branch): the assertion on `/original/dir` failed, observing
+    /// `/moved/dir` instead — exactly the defect this slice exists to
+    /// close. Reverted.
+    #[tokio::test]
+    async fn redemption_returns_the_cwd_captured_at_ask_time_even_after_it_moved() {
+        let d = gate_dispatcher().await;
+        let ctx_id = register_context(&d, Some("pin-redeem"), None, kaijutsu_types::PrincipalId::new());
+        seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
+        let caller = caller_with_context(ctx_id);
+
+        let first = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(first.verdict, GateVerdict::Pending);
+        let request_id = pending_id(&d);
+
+        // The context moves BEFORE the human answers — exactly the race
+        // this pin exists to close.
+        seed_cwd(&d.kernel_db, ctx_id, "/moved/dir");
+        answer(&d, &request_id, true);
+
+        let second = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(second.verdict, GateVerdict::Allowed);
+        assert_eq!(
+            second.cwd,
+            Some(PathBuf::from("/original/dir")),
+            "a redeemed approval must run in the directory it was ASKED about, not \
+             wherever the context's cwd has since moved to"
+        );
+    }
+
+    /// The pin is single-use: once a redemption has taken it, a second take
+    /// for the same `request_id` gets nothing — never the same directory
+    /// twice, and never silently stale.
+    ///
+    /// Falsified by making `take_pinned_cwd` peek (`get` + `clone`) instead
+    /// of remove: the second `take_pinned_cwd` call returned
+    /// `Some("/original/dir")` again instead of `None`. Reverted.
+    #[tokio::test]
+    async fn the_pin_is_single_use() {
+        let d = gate_dispatcher().await;
+        let ctx_id = register_context(&d, Some("pin-single-use"), None, kaijutsu_types::PrincipalId::new());
+        seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
+        let caller = caller_with_context(ctx_id);
+
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
+            .await;
+        let request_id = pending_id(&d);
+        answer(&d, &request_id, true);
+
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
+            .await;
+
+        assert_eq!(
+            take_pinned_cwd(&request_id),
+            None,
+            "the redemption above must already have taken (removed) this pin; a second \
+             take must find nothing, not a stale directory"
+        );
+    }
+
+    /// A caller with no `context_id` has nothing to pin — documented
+    /// behavior for the synthetic/internal-caller case, not a gap. Its
+    /// escalation still leaves a normal pending row; only the pin is
+    /// absent, so its later redemption runs with no cwd override (unchanged
+    /// from before this pin existed).
+    #[tokio::test]
+    async fn a_caller_with_no_context_id_pins_nothing() {
+        let d = gate_dispatcher().await;
+        let mut caller = test_caller();
+        caller.context_id = None;
+
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+        let request_id = outcome.ask.expect("still a normal escalation").request_id;
+
+        let pinned = lock_pins().get(&request_id).cloned();
+        assert_eq!(pinned, None, "a caller with no context_id has no persisted cwd to pin");
     }
 }
