@@ -1,10 +1,16 @@
-# The gate stops blocking, and the kernel resumes the action
+# The gate stops blocking
+
+**Read "Rescoped" first if you are here to build something.** This document
+is written oldest-first: the 2026-08-22 ruling below is what shipped, and the
+2026-08-23 ruling deleted its durable half. Everything about *not blocking the
+wire* still holds. Anything promising that the kernel resumes an action across
+a restart does not.
 
 **Amy's ruling, 2026-08-22.** A gated tool call must not hold an RPC open
 while a human thinks. The kernel tells the client it is waiting; the client
-may block locally; nothing blocks on the wire. When the answer lands — an
-hour later, at 3am, after a kernel restart — **the kernel performs the
-action itself** and authors the result into the originating context.
+may block locally; nothing blocks on the wire. The original ruling went
+further — when the answer lands, *the kernel performs the action itself* —
+and that half was reversed a day later.
 
 > *"perhaps we should consider a state machine and not actually having
 > anything block on the wire? so kernel would instruct the client it is
@@ -157,16 +163,21 @@ call    →  no rule covers it  →  create ask + persist the action  →  RETUR
                                         │
                               kj ledger allow 7f3a
                                         ▼
-                   kernel claims the job, runs the action, authors
-                   its result blocks into the originating context
+                   the caller's NEXT attempt redeems the answer
+                   and runs the action  (2026-08-22 had the kernel
+                   run it here; see "Rescoped")
                                         ▼
                         model sees the result whenever it next runs
 ```
 
+A restart anywhere in that gap sweeps the ask to `Abandoned`, and the human
+is told to ask again rather than answering into a void.
+
 Three rules this has to keep, and the third is what makes it safe:
 
-1. **The action is persisted with the ask, not held in a stack frame.** A
-   suspended call cannot survive a restart; a row can.
+1. ~~**The action is persisted with the ask, not held in a stack frame.**~~
+   Reversed 2026-08-23. Nothing is persisted; an ask that cannot outlive the
+   process is abandoned at boot instead.
 2. **An answer is single-use, and a denial is an answer.** A decided ask —
    allowed *or* denied — is delivered to exactly one retry and is then
    spent. Allowed authorizes one execution and never becomes a standing
@@ -238,102 +249,131 @@ obvious manual fix, which is a better failure than a heuristic that marks the
 wrong asks abandoned and is hard to notice. Nothing here needs the guess, and
 guessing consistently is the part we cannot do.
 
-## Open questions, with recommendations
+## Rescoped: the kernel does not resume across a restart
 
-**Do not reconstruct the action from the ask.** Settled while sizing slice 2.
-An ask's statements carry `render_for_review(ps)` — a rendering built for a
-human to read in `kj ledger show`, not re-executable source. Re-running it would be
-re-deriving intent from a display string, which is the same mistake as a
-client decoding storage to learn what happened (CLAUDE.md, "Durable state and
-the wire"). The action is its own durable fact and gets its own row.
+**Amy's ruling, 2026-08-23.** Everything above about *not blocking the wire*
+stands and is shipped. What is gone is the durable half — the `gate_actions`
+table, the claim protocol, boot recovery, and exactly-once across a crash.
 
-**Where does the persisted action live?** Recommend a new table in
-`KernelDb`, keyed by `request_id`, **not** in `approval-ledger`. Good news for
-atomicity, verified: `KernelDb::conn_for_ledger` returns `&self.conn` — the
-ledger and the kernel share one SQLite connection and one file, so the ask row
-and the action row can commit in a single transaction rather than needing a
-two-phase dance between two databases. The ledger
-crate is deliberately free of MCP and tool vocabulary; teaching it what an
-instance and a tool call are would put kaijutsu's domain inside a crate that
-does not have it. The ledger owns the decision; the kernel owns what to do
-about it. Normalized columns, not a JSON blob.
+> *"Why put all this effort into resume? I almost feel we should just fail
+> tool calls across restarts. the kernel is really reliable and the only
+> reason it restarts a lot right now is because we're actively advancing it."*
 
-**The ask and its action cannot commit together, and that is survivable.**
-Found while specifying slice 2, after the atomicity note above turned out to
-be only half true. They share a connection, so one transaction is *physically*
-possible — but `create_ask` opens its own transaction and returns the
-`request_id` the action row's foreign key needs, and SQLite has no nested
-transactions. So the order is: commit the ask, then write the action.
+**The accounting.** Three things were riding on one design, and they separate
+cleanly:
 
-The window is real and its failure is the safe one. A crash in between leaves
-a `Pending` ask with no action, which is inert: nothing runs from a pending
-ask. It only matters when a human answers it, and then the executor finds an
-allowed ask with no action row — which **must fail loudly and author an error
-block**, never silently succeed and never guess. Recorded here rather than
-papered over, because the tempting fix (drop the foreign key so the action can
-be written first) trades a detectable gap for an undetectable one.
+| What | Where it lives now | Cost |
+|---|---|---|
+| Not blocking the wire while a human thinks | shipped, slice 1 | the real driver |
+| Redeeming the answer when the caller tries again | shipped, slice 1 | one query |
+| Surviving a kernel restart between ask and answer | **deleted** | ~964 lines, and every hard problem in the design |
 
-**Exactly-once.** A resumed job must not run twice if the kernel dies
-between running and recording. Claim the job the way the ledger claims an
-ask — a status column plus `BEGIN IMMEDIATE` — and record the terminal state
-in the same transaction that records the result block id. At boot, a job
-found `claimed` with no result is the one genuinely ambiguous case: it must
-fail closed and author an error, not re-run.
+The first two are most of the value. The third dragged in exactly-once across
+a crash, the `claimed`-at-boot row nobody can resolve, and staleness rules for
+a context that may be archived by the time an answer lands — and the worst
+outcome this design can produce, **an approved destructive action running
+twice**, is reachable only on that path. Failing closed is both safer and far
+smaller.
 
-**Staleness.** A persisted action carries the environment it needs (context,
-principal, cwd, env). If any of that no longer resolves — the context is
-archived, the cwd is gone — the resume must refuse loudly and author an
-error block, never approximate. Amy's rule: *"the operation would not go
-through without approval"*; the converse is that an approval authorizes
-*that* operation, not a similar one.
+### What replaces it
 
-**A `claimed` row at boot is the one state nobody can resolve.** The kernel
-died between claiming an action and recording its result, so whether it ran is
-unknowable from the row. It must not be re-run — an approved destructive action
-executed twice is the worst outcome this design can produce. Fail it closed and
-author an error naming the request id; a human can look and decide.
+**Pending asks are abandoned at boot.** An ask that silently stops being
+answerable is worse than one honestly buried: a human would answer it, be told
+nothing, and nothing would happen. At cold start no live waiter can exist by
+construction, so every unresolved ask is swept to `Abandoned` with a reason
+saying the kernel restarted, nothing ran, ask again. This is the use Amy
+described when she designed the state: *"it's like archive, we set it manually
+and when we have good evidence, but it can also be used for sweeps."* A cold
+start is the best evidence there is.
 
-**Per-ask TTL.** Nullable, `NULL` = eternal. Expiry becomes a janitor's job
-over the ledger, decoupled from every caller. A first pass may ship with no
-TTL at all — eternal is the default Amy asked for, and a sweep can come
-later.
+**The sweep covers `claimed`, not just `pending`.** `ask::list_pending` hides
+a claimed row on purpose — an answerer is working it, and a second answerer
+would step on the claim. That is true while the process holding the claim is
+alive, and only then. At cold start a `claimed` row is an answerer that died
+mid-decision, and it is reachable from neither `list_pending` nor
+`list_history`: invisible and unanswerable at once. `ask::list_unresolved` is
+the read that sees it.
 
-**What the model is told, and when.** Recommend authoring a `Notification`
-block on every terminal transition (allowed-and-run, denied, expired), so a
-model that is running learns without polling and a model that is not finds
-it on rehydrate.
+**A decided ask is never swept.** An `allowed` or `denied` answer nobody has
+redeemed yet survives the restart untouched — it is still redeemable, and
+abandoning it would silently destroy a human's answer.
+
+**cwd is pinned in memory, at ask time.** The gate captures the context's
+persisted cwd when it records the ask, keyed by `request_id`, and hands it
+back when the answer is redeemed; `shell_write` passes it through
+`ExecuteOptions.cwd`.
+
+Without this, a command runs wherever the context has wandered to by the time
+a human answers. Picture a recursive delete aimed at a relative path: the
+human reads it in `kj ledger show` with one directory in mind, the context
+runs `cd` somewhere else before the answer lands, and the approved command
+deletes a different tree with the same name. That breaks the rule the whole
+gate exists to keep: **an approval authorizes that operation, not a similar
+one.**
+
+A pinned directory that no longer resolves is a loud refusal, never a fallback
+to the current one. **`ExecuteOptions.cwd` alone does not fail closed** —
+proven by falsification: with the explicit `try_set_cwd` validation removed,
+the command ran anyway and printed its output. The check is load-bearing.
+
+The pin is in memory rather than in a table on purpose, and it is the same
+ruling twice: an ask cannot outlive the process, so neither should its pin.
+
+**Quiesce covers what can be drained.** A tool call and a model turn are
+bounded by machine time, so a graceful shutdown can finish them. An ask is
+bounded by human time and cannot be drained at all. The two are complements,
+not alternatives — see `docs/issues.md`, "A quiesce flag for graceful restart".
+
+### Two findings that outlived the design they were found in
+
+**Do not reconstruct the action from the ask.** An ask's statements carry
+`render_for_review(ps)` — a rendering built for a human to read in
+`kj ledger show`, not re-executable source. This stays true and now has a
+sharper edge: whatever is *not* in the rendered statement is not covered by
+the approval either, because the ledger digests exactly that text.
+
+**The digest is the authorization key, so it must cover everything that runs.**
+Found 2026-08-23: `kj cc send` rendered the literal template
+`kj cc send ${TARGET} ${MESSAGE}`, so every send to one target hashed
+identically and an approval read for one message could be redeemed by another.
+`hook_gate` and `shell_gate` both put the real content in the digest; `cc.rs`
+was the outlier. A related gap is disclosed rather than fixed:
+`shell_write`'s gate covers `parsed.command` and deliberately not
+`parsed.stdin` — see `kj::shell_gate`'s module docs for the full honest list.
 
 ## Slices
 
-1. **The call stops blocking, and an answered ask is redeemable.** Two
-   halves, and they cannot be separated — see below. `GateVerdict::Pending
-   { request_id }`, a third `PermissionAskOutcome`, a tool result that says
-   "pending, ask `<id>`, nothing was run"; the ask stops being expired by
-   the caller; and `run_gate` looks for an existing allowed-and-unredeemed
-   ask matching this statement *before* creating a new one, redeeming it
-   single-use when it finds one. Deletes the poll loop; keeps the ladder.
-2. **The persisted action.** The `KernelDb` table, written in the same
-   transaction as the ask's creation, plus the claim protocol. No executor
-   yet; a test proves the row round-trips and survives a restart.
-3. **The executor.** A `ledger.changed` subscriber that claims allowed jobs,
-   runs them, and authors result blocks. Boot-time recovery for jobs claimed
-   without a result. This is where exactly-once earns its tests.
-4. **Notifications and the ladder deletion.** Terminal transitions author
-   `Notification` blocks; `timeout::gate` and the patient hold come out.
-   **After the executor, never before** — between "stops blocking" and "the
-   kernel resumes," the ladder is what still makes a retry work.
-5. **TTL and the janitor**, if evidence says it is wanted.
+1. **The call stops blocking, and an answered ask is redeemable.** SHIPPED
+   (`d8d45d39`). Two halves that cannot be separated — see below.
+2. ~~The persisted action.~~ **Deleted 2026-08-23**, the day after it landed.
+3. ~~The executor.~~ **Deleted with it** — there is nothing durable to execute.
+4. **Abandon on boot, and pin the cwd.** SHIPPED (`8123a873`, `f880285a`),
+   with the digest fix (`ee8b6749`).
+5. **Delete `timeout::gate` and the patient hold.** The ladder is what still
+   makes a retry work, so it comes out only once the rest is deployed and
+   living.
 
-**Why slice 1 has two halves.** An earlier draft of this doc said slice 1
-could ship alone because "the model can retry after answering, since nothing
-has run." That is wrong, and the reason is the verified-absent finding above:
-`create_ask` does no deduplication. A retry would build the same
+**Why slice 1 has two halves.** An earlier draft said slice 1 could ship alone
+because "the model can retry after answering, since nothing has run." That is
+wrong: `create_ask` does no deduplication, so a retry would build the same
 free-variable statement, find no rule covering it (guarantee 3 forbids one),
 create a *second* ask, and return `Pending` again — a loop that never
-terminates however many times a human says yes. The redemption check is not
-an optimization on top of the state machine; it is the edge that closes it.
+terminates however many times a human says yes. The redemption check is not an
+optimization on top of the state machine; it is the edge that closes it.
 
-With both halves, slice 1 is worth landing alone: an approved action runs on
-the model's next attempt, which is the whole behavior change from a model's
-point of view, and slices 2–3 upgrade "next attempt" to "immediately, even
-with nothing running."
+**The invariant the whole lane turns on:** *only a human's undelivered answer
+is redeemable.*
+
+- a **denial** must be redeemable, or a denied caller loops forever minting
+  duplicate asks and never learns it was denied;
+- a **rule-decided** ask (`auto_reason` set) is an audit record, not an offer;
+- **learning a rule spends the answer it was learned from.**
+
+## Still open
+
+**Nothing resumes an approval on its own.** An answer is redeemed on the
+caller's *next attempt*. A model that is still working comes back and gets it;
+a delegated coder whose turn already ended has nothing that retries, so the
+approval sits until something drives that context again. An in-memory
+`ledger.changed` subscriber would close this without reintroducing anything
+durable. Not built, and not yet ruled on.
