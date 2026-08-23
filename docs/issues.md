@@ -6,30 +6,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## `unbind` leaves resource subscriptions live, and the tool schema says otherwise (2026-08-23)
-
-`Broker::set_binding` (`mcp/broker.rs:929`) — which both `bind` and `unbind`
-funnel through — updates the binding map, persists it, and emits the diff. It
-never touches `self.subscriptions` or `self.resource_parents`. Only
-`clear_binding` (`:1157`) drains those, and that is whole-context removal, not
-narrowing.
-
-So `kj binding revoke <instance>` on a context subscribed to a resource on that
-instance leaves the subscription live and updates keep landing from an instance
-the context no longer binds. Authority narrowed; effect kept flowing.
-
-Worse, the published `subscribe` description says *"Subscription dies with the
-binding"* (`mcp/servers/resources_builtin.rs:110`). That string reaches every
-connected client and is false for `unbind`. An MCP tool schema is a product
-surface (CLAUDE.md, "Published text"), so the wrong half is the doc as much as
-the code.
-
-Fix: tear down the subscriptions an instance owns when a binding narrows to
-exclude it, in `set_binding` where the old and new pairs are already both in
-hand. Note the existing teardown is best-effort (`clear_binding` logs at debug
-and continues) — match that, and decide deliberately whether a failed
-unsubscribe should be louder here.
-
 ## A quiesce flag for graceful restart (Amy, 2026-08-23)
 
 Amy: *"I've also been thinking about a quiesce flag too, so we could have a
