@@ -1962,6 +1962,38 @@ pub async fn create_shared_kernel(
         }
     }
 
+    // Bury every ask nobody can answer any more. An ask does not survive a
+    // kernel restart: the machinery to resume an approved action across one
+    // is where the exactly-once risk lives, and an approved destructive
+    // action running twice is worse than an ask that has to be made again
+    // (docs/gate-resume.md, "Rescoped").
+    //
+    // Sweeping is what keeps that honest rather than silent. Left alone, a
+    // pending ask stays answerable-looking: a human decides it, is told
+    // nothing, and nothing runs. `claimed` rows go too — the queue hides
+    // them because an answerer is working them, which stops being true the
+    // moment that process dies.
+    //
+    // Loud but not fatal, matching the two recoveries around it: a kernel
+    // that cannot sweep is still a kernel that can serve, and the stale
+    // rows are visible in `kj ledger list` either way. No ledger-change
+    // notification is published — nothing has subscribed to the bus yet at
+    // this point in boot, so it would be an announcement to nobody.
+    match kernel_db_arc
+        .lock()
+        .abandon_unresolved_asks_on_restart("the kernel restarted before this was answered; nothing ran — ask again")
+    {
+        Ok(0) => {}
+        Ok(n) => log::info!(
+            "abandoned {n} approval ask(s) that did not survive the restart; nothing they \
+             guarded was run"
+        ),
+        Err(e) => log::warn!(
+            "failed to abandon unresolved approval asks at startup: {e} — stale asks may \
+             still look answerable in `kj ledger list`"
+        ),
+    }
+
     // Re-adopt the persisted drift queue and rebuild the cursor from it
     // (docs/drifting-dead-letters.md, slice 3). **Adopt-only, never mint** —
     // exactly like the lost+found arm above, and for the same reason: a

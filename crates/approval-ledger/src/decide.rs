@@ -141,6 +141,58 @@ pub fn abandon(conn: &Connection, request_id: &str, reason: Option<&str>) -> Res
     transition(conn, request_id, "abandoned", EventKind::Abandoned, reason)
 }
 
+/// Abandon every still-`pending` ask, once at kernel cold start — the
+/// sweep that makes the restart rule real: an ask must not survive a
+/// kernel restart, because the machinery to safely resume an approved
+/// action across one is where the exactly-once risk lives, and a
+/// duplicated destructive action is worse than an honestly buried ask. A
+/// human who answers a swept ask is told nothing happened and must ask
+/// again — `reason` is what `kj ledger show` displays to explain why, so
+/// callers should say the restart happened and that a retry is the next
+/// step, not just "abandoned". Returns how many asks this call moved.
+///
+/// **Sweeps `claimed` as well as `pending`**, via
+/// [`ask::list_unresolved`] rather than [`ask::list_pending`]. The queue
+/// view hides a `claimed` row because an answerer is working it and a
+/// second answerer would step on the claim — true while that answerer's
+/// process is alive, and only then. At a cold start there is no claimant,
+/// so a `claimed` row is an answerer that died mid-decision, and it is
+/// reachable from neither the queue nor the history: leaving it is
+/// leaving a row that can never be seen or answered again.
+///
+/// **Does not touch `allowed`/`denied`.** Those are answered but possibly
+/// not yet redeemed (`redeem_ask`) — abandoning one would silently
+/// destroy a human's answer that is still good to deliver. `abandoned`
+/// and `expired` are already terminal and untouched for the same reason
+/// [`abandon`] never overwrites a terminal row.
+///
+/// One [`abandon`] call per row — each already opens its own `BEGIN
+/// IMMEDIATE` transaction ([`transition`]'s doc), and SQLite has no
+/// nested transactions on one connection, so this cannot be one
+/// transaction wrapped around the whole sweep. A row that raced away from
+/// non-terminal between [`ask::list_unresolved`]'s read and this call's own
+/// `abandon` ([`LedgerError::AlreadyDecided`]) is not a sweep failure —
+/// something else already gave that row a terminal state, which is
+/// exactly this sweep's goal for it, reached by a different path; it is
+/// skipped and not counted. Any other error is a real database failure,
+/// not a race, and aborts the sweep immediately rather than being
+/// swallowed and continuing past it — rows already abandoned by this call
+/// stay abandoned regardless (each one already committed on its own), but
+/// a database that cannot complete a write is not one this function
+/// should keep hammering.
+pub fn abandon_unresolved_on_restart(conn: &Connection, reason: &str) -> Result<usize> {
+    let unresolved = crate::ask::list_unresolved(conn)?;
+    let mut swept = 0usize;
+    for row in unresolved {
+        match abandon(conn, &row.request_id, Some(reason)) {
+            Ok(_) => swept += 1,
+            Err(LedgerError::AlreadyDecided { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(swept)
+}
+
 fn transition(
     conn: &Connection,
     request_id: &str,
@@ -471,5 +523,157 @@ mod tests {
     fn redeeming_an_unknown_request_is_not_found() {
         let conn = open_memory();
         assert!(matches!(redeem_ask(&conn, "nope").unwrap_err(), LedgerError::NotFound(_)));
+    }
+
+    // ── `abandon_unresolved_on_restart` (the cold-start sweep) ──────────────
+
+    /// The core claim: every `pending` row becomes `abandoned`, the
+    /// reported count matches, and the reason is readable back.
+    ///
+    /// Falsified by changing the loop body's `Ok(_) => swept += 1` to `Ok(_)
+    /// => {}` (never incrementing): `count` then read `0` instead of `3`,
+    /// failing the assertion as expected. Reverted afterward.
+    #[test]
+    fn sweep_abandons_every_pending_ask_and_reports_the_count() {
+        let conn = open_memory();
+        let a = create_ask(&conn, &minimal_ask()).unwrap();
+        let b = create_ask(&conn, &minimal_ask()).unwrap();
+        let c = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let count = abandon_unresolved_on_restart(&conn, "kernel restarted; nothing ran; ask again").unwrap();
+        assert_eq!(count, 3);
+
+        for id in [&a, &b, &c] {
+            let row = get_approval(&conn, id).unwrap().unwrap();
+            assert_eq!(row.status, ApprovalStatus::Abandoned);
+        }
+    }
+
+    /// A `claimed` ask must be swept too, and it is the one the queue
+    /// cannot show you. `list_pending` hides `claimed` on purpose — an
+    /// answerer is working it and a second answerer would step on the
+    /// claim — but that premise dies with the process that held the claim.
+    /// At a cold start a `claimed` row is reachable from neither
+    /// `list_pending` nor `list_history`, so leaving it behind leaves a row
+    /// that can never be seen or answered again.
+    #[test]
+    fn sweep_abandons_a_claimed_ask_the_queue_cannot_show() {
+        let conn = open_memory();
+        let id = create_ask(&conn, &minimal_ask()).unwrap();
+        crate::claim::claim(&conn, &id, b"an-answerer-that-died").unwrap();
+        assert_eq!(
+            get_approval(&conn, &id).unwrap().unwrap().status,
+            ApprovalStatus::Claimed,
+        );
+
+        // The gap this closes: invisible to both list queries.
+        assert!(crate::ask::list_pending(&conn).unwrap().is_empty());
+        assert!(crate::ask::list_history(&conn, 100).unwrap().is_empty());
+
+        let count = abandon_unresolved_on_restart(&conn, "kernel restarted").unwrap();
+        assert_eq!(count, 1, "the claimed ask must be swept");
+        assert_eq!(
+            get_approval(&conn, &id).unwrap().unwrap().status,
+            ApprovalStatus::Abandoned,
+        );
+    }
+
+    /// **The most important test here.** An `allowed` ask nobody has
+    /// redeemed yet is still a live, deliverable answer — the sweep must
+    /// leave it completely untouched, not abandon it out from under the
+    /// human who already decided it.
+    ///
+    /// Falsified two ways. First, by widening `abandon_unresolved_on_restart`
+    /// to enumerate via `list_asks_filtered` with `statuses: vec![Pending,
+    /// Allowed, Denied]` instead of `list_pending`'s `pending`-only query,
+    /// while still routing each row through `abandon`: this did **not**
+    /// fail — `abandon`'s own `transition` only ever matches `status IN
+    /// ('pending', 'claimed')`, so calling it on an `allowed`/`denied` row
+    /// hits `AlreadyDecided`, which the sweep's loop already treats as
+    /// "already reached a terminal state, skip" and does not count. That is
+    /// a real structural fact, not a weak test: the enumeration query is
+    /// redundant with `transition`'s own `WHERE` clause as the thing
+    /// actually protecting a decided row, and is recorded here rather than
+    /// silently dropped. Second, by replacing the whole function body with
+    /// a raw bulk `UPDATE approvals SET status = 'abandoned' WHERE status
+    /// IN ('pending', 'allowed', 'denied')` — bypassing `transition`
+    /// entirely: this DID fail, but with a `SqliteFailure` panic from
+    /// `schema.rs`'s `approvals_decided_is_immutable` trigger ("approval
+    /// already reached a terminal status; re-deciding is refused") rather
+    /// than a plain assertion mismatch — a third, schema-level backstop
+    /// underneath `transition`'s own guard. Reverted afterward.
+    #[test]
+    fn sweep_does_not_touch_an_undelivered_allowed_or_denied_ask() {
+        let conn = open_memory();
+        let allowed = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &allowed, DecideInput { allow: true, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
+        let denied = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &denied, DecideInput { allow: false, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
+
+        let count = abandon_unresolved_on_restart(&conn, "kernel restarted").unwrap();
+        assert_eq!(count, 0, "no pending rows exist, so nothing should be swept");
+
+        let allowed_row = get_approval(&conn, &allowed).unwrap().unwrap();
+        assert_eq!(allowed_row.status, ApprovalStatus::Allowed, "an undelivered answer must survive the sweep");
+        let denied_row = get_approval(&conn, &denied).unwrap().unwrap();
+        assert_eq!(denied_row.status, ApprovalStatus::Denied, "an undelivered answer must survive the sweep");
+
+        // Still redeemable — the sweep did not spend either answer.
+        assert!(redeem_ask(&conn, &allowed).unwrap(), "the allowed ask must still be deliverable after a sweep");
+        assert!(redeem_ask(&conn, &denied).unwrap(), "the denied ask must still be deliverable after a sweep");
+    }
+
+    /// An already-terminal `abandoned` or `expired` row is left alone —
+    /// both because [`ask::list_pending`] never returns them, and because
+    /// [`abandon`] would no-op against them anyway if it somehow tried.
+    ///
+    /// Falsified by dropping the `Err(LedgerError::AlreadyDecided { .. }) =>
+    /// {}` arm (making every non-`Ok` an aborting error): this test still
+    /// passed, because `list_pending` never hands the sweep an
+    /// already-terminal row to race against in the first place — recorded
+    /// here rather than silently dropped, per the falsification-must-report
+    /// rule. The arm still earns its place: it is what keeps a genuine
+    /// pending→terminal race (a future caller invoking this mid-process,
+    /// not only at cold start) from aborting the rest of the sweep.
+    #[test]
+    fn sweep_leaves_an_already_terminal_ask_alone() {
+        let conn = open_memory();
+        let expired = create_ask(&conn, &minimal_ask()).unwrap();
+        expire(&conn, &expired).unwrap();
+        let abandoned = create_ask(&conn, &minimal_ask()).unwrap();
+        abandon(&conn, &abandoned, Some("operator gave up waiting")).unwrap();
+
+        let count = abandon_unresolved_on_restart(&conn, "kernel restarted").unwrap();
+        assert_eq!(count, 0);
+
+        assert_eq!(get_approval(&conn, &expired).unwrap().unwrap().status, ApprovalStatus::Expired);
+        let abandoned_row = get_approval(&conn, &abandoned).unwrap().unwrap();
+        assert_eq!(abandoned_row.status, ApprovalStatus::Abandoned);
+        // The original abandonment reason survives — the sweep did not
+        // re-abandon it with its own restart reason.
+        let events = list_events(&conn, &abandoned).unwrap();
+        assert_eq!(events.iter().filter(|e| e.kind == EventKind::Abandoned).count(), 1);
+        assert_eq!(events[0].note.as_deref(), Some("operator gave up waiting"));
+    }
+
+    /// The reason string is recorded on the row's event and readable back
+    /// — what `kj ledger show` displays to a human who comes back to an
+    /// ask that no longer does anything.
+    ///
+    /// Falsified by passing `None` instead of `Some(reason)` into the
+    /// per-row `abandon` call: `events[0].note` then read `None` instead of
+    /// `Some("kernel restarted; nothing ran; ask again")`, failing as
+    /// expected. Reverted afterward.
+    #[test]
+    fn sweep_records_the_given_reason_on_each_abandoned_ask() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        abandon_unresolved_on_restart(&conn, "kernel restarted; nothing ran; ask again").unwrap();
+
+        let events = list_events(&conn, &request_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Abandoned);
+        assert_eq!(events[0].note.as_deref(), Some("kernel restarted; nothing ran; ask again"));
     }
 }

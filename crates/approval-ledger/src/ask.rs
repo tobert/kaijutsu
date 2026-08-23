@@ -336,12 +336,43 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
     Ok(rows)
 }
 
+/// Every ask that has not reached a terminal state — `pending` *and*
+/// `claimed` — oldest first.
+///
+/// [`list_pending`] deliberately hides a `claimed` row because an answerer
+/// is working it and a second answerer would step on the claim. That
+/// reasoning holds while the process that claimed it is alive, and only
+/// then. At a cold start no claimant can exist, so every `claimed` row is
+/// an answerer that died mid-decision — and it is reachable from neither
+/// [`list_pending`] nor [`list_history`], which makes it invisible and
+/// unanswerable at once.
+///
+/// This is the read for a caller that owns the whole non-terminal set,
+/// which today means the boot sweep
+/// ([`crate::decide::abandon_unresolved_on_restart`]). Prefer
+/// [`list_pending`] for anything that answers asks while the kernel runs.
+pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+                description, authorized_label, rc_run_id, status, created_at,
+                expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
+                remember_scope, auto_reason
+         FROM approvals WHERE status IN ('pending', 'claimed') ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Every decided ask — `allowed`, `denied`, `expired`, or `abandoned`
 /// (i.e. [`crate::types::ApprovalStatus::is_terminal`]) — most recently
 /// created first, capped at `limit` rows. This is the audit-trail
 /// read-back `list_pending` doesn't provide: `pending`/`claimed` rows
 /// never appear here, and once a row lands here it never appears in
-/// `list_pending` again (the two queries partition `approvals` by status).
+/// `list_pending` again.
+///
+/// **These two queries do not partition `approvals`.** A `claimed` row is
+/// in neither — not terminal, so not history; not `pending`, so not the
+/// queue. [`list_unresolved`] is the read that sees it.
 /// Ordered by `created_at` rather than `decided_at` because `decide`'s
 /// `expire`/`abandon` legs leave `decided_at` NULL (see `decide.rs`'s
 /// `transition`) — `created_at` is the one timestamp every row has.

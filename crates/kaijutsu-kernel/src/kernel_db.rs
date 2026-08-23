@@ -1726,6 +1726,25 @@ impl KernelDb {
     /// the ONLY way kernel code reaches the raw connection — the ledger's
     /// tables live in this DB (see [`Self::migrate_ledger`]), and its
     /// functions are the sanctioned callers.
+    /// Abandon every ask that has not reached a terminal state, once at
+    /// kernel cold start. Returns how many rows moved.
+    ///
+    /// The public face of `approval_ledger::decide::abandon_unresolved_on_restart`
+    /// for callers outside this crate: the ledger's whole API borrows a
+    /// `Connection`, and [`Self::conn_for_ledger`] is `pub(crate)` on
+    /// purpose, so the server crate reaches the sweep through here rather
+    /// than through the raw connection.
+    ///
+    /// `reason` is displayed by `kj ledger show`, so it should name the
+    /// condition and the next step: the kernel restarted, nothing ran, ask
+    /// again. See `docs/gate-resume.md`.
+    pub fn abandon_unresolved_asks_on_restart(&self, reason: &str) -> KernelDbResult<usize> {
+        Ok(approval_ledger::decide::abandon_unresolved_on_restart(
+            self.conn_for_ledger(),
+            reason,
+        )?)
+    }
+
     pub(crate) fn conn_for_ledger(&self) -> &Connection {
         &self.conn
     }
