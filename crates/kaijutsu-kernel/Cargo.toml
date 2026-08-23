@@ -95,7 +95,7 @@ kaish-help.workspace = true
 # kaish-tool-api/kaish-types to the same "0.15" this workspace pins above, so
 # the `Tool` trait objects unify — `cargo tree -i kaish-types` must show
 # exactly one version after this is added.
-kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "55369bf7cb33e85e92b7b7e559a01de7f756293a" }
+kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "c8785b94b22c9af41039713c2ae8622b78ed2be3" }
 
 # gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
 ignore.workspace = true

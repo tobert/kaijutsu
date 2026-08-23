@@ -220,45 +220,46 @@ mod tests {
         let err = build_shell_gate_spec("echo 'unclosed").unwrap_err();
         assert!(matches!(err, ShellGateBuildError::Parse(_)));
     }
-
-    /// The landmine, as a regression test: `plan_program` numbers
-    /// statements BEFORE dropping the empty ones (a leading comment or
-    /// blank line), so a consumer that re-derives a position by counting
-    /// the FILTERED list reports the wrong statement. This asserts the
-    /// PUBLISHED index survives into `GatedStatement::source_index`
-    /// unshifted.
+    /// `source_index` carries `PlannedStatement::index` verbatim rather
+    /// than re-enumerating the filtered list.
+    ///
+    /// **kaish 0.16 reversed what that index means.** It used to number
+    /// statements before the empty ones were dropped, so a leading comment
+    /// shifted the first real statement to 1 and this test asserted exactly
+    /// that. 0.16 defines `index` as "the statement's position in the
+    /// returned list" (`ast/plan.rs`) and ships its own
+    /// `a_leading_comment_does_not_shift_the_indexes` pinning 0.
+    ///
+    /// So the old landmine is gone upstream, and with it this test's power
+    /// to tell carrying-the-index apart from re-enumerating: under the new
+    /// contract the two answers agree by construction. Kept anyway, pinning
+    /// the contract we consume — if kaish reintroduces a gap between the
+    /// published index and the positional one, this is where it surfaces,
+    /// and the module must still READ `PlannedStatement::index` rather than
+    /// count the filtered list.
     #[test]
-    fn a_leading_comment_does_not_shift_which_statement_is_reported() {
+    fn source_index_follows_kaish_published_index_across_a_leading_comment() {
         let source = "# a comment\nls\nrm -rf foo\n";
         let spec = build_shell_gate_spec(source).unwrap();
         assert_eq!(spec.statements.len(), 2, "the comment itself plans nothing");
 
-        // If this module had (incorrectly) enumerated the filtered Vec
-        // instead of carrying `PlannedStatement::index`, these would read
-        // 0 and 1 instead of 1 and 2 — silently blaming the wrong
-        // statement in every downstream reason string.
         assert_eq!(spec.statements[0].rendered, "ls");
-        assert_eq!(spec.statements[0].source_index, Some(1));
+        assert_eq!(spec.statements[0].source_index, Some(0));
         assert_eq!(spec.statements[1].rendered, "rm -rf foo");
-        assert_eq!(spec.statements[1].source_index, Some(2));
+        assert_eq!(spec.statements[1].source_index, Some(1));
     }
 
-    /// Same landmine, two comments/blanks deep, to rule out an off-by-one
-    /// that only a single gap happens to hide. Doesn't assert kaish's exact
-    /// statement-numbering rule for consecutive blank/comment lines (that's
-    /// kaish's own contract, not this module's) — only that a leading gap
-    /// is never silently collapsed to the naive "re-enumerate the filtered
-    /// Vec" answer of 0, which is exactly the bug this regression test
-    /// exists to catch.
+    /// Two gaps deep, same contract: consecutive comments and blank lines do
+    /// not push the first real statement off 0 under kaish 0.16.
     #[test]
-    fn multiple_leading_gaps_still_report_a_nonzero_source_index() {
+    fn multiple_leading_gaps_do_not_shift_the_published_index() {
         let source = "\n# one\n# two\nrm -rf foo\n";
         let spec = build_shell_gate_spec(source).unwrap();
         assert_eq!(spec.statements.len(), 1);
-        assert!(
-            spec.statements[0].source_index.unwrap() > 0,
-            "a leading gap must shift the published index away from a naive 0: {:?}",
-            spec.statements[0].source_index
+        assert_eq!(
+            spec.statements[0].source_index,
+            Some(0),
+            "kaish 0.16 numbers the returned list, so a leading gap shifts nothing"
         );
     }
 

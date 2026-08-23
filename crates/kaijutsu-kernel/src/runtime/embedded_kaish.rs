@@ -453,11 +453,18 @@ impl EmbeddedKaish {
     /// so kernel spans are not orphaned. The wiring is a no-op when OTel is
     /// inactive (empty carrier) or when a caller has already set its own
     /// `traceparent` — see [`merge_trace_context`].
+    /// Returns kaish's typed [`kaish_kernel::KernelError`] rather than
+    /// flattening it into `anyhow`. The distinction is the whole point: a
+    /// `Parse`/`Validation` error means the program was refused and NOTHING
+    /// RAN, while `Execution` means a statement started and faulted. A caller
+    /// that reports the first as a fault teaches a model to retry a command
+    /// that will never work. `is_rejected()` is the predicate; `Display` is
+    /// byte-identical either way, so a caller that only prints needs nothing.
     pub async fn execute_with_options(
         &self,
         code: &str,
         opts: ExecuteOptions,
-    ) -> Result<ExecResult> {
+    ) -> std::result::Result<ExecResult, kaish_kernel::KernelError> {
         let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);

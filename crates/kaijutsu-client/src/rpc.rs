@@ -3162,13 +3162,22 @@ fn parse_output_node(
     for i in 0..children_reader.len() {
         children.push(parse_output_node(children_reader.get(i))?);
     }
-    Ok(kaijutsu_types::OutputNode {
-        name,
-        entry_type,
-        text,
-        cells,
-        children,
-    })
+    // Builders, not a struct literal: `OutputNode` is `#[non_exhaustive]`
+    // because it grows, and it grew a `line` field. `text` stays conditional
+    // — `None` (a named entry) and `Some("")` (a text node that is empty) are
+    // different things to kaish.
+    //
+    // `line` is deliberately unset: the wire carries no line number for an
+    // output node. See docs/issues.md, "The wire drops kaish's output line
+    // anchor".
+    let mut node = kaijutsu_types::OutputNode::new(name)
+        .with_entry_type(entry_type)
+        .with_cells(cells)
+        .with_children(children);
+    if let Some(text) = text {
+        node = node.with_text(text);
+    }
+    Ok(node)
 }
 
 /// Parse a Cap'n Proto `BlockMetadata` into the typed struct.

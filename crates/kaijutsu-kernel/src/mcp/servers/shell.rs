@@ -448,8 +448,22 @@ impl McpServerLike for ShellServer {
         // pin existed.
         let mut pinned_cwd: Option<std::path::PathBuf> = None;
         if !self.read_only {
-            let spec = crate::kj::shell_gate::build_shell_gate_spec(&parsed.command)
-                .map_err(|e| McpError::Protocol(format!("shell_write: {e} — nothing was run")))?;
+            // A submission that does not parse is refused here, before the
+            // gate — a human is never asked to approve text that cannot be
+            // rendered. `ShellGateBuildError` has exactly one variant and it
+            // is `Parse`, so this is always the model's mistake to fix and
+            // never a fault: it takes the same D-28 `is_error` channel a
+            // post-gate rejection takes, not `McpError::Protocol`.
+            let spec = match crate::kj::shell_gate::build_shell_gate_spec(&parsed.command) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    return Ok(KernelToolResult {
+                        is_error: true,
+                        content: vec![ToolContent::Text(format!("{e} — nothing was run"))],
+                        structured: None,
+                    });
+                }
+            };
             let caller = crate::kj::KjCaller {
                 principal_id: ctx.principal_id,
                 context_id: Some(ctx.context_id),
@@ -556,10 +570,32 @@ impl McpServerLike for ShellServer {
         if let Some(cwd) = pinned_cwd {
             opts = opts.with_cwd(cwd);
         }
-        let result = kaish
-            .execute_with_options(&parsed.command, opts)
-            .await
-            .map_err(|e| McpError::Protocol(format!("shell execution failed: {e}")))?;
+        // A REJECTED program is not a plumbing fault. kaish refuses parse and
+        // validation failures before anything runs, and that is the model's
+        // own mistake to read and fix — so it travels the D-28 `is_error`
+        // channel with kaish's text verbatim, the same way a nonzero exit
+        // does. Wrapping it in `McpError::Protocol` prepended `mcp protocol
+        // error:`, which is broker-internal vocabulary its own doc comment
+        // says must be converted at the LLM boundary, and it read like
+        // kaijutsu was broken rather than like the command was rejected.
+        //
+        // `Execution` keeps the fault channel: a statement started and
+        // something under it broke, which is not a rejection the model can
+        // fix by rewriting the command. `is_rejected()` is kaish's own
+        // predicate for the split; do not re-derive it from the message text.
+        let result = match kaish.execute_with_options(&parsed.command, opts).await {
+            Ok(result) => result,
+            Err(e) if e.is_rejected() => {
+                return Ok(KernelToolResult {
+                    is_error: true,
+                    content: vec![ToolContent::Text(e.to_string())],
+                    structured: None,
+                });
+            }
+            Err(e) => {
+                return Err(McpError::Protocol(format!("shell execution failed: {e}")));
+            }
+        };
 
         Ok(shell_result_to_kernel(result))
     }
@@ -926,6 +962,95 @@ mod tests {
     /// — `run_gate` never waits): a rename of the old
     /// `shell_write_with_no_answer_escalates_and_times_out_refusing_the_call`,
     /// which pinned a wait that no longer exists.
+    /// The POST-gate half of the same rule: a program that parses, gets
+    /// approved, and is then refused by kaish's validator.
+    ///
+    /// The pre-gate test below cannot reach this branch — an unparseable
+    /// program never builds a gate spec, so it never gets as far as
+    /// `execute_with_options`. `break` outside a loop is the opposite shape:
+    /// it parses cleanly (a human is shown it and approves it) and the
+    /// validator rejects it before any statement runs. That is the case
+    /// `KernelError::is_rejected()` exists to separate from a real fault.
+    #[tokio::test]
+    async fn a_validator_rejection_after_approval_is_also_a_tool_failure() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("validrej"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let bad = "break";
+
+        let _ = broker
+            .call_tool(call_write(bad), &cc, CancellationToken::new())
+            .await;
+        answer_pending_ask(d.kernel_db().clone(), true);
+
+        let result = broker
+            .call_tool(call_write(bad), &cc, CancellationToken::new())
+            .await
+            .expect("a validator rejection must come back as a result, not an Err");
+
+        assert!(result.is_error, "a rejected program must set is_error");
+        let body = match result.content.first() {
+            Some(ToolContent::Text(t)) => t.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(
+            !body.contains("mcp protocol error"),
+            "broker-internal vocabulary must not reach the model; got: {body}"
+        );
+    }
+
+    /// A program kaish REFUSES reaches the model as a tool failure it can
+    /// read, not as a broker protocol fault.
+    ///
+    /// Before the 0.16 error split, every kaish failure — parse, validation,
+    /// genuine IO fault alike — was wrapped in `McpError::Protocol`, whose
+    /// Display prepends `mcp protocol error:`. That is broker-internal
+    /// vocabulary its own doc says must be converted at the LLM boundary, and
+    /// it made "your command was rejected, fix it and retry" read like
+    /// kaijutsu was broken. This pins the two halves that matter: `is_error`
+    /// is set, and the internal prefix is absent.
+    #[tokio::test]
+    async fn a_rejected_program_is_a_tool_failure_not_a_protocol_fault() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("reject"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        // An unterminated quote. This is refused BEFORE the gate — a human
+        // is never asked to approve text that cannot be rendered — so there
+        // is no ask to answer, and the refusal must still not wear protocol
+        // clothes.
+        let result = broker
+            .call_tool(call_write("echo 'unclosed"), &cc, CancellationToken::new())
+            .await
+            .expect("a refused program must come back as a result, not an Err");
+
+        assert!(result.is_error, "a rejected program must set is_error");
+        let body = match result.content.first() {
+            Some(ToolContent::Text(t)) => t.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(
+            !body.contains("mcp protocol error"),
+            "broker-internal vocabulary must not reach the model; got: {body}"
+        );
+        assert!(
+            !body.is_empty(),
+            "kaish's own rejection text must survive; got an empty body"
+        );
+    }
+
     #[tokio::test]
     async fn shell_write_with_no_answer_escalates_and_returns_pending_refusing_the_call() {
         let (broker, d) = wired().await;

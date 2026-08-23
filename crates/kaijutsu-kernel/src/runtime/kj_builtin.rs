@@ -504,6 +504,21 @@ impl Tool for KjBuiltin {
                 .with_aliases(vec!["h".to_string()])
                 .with_description("Show command help (routed to the leaf's own clap help)"),
         );
+        // `$(kj …)` binds `.data`, not the rendered table.
+        //
+        // kaish 0.16 stopped inferring this: a tool that prints text AND
+        // attaches data has to say which one a command substitution means,
+        // because both readings are defensible (`jq` means the data, `cut`
+        // means the text). kj means the data — `kj context list` renders a
+        // human table on stdout and attaches the id array, and
+        // `for h in $(kj context list)` has to iterate ids. Without this the
+        // loop silently iterates the table's rendered ROWS instead, which is
+        // a wrong-shaped string per iteration rather than an error.
+        //
+        // Declared here rather than by suppressing kj's text output, because
+        // the text is what a human reads in the shell.
+        let schema = schema.with_typed_substitution();
+
         schema
     }
 
