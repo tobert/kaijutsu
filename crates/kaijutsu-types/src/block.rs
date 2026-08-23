@@ -503,13 +503,19 @@ impl ErrorPayload {
     /// Build a one-line summary from the payload fields.
     /// Used to populate `BlockSnapshot.content` when the producer doesn't
     /// supply an explicit summary string.
+    ///
+    /// A multi-line `detail` is flattened onto the one line rather than cut
+    /// after its first: a detail's first line is often only a heading
+    /// (`validation failed:`) and the part worth reading — the command named,
+    /// the forms that would work — is below it. Flattening is capped at
+    /// [`ERROR_SUMMARY_BUDGET`] scalar values with a trailing `…`.
     pub fn summary_line(&self) -> String {
         if let Some(ref detail) = self.detail {
-            let first_line = detail.lines().next().unwrap_or("");
+            let flattened = flatten_to_one_line(detail, ERROR_SUMMARY_BUDGET);
             if let Some(ref code) = self.code {
-                format!("{} error ({}): {}", self.category, code, first_line)
+                format!("{} error ({}): {}", self.category, code, flattened)
             } else {
-                format!("{} error: {}", self.category, first_line)
+                format!("{} error: {}", self.category, flattened)
             }
         } else if let Some(ref code) = self.code {
             format!("{} error ({})", self.category, code)
@@ -517,6 +523,33 @@ impl ErrorPayload {
             format!("{} error", self.category)
         }
     }
+}
+
+/// Maximum chars of flattened `detail` a summary line carries, measured in
+/// Unicode scalar values. The full text stays in `ErrorPayload.detail`, which
+/// the expanded view and [`format_error_for_llm`] both read whole.
+pub const ERROR_SUMMARY_BUDGET: usize = 200;
+
+/// Squeeze a possibly multi-line, possibly ragged string onto one line:
+/// every line trimmed, empty lines dropped, the rest joined with a single
+/// space, then truncated to `budget` scalar values with a trailing `…`.
+///
+/// Truncation counts scalar values, never bytes — slicing a UTF-8 string at a
+/// byte offset panics mid-character, and an error summary is exactly where
+/// that would land.
+fn flatten_to_one_line(text: &str, budget: usize) -> String {
+    let mut out = String::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    if out.chars().count() > budget {
+        out = out.chars().take(budget).collect::<String>();
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Maximum chars of `ErrorPayload.detail` included in LLM hydration.
@@ -4615,6 +4648,81 @@ mod tests {
             source_kind: None,
         };
         assert_eq!(payload.summary_line(), "stream error");
+    }
+
+    /// The reported failure: kaish's validator puts `validation failed:` on
+    /// line 1 and the command it rejected on line 2, so a first-line-only
+    /// summary kept exactly the useless half.
+    #[test]
+    fn summary_line_keeps_the_useful_line_below_the_heading() {
+        let payload = ErrorPayload {
+            category: ErrorCategory::Validation,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: Some(
+                "validation failed:\n  rm: refusing -rf without --force\n  try: rm -r build/"
+                    .into(),
+            ),
+            span: None,
+            source_kind: None,
+        };
+        assert_eq!(
+            payload.summary_line(),
+            "validation error: validation failed: rm: refusing -rf without --force \
+             try: rm -r build/"
+        );
+    }
+
+    /// Blank lines and indentation are layout, not content — they must not
+    /// reach a one-line summary as runs of spaces.
+    #[test]
+    fn summary_line_drops_blank_lines_and_indentation() {
+        let payload = ErrorPayload {
+            category: ErrorCategory::Tool,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: Some("first\n\n    second\n\t\nthird   ".into()),
+            span: None,
+            source_kind: None,
+        };
+        assert_eq!(payload.summary_line(), "tool error: first second third");
+    }
+
+    /// Flattening removed the implicit bound a single line gave us, so the
+    /// cap is the thing standing between a 2 KiB detail and the collapsed
+    /// stub. Counted in scalar values, and the ellipsis is not part of it.
+    #[test]
+    fn summary_line_caps_a_long_detail_at_the_budget() {
+        let payload = ErrorPayload {
+            category: ErrorCategory::Kernel,
+            severity: ErrorSeverity::Fatal,
+            code: None,
+            detail: Some("x".repeat(ERROR_SUMMARY_BUDGET + 50)),
+            span: None,
+            source_kind: None,
+        };
+        let summary = payload.summary_line();
+        let body = summary.strip_prefix("kernel error: ").unwrap();
+        assert_eq!(body.chars().count(), ERROR_SUMMARY_BUDGET + 1);
+        assert!(body.ends_with('\u{2026}'));
+    }
+
+    /// Truncation counts scalar values, never bytes: three-byte characters
+    /// straddling the budget would panic a byte slice, and an error summary
+    /// is precisely where a panic must not happen.
+    #[test]
+    fn summary_line_truncates_multibyte_text_without_panicking() {
+        let payload = ErrorPayload {
+            category: ErrorCategory::Parse,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: Some("\u{6F22}".repeat(ERROR_SUMMARY_BUDGET + 10)),
+            span: None,
+            source_kind: None,
+        };
+        let summary = payload.summary_line();
+        let body = summary.strip_prefix("parse error: ").unwrap();
+        assert_eq!(body.chars().count(), ERROR_SUMMARY_BUDGET + 1);
     }
 
     // ── BlockSnapshot::error_for ────────────────────────────────────────
