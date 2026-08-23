@@ -1994,6 +1994,31 @@ pub async fn create_shared_kernel(
         ),
     }
 
+    // Fail every block still `Running` at cold start. Same shape as the ask
+    // sweep just above: `process_llm_stream` is spawned with no retained
+    // `JoinHandle` and no `catch_unwind` (llm_stream.rs), so a panic between
+    // "insert Running" and "set terminal status" — or the kernel restarting
+    // mid-turn — leaves a block `Running` forever with nothing left to
+    // finalize it. At cold start no writer can be mid-turn, so any `Running`
+    // block found here is known-stale (docs/issues.md, "Blocks orphaned in
+    // `Running` have no supervisor"). `abandon_running_blocks_on_restart`
+    // does not touch `Pending` (the drift queue's own durable waiting state)
+    // or `Draft` (an unsubmitted compose draft), and a completed block is
+    // never in scope — it isn't `Running`.
+    //
+    // Loud but not fatal, matching the ask sweep: the count is reported, and
+    // a per-block failure inside the sweep is logged there rather than
+    // aborting kernel start.
+    let swept_blocks = documents.abandon_running_blocks_on_restart(
+        "the kernel restarted while this was still in progress; nothing is being retried",
+    );
+    if swept_blocks > 0 {
+        log::info!(
+            "abandoned {swept_blocks} block(s) left `Running` by a writer that did not survive \
+             the restart"
+        );
+    }
+
     // Re-adopt the persisted drift queue and rebuild the cursor from it
     // (docs/drifting-dead-letters.md, slice 3). **Adopt-only, never mint** —
     // exactly like the lost+found arm above, and for the same reason: a

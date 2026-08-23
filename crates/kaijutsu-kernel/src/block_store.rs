@@ -3116,6 +3116,91 @@ impl BlockStore {
 
         Ok(block_id)
     }
+
+    /// Fail every block still `Running` at kernel cold start.
+    ///
+    /// `Running` is set only by an active writer — a streaming LLM turn, an
+    /// in-flight tool call — never as a durable "waiting" state. At cold
+    /// start no such writer can exist: the process that would have carried
+    /// it to a terminal status does not survive a restart. So a `Running`
+    /// block found here is known-stale, not merely suspected — the same
+    /// reasoning `KernelDb::abandon_unresolved_asks_on_restart` applies to
+    /// unanswered asks (docs/issues.md, "Blocks orphaned in `Running` have
+    /// no supervisor").
+    ///
+    /// Sweeps every document and every `BlockKind` on purpose, rather than
+    /// naming `model`/`tool_call`/`tool_result` specifically: `Running`
+    /// itself is the writer-in-flight signal regardless of kind, so a
+    /// narrower list would just be a second place to remember to update
+    /// when a new streaming kind is added. `Pending` and `Draft` are left
+    /// untouched — `Pending` is the drift queue's durable "waiting to be
+    /// flushed" state (`drift.rs`) and must survive a restart unswept;
+    /// `Draft` is an unsubmitted compose draft, exactly what a player left
+    /// mid-sentence, not abandoned work.
+    ///
+    /// Each swept block is set `Status::Error` and gets an `Error` child
+    /// block naming `reason`, so both the model and the app can read why —
+    /// see [`Self::insert_error_block_as`]. A per-block failure is logged
+    /// and does not stop the sweep: one document that cannot be written
+    /// must not hide every other orphan (loud but not fatal, matching the
+    /// restart recoveries this sits beside in `create_shared_kernel`).
+    ///
+    /// Returns how many blocks were swept.
+    pub fn abandon_running_blocks_on_restart(&self, reason: &str) -> usize {
+        let mut swept = 0usize;
+        for context_id in self.list_ids() {
+            let running: Vec<(BlockId, BlockKind)> = match self.block_snapshots(context_id) {
+                Ok(snaps) => snaps
+                    .into_iter()
+                    .filter(|s| s.status == Status::Running)
+                    .map(|s| (s.id, s.kind))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %context_id.to_hex(),
+                        error = %e,
+                        "abandon_running_blocks_on_restart: failed to read blocks; skipping this document"
+                    );
+                    continue;
+                }
+            };
+            for (block_id, kind) in running {
+                if let Err(e) = self.set_status(context_id, &block_id, Status::Error) {
+                    tracing::warn!(
+                        context_id = %context_id.to_hex(),
+                        block_id = %block_id,
+                        error = %e,
+                        "abandon_running_blocks_on_restart: failed to set Error status"
+                    );
+                    continue;
+                }
+                let payload = kaijutsu_types::ErrorPayload {
+                    category: kaijutsu_types::ErrorCategory::Kernel,
+                    severity: kaijutsu_types::ErrorSeverity::Fatal,
+                    code: Some("kernel.restart_orphan".to_string()),
+                    detail: Some(reason.to_string()),
+                    span: None,
+                    source_kind: Some(kind),
+                };
+                if let Err(e) = self.insert_error_block_as(
+                    context_id,
+                    &block_id,
+                    &payload,
+                    reason,
+                    Some(self.principal_id()),
+                ) {
+                    tracing::warn!(
+                        context_id = %context_id.to_hex(),
+                        block_id = %block_id,
+                        error = %e,
+                        "abandon_running_blocks_on_restart: failed to attach error detail"
+                    );
+                }
+                swept += 1;
+            }
+        }
+        swept
+    }
 }
 
 /// Derive a context's *live* status from its block statuses in timeline order
@@ -6929,5 +7014,243 @@ mod tests {
 
         let after = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
         assert_eq!(between, after, "second run must not touch a single row");
+    }
+
+    // ========================================================================
+    // abandon_running_blocks_on_restart — boot-time sweep for a block a dead
+    // writer left `Running` (docs/issues.md, "Blocks orphaned in `Running`
+    // have no supervisor").
+    // ========================================================================
+
+    #[test]
+    fn abandon_running_blocks_fails_a_running_block_with_a_readable_reason() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let running = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "partial stream...",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let swept = store.abandon_running_blocks_on_restart(
+            "the kernel restarted while this was still in progress; nothing is being retried",
+        );
+        assert_eq!(swept, 1, "exactly the one Running block should be swept");
+
+        let snap = store.get_block_snapshot(ctx, &running).unwrap().unwrap();
+        assert_eq!(
+            snap.status,
+            Status::Error,
+            "a Running block with no possible writer must be failed"
+        );
+
+        // The reason must be readable back — by both the model and a human —
+        // as an Error child, matching the tool-failure path's shape
+        // (`insert_error_block_as` off the block that failed).
+        let blocks = store.block_snapshots(ctx).unwrap();
+        let error_child = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Error && b.parent_id == Some(running))
+            .expect("swept block must get an Error child naming the reason");
+        assert!(
+            error_child.content.contains("nothing is being retried"),
+            "error child content must carry the reason text back, got: {}",
+            error_child.content
+        );
+    }
+
+    /// The most important test here: a completed block must never be
+    /// rewritten by the sweep. A boot sweep that touched a real, finished
+    /// result would be silent corruption, not a safety net.
+    #[test]
+    fn abandon_running_blocks_does_not_touch_a_terminal_block() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let done = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "a completed real result",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let errored = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "a real, already-reported failure",
+                Status::Error,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let swept = store.abandon_running_blocks_on_restart("reason");
+        assert_eq!(
+            swept, 0,
+            "no Running block exists — a terminal block must not be counted or touched"
+        );
+
+        let done_snap = store.get_block_snapshot(ctx, &done).unwrap().unwrap();
+        assert_eq!(done_snap.status, Status::Done, "Done status must be untouched");
+        assert_eq!(
+            done_snap.content, "a completed real result",
+            "Done content must be untouched"
+        );
+
+        let error_snap = store.get_block_snapshot(ctx, &errored).unwrap().unwrap();
+        assert_eq!(error_snap.status, Status::Error, "existing Error status must be untouched");
+        assert_eq!(
+            error_snap.content, "a real, already-reported failure",
+            "existing Error content must be untouched"
+        );
+
+        let blocks = store.block_snapshots(ctx).unwrap();
+        assert!(
+            !blocks.iter().any(|b| b.kind == BlockKind::Error && b.parent_id.is_some()),
+            "no Error child may be attached to a block the sweep did not touch"
+        );
+    }
+
+    /// `Pending` is the drift queue's own durable "waiting to be flushed"
+    /// state (`drift.rs`) and must survive a restart unswept. `Draft` is an
+    /// unsubmitted compose draft — exactly what a player left mid-sentence,
+    /// not abandoned work. Neither is `Running`, so neither is in scope.
+    #[test]
+    fn abandon_running_blocks_leaves_pending_and_draft_alone() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let pending = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::System,
+                BlockKind::Text,
+                "queued, not yet started",
+                Status::Pending,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let draft = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "typing...",
+                Status::Draft,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let swept = store.abandon_running_blocks_on_restart("reason");
+        assert_eq!(swept, 0);
+
+        assert_eq!(
+            store.get_block_snapshot(ctx, &pending).unwrap().unwrap().status,
+            Status::Pending,
+            "Pending must survive the sweep — the drift queue depends on this"
+        );
+        assert_eq!(
+            store.get_block_snapshot(ctx, &draft).unwrap().unwrap().status,
+            Status::Draft,
+            "a compose draft must survive the sweep"
+        );
+    }
+
+    /// Running is the writer-in-flight signal regardless of `BlockKind` — a
+    /// `ToolCall` left `Running` by a dead writer is exactly as stale as a
+    /// model `Text` block, so the sweep must not be restricted to one kind.
+    #[test]
+    fn abandon_running_blocks_is_not_restricted_to_one_kind() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let tool_call = store
+            .insert_tool_call(
+                ctx,
+                None,
+                None,
+                "shell",
+                serde_json::json!({"cmd": "ls"}),
+                Some(ToolKind::Shell),
+            )
+            .unwrap();
+        // insert_tool_call always lands Running (writer-in-flight by
+        // construction, blocks/block_store.rs) — pin the fixture before
+        // relying on it.
+        assert_eq!(
+            store.get_block_snapshot(ctx, &tool_call).unwrap().unwrap().status,
+            Status::Running
+        );
+
+        let swept = store.abandon_running_blocks_on_restart("reason");
+        assert_eq!(swept, 1);
+        assert_eq!(
+            store.get_block_snapshot(ctx, &tool_call).unwrap().unwrap().status,
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn abandon_running_blocks_sweeps_every_context() {
+        let store = BlockStore::new(test_agent());
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        store
+            .create_document(ctx_a, DocumentKind::Conversation, None)
+            .unwrap();
+        store
+            .create_document(ctx_b, DocumentKind::Conversation, None)
+            .unwrap();
+        let a = store
+            .insert_block(
+                ctx_a, None, None, Role::Model, BlockKind::Text, "", Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let b = store
+            .insert_block(
+                ctx_b, None, None, Role::Model, BlockKind::Text, "", Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let swept = store.abandon_running_blocks_on_restart("reason");
+        assert_eq!(swept, 2, "the sweep must not stop at the first context");
+        assert_eq!(
+            store.get_block_snapshot(ctx_a, &a).unwrap().unwrap().status,
+            Status::Error
+        );
+        assert_eq!(
+            store.get_block_snapshot(ctx_b, &b).unwrap().unwrap().status,
+            Status::Error
+        );
     }
 }
