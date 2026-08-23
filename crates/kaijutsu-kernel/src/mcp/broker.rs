@@ -1298,6 +1298,35 @@ impl Broker {
             .await
             .retain(|(ctx, _, _), _| ctx != context_id);
         self.bindings.write().await.remove(context_id);
+        self.forget_persisted_binding(context_id).await;
+    }
+
+    /// Delete the durable binding row, so a cleared binding STAYS cleared.
+    ///
+    /// Dropping only the in-memory entry does not reset anything: `binding()`
+    /// re-hydrates from the kernel DB on a cache miss, so the very next read
+    /// resurrects the row this call was meant to remove — and `kj binding
+    /// reset` reported "now denies all" while the loadout came straight back.
+    /// Both readers agreed, and both were wrong, which is why no divergence
+    /// test would have caught it.
+    ///
+    /// A write failure is logged and not propagated, matching
+    /// [`Self::persist_binding`] — but note the asymmetry it leaves: a failed
+    /// delete means the row outlives the reset, so the operator's next read
+    /// sees the old loadout. The warning is the only signal.
+    async fn forget_persisted_binding(&self, context_id: &ContextId) {
+        let db = match self.db.read().await.clone() {
+            Some(h) => h,
+            None => return,
+        };
+        let guard = db.lock();
+        if let Err(e) = guard.delete_context_binding(*context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = ?e,
+                "failed to delete context binding; the reset will not survive a re-read",
+            );
+        }
     }
 
     /// Read a context's binding, hydrating from the kernel DB on cache miss.
@@ -5230,6 +5259,40 @@ mod tests {
             .collect();
         assert!(child_uris.contains("file:///a"));
         assert!(child_uris.contains("file:///b"));
+    }
+
+    /// A cleared binding STAYS cleared across a re-read.
+    ///
+    /// `clear_binding` used to drop only the in-memory entry, and `binding()`
+    /// re-hydrates from the kernel DB on a cache miss — so the next read
+    /// resurrected the row and `kj binding reset` reported "now denies all"
+    /// while the loadout came straight back. Note what this means for test
+    /// design: BOTH readers saw the same stale row, so no
+    /// cache-versus-database divergence test would have caught it. The thing
+    /// to assert is durability, not agreement.
+    #[tokio::test]
+    async fn a_cleared_binding_does_not_come_back_on_the_next_read() {
+        let (broker, _store, ctx) = wired_broker().await;
+        let d = crate::kj::test_helpers::test_dispatcher().await;
+        broker.set_db(d.kernel_db().clone()).await;
+
+        let mut binding = ContextToolBinding::new();
+        binding.allow(InstanceId::new("res"));
+        broker.set_binding(ctx, binding).await;
+        assert!(
+            broker.binding(&ctx).await.is_some_and(|b| !b.is_empty()),
+            "precondition: the binding is set and persisted"
+        );
+
+        broker.clear_binding(&ctx).await;
+
+        // The cache is empty either way; this is the read that used to
+        // resurrect the row straight out of the database.
+        let after = broker.binding(&ctx).await;
+        assert!(
+            after.is_none_or(|b| b.is_empty()),
+            "a cleared binding must not re-hydrate from the kernel DB"
+        );
     }
 
     /// Exit criterion #4: clear_binding unsubscribes every live URI cleanly.

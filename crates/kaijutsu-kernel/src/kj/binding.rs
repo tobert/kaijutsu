@@ -301,6 +301,22 @@ impl KjDispatcher {
         if allow {
             binding.grant(cap.clone());
         } else {
+            // Refuse rather than report a revoke that changes nothing: a
+            // broad flag out-ranks every granular entry, so clearing the
+            // entry leaves the capability allowed.
+            if binding.revoke_is_inert(&cap) {
+                let broad = match cap {
+                    Capability::Facade(_) => "facade:*",
+                    _ => "*",
+                };
+                return KjResult::Err(format!(
+                    "kj binding revoke: nothing revoked — context {} holds '{broad}', \
+                     which allows '{}' regardless of this grant. Revoke '{broad}' first, \
+                     then allow back only what the context should keep.",
+                    ctx_id.short(),
+                    cap_label(&cap),
+                ));
+            }
             binding.revoke_cap(&cap);
         }
         broker.set_binding(ctx_id, binding).await;
@@ -402,6 +418,50 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Revoking under a broad `*` refuses instead of reporting a change it
+    /// did not make.
+    ///
+    /// `allows` short-circuits on `all_instances`, and `revoke_cap` never
+    /// touches that flag, so clearing a granular entry left the capability
+    /// allowed. Every broad role grants `*` and a context may narrow itself,
+    /// so this was the common path: the verb printed "revoked X" and nothing
+    /// changed.
+    #[tokio::test]
+    async fn revoking_an_instance_under_a_star_binding_refuses_loudly() {
+        let d = crate::kj::test_helpers::test_dispatcher().await;
+        let caller = crate::kj::test_helpers::test_caller();
+        let ctx = caller.context_id.expect("test caller has a context");
+
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::AllInstances);
+        binding.grant(crate::mcp::Capability::Admin);
+        d.kernel().broker().set_binding(ctx, binding).await;
+
+        let out = d
+            .dispatch_binding(&[s("revoke"), s("builtin.file")], &caller)
+            .await;
+
+        let msg = out.message();
+        assert!(
+            msg.contains("nothing revoked"),
+            "an inert revoke must refuse, got: {msg}"
+        );
+        assert!(
+            msg.contains("Revoke '*' first"),
+            "the refusal must name the next step, got: {msg}"
+        );
+
+        // And the capability really is still allowed — the refusal is not
+        // merely cosmetic caution.
+        let after = d.kernel().broker().binding(&ctx).await.unwrap_or_default();
+        assert!(
+            after.allows(&crate::mcp::Capability::Instance(
+                crate::mcp::InstanceId::new("builtin.file")
+            )),
+            "precondition of the whole finding: `*` still allows it"
+        );
     }
 
     #[tokio::test]

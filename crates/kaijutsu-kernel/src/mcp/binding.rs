@@ -423,6 +423,25 @@ impl ContextToolBinding {
 
     /// Remove one capability grant (idempotent if absent). Revoking an
     /// instance also drops tool grants and `name_map` entries for it.
+    /// Would revoking `cap` change what this binding allows?
+    ///
+    /// `allows` short-circuits on the broad flags, so an instance or tool
+    /// revoke is INERT while `all_instances` is set — `revoke_cap` clears the
+    /// granular entry and the flag keeps allowing the very thing that was
+    /// just revoked. Every broad role grants `*`, and a context is explicitly
+    /// permitted to narrow itself, so this is the common path rather than an
+    /// edge. Callers check this and refuse loudly instead of reporting a
+    /// revoke that did nothing.
+    ///
+    /// `AllInstances` itself is never inert — revoking `*` does narrow.
+    pub fn revoke_is_inert(&self, cap: &Capability) -> bool {
+        match cap {
+            Capability::Instance(_) | Capability::Tool { .. } => self.all_instances,
+            Capability::Facade(_) => self.all_facades,
+            _ => false,
+        }
+    }
+
     pub fn revoke_cap(&mut self, cap: &Capability) {
         match cap {
             Capability::Instance(instance) => self.revoke(instance),

@@ -237,6 +237,24 @@ impl McpServerLike for BuiltinBindingsServer {
                 let p: InstanceParams = serde_json::from_value(params.arguments.clone())
                     .map_err(McpError::InvalidParams)?;
                 let instance = InstanceId::new(p.instance.clone());
+                // Same rule the `kj binding revoke` verb applies: a broad
+                // `*` out-ranks every granular entry, so unbinding one
+                // instance under it changes nothing. Say so instead of
+                // reporting a removal and sending tool_removed events that
+                // will never come.
+                let current = broker.binding(&ctx.context_id).await.unwrap_or_default();
+                if current.revoke_is_inert(&Capability::Instance(instance.clone())) {
+                    return Ok(KernelToolResult {
+                        is_error: true,
+                        content: vec![ToolContent::Text(format!(
+                            "nothing unbound — this context holds '*', which allows \
+                             '{}' regardless of instance grants. Revoke '*' first, then \
+                             bind back only what it should keep.",
+                            p.instance
+                        ))],
+                        structured: None,
+                    });
+                }
                 broker.unbind(ctx.context_id, &instance).await;
                 let json = serde_json::json!({ "instance": p.instance });
                 Ok(KernelToolResult {
