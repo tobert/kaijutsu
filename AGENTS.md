@@ -173,7 +173,7 @@ beat/clock/cue code with that section open.
 
 **Conversation** is the live session: an append-only message sequence shipped to the LLM. Hydrated from context once at boundary events (fork, new, cold start, attach) and append-only thereafter.
 
-`block exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) queue in a per-context mailbox and flush on the next turn. The mailbox is also the atomicity gate that keeps tool_use+tool_result pairs (and other must-travel-together blocks) from being split by unrelated writers.
+`block exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) reach the next turn through a per-context mailbox, which is a **pull-based cursor over the durable block log**, not a queue: a background writer inserts into the block store and the mailbox discovers the delta on the next turn's `catch_up`. **There is no insert-time atomicity gate**, so an unrelated writer can still land a block between a tool_use and its tool_result; what exists is repair at `snapshot()` time, which fixes the conversation shape and leaves the durable blocks interleaved. The gate is a named follow-up — `docs/conversation-session.md`, "Out of scope for Slice A".
 
 ## Machines
 
