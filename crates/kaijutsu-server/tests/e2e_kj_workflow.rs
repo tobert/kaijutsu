@@ -802,8 +802,10 @@ fn test_rpc_default_context_type_is_default() {
 // Neither test below matches a `focused`-tier pattern (`*opus*`, `*sonnet*`,
 // `*fable*`, `*glm*`, `*gpt-5*`, `*-pro*`) — both a real fast-executor model
 // id and a deliberately non-matching one fall through the same `guided`
-// default arm. No test in this file drives a model id that lands in
-// `focused`; see the coverage note in the report for this change.
+// default arm. `test_coder_stance_focused_for_a_frontier_model` covers the
+// other side, and it is the one that keeps the fallback honest: with every
+// input landing in `guided`, a `case` that had stopped matching anything
+// would look exactly like a passing suite.
 // ============================================================================
 
 #[test]
@@ -851,6 +853,78 @@ fn test_coder_stance_guided_for_rpc_created_fast_model() {
             has_guided_stance,
             "expected the guided coder stance (\"Do not guess.\") for a \
              context inheriting a fast-executor model; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+    });
+}
+
+/// The `focused` tier, which nothing else here reaches.
+///
+/// Every other stance test lands in `guided` — a fast model matches no
+/// pattern, and so does a nonsense id, because the unmatched fallback IS
+/// `guided`. That makes the whole suite insensitive to the one failure that
+/// matters most: a `case` arm that quietly stopped matching would send a
+/// frontier model the plain-procedure stance and every test would still
+/// pass. This is the test that can see that.
+///
+/// `claude-opus-4-6` is chosen for `*opus*`, the first pattern in the arm.
+#[test]
+fn test_coder_stance_focused_for_a_frontier_model() {
+    run_local(async {
+        let addr = start_server_with_mock_llm_model("claude-opus-4-6").await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let ctx = kernel
+            .create_context_typed("rc-coder-focused", "coder")
+            .await
+            .expect("create_context_typed");
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+
+        let has_focused_trace = blocks.iter().any(|b| {
+            b.kind == BlockKind::Trace
+                && b.content.contains("stance: focused tier")
+                && b.content.contains("resolved_model=claude-opus-4-6")
+        });
+        assert!(
+            has_focused_trace,
+            "expected a 'stance: focused tier (resolved_model=claude-opus-4-6)' \
+             trace block for a frontier model matching the *opus* arm; \
+             got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+
+        // "one hand in a cybernetic loop" is the focused tier's defining
+        // line and appears in no other arm — the register split is the
+        // whole point of the tiering, so pin the register, not the length.
+        let has_focused_stance = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("one hand in a cybernetic loop")
+        });
+        assert!(
+            has_focused_stance,
+            "expected the focused coder stance (\"one hand in a cybernetic \
+             loop\") for a frontier model; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+
+        // The guided arm's plain-procedure marker must NOT be here. Without
+        // this, a script that emitted both arms' text would pass above.
+        let has_guided_marker = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("Do not guess.")
+        });
+        assert!(
+            !has_guided_marker,
+            "the guided tier's marker leaked into a focused-tier context; \
+             got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
