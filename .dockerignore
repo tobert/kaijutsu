@@ -1,0 +1,14 @@
+.git
+.agents
+.codex
+.chainlink
+.claude
+Containerfile
+target
+incoming-assets
+node_modules
+scratch
+tmp
+run.log
+*.log
+signoff.md

@@ -1,0 +1,21 @@
+{
+  "name": "kaijutsu",
+  "build": {
+    "dockerfile": "../Containerfile",
+    "context": "..",
+    "target": "devcontainer"
+  },
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+  "workspaceFolder": "/workspaces/kaijutsu",
+  "mounts": [
+    "source=kaijutsu-dev-data,target=/var/lib/kaijutsu,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}
