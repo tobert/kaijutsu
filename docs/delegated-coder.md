@@ -61,8 +61,25 @@ described a parse error as a variable lookup — and that difference was the
 whole reason the bug was silent. Weight a `file:line` by whether the sender
 read it, including your own.
 
-**Falsify.** A test asserts behavior at one point. Running the falsification
-is what tells you the test can fail at all. It also produces findings on its
+**Falsify — including claims you write in prose.** A test asserts behavior at
+one point. Running the falsification is what tells you the test can fail at
+all. The same applies to a sentence: kaish-extras caught a wrong claim in
+their own documentation by mutating it against the code, an hour before
+sending us the warning they had built out of it. A doc section and a test are
+both assertions; only one of them gets run by CI.
+
+Two traps worth knowing before you trust a mutation:
+
+- **Independently inert pairs.** Two things can each do nothing alone and
+  change behavior only together — kaish's typed-substitution flag and a
+  tool's `.data` are exactly this. A one-variable mutation against the wrong
+  fixture shows green and proves nothing. Mutate where both are present.
+- **Accidental correctness.** A test can pass for a reason nobody chose that
+  happens to be the right one. Our `curl -k` test pinned a flag-parsing-
+  before-allowlist ordering because the host was picked for an unrelated
+  reason. Same blindness as a test passing for a wrong reason, opposite luck,
+  and the only difference is whether someone looked. When you find one, one
+  comment makes it deliberate. It also produces findings on its
 own: removing one validation step proved a command still ran, in the wrong
 directory — so the step was load-bearing rather than defensive, which reading
 would not have shown.
