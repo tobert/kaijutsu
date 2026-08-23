@@ -6,6 +6,62 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `unbind` leaves resource subscriptions live, and the tool schema says otherwise (2026-08-23)
+
+`Broker::set_binding` (`mcp/broker.rs:929`) — which both `bind` and `unbind`
+funnel through — updates the binding map, persists it, and emits the diff. It
+never touches `self.subscriptions` or `self.resource_parents`. Only
+`clear_binding` (`:1157`) drains those, and that is whole-context removal, not
+narrowing.
+
+So `kj binding revoke <instance>` on a context subscribed to a resource on that
+instance leaves the subscription live and updates keep landing from an instance
+the context no longer binds. Authority narrowed; effect kept flowing.
+
+Worse, the published `subscribe` description says *"Subscription dies with the
+binding"* (`mcp/servers/resources_builtin.rs:110`). That string reaches every
+connected client and is false for `unbind`. An MCP tool schema is a product
+surface (CLAUDE.md, "Published text"), so the wrong half is the doc as much as
+the code.
+
+Fix: tear down the subscriptions an instance owns when a binding narrows to
+exclude it, in `set_binding` where the old and new pairs are already both in
+hand. Note the existing teardown is best-effort (`clear_binding` logs at debug
+and continues) — match that, and decide deliberately whether a failed
+unsubscribe should be louder here.
+
+## A quiesce flag for graceful restart (Amy, 2026-08-23)
+
+Amy: *"I've also been thinking about a quiesce flag too, so we could have a
+graceful restart (quiesce would let tool calls finish, receive model turns in
+flight and record them, and flush sql and all that)."*
+
+The shape: a kernel mode that stops accepting new work, drains what is running,
+records the results durably, and then exits cleanly — so a development restart
+costs nothing that was mid-flight.
+
+**What quiesce cannot cover, and why that is fine.** A tool call and a model
+turn are bounded by machine time, so draining them terminates. An approval ask
+is bounded by *human* time, so it cannot be drained — quiesce cannot hold a
+restart open until someone wakes up. The two mechanisms are complements:
+quiesce saves the work that was running, and the boot-time abandon sweep
+honestly buries the asks that were waiting.
+
+This is the argument that made restart-surviving gate actions unnecessary; see
+`docs/gate-resume.md`.
+
+## `kj rc reseed --overwrite` may clobber a concurrent edit (2026-08-23, UNVERIFIED)
+
+Reported by an audit and **not independently checked** — verify before acting.
+The claim: `rc_reseed` in `kj/rc.rs` reads current content into `plan.old` in
+one loop, builds diffs from it, then writes in a separate later loop with no
+re-check between. A concurrent `kj rc edit` in that window is silently
+clobbered, and the returned diff misreports what was replaced.
+
+Ranked low if true: an admin verb, human-run, short window, and the content is
+recoverable from the embedded seeds. Listed because it is the same
+capture-then-write-without-recheck shape as the cwd defect fixed today.
+
 ## `command not found` hides "this shell refuses external commands" — waiting on kaish 0.16
 
 **kaijutsu's half SHIPPED 2026-08-22** (`465b0d71`, `9217d6a8`). A delegated
@@ -144,13 +200,33 @@ event volume actually shows up in a profile — the firehose is a known cost, no
 a known problem, and the 2026-06-17 starvation it caused was on the MCP's
 single-threaded LocalSet, not the app's.
 
-## The gate stops blocking; the kernel resumes the action (RULED 2026-08-22)
+## The gate stops blocking (RULED 2026-08-22, RESCOPED 2026-08-23)
 
 **Design: `docs/gate-resume.md`.** Amy ruled that a gated tool call must not
 hold an RPC open while a human thinks — the kernel announces, the client may
-block locally, and when the answer lands the *kernel* performs the action and
-authors the result. Supersedes the blocking wait that shipped in Slice 4.6.
-Unbuilt; five slices in the design, slice 1 worth landing alone.
+block locally, and the answer is redeemed on the caller's next attempt.
+Supersedes the blocking wait that shipped in Slice 4.6. **Slice 1 shipped**
+(`d8d45d39`).
+
+**Rescoped 2026-08-23, and it got much smaller.** The original design had the
+kernel resume an approved action itself, across a kernel restart, from a
+durable `gate_actions` table. Amy: *"Why put all this effort into resume? I
+almost feel we should just fail tool calls across restarts. the kernel is
+really reliable and the only reason it restarts a lot right now is because
+we're actively advancing it."*
+
+The accounting that settled it: not blocking the wire and running the action
+when the answer lands are ~90% of the value and need no durability. Surviving
+a restart was ~90% of the cost and ~100% of the risk — exactly-once across a
+crash, the unresolvable `claimed`-at-boot row, staleness rules for a context
+that may be archived by now — and the worst outcome the whole design can
+produce, an approved destructive action running twice, exists only on that
+path. Slice 2's durable table was deleted the day after it landed.
+
+What replaced it: pending asks are swept to `Abandoned` at boot, so a human is
+told the truth instead of answering into a void; cwd is pinned in memory at ask
+time and passed through `ExecuteOptions.cwd` at redemption; and a quiesce flag
+(entry above) covers the work that *can* be drained.
 
 **Corrects the entry this replaces**, which claimed an expired ask reached the
 model with "nothing informative." It does not, and has not since the
