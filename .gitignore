@@ -26,3 +26,7 @@ signoff.md
 # handoff pattern as signoff.md, but written by a kernel context about itself
 # so it survives its own restarts. Never commit.
 *-chan.md
+
+# docs/kaijutsu-agent-feedback.md — the agent-experience log, cycled directly
+# rather than versioned; agents rewrite it in place and it never lands in git.
+docs/kaijutsu-agent-feedback.md
