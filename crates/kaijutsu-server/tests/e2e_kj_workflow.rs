@@ -782,7 +782,7 @@ fn test_rpc_default_context_type_is_default() {
 }
 
 // ============================================================================
-// Coder stance branch selection (S00-stance.kai) on the RPC creation path.
+// Coder stance tier selection (S00-stance.kai) on the RPC creation path.
 //
 // NOTE what these two tests do and don't pin: `create_context_typed` goes
 // through the kernel RPC `create_context`. Through 2026-08-10 that path
@@ -793,15 +793,21 @@ fn test_rpc_default_context_type_is_default() {
 // paths disagree about stamping the model": neither path stamps now, so
 // `.model` is genuinely null here too and `.resolved_model` is the only
 // thing reading through to the registry default. These two tests still pin
-// something real (branch selection follows the effective model when driven
+// something real (tier selection follows the effective model when driven
 // over RPC) but no longer distinguish `.model` from `.resolved_model` reads
-// by themselves — see `test_coder_stance_crisp_for_null_row_model_via_kj_dispatch`
+// by themselves — see `test_coder_stance_guided_for_null_row_model_via_kj_dispatch`
 // below for the test that pins the null-row-model case explicitly (now true
 // of both creation paths, not just kj dispatch).
+//
+// Neither test below matches a `focused`-tier pattern (`*opus*`, `*sonnet*`,
+// `*fable*`, `*glm*`, `*gpt-5*`, `*-pro*`) — both a real fast-executor model
+// id and a deliberately non-matching one fall through the same `guided`
+// default arm. No test in this file drives a model id that lands in
+// `focused`; see the coverage note in the report for this change.
 // ============================================================================
 
 #[test]
-fn test_coder_stance_crisp_for_rpc_created_fast_model() {
+fn test_coder_stance_guided_for_rpc_created_fast_model() {
     run_local(async {
         // Registry default only — no per-context model override.
         let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
@@ -809,42 +815,42 @@ fn test_coder_stance_crisp_for_rpc_created_fast_model() {
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let ctx = kernel
-            .create_context_typed("rc-coder-crisp", "coder")
+            .create_context_typed("rc-coder-guided", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
 
-        // Trace block: precise signal of which branch fired and on what
+        // Trace block: precise signal of which tier fired and on what
         // model read — the rc script echoes this specifically so a
-        // mis-routed branch is visible without a bisect.
-        let has_crisp_trace = blocks.iter().any(|b| {
+        // mis-routed tier is visible without a bisect.
+        let has_guided_trace = blocks.iter().any(|b| {
             b.kind == BlockKind::Trace
-                && b.content.contains("stance: crisp branch")
+                && b.content.contains("stance: guided tier")
                 && b.content.contains("resolved_model=claude-haiku-4-5")
         });
         assert!(
-            has_crisp_trace,
-            "expected a 'stance: crisp branch (resolved_model=claude-haiku-4-5)' \
+            has_guided_trace,
+            "expected a 'stance: guided tier (resolved_model=claude-haiku-4-5)' \
              trace block for a context inheriting a fast-executor model from \
              the registry default; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
 
-        // Stance text: "not a survey" is the crisp branch's defining
-        // instruction (act, don't reconnoiter) and appears in no other
-        // branch.
-        let has_crisp_stance = blocks.iter().any(|b| {
+        // Stance text: "Do not guess." is the guided tier's defining
+        // instruction (plain imperative, no metaphor) and appears in no
+        // other tier.
+        let has_guided_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("not a survey")
+                && b.content.contains("Do not guess.")
         });
         assert!(
-            has_crisp_stance,
-            "expected the crisp coder stance (\"not a survey\") for a context \
-             inheriting a fast-executor model; got {} blocks: {:#?}",
+            has_guided_stance,
+            "expected the guided coder stance (\"Do not guess.\") for a \
+             context inheriting a fast-executor model; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
@@ -852,49 +858,50 @@ fn test_coder_stance_crisp_for_rpc_created_fast_model() {
 }
 
 #[test]
-fn test_coder_stance_synth_for_rpc_created_non_matching_model() {
+fn test_coder_stance_guided_for_rpc_created_non_matching_model() {
     run_local(async {
         let addr = start_server_with_mock_llm_model("kaijutsu-reflective-test-model").await;
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let ctx = kernel
-            .create_context_typed("rc-coder-synth", "coder")
+            .create_context_typed("rc-coder-guided-nonmatch", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
 
-        let has_synth_trace = blocks.iter().any(|b| {
+        let has_guided_trace = blocks.iter().any(|b| {
             b.kind == BlockKind::Trace
-                && b.content.contains("stance: synth branch")
+                && b.content.contains("stance: guided tier")
                 && b.content
                     .contains("resolved_model=kaijutsu-reflective-test-model")
         });
         assert!(
-            has_synth_trace,
-            "expected a 'stance: synth branch \
+            has_guided_trace,
+            "expected a 'stance: guided tier \
              (resolved_model=kaijutsu-reflective-test-model)' trace block for \
              a context inheriting a non-matching model from the registry \
-             default; got {} blocks: {:#?}",
+             default — an unreadable or unmatched model falls to guided, per \
+             the script's own header comment; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
 
-        // Stance text: "one hand in a cybernetic loop" is the synth branch's
-        // defining trait (equals in the loop, room to reflect) and appears
-        // in no other branch.
-        let has_synth_stance = blocks.iter().any(|b| {
+        // Stance text: "Do not read the whole repository first." is a
+        // guided-tier-only instruction and appears in no other tier.
+        let has_guided_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("one hand in a cybernetic loop")
+                && b.content
+                    .contains("Do not read the whole repository first.")
         });
         assert!(
-            has_synth_stance,
-            "expected the synth coder stance (\"one hand in a cybernetic \
-             loop\") for a context inheriting a non-matching model; got {} \
-             blocks: {:#?}",
+            has_guided_stance,
+            "expected the guided coder stance (\"Do not read the whole \
+             repository first.\") for a context inheriting a non-matching \
+             model; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
@@ -921,7 +928,7 @@ fn test_coder_stance_synth_for_rpc_created_non_matching_model() {
 // ============================================================================
 
 #[test]
-fn test_coder_stance_crisp_for_null_row_model_via_kj_dispatch() {
+fn test_coder_stance_guided_for_null_row_model_via_kj_dispatch() {
     run_local(async {
         // Registry default only; kj-dispatch context creation never stamps
         // it onto the row absent an explicit --model.
@@ -956,28 +963,28 @@ fn test_coder_stance_crisp_for_null_row_model_via_kj_dispatch() {
 
         let blocks = get_all_blocks(&kernel, ctx).await;
 
-        let has_crisp_trace = blocks.iter().any(|b| {
+        let has_guided_trace = blocks.iter().any(|b| {
             b.kind == BlockKind::Trace
-                && b.content.contains("stance: crisp branch")
+                && b.content.contains("stance: guided tier")
                 && b.content.contains("resolved_model=claude-haiku-4-5")
         });
         assert!(
-            has_crisp_trace,
-            "expected a 'stance: crisp branch (resolved_model=claude-haiku-4-5)' \
+            has_guided_trace,
+            "expected a 'stance: guided tier (resolved_model=claude-haiku-4-5)' \
              trace block for a kj-dispatch-created context with a null row \
              model and a fast-executor registry default; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
 
-        let has_crisp_stance = blocks.iter().any(|b| {
+        let has_guided_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("not a survey")
+                && b.content.contains("Do not guess.")
         });
         assert!(
-            has_crisp_stance,
-            "expected the crisp coder stance (\"not a survey\") for a \
+            has_guided_stance,
+            "expected the guided coder stance (\"Do not guess.\") for a \
              kj-dispatch-created context with a null row model and a \
              fast-executor registry default; got {} blocks: {:#?}",
             blocks.len(),
