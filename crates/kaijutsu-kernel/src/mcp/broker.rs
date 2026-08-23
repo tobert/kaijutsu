@@ -968,6 +968,26 @@ impl Broker {
         }
     }
 
+    /// Of `uris` (all on `instance`), keep only those no remaining context
+    /// in `subs` still subscribes to.
+    ///
+    /// The refcount that makes a per-context teardown safe. `unsubscribe` on
+    /// a server takes an instance and a uri and has no notion of which
+    /// context asked, so it is the *last* subscriber's call to make.
+    fn unwatched_only(
+        subs: &HashMap<ContextId, HashSet<(InstanceId, String)>>,
+        instance: &InstanceId,
+        uris: Vec<String>,
+    ) -> Vec<String> {
+        uris.into_iter()
+            .filter(|uri| {
+                !subs
+                    .values()
+                    .any(|set| set.contains(&(instance.clone(), uri.clone())))
+            })
+            .collect()
+    }
+
     /// Drop this ONE context's resource subscriptions to `instance`, and ask
     /// the server to unsubscribe.
     ///
@@ -1000,7 +1020,11 @@ impl Broker {
             if set.is_empty() {
                 subs.remove(&context_id);
             }
-            hits
+            // Only the ones nobody else is watching. An upstream
+            // `unsubscribe` is per (instance, uri) and knows nothing about
+            // contexts, so sending it while a sibling context still
+            // subscribes would stop that sibling's updates too.
+            Self::unwatched_only(&subs, instance, hits)
         };
         if uris.is_empty() {
             return;
@@ -1232,9 +1256,25 @@ impl Broker {
     /// Drop a binding. D-44: walk any live subscriptions for this context
     /// and best-effort unsubscribe on each server. Subscription drops are
     /// not replayed from the oplog — they are a live side effect.
+    ///
+    /// Upstream `unsubscribe` goes out only for a `(instance, uri)` no other
+    /// context still watches: the server call is per resource and knows
+    /// nothing about contexts, so sending it while a sibling subscribes
+    /// would silently stop that sibling's updates.
     pub async fn clear_binding(&self, context_id: &ContextId) {
-        // Drain the subscription set for this context.
-        let pending = self.subscriptions.lock().await.remove(context_id);
+        // Drain this context's set, then keep only what nobody else watches.
+        let pending = {
+            let mut subs = self.subscriptions.lock().await;
+            subs.remove(context_id).map(|set| {
+                set.into_iter()
+                    .filter(|(instance, uri)| {
+                        !subs
+                            .values()
+                            .any(|other| other.contains(&(instance.clone(), uri.clone())))
+                    })
+                    .collect::<HashSet<(InstanceId, String)>>()
+            })
+        };
         if let Some(set) = pending {
             let system_ctx = CallContext::system_for_context(*context_id);
             for (instance, uri) in set {
@@ -5312,6 +5352,16 @@ mod tests {
         }
 
         broker.unbind(ctx, &InstanceId::new("res")).await;
+
+        // The server must still hold the subscription: the sibling context
+        // is a live subscriber, and `unsubscribe` is per (instance, uri)
+        // with no notion of who asked, so sending it here would silently
+        // stop the sibling's updates. This assertion caught exactly that
+        // bug in the first version of this teardown.
+        assert!(
+            server_handle.was_subscribed("file:///a"),
+            "the upstream subscription survives because a sibling still wants it",
+        );
 
         let subs = broker.subscriptions.lock().await;
         assert!(subs.get(&ctx).is_none(), "the narrowed context is cleared");
