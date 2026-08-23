@@ -38,29 +38,73 @@ Ranked low if true: an admin verb, human-run, short window, and the content is
 recoverable from the embedded seeds. Listed because it is the same
 capture-then-write-without-recheck shape as the cwd defect fixed today.
 
-## `command not found` hides "this shell refuses external commands" — waiting on kaish 0.16
+## kaish 0.16 is published; the bump waits on kaish-extras (2026-08-23)
 
-**kaijutsu's half SHIPPED 2026-08-22** (`465b0d71`, `9217d6a8`). A delegated
-coder read `command not found: git`, concluded git was not installed, and
-abandoned a viable path. git was on PATH; it was on a shell whose external
-execution is structurally denied, and kaish returned the same message for both.
+**0.16.0 is on crates.io and both proposals we made shipped.** Measured by
+bumping the four pins, compiling, and reading the vendored source at
+`~/.cargo/registry/src/*/kaish-kernel-0.16.0`. The bump was reverted; the tree
+is on 0.15 and green.
 
-The read-only `shell` description now says the binary is still installed and on
-PATH and names `shell_write`, with an assertion pinning both phrases. The
-condition itself is kaish's to report, and it accepted the change: 0.16 says
-"git: external commands are disabled on this shell", carrying the reason as an
-`ExternalCommandOutcome` through dispatch rather than rebuilding it per site.
+**Exactly one thing blocks it, and it is not ours.** `kaish-tools-curl` (the
+`kaish-extras` git rev in `crates/kaijutsu-kernel/Cargo.toml`) still depends on
+`kaish-tool-api` 0.15, so the graph carries 0.15 **and** 0.16 and
+`CurlTool: kaish_kernel::Tool` stops being satisfied at
+`kj/context_shell.rs:242`. Checked `kaish-extras` main (`52950050`, ahead of
+our pinned `55369bf7`) — still 0.15, so waiting is correct. Amy 2026-08-23:
+*"we'll have a kaish-extras update soon so we can wait for that if it's
+easier."*
 
-**What remains: take kaish 0.16 when it is on crates.io** (not when it tags).
-Two things ride along, agreed with kaish-lead:
+**The whole work order, so the eventual change is short:**
 
-- `execute_with_options` grows a `#[non_exhaustive]` error enum. Display is
-  preserved exactly. **Do the `EmbeddedKaish` error routing in the same change**
-  rather than bolting it on after — kaish has this written down as an owed item.
-- We asked them NOT to widen `ExecResult` with the refusal reason. We went
-  looking for the call site that would consume it and found none: their message
-  kills the wrong belief, our description names the remedy, and neither half
-  depends on the other's wording holding still.
+1. Bump `kaish-kernel`/`-glob`/`-types`/`-help` to `"0.16"` in the workspace
+   `Cargo.toml`, and move the `kaish-tools-curl` rev to whichever
+   `kaish-extras` commit targets 0.16.
+2. **`OutputNode` is `#[non_exhaustive]` and grew a `line` field.**
+   `kaijutsu-client/src/rpc.rs`'s `parse_output_node` builds it with a struct
+   literal, which no longer compiles. Use `OutputNode::new(name)` +
+   `.with_entry_type()` / `.with_cells()` / `.with_children()`, and keep
+   `with_text` conditional — `None` (a named entry) and `Some("")` (an empty
+   text node) are different things to kaish.
+3. **Error routing, the item we owe.** `Kernel::execute_with_options` now
+   returns `Result<ExecResult, KernelError>` instead of `anyhow::Error`
+   (`runtime/embedded_kaish.rs:464`). `KernelError` is three variants:
+   `Parse { errors, message }` and `Validation { issues, message }` both mean
+   *nothing ran*, and `Execution(anyhow::Error)` means *a statement started and
+   failed*. Display is byte-identical to before, hand-written specifically so
+   `{:#}` still walks the cause chain.
+4. **That closes the broker-clothes issue below.** `mcp/servers/shell.rs:542`
+   maps every kaish failure to `McpError::Protocol`, whose Display prepends
+   `mcp protocol error:` — broker-internal vocabulary leaking to the model for
+   what is usually "your command was rejected, fix it and retry". With the
+   split, `Parse`/`Validation` route to `ErrorCategory::Validation` and only
+   `Execution` is a genuine fault. No string matching needed.
+5. **And it closes the `command not found` issue.** 0.16 has
+   `ExternalCommandOutcome::{Ran, NotFound, Unavailable(reason)}`
+   (`dispatch.rs:662-670`) with a distinct
+   `external_commands_unavailable_error`, so a shell whose external execution
+   is disabled no longer reports the same text as a missing binary. A small
+   model read `command not found: git`, concluded git was not installed, and
+   abandoned a task it could have finished.
+
+**Also found, and independent of the bump:** the wire carries no `line` for an
+output node — see the entry below.
+
+## The wire drops kaish's output line anchor (2026-08-23)
+
+`OutputNode` gained `line: Option<u64>` in kaish 0.16 — "which line of the file
+or stream this row is, 1-based", the anchor a builtin declares and every
+consumer reads. Its doc is explicit that a consumer must not re-derive it from
+`cells`, because a cell is a per-builtin rendering choice and reading one back
+is what the field exists to stop.
+
+Our Cap'n Proto `OutputNode` has no such field, so `parse_output_node`
+(`kaijutsu-client/src/rpc.rs`) cannot populate it and any client reading
+structured output loses the anchor. Adding it is a **wire change** — schema
+field plus all five artifacts rebuilt (`docs`/signoff's deployment note) — so
+it is its own decision, not a rider on the version bump.
+
+Worth doing when something wants it: `grep -n` output, an editor jumping to a
+match, and the vi surface are all line-anchored already.
 
 ## Tool errors reach the model wearing broker-internal clothes (2026-08-22)
 
