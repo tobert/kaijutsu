@@ -140,41 +140,30 @@ Also noted while in there: on rehydrate (`llm/hydrate.rs:350`) the Error
 block's envelope is folded onto a `ToolResult.content` that already carries the
 same message, so after a fork the model can see it twice.
 
-## Blocks orphaned in `Running` have no supervisor (2026-08-22)
+## A dying turn still orphans its blocks mid-run (2026-08-22, half shipped)
 
-Distinct from the mid-turn `kj wait` bug above — that one is a transient false
-positive from an instantaneous sample; this is a permanent stuck status.
+**The boot sweep shipped** (`830711e9`): at cold start every `Running` block
+is failed with an `Error` child, because no live writer can exist then. That
+covers the restart case, which was the common one.
 
-Every *returning* path finalizes correctly. `dispatch_and_map_tool_result`
-covers success, tool failure, cancellation and timeout, and a hard interrupt is
-cooperative — the cancellation token is threaded into the broker's own
-`select!`, so an interrupted tool call returns an `Err` rather than dropping a
-future. The gap is the writer dying:
+**The panic case is still open.** `process_llm_stream` is `spawn_local`'d with
+no retained `JoinHandle` and no `catch_unwind`
+(`kaijutsu-server/src/llm_stream.rs`, find the current line). A panic between
+"insert Running" and "set terminal status" silently kills the task: nothing
+publishes `TurnFlow::Failed`, nothing finalizes the blocks, and they stay
+`Running` until the next kernel restart sweeps them. A live kernel therefore
+still shows a stuck turn until it is bounced.
 
-- `process_llm_stream` is `spawn_local`'d with **no retained `JoinHandle` and
-  no `catch_unwind`** (`kaijutsu-server/src/llm_stream.rs:492`). A panic between
-  "insert Running" and "set terminal status" silently kills the task; nothing
-  publishes `TurnFlow::Failed`, nothing finalizes the blocks.
-- **A kernel restart mid-turn leaves them forever.** `create_shared_kernel`'s
-  context recovery (`rpc.rs:1841`) re-bootstraps contexts, drift and
-  lost+found, and never touches block `Status`.
-- The existing reaper (`background_exec.rs:366`) sweeps only `background:true`
-  shell jobs — a structurally separate path that knows nothing about
-  `model/tool_call` / `tool/tool_result` blocks.
-- `hydrate`'s orphaned-tool_use repair (`llm/hydrate.rs:474`) synthesizes a
-  tool result into the in-memory `Vec<Message>` only; it never calls
-  `set_status`. So "exclude, then fork" fixes the next conversation's shape and
-  leaves the durable blocks wrong.
+The fix is a `catch_unwind` around the turn body, and it carries a hazard
+worth naming before anyone starts: **the mailbox lock must release on
+unwind.** `process_llm_stream` holds the per-context mailbox lock for the
+whole stream (that is what serializes concurrent prompts to one context), so
+a naive catch that resumes without dropping it deadlocks every later turn on
+that context — trading a stuck block for a stuck context.
 
-Two fixes, independent. A **boot-time sweep** is the safe one: at cold start no
-live writer can exist, so any `Running`/`Pending` block is known-stale and can
-be failed with a reason — the same shape as the existing swap/file-buffer
-restart recovery. A **`catch_unwind` around the turn body** covers the panic
-case, and needs care that the mailbox lock releases on unwind.
-
-Note: once `kj wait` stops inferring liveness from block status, orphans no
-longer poison future waits — but the blocks are still wrong for anything that
-reads them, including the app.
+Related and unchanged: `hydrate`'s orphaned-tool_use repair patches the
+in-memory `Vec<Message>` only and never calls `set_status`, so "exclude, then
+fork" fixes the next conversation and leaves the durable blocks wrong.
 
 ## Asks vs forms — brief written, decision open (2026-08-22)
 
