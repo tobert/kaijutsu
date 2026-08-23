@@ -6,44 +6,24 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Both narrowing verbs report success and do not narrow (2026-08-23)
+## `persist_binding` swallows a failed write (2026-08-23)
 
-From a kaibo binding review (deepseek-v4-pro), **both verified by the lead
-against the code**. These are the highest-value class the instrument-design
-stance names: a fence that says it moved when it did not.
+`Broker::persist_binding` logs `upsert_context_binding` failures at WARN and
+returns (`broker.rs:1241`). Nothing bubbles, so a caller that just wrote a
+loadout cannot tell whether the loadout is durable — the in-memory cache is
+updated either way, and every subsequent read is served from it. This is the
+DB-first write-through rule inverted: the mirror wins and the failure is a
+log line.
 
-**1. `kj binding reset` is non-durable.** `Broker::clear_binding` drains
-subscriptions and `resource_parents` and removes the in-memory entry — and
-never persists. Its whole body ends at
-`self.bindings.write().await.remove(context_id)`. `KernelDb::
-delete_context_binding` exists (`kernel_db.rs:4439`) and is not called. In
-production the broker is DB-wired, so the pre-reset row survives and the very
-next cache miss re-hydrates it (`broker.rs` `binding()`/`binding_checked()`).
-`kj/binding.rs` reports *"reset context X — now denies all"* regardless.
+Found because it hid a test. `context_bindings.context_id` references
+`contexts`, so binding an unregistered `ContextId` fails the foreign key —
+and the binding durability test bound exactly that, persisted nothing, and
+stayed green with the fix removed. A returned error would have failed the
+test at the write instead of leaving it to a falsification to notice.
 
-Worse, there are **two independent readers of the same data**: the broker's
-cache, and `require_cap`, which reads the `KernelDb` row directly for `kj`
-verb gates (`kj/mod.rs:660`). The `kj` gates never saw the reset at all. Same
-two-sources-of-truth shape as the subscriptions bug, one layer up.
-
-**2. Granular `revoke` is a silent no-op under `"*"`.** `allows` short-circuits
-on `self.all_instances ||` for both `Instance` and `Tool` (`binding.rs:345`),
-and `revoke` touches `allowed_instances`/`allowed_tools`/`name_map` but never
-`all_instances` (`binding.rs:461`). Every broad role grants `"*"`
-(`/etc/rc/lib/create/S10-binding.kai`), so `kj binding revoke builtin.file` on
-a coder prints "revoked" and changes nothing. Self-narrowing is explicitly
-invited (`authorize_binding_write`), which makes this the common path, not an
-edge. The MCP `unbind` tool has the same no-op and promises tool-removed
-notifications it will not send.
-
-Note the asymmetry nothing surfaces: `revoke "*"` DOES narrow (it flips the
-flag). Only granular revokes under a live broad flag are inert.
-
-**Recommended order:** make `clear_binding` delete the row (one call), or
-better, make the broker the single reader by routing `require_cap` through
-`binding_checked` — that removes the whole class. Then either teach `revoke`
-under `"*"` to materialize the explicit list first, or refuse loudly with
-"`*` covers every instance; reset to an explicit loadout first."
+`kj binding reset`/`allow`/`revoke` and the MCP bind/unbind tools are the
+callers that would have to carry the error. Two of them already return
+`KjResult::Err`.
 
 ## Binding review: four more, unfixed (2026-08-23)
 
