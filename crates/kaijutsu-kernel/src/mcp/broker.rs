@@ -938,6 +938,18 @@ impl Broker {
         let old_pairs = self.binding_visible_tool_pairs(&old).await;
         let new_pairs = self.binding_visible_tool_pairs(&binding).await;
 
+        // Instances this context can no longer reach. A binding carries its
+        // own cleanup for the state it owns (tool grants, `name_map`, in
+        // `ContextToolBinding::revoke`); the broker holds the rest keyed by
+        // context, and that half has to be swept here or it outlives the
+        // grant that justified it.
+        let kept = binding.candidate_instances();
+        let departed: Vec<InstanceId> = old
+            .candidate_instances()
+            .into_iter()
+            .filter(|i| !kept.contains(i))
+            .collect();
+
         self.bindings
             .write()
             .await
@@ -947,6 +959,72 @@ impl Broker {
 
         self.emit_binding_diff(context_id, &old_pairs, &new_pairs)
             .await;
+
+        // After the binding is in place, so a concurrent reader never sees
+        // the subscription gone while the grant still looks present.
+        for instance in &departed {
+            self.teardown_subscriptions_for_context(context_id, instance)
+                .await;
+        }
+    }
+
+    /// Drop this ONE context's resource subscriptions to `instance`, and ask
+    /// the server to unsubscribe.
+    ///
+    /// Scoped to one context on purpose.
+    /// [`Self::teardown_subscriptions_for_instance`] sweeps every context and
+    /// is right for unregister, where the instance itself is going away;
+    /// using it here would tear down a sibling context's subscriptions to an
+    /// instance that context still binds.
+    ///
+    /// Best-effort against the server, like every other teardown path: an
+    /// instance that is gone or failing still gets its local rows dropped,
+    /// because the alternative is a subscription this context can neither
+    /// receive correctly nor clear.
+    async fn teardown_subscriptions_for_context(
+        &self,
+        context_id: ContextId,
+        instance: &InstanceId,
+    ) {
+        let uris: Vec<String> = {
+            let mut subs = self.subscriptions.lock().await;
+            let Some(set) = subs.get_mut(&context_id) else {
+                return;
+            };
+            let hits: Vec<String> = set
+                .iter()
+                .filter(|(i, _)| i == instance)
+                .map(|(_, uri)| uri.clone())
+                .collect();
+            set.retain(|(i, _)| i != instance);
+            if set.is_empty() {
+                subs.remove(&context_id);
+            }
+            hits
+        };
+        if uris.is_empty() {
+            return;
+        }
+        self.resource_parents
+            .lock()
+            .await
+            .retain(|(c, i, _), _| !(*c == context_id && i == instance));
+
+        let server = self.instances.read().await.get(instance).cloned();
+        if let Some(server) = server {
+            let sys = CallContext::system_for_context(context_id);
+            for uri in uris {
+                if let Err(e) = server.unsubscribe(&uri, &sys).await {
+                    tracing::debug!(
+                        context_id = %context_id,
+                        instance = %instance,
+                        uri = %uri,
+                        error = ?e,
+                        "unsubscribe while narrowing a binding failed (best-effort)",
+                    );
+                }
+            }
+        }
     }
 
     /// Add an instance to a context's binding (idempotent). Triggers the
@@ -5150,6 +5228,98 @@ mod tests {
         assert!(!server_handle.was_subscribed("file:///c"));
         let unsubs = server_handle.unsubscribed_uris();
         assert_eq!(unsubs.len(), 3, "each uri unsubscribed once");
+    }
+
+    /// Narrowing a binding tears down that instance's subscriptions for
+    /// this context.
+    ///
+    /// A binding cleans the state it owns (tool grants, `name_map`, in
+    /// `ContextToolBinding::revoke`), but `subscriptions` and
+    /// `resource_parents` live on the broker keyed by context, and nothing
+    /// swept them when a binding narrowed. `handle_resource_flush` builds
+    /// its targets from those two maps and never consults the binding, so
+    /// the context kept receiving resource blocks from an instance it had
+    /// revoked — for the life of the process, since only unregister and
+    /// `clear_binding` tore anything down.
+    #[tokio::test]
+    async fn unbind_unsubscribes_that_instance_for_this_context() {
+        let (broker, _store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res")
+                .with_text_resource("file:///a", "A")
+                .with_text_resource("file:///b", "B"),
+        );
+        let server_handle = server.clone();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        for uri in ["file:///a", "file:///b"] {
+            broker
+                .subscribe(&InstanceId::new("res"), uri, &call_ctx)
+                .await
+                .unwrap();
+        }
+        assert!(server_handle.was_subscribed("file:///a"));
+
+        broker.unbind(ctx, &InstanceId::new("res")).await;
+
+        assert!(!server_handle.was_subscribed("file:///a"));
+        assert!(!server_handle.was_subscribed("file:///b"));
+        assert_eq!(server_handle.unsubscribed_uris().len(), 2);
+        assert!(
+            broker.subscriptions.lock().await.get(&ctx).is_none(),
+            "the context's subscription set must be gone, not left empty",
+        );
+    }
+
+    /// Narrowing ONE context must not unsubscribe another context that
+    /// still binds the same instance.
+    ///
+    /// This is why the teardown is per-context rather than a reuse of
+    /// `teardown_subscriptions_for_instance`, which sweeps every context and
+    /// is correct only for unregister, where the instance itself is leaving.
+    /// Anyone looking at the two functions and seeing near-duplicate bodies
+    /// should read this test before merging them.
+    #[tokio::test]
+    async fn narrowing_one_context_leaves_a_sibling_context_subscribed() {
+        let (broker, store, ctx) = wired_broker().await;
+        let sibling = ContextId::new();
+        store
+            .create_document(sibling, DocumentKind::File, Some("rust".into()))
+            .unwrap();
+        bind(&broker, ctx, "res").await;
+        bind(&broker, sibling, "res").await;
+
+        let server = Arc::new(ResourceMock::new("res").with_text_resource("file:///a", "A"));
+        let server_handle = server.clone();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        for target in [ctx, sibling] {
+            let mut call_ctx = CallContext::test();
+            call_ctx.context_id = target;
+            broker
+                .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+                .await
+                .unwrap();
+        }
+
+        broker.unbind(ctx, &InstanceId::new("res")).await;
+
+        let subs = broker.subscriptions.lock().await;
+        assert!(subs.get(&ctx).is_none(), "the narrowed context is cleared");
+        assert!(
+            subs.get(&sibling)
+                .is_some_and(|s| s.contains(&(InstanceId::new("res"), "file:///a".to_string()))),
+            "the sibling context still binds res and keeps its subscription",
+        );
     }
 
     /// R2 / D-44: unregister tears down subscriptions even if clear_binding

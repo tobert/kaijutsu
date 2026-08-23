@@ -107,7 +107,8 @@ impl McpServerLike for BuiltinResourcesServer {
                 name: "subscribe".to_string(),
                 description: Some(
                     "Subscribe the calling context to update notifications for the \
-                     given resource URI. Subscription dies with the binding."
+                     given resource URI. The subscription ends when this context \
+                     stops binding the instance, or when you call unsubscribe."
                         .to_string(),
                 ),
                 input_schema: uri_value.clone(),
