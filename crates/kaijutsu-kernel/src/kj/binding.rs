@@ -430,17 +430,16 @@ mod tests {
     /// changed.
     #[tokio::test]
     async fn revoking_an_instance_under_a_star_binding_refuses_loudly() {
-        let d = crate::kj::test_helpers::test_dispatcher().await;
-        let caller = crate::kj::test_helpers::test_caller();
-        let ctx = caller.context_id.expect("test caller has a context");
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("star-revoke"), None, PrincipalId::system());
+        let caller = KjCaller { privileged: true, ..caller_with_context(ctx) };
 
         let mut binding = crate::mcp::ContextToolBinding::new();
-        binding.grant(crate::mcp::Capability::AllInstances);
-        binding.grant(crate::mcp::Capability::Admin);
+        binding.grant(Capability::AllInstances);
         d.kernel().broker().set_binding(ctx, binding).await;
 
         let out = d
-            .dispatch_binding(&[s("revoke"), s("builtin.file")], &caller)
+            .dispatch(&argv(&["binding", "revoke", "builtin.file"]), &caller)
             .await;
 
         let msg = out.message();
@@ -457,9 +456,7 @@ mod tests {
         // merely cosmetic caution.
         let after = d.kernel().broker().binding(&ctx).await.unwrap_or_default();
         assert!(
-            after.allows(&crate::mcp::Capability::Instance(
-                crate::mcp::InstanceId::new("builtin.file")
-            )),
+            after.allows(&Capability::Instance(InstanceId::new("builtin.file"))),
             "precondition of the whole finding: `*` still allows it"
         );
     }

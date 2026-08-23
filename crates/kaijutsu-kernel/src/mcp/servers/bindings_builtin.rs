@@ -38,6 +38,8 @@
 
 use std::sync::{Arc, Weak};
 
+use crate::mcp::Capability;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -587,6 +589,67 @@ mod tests {
         assert!(
             !allowed.contains(&"target".to_string()),
             "unbind must remove target, got {allowed:?}"
+        );
+    }
+
+    /// `unbind` under a broad `*` refuses instead of reporting a removal it
+    /// did not make.
+    ///
+    /// The `kj binding revoke` verb and this tool are two surfaces over one
+    /// rule (`ContextToolBinding::revoke_is_inert`), and a test on either one
+    /// alone leaves the other free to drop its check: falsifying the rule to
+    /// `false` fails only the surface that is covered. Both are needed.
+    #[tokio::test]
+    async fn unbind_under_a_star_binding_refuses_loudly() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinBindingsServer::new(Arc::downgrade(&broker)));
+        broker
+            .register_silently(
+                Arc::new(ToolsMock::new("target", &["alpha"])),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let ctx_id = ContextId::new();
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(Capability::AllInstances);
+        broker.set_binding(ctx_id, binding).await;
+        let call_ctx = call_ctx_for(ctx_id);
+
+        let out = broker
+            .call_tool(
+                call_params("unbind", serde_json::json!({ "instance": "target" })),
+                &call_ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_error, "an inert unbind must be an error result");
+        let text = match out.content.first() {
+            Some(ToolContent::Text(t)) => t.clone(),
+            other => panic!("expected a text refusal, got {other:?}"),
+        };
+        assert!(
+            text.contains("nothing unbound"),
+            "the refusal must say nothing changed, got: {text}"
+        );
+        assert!(
+            text.contains("Revoke '*' first"),
+            "the refusal must name the next step, got: {text}"
+        );
+
+        // And the capability really is still allowed — the refusal is not
+        // merely cosmetic caution.
+        let after = broker.binding(&ctx_id).await.unwrap_or_default();
+        assert!(
+            after.allows(&Capability::Instance(InstanceId::new("target"))),
+            "precondition of the whole finding: `*` still allows it"
         );
     }
 

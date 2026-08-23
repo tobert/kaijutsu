@@ -5270,21 +5270,40 @@ mod tests {
     /// design: BOTH readers saw the same stale row, so no
     /// cache-versus-database divergence test would have caught it. The thing
     /// to assert is durability, not agreement.
+    ///
+    /// The context has to be REGISTERED in the same kernel DB, and the
+    /// precondition has to read the durable row rather than the cache.
+    /// `context_bindings.context_id` references `contexts`, so an
+    /// unregistered id makes the upsert fail the foreign key;
+    /// `persist_binding` logs that at WARN and returns, leaving nothing to
+    /// resurrect — and a cache-level precondition still passes, so the test
+    /// reports success while covering nothing.
     #[tokio::test]
     async fn a_cleared_binding_does_not_come_back_on_the_next_read() {
-        let (broker, _store, ctx) = wired_broker().await;
+        let (broker, _store, _unused) = wired_broker().await;
         let d = crate::kj::test_helpers::test_dispatcher().await;
         broker.set_db(d.kernel_db().clone()).await;
+        let ctx = crate::kj::test_helpers::register_context(
+            &d,
+            Some("cleared-binding"),
+            None,
+            PrincipalId::system(),
+        );
 
         let mut binding = ContextToolBinding::new();
         binding.allow(InstanceId::new("res"));
         broker.set_binding(ctx, binding).await;
         assert!(
-            broker.binding(&ctx).await.is_some_and(|b| !b.is_empty()),
-            "precondition: the binding is set and persisted"
+            d.kernel_db().lock().get_context_binding(ctx).unwrap().is_some(),
+            "precondition: the binding reached the durable row, not just the cache"
         );
 
         broker.clear_binding(&ctx).await;
+
+        assert!(
+            d.kernel_db().lock().get_context_binding(ctx).unwrap().is_none(),
+            "clear_binding must delete the durable row"
+        );
 
         // The cache is empty either way; this is the read that used to
         // resurrect the row straight out of the database.
