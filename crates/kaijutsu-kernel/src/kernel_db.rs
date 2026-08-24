@@ -1745,6 +1745,15 @@ impl KernelDb {
         )?)
     }
 
+    /// The public face of `approval_ledger::ask::list_pending` — the asks
+    /// waiting on a human right now.
+    ///
+    /// `claimed` rows are excluded, matching the queue `kj ledger list`
+    /// shows: an answerer is already working them.
+    pub fn list_pending_asks(&self) -> KernelDbResult<Vec<approval_ledger::types::ApprovalRow>> {
+        Ok(approval_ledger::ask::list_pending(self.conn_for_ledger())?)
+    }
+
     /// The public face of `approval_ledger::ask::undelivered_answers` — every
     /// ask a human answered whose answer nobody has collected.
     ///

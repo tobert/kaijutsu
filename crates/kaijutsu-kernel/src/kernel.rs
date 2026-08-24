@@ -1014,6 +1014,18 @@ impl Kernel {
         self.turn_liveness.lock().contains(&context_id)
     }
 
+    /// Every context with a turn in flight right now.
+    ///
+    /// A snapshot, not a subscription: a turn can begin or end the instant
+    /// after this returns. That is fine for what reads it — an operator
+    /// asking what the kernel is doing wants the shape of the moment, not a
+    /// consistent view to act on transactionally.
+    pub fn turns_in_flight(&self) -> Vec<kaijutsu_types::ContextId> {
+        let mut ids: Vec<_> = self.turn_liveness.lock().iter().copied().collect();
+        ids.sort();
+        ids
+    }
+
     /// Get the content-addressed store.
     pub fn cas(&self) -> &Arc<FileStore> {
         &self.cas

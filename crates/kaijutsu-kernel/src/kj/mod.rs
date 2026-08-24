@@ -48,6 +48,7 @@ pub mod model;
 pub mod refs;
 pub mod search;
 pub mod shell_gate;
+pub mod system;
 pub mod stage;
 pub mod swap;
 pub mod transport;
@@ -579,6 +580,7 @@ impl KjDispatcher {
         match cmd {
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
             "drive" => self.dispatch_drive(&argv[1..], caller).await,
+            "system" => self.dispatch_system(&argv[1..], caller).await,
             "wait" => self.dispatch_wait(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
@@ -916,6 +918,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(rc::RcArgs::command())
         .subcommand(editor::EditorArgs::command())
         .subcommand(swap::SwapArgs::command())
+        .subcommand(system::SystemArgs::command())
         .subcommand(config::ConfigArgs::command())
         .subcommand(block::BlockArgs::command())
         .subcommand(binding::BindingArgs::command())
