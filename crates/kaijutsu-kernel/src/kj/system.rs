@@ -87,6 +87,14 @@ impl KjDispatcher {
             }
         };
 
+        // The whole noun is gated, `ps` and `status` included. A seat doing
+        // ordinary work has no business reading the kernel's process table,
+        // and one that needs an answer drifts the question to a seat that
+        // holds this (docs/system-verbs.md, "Who holds `kj system`").
+        if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::System, "system") {
+            return denied;
+        }
+
         match parsed.command {
             SystemCommand::Status => self.system_status(caller),
             SystemCommand::Ps => self.system_ps(caller),

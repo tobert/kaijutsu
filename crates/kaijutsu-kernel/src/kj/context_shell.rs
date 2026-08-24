@@ -191,6 +191,7 @@ impl KjDispatcher {
             move |scm: SessionContextMap,
                   sid: SessionId,
                   tools: &mut kaish_kernel::ToolRegistry| {
+                let has_kj = dispatcher.is_some();
                 if let Some(d) = dispatcher {
                     // The opener captured for this materialized shell: who's
                     // running it + the context they're in. `vi` records it on the
@@ -226,7 +227,7 @@ impl KjDispatcher {
                     // as `fg` above: `ToolRegistry::register` is keyed by
                     // tool name, so this replaces kaish's `ps` for kaijutsu
                     // shells only and leaves kaish's own surface untouched.
-                    tools.register(crate::runtime::ps_builtin::PsBuiltin::new(d.clone()));
+                    tools.register(crate::runtime::ps_builtin::PsBuiltin::new(true));
                     tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
                         d,
                         scm,
@@ -245,6 +246,13 @@ impl KjDispatcher {
                 // single internal inference endpoint (`runtime::curl_tool`),
                 // so the exposure a read-only shell picks up here is narrow
                 // even for a non-GET method against that one host.
+                // Registered OUTSIDE the `kj` block on purpose: a shell with
+                // no `kj` still must not fall through to kaish's host `ps`.
+                // `has_kj` is false there, so it refuses flatly instead of
+                // naming a command that shell cannot run.
+                if !has_kj {
+                    tools.register(crate::runtime::ps_builtin::PsBuiltin::new(false));
+                }
                 tools.register(crate::runtime::curl_tool::curl_tool());
             };
 

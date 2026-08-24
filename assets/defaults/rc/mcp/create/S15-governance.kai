@@ -15,3 +15,12 @@ set -e
 kj binding allow "rc-write"      # kj rc edit/reset + file-tool writes under /etc/rc
 kj binding allow "config-write"  # kj config set/reset over /etc/config, plus
                                  # kj backend/cast/alias (which model runs)
+kj binding allow "system"        # kj system ps/status, and the stopping verbs
+
+# `system` is here and NOT in the shared lib binding on purpose. It is the
+# authority to see and stop the instrument, which a seat doing ordinary work
+# (coder, musician) has no business holding -- it drifts the question instead.
+# The producer seat holds it because it is the OUTSIDE hand: after a seppuku
+# the kernel returns quiesced, kaijutsu's own agents must not bring it back,
+# and a human or an external agent over MCP must be able to
+# (docs/system-verbs.md).

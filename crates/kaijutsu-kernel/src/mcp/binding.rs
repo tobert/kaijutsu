@@ -72,6 +72,7 @@ pub const KNOWN_AUTHORITIES: &[&str] = &[
     "config-write",
     "exec",
     "editor",
+    "system",
 ];
 
 /// Builtin broker instances that are the in-kernel **projection** of a facade,
@@ -204,6 +205,23 @@ pub enum Capability {
     /// need a redesign sweep"); this variant is deliberately an experiment
     /// ahead of it, not the final shape.
     Editor,
+    /// `kj system` — inspect and stop the running kernel: `ps`, `status`,
+    /// and (unbuilt) `quiesce`/`resume`/`seppuku`.
+    ///
+    /// Deliberately its own authority and NOT implied by `operator`, which
+    /// every broad seat already holds via the shared `lib` binding. What
+    /// this gates is not "may mutate durable structure" but "may see and
+    /// stop the instrument", and the seats that do ordinary work — `coder`,
+    /// `musician` — have no business holding it (Amy, 2026-08-24: *"coder
+    /// doesn't really need to know, nor does a musician. they can always
+    /// drift questions to a help desk"*). A narrow seat that needs an
+    /// answer drifts the question to a seat that holds this, rather than
+    /// every loadout widening to cover a rare need.
+    ///
+    /// `resume` carries a further rule this capability cannot express on
+    /// its own: kaijutsu's own agents must never bring a seppuku'd kernel
+    /// back. See `docs/system-verbs.md`.
+    System,
 }
 
 impl Capability {
@@ -222,6 +240,7 @@ impl Capability {
             Capability::ConfigWrite => "config-write",
             Capability::Exec => "exec",
             Capability::Editor => "editor",
+            Capability::System => "system",
             _ => return None,
         })
     }
@@ -238,6 +257,7 @@ impl Capability {
             "config-write" => Capability::ConfigWrite,
             "exec" => Capability::Exec,
             "editor" => Capability::Editor,
+            "system" => Capability::System,
             _ => return None,
         })
     }
@@ -371,7 +391,8 @@ impl ContextToolBinding {
             | Capability::Operator
             | Capability::ConfigWrite
             | Capability::Exec
-            | Capability::Editor => {
+            | Capability::Editor
+            | Capability::System => {
                 cap.authority_name().is_some_and(|n| self.authorities.contains(n))
             }
         }
@@ -413,7 +434,8 @@ impl ContextToolBinding {
             | Capability::Operator
             | Capability::ConfigWrite
             | Capability::Exec
-            | Capability::Editor) => {
+            | Capability::Editor
+            | Capability::System) => {
                 if let Some(n) = c.authority_name() {
                     self.authorities.insert(n.to_string());
                 }
@@ -463,7 +485,8 @@ impl ContextToolBinding {
             | Capability::Operator
             | Capability::ConfigWrite
             | Capability::Exec
-            | Capability::Editor => {
+            | Capability::Editor
+            | Capability::System => {
                 if let Some(n) = cap.authority_name() {
                     self.authorities.remove(n);
                 }

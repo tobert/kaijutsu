@@ -28,6 +28,12 @@ kj binding allow "fork"
 kj binding allow "drift"
 kj binding allow "transport"
 kj binding allow "operator"
+# system: see and stop the running kernel (`kj system ps/status`, and the
+# stopping verbs). Its own authority, not implied by `operator` -- what it
+# gates is not "may mutate durable structure" but "may stop the instrument",
+# and a director is the seat that coordinates, so it holds it. A coder or
+# musician does not, and drifts the question instead (docs/system-verbs.md).
+kj binding allow "system"
 # Host subprocess exec from the context shell — the director's operational
 # reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
 # the VFS, so it's a dedicated authority, not implied by anything above.
