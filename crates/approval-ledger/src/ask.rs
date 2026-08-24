@@ -832,6 +832,62 @@ pub fn find_redeemable(
     Ok(None)
 }
 
+/// One answered ask nobody has collected yet.
+pub struct UndeliveredAnswer {
+    pub request_id: String,
+    pub context_id: Vec<u8>,
+    /// The principal that raised the ask. **Load-bearing for redemption:**
+    /// [`find_redeemable`] scopes by principal, so a caller woken under a
+    /// different one mints a fresh ask instead of collecting this answer.
+    pub principal_id: Vec<u8>,
+    pub status: crate::types::ApprovalStatus,
+    pub description: String,
+}
+
+/// Every ask a human has answered whose answer has not been redeemed,
+/// newest last.
+///
+/// The predicate is [`find_redeemable`]'s, minus the statement matching:
+/// decided, `auto_reason IS NULL`, and absent from `approval_redemptions`.
+/// The two must stay in step — this function decides who gets *told* an
+/// answer landed, and `find_redeemable` decides whether that answer still
+/// authorizes anything. A row here that `find_redeemable` would refuse
+/// sends a caller back to do nothing.
+///
+/// Denials are included on purpose. A denied caller that is never woken
+/// keeps its last word as "waiting on a human" and learns nothing; the
+/// point of resuming it is that it finds out.
+///
+/// This reports; it does not claim. Reading it twice returns the same rows,
+/// because only a redemption clears one — so a caller that wakes a context
+/// and gets no retry must not expect the row to disappear.
+pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> {
+    let mut q = conn.prepare(
+        "SELECT request_id, context_id, principal_id, status, description FROM approvals
+         WHERE status IN ('allowed', 'denied')
+           AND auto_reason IS NULL
+           AND request_id NOT IN (SELECT request_id FROM approval_redemptions)
+         ORDER BY created_at ASC",
+    )?;
+    let rows = q
+        .query_map([], |row| {
+            let status: String = row.get(3)?;
+            Ok(UndeliveredAnswer {
+                request_id: row.get(0)?,
+                context_id: row.get(1)?,
+                principal_id: row.get(2)?,
+                // Total because the query admits exactly these two statuses.
+                status: match status.as_str() {
+                    "allowed" => crate::types::ApprovalStatus::Allowed,
+                    _ => crate::types::ApprovalStatus::Denied,
+                },
+                description: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
@@ -1563,6 +1619,130 @@ mod tests {
             None,
             "a rule's own decision must never be handed to a later request as an answer"
         );
+    }
+
+    // ── `undelivered_answers` ────────────────────────────────────────────
+    //
+    // These pin the agreement with `find_redeemable`. The two share a
+    // predicate on purpose: this one decides who gets TOLD an answer
+    // landed, the other decides whether that answer still authorizes
+    // anything. A row here that `find_redeemable` refuses wakes a caller to
+    // do nothing, so every case below asserts both.
+
+    /// Falsified by dropping `AND auto_reason IS NULL`: the rule-decided ask
+    /// appeared and the assertion tripped. Reverted.
+    #[test]
+    fn undelivered_answers_reports_only_what_find_redeemable_would_honor() {
+        let conn = open_memory();
+
+        // A human's allow — offered by both.
+        let human = ask_with_statement("ua-human", VarBinding::Bound, "rm target");
+        let human_id = create_ask(&conn, &human).unwrap();
+        crate::decide::decide(
+            &conn,
+            &human_id,
+            crate::decide::DecideInput { allow: true, ..Default::default() },
+        )
+        .unwrap();
+
+        // A rule's decision — an audit record, offered by neither.
+        let auto = ask_with_statement("ua-auto", VarBinding::Free, "rm other");
+        let auto_id = create_auto_allowed_ask(&conn, &auto, "rule:always").unwrap();
+
+        // Still open — nobody has answered, so there is nothing to deliver.
+        let pending = ask_with_statement("ua-pending", VarBinding::Bound, "rm third");
+        let pending_id = create_ask(&conn, &pending).unwrap();
+
+        let ids: Vec<String> = undelivered_answers(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.request_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![human_id.clone()],
+            "only a human's undecided-by-rule answer is undelivered"
+        );
+        assert!(!ids.contains(&auto_id), "a rule's decision is not an offer");
+        assert!(!ids.contains(&pending_id), "an unanswered ask delivers nothing");
+
+        // The agreement: what this reports, find_redeemable honors.
+        assert!(
+            find_redeemable(&conn, &["ua-human"], "rm target", None, None)
+                .unwrap()
+                .is_some(),
+            "an answer reported as undelivered must still authorize"
+        );
+        assert!(
+            find_redeemable(&conn, &["ua-auto"], "rm other", None, None)
+                .unwrap()
+                .is_none(),
+            "and one it refuses must not be reported"
+        );
+    }
+
+    /// Falsified by dropping the `NOT IN approval_redemptions` clause: the
+    /// redeemed ask kept being reported and the assertion tripped. That is
+    /// the loop this guards — a caller woken forever for an answer it has
+    /// already collected. Reverted.
+    #[test]
+    fn undelivered_answers_drops_an_answer_once_it_is_collected() {
+        let conn = open_memory();
+        let ask = ask_with_statement("ua-spent", VarBinding::Bound, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        crate::decide::decide(
+            &conn,
+            &request_id,
+            crate::decide::DecideInput { allow: true, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(undelivered_answers(&conn).unwrap().len(), 1);
+
+        crate::decide::redeem_ask(&conn, &request_id).unwrap();
+        assert!(
+            undelivered_answers(&conn).unwrap().is_empty(),
+            "a collected answer is no longer waiting for anyone"
+        );
+    }
+
+    /// A denial is an answer. A denied caller that is never woken keeps
+    /// "waiting on a human" as its last word and never learns otherwise.
+    #[test]
+    fn undelivered_answers_includes_a_denial() {
+        let conn = open_memory();
+        let ask = ask_with_statement("ua-denied", VarBinding::Bound, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        crate::decide::decide(
+            &conn,
+            &request_id,
+            crate::decide::DecideInput { allow: false, ..Default::default() },
+        )
+        .unwrap();
+
+        let rows = undelivered_answers(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "a denial waits to be delivered like an allow");
+        assert_eq!(rows[0].status, ApprovalStatus::Denied, "and says it was denied");
+        assert_eq!(rows[0].request_id, request_id);
+    }
+
+    /// The context is what a caller needs to know WHO to wake; a row
+    /// without it is unactionable. `approvals.context_id` is NOT NULL, so
+    /// this pins that it survives the read rather than that it exists.
+    #[test]
+    fn undelivered_answers_carries_the_context_that_raised_the_ask() {
+        let conn = open_memory();
+        let mut ask = ask_with_statement("ua-ctx", VarBinding::Bound, "rm target");
+        ask.context_id = vec![7u8; 16];
+        let request_id = create_ask(&conn, &ask).unwrap();
+        crate::decide::decide(
+            &conn,
+            &request_id,
+            crate::decide::DecideInput { allow: true, ..Default::default() },
+        )
+        .unwrap();
+
+        let rows = undelivered_answers(&conn).unwrap();
+        assert_eq!(rows[0].context_id, vec![7u8; 16], "the raising context comes back");
     }
 
     #[test]

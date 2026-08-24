@@ -1745,6 +1745,20 @@ impl KernelDb {
         )?)
     }
 
+    /// The public face of `approval_ledger::ask::undelivered_answers` — every
+    /// ask a human answered whose answer nobody has collected.
+    ///
+    /// Wrapped here rather than handing out the connection: the gate-resume
+    /// driver lives in `kaijutsu-server` and has no business knowing the
+    /// ledger's schema. See `docs/gate-resume.md`.
+    pub fn undelivered_answers(
+        &self,
+    ) -> KernelDbResult<Vec<approval_ledger::ask::UndeliveredAnswer>> {
+        Ok(approval_ledger::ask::undelivered_answers(
+            self.conn_for_ledger(),
+        )?)
+    }
+
     pub(crate) fn conn_for_ledger(&self) -> &Connection {
         &self.conn
     }

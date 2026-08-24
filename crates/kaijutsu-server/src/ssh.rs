@@ -337,6 +337,11 @@ impl SshServer {
         // dropped. One driver for the whole server (see spawn_turn_driver).
         crate::rpc::spawn_turn_driver(registry.clone());
 
+        // The gate-resume driver, after the turn driver: it wakes a context
+        // by publishing a turn request, and a request published with no
+        // driver subscribed is dropped.
+        crate::rpc::spawn_gate_resume_driver(registry.clone());
+
         // The single coalescing beat scheduler: drives per-context hyoushigi
         // timelines on their wall-clock beat (musician contexts). Installs its
         // ingress on the kernel so the rc lifecycle can arm/disarm musicians.

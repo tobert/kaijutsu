@@ -620,6 +620,267 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
     }
 }
 
+/// Spawn the server-lifetime gate-resume driver.
+///
+/// The gate does not block the wire: an escalated call returns
+/// [`GateVerdict::Pending`] and the answer is redeemed on the caller's *next
+/// attempt* (`docs/gate-resume.md`). A human at a keyboard supplies that
+/// attempt by carrying on. A delegated coder does not — its turn ended when
+/// the gate refused, so without this nothing ever asks again and the answer
+/// sits in the ledger unread.
+///
+/// This closes that: on every `ledger.changed`, wake each context holding an
+/// answer nobody has collected, by writing the news as a seed block and
+/// publishing a turn request — the same two steps `kj drive --prompt` takes.
+/// The woken turn retries the tool call, and *that* attempt is what redeems.
+///
+/// **It does not need exactly-once, and deliberately does not implement it.**
+/// The single-use guarantee lives in the `approval_redemptions` row that
+/// `find_redeemable` filters on, not here. Waking a context twice costs one
+/// wasted turn: the second retry finds nothing redeemable and gets a fresh
+/// ask. That is why the durable claimable row this replaced could be deleted
+/// — every hard problem it carried (exactly-once across a crash, a `claimed`
+/// row nobody can resolve) belonged to executing the action, and this does
+/// not execute anything.
+///
+/// Denials wake a context too. A denied caller that is never woken keeps
+/// "waiting on a human" as its last word and never learns it was refused.
+pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
+    let builder = std::thread::Builder::new().name("gate-resume".to_string());
+    if let Err(e) = builder.spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::error!("gate-resume: failed to build runtime: {e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let kernel = &registry.kernel;
+            let mut sub = kernel.kernel.ledger_flows().subscribe("ledger.changed");
+            log::info!("Gate-resume driver online");
+
+            // Answers this driver has already woken someone for. The ledger
+            // row does not clear until the caller actually retries, so
+            // without this every later `ledger.changed` would wake the same
+            // context again for the same answer.
+            //
+            // In memory on purpose. A restart clears it, and re-waking once
+            // after a restart is the harmless side of the trade — the wake
+            // costs a turn, never a duplicated action.
+            let mut woken: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            // Seeded with everything already outstanding, so the driver only
+            // reacts to answers that land while it is running.
+            //
+            // Without this the first `ledger.changed` after a restart wakes
+            // every context holding an answer nobody ever collected — the
+            // whole backlog at once. Measured: it drove the kernel to 754%
+            // CPU and several concurrent LLM turns on the first try. An
+            // answer left uncollected across a restart is stale anyway; the
+            // caller that would have used it is long gone.
+            match kernel.kernel_db.lock().undelivered_answers() {
+                Ok(rows) => {
+                    let n = rows.len();
+                    woken.extend(rows.into_iter().map(|a| a.request_id));
+                    log::info!("gate-resume: {n} answer(s) already outstanding at start; not waking those");
+                }
+                Err(e) => {
+                    // Fail loud and stay closed: an empty seed set would
+                    // wake the whole backlog on the next event.
+                    log::error!(
+                        "gate-resume: could not read the outstanding answers at start ({e}); \
+                         driver exiting rather than risk waking the backlog"
+                    );
+                    return;
+                }
+            }
+
+            // A single ledger change should never wake more than a handful of
+            // contexts. More than this means something is wrong with the
+            // predicate, and a herd of LLM turns is the expensive way to find
+            // out — stop at the cap and say so.
+            const WAKE_CAP_PER_EVENT: usize = 4;
+
+            while sub.recv().await.is_some() {
+                // The event carries only a generation; the ledger is the
+                // authority, so re-read it rather than trusting the number.
+                // `ledger.changed` is on the timing lane (lossy by design):
+                // dropping events is safe here because any later one
+                // re-reads everything still outstanding.
+                let answers = {
+                    let db = kernel.kernel_db.lock();
+                    match db.undelivered_answers() {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            log::error!("gate-resume: could not read the ledger: {e}");
+                            continue;
+                        }
+                    }
+                };
+
+                let mut woken_this_event = 0usize;
+                for answer in answers {
+                    if woken.contains(&answer.request_id) {
+                        continue;
+                    }
+                    if woken_this_event >= WAKE_CAP_PER_EVENT {
+                        log::warn!(
+                            "gate-resume: stopped at {WAKE_CAP_PER_EVENT} wakes for one ledger                              change; the rest wait for the next one"
+                        );
+                        break;
+                    }
+                    let Ok(bytes) = <[u8; 16]>::try_from(answer.context_id.as_slice()) else {
+                        log::error!(
+                            "gate-resume: ask {} has a context_id that is not 16 bytes; skipping",
+                            answer.request_id
+                        );
+                        continue;
+                    };
+                    let context_id = ContextId::from(uuid::Uuid::from_bytes(bytes));
+
+                    // Only a Live context may be woken. An ask outlives the
+                    // context that raised it on purpose (`approvals` has no
+                    // foreign key on `context_id`, so an audit row survives
+                    // an archive), which means the ledger will happily hand
+                    // back answers for contexts nobody is working any more.
+                    // Waking those appends blocks to a concluded or archived
+                    // conversation and spends provider tokens on it —
+                    // measured: 9 stale contexts woken and 11 seed blocks
+                    // written before this guard existed.
+                    //
+                    // Marked woken either way: a context that is not Live is
+                    // not going to become Live because we looked again.
+                    match kernel.kernel_db.lock().get_context(context_id) {
+                        Ok(Some(row)) if row.context_state == kaijutsu_types::ContextState::Live => {}
+                        Ok(Some(row)) => {
+                            log::info!(
+                                "gate-resume: {context_id} is {:?}, not Live; leaving ask {} \
+                                 uncollected",
+                                row.context_state,
+                                answer.request_id
+                            );
+                            woken.insert(answer.request_id.clone());
+                            continue;
+                        }
+                        Ok(None) => {
+                            log::info!(
+                                "gate-resume: {context_id} no longer exists; leaving ask {} \
+                                 uncollected",
+                                answer.request_id
+                            );
+                            woken.insert(answer.request_id.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            // Fail closed: an unreadable context is not a
+                            // reason to write into it.
+                            log::error!(
+                                "gate-resume: could not read context {context_id} ({e}); not waking"
+                            );
+                            continue;
+                        }
+                    }
+
+                    // A turn already running will make its own next attempt.
+                    // Not marked woken: if that turn ends without retrying,
+                    // the next ledger change picks this up again.
+                    if kernel.kernel.turn_in_flight(context_id) {
+                        continue;
+                    }
+
+                    let decision = match answer.status {
+                        kaijutsu_kernel::ApprovalStatus::Allowed => "approved",
+                        _ => "denied",
+                    };
+                    // Written as the model reads it: the outcome first, then
+                    // what to do about it. It must not imply the action ran
+                    // — an approval authorizes the retry, it does not
+                    // perform it.
+                    let seed = format!(
+                        "A human {decision} the action you were waiting on: {}\n\n\
+                         Nothing has run yet. Try the same call again — an approval \
+                         authorizes it exactly once. If it was denied, do not retry it; \
+                         say so and continue with the rest of your work.",
+                        answer.description
+                    );
+
+                    let tail = kernel.documents.last_block_id(context_id);
+                    let seed_block = match kernel.documents.insert_block_as(
+                        context_id,
+                        None,
+                        tail.as_ref(),
+                        kaijutsu_types::Role::User,
+                        kaijutsu_types::BlockKind::Text,
+                        seed.clone(),
+                        kaijutsu_types::Status::Done,
+                        kaijutsu_types::ContentType::Plain,
+                        None,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::error!(
+                                "gate-resume: failed to write the seed block for {context_id}: {e}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // The principal that RAISED the ask, never a fresh one:
+                    // `find_redeemable` scopes by principal, so a turn woken
+                    // under a different identity mints a new ask instead of
+                    // collecting the answer. Measured — the first cut used
+                    // `PrincipalId::new()` and every wake produced a fresh
+                    // ask id while the approval sat uncollected.
+                    let Ok(pbytes) = <[u8; 16]>::try_from(answer.principal_id.as_slice())
+                    else {
+                        log::error!(
+                            "gate-resume: ask {} has a principal_id that is not 16 bytes; skipping",
+                            answer.request_id
+                        );
+                        continue;
+                    };
+                    let principal_id =
+                        kaijutsu_types::PrincipalId::from(uuid::Uuid::from_bytes(pbytes));
+
+                    kernel.kernel.mark_turn_begun(context_id);
+                    let delivered =
+                        kernel.kernel.turn_flows().publish(TurnFlow::Requested {
+                            context_id,
+                            after_block_id: seed_block,
+                            content: seed,
+                            principal_id,
+                            model: None,
+                        });
+                    if delivered == 0 {
+                        // No turn driver listening. Clear the flag we just
+                        // set and leave the answer uncollected rather than
+                        // recording a wake that never happened.
+                        kernel.kernel.mark_turn_ended(context_id);
+                        log::warn!(
+                            "gate-resume: no turn driver subscribed; {context_id} not woken"
+                        );
+                        continue;
+                    }
+                    woken.insert(answer.request_id.clone());
+                    woken_this_event += 1;
+                    log::info!(
+                        "gate-resume: woke {context_id} for {} ask {}",
+                        decision,
+                        answer.request_id
+                    );
+                }
+            }
+            log::warn!("gate-resume: ledger bus closed, driver exiting");
+        });
+    }) {
+        log::error!("Failed to spawn gate-resume thread: {e}");
+    }
+}
+
 /// Spawn the server-lifetime editor reconciler — the remote-merge half of the
 /// editor push channel (docs/vi.md step 1b).
 ///
