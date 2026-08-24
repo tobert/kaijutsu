@@ -278,11 +278,33 @@ keyed by `context_type` (`kj cast show house` lists one slot per seat), so a new
 seat gets its model from config with no code; rc gives it a stance and a
 loadout; the ledger gives it a durable place to write.
 
-What is missing is one thing, and enforcing lfm2d needs the same thing: **a
-structured return path.** A hook body's stdout is discarded — only the exit code
-and 512 bytes of stderr are read — and `approval_signals.stmt_seq`/`cmd_seq` are
-nullable and never populated, so nothing records which clause was judged. Widen
-that row and both lanes unblock.
+What is missing is **a structured return path** — narrower now than when this
+was written. `approval_signals.stmt_seq`/`cmd_seq` are populated (2026-08-24):
+`kj ledger signal add --stmt-seq/--cmd-seq`, rendered by `kj ledger show
+--signals` as `clause=0#2`, and S50 passes the position for the winner and
+every secondary clause. Enforcing lfm2d turned out not to need this at all —
+it ships on exit 3 and the stderr tail.
+
+What is still missing is the stdout half. A hook body's stdout is
+**captured and then ignored**: `broker.rs:2316` passes only `exec.code` and
+`exec.err` to `classify_kaish_hook_exit`, whose signature (`broker.rs:281`)
+has no stdout parameter, while kaish's `ExecResult` carries `out` and
+`data` the whole time.
+
+Two facts decide the contract before anyone designs it, both from kaish
+0.16's own kernel:
+
+- **`out`/`err` concatenate across every top-level statement** of the hook
+  body, so a script's diagnostic `echo`s are mixed in with anything it meant
+  as a return value. "JSON on stdout" needs a rule for which line.
+- **`code`, `data`, and `data_is_value` are overwritten by each top-level
+  statement**, so `exec.data` reflects only the LAST one. Reading `.data`
+  means requiring hook authors to end the script with the call that produces
+  it — a real constraint, not a detail.
+
+`AskSpec` (`hook_table.rs:124-129`) has one field but its doc comment says it
+exists so the ask surface can grow without another `HookAction` shape change,
+so the extension point is already deliberate.
 
 **Replying inline is a real option and worth designing for.** Blocks carry an
 author principal, so a reply in the seat's own context is *attributable* — which
@@ -4250,52 +4272,79 @@ wire). What it deliberately did NOT do:
   `serverShutdown` and `superseded`; nothing emits them yet. A clean shutdown
   still looks to a client like an ordinary disconnect.
 
-## lfm2d risk scoring into the approval ledger, via rc (Amy asked 2026-08-17: "is lfm2d integration with kernel ledger via rc still in our plans somewhere?")
+## lfm2d escalation: tuning the scorer that now gates the shell (wired 2026-08-24)
 
-**Honest answer: no — not as a written plan. Every piece exists; the join
-does not.** Searched kaijutsu's docs and exomemory: nothing connects lfm2d's
-scorer to the ledger through rc. Filing it so the answer stops being "I think
-so." The moment is good — the gate/ledger design is being drafted today
-(`docs/gate-and-shell-split.md`), and this is a hook point in it rather than
-a separate project.
+**The join exists.** `assets/defaults/rc/lib/create/S50-lfm2d.kai` scores every
+clause of a `shell_write` call and, in `escalate` mode, exits 3 — which asks a
+human through the ledger. `escalate` is the default; `log` records the signals
+and always proceeds; anything else turns the hook off. The script is one file,
+symlinked into the `coder`, `mcp`, and `lib` seats.
 
-The pieces already in hand:
+**The scorer never denies, in any mode.** Exit 3 or exit 0, never exit 1. A
+`data-critical` verdict escalates exactly like an unresolvable one. A hard
+block from this classifier would be unappealable, and it cannot separate a
+true positive from a false one well enough to earn that. It may raise a
+prompt, never lower one, never decide.
 
-- **The scorer** — lfm2d serves `/v1/cascade`, which scores a command.
-- **The ledger** — `crates/approval-ledger`, already migrated into `KernelDb`
-  via `KernelDb::migrate_ledger`.
-- **rc** — `/etc/rc/<context_type>/<verb>/SXX-name.kai` already composes
-  per-context behaviour, and is exactly where a per-context-type policy
-  ("this seat asks lfm2d before it runs a destructive verb") belongs, rather
-  than in kernel code.
-- **The seam** — `HookAction::Ask` / `mcp/permission.rs`, which the gate
-  design already routes everything through.
+**A scorer that is down leaves the baseline alone.** Unreachable, unparseable,
+or missing-field paths all exit 0 and write a trace block. lfm2d was evicted
+for 21 hours on 2026-08-23 (zorak `DiskPressure`, root filesystem 100% full)
+and nobody noticed; a guard that failed closed would have blocked every seat
+that whole time. The S45 shell-escape guard and the human are the controls
+that do not depend on a model being up.
 
-**The constraint that decides the shape, and it is not optional.** The lfm2d
-lane's own measurement (exomemory queue, 2026-08-14): `/v1/cascade` scores
-`git checkout -- crates/` at **0.210 `situation-normal`** — confidently wrong,
-mid-range, in the costly direction, **on an operation that has already
-destroyed uncommitted work in this repo**. The lane's read is
-foreign-training-distribution rather than a calibration bug, which does not
-make the number safer to act on. A companion finding: `lane.route` cosine is
-unusable as an is-this-shell signal ("capital of France" scores 0.98, above a
-genuine shell statement at 0.66).
+### What v9_cal actually does (measured 2026-08-24, live `/v1/cascade`, N=16)
 
-So: **advisory, never an auto-decider.** A score may RAISE a prompt that would
-not otherwise fire, or enrich one that does; it must never lower one, and must
-never silently allow. That direction is also the doctrinal one — capabilities
-and gates here are ergonomic nudges for mistake-prevention, not security
-(`docs/instrument-design.md`, "Many hands, one trust boundary"), and a
-mistake-prevention nudge that can be talked out of firing by a 350M encoder is
-worse than no nudge, because it trains trust it hasn't earned.
+The live checkpoint is `kube_ordinal_v9_cal`, labels
+`[informative, situation-normal, data-critical]`. **Every number previously
+recorded here was v8 and no longer describes the deployed model.**
 
-Prerequisite before any wiring: re-measure the scorer against a corpus of the
-destructive `kj` verbs and shell statements the ledger would actually gate.
-The 0.210 receipt is one sample; the decision needs a distribution. That
-measurement is worth doing even if the integration never ships.
+v9_cal fixed the data-position defect that motivated the work — a severe token
+quoted as an argument no longer reads as a severe command:
 
-See also the LFM2.5 entry immediately below (the model family, runtimes, and
-the candle-in-process decision) and the gate entries above (the seam).
+| clause | v8 | v9_cal |
+|---|---|---|
+| `curl -d` with a destructive delete in the JSON body | data-critical 0.921 | situation-normal 0.446 |
+| `grep -rn` for a destructive delete pattern | data-critical 0.892 | informative 0.472 |
+| `echo` of a warning sentence naming one | informative 0.953 | informative 0.450 |
+
+All five benign commands probed (`git status`, `cargo test`, `kj block list`,
+`ls -la`, `kj ledger list`) land `informative`.
+
+It paid for that with severity false negatives, and this is the open work:
+
+| clause | v9_cal | should be |
+|---|---|---|
+| `dd if=/dev/zero of=/dev/sda` | **informative 0.540** | data-critical |
+| `kj context archive <id>` | informative 0.644 | at least situation-normal |
+| `kubectl delete namespace <ns>` | situation-normal 0.415 | data-critical |
+| `git checkout -- crates/` | situation-normal 0.567 | data-critical |
+
+Only 3 of 7 true positives reach `data-critical`. A disk-wiping `dd` lands in
+the *least severe* bucket — under the ordinal mapping that is a verdict of
+`allow`, so it is waved through without a prompt. Our own destructive `kj`
+verbs are out of distribution entirely.
+
+**A confidence floor on `informative` does not separate them.** The misses sit
+at 0.540 and 0.644 while `git status` is 0.598 and `cargo test` is 0.601 — any
+threshold that catches `dd` escalates ordinary work. The signal is absent, not
+mis-scaled. Training data is the fix; a knob is not.
+
+### Open
+
+- **Feed the false negatives back to the lfm2d lane** as a v10 training
+  target: `dd`-shaped device writes, and the destructive `kj` verbs
+  (`context archive`, `block exclude`, `binding reset`).
+- **Widen the probe past N=16.** This is a start on the distribution this
+  entry used to ask for, not the corpus.
+- **Escalation stalls a delegated coder.** The gate returns `Pending` and the
+  answer is redeemed on the caller's *next attempt*. A human at a keyboard
+  retries; a delegated coder whose turn ended has nothing that retries. With
+  `escalate` on by default this is the dominant failure mode.
+- **Two asks per escalated call.** The audit ask (auto-allowed, carrying every
+  scored clause as signals) and the ask a human answers are separate rows; the
+  exit-3 stderr names the first so `kj ledger show` reaches the signals. The
+  structured return path collapses them — see "The escalation seat" above.
 
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 

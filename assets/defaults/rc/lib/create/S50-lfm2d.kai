@@ -1,12 +1,17 @@
-# lfm2d risk scoring, wired log-only into the seats that hold Exec
+# lfm2d risk scoring, wired into the seats that hold Exec
 # (docs/gate-and-shell-split.md, "lfm2d risk scoring"). Runs at create. This
 # script is symlinked (not copied) into the create/ lifecycle of each seat
 # that scores its shell, the same composition S45 in this directory uses.
 # Two things:
 #
-#   1. Export durable env: LFM2D_MODE=log, LFM2D_URL. The hook body below
+#   1. Export durable env: LFM2D_MODE, LFM2D_URL. The hook body below
 #      reads both at fire time; neither is hard-coded into the hook body
 #      itself, so a mode or host change is one `kj context set` away.
+#
+#      Three modes. `escalate` (the default) asks a human for any verdict
+#      that is not `allow`. `log` writes the signals and always proceeds --
+#      what to set while measuring a new checkpoint. Anything else, including
+#      unset, turns the hook off.
 #   2. Install the pre_call advisory hook (hook_id lfm2d-advisory,
 #      match_tool shell_write). `kj hook add` is idempotent on hook_id, so
 #      this script re-running for the same context (a second `create`, or
@@ -18,7 +23,7 @@
 # (lfm2d/docs/integration.md, invariant 2) -- a label baked in here would go
 # stale the next time the daemon's checkpoint changes, silently.
 
-kj context set . --env LFM2D_MODE=log
+kj context set . --env LFM2D_MODE=escalate
 kj context set . --env LFM2D_URL=http://lfm2d-1.taila4abc.ts.net:8088
 
 # The hook body is embedded below and installed as an inline HookBody::Kaish
@@ -37,20 +42,22 @@ hook_body=$(cat <<'HOOK_BODY_EOF'
 # hook_id lfm2d-advisory, match_tool shell_write). Runs in a snapshot of
 # the calling context's durable env (LFM2D_MODE, LFM2D_URL) plus the
 # per-call KJ_HOOK_*/KJ_TOOL_* vars broker.rs's run_kaish_hook sets. A
-# pre_call hook that exits non-zero denies the call (PhaseOutcome::Deny)
-# -- this hook only logs, so it exits 0 unconditionally: every skip path
-# below falls through to the final "exit 0", and no path returns non-zero.
+# pre_call hook exits 0 to proceed, 3 to ask a human, and any other
+# non-zero to deny (PhaseOutcome::Deny). This hook uses 0 and 3 only: it
+# never denies, in any mode. Every skip path exits 0.
 #
-# lfm2d's /v1/cascade ranks command-shaped clauses by severity and is
-# confidently wrong in the costly direction on real shell text
-# (docs/issues.md, "lfm2d risk scoring into the approval ledger, via
-# rc"): advisory, never an auto-decider. This hook creates a log-only ask,
-# already decided Allowed, carrying the classifier's read as a signal --
-# nothing here, and nothing in approval-ledger, ever lets a signal
-# auto-decide an ask (rules::redeem composes from approval_rules alone).
+# lfm2d's /v1/cascade ranks command-shaped clauses by severity and is wrong
+# in both directions on real shell text (docs/issues.md, "lfm2d risk scoring
+# into the approval ledger, via rc"): it may raise a prompt, never lower
+# one, and never decide. It always writes an ask carrying the classifier's
+# read as a signal -- nothing here, and nothing in approval-ledger, ever
+# lets a signal auto-decide an ask (rules::redeem composes from
+# approval_rules alone). In `escalate` mode it then hands the call to a
+# human; the human decides, through `kj ledger`.
 
 case "$LFM2D_MODE" in
   log) ;;
+  escalate) ;;
   *) exit 0 ;;
 esac
 
@@ -79,12 +86,31 @@ items_filter="$(cat <<'ITEMS_FILTER_EOF'
   | ($s.plan.commands // []) as $cmds
   | ( if ($cmds|length) > 0
         and ($cmds | all((.args // []) | all(has($pk))))
-      then $cmds | map({stmt: $s.plan.rendered,
-                         clause: (([.name] + ((.args // [])|map(.plain))) | join($sp))})
-      else [{stmt: $s.plan.rendered, clause: $s.plan.rendered}]
+      then [ range(0; $cmds|length) as $i
+             | $cmds[$i]
+             | {stmt: $s.plan.rendered,
+                stmt_seq: $s.index,
+                cmd_seq: $i,
+                clause: (([.name] + ((.args // [])|map(.plain))) | join($sp))} ]
+      else [{stmt: $s.plan.rendered,
+             stmt_seq: $s.index,
+             cmd_seq: null,
+             clause: $s.plan.rendered}]
       end )
 ] | add // []
 ITEMS_FILTER_EOF
+)"
+
+# `kj ledger signal add` refuses the literal `null` that an unresolved jq
+# field renders as, so the position travels as ready-made FLAGS rather than
+# as two values a later `case` has to guard. jq emits "" when a position is
+# unknown and the unquoted expansion contributes no argument at all --
+# `--stmt-seq` is never passed without a number behind it.
+seq_flags_filter="$(cat <<'SEQ_FLAGS_FILTER_EOF'
+[ (if (.stmt_seq // null) == null then empty else "--stmt-seq", (.stmt_seq|tostring) end),
+  (if (.cmd_seq // null) == null then empty else "--cmd-seq", (.cmd_seq|tostring) end) ]
+| join(" ")
+SEQ_FLAGS_FILTER_EOF
 )"
 items_rc=1
 if test -n "${KJ_TOOL_PLAN:-}"; then
@@ -137,6 +163,10 @@ winner_score="$(echo $resp | jq -r --argjson i $winner_index '.clauses[] | selec
 model_id="$(echo $resp | jq -r '.models[0].model_id')"
 weight_hash="$(echo $resp | jq -r '.models[0].weight_hash')"
 winner_stmt="$(echo $items | jq -r --argjson i $winner_index '.[$i].stmt')"
+# Extracted to its own variable first: composing the index into the filter
+# string would need double quotes at both levels, which does not parse.
+winner_item=$(echo $items | jq -c --argjson i $winner_index '.[$i]')
+winner_seq_flags=$(echo $winner_item | jq -r $seq_flags_filter)
 
 # -- read the severity ladder from /v1/models at call time (never
 # hard-coded: label vocabularies change between checkpoints -- lfm2d's own
@@ -176,10 +206,13 @@ case "$winner_score" in
     ;;
 esac
 
-# -- log-only: create the ask already decided Allowed, carrying the
-# winner as the primary signal. approval_signals.request_id stays NOT
-# NULL -- this is an auto-approved ask, not a nullable half-row.
-add_out="$(kj ledger signal add $winner_stmt --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $winner_label --score $winner_score --verdict $verdict --auto-allow --json)"
+# -- record the read in both modes: an ask already decided Allowed,
+# carrying the winner as the primary signal. approval_signals.request_id
+# stays NOT NULL -- this is an auto-approved ask, not a nullable half-row.
+# In `escalate` mode this stays the audit record and the exit 3 below mints
+# the ask a human actually answers; the stderr line names this one so the
+# full signal set is one `kj ledger show` away.
+add_out="$(kj ledger signal add $winner_stmt --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $winner_label --score $winner_score $winner_seq_flags --verdict $verdict --auto-allow --json)"
 add_rc=$?
 if [[ "$add_rc" -ne 0 ]]; then
   kj block create --kind trace --content "lfm2d-advisory: kj ledger signal add --auto-allow failed: $add_out"
@@ -191,14 +224,28 @@ request_id="$(echo $add_out | jq -r '.request_id')"
 # ask. Kept conservative (verdict escalate) rather than re-deriving the
 # ordinal position per clause -- these are secondary annotations, and
 # escalate is the one verdict that can never read as a silent allow.
+# Field 4 carries this clause's position as ready-made flags, joined by the
+# same rule the winner uses -- built in jq rather than accumulated across
+# `case` arms inside the loop, because a variable assigned in a loop body
+# does not survive to the next statement in kaish.
 tab="$(printf '\t')"
 other_filter="$(cat <<'SECONDARY_FILTER_EOF'
-.clauses[] | select(.index != $wi) | [(.index|tostring), .top_severity, (.severity_scores[.top_severity]|tostring)] | join($tab)
+.clauses[] as $c
+| select($c.index != $wi)
+| ($items[$c.index] // {}) as $it
+| [ ($c.index|tostring),
+    $c.top_severity,
+    ($c.severity_scores[$c.top_severity]|tostring),
+    ([ (if ($it.stmt_seq // null) == null then empty else "--stmt-seq", ($it.stmt_seq|tostring) end),
+       (if ($it.cmd_seq // null) == null then empty else "--cmd-seq", ($it.cmd_seq|tostring) end) ] | join(" "))
+  ]
+| join($tab)
 SECONDARY_FILTER_EOF
 )"
-for row in $(echo $resp | jq -r --argjson wi $winner_index --arg tab $tab $other_filter); do
+for row in $(echo $resp | jq -r --argjson wi $winner_index --argjson items $items --arg tab $tab $other_filter); do
   c_label="$(echo $row | cut -f2)"
   c_score="$(echo $row | cut -f3)"
+  c_seq_flags="$(echo $row | cut -f4)"
   c_skip=""
   case "$c_label" in
     ""|null) c_skip="label=$c_label" ;;
@@ -209,7 +256,7 @@ for row in $(echo $resp | jq -r --argjson wi $winner_index --arg tab $tab $other
   if test -n "$c_skip"; then
     kj block create --kind trace --content "lfm2d-advisory: secondary signal skipped, unusable classifier value ($c_skip)"
   else
-    sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --verdict escalate)"
+    sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score $c_seq_flags --verdict escalate)"
     sec_rc=$?
     case "$sec_rc" in
       0) ;;
@@ -218,7 +265,35 @@ for row in $(echo $resp | jq -r --argjson wi $winner_index --arg tab $tab $other
   fi
 done
 
-exit 0
+# -- `log` mode stops here: the signals are written and the call proceeds.
+case "$LFM2D_MODE" in
+  escalate) ;;
+  *) exit 0 ;;
+esac
+
+# -- `escalate` mode: exit 3, which asks a human (KaishHookOutcome::Escalate
+# -> the ledger ask round trip -> GateVerdict::Pending). Only `allow` runs
+# without asking. `deny` escalates too and never exits 1: a hard block from
+# the classifier is unappealable, and it cannot tell a true positive from a
+# false one well enough to earn that. The classifier may RAISE a prompt that
+# would not otherwise fire; it may never lower one and never silently allow
+# (docs/issues.md, "lfm2d risk scoring into the approval ledger, via rc").
+#
+# Every skip path above still exits 0 in this mode -- a scorer that is
+# unreachable, unparseable, or missing a field leaves the baseline controls
+# (the S45 shell-escape guard, the human) exactly as they were, and says so
+# in a trace block rather than silently. A guard that denied whenever lfm2d
+# was down would have blocked every seat for the 21 hours it was evicted.
+case "$verdict" in
+  allow) exit 0 ;;
+esac
+
+# The 512-byte stderr tail becomes the ask description a human reads
+# (broker.rs classify_kaish_hook_exit), so the verdict leads and the
+# pointer to the full signal set trails -- a cut keeps the rule.
+echo "lfm2d says $winner_label ($winner_score), verdict $verdict, on: $winner_stmt" >&2
+echo "classifier $model_id -- all scored clauses: kj ledger show $request_id" >&2
+exit 3
 HOOK_BODY_EOF
 )
 
