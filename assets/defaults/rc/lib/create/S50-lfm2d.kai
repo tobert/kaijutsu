@@ -25,6 +25,7 @@
 
 kj context set . --env LFM2D_MODE=escalate
 kj context set . --env LFM2D_URL=http://lfm2d-1.taila4abc.ts.net:8088
+kj context set . --env LFM2D_BENIGN_LABEL=informative
 
 # The hook body is embedded below and installed as an inline HookBody::Kaish
 # action, not a stored hook_scripts row (docs/gate-and-shell-split.md, "Slice
@@ -174,6 +175,22 @@ winner_seq_flags=$(echo $winner_item | jq -r $seq_flags_filter)
 # least severe label reads allow, the most severe reads deny, anything
 # else (and any failure to resolve the ladder) reads escalate -- the safe
 # default when the position can't be determined, never allow.
+#
+# ORDINAL POSITION ALONE IS NOT ENOUGH TO ALLOW. The ladder is only
+# severity-ordered from kube_ordinal_v8 on (lfm2d integration doc,
+# invariant 4). kube_ordinal_v6 is a staged rollback target whose
+# id2label order is ALPHABETICAL, which puts the most destructive label at
+# index 0 -- against that checkpoint a bare index-0-reads-allow rule
+# inverts completely and auto-allows the exact commands this hook exists
+# to catch. So `allow` additionally requires the winning label to BE the
+# benign label, named by LFM2D_BENIGN_LABEL.
+#
+# Yes, that is a label name in the decision, which the header warns
+# against. The direction of the failure is what makes it safe: a
+# checkpoint that renames its benign end stops matching and everything
+# escalates -- loud, and one `kj context set` away from fixed. The rule it
+# replaces failed the other way, silently allowing.
+benign_label="${LFM2D_BENIGN_LABEL:-informative}"
 verdict="escalate"
 models_resp="$(curl --max-time 5 $models_url)"
 models_rc=$?
@@ -183,7 +200,14 @@ if [[ "$models_rc" -eq 0 ]]; then
   if [[ "$label_index" -lt 0 ]]; then
     verdict="escalate"
   elif [[ "$label_index" -eq 0 ]]; then
-    verdict="allow"
+    # Both conditions, or escalate: index 0 says "least severe by position",
+    # the name match says "and this ladder really is severity-ordered".
+    if [[ "$winner_label" = "$benign_label" ]]; then
+      verdict="allow"
+    else
+      verdict="escalate"
+      kj block create --kind trace --content "lfm2d-advisory: $model_id puts '$winner_label' at ladder index 0 but the benign label is '$benign_label' -- ladder may not be severity-ordered, escalating instead of allowing"
+    fi
   elif [[ "$label_index" -eq $((label_count - 1)) ]]; then
     verdict="deny"
   fi
