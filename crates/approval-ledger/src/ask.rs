@@ -967,6 +967,45 @@ mod tests {
         assert_eq!(signals[1].label.as_deref(), Some("informative"));
     }
 
+    /// `stmt_seq`/`cmd_seq` are the clause position a signal judged (see
+    /// `schema.rs`'s `approval_signals` doc) — round-trip both all the way
+    /// through storage, not just carry them without ever reading them back.
+    #[test]
+    fn add_signal_round_trips_stmt_seq_and_cmd_seq() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let mut sig = classifier_signal();
+        sig.stmt_seq = Some(1);
+        sig.cmd_seq = Some(2);
+        let row = add_signal(&conn, &request_id, &sig).unwrap();
+        assert_eq!(row.stmt_seq, Some(1), "the insert's own return must carry the position back");
+        assert_eq!(row.cmd_seq, Some(2), "the insert's own return must carry the position back");
+
+        let signals = list_signals(&conn, &request_id).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].stmt_seq, Some(1), "{signals:?}");
+        assert_eq!(signals[0].cmd_seq, Some(2), "{signals:?}");
+    }
+
+    /// Both fields stay OPTIONAL (task contract) — a signal that speaks to
+    /// the whole ask, not one clause within it, must not be forced to
+    /// invent a position.
+    #[test]
+    fn add_signal_stmt_seq_and_cmd_seq_stay_null_when_unset() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let mut sig = classifier_signal();
+        sig.stmt_seq = None;
+        sig.cmd_seq = None;
+        add_signal(&conn, &request_id, &sig).unwrap();
+
+        let signals = list_signals(&conn, &request_id).unwrap();
+        assert_eq!(signals[0].stmt_seq, None, "{signals:?}");
+        assert_eq!(signals[0].cmd_seq, None, "{signals:?}");
+    }
+
     #[test]
     fn add_signal_to_an_unknown_ask_is_not_found() {
         let conn = open_memory();

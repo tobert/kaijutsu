@@ -419,6 +419,19 @@ enum SignalCommand {
         /// thresholded here or anywhere in this crate — see `--verdict`.
         #[arg(long)]
         score: Option<f64>,
+        /// Which statement of the ask this signal judged (0-based, matching
+        /// `approval_ask_statements.stmt_seq`) — the position that makes
+        /// "which clause of a multi-statement ask was this?" answerable.
+        /// Omit when the signal speaks to the whole ask rather than one
+        /// statement within it.
+        #[arg(long = "stmt-seq")]
+        stmt_seq: Option<i64>,
+        /// Which command within that statement this signal judged (0-based,
+        /// matching `approval_statement_commands.cmd_seq`). Omit when the
+        /// signal speaks to the whole statement rather than one command
+        /// within it; only meaningful alongside `--stmt-seq`.
+        #[arg(long = "cmd-seq")]
+        cmd_seq: Option<i64>,
         /// The signal's own recommendation: `escalate` (raise or leave a
         /// prompt), `deny`, or `allow`. Always advisory — see the module
         /// doc: nothing in `approval_ledger` ever reads a signal to
@@ -480,6 +493,8 @@ impl KjDispatcher {
                     weight_hash,
                     label,
                     score,
+                    stmt_seq,
+                    cmd_seq,
                     verdict,
                     auto_allow,
                     request_id,
@@ -491,6 +506,8 @@ impl KjDispatcher {
                     weight_hash,
                     label,
                     score,
+                    stmt_seq,
+                    cmd_seq,
                     verdict,
                     auto_allow,
                     request_id.as_deref(),
@@ -693,10 +710,19 @@ impl KjDispatcher {
         }
         if show_signals {
             for s in &signal_rows {
+                // Clause position: `stmt#cmd` when both are known, `stmt`
+                // alone when only the statement is, `-` when the signal
+                // speaks to the whole ask (both nullable — see `NewSignal`).
+                let clause = match (s.stmt_seq, s.cmd_seq) {
+                    (Some(stmt), Some(cmd)) => format!("{stmt}#{cmd}"),
+                    (Some(stmt), None) => stmt.to_string(),
+                    (None, _) => "-".to_string(),
+                };
                 lines.push(format!(
-                    "signal:     {} {} label={} score={} verdict={}",
+                    "signal:     {} {} clause={} label={} score={} verdict={}",
                     s.source_kind,
                     s.source_id.as_deref().unwrap_or("-"),
+                    clause,
                     s.label.as_deref().unwrap_or("-"),
                     s.score.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
                     s.verdict,
@@ -1089,6 +1115,8 @@ impl KjDispatcher {
         weight_hash: Option<String>,
         label: Option<String>,
         score: Option<f64>,
+        stmt_seq: Option<i64>,
+        cmd_seq: Option<i64>,
         verdict: SignalVerdictArg,
         auto_allow: bool,
         request_id: Option<&str>,
@@ -1116,8 +1144,8 @@ impl KjDispatcher {
             source_id: source_id.clone(),
             model_id: model_id.clone(),
             weight_hash,
-            stmt_seq: None,
-            cmd_seq: None,
+            stmt_seq,
+            cmd_seq,
             label,
             score,
             verdict: verdict.to_ledger(),
@@ -1567,6 +1595,84 @@ mod tests {
         let db = d.kernel_db.lock();
         let signals = approval_ledger::ask::list_signals(db.conn_for_ledger(), &request_id).unwrap();
         assert_eq!(signals.len(), 2, "both signals must land on the ONE ask: {signals:?}");
+    }
+
+    /// `--stmt-seq`/`--cmd-seq` are the clause position (the escalation-seat
+    /// gap `docs/issues.md` names) — round-trip through storage AND show up
+    /// in `kj ledger show --signals`'s text, not just its `.data`.
+    #[tokio::test]
+    async fn ledger_signal_add_stmt_and_cmd_seq_round_trip_through_storage_and_show() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let created = d
+            .dispatch(
+                &signal_add_argv(
+                    "rm build artifacts now",
+                    &["--auto-allow", "--stmt-seq", "0", "--cmd-seq", "2"],
+                ),
+                &c,
+            )
+            .await;
+        assert!(created.is_ok(), "{created:?}");
+        let request_id = match &created {
+            KjResult::Ok { data: Some(v), .. } => v["request_id"].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+
+        {
+            let db = d.kernel_db.lock();
+            let signals = approval_ledger::ask::list_signals(db.conn_for_ledger(), &request_id).unwrap();
+            assert_eq!(signals.len(), 1);
+            assert_eq!(signals[0].stmt_seq, Some(0), "{signals:?}");
+            assert_eq!(signals[0].cmd_seq, Some(2), "{signals:?}");
+        }
+
+        let shown = d.dispatch(&[s("ledger"), s("show"), s(&request_id), s("--signals")], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(
+            shown.message().contains("clause=0#2"),
+            "kj ledger show --signals must render the clause position: {}",
+            shown.message()
+        );
+        let data = match &shown {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(data["signals"][0]["stmt_seq"], serde_json::json!(0), "{data}");
+        assert_eq!(data["signals"][0]["cmd_seq"], serde_json::json!(2), "{data}");
+    }
+
+    /// Both fields stay optional: a signal with no clause position must
+    /// still render, showing `-` rather than a silently-omitted line or an
+    /// invented `0`.
+    #[tokio::test]
+    async fn ledger_signal_add_without_stmt_seq_shows_clause_as_dash() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let created = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
+        let request_id = match &created {
+            KjResult::Ok { data: Some(v), .. } => v["request_id"].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+
+        {
+            let db = d.kernel_db.lock();
+            let signals = approval_ledger::ask::list_signals(db.conn_for_ledger(), &request_id).unwrap();
+            assert_eq!(
+                signals[0].stmt_seq, None,
+                "a signal with no --stmt-seq must stay NULL, not invent 0: {signals:?}"
+            );
+        }
+
+        let shown = d.dispatch(&[s("ledger"), s("show"), s(&request_id), s("--signals")], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(
+            shown.message().contains("clause=-"),
+            "an unset clause position must render as '-': {}",
+            shown.message()
+        );
     }
 
     #[tokio::test]
