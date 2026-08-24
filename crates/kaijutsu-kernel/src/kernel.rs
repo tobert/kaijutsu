@@ -191,7 +191,11 @@ pub struct Kernel {
     /// resume — and it needs no schema migration and no startup sweep.
     /// `parking_lot::Mutex` like `editor_sessions`: every access here is a
     /// synchronous set op, never held across an await.
-    turn_liveness: parking_lot::Mutex<std::collections::HashSet<kaijutsu_types::ContextId>>,
+    /// Value is when the turn was first marked begun, which is what makes a
+    /// process table useful — elapsed is the number an operator reads first.
+    turn_liveness: parking_lot::Mutex<
+        std::collections::HashMap<kaijutsu_types::ContextId, std::time::Instant>,
+    >,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -346,7 +350,7 @@ impl Kernel {
                 bg
             },
             cc_inbox: OnceLock::new(),
-            turn_liveness: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -452,7 +456,7 @@ impl Kernel {
                 bg
             },
             cc_inbox: OnceLock::new(),
-            turn_liveness: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1000,7 +1004,16 @@ impl Kernel {
     /// a `kj wait` issued right after win the race and read the previous
     /// turn's state.
     pub fn mark_turn_begun(&self, context_id: kaijutsu_types::ContextId) {
-        self.turn_liveness.lock().insert(context_id);
+        // `or_insert`, not `insert`: an autonomous turn is marked twice —
+        // once by `publish_turn_request` and again by `spawn_llm_for_prompt`
+        // — and the FIRST mark is when the turn actually began. Overwriting
+        // would reset the clock at the point the driver picked it up and
+        // hide any time the turn spent queued, which is exactly the delay
+        // worth seeing.
+        self.turn_liveness
+            .lock()
+            .entry(context_id)
+            .or_insert_with(std::time::Instant::now);
     }
 
     /// Mark a context's turn as ended. Idempotent: ending a context with no
@@ -1011,7 +1024,7 @@ impl Kernel {
 
     /// Whether a context has a turn in flight right now.
     pub fn turn_in_flight(&self, context_id: kaijutsu_types::ContextId) -> bool {
-        self.turn_liveness.lock().contains(&context_id)
+        self.turn_liveness.lock().contains_key(&context_id)
     }
 
     /// Every context with a turn in flight right now.
@@ -1020,10 +1033,17 @@ impl Kernel {
     /// after this returns. That is fine for what reads it — an operator
     /// asking what the kernel is doing wants the shape of the moment, not a
     /// consistent view to act on transactionally.
-    pub fn turns_in_flight(&self) -> Vec<kaijutsu_types::ContextId> {
-        let mut ids: Vec<_> = self.turn_liveness.lock().iter().copied().collect();
-        ids.sort();
-        ids
+    pub fn turns_in_flight(&self) -> Vec<(kaijutsu_types::ContextId, std::time::Duration)> {
+        let now = std::time::Instant::now();
+        let mut rows: Vec<_> = self
+            .turn_liveness
+            .lock()
+            .iter()
+            .map(|(id, began)| (*id, now.saturating_duration_since(*began)))
+            .collect();
+        // Longest-running first: the runaway is what you are looking for.
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        rows
     }
 
     /// Get the content-addressed store.

@@ -221,6 +221,12 @@ impl KjDispatcher {
                         d.clone(),
                         Some(principal),
                     ));
+                    // `ps` — kaijutsu's process table, SHADOWING kaish's
+                    // host-listing one (`runtime/ps_builtin.rs`). Same move
+                    // as `fg` above: `ToolRegistry::register` is keyed by
+                    // tool name, so this replaces kaish's `ps` for kaijutsu
+                    // shells only and leaves kaish's own surface untouched.
+                    tools.register(crate::runtime::ps_builtin::PsBuiltin::new(d.clone()));
                     tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
                         d,
                         scm,
