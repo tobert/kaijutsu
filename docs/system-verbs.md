@@ -160,6 +160,40 @@ security control. Every player is still inside one trust boundary
 is that a runaway agent should not be able to un-stop itself by accident,
 not that it is being defended against.
 
+## What this lets us retire — less than it looks
+
+The rule that decides it is already written down (CLAUDE.md): *`kj` is good
+enough for all admin-like stuff; normal ops over RPC is probably still
+advisable for chatty paths.* Applied to the surfaces `ps` overlaps:
+
+| surface | verdict |
+|---|---|
+| `list_background_processes` (MCP) | **Retirement candidate.** `kj system ps` and the bare `ps` builtin now render the same roster, and `ps` supplies the job ids the other two tools need. |
+| `read_background_output` (MCP) | **Keep.** Polling a running job's output mid-turn is the definition of a chatty path. It is not admin work and must not become a `kj` verb. |
+| `kill_background_process` (MCP) | **Judgment call.** Admin-shaped, but a model stopping its own runaway job mid-turn is ordinary operation, not administration. |
+| `interruptContext` (RPC) | **Keep.** It has a real interactive caller — the app's Ctrl+C path (`kaijutsu-app/src/input/systems.rs`). Per-context and interactive; quiesce does not replace it. |
+
+Caution before acting on the one candidate: these are **MCP tools, so their
+callers are outside this repo** — external agents and the models in the
+kernel. "No internal caller" is not evidence of disuse the way it would be
+for an internal function. Retiring one is a roster change external clients
+see.
+
+## `ps` is not privileged; the stopping verbs are
+
+`kj system` is for the most privileged contexts, but that gate belongs on
+the verbs that *act*. The split:
+
+- **`ps` and `status` stay open.** They are read-only and they are how a
+  seat answers "is something already running?" before it starts work.
+  The bare `ps` shell builtin is the agent-facing door and should stay
+  ungated.
+- **`quiesce`, `resume`, `seppuku` are gated**, with `resume` carrying the
+  extra rule above: kaijutsu's own agents may never call it.
+
+Recorded because the gate does not exist yet and the easy mistake, when it
+is added, is to gate the whole noun.
+
 ## Open
 
 - Should `quiesce` also cancel turns already running, or only refuse new
