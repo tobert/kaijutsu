@@ -102,17 +102,14 @@ items_filter="$(cat <<'ITEMS_FILTER_EOF'
 ITEMS_FILTER_EOF
 )"
 
-# `kj ledger signal add` refuses the literal `null` that an unresolved jq
-# field renders as, so the position travels as ready-made FLAGS rather than
-# as two values a later `case` has to guard. jq emits "" when a position is
-# unknown and the unquoted expansion contributes no argument at all --
-# `--stmt-seq` is never passed without a number behind it.
-seq_flags_filter="$(cat <<'SEQ_FLAGS_FILTER_EOF'
-[ (if (.stmt_seq // null) == null then empty else "--stmt-seq", (.stmt_seq|tostring) end),
-  (if (.cmd_seq // null) == null then empty else "--cmd-seq", (.cmd_seq|tostring) end) ]
-| join(" ")
-SEQ_FLAGS_FILTER_EOF
-)"
+# The clause position travels as two VALUES, and the call that carries them
+# is written out twice, because **kaish has no implicit word splitting**
+# (its own E012: "bare variable in for loop iterates once"). A string like
+# `--stmt-seq 0 --cmd-seq 0` expanded unquoted stays ONE argument, clap
+# refuses it, and the add fails -- silently, because the trace that reports
+# it is written with `kj block create`, which does not land from inside a
+# hook body (docs/issues.md, "A hook's skip paths are invisible"). Do not
+# refactor these two calls back into one with an interpolated flag string.
 items_rc=1
 if test -n "${KJ_TOOL_PLAN:-}"; then
   items="$(echo $KJ_TOOL_PLAN | jq -c --arg pk $plain_key --arg sp $sp $items_filter)"
@@ -139,7 +136,7 @@ fi
 cascade_url="${LFM2D_URL}/v1/cascade"
 models_url="${LFM2D_URL}/v1/models"
 payload="$(jq -cn --argjson clauses $clauses_json '{clauses: $clauses}')"
-resp="$(curl -X POST -H 'content-type: application/json' -d $payload --max-time 5 $cascade_url)"
+resp="$(curl -X POST -H 'content-type: application/json' -d $payload --max-time 15 $cascade_url)"
 curl_rc=$?
 if [[ "$curl_rc" -ne 0 ]]; then
   kj block create --kind trace --content "lfm2d-advisory: /v1/cascade unreachable (curl exit $curl_rc); skipping"
@@ -166,8 +163,21 @@ weight_hash="$(echo $resp | jq -r '.models[0].weight_hash')"
 winner_stmt="$(echo $items | jq -r --argjson i $winner_index '.[$i].stmt')"
 # Extracted to its own variable first: composing the index into the filter
 # string would need double quotes at both levels, which does not parse.
-winner_item=$(echo $items | jq -c --argjson i $winner_index '.[$i]')
-winner_seq_flags=$(echo $winner_item | jq -r $seq_flags_filter)
+# Both assignments take the `x="$(...)"` form the rest of this script uses,
+# and the quotes are load-bearing: kaish 0.16 binds a tool's typed `.data`
+# through an UNQUOTED substitution, so `x=$(jq ...)` yields a JSON value
+# rather than text, and the next command is handed an object it refuses.
+winner_item="$(echo $items | jq -c --argjson i $winner_index '.[$i]')"
+# `// empty` yields "" only for null/absent -- a position of 0 survives it,
+# because jq treats 0 as present.
+winner_stmt_seq="$(echo $winner_item | jq -r '.stmt_seq // empty')"
+winner_cmd_seq="$(echo $winner_item | jq -r '.cmd_seq // empty')"
+winner_seq_ok="no"
+if test -n "$winner_stmt_seq"; then
+  if test -n "$winner_cmd_seq"; then
+    winner_seq_ok="yes"
+  fi
+fi
 
 # -- read the severity ladder from /v1/models at call time (never
 # hard-coded: label vocabularies change between checkpoints -- lfm2d's own
@@ -192,7 +202,7 @@ winner_seq_flags=$(echo $winner_item | jq -r $seq_flags_filter)
 # replaces failed the other way, silently allowing.
 benign_label="${LFM2D_BENIGN_LABEL:-informative}"
 verdict="escalate"
-models_resp="$(curl --max-time 5 $models_url)"
+models_resp="$(curl --max-time 15 $models_url)"
 models_rc=$?
 if [[ "$models_rc" -eq 0 ]]; then
   label_index="$(echo $models_resp | jq -r --arg id $model_id --arg lbl $winner_label '(map(select(.id == $id)) | .[0].labels // []) as $labels | ($labels | index($lbl)) // -1')"
@@ -236,7 +246,14 @@ esac
 # In `escalate` mode this stays the audit record and the exit 3 below mints
 # the ask a human actually answers; the stderr line names this one so the
 # full signal set is one `kj ledger show` away.
-add_out="$(kj ledger signal add $winner_stmt --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $winner_label --score $winner_score $winner_seq_flags --verdict $verdict --auto-allow --json)"
+case "$winner_seq_ok" in
+  yes)
+    add_out="$(kj ledger signal add $winner_stmt --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $winner_label --score $winner_score --stmt-seq $winner_stmt_seq --cmd-seq $winner_cmd_seq --verdict $verdict --auto-allow --json)"
+    ;;
+  *)
+    add_out="$(kj ledger signal add $winner_stmt --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $winner_label --score $winner_score --verdict $verdict --auto-allow --json)"
+    ;;
+esac
 add_rc=$?
 if [[ "$add_rc" -ne 0 ]]; then
   kj block create --kind trace --content "lfm2d-advisory: kj ledger signal add --auto-allow failed: $add_out"
@@ -248,10 +265,9 @@ request_id="$(echo $add_out | jq -r '.request_id')"
 # ask. Kept conservative (verdict escalate) rather than re-deriving the
 # ordinal position per clause -- these are secondary annotations, and
 # escalate is the one verdict that can never read as a silent allow.
-# Field 4 carries this clause's position as ready-made flags, joined by the
-# same rule the winner uses -- built in jq rather than accumulated across
-# `case` arms inside the loop, because a variable assigned in a loop body
-# does not survive to the next statement in kaish.
+# Fields 4 and 5 carry this clause's position as two VALUES, empty when
+# unknown, and the add is written out twice for the same reason the winner's
+# is: kaish does not word-split, so a flag string cannot become arguments.
 tab="$(printf '\t')"
 other_filter="$(cat <<'SECONDARY_FILTER_EOF'
 .clauses[] as $c
@@ -260,8 +276,8 @@ other_filter="$(cat <<'SECONDARY_FILTER_EOF'
 | [ ($c.index|tostring),
     $c.top_severity,
     ($c.severity_scores[$c.top_severity]|tostring),
-    ([ (if ($it.stmt_seq // null) == null then empty else "--stmt-seq", ($it.stmt_seq|tostring) end),
-       (if ($it.cmd_seq // null) == null then empty else "--cmd-seq", ($it.cmd_seq|tostring) end) ] | join(" "))
+    (($it.stmt_seq // "") | tostring),
+    (($it.cmd_seq // "") | tostring)
   ]
 | join($tab)
 SECONDARY_FILTER_EOF
@@ -269,7 +285,14 @@ SECONDARY_FILTER_EOF
 for row in $(echo $resp | jq -r --argjson wi $winner_index --argjson items $items --arg tab $tab $other_filter); do
   c_label="$(echo $row | cut -f2)"
   c_score="$(echo $row | cut -f3)"
-  c_seq_flags="$(echo $row | cut -f4)"
+  c_stmt_seq="$(echo $row | cut -f4)"
+  c_cmd_seq="$(echo $row | cut -f5)"
+  c_seq_ok="no"
+  if test -n "$c_stmt_seq"; then
+    if test -n "$c_cmd_seq"; then
+      c_seq_ok="yes"
+    fi
+  fi
   c_skip=""
   case "$c_label" in
     ""|null) c_skip="label=$c_label" ;;
@@ -280,7 +303,14 @@ for row in $(echo $resp | jq -r --argjson wi $winner_index --argjson items $item
   if test -n "$c_skip"; then
     kj block create --kind trace --content "lfm2d-advisory: secondary signal skipped, unusable classifier value ($c_skip)"
   else
-    sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score $c_seq_flags --verdict escalate)"
+    case "$c_seq_ok" in
+      yes)
+        sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --stmt-seq $c_stmt_seq --cmd-seq $c_cmd_seq --verdict escalate)"
+        ;;
+      *)
+        sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --verdict escalate)"
+        ;;
+    esac
     sec_rc=$?
     case "$sec_rc" in
       0) ;;

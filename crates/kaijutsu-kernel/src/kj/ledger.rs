@@ -384,8 +384,8 @@ enum LedgerCommand {
 enum SignalCommand {
     /// Add one advisory signal from a scorer (a hook body calls this after
     /// scoring a command). With `--auto-allow`, creates a new ask that is
-    /// decided `allowed` in the same transaction — the log-only path: the
-    /// ask is recorded and never blocks on a human. With `--request-id <id>`,
+    /// decided `allowed` in the same transaction — the advisory path: the
+    /// ask records what a scorer read and never blocks on a human itself. With `--request-id <id>`,
     /// attaches the signal to an existing ask (a second scored command from
     /// the same statement lands on the ask the first one created). Exactly
     /// one of the two is required. A signal is advisory: nothing reads it to
@@ -439,7 +439,7 @@ enum SignalCommand {
         #[arg(long, value_enum)]
         verdict: SignalVerdictArg,
         /// Create a NEW ask, already decided `Allowed`, carrying this
-        /// signal — the log-only classifier path. Mutually exclusive with
+        /// signal — the advisory classifier path. Mutually exclusive with
         /// `--request-id`.
         #[arg(long = "auto-allow")]
         auto_allow: bool,
@@ -1102,7 +1102,7 @@ impl KjDispatcher {
     /// `kj ledger signal add` — see [`SignalCommand::Add`] for the full
     /// contract. `--auto-allow` and `--request-id` are validated mutually
     /// exclusive-and-required here rather than via clap's `ArgGroup`: the
-    /// error needs to name BOTH the missing choice and why (log-only vs.
+    /// error needs to name BOTH the missing choice and why (advisory vs.
     /// attach), which reads better as prose than as clap's generic
     /// "one of these is required" message.
     #[allow(clippy::too_many_arguments)]
@@ -1131,7 +1131,7 @@ impl KjDispatcher {
             }
             (false, None) => {
                 return KjResult::Err(
-                    "kj ledger signal add: give --auto-allow (create a new log-only ask) or \
+                    "kj ledger signal add: give --auto-allow (create a new advisory ask) or \
                      --request-id <id> (attach to an existing one)"
                         .to_string(),
                 );
@@ -1158,8 +1158,12 @@ impl KjDispatcher {
                         .to_string(),
                 );
             };
+            // "advisory", not "log-only": this ask records what a classifier
+            // read, and the caller may still escalate on it. Saying log-only
+            // told a human the call had been waved through, which stopped
+            // being true when S50 gained its escalate mode.
             let auto_reason = format!(
-                "{} (log-only)",
+                "{} (advisory)",
                 source_id.as_deref().unwrap_or("classifier")
             );
             let ask = NewAsk {

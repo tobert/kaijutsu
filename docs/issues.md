@@ -4283,8 +4283,26 @@ symlinked into the `coder`, `mcp`, and `lib` seats.
 **The scorer never denies, in any mode.** Exit 3 or exit 0, never exit 1. A
 `data-critical` verdict escalates exactly like an unresolvable one. A hard
 block from this classifier would be unappealable, and it cannot separate a
-true positive from a false one well enough to earn that. It may raise a
-prompt, never lower one, never decide.
+true positive from a false one well enough to earn that.
+
+**Where this is going, and it reverses the old "never lower a prompt" rule**
+(Amy, 2026-08-24): *"shell_write could get that small % of go aheads for
+confidently informative commands soon (when we're happy with lfm2d outputs).
+then we'll have a judge context look at it to let more % through, and
+gradually reduce the amount you or I have to approve as we build confidence
+& experience."*
+
+So the destination is lfm2d **lowering** prompts, not only raising them. The
+shell gate escalates 100% of `shell_write` today; the ladder down is:
+
+1. lfm2d auto-allows a small, confidently-`informative` slice.
+2. A judge context (the escalation seat, above) reviews more and widens it.
+3. The human-approval share shrinks as evidence accumulates.
+
+Until step 1 has evidence behind it, the rule in force stays "raise, never
+lower" — the hook cannot auto-allow anything, because the shell gate asks
+regardless. Step 1 is a change to the **shell gate's** rules, not to this
+hook: the hook has no power to lower a prompt the gate raises.
 
 **A scorer that is down leaves the baseline alone.** Unreachable, unparseable,
 or missing-field paths all exit 0 and write a trace block. lfm2d was evicted
@@ -4330,11 +4348,53 @@ at 0.540 and 0.644 while `git status` is 0.598 and `cargo test` is 0.601 — any
 threshold that catches `dd` escalates ordinary work. The signal is absent, not
 mis-scaled. Training data is the fix; a knob is not.
 
+### A hook's skip paths are invisible, and that cost an hour (2026-08-24)
+
+**`kj block create` from inside a kaish hook body does not land a visible
+block.** Every "scorer unavailable, skipping" path in S50 writes its trace
+that way, so all of them are silent — the hook can fail on every call and
+look exactly like a hook that decided to allow. Proven twice: a probe hook
+whose whole body was `kj block create --kind trace` produced no block, while
+an `exit 1` probe on the same path denied the call, so the hook was firing
+the whole time.
+
+Until there is a working channel, **probe a hook with its exit code, never
+with a block write**: 0 proceeds, 3 escalates with the stderr tail as the
+ask description, anything else denies. The exit-3 stderr is currently the
+only way to get data out of a hook body — that is what diagnosed the bug
+below.
+
+Related: a kaish **parse error** in a hook body escalates with the parse
+message as the ask description (`broker.rs:2327`), which is loud and good.
+A *runtime* skip is what disappears.
+
+### Fixed: a 5-second curl timeout made the hook silently inert (2026-08-24)
+
+S50 called `/v1/cascade` and `/v1/models` with `--max-time 5`. From inside
+the kernel the first call to lfm2d exceeded that (`curl_rc=28`) even though
+the same endpoint answers in 0.002s warm from a shell — measured `RC=0
+RLEN=3` from inside a hook once the timeout was raised to 25s, so it is slow
+on the kernel's path, not blocked. curl returned 28, the skip path wrote an
+invisible trace, and the hook exited 0. Every scored command stopped
+producing signals and it looked exactly like normal operation.
+
+Now `--max-time 15`. If the hot path proves too slow at that bound, the fix
+is a warm-up or a cached ladder, not a shorter timeout that reintroduces
+this.
+
+**Also fixed in the same pass:** two assignments used the unquoted
+`x=$(jq …)` form. kaish 0.16 binds a tool's typed `.data` through an
+unquoted substitution, so those yielded JSON values rather than text and the
+next command refused the argument. The `x="$(…)"` form the rest of the
+script uses is load-bearing, not style.
+
 ### Open
 
 - **Feed the false negatives back to the lfm2d lane** as a v10 training
   target: `dd`-shaped device writes, and the destructive `kj` verbs
-  (`context archive`, `block exclude`, `binding reset`).
+  (`context archive`, `block exclude`, `binding reset`). The lfm2d session
+  asked for the canonical verb list with destructiveness semantics to seed
+  a v10 probe family; they are on v10 slice 1 now.
 - **Widen the probe past N=16.** This is a start on the distribution this
   entry used to ask for, not the corpus.
 - **Escalation stalls a delegated coder.** The gate returns `Pending` and the
