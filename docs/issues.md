@@ -65,25 +65,20 @@ tables matched at evaluation time. On the broker, `subscriptions` and
 `resource_parents` were the only context-keyed state besides `bindings`
 itself, and both are now swept.
 
-## A quiesce flag for graceful restart (Amy, 2026-08-23)
+## `kj system` — quiesce, resume, stop, seppuku (designed 2026-08-24, unbuilt)
 
-Amy: *"I've also been thinking about a quiesce flag too, so we could have a
-graceful restart (quiesce would let tool calls finish, receive model turns in
-flight and record them, and flush sql and all that)."*
+**`docs/system-verbs.md` is canonical.** `status` and `ps` ship, gated on
+`Capability::System`; the stopping verbs are designed there with the
+enforcement point, the rc `shutdown` seam, and the capability split.
 
-The shape: a kernel mode that stops accepting new work, drains what is running,
-records the results durably, and then exits cleanly — so a development restart
-costs nothing that was mid-flight.
-
-**What quiesce cannot cover, and why that is fine.** A tool call and a model
-turn are bounded by machine time, so draining them terminates. An approval ask
-is bounded by *human* time, so it cannot be drained — quiesce cannot hold a
-restart open until someone wakes up. The two mechanisms are complements:
-quiesce saves the work that was running, and the boot-time abandon sweep
-honestly buries the asks that were waiting.
-
-This is the argument that made restart-surviving gate actions unnecessary; see
-`docs/gate-resume.md`.
+Kept here because the design doc does not carry it: **quiesce cannot cover
+an approval ask.** A tool call and a model turn are bounded by machine
+time, so draining them terminates. An ask is bounded by *human* time, so it
+cannot be drained — quiesce cannot hold a restart open until someone wakes
+up. The two mechanisms are complements: quiesce saves the work that was
+running, and the boot-time abandon sweep honestly buries the asks that were
+waiting. That is the argument that made restart-surviving gate actions
+unnecessary (`docs/gate-resume.md`).
 
 ## `kj rc reseed --overwrite` may clobber a concurrent edit (2026-08-23, UNVERIFIED)
 
