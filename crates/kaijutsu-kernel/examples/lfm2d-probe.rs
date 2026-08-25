@@ -479,6 +479,15 @@ struct MeasuredSignal {
     #[serde(default)]
     model_id: Option<String>,
     verdict: String,
+    /// Absent on the fallback path. The rc hook records a clause's position
+    /// only when it came from `KJ_TOOL_PLAN`; when kaish cannot plan the
+    /// command, the hook scores the whole raw command as one clause and has
+    /// no position to record. A null here is therefore the marker for
+    /// "this ask was scored without per-command granularity".
+    #[serde(default)]
+    stmt_seq: Option<i64>,
+    #[serde(default)]
+    cmd_seq: Option<i64>,
 }
 
 /// Mirrors one `{request_id, signals}` element of `kj ledger list
@@ -494,6 +503,12 @@ struct MeasuredRequest {
 struct ModelAgg {
     asks: u64,
     escalations: u64,
+    /// Asks scored from the whole raw command because kaish could not plan
+    /// it. Worth watching: the lfm2d lane measured this path firing 2.6% of
+    /// clauses against 0.16% on the plan path, so a rise here is a rise in
+    /// noise, and its cause is a kaish parse failure rather than anything
+    /// the classifier did.
+    fallback: u64,
 }
 
 /// A checkpoint below this many primary asks is not a measurement -- our
@@ -532,6 +547,9 @@ fn run_measured(path: &Path) -> Result<()> {
             if sig.verdict == "escalate" {
                 agg.escalations += 1;
             }
+            if sig.stmt_seq.is_none() || sig.cmd_seq.is_none() {
+                agg.fallback += 1;
+            }
         }
         if !saw_primary {
             no_primary += 1;
@@ -545,11 +563,17 @@ fn run_measured(path: &Path) -> Result<()> {
         );
     }
 
-    println!("{:<28} {:>8} {:>12} {:>8}", "model_id", "asks", "escalations", "rate");
-    println!("{}", "-".repeat(60));
+    println!(
+        "{:<28} {:>8} {:>12} {:>8} {:>10}",
+        "model_id", "asks", "escalations", "rate", "no-plan"
+    );
+    println!("{}", "-".repeat(71));
     for (model, agg) in &by_model {
         let rate = 100.0 * agg.escalations as f64 / agg.asks as f64;
-        println!("{model:<28} {:>8} {:>12} {rate:>7.1}%", agg.asks, agg.escalations);
+        println!(
+            "{model:<28} {:>8} {:>12} {rate:>7.1}% {:>10}",
+            agg.asks, agg.escalations, agg.fallback
+        );
     }
     println!();
     println!(
@@ -559,6 +583,15 @@ fn run_measured(path: &Path) -> Result<()> {
     );
     if no_primary > 0 {
         println!("{no_primary} request(s) carried no seq == 0 signal and were not counted.");
+    }
+    let fallback_total: u64 = by_model.values().map(|a| a.fallback).sum();
+    if fallback_total > 0 {
+        println!(
+            "{fallback_total} ask(s) were scored WITHOUT per-command granularity: kaish could \
+             not plan the command, so the hook scored the whole raw string as one clause. That \
+             path fires ~16x more often than the plan path, and the fix is the kaish parse \
+             failure, not the classifier."
+        );
     }
     for (model, agg) in &by_model {
         if agg.asks < MIN_ASKS_FOR_A_RATE {
