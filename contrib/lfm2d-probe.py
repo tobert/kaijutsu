@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Score kaijutsu's own clause families against the live lfm2d scorer.
 
+SUPERSEDED by `cargo run --example lfm2d-probe` (2026-08-25), which builds
+the same corpus from `kj_command()` reflection instead of the hand-typed
+list below -- 173 verbs and 48 alias pairs against this file's 22 and 10,
+with a test that fails when a new verb appears. This file is kept because
+the lfm2d lane uses `--aliases` as an acceptance test; switching is theirs
+to schedule. The generated corpus is committed at `contrib/kj-corpus.json`
+so no Rust toolchain is needed to read it.
+
+Known wrong here and right there: `kj block edit <id> --delete 3` does not
+parse. The real form is `kj block edit <id> delete --start 3 --end 4`.
+
+
 Sends clause TEXT to a classifier over HTTP and prints the scores. It runs
 none of the clauses locally, and it never writes to the kernel.
 

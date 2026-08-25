@@ -4499,6 +4499,53 @@ which signal decided.
 
 Until this is fixed, quote our escalation rate from `seq = 0` signals only.
 
+### The alias split is 18 of 48, and the head is scoring the English word (measured 2026-08-25, kube_ordinal_v10)
+
+The earlier finding in this file said ten destructive verbs have a second
+live spelling and six of the ten disagree. That was a hand-built list.
+Reflection over `kj_command()` finds **48 alias pairs**, and **18 of them
+disagree on argmax severity**. Each spelling is scored in its own request, so
+none of it is cascade aggregation.
+
+The correction that matters is not the count. It is that the split does not
+run "destructive verb reads cheaper through its alias." It runs in **both
+directions, and it lands on reads**:
+
+| operation | one spelling | the other |
+|---|---|---|
+| list workspaces (a read) | `workspace list` **dc 0.523** | `workspace ls` inf 0.165 |
+| list midi devices (a read) | `midi list` inf 0.193 | `midi ls` **dc 0.645** |
+| show an rc script (a read) | `rc show` **dc 0.516** | `rc cat` inf 0.200 |
+| show bindings (a read) | `binding show` **dc 0.462** | `binding list` inf 0.110 |
+| grant a capability | `binding allow` inf 0.413 | `binding grant` **dc 0.791** |
+| revoke a capability | `binding revoke` inf 0.166 | `binding deny` **dc 0.482** |
+| commit the stage | `stage commit` inf 0.345 | `stage go` **dc 0.648** |
+| remove a workspace | `workspace remove` **dc 0.752** | `workspace rm` sn 0.238 |
+
+`workspace list` and `midi list` are the pair that settles the diagnosis:
+the same word, `list`, scores data-critical on one verb and informative on
+another, and `ls` inverts it on both. **The head is scoring the English word
+in context, not the operation**, and it has no anchor for our vocabulary in
+either direction. Four of the eight rows above are pure reads that cannot
+change anything.
+
+Two consequences:
+
+- **The bypass argument survives and gets a second half.** `workspace
+  remove` dc 0.752 vs `workspace rm` sn 0.238 still means a band anywhere
+  between them auto-allows a confirm-gated permanent removal through its
+  alias. But the reverse error — a read at dc 0.523 — is the one costing us
+  asks *today*, because sn and dc both escalate and informative does not.
+- **A read-only allowlist would be doing real work, and it is derivable.**
+  `contrib/kj-expectations.toml` carries `mutates` for all 173 leaves, so
+  "auto-allow a `kj` verb we know cannot mutate" is a static claim checkable
+  against reflection, in the same way the `--help` bypass is. It needs no
+  threshold and no band. It is the same shape Amy sanctioned for `--help`
+  and is the obvious next candidate — `kj system ps` escalated at sn 0.416
+  the same afternoon, and it is a read.
+
+Reproduce: `cargo run --example lfm2d-probe -- --aliases`.
+
 ### Our own measured escalation rate, and why v10's is not yet quotable (2026-08-25)
 
 From `kj ledger list --signals --history --since 48h`, counting `seq = 0`
