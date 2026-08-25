@@ -4546,6 +4546,27 @@ Two consequences:
 
 Reproduce: `cargo run --example lfm2d-probe -- --aliases`.
 
+### Two pre-existing boot complaints, one of them a silent fallback (noticed 2026-08-25)
+
+Six lines on every kernel boot, identical across the 08:39 and 18:33 restarts,
+so neither is new. Recorded because one of them is the shape we say we do not
+ship.
+
+- **`api_key_file configured but unreadable; falling through to env`** for four
+  backends (`gemma-26b`, `gemma-e4b`, `openai-local`, `sd`), all pointing at
+  `~/.openai-key`, which does not exist. It warns and then silently uses a
+  different credential source. If the env var is also absent the failure moves
+  to first use, far from the cause. Either the path should be corrected in the
+  backends table or an unreadable `api_key_file` should be an error at load —
+  a configured credential source that cannot be read is a statement of intent,
+  not a hint.
+- **`external MCP server 'bevy_brp' ... failed to start: spawn: No such file or
+  directory`.** The binary is not on the kernel's PATH. This one already fails
+  loudly and names its own recovery (`kj mcp reload`), so it is only a stale
+  config entry.
+
+Neither blocks anything. The first is the one worth fixing.
+
 ### Our own measured escalation rate, and why v10's is not yet quotable (2026-08-25)
 
 From `kj ledger list --signals --history --since 48h`, counting `seq = 0`
