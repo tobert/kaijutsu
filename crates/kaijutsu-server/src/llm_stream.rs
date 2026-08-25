@@ -293,9 +293,13 @@ pub(crate) async fn spawn_llm_for_prompt(
     // enforcement point — every turn that reaches a provider passes through
     // here, autonomous and interactive alike (docs/system-verbs.md).
     //
-    // Read fresh from disk, and checked before any per-turn state is built:
-    // a refused turn must leave nothing behind to clean up. Turns already
-    // running are not touched; cancellation is rc's shutdown policy, not this.
+    // Read fresh from disk, and checked before this function builds any
+    // per-turn state — no interrupt state, no system prompt, no turn mark.
+    // An autonomous turn is the exception and not this function's to fix:
+    // `publish_turn_request` marks the turn begun before publishing, so a
+    // refusal here leaves that mark for the turn driver to clear on the
+    // error path, and the seed block it already wrote stays. Turns already
+    // running are not touched; cancellation is rc's shutdown policy.
     //
     // A read failure refuses. A kernel that cannot answer "am I stopped?" is
     // not one to start a turn on, and the flag is only ever set when

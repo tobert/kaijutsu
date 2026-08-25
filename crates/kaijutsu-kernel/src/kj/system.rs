@@ -138,7 +138,15 @@ impl KjDispatcher {
         // cached answer would be the one thing it must not give.
         let (pending, quiesced) = {
             let db = self.kernel_db().lock();
-            (db.list_pending_asks().unwrap_or_default(), db.quiesce_state())
+            (db.list_pending_asks(), db.quiesce_state())
+        };
+        // Both reads fail loudly. An operator reads this line during an
+        // incident, which is exactly when the database is most likely to be
+        // unhappy — and "asks waiting on a human: 0" from a failed read is
+        // the answer that gets someone to stop looking.
+        let pending = match pending {
+            Ok(p) => p,
+            Err(e) => return KjResult::Err(format!("kj system status: pending asks: {e}")),
         };
         let quiesced = match quiesced {
             Ok(q) => q,
@@ -178,9 +186,10 @@ impl KjDispatcher {
     /// Set the durable quiesce flag.
     ///
     /// Deliberately not idempotent in its *reporting*: re-quiescing succeeds
-    /// and replaces the reason, and says so, because an operator who runs it
+    /// and updates the reason, and says so, because an operator who runs it
     /// twice under pressure should learn the kernel was already stopped
     /// rather than get a silent success indistinguishable from the first.
+    /// The original stop time is kept — see `KernelDb::set_quiesced`.
     fn system_quiesce(&self, caller: &KjCaller, reason: Option<&str>) -> KjResult {
         let db = self.kernel_db().lock();
         let already = match db.quiesce_state() {

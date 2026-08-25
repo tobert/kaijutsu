@@ -494,6 +494,7 @@ CREATE TABLE IF NOT EXISTS kernel (
 CREATE TABLE IF NOT EXISTS system_quiesce (
     singleton   INTEGER NOT NULL PRIMARY KEY DEFAULT 1
         CHECK (singleton = 1),
+    -- Always supplied by the writer; the default is a floor, not the path.
     since       INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     quiesced_by BLOB    NOT NULL,
     reason      TEXT
@@ -1823,12 +1824,17 @@ impl KernelDb {
         }
     }
 
-    /// Set the flag. Re-quiescing an already-quiesced kernel replaces the row,
-    /// so the reason and principal describe the most recent decision.
+    /// Set the flag. Re-quiescing an already-quiesced kernel updates the
+    /// principal and reason but **keeps the original `since`**: "how long has
+    /// this kernel been stopped" is an incident-response question, and
+    /// correcting the reason must not erase the answer.
     pub fn set_quiesced(&self, by: PrincipalId, reason: Option<&str>) -> KernelDbResult<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO system_quiesce (singleton, since, quiesced_by, reason)
-             VALUES (1, ?1, ?2, ?3)",
+            "INSERT INTO system_quiesce (singleton, since, quiesced_by, reason)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 quiesced_by = excluded.quiesced_by,
+                 reason      = excluded.reason",
             params![now_millis(), blob_param(by.as_bytes()), reason],
         )?;
         Ok(())
@@ -4514,6 +4520,15 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Drop the quiesce table, so `quiesce_state` returns an error rather than
+    /// "not quiesced". The turn path fails closed on that error, and this is
+    /// the only way to reach that branch. Never compiled outside test builds.
+    #[cfg(test)]
+    pub(crate) fn poison_quiesce_table_for_test(&self) -> KernelDbResult<()> {
+        self.conn.execute_batch("DROP TABLE system_quiesce")?;
+        Ok(())
+    }
+
     /// Delete one oplog row, simulating the two states `block_content_at_seq`
     /// must refuse to paper over: a journal write that has claimed its seq but
     /// not yet committed (the TOCTOU window in `journal_op`), and a row lost
@@ -7126,13 +7141,24 @@ mod tests {
         assert_eq!(state.reason.as_deref(), Some("wake storm"));
         assert!(state.since_unix_ms > 0);
 
-        // Re-quiescing replaces rather than erroring on the singleton PK, and
-        // the newest decision is the one that shows.
+        // Re-quiescing updates rather than erroring on the singleton PK, and
+        // the newest decision is the one that shows — but the ORIGINAL stop
+        // time survives. Correcting a reason must not erase how long the
+        // kernel has been down.
+        let first_since = state.since_unix_ms;
         let who2 = PrincipalId::new();
         db.set_quiesced(who2, None).unwrap();
         let state = db.quiesce_state().unwrap().expect("still quiesced");
         assert_eq!(state.quiesced_by, who2);
         assert_eq!(state.reason, None);
+        assert_eq!(state.since_unix_ms, first_since, "re-quiesce reset the clock");
+
+        // A full resume/quiesce cycle DOES start a new clock — this is a new
+        // stop, not a correction of the old one.
+        assert!(db.clear_quiesced().unwrap());
+        db.set_quiesced(who2, None).unwrap();
+        let restarted = db.quiesce_state().unwrap().expect("quiesced again");
+        assert!(restarted.since_unix_ms >= first_since);
 
         // clear() reports whether it changed anything, so `resume` can tell
         // "resumed" from "was already running".
@@ -7165,6 +7191,22 @@ mod tests {
         drop(db);
         let db = KernelDb::open(&path).unwrap();
         assert!(db.quiesce_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn quiesce_read_failure_is_an_error_not_a_running_kernel() {
+        // The turn path refuses when this read fails, and that decision only
+        // makes sense if the failure is distinguishable from "not quiesced".
+        // A read that degraded to None would start the turn an operator was
+        // stopping — the one outcome the flag exists to prevent.
+        let db = KernelDb::temporary().unwrap();
+        assert!(db.quiesce_state().unwrap().is_none());
+
+        db.poison_quiesce_table_for_test().unwrap();
+        assert!(
+            db.quiesce_state().is_err(),
+            "a failed quiesce read must error, never report a running kernel"
+        );
     }
 
     #[test]
