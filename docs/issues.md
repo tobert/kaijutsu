@@ -4567,6 +4567,47 @@ ship.
 
 Neither blocks anything. The first is the one worth fixing.
 
+### A kaish parse failure degrades the gate, and it looked like a classifier problem (found 2026-08-25)
+
+When `KJ_TOOL_PLAN` is unavailable, `S50-lfm2d.kai` falls back to scoring the
+whole raw command as one clause. The lfm2d lane measured both paths in live
+traffic: **the plan path fires on 0.16% of clauses, the fallback on 2.6%** —
+about 16x — and six of v10's seven noise firings in Amy's sessions came from
+the fallback, on 31 `parse` returns out of 198 rows.
+
+**The cause is a kaish 0.16.0 lexer rule, reproduced here.** A bareword
+argument that ends in `=`, or carries a second `=`, is rejected as token
+pasting:
+
+```
+kaish --plan 'ps -o etime=,pcpu='   # EXIT 2
+kaish --plan 'echo a='              # EXIT 2
+kaish --plan 'echo a=b=c'           # EXIT 2
+kaish --plan 'echo a=b'             # ok
+kaish --plan "echo 'a=b,c=d'"       # ok — quoting is the workaround
+```
+
+Exactly one `=` with a non-empty value parses; a trailing `=` or any second
+`=` does not. Reported to the kaish lane with the repro; not ours to fix.
+
+**The lesson is the coupling, and it is the reusable part.** A parse rejection
+in one tool did not just fail one command — it silently moved a downstream
+gate onto a 16x noisier path, and from inside kaijutsu that looks exactly like
+a classifier getting worse. Neither lane could see it alone: we had the
+fallback, they had the firing rates, and only splitting the measurement by
+path connected them. **When a signal degrades, check whether its input path
+changed before concluding anything about the model.**
+
+**We had no visibility into our own fallback, and now we do.** The hook's
+fallback branch reports itself with `kj block create`, which does not land
+from inside a hook body — so every fallback was invisible. The marker turns
+out to be structural: the hook records a clause position only for plan-path
+clauses, so a `seq = 0` signal with a null `stmt_seq`/`cmd_seq` *is* a
+fallback ask. `--measured` reports it as a `no-plan` column.
+
+Our own 48-hour window reads **0 of 189** — this seat never hit it, so those
+parse failures were in Amy's other sessions.
+
 ### Our own measured escalation rate, and why v10's is not yet quotable (2026-08-25)
 
 From `kj ledger list --signals --history --since 48h`, counting `seq = 0`
