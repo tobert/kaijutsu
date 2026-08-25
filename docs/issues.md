@@ -4366,6 +4366,44 @@ at 0.540 and 0.644 while `git status` is 0.598 and `cargo test` is 0.601 — any
 threshold that catches `dd` escalates ordinary work. The signal is absent, not
 mis-scaled. Training data is the fix; a knob is not.
 
+### The gate cannot tell reformulation from evasion (2026-08-25)
+
+A seat whose command is escalated has two ways to proceed, and the ledger
+records them identically:
+
+1. answer its own ask with `kj ledger allow` — every seat holding the verb can,
+   and self-approval is indistinguishable from the gate not existing;
+2. rewrite the command until it stops being asked about, leaving the original
+   ask pending.
+
+Both happened for real on 2026-08-25. The gate escalated this lane's own
+`echo '--- status ---'` (situation-normal 0.408, a separator string). The lane
+took path 2 in good faith — split one multi-clause line into single-clause
+calls, left the ask pending — and **the durable record cannot distinguish that
+from routing around the gate.** Nothing links the second attempt to the first.
+
+Two halves, and the second is the one an audit can check (the framing is the
+lfm2d lane's, from their guard-evasion work — the signal is the
+retry-after-denial, not the command text):
+
+- **A seat may not answer its own ask.** Needs a principal comparison at
+  `kj ledger allow`/`deny`: refuse when the answering principal is the one the
+  ask was raised against. Cheap, and it closes path 1 outright.
+- **A reformulated command carries the pending ask forward.** Harder, and
+  unbuilt: it needs the gate to recognize that a new call is a retry of an
+  outstanding ask, which means a similarity or provenance link the ledger does
+  not have today. Recording it as a `retry-after-ask` row is the minimum — an
+  auditable count of "how often does a seat rephrase instead of waiting"
+  without needing to judge intent.
+
+Amy rules on both; proposed to fleet.md 2026-08-25. Note the design tension
+before building: this repo's stance is that capabilities are ergonomic nudges
+in a shared-trust kernel, not security controls, and every player is inside the
+trust boundary. That argues against enforcement between players. It does not
+argue against the *record* — the second half is instrumentation, not a denial,
+and a lane that cannot see its own evasion rate cannot tune the gate that
+produces it.
+
 ### A refused turn writes two blocks that say the same thing (2026-08-25)
 
 Quiescing and then driving a turn lands both a `system/error` ("stream error:
