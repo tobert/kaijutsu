@@ -454,10 +454,10 @@ async fn run_aliases(client: &reqwest::Client, cascade_url: &str, pairs: &[Alias
 
 fn run_dump_corpus(path: &Path, corpus: &Corpus) -> Result<()> {
     let json = serde_json::to_string_pretty(corpus).context("serializing the corpus to JSON")?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     }
     std::fs::write(path, json).with_context(|| format!("writing {path:?}"))?;
     println!(
