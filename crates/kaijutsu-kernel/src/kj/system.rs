@@ -5,10 +5,17 @@
 //! journal. That is the wrong instrument: the log says what happened, not
 //! what is happening, and it costs a search under time pressure.
 //!
-//! `status` answers it in one line; `ps` gives the roster. Both are
-//! read-only, and deliberately land before the stopping verbs
-//! (`quiesce`, `resume`, `seppuku` — `docs/system-verbs.md`), because
-//! those are only safe to use if you can see whether they took effect.
+//! `status` answers it in one line; `ps` gives the roster. `quiesce` and
+//! `resume` are the stopping pair, and they came second on purpose: a stop
+//! is only safe to use if you can see whether it took effect.
+//!
+//! ## Quiesced means writes land and turns do not start
+//!
+//! Blocks, ledger answers and config edits are RPC → SQL → disk and inert
+//! on their own, so quiesce never gates them. What stops is the kernel
+//! acting: turns. Turns already running finish — cancellation is rc's
+//! `shutdown` policy, not this. The flag is durable, because a stop that
+//! did not outlive the process would not be one. `docs/system-verbs.md`.
 //!
 //! ## Kaijutsu's processes, not the host's
 //!
@@ -49,13 +56,23 @@ pub(crate) struct SystemArgs {
 
 #[derive(Subcommand, Debug)]
 enum SystemCommand {
-    /// Summarize what the kernel is working on: how many turns are in
-    /// flight and how many asks are waiting on a human.
+    /// Report whether the kernel is quiesced, how many turns are in flight,
+    /// and how many asks are waiting on a human.
     Status,
     /// List the kernel's own processes: turns in flight and the child
     /// processes kaijutsu spawned, longest-running first. Not the host's
     /// process table.
     Ps,
+    /// Stop the kernel from starting turns. Writes keep landing and turns
+    /// already running finish; only new turns are refused. The flag is
+    /// durable, so it survives a restart until `resume` clears it.
+    Quiesce {
+        /// Why the kernel was stopped, shown to whoever finds it quiesced.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Clear the quiesce flag so turns start again.
+    Resume,
 }
 
 /// Render a duration the way a process table should: short, fixed-ish
@@ -98,6 +115,8 @@ impl KjDispatcher {
         match parsed.command {
             SystemCommand::Status => self.system_status(caller),
             SystemCommand::Ps => self.system_ps(caller),
+            SystemCommand::Quiesce { reason } => self.system_quiesce(caller, reason.as_deref()),
+            SystemCommand::Resume => self.system_resume(caller),
         }
     }
 
@@ -114,23 +133,105 @@ impl KjDispatcher {
 
     fn system_status(&self, _caller: &KjCaller) -> KjResult {
         let turns = self.kernel().turns_in_flight();
-        let pending = {
+        // One lock, both reads. The quiesce flag comes from disk every time:
+        // status is what an operator checks to see whether a stop took, so a
+        // cached answer would be the one thing it must not give.
+        let (pending, quiesced) = {
             let db = self.kernel_db().lock();
-            db.list_pending_asks().unwrap_or_default()
+            (db.list_pending_asks().unwrap_or_default(), db.quiesce_state())
+        };
+        let quiesced = match quiesced {
+            Ok(q) => q,
+            Err(e) => return KjResult::Err(format!("kj system status: quiesce flag: {e}")),
         };
 
         // Turns and asks are counted separately, never summed: a turn is
         // bounded by machine time and will end on its own, an ask is
         // bounded by human time and will not.
-        let lines = vec![
-            format!("turns in flight: {}", turns.len()),
-            format!("asks waiting on a human: {}", pending.len()),
-        ];
+        // The flag leads, because it changes what every other number means:
+        // turns in flight on a quiesced kernel are the ones finishing, not
+        // the ones starting.
+        let mut lines = vec![match &quiesced {
+            Some(q) => {
+                let since = elapsed(std::time::Duration::from_millis(
+                    now_unix_ms().saturating_sub(q.since_unix_ms),
+                ));
+                match q.reason.as_deref() {
+                    Some(r) => format!("QUIESCED for {since} — no turns start. Reason: {r}"),
+                    None => format!("QUIESCED for {since} — no turns start."),
+                }
+            }
+            None => "running".to_string(),
+        }];
+        lines.push(format!("turns in flight: {}", turns.len()));
+        lines.push(format!("asks waiting on a human: {}", pending.len()));
         let data = serde_json::json!({
+            "quiesced": quiesced.is_some(),
+            "quiesced_since_unix_ms": quiesced.as_ref().map(|q| q.since_unix_ms),
+            "quiesce_reason": quiesced.as_ref().and_then(|q| q.reason.clone()),
             "turns_in_flight": turns.len(),
             "asks_pending": pending.len(),
         });
         KjResult::ok_ephemeral_with_data(lines.join("\n"), ContentType::Plain, data)
+    }
+
+    /// Set the durable quiesce flag.
+    ///
+    /// Deliberately not idempotent in its *reporting*: re-quiescing succeeds
+    /// and replaces the reason, and says so, because an operator who runs it
+    /// twice under pressure should learn the kernel was already stopped
+    /// rather than get a silent success indistinguishable from the first.
+    fn system_quiesce(&self, caller: &KjCaller, reason: Option<&str>) -> KjResult {
+        let db = self.kernel_db().lock();
+        let already = match db.quiesce_state() {
+            Ok(q) => q,
+            Err(e) => return KjResult::Err(format!("kj system quiesce: {e}")),
+        };
+        if let Err(e) = db.set_quiesced(caller.principal_id, reason) {
+            return KjResult::Err(format!("kj system quiesce: {e}"));
+        }
+        drop(db);
+
+        // Turns already running are untouched — naming them is the honest
+        // answer to "did that stop everything?", which is no.
+        let running = self.kernel().turns_in_flight().len();
+        let mut line = if already.is_some() {
+            "already quiesced; reason updated".to_string()
+        } else {
+            "quiesced — no new turns start".to_string()
+        };
+        if running > 0 {
+            line.push_str(&format!(
+                " ({running} turn(s) already running will finish; `kj system ps` lists them)"
+            ));
+        }
+        KjResult::ok_ephemeral_with_data(
+            line,
+            ContentType::Plain,
+            serde_json::json!({ "quiesced": true, "was_quiesced": already.is_some(), "turns_in_flight": running }),
+        )
+    }
+
+    /// Clear the flag. Reports whether it was actually set, so "resumed" and
+    /// "was already running" are distinguishable.
+    fn system_resume(&self, _caller: &KjCaller) -> KjResult {
+        let cleared = {
+            let db = self.kernel_db().lock();
+            match db.clear_quiesced() {
+                Ok(c) => c,
+                Err(e) => return KjResult::Err(format!("kj system resume: {e}")),
+            }
+        };
+        let line = if cleared {
+            "resumed — turns start again"
+        } else {
+            "already running; nothing to resume"
+        };
+        KjResult::ok_ephemeral_with_data(
+            line.to_string(),
+            ContentType::Plain,
+            serde_json::json!({ "quiesced": false, "was_quiesced": cleared }),
+        )
     }
 
     /// The same roster `kj system ps` renders, for the `ps` shell builtin

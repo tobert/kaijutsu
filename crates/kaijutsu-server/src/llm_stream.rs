@@ -288,6 +288,61 @@ pub(crate) async fn spawn_llm_for_prompt(
     let kernel_arc = kernel.kernel.clone();
     let kernel_db = kernel.kernel_db.clone();
     let conversation_cache = kernel.conversation_cache.clone();
+
+    // Quiesce: the kernel accepts writes but starts no turns. This is the one
+    // enforcement point — every turn that reaches a provider passes through
+    // here, autonomous and interactive alike (docs/system-verbs.md).
+    //
+    // Read fresh from disk, and checked before any per-turn state is built:
+    // a refused turn must leave nothing behind to clean up. Turns already
+    // running are not touched; cancellation is rc's shutdown policy, not this.
+    //
+    // A read failure refuses. A kernel that cannot answer "am I stopped?" is
+    // not one to start a turn on, and the flag is only ever set when
+    // something has already gone wrong.
+    let quiesce = {
+        let db = kernel_db.lock();
+        db.quiesce_state()
+    };
+    let quiesced = match quiesce {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("quiesce flag read failed: {e}; refusing the turn");
+            return Err(capnp::Error::failed(format!(
+                "cannot read the quiesce flag, so no turn starts: {e}"
+            )));
+        }
+    };
+    if let Some(state) = quiesced {
+        let reason = match state.reason.as_deref() {
+            Some(r) => format!(" Reason: {r}."),
+            None => String::new(),
+        };
+        // Writes land while quiesced, so this explanation reaches the
+        // conversation even though the turn does not run.
+        let _ = documents
+            .insert_block_as(
+                context_id,
+                None,
+                Some(after_block_id),
+                kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Text,
+                &format!(
+                    "The kernel is quiesced, so no turn starts.{reason} Writes still \
+                     land — anything you or anyone else writes is saved and will be \
+                     here when turns resume. `kj system status` shows the flag; \
+                     `kj system resume` clears it."
+                ),
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+                Some(PrincipalId::system()),
+            )
+            .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
+        return Err(capnp::Error::failed(
+            "the kernel is quiesced — no turn starts; `kj system resume` clears it".into(),
+        ));
+    }
+
     // Create a fresh interrupt state for this prompt (replaces any previous entry).
     // The generation counter prevents the race where stream A's cleanup removes
     // stream B's interrupt state.

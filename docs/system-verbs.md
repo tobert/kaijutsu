@@ -5,8 +5,9 @@ it to stop doing. It exists because the only lever that used to work was
 `systemctl restart`, and that loses every turn in flight, every background
 job, and any chance of looking at what went wrong.
 
-Status: `kj system status` ships. `quiesce`, `resume`, and `seppuku` are
-designed here and unbuilt.
+Status: `kj system status`, `ps`, `quiesce` and `resume` ship. `seppuku` and
+`stop` are designed here and unbuilt, as is the rc `shutdown` verb that
+`quiesce` will call once it exists.
 
 ## The definition everything follows from
 
@@ -244,14 +245,31 @@ shadow should render a refusal that names the alternative (drift a
 question) rather than the roster. The `privileged` flag already threaded
 through `kj/context_shell.rs` is the switch.
 
+## Settled while building
+
+**Quiesce refuses new turns and does not cancel running ones** (Amy,
+2026-08-25). Cancellation is rc's `shutdown` policy, where it can differ by
+model tier; keeping it out of quiesce meant the flag touched no in-flight
+machinery at all. The consequence to be honest about: quiesce alone would not
+have stopped the 14 concurrent turns of 2026-08-24 — it stops the 15th.
+Stopping the running ones needs the rc `shutdown` verb, or seppuku.
+
+**The flag lives in `kernel_db`**, in its own singleton table
+(`system_quiesce`). Absence of the row is the running state, so a fresh
+database runs and `resume` is a `DELETE`. Every read goes to disk: the flag is
+set precisely when something has gone wrong, and a cached "running" would
+start the turn the operator was stopping.
+
+**A read failure refuses the turn.** A kernel that cannot answer "am I
+stopped?" is not one to start a turn on.
+
+**`status` reports the flag first**, because it changes what the other numbers
+mean — turns in flight on a quiesced kernel are the ones finishing, not the
+ones starting.
+
 ## Open
 
-- Should `quiesce` also cancel turns already running, or only refuse new
-  ones? Leaning: refuse new ones only, and let rc's shutdown hooks decide
-  about the running ones. That keeps quiesce non-destructive and gives
-  seppuku a clear job — but it means quiesce alone would not have stopped
-  the 14 concurrent turns of 2026-08-24.
-- Where does the durable flag live? `kernel_db` is the obvious home; it
-  must be readable at boot before any driver spawns.
-- Does `status` report the flag? It should, or you cannot tell a quiet
-  kernel from a stopped one.
+- `quiesce` does not yet run the `shutdown` rc hooks; that arrives with the rc
+  verb. Until then it is purely the flag.
+- `seppuku` and `stop` remain unbuilt. `stop` still needs the FlowBus hop for
+  the turn half — `ContextInterruptState` lives in `kaijutsu-server`.

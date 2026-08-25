@@ -205,6 +205,24 @@ the flag; and all of `fork`, `drive`, `play`, `cp`, `drift push/pull/merge/flush
 | `kj fork` | Fork the current context into a child | yes | no |
 | `kj drive` | Clock one autonomous turn on a context | yes | no |
 | `kj wait` | Wait for a context's turn to finish and report what it produced | no | no |
+| `kj system status` | Report whether the kernel is quiesced, how many turns are in flight, and how many asks are waiting on a human | no | no |
+| `kj system ps` | List the kernel's own processes: turns in flight and the child processes kaijutsu spawned, longest-running first | no | no |
+| `kj system quiesce` | Stop the kernel from starting turns. Writes keep landing and turns already running finish | yes | no |
+| `kj system resume` | Clear the quiesce flag so turns start again | yes | no |
+
+### `kj system` is gated by authority, not by `--confirm`
+
+The whole `system` noun — `status` and `ps` included — requires
+`Capability::System`, checked once in `dispatch_system` before the subcommand
+runs. `quiesce` mutates durable state (a singleton row) and is not
+confirm-gated, which is deliberate: it is the verb an operator reaches for
+during an incident, and a confirmation round trip is exactly the friction that
+sends someone to `kill -9` instead. It is also cheaply reversible — `kj system
+resume` clears it — which is the property `--confirm` exists to protect and
+this verb does not need.
+
+This is the clearest example in the corpus of the two mechanisms being
+orthogonal: high authority, no confirmation, low regret.
 
 ## Where help text and code disagree
 

@@ -450,6 +450,20 @@ pub struct ContextEdgeRow {
     pub created_at: i64,
 }
 
+/// The kernel is quiesced: it accepts writes but starts no turns.
+///
+/// Held only while the flag is set — the running kernel has no
+/// `QuiesceState`, which is why every read returns an `Option`.
+#[derive(Debug, Clone)]
+pub struct QuiesceState {
+    pub since_unix_ms: u64,
+    pub quiesced_by: PrincipalId,
+    /// What the operator said they were stopping. Optional, and worth
+    /// asking for: whoever finds the kernel quiesced is usually not the
+    /// person who quiesced it.
+    pub reason: Option<String>,
+}
+
 // ============================================================================
 // Schema
 // ============================================================================
@@ -467,6 +481,22 @@ CREATE TABLE IF NOT EXISTS kernel (
     founder    BLOB    NOT NULL,
     label      TEXT,
     created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
+
+-- ── Quiesce (singleton; the row's absence means running) ────────
+-- A row here means the kernel is quiesced: it accepts writes but starts no
+-- turns. Blocks, ledger answers and config edits still land — a write is
+-- inert on its own. Absence of the row is the running state, so a fresh
+-- database runs and `resume` is a DELETE.
+--
+-- The flag is durable because the stop has to outlive the process: a kernel
+-- that came back running is not an emergency stop. See docs/system-verbs.md.
+CREATE TABLE IF NOT EXISTS system_quiesce (
+    singleton   INTEGER NOT NULL PRIMARY KEY DEFAULT 1
+        CHECK (singleton = 1),
+    since       INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    quiesced_by BLOB    NOT NULL,
+    reason      TEXT
 );
 
 -- ── Workspaces ──────────────────────────────────────────────────
@@ -1766,6 +1796,51 @@ impl KernelDb {
         Ok(approval_ledger::ask::undelivered_answers(
             self.conn_for_ledger(),
         )?)
+    }
+
+    // ========================================================================
+    // Quiesce
+    // ========================================================================
+
+    /// The quiesce flag as it is on disk right now, or `None` when the kernel
+    /// is running.
+    ///
+    /// Every caller reads it fresh. There is no cached copy on purpose: the
+    /// flag is set precisely when something has gone wrong, and a stale
+    /// "running" would start the turn the operator was stopping.
+    pub fn quiesce_state(&self) -> KernelDbResult<Option<QuiesceState>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT since, quiesced_by, reason FROM system_quiesce WHERE singleton = 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(QuiesceState {
+                since_unix_ms: row.get::<_, i64>(0)? as u64,
+                quiesced_by: read_principal_id(row, 1)?,
+                reason: row.get(2)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the flag. Re-quiescing an already-quiesced kernel replaces the row,
+    /// so the reason and principal describe the most recent decision.
+    pub fn set_quiesced(&self, by: PrincipalId, reason: Option<&str>) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO system_quiesce (singleton, since, quiesced_by, reason)
+             VALUES (1, ?1, ?2, ?3)",
+            params![now_millis(), blob_param(by.as_bytes()), reason],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the flag. Returns true when the kernel was quiesced, so a caller
+    /// can tell "resumed" from "was already running" without a second read.
+    pub fn clear_quiesced(&self) -> KernelDbResult<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM system_quiesce WHERE singleton = 1", [])?;
+        Ok(rows > 0)
     }
 
     pub(crate) fn conn_for_ledger(&self) -> &Connection {
@@ -7035,6 +7110,62 @@ fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiesce_flag_defaults_clear_and_roundtrips() {
+        let db = KernelDb::temporary().unwrap();
+
+        // A fresh kernel runs. Absence of the row IS the running state, so
+        // this also proves the schema does not seed one.
+        assert!(db.quiesce_state().unwrap().is_none());
+
+        let who = PrincipalId::new();
+        db.set_quiesced(who, Some("wake storm")).unwrap();
+        let state = db.quiesce_state().unwrap().expect("quiesced");
+        assert_eq!(state.quiesced_by, who);
+        assert_eq!(state.reason.as_deref(), Some("wake storm"));
+        assert!(state.since_unix_ms > 0);
+
+        // Re-quiescing replaces rather than erroring on the singleton PK, and
+        // the newest decision is the one that shows.
+        let who2 = PrincipalId::new();
+        db.set_quiesced(who2, None).unwrap();
+        let state = db.quiesce_state().unwrap().expect("still quiesced");
+        assert_eq!(state.quiesced_by, who2);
+        assert_eq!(state.reason, None);
+
+        // clear() reports whether it changed anything, so `resume` can tell
+        // "resumed" from "was already running".
+        assert!(db.clear_quiesced().unwrap());
+        assert!(db.quiesce_state().unwrap().is_none());
+        assert!(!db.clear_quiesced().unwrap());
+    }
+
+    #[test]
+    fn quiesce_flag_survives_reopen() {
+        // The whole reason the flag is durable: a kernel that came back
+        // running is not an emergency stop. Restart is simulated by dropping
+        // the connection and opening the same file again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let who = PrincipalId::new();
+
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.set_quiesced(who, Some("seppuku")).unwrap();
+        }
+
+        let db = KernelDb::open(&path).unwrap();
+        let state = db.quiesce_state().unwrap().expect("still quiesced after reopen");
+        assert_eq!(state.quiesced_by, who);
+        assert_eq!(state.reason.as_deref(), Some("seppuku"));
+
+        // And resume is durable in the same direction.
+        assert!(db.clear_quiesced().unwrap());
+        drop(db);
+        let db = KernelDb::open(&path).unwrap();
+        assert!(db.quiesce_state().unwrap().is_none());
+    }
 
     #[test]
     fn fork_kind_from_sql_fails_loud_on_unknown() {
