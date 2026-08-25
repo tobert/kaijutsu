@@ -262,9 +262,18 @@ fi
 request_id="$(echo $add_out | jq -r '.request_id')"
 
 # -- attach every other scored command as a secondary signal on the same
-# ask. Kept conservative (verdict escalate) rather than re-deriving the
-# ordinal position per clause -- these are secondary annotations, and
-# escalate is the one verdict that can never read as a silent allow.
+# ask, each carrying the verdict ITS OWN label earns on the ladder. The
+# decision belongs to seq 0 alone; a secondary is a record of what the
+# classifier said about a clause that did not drive the ask.
+#
+# These were stamped `escalate` unconditionally, on the reasoning that
+# escalate can never read as a silent allow. That is right for a decision
+# column and wrong for a record: an auto-allowed two-clause call then
+# carried one honest allow and one fiction, and counting the column gave
+# 21.3% where the ask-level rate was 4.2%. Re-deriving costs one jq call
+# per clause against the ladder already fetched above. See docs/issues.md,
+# "The ledger cannot be counted".
+#
 # Fields 4 and 5 carry this clause's position as two VALUES, empty when
 # unknown, and the add is written out twice for the same reason the winner's
 # is: kaish does not word-split, so a flag string cannot become arguments.
@@ -300,15 +309,30 @@ for row in $(echo $resp | jq -r --argjson wi $winner_index --argjson items $item
   case "$c_score" in
     ""|null) c_skip="score=$c_score" ;;
   esac
+  # Same ladder, same two conditions as the winner's verdict above: index 0
+  # AND the label matches the benign name, or it is not an allow. An
+  # unresolvable ladder leaves `escalate`, which is what this whole hook
+  # defaults to when it cannot tell.
+  c_verdict="escalate"
+  if [[ "$models_rc" -eq 0 ]]; then
+    c_index="$(echo $models_resp | jq -r --arg id $model_id --arg lbl $c_label '(map(select(.id == $id)) | .[0].labels // []) as $labels | ($labels | index($lbl)) // -1')"
+    if [[ "$c_index" -eq 0 ]]; then
+      if [[ "$c_label" = "$benign_label" ]]; then
+        c_verdict="allow"
+      fi
+    elif [[ "$c_index" -eq $((label_count - 1)) ]]; then
+      c_verdict="deny"
+    fi
+  fi
   if test -n "$c_skip"; then
     kj block create --kind trace --content "lfm2d-advisory: secondary signal skipped, unusable classifier value ($c_skip)"
   else
     case "$c_seq_ok" in
       yes)
-        sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --stmt-seq $c_stmt_seq --cmd-seq $c_cmd_seq --verdict escalate)"
+        sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --stmt-seq $c_stmt_seq --cmd-seq $c_cmd_seq --verdict $c_verdict)"
         ;;
       *)
-        sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --verdict escalate)"
+        sec_out="$(kj ledger signal add $winner_stmt --request-id $request_id --source-id lfm2d --model-id $model_id --weight-hash $weight_hash --label $c_label --score $c_score --verdict $c_verdict)"
         ;;
     esac
     sec_rc=$?

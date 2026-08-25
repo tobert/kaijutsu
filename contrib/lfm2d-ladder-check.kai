@@ -1,0 +1,67 @@
+# Exercises the ordinal-ladder verdict derivation from
+# `assets/defaults/rc/lib/create/S50-lfm2d.kai` against canned /v1/models
+# bodies. Contacts no service, touches no kernel, and runs anywhere kaish does:
+#
+#     kaish contrib/lfm2d-ladder-check.kai     # exits 0, or 1 naming the case
+#
+# `check` RETURNS non-zero and the caller accumulates. It does not `exit`:
+# kaish runs `exit` inside a function body without stopping the script, so an
+# exiting check prints FAIL and still leaves the script at 0 — a test that
+# cannot fail. Verified against kaish 0.16.
+#
+# The hook itself cannot be unit-tested — it runs inside a live kernel behind a
+# gate — so this covers the one decision in it that a wrong answer makes
+# silent: which verdict a label earns from its position on the ladder.
+#
+# Keep it in step with the hook. If the two-condition rule there changes, this
+# file changes with it, and the v6 case below is the one that must never pass.
+fails=0
+
+check() {
+  # $1 label, $2 expected verdict, $3 models body, $4 model id
+  c_label="$1"
+  expected="$2"
+  models_resp="$3"
+  model_id="$4"
+  benign_label="informative"
+  label_count=3
+  c_verdict="escalate"
+  c_index="$(echo $models_resp | jq -r --arg id $model_id --arg lbl $c_label '(map(select(.id == $id)) | .[0].labels // []) as $labels | ($labels | index($lbl)) // -1')"
+  if [[ "$c_index" -eq 0 ]]; then
+    if [[ "$c_label" = "$benign_label" ]]; then
+      c_verdict="allow"
+    fi
+  elif [[ "$c_index" -eq $((label_count - 1)) ]]; then
+    c_verdict="deny"
+  fi
+  if [[ "$c_verdict" = "$expected" ]]; then
+    echo "ok   $model_id $c_label (index $c_index) -> $c_verdict"
+  else
+    echo "FAIL $model_id $c_label (index $c_index) -> $c_verdict, expected $expected"
+    return 1
+  fi
+}
+
+# A severity-ordered ladder, which is what every checkpoint from v8 on ships.
+v10='[{"id":"kube_ordinal_v10","labels":["informative","situation-normal","data-critical"]}]'
+check informative      allow    "$v10" kube_ordinal_v10 || fails=1
+check situation-normal escalate "$v10" kube_ordinal_v10 || fails=1
+check data-critical    deny     "$v10" kube_ordinal_v10 || fails=1
+# A label the ladder does not carry resolves to index -1 and must escalate.
+# Reaching `allow` here is the failure that reads as no gate at all.
+check bogus-label      escalate "$v10" kube_ordinal_v10 || fails=1
+
+# kube_ordinal_v6 is a live rollback target and orders its labels
+# ALPHABETICALLY, which puts the most destructive one at index 0. Position
+# alone would auto-allow exactly the commands the hook exists to catch; the
+# benign-name match is what stops it. This case is the regression guard for
+# the fail-open that shipped and was fixed in d2ce85ed.
+v6='[{"id":"kube_ordinal_v6","labels":["data-critical","informative","situation-normal"]}]'
+check data-critical    escalate "$v6" kube_ordinal_v6 || fails=1
+check informative      escalate "$v6" kube_ordinal_v6 || fails=1
+
+if [[ "$fails" -ne 0 ]]; then
+  echo "ladder check FAILED"
+  exit 1
+fi
+echo "all ladder cases pass"
