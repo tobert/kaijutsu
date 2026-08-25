@@ -4593,12 +4593,14 @@ main, not only on 0.16.0**, and added `env FOO=` and `--define=k=v` as the
 shapes that make it ordinary usage rather than selector syntax. Not ours to
 fix.
 
-**Their diagnosis is sharper than "the message is badly worded."** That text
-is a real verdict about token pasting, and their PR #413 tightened the
-machinery so it cannot author a verdict it has not earned. `ps -o etime=` has
-no adjacency in it at all — so something upstream is classifying a single word
-as two, and the message is a symptom of that misclassification rather than
-the bug itself.
+**Their diagnosis is sharper than "the message is badly worded," but hold the
+second half as a hypothesis.** Established: that text is a real verdict about
+token pasting, their PR #413 tightened the machinery so it cannot author a
+verdict it has not earned, and `ps -o etime=` contains no adjacency at all.
+*Their read, explicitly flagged by them as not yet checked:* something
+upstream is classifying a single word as two, making the message a symptom
+rather than the bug. What would settle it is where the word gets split, and
+nobody has looked. Do not repeat it as a finding.
 
 **The lesson is the coupling, and it is the reusable part.** A parse rejection
 in one tool did not just fail one command — it silently moved a downstream
@@ -4624,6 +4626,18 @@ against committing an rc script the kernel cannot parse — an rc script only
 fails when a context is created, far from the edit that broke it — and it is
 offered to the kaish lane as a real corpus to test a candidate lexer change
 against.
+
+It earned its keep the same evening: the kaish lane ran it against their
+`fix/dash-zero-render` branch and got 71/71 unchanged from baseline, which
+goes into that PR as a corroborating result. Their own framing of why it was
+worth having — that change makes a leading-zero numeral text everywhere a word
+is text and an error in the three positions needing a real number, and
+"synthetic tests cover those positions well and real scripts cover them
+differently."
+
+**Keep the script free of kernel, config and network.** That is what let a
+sibling lane point `KAISH=` at their own build and run it without touching
+this tree, and it is the property that makes it useful to anyone but us.
 
 ### Our own measured escalation rate, and why v10's is not yet quotable (2026-08-25)
 

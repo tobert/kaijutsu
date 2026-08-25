@@ -10,6 +10,12 @@
 # far from the edit that broke it. For the kaish lane it is a real corpus to
 # test a candidate lexer change against, which beats synthetic cases.
 #
+# KEEP THIS FREE OF KERNEL, CONFIG AND NETWORK. `KAISH=<path>` pointing at a
+# branch build, with nothing else in the path, is what lets a sibling lane run
+# this against their own kaish without touching this tree -- and that is the
+# only reason it is useful to anyone but us. It is also why the version banner
+# above prints: it is how a caller confirms which binary actually ran.
+#
 # A parse failure here is not always ours. kaish 0.16 rejects a bareword that
 # ends in `=` or carries a second `=` (`ps -o etime=,pcpu=`), so a script can
 # fail on a line that is correct POSIX. Read the message before editing the
