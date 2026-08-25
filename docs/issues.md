@@ -4581,14 +4581,24 @@ pasting:
 
 ```
 kaish --plan 'ps -o etime=,pcpu='   # EXIT 2
-kaish --plan 'echo a='              # EXIT 2
-kaish --plan 'echo a=b=c'           # EXIT 2
+kaish --plan 'env FOO='             # EXIT 2
+kaish --plan 'echo --define=k=v'    # EXIT 2
 kaish --plan 'echo a=b'             # ok
 kaish --plan "echo 'a=b,c=d'"       # ok — quoting is the workaround
 ```
 
 Exactly one `=` with a non-empty value parses; a trailing `=` or any second
-`=` does not. Reported to the kaish lane with the repro; not ours to fix.
+`=` does not. Reported to the kaish lane, who **confirmed it on their current
+main, not only on 0.16.0**, and added `env FOO=` and `--define=k=v` as the
+shapes that make it ordinary usage rather than selector syntax. Not ours to
+fix.
+
+**Their diagnosis is sharper than "the message is badly worded."** That text
+is a real verdict about token pasting, and their PR #413 tightened the
+machinery so it cannot author a verdict it has not earned. `ps -o etime=` has
+no adjacency in it at all — so something upstream is classifying a single word
+as two, and the message is a symptom of that misclassification rather than
+the bug itself.
 
 **The lesson is the coupling, and it is the reusable part.** A parse rejection
 in one tool did not just fail one command — it silently moved a downstream
@@ -4607,6 +4617,13 @@ fallback ask. `--measured` reports it as a `no-plan` column.
 
 Our own 48-hour window reads **0 of 189** — this seat never hit it, so those
 parse failures were in Amy's other sessions.
+
+`contrib/kai-parse-check.sh` plan-checks every `.kai` in the repo (71 files,
+all passing) and exits 1 listing the failures with their offsets. It guards
+against committing an rc script the kernel cannot parse — an rc script only
+fails when a context is created, far from the edit that broke it — and it is
+offered to the kaish lane as a real corpus to test a candidate lexer change
+against.
 
 ### Our own measured escalation rate, and why v10's is not yet quotable (2026-08-25)
 
