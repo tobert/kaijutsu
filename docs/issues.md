@@ -4396,13 +4396,25 @@ retry-after-denial, not the command text):
   auditable count of "how often does a seat rephrase instead of waiting"
   without needing to judge intent.
 
-Amy rules on both; proposed to fleet.md 2026-08-25. Note the design tension
-before building: this repo's stance is that capabilities are ergonomic nudges
-in a shared-trust kernel, not security controls, and every player is inside the
-trust boundary. That argues against enforcement between players. It does not
-argue against the *record* — the second half is instrumentation, not a denial,
-and a lane that cannot see its own evasion rate cannot tune the gate that
-produces it.
+**The shared-trust tension has an answer, and it survives scrutiny.** This
+repo's stance is that capabilities are ergonomic nudges in a shared-trust
+kernel, not security controls, and every player is inside the trust boundary —
+which argues against enforcement between players. Both halves clear it, for
+different reasons (the argument is the lfm2d lane's, made against their own
+proposal at our request):
+
+- The `retry-after-ask` row is **a measurement of the gate, not a control on a
+  player.** What it protects is the gate's own tuning loop: escalation and
+  pass-through rates are biased by exactly the calls that got rephrased out of
+  them, so without the record *a low escalation rate is indistinguishable from
+  a well-evaded one.* That argument holds even in a kernel with no enforcement
+  between players at all.
+- The principal check at `kj ledger allow` **is** enforcement, but it is
+  enforcement against a seat answering *itself* — which shared trust never
+  promised anyone. Trusting your neighbor is not the same as being your own
+  neighbor.
+
+Amy rules on both; proposed to fleet.md 2026-08-25.
 
 ### A refused turn writes two blocks that say the same thing (2026-08-25)
 
