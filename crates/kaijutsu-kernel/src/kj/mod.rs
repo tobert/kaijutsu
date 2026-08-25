@@ -19,6 +19,7 @@ pub mod cache;
 pub mod cas;
 pub mod cast;
 pub mod cc;
+pub mod corpus;
 pub mod cp;
 pub mod config;
 pub mod context;
@@ -858,7 +859,7 @@ pub(crate) fn clap_help_for<T: clap::CommandFactory>() -> KjResult {
 /// list below must mirror `dispatch`'s match arms (see
 /// docs/monday-clap-upgrades.md §2.1). Aliases (`ctx`, `ws`) ride on the
 /// respective `*Args` as `visible_alias` so kaish's leaf-walker matches them.
-pub(crate) fn kj_command() -> clap::Command {
+pub fn kj_command() -> clap::Command {
     use clap::CommandFactory;
     clap::Command::new("kj")
         .about("Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.")
