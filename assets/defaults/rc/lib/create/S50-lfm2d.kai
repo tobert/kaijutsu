@@ -130,6 +130,46 @@ if [[ "$n_clauses" -eq 0 ]]; then
   exit 0
 fi
 
+# -- a call whose every clause is a `kj` help invocation proceeds without
+# being scored. clap resolves help before dispatch, so the verb never runs
+# and there is nothing for a classifier to be right or wrong about. The
+# scorer reads these as ordinary commands -- `kj rc edit --help` scored
+# situation-normal 0.367 under v10 and asked a human about a help screen.
+#
+# The rule is deliberately narrow, and the narrowness is the whole point:
+#
+#   * the first word is `kj`, because this claim rests on clap's behavior
+#     and we only know clap governs our own surface. `cargo test --help`
+#     is not covered.
+#   * `--help` or `-h` is the LAST word.
+#   * no word between them starts with `-`.
+#
+# That third condition is what makes it safe rather than convenient. A
+# word-scan for `--help` anywhere is a real bypass: `kj rc edit <path>
+# --content --help` binds `--help` as the content VALUE (the field is
+# `allow_hyphen_values`), so clap prints nothing and the write runs for
+# real. Covered by contrib/lfm2d-ladder-check.kai, which asserts that exact
+# clause is NOT treated as help.
+#
+# A mixed call is scored in full: one real clause anywhere means the whole
+# call is scored, so nothing hides behind a help clause.
+dash="-"
+help_filter="$(cat <<'HELP_FILTER_EOF'
+[ .[] | .clause | (. / $sp) as $w
+  | ( ($w|length) >= 2
+      and ($w[0] == $kj)
+      and (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
+      and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) ) ] | all
+HELP_FILTER_EOF
+)"
+all_help="$(echo $items | jq -r --arg sp $sp --arg dash $dash --arg kj kj --arg help help $help_filter)"
+all_help_rc=$?
+if [[ "$all_help_rc" -eq 0 ]]; then
+  case "$all_help" in
+    true) exit 0 ;;
+  esac
+fi
+
 # -- score the clauses. Never -L (CU8: egress is checked on the initial
 # URL only); a non-2xx prints its body and exits 0 -- check the body, not
 # the curl exit code, for that case.
