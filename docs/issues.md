@@ -4366,6 +4366,24 @@ at 0.540 and 0.644 while `git status` is 0.598 and `cargo test` is 0.601 — any
 threshold that catches `dd` escalates ordinary work. The signal is absent, not
 mis-scaled. Training data is the fix; a knob is not.
 
+### A refused turn writes two blocks that say the same thing (2026-08-25)
+
+Quiescing and then driving a turn lands both a `system/error` ("stream error:
+autonomous turn failed to run for this context: … the kernel is quiesced") and
+a `system/text` explanation carrying the reason and the "writes still land"
+guidance. Verified live on the quiesce probe.
+
+Neither is wrong and the pair is house precedent — the Staging guard in
+`spawn_llm_for_prompt` does exactly the same thing, block plus `Err`. But two
+blocks saying one thing is noise in the context of the model that caused it,
+and `BlockKind::Error` text is prose we ship to models.
+
+The fix is one block, not two, and the choice is which channel keeps it: fold
+the reason into the returned error so the error block carries everything, or
+keep the explanation block and let the error stay terse. Whichever wins should
+change the Staging guard the same way, since the redundancy is the pattern
+rather than this one call.
+
 ### A hook's skip paths are invisible, and that cost an hour (2026-08-24)
 
 **`kj block create` from inside a kaish hook body does not land a visible
