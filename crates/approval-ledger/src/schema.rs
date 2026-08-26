@@ -399,6 +399,38 @@ CREATE TABLE IF NOT EXISTS approval_events (
     PRIMARY KEY (request_id, seq)
 );
 
+-- ── Refused answer attempts ────────────────────────────────────────────
+-- An answer this crate refused on an invariant, which therefore committed
+-- nothing else. Today the one reason is `self_approval`: the answering
+-- context is the context that raised the ask (`docs/gate-and-shell-split.md`,
+-- "No self-approval — the gate's own answer path"). A refusal that is only
+-- returned to its caller is invisible to the measurement the gate is tuned
+-- on, so it lands here.
+--
+-- A separate table rather than another `approval_events.kind`: `migrate` is
+-- built entirely from `CREATE ... IF NOT EXISTS` and has no ALTER-TABLE path,
+-- so widening that column's CHECK would never reach a database that already
+-- ran an earlier `migrate()`, and the INSERT would then fail a constraint the
+-- new code cannot see. A new table needs no migration machinery at all — the
+-- same reasoning `approval_redemptions` below is built on.
+--
+-- `reason` carries no CHECK on purpose. The set of refusal reasons is
+-- expected to grow, and a value-enum CHECK here would inherit the very
+-- no-ALTER trap this table exists to route around.
+CREATE TABLE IF NOT EXISTS approval_refusals (
+    request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    reason         TEXT    NOT NULL,
+    -- Nullable for symmetry with `approval_events.actor`: a refusal can be
+    -- recorded for an answerer that named no context, and `actor_context` is
+    -- then exactly what was missing.
+    actor          BLOB,
+    actor_context  BLOB,
+    created_at     INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (request_id, seq)
+);
+
 -- ── Approval redemptions (single-use consumption of an ALLOWED ask) ────
 -- Whether an `allowed` ask has already authorized its one execution
 -- (`docs/gate-resume.md`'s single-use redemption: an allowed ask must

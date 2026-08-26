@@ -87,10 +87,29 @@ pub use schema::migrate;
 pub(crate) mod fixtures {
     use rusqlite::Connection;
 
+    use crate::decide::Answerer;
     use crate::types::{
         NewAsk, NewOption, NewPlanCommand, NewPlanStatement, NewPlanVar, NewPlannedValue, Origin,
         VarBinding,
     };
+
+    /// The context `minimal_ask` raises its ask from. An answer carrying
+    /// this context is a self-approval and must be refused.
+    pub(crate) const ASKING_CONTEXT: &[u8] = &[1, 2, 3, 4];
+
+    /// A different seat. Peer-seat approval is permitted, so an answer from
+    /// here is the ordinary success path.
+    pub(crate) const PEER_CONTEXT: &[u8] = &[7, 7, 7, 7];
+
+    /// An answerer in another context — what a human in a second shell is.
+    pub(crate) fn peer(principal: &'static [u8]) -> Answerer<'static> {
+        Answerer { principal, context: Some(PEER_CONTEXT) }
+    }
+
+    /// An answerer in the context that raised the ask.
+    pub(crate) fn author(principal: &'static [u8]) -> Answerer<'static> {
+        Answerer { principal, context: Some(ASKING_CONTEXT) }
+    }
 
     pub(crate) fn open_memory() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory sqlite");
@@ -100,7 +119,7 @@ pub(crate) mod fixtures {
 
     pub(crate) fn minimal_ask() -> NewAsk {
         NewAsk {
-            context_id: vec![1, 2, 3, 4],
+            context_id: ASKING_CONTEXT.to_vec(),
             principal_id: vec![9, 9, 9],
             origin: Origin::ShellGate,
             instance: Some("builtin.shell".into()),

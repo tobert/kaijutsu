@@ -314,7 +314,7 @@ fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<RuleRow> {
 mod tests {
     use crate::ask::{create_auto_allowed_ask, create_ask};
     use crate::decide::{DecideInput, decide};
-    use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
+    use crate::fixtures::{ask_with_statement, minimal_ask, open_memory, peer};
     use crate::types::{AskVerdict, NewSignal, SignalSourceKind, SignalVerdict, VarBinding};
 
     use super::*;
@@ -362,7 +362,7 @@ mod tests {
     }
 
     fn decided_allowed(conn: &Connection, request_id: &str) {
-        decide(conn, request_id, DecideInput { allow: true, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
+        decide(conn, request_id, DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
     }
 
     #[test]

@@ -30,17 +30,75 @@ const APPROVAL_COLUMNS: &str = "request_id, context_id, principal_id, origin, in
      expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option, \
      remember_scope, auto_reason";
 
+/// Who is answering, and from where.
+///
+/// An answer that carries an identity must also name the context it came
+/// from, so [`ensure_not_self_approval`] cannot be skipped by a caller that
+/// simply forgets to pass one. The auto-decision path opts out by carrying no
+/// `Answerer` at all — which is the same signal the ledger already uses to
+/// tell a classifier's decision from a person's (`crate::ask::list_history`).
+#[derive(Clone, Copy, Debug)]
+pub struct Answerer<'a> {
+    /// Stored as `approvals.decided_by`.
+    pub principal: &'a [u8],
+    /// The answering context, compared against `approvals.context_id`.
+    /// `None` is refused: a caller that cannot name its context cannot show
+    /// it is not the author.
+    pub context: Option<&'a [u8]>,
+}
+
 /// What a decide call is presenting. `decided_by` is `None` for an
 /// auto-decision (a matching [`crate::rules::RuleRow`] fired) and `Some`
-/// for a human's answer — either way `auto_reason` and `decided_by` are
-/// stored as given, so a read-back can always tell which happened.
+/// for a human's answer — either way `auto_reason` and the stored
+/// `decided_by` reflect what was given, so a read-back can always tell which
+/// happened.
 #[derive(Debug, Default)]
 pub struct DecideInput<'a> {
     pub allow: bool,
-    pub decided_by: Option<&'a [u8]>,
+    pub decided_by: Option<Answerer<'a>>,
     pub decided_option: Option<&'a str>,
     pub remember_scope: Option<&'a str>,
     pub auto_reason: Option<&'a str>,
+}
+
+/// Refuse an answer from the context that raised the ask — no self-approval
+/// (`docs/gate-and-shell-split.md`, "No self-approval — the gate's own answer
+/// path"). Peer contexts may answer each other; only the author is refused.
+///
+/// Call this **before claiming**. [`decide`] calls it too, so the invariant
+/// holds for every caller, but a claim taken first would leave the ask
+/// `claimed` by the one seat that may not answer it — locking out the seats
+/// that may.
+///
+/// Every refusal appends an `approval_refusals` row before returning
+/// [`LedgerError::SelfApproval`]: a refusal that is only returned to its
+/// caller is invisible to the measurement the gate is tuned on.
+pub fn ensure_not_self_approval(
+    conn: &Connection,
+    request_id: &str,
+    answerer: Answerer<'_>,
+) -> Result<()> {
+    let Some(row) = crate::ask::get_approval(conn, request_id)? else {
+        return Err(LedgerError::NotFound(request_id.to_string()));
+    };
+
+    let reason = match answerer.context {
+        Some(ctx) if ctx != row.context_id.as_slice() => return Ok(()),
+        Some(_) => "this context raised the ask",
+        None => "the answer names no context",
+    };
+
+    events::append_refusal(
+        conn,
+        request_id,
+        "self_approval",
+        Some(answerer.principal),
+        answerer.context,
+    )?;
+    Err(LedgerError::SelfApproval {
+        request_id: request_id.to_string(),
+        reason,
+    })
 }
 
 /// Decide a `pending` or `claimed` ask. On success, `status` becomes
@@ -53,6 +111,16 @@ pub struct DecideInput<'a> {
 /// [`LedgerError::AlreadyDecided`] — the history is recorded, never
 /// silently dropped and never silently applied (guarantee 6).
 pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result<ApprovalRow> {
+    // The backstop, not the primary check: a caller should call this before
+    // claiming (see [`ensure_not_self_approval`]). Here it guarantees the
+    // invariant for every caller regardless. An auto-decision carries no
+    // `Answerer` and is untouched — a classifier is a different system from
+    // the one that raised the ask.
+    if let Some(answerer) = input.decided_by {
+        ensure_not_self_approval(conn, request_id, answerer)?;
+    }
+
+    let decided_by = input.decided_by.map(|a| a.principal);
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let now = now_millis();
     let new_status = if input.allow { "allowed" } else { "denied" };
@@ -68,7 +136,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             params![
                 new_status,
                 now,
-                input.decided_by,
+                decided_by,
                 input.decided_option,
                 input.remember_scope,
                 input.auto_reason,
@@ -83,7 +151,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             &tx,
             request_id,
             EventKind::Decided,
-            input.decided_by,
+            decided_by,
             input.decided_option,
             input.remember_scope,
             input.auto_reason,
@@ -112,7 +180,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
                 &tx,
                 request_id,
                 EventKind::LateDecision,
-                input.decided_by,
+                decided_by,
                 input.decided_option,
                 input.remember_scope,
                 input.auto_reason,
@@ -303,7 +371,8 @@ pub fn redeem_ask(conn: &Connection, request_id: &str) -> Result<bool> {
 mod tests {
     use crate::ask::{create_ask, get_approval, list_events};
     use crate::error::LedgerError;
-    use crate::fixtures::{minimal_ask, open_memory};
+    use crate::ask::list_refusals;
+    use crate::fixtures::{ASKING_CONTEXT, PEER_CONTEXT, author, minimal_ask, open_memory, peer};
     use crate::types::{ApprovalStatus, EventKind};
 
     use super::*;
@@ -316,7 +385,7 @@ mod tests {
         let row = decide(
             &conn,
             &request_id,
-            DecideInput { allow: true, decided_by: Some(b"alice"), decided_option: Some("allow_once"), ..Default::default() },
+            DecideInput { allow: true, decided_by: Some(peer(b"alice")), decided_option: Some("allow_once"), ..Default::default() },
         )
         .unwrap();
         assert_eq!(row.status, ApprovalStatus::Allowed);
@@ -332,7 +401,7 @@ mod tests {
     fn decide_deny_is_not_allowed() {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
-        let row = decide(&conn, &request_id, DecideInput { allow: false, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
+        let row = decide(&conn, &request_id, DecideInput { allow: false, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
         assert_eq!(row.status, ApprovalStatus::Denied);
         assert!(!row.status.is_allowed());
     }
@@ -376,7 +445,7 @@ mod tests {
         let err = decide(
             &conn,
             &request_id,
-            DecideInput { allow: true, decided_by: Some(b"late-alice"), decided_option: Some("allow_once"), ..Default::default() },
+            DecideInput { allow: true, decided_by: Some(peer(b"late-alice")), decided_option: Some("allow_once"), ..Default::default() },
         )
         .unwrap_err();
         assert!(matches!(&err, LedgerError::AlreadyDecided { status, .. } if status == "expired"));
@@ -606,9 +675,9 @@ mod tests {
     fn sweep_does_not_touch_an_undelivered_allowed_or_denied_ask() {
         let conn = open_memory();
         let allowed = create_ask(&conn, &minimal_ask()).unwrap();
-        decide(&conn, &allowed, DecideInput { allow: true, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
+        decide(&conn, &allowed, DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
         let denied = create_ask(&conn, &minimal_ask()).unwrap();
-        decide(&conn, &denied, DecideInput { allow: false, decided_by: Some(b"alice"), ..Default::default() }).unwrap();
+        decide(&conn, &denied, DecideInput { allow: false, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
 
         let count = abandon_unresolved_on_restart(&conn, "kernel restarted").unwrap();
         assert_eq!(count, 0, "no pending rows exist, so nothing should be swept");
@@ -676,4 +745,163 @@ mod tests {
         assert_eq!(events[0].kind, EventKind::Abandoned);
         assert_eq!(events[0].note.as_deref(), Some("kernel restarted; nothing ran; ask again"));
     }
+
+    // ── No self-approval ────────────────────────────────────────────────
+    // `docs/gate-and-shell-split.md`, "No self-approval — the gate's own
+    // answer path". The author of an ask may not answer it; a peer may.
+
+    /// Falsified by dropping the `ensure_not_self_approval` call from
+    /// `decide`: the decide returns Ok and the ask reads `allowed`.
+    #[test]
+    fn the_context_that_raised_an_ask_cannot_answer_it() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let err = decide(
+            &conn,
+            &request_id,
+            DecideInput { allow: true, decided_by: Some(author(b"the-asker")), ..Default::default() },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, LedgerError::SelfApproval { reason, .. } if *reason == "this context raised the ask"),
+            "expected a SelfApproval refusal, got: {err}"
+        );
+        // Nothing decided, and nothing consumed: the ask is still answerable
+        // by a seat that may answer it.
+        let row = get_approval(&conn, &request_id).unwrap().unwrap();
+        assert_eq!(row.status, ApprovalStatus::Pending);
+        assert!(row.decided_by.is_none());
+    }
+
+    /// Peer-seat approval is permitted on purpose (Amy, 2026-08-26) — the
+    /// rule bans answering *yourself*, not answering for someone else.
+    #[test]
+    fn a_different_context_may_answer() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let row = decide(
+            &conn,
+            &request_id,
+            DecideInput { allow: true, decided_by: Some(peer(b"a-neighbor")), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(row.status, ApprovalStatus::Allowed);
+        assert!(list_refusals(&conn, &request_id).unwrap().is_empty());
+    }
+
+    /// Fails closed: an answerer that cannot name its context cannot show it
+    /// is not the author, so it is refused exactly like the author is.
+    /// Falsified by treating `context: None` as "not the author" — the
+    /// decide succeeds and this trips.
+    #[test]
+    fn an_answer_that_names_no_context_is_refused() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let err = decide(
+            &conn,
+            &request_id,
+            DecideInput {
+                allow: true,
+                decided_by: Some(Answerer { principal: b"contextless", context: None }),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, LedgerError::SelfApproval { reason, .. } if *reason == "the answer names no context"),
+            "expected a SelfApproval refusal naming the missing context, got: {err}"
+        );
+        assert_eq!(get_approval(&conn, &request_id).unwrap().unwrap().status, ApprovalStatus::Pending);
+    }
+
+    /// A refusal that is only returned to its caller is invisible to the
+    /// measurement the gate is tuned on, so every refusal lands a row.
+    /// Falsified by dropping the `append_refusal` call: the table is empty.
+    #[test]
+    fn a_refused_self_approval_is_recorded_with_who_and_from_where() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        for _ in 0..2 {
+            decide(
+                &conn,
+                &request_id,
+                DecideInput { allow: true, decided_by: Some(author(b"the-asker")), ..Default::default() },
+            )
+            .unwrap_err();
+        }
+
+        let refusals = list_refusals(&conn, &request_id).unwrap();
+        assert_eq!(refusals.len(), 2, "every attempt is recorded, not just the first");
+        assert_eq!(refusals[0].seq, 0);
+        assert_eq!(refusals[1].seq, 1);
+        assert_eq!(refusals[0].reason, "self_approval");
+        assert_eq!(refusals[0].actor.as_deref(), Some(&b"the-asker"[..]));
+        assert_eq!(refusals[0].actor_context.as_deref(), Some(ASKING_CONTEXT));
+
+        // A refusal is not an event: nothing was claimed, decided, or
+        // late-decided, so `approval_events` stays empty.
+        assert!(list_events(&conn, &request_id).unwrap().is_empty());
+    }
+
+    /// The classifier chain is a different system from the model that raised
+    /// the ask, so an auto-decision is never a self-approval — even though it
+    /// decides an ask its own context raised. It carries no `Answerer` at
+    /// all, which is the same signal that already separates it from a
+    /// person's answer.
+    #[test]
+    fn an_auto_decision_from_the_asking_context_is_not_a_self_approval() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let row = decide(
+            &conn,
+            &request_id,
+            DecideInput {
+                allow: true,
+                decided_by: None,
+                auto_reason: Some("a standing rule covered every statement"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(row.status, ApprovalStatus::Allowed);
+        assert!(row.decided_by.is_none(), "no identity decided this");
+        assert!(list_refusals(&conn, &request_id).unwrap().is_empty());
+    }
+
+    /// The guard is callable before `claim`, which is how the kj verb uses it
+    /// — a claim taken first would leave the ask `claimed` by the one seat
+    /// that may not answer it, locking out every seat that may.
+    #[test]
+    fn the_guard_refuses_without_claiming_and_a_peer_can_still_claim() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        ensure_not_self_approval(&conn, &request_id, author(b"the-asker")).unwrap_err();
+
+        // Still `pending`, so a peer's claim wins normally.
+        let claimed = crate::claim::claim(&conn, &request_id, b"a-neighbor").unwrap();
+        assert_eq!(claimed.status, ApprovalStatus::Claimed);
+        assert_eq!(
+            ensure_not_self_approval(&conn, &request_id, peer(b"a-neighbor")).is_ok(),
+            true,
+            "a peer context passes the guard"
+        );
+        assert_eq!(PEER_CONTEXT, &[7, 7, 7, 7]);
+    }
+
+    /// An unknown request is `NotFound`, not a refusal — a caller must be able
+    /// to tell "you may not answer this" from "there is nothing here".
+    #[test]
+    fn the_guard_reports_an_unknown_ask_as_not_found() {
+        let conn = open_memory();
+        let err = ensure_not_self_approval(&conn, "no-such-ask", peer(b"a-neighbor")).unwrap_err();
+        assert!(matches!(err, LedgerError::NotFound(_)), "got: {err}");
+    }
+
 }

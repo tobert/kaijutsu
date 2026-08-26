@@ -16,7 +16,7 @@ use crate::events;
 use crate::time::now_millis;
 use crate::types::{
     ApprovalRow, AskStatementRow, EventKind, EventRow, NewAsk, NewPlanStatement, NewPlannedValue,
-    Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow, PlannedValueRow,
+    Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow, PlannedValueRow, RefusalRow,
     SignalRow, SignalSourceKind, SignalVerdict, ValueKind, VarBinding, parse_enum,
 };
 
@@ -582,6 +582,28 @@ pub fn list_events(conn: &Connection, request_id: &str) -> Result<Vec<EventRow>>
                 auto_reason: row.get(5)?,
                 note: row.get(6)?,
                 created_at: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every refused answer attempt on one ask, oldest first. The measurement
+/// side of the no-self-approval invariant: without this, a low escalation
+/// rate is indistinguishable from a gate everyone answered themselves.
+pub fn list_refusals(conn: &Connection, request_id: &str) -> Result<Vec<RefusalRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, reason, actor, actor_context, created_at
+         FROM approval_refusals WHERE request_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt
+        .query_map(params![request_id], |row| {
+            Ok(RefusalRow {
+                seq: row.get(0)?,
+                reason: row.get(1)?,
+                actor: row.get(2)?,
+                actor_context: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

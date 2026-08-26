@@ -504,6 +504,18 @@ pub struct EventRow {
     pub created_at: i64,
 }
 
+/// One `approval_refusals` row — an answer this crate refused on an
+/// invariant. `reason` is free text by design (`schema::DDL`); today the
+/// only value written is `self_approval`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusalRow {
+    pub seq: i64,
+    pub reason: String,
+    pub actor: Option<Vec<u8>>,
+    pub actor_context: Option<Vec<u8>>,
+    pub created_at: i64,
+}
+
 /// A reconstructed plan value (argument or redirect target).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -782,6 +782,27 @@ impl KjDispatcher {
             let db = self.kernel_db.lock();
             let conn = db.conn_for_ledger();
             let principal = caller.principal_id.as_bytes();
+            let context = caller.context_id.map(|c| c.as_bytes().to_vec());
+            let answerer = approval_ledger::decide::Answerer {
+                principal,
+                context: context.as_deref(),
+            };
+
+            // No self-approval, checked BEFORE the claim. `decide` enforces it
+            // too, but a claim taken first would leave the ask `claimed` by the
+            // one seat that may not answer it, locking out every seat that may.
+            // Nothing has committed on this path, so it returns without
+            // announcing.
+            if let Err(e) =
+                approval_ledger::decide::ensure_not_self_approval(conn, request_id, answerer)
+            {
+                return match e {
+                    LedgerError::NotFound(_) => {
+                        KjResult::Err(format!("kj ledger: no such ask {request_id}"))
+                    }
+                    e => KjResult::Err(format!("kj ledger: {e}")),
+                };
+            }
 
             match approval_ledger::claim::claim(conn, request_id, principal) {
                 Ok(_) => {}
@@ -808,7 +829,7 @@ impl KjDispatcher {
                 request_id,
                 approval_ledger::decide::DecideInput {
                     allow,
-                    decided_by: Some(principal),
+                    decided_by: Some(answerer),
                     decided_option: Some(if allow { "allow_once" } else { "deny" }),
                     remember_scope: remember.map(RememberScopeArg::as_str),
                     auto_reason: None,
@@ -1371,7 +1392,7 @@ mod tests {
             .expect("request id is the first column")
             .to_string();
         let result = d
-            .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat())
             .await;
         assert!(result.is_ok(), "deny must succeed: {result:?}");
 
@@ -1381,6 +1402,60 @@ mod tests {
         // being unable to reach one.
         assert_eq!(second.verdict, crate::kj::gate::GateVerdict::Denied);
         assert_eq!(second.ask.expect("a denied ask has a row").request_id, request_id);
+    }
+
+    /// A second seat, used wherever a test answers a gate it raised itself.
+    /// No self-approval: an ask may not be answered from the context that
+    /// raised it (`docs/gate-and-shell-split.md`, "No self-approval — the
+    /// gate's own answer path"). `test_caller` mints a fresh `ContextId`, so
+    /// this is a peer, and peer-seat approval is permitted.
+    fn answering_seat() -> crate::kj::KjCaller {
+        test_caller()
+    }
+
+    /// No self-approval, at the surface a person actually types. The seat
+    /// that tripped the gate is refused; the ask stays answerable by anyone
+    /// else, and the attempt is on the record.
+    ///
+    /// Falsified by answering with `&answering_seat()` instead of `&c`: the
+    /// allow succeeds and every assertion below trips.
+    #[tokio::test]
+    async fn ledger_allow_refuses_the_seat_that_raised_the_ask() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let first = gate_once(&d, &c, spec()).await;
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+
+        let refused = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c)
+            .await;
+        assert!(!refused.is_ok(), "a seat must not answer its own ask");
+        assert!(
+            refused.message().contains("this context raised the ask"),
+            "the refusal must say why, got: {}",
+            refused.message()
+        );
+
+        {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            // Not claimed by the refused answerer: a burnt claim would lock
+            // out the seats that MAY answer.
+            let row = approval_ledger::ask::get_approval(conn, &request_id).unwrap().unwrap();
+            assert_eq!(row.status, approval_ledger::types::ApprovalStatus::Pending);
+            assert!(row.claimed_by.is_none());
+
+            let refusals = approval_ledger::ask::list_refusals(conn, &request_id).unwrap();
+            assert_eq!(refusals.len(), 1, "the refused attempt must be on the record");
+            assert_eq!(refusals[0].reason, "self_approval");
+        }
+
+        // Peer-seat approval is permitted, so the ask is still answerable.
+        let allowed = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat())
+            .await;
+        assert!(allowed.is_ok(), "a peer seat must still be able to answer: {allowed:?}");
     }
 
     #[tokio::test]
@@ -1393,7 +1468,7 @@ mod tests {
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
         let result = d
-            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat())
             .await;
         assert!(result.is_ok(), "allow must succeed: {result:?}");
         assert!(result.message().starts_with("allowed ask"));
@@ -1401,7 +1476,7 @@ mod tests {
         // Answering again is a loud error naming the terminal status, never
         // a silent no-op (guarantee 6).
         let again = d
-            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat())
             .await;
         assert!(!again.is_ok());
         assert!(again.message().contains("not `pending`") || again.message().contains("already"));
@@ -1464,7 +1539,7 @@ mod tests {
         assert_eq!(data["request_id"].as_str(), Some(request_id.as_str()), "{data}");
 
         // Clean up the pending ask so the spawned gate terminates.
-        d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
+        d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat())
             .await;
         let _ = gate.await;
     }
@@ -1492,7 +1567,7 @@ mod tests {
             assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
             let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
-            let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], &c).await;
+            let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], &answering_seat()).await;
             assert!(result.is_ok(), "{verb} must succeed: {result:?}");
             assert!(
                 result.message().starts_with(expected),
@@ -1507,7 +1582,7 @@ mod tests {
         let d = test_dispatcher().await;
         let c = test_caller();
         let result = d
-            .dispatch(&[s("ledger"), s("allow"), s("deadbeef")], &c)
+            .dispatch(&[s("ledger"), s("allow"), s("deadbeef")], &answering_seat())
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such ask"));
@@ -1828,7 +1903,7 @@ mod tests {
         let request_id = wait_for_pending(&d).await;
 
         let deny = d
-            .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c)
+            .dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat())
             .await;
         assert!(deny.is_ok(), "deny must succeed: {deny:?}");
         let _ = gate.await;
@@ -1886,7 +1961,7 @@ mod tests {
             assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
             let request_id = first.ask.expect("an escalated ask has a row").request_id;
             let verb = if allow { "allow" } else { "deny" };
-            let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], c).await;
+            let result = d.dispatch(&[s("ledger"), s(verb), s(&request_id)], &answering_seat()).await;
             assert!(result.is_ok(), "{verb} must succeed: {result:?}");
             request_id
         }
@@ -1942,7 +2017,7 @@ mod tests {
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
         let result = d
-            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &answering_seat())
             .await;
         assert!(result.is_ok(), "allow --remember must succeed: {result:?}");
         assert!(
@@ -1990,7 +2065,7 @@ mod tests {
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
 
         let result = d
-            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &answering_seat())
             .await;
         assert!(
             result.is_ok(),
@@ -2041,7 +2116,7 @@ mod tests {
         assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
         let result = d
-            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("session")], &c)
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("session")], &answering_seat())
             .await;
         assert!(result.is_ok(), "{result:?}");
         assert!(result.message().contains("session"), "{}", result.message());
@@ -2074,7 +2149,7 @@ mod tests {
         let first = gate_once(&d, &c, shell_spec(label, rendered)).await;
         assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
-        d.dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &c)
+        d.dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &answering_seat())
             .await;
         let second = gate_once(&d, &c, shell_spec(label, rendered)).await;
         assert!(second.allowed());
@@ -2139,7 +2214,7 @@ mod tests {
         let d = test_dispatcher().await;
         let c = test_caller();
         let result = d
-            .dispatch(&[s("ledger"), s("allow"), s("deadbeef"), s("--remember"), s("forever")], &c)
+            .dispatch(&[s("ledger"), s("allow"), s("deadbeef"), s("--remember"), s("forever")], &answering_seat())
             .await;
         assert!(!result.is_ok());
         assert!(
@@ -2526,7 +2601,7 @@ mod tests {
         let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows).await });
         let request_id = wait_for_pending(&d).await;
-        let allow = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &c).await;
+        let allow = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat()).await;
         assert!(allow.is_ok(), "{allow:?}");
         let _ = gate.await;
 
@@ -2575,7 +2650,7 @@ mod tests {
             "--status claimed must surface it deliberately"
         );
 
-        let _ = d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &c).await;
+        let _ = d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat()).await;
         let _ = gate.await;
     }
 

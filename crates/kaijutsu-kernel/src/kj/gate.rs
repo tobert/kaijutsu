@@ -732,6 +732,8 @@ mod tests {
     /// principal from the one that asked, via claim-then-decide.
     fn answer(d: &crate::kj::KjDispatcher, request_id: &str, allow: bool) {
         let answerer = kaijutsu_types::PrincipalId::new();
+        // Another seat: peer-seat approval is allowed, self-approval is not.
+        let from = kaijutsu_types::ContextId::new();
         let db = d.kernel_db.lock();
         approval_ledger::claim::claim(db.conn_for_ledger(), request_id, answerer.as_bytes())
             .unwrap();
@@ -740,7 +742,10 @@ mod tests {
             request_id,
             approval_ledger::decide::DecideInput {
                 allow,
-                decided_by: Some(answerer.as_bytes()),
+                decided_by: Some(approval_ledger::decide::Answerer {
+                    principal: answerer.as_bytes(),
+                    context: Some(from.as_bytes()),
+                }),
                 decided_option: Some(if allow { "allow_once" } else { "deny" }),
                 remember_scope: None,
                 auto_reason: None,
@@ -984,7 +989,10 @@ mod tests {
                 &request_id,
                 approval_ledger::decide::DecideInput {
                     allow: true,
-                    decided_by: Some(answerer.as_bytes()),
+                    decided_by: Some(approval_ledger::decide::Answerer {
+                        principal: answerer.as_bytes(),
+                        context: Some(kaijutsu_types::ContextId::new().as_bytes()),
+                    }),
                     decided_option: Some("allow_once"),
                     remember_scope: Some("always"),
                     auto_reason: None,
@@ -1054,7 +1062,10 @@ mod tests {
             &request_id,
             approval_ledger::decide::DecideInput {
                 allow: false,
-                decided_by: Some(&[1, 2, 3]),
+                decided_by: Some(approval_ledger::decide::Answerer {
+                    principal: &[1, 2, 3],
+                    context: Some(&[4, 5, 6]),
+                }),
                 decided_option: Some("deny"),
                 remember_scope: None,
                 auto_reason: None,

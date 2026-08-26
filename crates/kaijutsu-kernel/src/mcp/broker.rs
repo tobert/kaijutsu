@@ -8482,7 +8482,10 @@ mod tests {
             &row.request_id,
             approval_ledger::decide::DecideInput {
                 allow,
-                decided_by: Some(b"test-approver"),
+                decided_by: Some(approval_ledger::decide::Answerer {
+                    principal: b"test-approver",
+                    context: Some(b"another-seat"),
+                }),
                 decided_option: Some(if allow { "allow_once" } else { "deny" }),
                 remember_scope: None,
                 auto_reason: None,
@@ -8681,7 +8684,10 @@ mod tests {
                 &request_id,
                 approval_ledger::decide::DecideInput {
                     allow: true,
-                    decided_by: Some(b"test-approver"),
+                    decided_by: Some(approval_ledger::decide::Answerer {
+                        principal: b"test-approver",
+                        context: Some(b"another-seat"),
+                    }),
                     decided_option: Some("allow_once"),
                     remember_scope: None,
                     auto_reason: None,

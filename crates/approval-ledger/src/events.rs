@@ -32,3 +32,29 @@ pub(crate) fn append(
     )?;
     Ok(())
 }
+
+/// Append an `approval_refusals` row — an answer this crate refused on an
+/// invariant, which by definition committed nothing else. Same monotonic
+/// per-`request_id` `seq` assignment as [`append`], computed inside the
+/// INSERT, so this table has exactly one write path too.
+///
+/// A separate table from `approval_events` because `migrate` has no
+/// ALTER-TABLE path — see `schema::DDL`'s comment on `approval_refusals`.
+pub(crate) fn append_refusal(
+    conn: &Connection,
+    request_id: &str,
+    reason: &str,
+    actor: Option<&[u8]>,
+    actor_context: Option<&[u8]>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO approval_refusals (
+            request_id, seq, reason, actor, actor_context
+         ) VALUES (
+            ?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM approval_refusals WHERE request_id = ?1),
+            ?2, ?3, ?4
+         )",
+        params![request_id, reason, actor, actor_context],
+    )?;
+    Ok(())
+}

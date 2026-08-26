@@ -35,6 +35,20 @@ pub enum LedgerError {
     #[error("approval request {request_id} cannot be claimed: status is `{status}`, not `pending`")]
     NotClaimable { request_id: String, status: String },
 
+    /// No self-approval: the answering context is the one that raised the
+    /// ask, or the answer named no context at all. A caller that cannot name
+    /// its context cannot show it is not the author, so both refuse.
+    /// `docs/gate-and-shell-split.md`, "No self-approval — the gate's own
+    /// answer path". Every refusal appends an `approval_refusals` row.
+    #[error(
+        "approval request {request_id} cannot be answered from this seat: {reason}. \
+         Answer it from another context"
+    )]
+    SelfApproval {
+        request_id: String,
+        reason: &'static str,
+    },
+
     /// Refused at the single write site that turns a decided approval's
     /// statement into a standing allow-always rule (guarantee 3): that
     /// statement has a `binding = 'free'` variable, so its
