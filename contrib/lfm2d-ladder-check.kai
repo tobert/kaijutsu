@@ -62,53 +62,79 @@ v6='[{"id":"kube_ordinal_v6","labels":["data-critical","informative","situation-
 check data-critical    escalate "$v6" kube_ordinal_v6 || fails=1
 check informative      escalate "$v6" kube_ordinal_v6 || fails=1
 
-# --- the help bypass ---------------------------------------------------
+# --- the scoring exemptions --------------------------------------------
 #
-# A call whose every clause is a `kj` help invocation is not scored: clap
-# resolves help before dispatch, so nothing runs. The predicate is narrow on
-# purpose and the `--content --help` case is why. `kj rc edit`'s content field
-# is `allow_hyphen_values`, so clap binds `--help` as the VALUE and performs a
-# real write — a word-scan for `--help` anywhere would auto-allow it.
+# A call whose every clause is exempt is not scored. Two exemptions, both
+# requiring `kj` as the first word.
+#
+#   1. `kj ... --help`. clap resolves help before dispatch, so nothing runs.
+#      The predicate is narrow on purpose and the `--content --help` case is
+#      why: `kj rc edit`'s content field is `allow_hyphen_values`, so clap
+#      binds `--help` as the VALUE and performs a real write — a word-scan
+#      for `--help` anywhere would auto-allow it.
+#   2. `kj ledger ...`, the gate's own answer path. Scoring it deadlocked the
+#      gate. Safe only because a seat can no longer answer its own ask
+#      (docs/gate-and-shell-split.md, "No self-approval").
+#
+# THIS FILTER IS A COPY of the one in
+# assets/defaults/rc/lib/create/S50-lfm2d.kai. Keeping this file free of
+# kernel, config and network is what lets another lane run it, and that is
+# worth a duplicated predicate — but the two must be changed together, or
+# this gate tests something the hook no longer does.
 
 sp=" "
 dash="-"
-help_filter="$(cat <<'HELP_FILTER_EOF'
+exempt_filter="$(cat <<'EXEMPT_FILTER_EOF'
 [ .[] | .clause | (. / $sp) as $w
   | ( ($w|length) >= 2
       and ($w[0] == $kj)
-      and (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
-      and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) ) ] | all
-HELP_FILTER_EOF
+      and ( ( (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
+              and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) )
+            or ($w[1] == $ledger) ) ) ] | all
+EXEMPT_FILTER_EOF
 )"
 
-check_help() {
+check_exempt() {
   # $1 items JSON, $2 expected, $3 description
   items="$1"
   expected="$2"
   what="$3"
-  got="$(echo $items | jq -r --arg sp $sp --arg dash $dash --arg kj kj --arg help help $help_filter)"
+  got="$(echo $items | jq -r --arg sp $sp --arg dash $dash --arg kj kj --arg help help --arg ledger ledger $exempt_filter)"
   if [[ "$got" = "$expected" ]]; then
-    echo "ok   help: $what -> $got"
+    echo "ok   exempt: $what -> $got"
   else
-    echo "FAIL help: $what -> $got, expected $expected"
+    echo "FAIL exempt: $what -> $got, expected $expected"
     return 1
   fi
 }
 
-check_help '[{"clause":"kj rc edit --help"}]' true "kj rc edit --help" || fails=1
-check_help '[{"clause":"kj ledger list --help"}]' true "kj ledger list --help" || fails=1
-check_help '[{"clause":"kj -h"}]' true "kj -h" || fails=1
-check_help '[{"clause":"kj rc rm /etc/rc/coder/create/S00.kai --help"}]' true "positional then --help" || fails=1
-check_help '[{"clause":"kj rc edit --help"},{"clause":"kj rc rm --help"}]' true "two help clauses" || fails=1
+check_exempt '[{"clause":"kj rc edit --help"}]' true "kj rc edit --help" || fails=1
+check_exempt '[{"clause":"kj ledger list --help"}]' true "kj ledger list --help" || fails=1
+check_exempt '[{"clause":"kj -h"}]' true "kj -h" || fails=1
+check_exempt '[{"clause":"kj rc rm /etc/rc/coder/create/S00.kai --help"}]' true "positional then --help" || fails=1
+check_exempt '[{"clause":"kj rc edit --help"},{"clause":"kj rc rm --help"}]' true "two help clauses" || fails=1
 # The bypass. This one must stay false.
-check_help '[{"clause":"kj rc edit /etc/rc/x --content --help"}]' false "--content --help is a WRITE, not help" || fails=1
-check_help '[{"clause":"kj rc rm /etc/rc/x"}]' false "a real rm" || fails=1
-check_help '[{"clause":"cargo test --help"}]' false "not kj, not covered" || fails=1
-check_help '[{"clause":"kj rc edit --help"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: one real clause scores the call" || fails=1
-check_help '[{"clause":"kj"}]' false "bare kj" || fails=1
+check_exempt '[{"clause":"kj rc edit /etc/rc/x --content --help"}]' false "--content --help is a WRITE, not help" || fails=1
+check_exempt '[{"clause":"kj rc rm /etc/rc/x"}]' false "a real rm" || fails=1
+check_exempt '[{"clause":"cargo test --help"}]' false "not kj, not covered" || fails=1
+check_exempt '[{"clause":"kj rc edit --help"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: one real clause scores the call" || fails=1
+check_exempt '[{"clause":"kj"}]' false "bare kj" || fails=1
+
+# The gate's own answer path. Every `kj ledger` verb is exempt, because the
+# no-self-approval check — not a score — is what keeps `allow`/`deny` honest.
+check_exempt '[{"clause":"kj ledger allow 01a03b0f"}]' true "kj ledger allow" || fails=1
+check_exempt '[{"clause":"kj ledger deny 01a03b0f"}]' true "kj ledger deny" || fails=1
+check_exempt '[{"clause":"kj ledger show 01a03b0f"}]' true "kj ledger show" || fails=1
+check_exempt '[{"clause":"kj ledger list"}]' true "kj ledger list" || fails=1
+check_exempt '[{"clause":"kj ledger allow a"},{"clause":"kj ledger deny b"}]' true "two ledger clauses" || fails=1
+# Narrowness: the exemption is the WORD `ledger` in position 1, not a prefix,
+# and not after any first word.
+check_exempt '[{"clause":"kj ledgerfoo bar"}]' false "ledgerfoo is not ledger" || fails=1
+check_exempt '[{"clause":"notkj ledger allow x"}]' false "first word must be kj" || fails=1
+check_exempt '[{"clause":"kj ledger list"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: a real clause scores the call" || fails=1
 
 if [[ "$fails" -ne 0 ]]; then
   echo "ladder check FAILED"
   exit 1
 fi
-echo "all ladder and help cases pass"
+echo "all ladder and exemption cases pass"

@@ -130,42 +130,60 @@ if [[ "$n_clauses" -eq 0 ]]; then
   exit 0
 fi
 
-# -- a call whose every clause is a `kj` help invocation proceeds without
-# being scored. clap resolves help before dispatch, so the verb never runs
-# and there is nothing for a classifier to be right or wrong about. The
-# scorer reads these as ordinary commands -- `kj rc edit --help` scored
-# situation-normal 0.367 under v10 and asked a human about a help screen.
+# -- a call whose every clause is exempt proceeds without being scored.
+# Two exemptions, both narrow, both requiring `kj` as the first word.
 #
-# The rule is deliberately narrow, and the narrowness is the whole point:
+# 1. `kj ... --help`. clap resolves help before dispatch, so the verb never
+#    runs and there is nothing for a classifier to be right or wrong about.
+#    The scorer reads these as ordinary commands -- `kj rc edit --help`
+#    scored situation-normal 0.367 under v10 and asked a human about a help
+#    screen. Three conditions:
 #
-#   * the first word is `kj`, because this claim rests on clap's behavior
-#     and we only know clap governs our own surface. `cargo test --help`
-#     is not covered.
-#   * `--help` or `-h` is the LAST word.
-#   * no word between them starts with `-`.
+#      * the first word is `kj`, because this claim rests on clap's behavior
+#        and we only know clap governs our own surface. `cargo test --help`
+#        is not covered.
+#      * `--help` or `-h` is the LAST word.
+#      * no word between them starts with `-`.
 #
-# That third condition is what makes it safe rather than convenient. A
-# word-scan for `--help` anywhere is a real bypass: `kj rc edit <path>
-# --content --help` binds `--help` as the content VALUE (the field is
-# `allow_hyphen_values`), so clap prints nothing and the write runs for
-# real. Covered by contrib/lfm2d-ladder-check.kai, which asserts that exact
-# clause is NOT treated as help.
+#    That third condition is what makes it safe rather than convenient. A
+#    word-scan for `--help` anywhere is a real bypass: `kj rc edit <path>
+#    --content --help` binds `--help` as the content VALUE (the field is
+#    `allow_hyphen_values`), so clap prints nothing and the write runs for
+#    real. Covered by contrib/lfm2d-ladder-check.kai, which asserts that
+#    exact clause is NOT treated as help.
+#
+# 2. `kj ledger ...`, the gate's own answer path. Scoring it deadlocked the
+#    gate: `kj ledger allow <id>` reads situation-normal 0.527 and
+#    `kj ledger show <id>` 0.403 under v10, so answering an ask required a
+#    command that raised an ask, and reading an ask's detail raised one too.
+#
+#    This is safe ONLY because a seat can no longer answer its own ask --
+#    the check is a context comparison in the ledger itself, not a score
+#    (docs/gate-and-shell-split.md, "No self-approval -- the gate's own
+#    answer path"). Without that invariant this exemption would make the
+#    gate clearable without a human by construction. If the invariant is
+#    ever removed, remove this exemption in the same change.
+#
+#    The whole verb is covered, not just `allow`/`deny`: `list`/`show`/
+#    `rules`/`runs` are reads, `signal add` is what this hook itself calls,
+#    and `forget` only ever makes the gate more conservative.
 #
 # A mixed call is scored in full: one real clause anywhere means the whole
-# call is scored, so nothing hides behind a help clause.
+# call is scored, so nothing hides behind an exempt clause.
 dash="-"
-help_filter="$(cat <<'HELP_FILTER_EOF'
+exempt_filter="$(cat <<'EXEMPT_FILTER_EOF'
 [ .[] | .clause | (. / $sp) as $w
   | ( ($w|length) >= 2
       and ($w[0] == $kj)
-      and (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
-      and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) ) ] | all
-HELP_FILTER_EOF
+      and ( ( (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
+              and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) )
+            or ($w[1] == $ledger) ) ) ] | all
+EXEMPT_FILTER_EOF
 )"
-all_help="$(echo $items | jq -r --arg sp $sp --arg dash $dash --arg kj kj --arg help help $help_filter)"
-all_help_rc=$?
-if [[ "$all_help_rc" -eq 0 ]]; then
-  case "$all_help" in
+all_exempt="$(echo $items | jq -r --arg sp $sp --arg dash $dash --arg kj kj --arg help help --arg ledger ledger $exempt_filter)"
+all_exempt_rc=$?
+if [[ "$all_exempt_rc" -eq 0 ]]; then
+  case "$all_exempt" in
     true) exit 0 ;;
   esac
 fi
