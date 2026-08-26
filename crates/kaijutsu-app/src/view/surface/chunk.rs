@@ -137,8 +137,17 @@ pub fn frozen_chunk_count(text: &str, ranges: &[Range<usize>], chunk_lines: usiz
 /// one by a line per chunk. The break carries no glyphs, so dropping it
 /// changes nothing else; the byte range keeps it, because ranges must tile.
 pub fn chunk_shaping_text<'a>(text: &'a str, range: &Range<usize>) -> &'a str {
+    &text[chunk_shaping_range(text, range)]
+}
+
+/// The byte range of [`chunk_shaping_text`] within `text`: the chunk's range
+/// minus one trailing hard break. Spans are sliced against this range, not
+/// the chunk's, so a span that covers only the dropped break clips to
+/// nothing instead of reaching parley as a range past the end of the text.
+pub fn chunk_shaping_range(text: &str, range: &Range<usize>) -> Range<usize> {
     let slice = &text[range.clone()];
-    slice.strip_suffix('\n').unwrap_or(slice)
+    let end = range.end - usize::from(slice.ends_with('\n'));
+    range.start..end
 }
 
 /// Clamp and rebase span brushes onto one chunk's local byte space.
@@ -148,8 +157,11 @@ pub fn chunk_shaping_text<'a>(text: &'a str, range: &Range<usize>) -> &'a str {
 /// as its own string starting at byte 0. A span crossing a chunk boundary
 /// therefore appears in both chunks, clipped to each. Spans that miss the
 /// range entirely — or that clip to nothing — are dropped: a zero-width
-/// brush range colors no glyph, and parley's ranged builder has no use for
-/// it.
+/// brush range colors no glyph, and parley asserts on one.
+///
+/// `range` is the chunk's [`chunk_shaping_range`], not its byte range: the
+/// two differ by the trailing hard break, and a span clipped to that one
+/// byte would be past the end of the text parley is given.
 pub fn slice_spans(spans: &[SpanBrush], range: Range<usize>) -> Vec<SpanBrush> {
     spans
         .iter()
@@ -483,6 +495,35 @@ mod tests {
         assert!(slice_styled_spans(&spans, 10..20).is_empty());
     }
 
+    /// A chunk is shaped from its bytes minus the trailing hard break
+    /// (`chunk_shaping_text`), so a span that covers only that break has no
+    /// glyph to color and must be dropped — parley clamps a pushed range to
+    /// the text length and then asserts on the empty style run it just made.
+    /// This is the crash: an ANSI span with a background that covered the
+    /// newline closing a 64-line chunk.
+    #[test]
+    fn a_span_on_the_chunk_closing_newline_is_dropped() {
+        let text = "a\nb\n";
+        let ranges = chunk_ranges(text, 2);
+        assert_eq!(ranges, vec![0..4]);
+        let range = ranges[0].clone();
+        let shaped = chunk_shaping_range(text, &range);
+        assert_eq!(shaped, 0..3);
+
+        let spans = [styled(3, 4)];
+        assert!(slice_styled_spans(&spans, shaped.clone()).is_empty());
+        let brushes = [SpanBrush { start: 3, end: 4, brush: brush(BLUE) }];
+        assert!(slice_spans(&brushes, shaped.clone()).is_empty());
+
+        // And the whole way through shaping, in both spanned currencies.
+        let font = mono();
+        let chunk_text = chunk_shaping_text(text, &range);
+        let styled = slice_styled_spans(&spans, shaped.clone());
+        font.layout_styled(chunk_text, &style(), VelloTextAlign::Left, None, &styled);
+        let plain = slice_spans(&brushes, shaped);
+        font.layout_spanned(chunk_text, &style(), VelloTextAlign::Left, None, &plain);
+    }
+
     // ---- the equivalence property ----------------------------------------
 
     /// Stack per-chunk layouts the way `shape_cache` does: each chunk's
@@ -502,7 +543,7 @@ mod tests {
         let mut y = 0.0_f32;
         for range in chunk_ranges(text, chunk_lines) {
             let chunk_text = chunk_shaping_text(text, &range);
-            let chunk_spans = slice_spans(spans, range.clone());
+            let chunk_spans = slice_spans(spans, chunk_shaping_range(text, &range));
             let layout = font.layout_spanned(
                 chunk_text,
                 &style,

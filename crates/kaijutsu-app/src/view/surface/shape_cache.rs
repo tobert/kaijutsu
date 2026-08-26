@@ -73,8 +73,8 @@ use crate::view::role_divider;
 
 use super::chrome::BlockLayout;
 use super::chunk::{
-    CHUNK_LINES, chunk_ranges, chunk_shaping_text, frozen_chunk_count, slice_spans,
-    slice_styled_spans,
+    CHUNK_LINES, chunk_ranges, chunk_shaping_range, chunk_shaping_text, frozen_chunk_count,
+    slice_spans, slice_styled_spans,
 };
 use super::content::RichKindInfo;
 
@@ -653,7 +653,11 @@ pub fn shape_chunk(
     out: &mut ShapeOutput,
 ) {
     let chunk_text = chunk_shaping_text(text, &range);
-    let chunk_styled = slice_styled_spans(style_spans, range.clone());
+    // Spans clip to the bytes actually shaped — the chunk minus its trailing
+    // hard break — so a span on that break alone clips to nothing rather than
+    // reaching parley as a range past the end of `chunk_text`.
+    let shaped = chunk_shaping_range(text, &range);
+    let chunk_styled = slice_styled_spans(style_spans, shaped.clone());
 
     // Three shaping currencies, cheapest first. The plain path skips parley's
     // run splitting entirely and is what nearly every chunk takes; the
@@ -674,7 +678,7 @@ pub fn shape_chunk(
         let (glyphs, keys) = collect_msdf_glyphs_ansi_deferred(&layout, (0.0, 0.0));
         (glyphs, keys, layout.height(), geometry)
     } else {
-        let chunk_spans = slice_spans(spans, range.clone());
+        let chunk_spans = slice_spans(spans, shaped);
         if chunk_spans.is_empty() {
             let layout = font.layout(chunk_text, style, VelloTextAlign::Left, max_advance);
             collect_fonts(&layout, &mut out.fonts);
@@ -2016,6 +2020,40 @@ mod tests {
 
     fn style() -> VelloTextStyle {
         block_text_style(&TextMetrics::default(), bevy_color_to_brush(Color::WHITE))
+    }
+
+    /// A styled span that covers only the newline closing a chunk must not
+    /// reach parley: the chunk is shaped without that byte, and parley asserts
+    /// on the empty style run a past-the-end range clamps to. The crash was
+    /// an ANSI background span on the newline ending a 64-line chunk.
+    #[test]
+    fn a_styled_span_on_a_chunk_boundary_newline_shapes_without_panicking() {
+        let font = mono();
+        let text = "one\ntwo\nthree\n";
+        let boundary = "one\ntwo\n".len();
+        let styled = StyledSpan {
+            start: boundary - 1,
+            end: boundary,
+            brush: crate::text::ansi::StyledBrush {
+                color: [0, 0, 255, 255],
+                style_index: 1,
+                importance: 1.0,
+            },
+            bg: Some([255, 255, 255, 255]),
+            ink: [0, 0, 255, 255],
+            underline: false,
+            strikethrough: false,
+        };
+        let out = shape_block(&font, text, &[], &[styled], &style(), 10_000.0, 2);
+        assert_eq!(out.chunks.len(), 2);
+
+        let span = SpanBrush {
+            start: boundary - 1,
+            end: boundary,
+            brush: Brush::Solid(peniko::Color::from_rgba8(0, 0, 255, 255)),
+        };
+        let out = shape_block(&font, text, &[span], &[], &style(), 10_000.0, 2);
+        assert_eq!(out.chunks.len(), 2);
     }
 
     // ---- ShapeKey --------------------------------------------------------

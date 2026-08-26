@@ -367,6 +367,13 @@ and the devlog. What remains:
 - `StyleEntry.effect`/`param`/`_pad` and `ChromeInstance.anim[1]` are unread
   (documented, leave with an expiry note). The six clamp copies shipped —
   `layout_bridge::unit_to_u8` is the one place now.
+- Six copies of `(x.clamp(0,1)*255.0) as u8` while `layout_bridge.rs` claims to
+  be the one place; `StyleEntry.effect`/`param`/`_pad` and
+  `ChromeInstance.anim[1]` are unread (documented, leave with an expiry note).
+- **The MIDI ear logs a WARN every ~4s while its capture context has no
+  track** (`midi_in`: "capture batch refused … `kj transport attach` first").
+  An expected idle state, not a fault; it buried the parley crash on 08-22.
+  Stop capturing until attached, or log once per state change. S.
 
 ### Hooks (kaibo review of the 08-20 hook work, DeepSeek)
 

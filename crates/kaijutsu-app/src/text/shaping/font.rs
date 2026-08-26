@@ -159,7 +159,11 @@ impl VelloFont {
             FontFamilyName::Named(Cow::Owned(self.family_name.clone())),
         )));
         builder.push_default(StyleProperty::Brush(default_brush));
+        // Parley clamps a pushed range to the text length and then asserts
+        // that no style run is empty, so a span past the end of `value` is a
+        // panic unless it is clamped *here*, where empty is still droppable.
         for (range, brush) in spans {
+            let range = range.start.min(value.len())..range.end.min(value.len());
             if range.start >= range.end {
                 continue;
             }

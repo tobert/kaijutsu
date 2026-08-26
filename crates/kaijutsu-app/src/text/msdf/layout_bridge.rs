@@ -315,6 +315,31 @@ mod tests {
         );
     }
 
+    /// Parley clamps a pushed range to the text length and then asserts that
+    /// no style run is empty — so a span lying past the end of the text is a
+    /// panic unless it is dropped before it reaches the builder. Both
+    /// spanned currencies must survive one.
+    #[test]
+    fn a_span_past_the_end_of_the_text_does_not_panic() {
+        let font = mono();
+        let text = "abc";
+        let spans = [SpanBrush { start: 3, end: 5, brush: brush(BLUE) }];
+        let layout =
+            font.layout_spanned(text, &style(RED), VelloTextAlign::Left, None, &spans);
+        assert_eq!(colors(&layout), vec![RED, RED, RED]);
+
+        let styled = [crate::text::ansi::StyledSpan {
+            start: 3,
+            end: 5,
+            brush: StyledBrush { color: BLUE, style_index: 1, importance: 1.0 },
+            bg: None,
+            ink: BLUE,
+            underline: false,
+            strikethrough: false,
+        }];
+        font.layout_styled(text, &style(RED), VelloTextAlign::Left, None, &styled);
+    }
+
     /// The failure this replaces, pinned so it cannot come back unnoticed: the
     /// run-start lookup cannot see a span that begins mid-run.
     #[test]
