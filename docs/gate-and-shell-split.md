@@ -1487,6 +1487,24 @@ can always rubber-stamp — and the difference that matters is that the maneuver
 is now deliberate and leaves a fork edge in the record instead of being
 invisible.
 
+### Where this goes next: a stronger principal (Amy, 2026-08-26)
+
+*"Over time — gradually — I think I want to make the principal stronger as an
+identifier, and perhaps that can become a way to add more ways to manage
+these approvals."*
+
+Today the principal is the weakest identifier in the system: `Principal` is
+`{ id, username, display_name }` with no kind, and every seat on one machine
+shares one SSH key, which is why this rule keys on the context instead. A
+principal that actually distinguished who is acting would let approval policy
+say things the context cannot — who may answer for whom, which seats a person
+speaks through, whether an answer came from a person at all.
+
+Nothing here blocks that, and the invariant does not depend on it: the
+context check stays correct however strong the principal gets. Treat it as
+the direction, not a task — the ordering is that peer-seat approval runs
+first and teaches us what the policy needs.
+
 ### Three details that are part of the rule
 
 - **The refusal is recorded, not merely returned.** A silently refused
