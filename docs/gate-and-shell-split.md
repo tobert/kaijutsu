@@ -1393,9 +1393,17 @@ slow hook delays only that task's own completion.
 ## No self-approval — the gate's own answer path (Amy, 2026-08-26)
 
 **An ask may not be answered from the context that raised it.** Compare
-`approvals.context_id` against `KjCaller.context_id` in `ledger_decide`
-(`kj/ledger.rs:766`), before `claim`, so a refusal does not burn the claim.
-Peer seats may answer each other; only the author is refused.
+`approvals.context_id` against `KjCaller.context_id` in `ledger_decide`,
+before `claim`, so a refusal does not burn the claim. Peer seats may answer
+each other; only the author is refused.
+
+**The context is part of the answerer's type, not a parameter beside it.**
+`DecideInput.decided_by` is an `Option<Answerer>`, and an `Answerer` carries
+a principal *and* the context it answers from. A caller cannot skip the check
+by forgetting to pass a context, because there is no way to name an answerer
+without one. The auto-decision path carries no `Answerer` at all, which is
+the same signal that already separates a classifier's decision from a
+person's.
 
 Amy's framing, and it is why this is small: *"a simple scheme similar to pull
 request review rules: no self-approval."* Pull-request review never verifies
@@ -1481,11 +1489,43 @@ invisible.
 
 ### Three details that are part of the rule
 
-- **The refusal is recorded, not merely returned.** `approval_events` exists so
-  that "every claim/decide/expire/abandon *attempt* lands, success or not"
-  (`approval-ledger/src/schema.rs`, design note). A silently refused
+- **The refusal is recorded, not merely returned.** A silently refused
   self-approval is invisible to the measurement that justifies the gate.
+  Every refusal appends an `approval_refusals` row — actor, actor context,
+  reason — read back through `ask::list_refusals`.
 - **`KjCaller.context_id` is `Option<ContextId>`; `None` refuses.** A caller
   with no context cannot show it is not the author.
 - **Not waivable.** A waivable invariant is not one, and the escape already
   exists: any other seat.
+
+### Why refusals got their own table
+
+`approval_events` was the obvious home and it is the wrong one. `migrate` is
+built entirely from `CREATE ... IF NOT EXISTS` and has **no ALTER-TABLE
+path**, so widening `approval_events.kind`'s `CHECK` would never reach a
+database that already ran an earlier `migrate()` — and the INSERT would then
+fail a constraint the new code cannot see. A new table needs no migration
+machinery at all, which is the same reasoning `approval_redemptions` was
+built on.
+
+`approval_refusals.reason` carries no `CHECK` for that reason: the set of
+refusal reasons is expected to grow, and a value-enum `CHECK` would inherit
+the very trap the table exists to route around.
+
+The guard is called twice, deliberately. `ledger_decide` calls it before
+`claim`; `decide` calls it as the backstop that holds for any other caller.
+One function, two call sites, no second copy of the policy.
+
+### The exemption is the whole `kj ledger` verb
+
+S50's predicate exempts `kj` + the literal word `ledger` in position 1 — not
+just `allow` and `deny`. `list`/`show`/`rules`/`runs` are reads, `signal add`
+is what the hook itself calls, and `forget` only ever makes the gate more
+conservative. `kj ledgerfoo` and `notkj ledger allow` are still scored, and a
+mixed call is scored in full.
+
+`contrib/lfm2d-ladder-check.kai` holds a **copy** of that predicate, on
+purpose: staying free of kernel, config and network is what lets the lfm2d
+lane run the check at all, and that is worth a duplicated jq filter. The two
+must be changed together, or the check tests something the hook no longer
+does. Its header says so.
