@@ -6,6 +6,34 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## No self-approval at `kj ledger` (RULED 2026-08-26, unbuilt)
+
+Two changes that only make sense together. Design, evidence and Amy's rulings:
+`docs/gate-and-shell-split.md`, "No self-approval — the gate's own answer path".
+
+1. **Refuse an answer from the context that raised the ask.** Compare
+   `approvals.context_id` (`approval-ledger/src/schema.rs:271`) against
+   `KjCaller.context_id` (`kj/mod.rs:80`) in `ledger_decide`
+   (`kj/ledger.rs:766`), **before** `claim`, so a refusal does not burn the
+   claim. `context_id` is `Option`; `None` refuses. Record the refusal in
+   `approval_events` — a silent refusal is invisible to the measurement that
+   justifies the gate. Not waivable.
+2. **S50 stops scoring `kj ledger`, reads and writes.** Safe only once 1 lands.
+
+Today `kj ledger` has **no capability check at all** — no `Capability::`, no
+authority anywhere in `kj/ledger.rs`. The verb that answers every gate in the
+system is guarded only by the classifier, which under live `kube_ordinal_v10`
+scores `kj ledger allow <id>` situation-normal 0.527 and `kj ledger show <id>`
+situation-normal 0.403, while `kj ledger list` reads informative 0.775. So a
+gated seat can list the queue, cannot read an ask's detail, and cannot answer
+one: **answering required a command that raised an ask.** Two asks sat pending
+through 2026-08-26 for exactly this reason.
+
+Peer-seat approval is accepted for now (Amy) — a sibling seat may answer this
+seat's ask. Revisit when autonomy widens.
+
+---
+
 ## `persist_binding` swallows a failed write (2026-08-23)
 
 `Broker::persist_binding` logs `upsert_context_binding` failures at WARN and
@@ -4853,9 +4881,14 @@ Two halves, and the second is the one an audit can check (the framing is the
 lfm2d lane's, from their guard-evasion work — the signal is the
 retry-after-denial, not the command text):
 
-- **A seat may not answer its own ask.** Needs a principal comparison at
-  `kj ledger allow`/`deny`: refuse when the answering principal is the one the
-  ask was raised against. Cheap, and it closes path 1 outright.
+- **A seat may not answer its own ask.** RULED 2026-08-26, unbuilt — design in
+  `docs/gate-and-shell-split.md`, "No self-approval". **The key is the context,
+  not the principal.** A principal comparison was this entry's original
+  proposal and it fails backwards: every seat on one machine authenticates with
+  one SSH key, so a Claude Code MCP seat's `whoami` returns `username: amy` and
+  the comparison refuses Amy at the app exactly as it refuses the model that
+  raised the ask. Compare `approvals.context_id` against `KjCaller.context_id`
+  instead — both already exist, so the check needs no schema change.
 - **A reformulated command carries the pending ask forward.** Harder, and
   unbuilt: it needs the gate to recognize that a new call is a retry of an
   outstanding ask, which means a similarity or provenance link the ledger does
@@ -4876,12 +4909,15 @@ proposal at our request):
   them, so without the record *a low escalation rate is indistinguishable from
   a well-evaded one.* That argument holds even in a kernel with no enforcement
   between players at all.
-- The principal check at `kj ledger allow` **is** enforcement, but it is
+- The context check at `kj ledger allow` **is** enforcement, but it is
   enforcement against a seat answering *itself* — which shared trust never
   promised anyone. Trusting your neighbor is not the same as being your own
   neighbor.
 
-Amy rules on both; proposed to fleet.md 2026-08-25.
+Amy ruled the first half on 2026-08-26 and accepted peer-seat approval with it
+(*"I wanna see what happens"*) — a sibling seat may answer this seat's ask, so
+an escalation is not guaranteed to reach a human. The second half, carrying a
+pending ask across a reformulation, is still open.
 
 ### A refused turn writes two blocks that say the same thing (2026-08-25)
 

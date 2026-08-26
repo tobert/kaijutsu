@@ -1389,3 +1389,103 @@ outside PreCall, not a property of these paths.
 `execute_kj_command` is synchronous, so a slow hook there delays the RPC caller
 directly. The other two evaluate PostCall/OnError on a background task, where a
 slow hook delays only that task's own completion.
+
+## No self-approval — the gate's own answer path (Amy, 2026-08-26)
+
+**An ask may not be answered from the context that raised it.** Compare
+`approvals.context_id` against `KjCaller.context_id` in `ledger_decide`
+(`kj/ledger.rs:766`), before `claim`, so a refusal does not burn the claim.
+Peer seats may answer each other; only the author is refused.
+
+Amy's framing, and it is why this is small: *"a simple scheme similar to pull
+request review rules: no self-approval."* Pull-request review never verifies
+that a reviewer is a human — it verifies the reviewer is not the author.
+Author-versus-not-author is a question the kernel answers from columns it
+already stores. Human-versus-model is not, and this design stops trying.
+
+### The key is the context, never the principal
+
+The obvious translation of the PR rule is "author principal is not approver
+principal." It fails backwards here, and the failure is worth keeping written
+down:
+
+| fact | where |
+|---|---|
+| `Principal` is `{ id, username, display_name }` — no kind field. The doc calls it "a human user, an AI model, or the system itself" and offers no way to say which. | `kaijutsu-types/src/principal.rs:16` |
+| `CallContext.principal_id` is *"Attribution only, never authorization (D-22)"* | `kaijutsu-kernel/src/mcp/context.rs:45` |
+| Every seat on one machine authenticates with one SSH key. A Claude Code MCP seat's `whoami` returns `username: amy`. | live, 2026-08-26 |
+| `whoami`'s `agent_name` is **not a kernel fact** — it is composed in the kaijutsu-mcp client process from local environment detection, and the kernel never receives or stores it. It cannot back a gate. | `kaijutsu-mcp/src/lib.rs:2238` |
+| The app and an external agent call the identical RPC. `shell_execute(code, ctx, user_initiated)` — the app passes `true`, kaijutsu-mcp passes `false`. That bool is client-asserted and decides block authorship and exclusion only, never authorization. | `kaijutsu-app/src/input/systems.rs:937`, `kaijutsu-mcp/src/lib.rs:1287`, `kaijutsu-server/src/rpc.rs:8811` |
+
+So a principal comparison refuses a human at the app exactly as it refuses the
+model that raised the ask. The context is the seat, and seats are what differ.
+`approvals.context_id` is already `NOT NULL`
+(`approval-ledger/src/schema.rs:271`) and `KjCaller` already carries
+`context_id` (`kj/mod.rs:80`): no schema change, no new plumbing, no new fact.
+
+This matches how the rest of the gate already discriminates. Facades are gated
+on the calling context's binding precisely because the RPC handlers are the
+surface "which both the human app and external agents cross"
+(`mcp/broker.rs:1409`).
+
+### The classifier chain is not a self-approval, and the ledger already says so
+
+`decided_by` set with `auto_reason` NULL is a decision by an identity;
+`decided_by` NULL with `auto_reason` set is a classifier's auto-decision
+(`approval-ledger/src/ask.rs:54`). A check on `decided_by` therefore skips the
+lfm2d path by construction — no exemption to write, none to maintain.
+
+Amy: *"the classifier escalation chain can approve/deny, because it's a
+different system making the call, not the model who generated the ask."*
+
+### What the rule deletes: the gate could not answer itself
+
+Found while looking for an interface to answer a pending ask, 2026-08-26. `kj
+ledger` carries **no capability check of any kind** — `kj/ledger.rs` has no
+`Capability::` and no authority — so the verb that answers every gate in the
+system was guarded only by the classifier, which scores it:
+
+| clause | argmax | score | hook verdict |
+|---|---|---|---|
+| `kj ledger list` | informative | 0.775 | allow |
+| `kj ledger show <id>` | situation-normal | 0.403 | escalate |
+| `kj ledger allow <id>` | situation-normal | 0.527 | escalate |
+| `kj ledger deny <id>` | situation-normal | 0.577 | escalate |
+
+Measured against live `kube_ordinal_v10`. In any seat carrying
+`lfm2d-advisory`, answering an ask required a command that raised an ask, and
+reading an ask's detail raised one too — the queue's own footer prints `answer
+with: kj ledger allow <request-id>`, advice the seat reading it cannot follow.
+
+**S50 therefore stops scoring `kj ledger` entirely, reads and writes.** That is
+safe *because of* the rule above and not before it: ungating the answer verb on
+its own would make the gate clearable without a human by construction, the same
+objection that holds against an auto-allow band covering `kj ledger allow`. The
+deterministic invariant replaces a probabilistic accident, and one mechanism
+goes away rather than growing a carve-out.
+
+### Peer-seat approval is accepted, deliberately
+
+A sibling seat may answer an ask this seat raised, so an escalation is not
+guaranteed to reach a human. Amy: *"peer seat approval is okay... I wanna see
+what happens. We won't be running a lot without some other layers of
+containment for a long time... autonomy comes with safety features and building
+trust."* Revisit when autonomy widens, not before; a classifier over drift
+edges is the named candidate if it needs tightening.
+
+The rule also does not stop a seat holding `fork` from making a child context
+and answering from there. Real review rules have the same property — a colleague
+can always rubber-stamp — and the difference that matters is that the maneuver
+is now deliberate and leaves a fork edge in the record instead of being
+invisible.
+
+### Three details that are part of the rule
+
+- **The refusal is recorded, not merely returned.** `approval_events` exists so
+  that "every claim/decide/expire/abandon *attempt* lands, success or not"
+  (`approval-ledger/src/schema.rs`, design note). A silently refused
+  self-approval is invisible to the measurement that justifies the gate.
+- **`KjCaller.context_id` is `Option<ContextId>`; `None` refuses.** A caller
+  with no context cannot show it is not the author.
+- **Not waivable.** A waivable invariant is not one, and the escape already
+  exists: any other seat.
