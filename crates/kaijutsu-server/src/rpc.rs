@@ -8899,7 +8899,13 @@ async fn execute_shell_command(
             return Ok(command_block_id);
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            let reason = format!("shell command denied: {err}");
+            // No "denied" prefix: this arm carries three different verdicts
+            // (`Denied`, `GateUnavailable`, `GatePending`) and only one of
+            // them is a no. Labelling all three "denied" teaches a model that
+            // a pending ask is a refusal, which is the collapse
+            // `McpError::GatePending`'s doc comment exists to prevent. Each
+            // variant's own Display already names what happened.
+            let reason = err.to_string();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, Status::Error);
             let _ = documents.set_status(context_id, &command_block_id, Status::Error);

@@ -220,3 +220,75 @@ pub enum McpError {
 }
 
 pub type McpResult<T> = Result<T, McpError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kj::gate::{AskRef, GateOutcome, GateVerdict, PENDING_REASON};
+    use approval_ledger::types::ApprovalStatus;
+
+    /// The three gate messages nest — `McpError` wraps the broker's summary,
+    /// which wraps `GateOutcome::reason` — so each layer must add what the
+    /// one outside it lacks. Composed, this said "waiting for a human" three
+    /// times before it reached a model, which is prose we ship.
+    ///
+    /// Falsified by putting "waiting for a human" back into either inner
+    /// layer.
+    #[test]
+    fn a_pending_gate_says_it_is_waiting_exactly_once() {
+        let outcome = GateOutcome {
+            verdict: GateVerdict::Pending,
+            ask: Some(AskRef {
+                request_id: "01a03e66-fa87-7680-a578-305f15202d4e".to_string(),
+                status: ApprovalStatus::Pending,
+            }),
+            cwd: None,
+            // The REAL text `run_gate` uses, not a stand-in — a stand-in
+            // makes this test unable to fail when that text regresses.
+            reason: PENDING_REASON.to_string(),
+        };
+        let rendered = McpError::GatePending {
+            by_hook: HookId("lfm2d-advisory".to_string()),
+            reason: outcome.ask_summary(),
+        }
+        .to_string();
+
+        assert_eq!(
+            rendered.matches("waiting").count(),
+            1,
+            "each layer must add new information, not restate the last: {rendered}"
+        );
+        // The three facts a reader needs, each present once.
+        assert!(rendered.contains("lfm2d-advisory"), "names the hook: {rendered}");
+        assert!(rendered.contains("01a03e66"), "names the ask: {rendered}");
+        assert!(rendered.contains("kj ledger allow"), "says what to do: {rendered}");
+        assert!(
+            !rendered.contains("denied"),
+            "a pending gate is not a denial: {rendered}"
+        );
+    }
+
+    /// The broken-control message nests the same way and had the same
+    /// doubling ("gate unavailable" inside "had nothing to answer it").
+    #[test]
+    fn an_unavailable_gate_does_not_restate_itself() {
+        let outcome = GateOutcome {
+            verdict: GateVerdict::Unavailable,
+            ask: None,
+            cwd: None,
+            reason: "the ledger could not be reached".to_string(),
+        };
+        let rendered = McpError::GateUnavailable {
+            by_hook: HookId("lfm2d-advisory".to_string()),
+            reason: outcome.ask_summary(),
+        }
+        .to_string();
+
+        assert_eq!(
+            rendered.matches("nothing to answer").count() + rendered.matches("unavailable").count(),
+            1,
+            "the broken-control fact belongs to one layer: {rendered}"
+        );
+        assert!(rendered.contains("no ask was recorded"), "{rendered}");
+    }
+}

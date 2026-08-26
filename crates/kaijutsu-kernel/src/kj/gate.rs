@@ -133,6 +133,14 @@ pub(crate) struct GateOutcome {
     pub cwd: Option<PathBuf>,
 }
 
+/// What a player does about a pending ask. "waiting for a human" is
+/// deliberately absent: that fact belongs to `McpError::GatePending`, which
+/// wraps this, and stating it here made the composed message say it three
+/// times. Named rather than inline so the layering test reads the real text.
+pub const PENDING_REASON: &str = "nothing was run. Answer with `kj ledger \
+     allow <id>` or `kj ledger deny <id>`, then run the same command again — \
+     an allowed ask authorizes it exactly once.";
+
 impl GateOutcome {
     /// Whether the gated action may proceed. The only question callers that
     /// do not distinguish a fault from a refusal need to ask.
@@ -143,6 +151,14 @@ impl GateOutcome {
     /// `"<id> (<status>)"`, or a plain statement that nothing was recorded.
     /// Callers put this in the message a model reads, so it must never
     /// render a blank where an ask id is expected.
+    /// The one-line summary the hook layers wrap: which ask, and what to do
+    /// about it. `McpError::GatePending`/`GateUnavailable` already name the
+    /// hook and the state, so this adds neither — see
+    /// `docs/gate-and-shell-split.md`, "One fact per layer".
+    pub fn ask_summary(&self) -> String {
+        format!("{} — {}", self.ask_description(), self.reason)
+    }
+
     pub fn ask_description(&self) -> String {
         match &self.ask {
             Some(a) => format!("ask {} ({})", a.request_id, a.status),
@@ -649,11 +665,7 @@ pub(crate) async fn run_gate(
         verdict: GateVerdict::Pending,
         ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
         cwd: None,
-        reason: format!(
-            "waiting for a human to answer; nothing was run. Answer with \
-             `kj ledger allow <id>` or `kj ledger deny <id>`, then run the \
-             same command again — an allowed ask authorizes it exactly once."
-        ),
+        reason: PENDING_REASON.to_string(),
     }
 }
 

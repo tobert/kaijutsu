@@ -6,6 +6,20 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Ctrl+Z lands in the wrong input on the second toggle (Amy, 2026-08-26)
+
+Amy: *"sometimes when I hit ctrl-z it goes to conversation input... usually
+first time is fine, second time goes to the other input."* So the first
+toggle reaches the shell surface and a later one does not — focus and the
+active surface disagree after at least one round trip.
+
+Queued for the app/UI session, not the kernel lane. Start at the
+`ActiveSurface`/`FocusArea` duplication already filed in
+`tech_debt_state_flags` — two pieces of state that must agree and are set in
+different places is the shape this bug has.
+
+---
+
 ## `kaijutsu-mcp`'s five e2e_shell tests panic in teardown (2026-08-26)
 
 `cargo test -p kaijutsu-mcp --test e2e_shell` fails all five

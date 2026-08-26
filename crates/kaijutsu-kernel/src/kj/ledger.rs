@@ -1580,7 +1580,6 @@ mod tests {
     #[tokio::test]
     async fn ledger_of_an_unknown_id_errors_loudly() {
         let d = test_dispatcher().await;
-        let c = test_caller();
         let result = d
             .dispatch(&[s("ledger"), s("allow"), s("deadbeef")], &answering_seat())
             .await;
@@ -2212,7 +2211,6 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_remember_scope_fails_at_parse_time() {
         let d = test_dispatcher().await;
-        let c = test_caller();
         let result = d
             .dispatch(&[s("ledger"), s("allow"), s("deadbeef"), s("--remember"), s("forever")], &answering_seat())
             .await;

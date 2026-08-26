@@ -2127,11 +2127,9 @@ impl Broker {
                     reason = %outcome.reason,
                     "permission ask gate unavailable; refusing (fail-closed)",
                 );
-                PermissionAskOutcome::Unavailable(format!(
-                    "permission ask: gate unavailable [{}]: {}",
-                    outcome.ask_description(),
-                    outcome.reason
-                ))
+                // Same layering as Pending below: `McpError::GateUnavailable`
+                // already says the control was broken and names the hook.
+                PermissionAskOutcome::Unavailable(outcome.ask_summary())
             }
             crate::kj::gate::GateVerdict::Pending => {
                 tracing::debug!(
@@ -2143,11 +2141,11 @@ impl Broker {
                     ask = %outcome.ask_description(),
                     "permission ask recorded; waiting for a human (nothing ran)",
                 );
-                PermissionAskOutcome::Pending(format!(
-                    "permission ask: waiting for a human [{}]: {}",
-                    outcome.ask_description(),
-                    outcome.reason
-                ))
+                // Each layer adds what the one outside it does not have.
+                // `McpError::GatePending` already says a human is being
+                // waited on and names the hook; this layer's new information
+                // is WHICH ask, and the reason carries what to do about it.
+                PermissionAskOutcome::Pending(outcome.ask_summary())
             }
         }
     }
