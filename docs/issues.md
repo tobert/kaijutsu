@@ -6,6 +6,26 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kaijutsu-mcp`'s five e2e_shell tests panic in teardown (2026-08-26)
+
+`cargo test -p kaijutsu-mcp --test e2e_shell` fails all five
+(`shell_returns_stdout`, `shell_returns_nonzero_exit_code`,
+`shell_returns_full_nontrivial_stdout`, `shell_sequential_commands`,
+`shell_survives_dead_event_feed`). The panic is a `TryCurrentError` inside
+`russh-0.61.1/src/channels/io/mod.rs:37` reached through capnp's write-queue
+drop glue — a channel dropped with no tokio runtime on the current thread, so
+it is teardown, not the path under test.
+
+**Pre-existing, verified**: identical failures at `HEAD~2`, before the
+no-self-approval work, run in a worktree against the same target dir. Nothing
+in the ledger change is implicated.
+
+These are the only faithful e2e for the MCP store-replica + shell-poll path,
+so `cargo test --workspace` is red until this is fixed and the whole class of
+replication/ordering regression they exist to catch is uncovered meanwhile.
+
+---
+
 ## No self-approval at `kj ledger` (RULED 2026-08-26, unbuilt)
 
 Two changes that only make sense together. Design, evidence and Amy's rulings:
