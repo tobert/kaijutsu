@@ -564,12 +564,21 @@ impl McpServerLike for BlockToolsServer {
             "block_list" => {
                 let p: BlockListParams = serde_json::from_value(params.arguments)
                     .map_err(McpError::InvalidParams)?;
-                let kind_filter = p.kind.as_ref().and_then(|k| self.parse_kind(k).ok());
-                let status_filter = p.status.as_ref().and_then(|s| self.parse_status(s).ok());
+                // `.transpose()?`, not `.ok()`: an unparseable filter is an
+                // error, never a silently dropped filter. Dropping one fails
+                // in the worst direction — the caller gets MORE blocks than it
+                // asked for, with no signal that its filter did nothing.
+                let kind_filter = p.kind.as_ref().map(|k| self.parse_kind(k)).transpose()?;
+                let status_filter = p
+                    .status
+                    .as_ref()
+                    .map(|s| self.parse_status(s))
+                    .transpose()?;
                 let parent_id_filter = p
                     .parent_id
                     .as_ref()
-                    .and_then(|s| self.parse_block_id(s).ok());
+                    .map(|s| self.parse_block_id(s))
+                    .transpose()?;
 
                 let mut blocks = Vec::new();
                 let context_ids = self.documents.list_ids();
@@ -1410,6 +1419,57 @@ mod tests {
         )
         .await;
         assert!(!res.is_error);
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        assert_eq!(response["count"], 1);
+    }
+
+    /// A filter this tool cannot parse must fail the call, never widen the
+    /// result. The old code reached `.ok()` on a real `McpError` and turned
+    /// it into "no filter", so a client asking for one kind was handed every
+    /// block in every context with nothing to tell it apart from a genuine
+    /// match. The `count` assertions are the teeth — an error surfacing
+    /// alongside a full result set would still be the bug.
+    #[tokio::test]
+    async fn block_list_rejects_a_filter_it_cannot_parse() {
+        let (broker, ctx, _db, store) = setup().await;
+        store
+            .insert_block(
+                ctx.context_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "thinking...",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        for (field, bad) in [
+            ("kind", "explosion"),
+            ("status", "explosion"),
+            ("parent_id", "not-a-block-id"),
+        ] {
+            let err = broker
+                .call_tool(
+                    KernelCallParams {
+                        instance: InstanceId::new(BlockToolsServer::INSTANCE),
+                        tool: "block_list".to_string(),
+                        arguments: serde_json::json!({ field: bad }),
+                    },
+                    &ctx,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                err.is_err(),
+                "`{field}={bad}` must fail the call, not list everything"
+            );
+        }
+
+        // The other half: a parseable filter still filters, so "reject the
+        // unparseable" cannot pass by rejecting everything.
+        let res = call(&broker, &ctx, "block_list", serde_json::json!({"kind": "thinking"})).await;
         let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
         assert_eq!(response["count"], 1);
     }

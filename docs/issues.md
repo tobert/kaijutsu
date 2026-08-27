@@ -6,25 +6,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## A bad `--status` filter silently returns everything (2026-08-27)
+## `kernel_search --document_id` silently searches nothing (2026-08-27)
 
-`kj block list --status explosion` lists every block instead of erroring:
-`kj/block.rs:508` is `status_arg.and_then(Status::from_str)`, so an
-unparseable name becomes `None`, which means "no filter". The MCP twin has
-the same shape — `mcp/servers/block.rs:568`,
-`p.status.as_ref().and_then(|s| self.parse_status(s).ok())` — and it discards
-a real `McpError` to get there.
+`mcp/servers/block.rs`, the `kernel_search` arm: an unparseable or unknown
+`document_id` falls to `_ => vec![]`, so the search runs over no contexts and
+reports zero matches — indistinguishable from a real miss.
 
-A silent fallback in the direction of *more* results is the bad direction: a
-model filtering for one status and reasoning over an unfiltered list has no
-signal that its filter did nothing. The setter next door already gets this
-right (`block_status` errors on an unparseable name, and the parser it calls
-now names the accepted set).
+Same family as the `block_list` filters fixed today, failing the other
+direction: fewer results rather than more. Fewer is the less dangerous
+direction and the reason this is filed rather than folded in, but "your query
+matched nothing" and "the id you gave me is not a document" are different
+facts and a caller cannot act on the first when it was really the second.
 
-Found while adding `Status::Waiting`, which is why the fix is not folded in:
-it changes the error behavior of a verb the status work did not otherwise
-touch. Both sites, one change; `--kind` and `--role` are worth a look in the
-same pass.
+The `.transpose()?` shape both `block_list` and `kernel_search`'s own
+kind/role filters now use is the fix; `ContextId::parse` failing and the
+context being absent want distinct messages.
 
 ---
 

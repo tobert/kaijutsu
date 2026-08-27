@@ -79,7 +79,7 @@ enum BlockCommand {
         /// Target context: . (default) | .parent | <label> | <hex prefix>
         #[arg(long, short = 'c')]
         context: Option<String>,
-        /// Filter by kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace
+        /// Filter by kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace|task
         #[arg(long)]
         kind: Option<String>,
         /// Filter by role: user|model|system|tool|asset
@@ -503,9 +503,18 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj block list: {e}")),
         };
 
-        let kf = kind_arg.and_then(parse_kind);
-        let rf = role_arg.and_then(Role::from_str);
-        let sf = status_arg.and_then(Status::from_str);
+        let kf = match parse_filter(kind_arg, parse_kind, "kind", KIND_NAMES) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(e),
+        };
+        let rf = match parse_filter(role_arg, Role::from_str, "role", ROLE_NAMES) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(e),
+        };
+        let sf = match parse_filter(status_arg, Status::from_str, "status", STATUS_NAMES) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(e),
+        };
 
         let filtered: Vec<_> = snapshots
             .iter()
@@ -1677,6 +1686,37 @@ struct BlockListRow {
     kind: String,
     status: String,
     content_length: usize,
+}
+
+/// The accepted names for each `kj block list` filter, in one place so the
+/// `--help` line and the error text cannot drift apart. `--kind` has its own
+/// parser below; `--role` and `--status` delegate to the type's `from_str`,
+/// which also accepts synonyms these lists do not advertise
+/// (`active`→running, `completed`→done).
+const KIND_NAMES: &str =
+    "text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace|task";
+const ROLE_NAMES: &str = "user|model|system|tool|asset";
+const STATUS_NAMES: &str = "pending|running|waiting|done|error|draft";
+
+/// Parse one optional `kj block list` filter.
+///
+/// `None` means no filter; an unparseable value is an error naming what is
+/// accepted, never a silently dropped filter. Dropping it fails in the worst
+/// direction — the caller gets MORE rows than it asked for, and a model
+/// filtering for one kind and reasoning over an unfiltered list has no signal
+/// that its filter did nothing.
+fn parse_filter<T>(
+    arg: Option<&str>,
+    parse: impl Fn(&str) -> Option<T>,
+    flag: &str,
+    accepted: &str,
+) -> Result<Option<T>, String> {
+    match arg {
+        None => Ok(None),
+        Some(value) => parse(value).map(Some).ok_or_else(|| {
+            format!("kj block list: invalid --{flag} '{value}' (expected {accepted})")
+        }),
+    }
 }
 
 fn parse_kind(s: &str) -> Option<BlockKind> {
@@ -2903,6 +2943,110 @@ mod tests {
             .find(|b| b.id == bid)
             .unwrap();
         assert_eq!(after.status, Status::Running);
+    }
+
+    /// An unparseable filter must error, never widen the result. This is the
+    /// direction that matters: the old code collapsed a bad value to "no
+    /// filter", so a caller asking for one status got EVERY block and had no
+    /// way to tell. Each assertion checks the row count too — an error
+    /// message alone would still pass if the rows leaked out beside it.
+    #[tokio::test]
+    async fn block_list_rejects_a_filter_it_cannot_parse() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        insert_text_block(&d, ctx, "one");
+        insert_text_block(&d, ctx, "two");
+
+        for (flag, bad) in [
+            ("--kind", "explosion"),
+            ("--role", "explosion"),
+            ("--status", "explosion"),
+        ] {
+            let result = d
+                .dispatch(&[s("block"), s("list"), s(flag), s(bad)], &c)
+                .await;
+            assert!(
+                !result.is_ok(),
+                "`{flag} {bad}` must not silently list everything"
+            );
+            let msg = result.message();
+            assert!(
+                msg.contains(bad) && msg.contains("expected"),
+                "the error must name the bad value and what is accepted: {msg}"
+            );
+        }
+    }
+
+    /// The other half: a filter that DOES parse still filters. Without this,
+    /// "reject everything unparseable" would pass by rejecting everything.
+    #[tokio::test]
+    async fn block_list_still_filters_on_a_good_value() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "one");
+        insert_text_block(&d, ctx, "two");
+        d.dispatch(&[s("block"), s("status"), bid.to_key(), s("waiting")], &c)
+            .await;
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("list"), s("--status"), s("waiting"), s("--json")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "{}", result.message());
+        let out = result.message();
+        assert!(out.contains(&bid.to_key()), "the waiting block is missing: {out}");
+        assert!(
+            out.matches("\"block_id\"").count() == 1,
+            "exactly one block matches --status waiting: {out}"
+        );
+    }
+
+    /// Every name `--kind`'s help advertises must parse, for the same reason
+    /// the status list is pinned: the `///` line and the parser are written
+    /// in different places and `task` was already missing from the help.
+    #[tokio::test]
+    async fn block_list_kind_filter_accepts_every_advertised_name() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        for name in KIND_NAMES.split('|') {
+            let result = d
+                .dispatch(&[s("block"), s("list"), s("--kind"), s(name)], &c)
+                .await;
+            assert!(
+                result.is_ok(),
+                "`{name}` is advertised by --help but was rejected: {}",
+                result.message()
+            );
+        }
+        for name in ROLE_NAMES.split('|') {
+            let result = d
+                .dispatch(&[s("block"), s("list"), s("--role"), s(name)], &c)
+                .await;
+            assert!(
+                result.is_ok(),
+                "`{name}` is advertised by --help but was rejected: {}",
+                result.message()
+            );
+        }
+        for name in STATUS_NAMES.split('|') {
+            let result = d
+                .dispatch(&[s("block"), s("list"), s("--status"), s(name)], &c)
+                .await;
+            assert!(
+                result.is_ok(),
+                "`{name}` is advertised by --help but was rejected: {}",
+                result.message()
+            );
+        }
     }
 
     #[tokio::test]
