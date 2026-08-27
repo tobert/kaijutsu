@@ -998,6 +998,21 @@ pub fn format_task_for_llm(block: &BlockSnapshot) -> String {
     )
 }
 
+/// The names each filter surface advertises for `BlockKind`, `Role` and
+/// `Status`, in one place so a `--help` line, an MCP schema and an error
+/// message cannot drift apart.
+///
+/// Advertised, not exhaustive: each type's `from_str` also takes synonyms
+/// these omit (`toolcall`, `human`, `assistant`, `agent`, `active`,
+/// `completed`). A name listed here must parse — that is what the surfaces
+/// test.
+pub const KIND_NAMES: &str =
+    "text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace|task";
+/// See [`KIND_NAMES`].
+pub const ROLE_NAMES: &str = "user|model|system|tool|asset";
+/// See [`KIND_NAMES`].
+pub const STATUS_NAMES: &str = "pending|running|waiting|done|error|draft";
+
 /// Execution status for blocks.
 ///
 /// Discriminant order (`Error > Done > Waiting > Running > Pending`) is a

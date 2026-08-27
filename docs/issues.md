@@ -6,24 +6,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## `kernel_search --document_id` silently searches nothing (2026-08-27)
-
-`mcp/servers/block.rs`, the `kernel_search` arm: an unparseable or unknown
-`document_id` falls to `_ => vec![]`, so the search runs over no contexts and
-reports zero matches — indistinguishable from a real miss.
-
-Same family as the `block_list` filters fixed today, failing the other
-direction: fewer results rather than more. Fewer is the less dangerous
-direction and the reason this is filed rather than folded in, but "your query
-matched nothing" and "the id you gave me is not a document" are different
-facts and a caller cannot act on the first when it was really the second.
-
-The `.transpose()?` shape both `block_list` and `kernel_search`'s own
-kind/role filters now use is the fix; `ContextId::parse` failing and the
-context being absent want distinct messages.
-
----
-
 ## Ctrl+Z lands in the wrong input on the second toggle (Amy, 2026-08-26)
 
 Amy: *"sometimes when I hit ctrl-z it goes to conversation input... usually

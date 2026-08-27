@@ -14,7 +14,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_cas::ContentStore;
-use kaijutsu_types::{BlockKind, ContentType, Role, Status};
+use kaijutsu_types::{BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAMES, STATUS_NAMES};
 use serde::Serialize;
 
 use crate::block_tools::translate::{line_range_to_char_range, line_to_char_offset};
@@ -503,15 +503,15 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj block list: {e}")),
         };
 
-        let kf = match parse_filter(kind_arg, parse_kind, "kind", KIND_NAMES) {
+        let kf = match parse_filter("list", kind_arg, BlockKind::from_str, "kind", KIND_NAMES) {
             Ok(v) => v,
             Err(e) => return KjResult::Err(e),
         };
-        let rf = match parse_filter(role_arg, Role::from_str, "role", ROLE_NAMES) {
+        let rf = match parse_filter("list", role_arg, Role::from_str, "role", ROLE_NAMES) {
             Ok(v) => v,
             Err(e) => return KjResult::Err(e),
         };
-        let sf = match parse_filter(status_arg, Status::from_str, "status", STATUS_NAMES) {
+        let sf = match parse_filter("list", status_arg, Status::from_str, "status", STATUS_NAMES) {
             Ok(v) => v,
             Err(e) => return KjResult::Err(e),
         };
@@ -664,8 +664,14 @@ impl KjDispatcher {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block count: {e}")),
         };
-        let kf = kind_arg.and_then(parse_kind);
-        let rf = role_arg.and_then(Role::from_str);
+        let kf = match parse_filter("count", kind_arg, BlockKind::from_str, "kind", KIND_NAMES) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(e),
+        };
+        let rf = match parse_filter("count", role_arg, Role::from_str, "role", ROLE_NAMES) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(e),
+        };
         let n = snapshots
             .iter()
             .filter(|b| kf.is_none_or(|k| b.kind == k) && rf.is_none_or(|r| b.role == r))
@@ -1594,15 +1600,15 @@ impl KjDispatcher {
             Some(r) => r,
             None => {
                 return KjResult::Err(format!(
-                    "kj block create: invalid role '{role}' (expected user|model|system|tool|asset)"
+                    "kj block create: invalid role '{role}' (expected {ROLE_NAMES})"
                 ));
             }
         };
-        let kind_p = match parse_kind(kind) {
+        let kind_p = match BlockKind::from_str(kind) {
             Some(k) => k,
             None => {
                 return KjResult::Err(format!(
-                    "kj block create: invalid kind '{kind}' (expected text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace)"
+                    "kj block create: invalid kind '{kind}' (expected {KIND_NAMES})"
                 ));
             }
         };
@@ -1688,16 +1694,6 @@ struct BlockListRow {
     content_length: usize,
 }
 
-/// The accepted names for each `kj block list` filter, in one place so the
-/// `--help` line and the error text cannot drift apart. `--kind` has its own
-/// parser below; `--role` and `--status` delegate to the type's `from_str`,
-/// which also accepts synonyms these lists do not advertise
-/// (`active`→running, `completed`→done).
-const KIND_NAMES: &str =
-    "text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace|task";
-const ROLE_NAMES: &str = "user|model|system|tool|asset";
-const STATUS_NAMES: &str = "pending|running|waiting|done|error|draft";
-
 /// Parse one optional `kj block list` filter.
 ///
 /// `None` means no filter; an unparseable value is an error naming what is
@@ -1706,6 +1702,7 @@ const STATUS_NAMES: &str = "pending|running|waiting|done|error|draft";
 /// filtering for one kind and reasoning over an unfiltered list has no signal
 /// that its filter did nothing.
 fn parse_filter<T>(
+    verb: &str,
     arg: Option<&str>,
     parse: impl Fn(&str) -> Option<T>,
     flag: &str,
@@ -1714,25 +1711,8 @@ fn parse_filter<T>(
     match arg {
         None => Ok(None),
         Some(value) => parse(value).map(Some).ok_or_else(|| {
-            format!("kj block list: invalid --{flag} '{value}' (expected {accepted})")
+            format!("kj block {verb}: invalid --{flag} '{value}' (expected {accepted})")
         }),
-    }
-}
-
-fn parse_kind(s: &str) -> Option<BlockKind> {
-    match s.to_ascii_lowercase().as_str() {
-        "text" => Some(BlockKind::Text),
-        "thinking" => Some(BlockKind::Thinking),
-        "tool_call" | "toolcall" => Some(BlockKind::ToolCall),
-        "tool_result" | "toolresult" => Some(BlockKind::ToolResult),
-        "drift" => Some(BlockKind::Drift),
-        "file" => Some(BlockKind::File),
-        "error" => Some(BlockKind::Error),
-        "notification" => Some(BlockKind::Notification),
-        "resource" => Some(BlockKind::Resource),
-        "trace" => Some(BlockKind::Trace),
-        "task" => Some(BlockKind::Task),
-        _ => None,
     }
 }
 
@@ -2977,6 +2957,43 @@ mod tests {
                 "the error must name the bad value and what is accepted: {msg}"
             );
         }
+    }
+
+    /// `kj block count` has the same filters as `list` and had the same
+    /// silent fallback — it was missed the first time because it takes its
+    /// arguments through a different function. A bad filter there returned a
+    /// COUNT of every block, which is worse than a bad list: a single number
+    /// carries no evidence a reader could notice was wrong.
+    #[tokio::test]
+    async fn block_count_rejects_a_filter_it_cannot_parse() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        insert_text_block(&d, ctx, "one");
+        insert_text_block(&d, ctx, "two");
+
+        for flag in ["--kind", "--role"] {
+            let result = d
+                .dispatch(&[s("block"), s("count"), s(flag), s("explosion")], &c)
+                .await;
+            assert!(
+                !result.is_ok(),
+                "`count {flag} explosion` must not return a count of everything"
+            );
+            let msg = result.message();
+            assert!(
+                msg.contains("kj block count") && msg.contains("expected"),
+                "the error names the verb and what is accepted: {msg}"
+            );
+        }
+
+        // A good filter still counts, so this cannot pass by rejecting all.
+        let result = d
+            .dispatch(&[s("block"), s("count"), s("--kind"), s("text")], &c)
+            .await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert_eq!(result.message().trim(), "2");
     }
 
     /// The other half: a filter that DOES parse still filters. Without this,

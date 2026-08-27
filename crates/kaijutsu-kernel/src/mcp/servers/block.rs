@@ -18,7 +18,7 @@ use crate::block_tools::translate::{
     content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
     line_to_char_offset, validate_expected_text,
 };
-use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAMES, STATUS_NAMES};
 use kaijutsu_types::ContextId;
 use kaijutsu_cas::ContentStore;
 use crate::execution::{ExecContext, ExecResult};
@@ -137,11 +137,13 @@ fn default_max_matches() -> u32 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockListParams {
-    /// Filter by parent block ID.
+    /// Filter by parent block ID. A malformed id is an error, not an
+    /// unfiltered result.
     pub parent_id: Option<String>,
-    /// Filter by block kind.
+    /// Filter by block kind: text, thinking, tool_call, tool_result, drift,
+    /// file, error, notification, resource, trace, task.
     pub kind: Option<String>,
-    /// Filter by status.
+    /// Filter by status: pending, running, waiting, done, error, draft.
     pub status: Option<String>,
     /// Filter file blocks by path prefix.
     pub path_prefix: Option<String>,
@@ -166,11 +168,13 @@ pub struct BlockStatusParams {
 pub struct KernelSearchParams {
     /// Regex pattern to search for.
     pub query: String,
-    /// Optional document ID to limit search to.
+    /// Limit the search to one document. A malformed or unknown id is an
+    /// error, not an empty result.
     pub document_id: Option<String>,
-    /// Optional block kind filter (text, thinking, tool_call, tool_result).
+    /// Filter by block kind: text, thinking, tool_call, tool_result, drift,
+    /// file, error, notification, resource, trace, task.
     pub kind: Option<String>,
-    /// Optional role filter (user, model, system, tool).
+    /// Filter by role: user, model, system, tool, asset.
     pub role: Option<String>,
     /// Number of context lines around matches.
     #[serde(default)]
@@ -655,21 +659,51 @@ impl McpServerLike for BlockToolsServer {
                 let max_matches = p.max_matches.unwrap_or(100);
                 let mut search_matches = Vec::new();
 
+                // A named document that cannot be searched is an error, not
+                // an empty result. Collapsing it to `vec![]` reported "no
+                // matches" for a document the caller never actually searched,
+                // and the two facts stay separate here because a caller acts
+                // on them differently: a malformed id is the caller's typo, a
+                // missing document is a context that is gone.
                 let context_ids: Vec<ContextId> = if let Some(ref doc_id_str) = p.document_id {
-                    match ContextId::parse(doc_id_str) {
-                        Ok(ctx) if self.documents.contains(ctx) => vec![ctx],
-                        _ => vec![],
+                    let ctx = ContextId::parse(doc_id_str).map_err(|_| {
+                        McpError::Protocol(format!(
+                            "document_id `{doc_id_str}` is not a valid context id;                              nothing was searched"
+                        ))
+                    })?;
+                    if !self.documents.contains(ctx) {
+                        return Err(McpError::Protocol(format!(
+                            "no document {doc_id_str}; nothing was searched"
+                        )));
                     }
+                    vec![ctx]
                 } else if p.all_documents {
                     self.documents.list_ids()
                 } else {
                     vec![tool_ctx.context_id]
                 };
 
+                // A document that cannot be read is reported, never dropped
+                // in silence: "no matches" and "no matches, and two documents
+                // could not be read" are different answers. Loud but not
+                // fatal on a sweep, matching `abandon_running_blocks_on_restart`
+                // — one unreadable document must not hide every other hit.
+                // A single named `document_id` never reaches this, having
+                // already been resolved to an error above.
+                let mut unreadable: Vec<String> = Vec::new();
                 'outer: for context_id in context_ids {
                     let snapshots = match self.documents.block_snapshots(context_id) {
                         Ok(s) => s,
-                        Err(_) => continue,
+                        Err(e) => {
+                            tracing::warn!(
+                                context_id = %context_id.to_hex(),
+                                error = %e,
+                                "kernel_search: could not read a document; \
+                                 reporting it as unreadable rather than skipping it"
+                            );
+                            unreadable.push(context_id.to_hex());
+                            continue;
+                        }
                     };
 
                     for snapshot in snapshots {
@@ -724,7 +758,8 @@ impl McpServerLike for BlockToolsServer {
                 let res_json = serde_json::json!({
                     "matches": search_matches,
                     "total": search_matches.len(),
-                    "truncated": search_matches.len() >= max_matches
+                    "truncated": search_matches.len() >= max_matches,
+                    "unreadable": unreadable
                 });
                 ExecResult::success(res_json.to_string())
             }
@@ -829,24 +864,24 @@ impl BlockToolsServer {
             .ok_or_else(|| McpError::Protocol(format!("invalid block_id format: {}", s)))
     }
 
+    /// Delegates to `Role::from_str`, for the reason `parse_status` gives:
+    /// a second table accepts a different set of names than `kj` does for the
+    /// same field. It also already accepted `asset`, which the table here did
+    /// not — so an MCP client could not filter for a role `kj` could.
     fn parse_role(&self, s: &str) -> McpResult<Role> {
-        match s.to_lowercase().as_str() {
-            "user" | "human" => Ok(Role::User),
-            "model" | "assistant" | "agent" => Ok(Role::Model),
-            "system" => Ok(Role::System),
-            "tool" => Ok(Role::Tool),
-            _ => Err(McpError::Protocol(format!("invalid role: {}", s))),
-        }
+        Role::from_str(s).ok_or_else(|| {
+            McpError::Protocol(format!("invalid role: {s} (expected {ROLE_NAMES})"))
+        })
     }
 
+    /// Delegates to `BlockKind::from_str`, which knows all eleven kinds. The
+    /// table this replaced knew four, so `drift`, `file`, `error`,
+    /// `notification`, `resource`, `trace` and `task` were unfilterable from
+    /// MCP while `kj block list` filtered them fine.
     fn parse_kind(&self, s: &str) -> McpResult<BlockKind> {
-        match s.to_lowercase().as_str() {
-            "text" => Ok(BlockKind::Text),
-            "thinking" => Ok(BlockKind::Thinking),
-            "tool_call" | "toolcall" => Ok(BlockKind::ToolCall),
-            "tool_result" | "toolresult" => Ok(BlockKind::ToolResult),
-            _ => Err(McpError::Protocol(format!("invalid kind: {}", s))),
-        }
+        BlockKind::from_str(s).ok_or_else(|| {
+            McpError::Protocol(format!("invalid kind: {s} (expected {KIND_NAMES})"))
+        })
     }
 
     /// Delegates to `Status::from_str`, which owns the synonym set
@@ -856,7 +891,7 @@ impl BlockToolsServer {
     fn parse_status(&self, s: &str) -> McpResult<Status> {
         Status::from_str(s).ok_or_else(|| {
             McpError::Protocol(format!(
-                "invalid status: {s} (expected pending|running|waiting|done|error|draft)"
+                "invalid status: {s} (expected {STATUS_NAMES})"
             ))
         })
     }
@@ -1429,6 +1464,145 @@ mod tests {
     /// block in every context with nothing to tell it apart from a genuine
     /// match. The `count` assertions are the teeth — an error surfacing
     /// alongside a full result set would still be the bug.
+    /// A named document that cannot be searched is an error. Reporting zero
+    /// matches for a document nobody searched is the same lie as listing
+    /// everything for a filter nobody applied, told the other direction:
+    /// the caller reads "your query is not in there" and it was never asked.
+    /// The two cases stay distinct because a caller acts on them differently.
+    #[tokio::test]
+    async fn kernel_search_refuses_a_document_id_it_cannot_search() {
+        let (broker, ctx, _db, store) = setup().await;
+        store
+            .insert_block(
+                ctx.context_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "findme",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let search = |doc: String| {
+            let broker = &broker;
+            let ctx = &ctx;
+            async move {
+                broker
+                    .call_tool(
+                        KernelCallParams {
+                            instance: InstanceId::new(BlockToolsServer::INSTANCE),
+                            tool: "kernel_search".to_string(),
+                            arguments: serde_json::json!({
+                                "query": "findme",
+                                "document_id": doc,
+                            }),
+                        },
+                        ctx,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+
+        let malformed = search("not-a-context-id".to_string()).await;
+        let msg = format!("{:?}", malformed.as_ref().err());
+        assert!(malformed.is_err(), "a malformed document_id must not report zero matches");
+        assert!(
+            msg.contains("not a valid context id"),
+            "a malformed id and a missing document are different facts: {msg}"
+        );
+
+        let absent = search(ContextId::new().to_hex()).await;
+        let msg = format!("{:?}", absent.as_ref().err());
+        assert!(absent.is_err(), "an unknown document must not report zero matches");
+        assert!(
+            msg.contains("no document"),
+            "a missing document says so: {msg}"
+        );
+
+        // And the searchable case still searches, so "refuse the bad ones"
+        // cannot pass by refusing all of them.
+        let res = call(
+            &broker,
+            &ctx,
+            "kernel_search",
+            serde_json::json!({"query": "findme", "document_id": ctx.context_id.to_hex()}),
+        )
+        .await;
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        assert_eq!(response["total"], 1);
+        assert_eq!(
+            response["unreadable"].as_array().map(|a| a.len()),
+            Some(0),
+            "a healthy search reports nothing unreadable"
+        );
+    }
+
+    /// A document that cannot be read is reported, not dropped in silence.
+    /// A caller cannot tell "your query is not in there" from "I never looked"
+    /// unless the second one says so, and the failure the old `Err(_) =>
+    /// continue` swallowed is reachable: searching a context that has no
+    /// document is `DocumentNotFound`.
+    #[tokio::test]
+    async fn kernel_search_reports_a_document_it_could_not_read() {
+        let (broker, ctx, _db, _store) = setup().await;
+
+        // A context with no document at all — the default branch searches
+        // `tool_ctx.context_id`, and reading it fails.
+        let mut empty = ctx.clone();
+        empty.context_id = ContextId::new();
+
+        let res = call(&broker, &empty, "kernel_search", serde_json::json!({"query": "findme"})).await;
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        assert_eq!(response["total"], 0);
+        assert_eq!(
+            response["unreadable"]
+                .as_array()
+                .expect("unreadable is always present")
+                .len(),
+            1,
+            "zero matches from a document nobody could read must say so: {response}"
+        );
+        assert_eq!(
+            response["unreadable"][0],
+            empty.context_id.to_hex(),
+            "the report names which document"
+        );
+    }
+
+    /// `kernel_search` now accepts every kind and role the type does. The
+    /// hand-written table it replaced knew four kinds, so an MCP client could
+    /// not filter for `drift` or `task` while `kj block list` could — and
+    /// once an unparseable filter became an error rather than a silent
+    /// no-op, that gap turned from invisible into a refusal.
+    #[tokio::test]
+    async fn kernel_search_accepts_every_kind_and_role_kj_does() {
+        let (broker, ctx, _db, _store) = setup().await;
+
+        for name in KIND_NAMES.split('|') {
+            let res = call(
+                &broker,
+                &ctx,
+                "kernel_search",
+                serde_json::json!({"query": "x", "kind": name}),
+            )
+            .await;
+            assert!(!res.is_error, "kind `{name}` was rejected: {}", text_of(&res));
+        }
+        for name in ROLE_NAMES.split('|') {
+            let res = call(
+                &broker,
+                &ctx,
+                "kernel_search",
+                serde_json::json!({"query": "x", "role": name}),
+            )
+            .await;
+            assert!(!res.is_error, "role `{name}` was rejected: {}", text_of(&res));
+        }
+    }
+
     #[tokio::test]
     async fn block_list_rejects_a_filter_it_cannot_parse() {
         let (broker, ctx, _db, store) = setup().await;
