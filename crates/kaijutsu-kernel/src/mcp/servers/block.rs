@@ -668,7 +668,7 @@ impl McpServerLike for BlockToolsServer {
                 let context_ids: Vec<ContextId> = if let Some(ref doc_id_str) = p.document_id {
                     let ctx = ContextId::parse(doc_id_str).map_err(|_| {
                         McpError::Protocol(format!(
-                            "document_id `{doc_id_str}` is not a valid context id;                              nothing was searched"
+                            "document_id `{doc_id_str}` is not a valid context id; nothing was searched"
                         ))
                     })?;
                     if !self.documents.contains(ctx) {
@@ -1512,6 +1512,14 @@ mod tests {
         assert!(
             msg.contains("not a valid context id"),
             "a malformed id and a missing document are different facts: {msg}"
+        );
+        // Published text a model reads: a lost line-continuation backslash
+        // bakes a run of source indentation into the message, and it compiles
+        // and passes a `contains` check either way. Caught in the live kernel
+        // rather than here, the first time.
+        assert!(
+            !msg.contains("  "),
+            "the message carries a run of source indentation: {msg}"
         );
 
         let absent = search(ContextId::new().to_hex()).await;
