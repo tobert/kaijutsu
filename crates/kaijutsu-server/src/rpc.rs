@@ -2262,10 +2262,14 @@ pub async fn create_shared_kernel(
     // mid-turn — leaves a block `Running` forever with nothing left to
     // finalize it. At cold start no writer can be mid-turn, so any `Running`
     // block found here is known-stale (docs/issues.md, "Blocks orphaned in
-    // `Running` have no supervisor"). `abandon_running_blocks_on_restart`
-    // does not touch `Pending` (the drift queue's own durable waiting state)
-    // or `Draft` (an unsubmitted compose draft), and a completed block is
-    // never in scope — it isn't `Running`.
+    // `Running` have no supervisor"). It also sweeps `Waiting`, and the ask
+    // sweep immediately above is why: those blocks are waiting on asks that
+    // were just abandoned, so nothing can ever move them. Order matters —
+    // the asks must be abandoned first, or the sweep would fail blocks whose
+    // questions were still live. `abandon_running_blocks_on_restart` does not
+    // touch `Pending` (the drift queue's own durable waiting state) or
+    // `Draft` (an unsubmitted compose draft), and a completed block is never
+    // in scope.
     //
     // Loud but not fatal, matching the ask sweep: the count is reported, and
     // a per-block failure inside the sweep is logged there rather than
@@ -2275,8 +2279,8 @@ pub async fn create_shared_kernel(
     );
     if swept_blocks > 0 {
         log::info!(
-            "abandoned {swept_blocks} block(s) left `Running` by a writer that did not survive \
-             the restart"
+            "abandoned {swept_blocks} block(s) left `Running` or `Waiting` by a writer or an \
+             ask that did not survive the restart"
         );
     }
 
@@ -8906,9 +8910,13 @@ async fn execute_shell_command(
             // `McpError::GatePending`'s doc comment exists to prevent. Each
             // variant's own Display already names what happened.
             let reason = err.to_string();
+            // Same three-verdict split the message above respects, applied to
+            // the blocks: a pending ask settles them `Waiting`, not `Error`,
+            // so the pair does not read as a failed command afterwards.
+            let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
-            let _ = documents.set_status(context_id, &output_block_id, Status::Error);
-            let _ = documents.set_status(context_id, &command_block_id, Status::Error);
+            let _ = documents.set_status(context_id, &output_block_id, settled);
+            let _ = documents.set_status(context_id, &command_block_id, settled);
             return Err(capnp::Error::failed(reason));
         }
     }
@@ -9162,9 +9170,10 @@ async fn execute_shell_command(
                     }
                     kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
                         let reason = format!("shell command result denied by hook: {err}");
+                        let settled = err.settled_block_status();
                         let _ = documents_clone.set_stderr(context_id, &output_block_id_clone, Some(reason));
-                        let _ = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error);
-                        let _ = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error);
+                        let _ = documents_clone.set_status(context_id, &output_block_id_clone, settled);
+                        let _ = documents_clone.set_status(context_id, &command_block_id_clone, settled);
                     }
                 }
             }
@@ -9532,9 +9541,10 @@ async fn execute_kj_command(
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
             let reason = format!("kj command denied: {err}");
+            let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
-            let _ = documents.set_status(context_id, &output_block_id, Status::Error);
-            let _ = documents.set_status(context_id, &command_block_id, Status::Error);
+            let _ = documents.set_status(context_id, &output_block_id, settled);
+            let _ = documents.set_status(context_id, &command_block_id, settled);
             return Err(capnp::Error::failed(reason));
         }
     }
@@ -9678,9 +9688,10 @@ async fn execute_kj_command(
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
             let reason = format!("kj command result denied by hook: {err}");
+            let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
-            let _ = documents.set_status(context_id, &output_block_id, Status::Error);
-            let _ = documents.set_status(context_id, &command_block_id, Status::Error);
+            let _ = documents.set_status(context_id, &output_block_id, settled);
+            let _ = documents.set_status(context_id, &command_block_id, settled);
             Ok(ExecutedKj {
                 exit_code: 1, stdout: String::new(), stderr: reason,
                 command_block_id, latch: None, data: None,
@@ -10127,6 +10138,7 @@ fn status_from_capnp(status: crate::kaijutsu_capnp::Status) -> Status {
         crate::kaijutsu_capnp::Status::Done => Status::Done,
         crate::kaijutsu_capnp::Status::Error => Status::Error,
         crate::kaijutsu_capnp::Status::Draft => Status::Draft,
+        crate::kaijutsu_capnp::Status::Waiting => Status::Waiting,
     }
 }
 
@@ -10296,6 +10308,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::Status::Done => Status::Done,
                 crate::kaijutsu_capnp::Status::Error => Status::Error,
                 crate::kaijutsu_capnp::Status::Draft => Status::Draft,
+                crate::kaijutsu_capnp::Status::Waiting => Status::Waiting,
             });
         }
         if statuses.is_empty() {
@@ -11062,6 +11075,7 @@ pub(crate) fn status_to_capnp(status: kaijutsu_types::Status) -> crate::kaijutsu
         kaijutsu_types::Status::Done => crate::kaijutsu_capnp::Status::Done,
         kaijutsu_types::Status::Error => crate::kaijutsu_capnp::Status::Error,
         kaijutsu_types::Status::Draft => crate::kaijutsu_capnp::Status::Draft,
+        kaijutsu_types::Status::Waiting => crate::kaijutsu_capnp::Status::Waiting,
     }
 }
 
@@ -12496,6 +12510,57 @@ mod turn_event_wire_mapping_tests {
         assert_eq!(
             turn_origin_to_capnp(TurnOrigin::Autonomous),
             crate::kaijutsu_capnp::TurnOrigin::Autonomous
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_wire_mapping_tests {
+    //! The Rust↔capnp encoding of block `Status`.
+    //!
+    //! The two enums are deliberately in different orders: the Rust
+    //! declaration order is a comparison rank (`Pending < Running < Waiting <
+    //! Done < Error`) while the capnp ordinals are append-only, so `waiting`
+    //! is `@5` on the wire and third in the rank. Nothing enforces the
+    //! correspondence but these two functions, which is why it is pinned
+    //! here rather than trusted.
+
+    use super::*;
+
+    /// Round-trips every variant. A mapping that sent `Waiting` as `Error`
+    /// would compile, pass every other test, and tell a client a gated call
+    /// had failed.
+    #[test]
+    fn every_status_round_trips_through_the_wire() {
+        for status in [
+            Status::Pending,
+            Status::Running,
+            Status::Waiting,
+            Status::Done,
+            Status::Error,
+            Status::Draft,
+        ] {
+            assert_eq!(
+                status_from_capnp(status_to_capnp(status)),
+                status,
+                "{} did not survive the wire round trip",
+                status.as_str()
+            );
+        }
+    }
+
+    /// A round trip alone cannot catch a mapping that swapped two variants
+    /// consistently in both directions, so the one that matters most is also
+    /// pinned to its enumerant by name.
+    #[test]
+    fn waiting_is_its_own_enumerant_not_an_error() {
+        assert_eq!(
+            status_to_capnp(Status::Waiting),
+            crate::kaijutsu_capnp::Status::Waiting
+        );
+        assert_ne!(
+            status_to_capnp(Status::Waiting),
+            crate::kaijutsu_capnp::Status::Error
         );
     }
 }

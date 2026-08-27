@@ -3132,11 +3132,19 @@ impl BlockStore {
     /// naming `model`/`tool_call`/`tool_result` specifically: `Running`
     /// itself is the writer-in-flight signal regardless of kind, so a
     /// narrower list would just be a second place to remember to update
-    /// when a new streaming kind is added. `Pending` and `Draft` are left
-    /// untouched — `Pending` is the drift queue's durable "waiting to be
-    /// flushed" state (`drift.rs`) and must survive a restart unswept;
-    /// `Draft` is an unsubmitted compose draft, exactly what a player left
-    /// mid-sentence, not abandoned work.
+    /// when a new streaming kind is added.
+    ///
+    /// `Waiting` is swept for the same reason, one step removed: the ask a
+    /// waiting block is waiting on was abandoned moments earlier by
+    /// `KernelDb::abandon_unresolved_asks_on_restart`, so the question it
+    /// names can never be answered and nothing will ever move the block.
+    /// Leaving it would be a block that reports an open question with no
+    /// open question behind it.
+    ///
+    /// `Pending` and `Draft` are left untouched — `Pending` is the drift
+    /// queue's durable "waiting to be flushed" state (`drift.rs`) and must
+    /// survive a restart unswept; `Draft` is an unsubmitted compose draft,
+    /// exactly what a player left mid-sentence, not abandoned work.
     ///
     /// Each swept block is set `Status::Error` and gets an `Error` child
     /// block naming `reason`, so both the model and the app can read why —
@@ -3152,7 +3160,7 @@ impl BlockStore {
             let running: Vec<(BlockId, BlockKind)> = match self.block_snapshots(context_id) {
                 Ok(snaps) => snaps
                     .into_iter()
-                    .filter(|s| s.status == Status::Running)
+                    .filter(|s| matches!(s.status, Status::Running | Status::Waiting))
                     .map(|s| (s.id, s.kind))
                     .collect(),
                 Err(e) => {
@@ -3208,6 +3216,8 @@ impl BlockStore {
 ///
 /// - any block `Running` → `Running` (the context is actively working);
 /// - else the tail block `Error` → `Error` (its most recent turn failed);
+/// - else the tail block `Waiting` → `Waiting` (its most recent move stopped
+///   on a question nobody has answered);
 /// - else `Pending` (idle — no rim in the time well).
 ///
 /// Non-sticky by construction: a new turn appends a `Running` block, so a past
@@ -3225,15 +3235,20 @@ pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
     // it lives at the END of the document, so a naive `.last()` would find the
     // draft instead of the failed turn behind it and report a broken context as
     // idle. A draft is not the context's work; it is someone mid-sentence.
-    } else if statuses_in_order
-        .iter()
-        .rev()
-        .find(|s| **s != Status::Draft)
-        == Some(&Status::Error)
-    {
-        Status::Error
     } else {
-        Status::Pending
+        // `Waiting` rides the same tail check as `Error` rather than an
+        // any-block check, and that is what keeps it non-sticky: nothing in
+        // the kernel moves a block out of `Waiting`, so an any-block check
+        // would pin a context to `Waiting` forever after one gated call.
+        match statuses_in_order
+            .iter()
+            .rev()
+            .find(|s| **s != Status::Draft)
+        {
+            Some(Status::Error) => Status::Error,
+            Some(Status::Waiting) => Status::Waiting,
+            _ => Status::Pending,
+        }
     }
 }
 
@@ -6511,6 +6526,47 @@ mod tests {
         );
     }
 
+    /// A context whose last move stopped on an unanswered ask is not idle,
+    /// and it is not failed either.
+    #[test]
+    fn a_waiting_tail_is_the_contexts_live_status() {
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Waiting]),
+            Status::Waiting,
+            "a gated call that ran nothing must not read as idle"
+        );
+        // Same draft-skipping rule the failed-turn case gets.
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Waiting, Status::Draft]),
+            Status::Waiting,
+            "a half-typed message must not mask the open question behind it"
+        );
+        // Real work beats a question: a later turn is what the context is
+        // doing now.
+        assert_eq!(
+            derive_context_live_status(&[Status::Waiting, Status::Running]),
+            Status::Running
+        );
+    }
+
+    /// `Waiting` must not become sticky. Nothing in the kernel moves a block
+    /// out of it, so an any-block check (rather than the tail check the
+    /// reducer uses) would pin a context to `Waiting` forever after one
+    /// gated call — this is the test that fails against that implementation.
+    #[test]
+    fn a_waiting_block_does_not_pin_the_context_forever() {
+        assert_eq!(
+            derive_context_live_status(&[Status::Waiting, Status::Done]),
+            Status::Pending,
+            "work after the gated call supersedes it, exactly as it does for Error"
+        );
+        assert_eq!(
+            derive_context_live_status(&[Status::Waiting, Status::Error]),
+            Status::Error,
+            "the newer failure is what the context's state is"
+        );
+    }
+
     // ── Version durability (docs/change-feed.md rules 21-26) ─────────────
 
     /// The context version RESUMES across a restart.
@@ -7215,6 +7271,57 @@ mod tests {
         assert_eq!(
             store.get_block_snapshot(ctx, &tool_call).unwrap().unwrap().status,
             Status::Error
+        );
+    }
+
+    /// A `Waiting` block is waiting on an ask that
+    /// `KernelDb::abandon_unresolved_asks_on_restart` just threw away, so it
+    /// is as stale as a `Running` one and must be swept with it. Left alone,
+    /// it would report an open question with no open question behind it, and
+    /// nothing would ever move it — the block store cannot answer an ask.
+    #[test]
+    fn abandon_running_blocks_also_sweeps_waiting() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let waiting = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolCall,
+                "kj rc reset",
+                Status::Waiting,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let pending = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "queued",
+                Status::Pending,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let swept = store.abandon_running_blocks_on_restart("reason");
+        assert_eq!(swept, 1, "the waiting block, and only it");
+        assert_eq!(
+            store.get_block_snapshot(ctx, &waiting).unwrap().unwrap().status,
+            Status::Error,
+            "an ask that cannot be answered is a failure, not an open question"
+        );
+        assert_eq!(
+            store.get_block_snapshot(ctx, &pending).unwrap().unwrap().status,
+            Status::Pending,
+            "Waiting joining the sweep must not drag Pending in with it"
         );
     }
 

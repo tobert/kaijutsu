@@ -85,7 +85,7 @@ enum BlockCommand {
         /// Filter by role: user|model|system|tool|asset
         #[arg(long)]
         role: Option<String>,
-        /// Filter by status: pending|running|done|error
+        /// Filter by status: pending|running|waiting|done|error|draft
         #[arg(long)]
         status: Option<String>,
         /// Emit a single JSON object instead of a table
@@ -216,7 +216,7 @@ enum BlockCommand {
     Status {
         /// Block id
         block_id: String,
-        /// New status: pending|running|done|error
+        /// New status: pending|running|waiting|done|error|draft
         new_status: String,
     },
     /// Edit a block via line-based operations. Single op per invocation —
@@ -1252,7 +1252,8 @@ impl KjDispatcher {
             Some(s) => s,
             None => {
                 return KjResult::Err(format!(
-                    "kj block status: invalid status '{new_status}' (expected pending|running|done|error)"
+                    "kj block status: invalid status '{new_status}' \
+                     (expected pending|running|waiting|done|error|draft)"
                 ));
             }
         };
@@ -2924,6 +2925,46 @@ mod tests {
             "expected 'invalid status' error: {}",
             result.message()
         );
+    }
+
+    /// Every name the help text advertises must actually parse. The help
+    /// and the parser are in different places — the parser delegates to
+    /// `Status::from_str` while the `///` line is hand-written — so nothing
+    /// but this test keeps them agreeing, and a `///` that lists a status
+    /// `kj` rejects is published text that lies to the model reading it.
+    #[tokio::test]
+    async fn block_status_accepts_every_advertised_name() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "x");
+
+        for (name, expected) in [
+            ("pending", Status::Pending),
+            ("running", Status::Running),
+            ("waiting", Status::Waiting),
+            ("done", Status::Done),
+            ("error", Status::Error),
+            ("draft", Status::Draft),
+        ] {
+            let result = d
+                .dispatch(&[s("block"), s("status"), bid.to_key(), s(name)], &c)
+                .await;
+            assert!(
+                result.is_ok(),
+                "`{name}` is advertised by --help but was rejected: {}",
+                result.message()
+            );
+            let after = d
+                .block_store()
+                .block_snapshots(ctx)
+                .unwrap()
+                .into_iter()
+                .find(|b| b.id == bid)
+                .unwrap();
+            assert_eq!(after.status, expected, "`{name}` set the wrong status");
+        }
     }
 
     // ── New: block edit ───────────────────────────────────────────────

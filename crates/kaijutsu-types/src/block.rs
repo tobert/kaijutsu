@@ -1000,8 +1000,8 @@ pub fn format_task_for_llm(block: &BlockSnapshot) -> String {
 
 /// Execution status for blocks.
 ///
-/// Discriminant order (`Error > Done > Running > Pending`) is a deliberate
-/// rank, not declaration convenience — the same convention `ContentType`
+/// Discriminant order (`Error > Done > Waiting > Running > Pending`) is a
+/// deliberate rank, not declaration convenience — the same convention `ContentType`
 /// documents on `richness()`. Not consumed by conflict resolution today:
 /// concurrent merge into kernel documents is structurally impossible
 /// (CLAUDE.md "Durable state and the wire"), so nothing races two writes to
@@ -1012,12 +1012,28 @@ pub fn format_task_for_llm(block: &BlockSnapshot) -> String {
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
 pub enum Status {
-    /// Queued, not started.
+    /// Queued, never started. Nothing is blocked — the kernel has not
+    /// reached this block yet. Contrast `Waiting`, which has started.
     #[default]
     Pending,
     /// In progress (streaming, executing).
     #[strum(serialize = "running", serialize = "active")]
     Running,
+    /// Started, then stopped, and cannot advance without a decision from
+    /// someone else. Contrast `Pending`, which never started at all.
+    ///
+    /// The one producer today is the gate: a call that left a durable ask
+    /// and ran nothing settles here instead of `Error`, because a question
+    /// nobody has answered is not a refusal (`docs/gate-and-shell-split.md`).
+    ///
+    /// Not terminal, but nothing in the kernel moves it either — an answered
+    /// ask authorizes a retry, which authors a new block. It is the state a
+    /// resumed call would resume *from* once that path exists.
+    ///
+    /// Live work without being active work: a context holding one is not
+    /// idle, but nothing is executing in it. Never a source of turn
+    /// liveness — `turnInFlight` is the only answer to that question.
+    Waiting,
     /// Completed successfully.
     #[strum(serialize = "done", serialize = "complete", serialize = "completed")]
     Done,
@@ -1052,6 +1068,7 @@ impl Status {
         match self {
             Status::Pending => "pending",
             Status::Running => "running",
+            Status::Waiting => "waiting",
             Status::Done => "done",
             Status::Error => "error",
             Status::Draft => "draft",
@@ -1059,13 +1076,26 @@ impl Status {
     }
 
     /// Check if this status indicates completion (Done or Error).
+    ///
+    /// `Waiting` is not terminal: the block stopped, but the question behind
+    /// it is open and its answer is still to come.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Status::Done | Status::Error)
     }
 
     /// Check if this status indicates active work.
+    ///
+    /// `Waiting` is not active — nothing is executing. It is still *live*
+    /// work, which is a different question and `is_idle` answers it.
     pub fn is_active(&self) -> bool {
         matches!(self, Status::Running)
+    }
+
+    /// Whether this status means the context has nothing of its own in
+    /// flight. `Waiting` is not idle: the work stopped on an open question
+    /// rather than finishing.
+    pub fn is_idle(&self) -> bool {
+        !matches!(self, Status::Running | Status::Waiting)
     }
 }
 
@@ -3162,6 +3192,73 @@ mod tests {
         assert_eq!(Status::from_str("active"), Some(Status::Running));
         assert_eq!(Status::from_str("complete"), Some(Status::Done));
         assert_eq!(Status::from_str("completed"), Some(Status::Done));
+    }
+
+    /// `Waiting` is the one status that is neither terminal, nor active, nor
+    /// idle. Each of those three is a separate question and each has bitten
+    /// a caller that assumed two of them move together, so all three are
+    /// pinned here rather than left to whichever one a caller happens to
+    /// reach for.
+    #[test]
+    fn waiting_is_not_terminal_not_active_and_not_idle() {
+        assert_eq!(Status::from_str("waiting"), Some(Status::Waiting));
+        assert_eq!(Status::from_str("WAITING"), Some(Status::Waiting));
+        assert_eq!(Status::Waiting.as_str(), "waiting");
+
+        assert!(!Status::Waiting.is_terminal(), "the question is still open");
+        assert!(!Status::Waiting.is_active(), "nothing is executing");
+        assert!(!Status::Waiting.is_idle(), "the context is not idle either");
+
+        // The three statuses it is most likely to be confused with, so a
+        // change to any predicate that widens onto them fails here.
+        assert!(Status::Pending.is_idle());
+        assert!(Status::Done.is_idle());
+        assert!(!Status::Running.is_idle());
+    }
+
+    /// Pins the LWW/comparison rank across the whole enum. `Waiting` was
+    /// inserted between `Running` and `Done` in declaration order while its
+    /// wire ordinal was appended at the end — two different numbers on
+    /// purpose — so an editor who "fixes" the mismatch by moving the variant
+    /// to match the schema breaks this.
+    #[test]
+    fn status_rank_is_pinned() {
+        assert!(Status::Pending < Status::Running);
+        assert!(Status::Running < Status::Waiting);
+        assert!(Status::Waiting < Status::Done);
+        assert!(Status::Done < Status::Error);
+
+        let mut ranked = [
+            Status::Error,
+            Status::Pending,
+            Status::Done,
+            Status::Waiting,
+            Status::Running,
+        ];
+        ranked.sort();
+        assert_eq!(
+            ranked,
+            [
+                Status::Pending,
+                Status::Running,
+                Status::Waiting,
+                Status::Done,
+                Status::Error,
+            ]
+        );
+    }
+
+    /// At-rest CBOR and the JSON surfaces carry the lowercase name, not the
+    /// discriminant, which is what makes the declaration-order insertion
+    /// above safe for already-stored blocks.
+    #[test]
+    fn waiting_serde_roundtrips_by_name() {
+        let json = serde_json::to_string(&Status::Waiting).unwrap();
+        assert_eq!(json, "\"waiting\"");
+        assert_eq!(
+            serde_json::from_str::<Status>(&json).unwrap(),
+            Status::Waiting
+        );
     }
 
     // ── ContentType ─────────────────────────────────────────────────────

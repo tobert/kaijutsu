@@ -73,6 +73,12 @@ pub fn acp_tool_status(status: Status) -> ToolCallStatus {
         // block someone is typing into. Mapped for totality only; if this arm
         // is ever reached, a draft has been handed to the tool renderer.
         Status::Draft => ToolCallStatus::Pending,
+        // ACP has four tool-call states and none of them is "stopped on an
+        // open question", so this mapping loses information. `Pending` is the
+        // honest half of it — nothing ran — where `Failed` would tell an ACP
+        // client the call was refused, which is the one reading this status
+        // exists to prevent.
+        Status::Waiting => ToolCallStatus::Pending,
     }
 }
 
@@ -1130,6 +1136,16 @@ mod tests {
         assert_eq!(acp_tool_status(Status::Running), ToolCallStatus::InProgress);
         assert_eq!(acp_tool_status(Status::Done), ToolCallStatus::Completed);
         assert_eq!(acp_tool_status(Status::Error), ToolCallStatus::Failed);
+    }
+
+    /// ACP has no state for "stopped on an unanswered question", so this
+    /// mapping is lossy either way. It must lose toward `Pending` (nothing
+    /// ran) and never toward `Failed` — an ACP client told a gated call
+    /// failed learns the one thing the pending-gate path exists to prevent.
+    #[test]
+    fn a_waiting_block_is_not_reported_to_acp_as_failed() {
+        assert_eq!(acp_tool_status(Status::Waiting), ToolCallStatus::Pending);
+        assert_ne!(acp_tool_status(Status::Waiting), ToolCallStatus::Failed);
     }
 
     // ── tool kind classification ────────────────────────────────────────────

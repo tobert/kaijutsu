@@ -12,7 +12,7 @@
 use thiserror::Error;
 
 use super::types::InstanceId;
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, Status};
 
 /// Hook identifier (opaque, stable across restarts of the process).
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -219,6 +219,25 @@ pub enum McpError {
     Policy(#[from] PolicyError),
 }
 
+impl McpError {
+    /// The status the blocks of a call that this error stopped should settle
+    /// to.
+    ///
+    /// `GatePending` settles to `Status::Waiting`, everything else to
+    /// `Status::Error`. The distinction is the same one the variants' own
+    /// `Display` text makes and exists for the same reason: an unanswered
+    /// question is not a refusal, and a block left `Error` says it was.
+    ///
+    /// One mapping, so the shell paths that settle blocks themselves cannot
+    /// each decide differently.
+    pub fn settled_block_status(&self) -> Status {
+        match self {
+            McpError::GatePending { .. } => Status::Waiting,
+            _ => Status::Error,
+        }
+    }
+}
+
 pub type McpResult<T> = Result<T, McpError>;
 
 #[cfg(test)]
@@ -290,5 +309,37 @@ mod tests {
             "the broken-control fact belongs to one layer: {rendered}"
         );
         assert!(rendered.contains("no ask was recorded"), "{rendered}");
+    }
+
+    /// The three verdicts that share the `Denied` arm of `ShellHookVerdict`
+    /// settle blocks differently, and only `GatePending` settles to
+    /// `Waiting`. `GateUnavailable` is the trap: it is also not a "no", but
+    /// nothing will ever come back to move its blocks — a broken control is
+    /// a failure, and calling it `Waiting` would leave a block waiting on an
+    /// answer that no one is composing.
+    #[test]
+    fn only_a_pending_gate_settles_blocks_to_waiting() {
+        let hook = || HookId("lfm2d-advisory".to_string());
+
+        assert_eq!(
+            McpError::GatePending { by_hook: hook(), reason: "r".into() }.settled_block_status(),
+            Status::Waiting
+        );
+        assert_eq!(
+            McpError::Denied { by_hook: hook() }.settled_block_status(),
+            Status::Error,
+            "someone said no"
+        );
+        assert_eq!(
+            McpError::GateUnavailable { by_hook: hook(), reason: "r".into() }
+                .settled_block_status(),
+            Status::Error,
+            "a broken control has no answer coming"
+        );
+        assert_eq!(
+            McpError::Cancelled.settled_block_status(),
+            Status::Error,
+            "a non-gate error is not a question"
+        );
     }
 }

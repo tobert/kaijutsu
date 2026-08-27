@@ -54,6 +54,14 @@ enum Status {
   # into a new block, which is what makes submit incapable of losing what you
   # typed. Never hydrated, never counted as live work.
   draft @4;
+  # Started, then stopped, and cannot advance without a decision from someone
+  # else — distinct from `pending`, which never started. The gate is the one
+  # producer: a call that recorded a durable ask and ran nothing settles here
+  # rather than `error`, because an unanswered question is not a refusal.
+  # Live work but not active work; never a source of turn liveness.
+  # Ordinal appended, not inserted, so the rank in the Rust enum (which is
+  # declaration order) and the wire value are deliberately different numbers.
+  waiting @5;
 }
 
 # Block content type — 10 variants covering what a block *is*.

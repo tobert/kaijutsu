@@ -212,7 +212,17 @@ impl LampSignal {
             // context's *live status* can never be it: the reducer
             // (`derive_context_live_status`) filters drafts out precisely so a
             // half-typed message cannot mask the failed turn behind it.
-            Status::Running | Status::Pending | Status::Done | Status::Draft => false,
+            // `Waiting` clears the ember. It is not fresh successful
+            // activity, but the ember means "the last thing this context did
+            // failed", and a call stopped on an unanswered question did not.
+            // The reducer only reports `Waiting` when it is the tail, so a
+            // real failure behind it is not being masked. A lamp state of its
+            // own is the ledger UI's call, not this boolean's.
+            Status::Running
+            | Status::Pending
+            | Status::Done
+            | Status::Draft
+            | Status::Waiting => false,
         };
     }
 

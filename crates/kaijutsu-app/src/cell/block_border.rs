@@ -260,6 +260,7 @@ pub fn compute_border_style(
                     Status::Pending => Some("pending".to_string()),
                     Status::Done => Some("done".to_string()),
                     Status::Error => Some("error".to_string()),
+                    Status::Waiting => Some("waiting".to_string()),
                     // A draft is what you are typing; labelling it "draft"
                     // would narrate the compose box back at you.
                     Status::Draft => None,
@@ -317,6 +318,7 @@ pub fn compute_border_style(
                 Status::Pending => Some("pending".to_string()),
                 Status::Done => None,
                 Status::Error => Some("error".to_string()),
+                Status::Waiting => Some("waiting".to_string()),
                 // As above: a draft is the thing being typed, not a state to
                 // report back.
                 Status::Draft => None,

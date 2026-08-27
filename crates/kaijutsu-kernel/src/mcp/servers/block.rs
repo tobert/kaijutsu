@@ -302,7 +302,7 @@ impl McpServerLike for BlockToolsServer {
             tool_def::<BlockReadParams>(&self.instance_id, "block_read", "Read block content with optional line numbers and range")?,
             tool_def::<BlockSearchParams>(&self.instance_id, "block_search", "Search within a block using regex or literal patterns")?,
             tool_def::<BlockListParams>(&self.instance_id, "block_list", "List blocks with optional filters")?,
-            tool_def::<BlockStatusParams>(&self.instance_id, "block_status", "Set block status (pending, running, done, error, cancelled)")?,
+            tool_def::<BlockStatusParams>(&self.instance_id, "block_status", "Set block status: pending, running, waiting, done, error, or draft")?,
             tool_def::<KernelSearchParams>(&self.instance_id, "kernel_search", "Search across all blocks using regex, with filters and context")?,
             tool_def::<SvgBlockParams>(&self.instance_id, "svg_block", "Append an SVG block to the current context. Renders as vector graphics inline.")?,
             tool_def::<AbcBlockParams>(&self.instance_id, "abc_block", "Append an ABC music notation block. Validates parse; renders as sheet music inline.")?,
@@ -840,14 +840,16 @@ impl BlockToolsServer {
         }
     }
 
+    /// Delegates to `Status::from_str`, which owns the synonym set
+    /// (active→running, complete/completed→done) and is case-insensitive.
+    /// A second hand-written table here would accept a different set of
+    /// names than `kj block status` does, for the same field.
     fn parse_status(&self, s: &str) -> McpResult<Status> {
-        match s.to_lowercase().as_str() {
-            "pending" => Ok(Status::Pending),
-            "active" | "running" => Ok(Status::Running),
-            "done" | "complete" | "completed" => Ok(Status::Done),
-            "error" => Ok(Status::Error),
-            _ => Err(McpError::Protocol(format!("invalid status: {}", s))),
-        }
+        Status::from_str(s).ok_or_else(|| {
+            McpError::Protocol(format!(
+                "invalid status: {s} (expected pending|running|waiting|done|error|draft)"
+            ))
+        })
     }
 
     fn find_block(&self, block_id_str: &str) -> McpResult<(ContextId, BlockId)> {

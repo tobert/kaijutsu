@@ -1547,3 +1547,55 @@ purpose: staying free of kernel, config and network is what lets the lfm2d
 lane run the check at all, and that is worth a duplicated jq filter. The two
 must be changed together, or the check tests something the hook no longer
 does. Its header says so.
+
+## A pending ask has a block status of its own: `Status::Waiting`
+
+`kj rc reset /etc/rc/lib/create/S50-lfm2d.kai` → the gate records an ask,
+nothing runs, and the command's two blocks settle `waiting`, not `error`.
+
+Rendering was fixed first: the message a model reads no longer calls a
+pending gate a denial. The blocks behind that message still did, because
+`Error` was the only non-`Done` settled status the store had. A player
+scrolling back saw a failed command; the reducer that feeds the context list
+(`derive_context_live_status`) saw a failed context; ACP saw a failed tool
+call. Three surfaces reproducing exactly the collapse the message stopped
+making.
+
+**The state:**
+
+| | `Pending` | `Running` | `Waiting` | `Error` |
+|---|---|---|---|---|
+| started | no | yes | yes | yes |
+| executing now | no | yes | no | no |
+| terminal | no | no | no | yes |
+| context reads idle | yes | no | **no** | no |
+| something will move it | yes | yes | a human | nothing |
+
+`Waiting` is the only status that is neither terminal, nor active, nor idle;
+`Status::is_idle` exists because those three are separate questions and
+callers kept reaching for whichever one was nearest.
+
+**One mapping decides it.** `McpError::settled_block_status()` sends
+`GatePending` to `Waiting` and everything else to `Error`. `GateUnavailable`
+is the near miss: it is also not a "no", but no answer is coming for a broken
+control, so it settles `Error`. Six shell paths in `rpc.rs` settle blocks and
+all six call that one method, because the previous arrangement — each site
+choosing — is how three of them ended up saying "denied" for a verdict that
+was not one.
+
+**Two orders, on purpose.** The Rust declaration order is a comparison rank
+(`Pending < Running < Waiting < Done < Error`); the capnp ordinals are
+append-only, so `waiting` is `@5`. Nothing enforces the correspondence but
+`status_to_capnp`/`status_from_capnp`, which is why both are pinned by test.
+
+**Restart ends the wait.** `abandon_unresolved_asks_on_restart` throws away
+every unanswered ask at boot, so a `Waiting` block that survived would name a
+question that no longer exists and nothing could ever move it.
+`abandon_running_blocks_on_restart` sweeps `Waiting` alongside `Running` for
+that reason, and the ask sweep must run first or it would fail blocks whose
+questions were still live.
+
+**What this does not add.** The gate still does not resume an approved call.
+An answered ask authorizes a retry and the model authors a new block; nothing
+transitions out of `Waiting`. Adding the state now is what gives that lane
+somewhere to resume *from* — `docs/gate-resume.md`.

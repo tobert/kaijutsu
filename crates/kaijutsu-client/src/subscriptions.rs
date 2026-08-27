@@ -380,6 +380,7 @@ fn parse_status(status: crate::kaijutsu_capnp::Status) -> kaijutsu_types::Status
         crate::kaijutsu_capnp::Status::Done => kaijutsu_types::Status::Done,
         crate::kaijutsu_capnp::Status::Error => kaijutsu_types::Status::Error,
         crate::kaijutsu_capnp::Status::Draft => kaijutsu_types::Status::Draft,
+        crate::kaijutsu_capnp::Status::Waiting => kaijutsu_types::Status::Waiting,
     }
 }
 

@@ -6,6 +6,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## A bad `--status` filter silently returns everything (2026-08-27)
+
+`kj block list --status explosion` lists every block instead of erroring:
+`kj/block.rs:508` is `status_arg.and_then(Status::from_str)`, so an
+unparseable name becomes `None`, which means "no filter". The MCP twin has
+the same shape — `mcp/servers/block.rs:568`,
+`p.status.as_ref().and_then(|s| self.parse_status(s).ok())` — and it discards
+a real `McpError` to get there.
+
+A silent fallback in the direction of *more* results is the bad direction: a
+model filtering for one status and reasoning over an unfiltered list has no
+signal that its filter did nothing. The setter next door already gets this
+right (`block_status` errors on an unparseable name, and the parser it calls
+now names the accepted set).
+
+Found while adding `Status::Waiting`, which is why the fix is not folded in:
+it changes the error behavior of a verb the status work did not otherwise
+touch. Both sites, one change; `--kind` and `--role` are worth a look in the
+same pass.
+
+---
+
 ## Ctrl+Z lands in the wrong input on the second toggle (Amy, 2026-08-26)
 
 Amy: *"sometimes when I hit ctrl-z it goes to conversation input... usually
