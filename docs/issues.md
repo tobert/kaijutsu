@@ -6,6 +6,38 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `register_session` lets a caller pick an ungated seat (2026-08-28)
+
+`context_type` on `register_session` is caller-chosen free text with no
+allow-list: `kaijutsu-mcp/src/lib.rs:1986` defaults it to `"mcp"` and hands it
+straight to `createContext @26 (label :Text, contextType :Text)`. Only
+`coder`, `lib` and `mcp` symlink `S50-lfm2d.kai`; `default`, `director` and
+`assistant` do not. So any MCP client reaches an unscored seat in one
+parameter — `register_session {"context_type": "default"}` — and the switch
+leaves no ledger row.
+
+**The cost is measurement, not authority.** Capabilities are ergonomic nudges
+here and a player choosing a narrower seat is ordinary. What is not ordinary
+is that choosing a *wider* one is invisible: the escalation rate we quote to
+the lfm2d lane counts asks raised, so a seat that never raises any is
+indistinguishable from a seat that never needed to. Same shape as the alias
+bypass below — a second spelling of the same act that the ledger cannot see.
+
+Found while trying to answer the pending `kj rc reset` ask from a gated seat.
+
+**Not obviously a hole to close by refusing.** Two smaller moves are
+available and neither needs a policy: record the requested `context_type` on
+the context row so a wide seat is at least *countable*, and have the ask
+description carry the seat's `context_type` so a reader sees which gate the
+statement passed through. Refusing an unrecognized `context_type` is worth
+doing on its own merits — today a typo silently creates a bucket with no rc
+at all — but it does not address this, because `default` is not a typo.
+
+**Human authentication is not the answer and is not a goal** (Amy,
+2026-08-28): *"if we ever decide to do actual human auth thing, it'll likely
+be some kind of yubikey or passkey thing, and it's not a goal right now."*
+Do not design toward a principal check that separates human from model.
+
 ## Ctrl+Z lands in the wrong input on the second toggle (Amy, 2026-08-26)
 
 Amy: *"sometimes when I hit ctrl-z it goes to conversation input... usually
