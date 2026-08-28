@@ -421,6 +421,9 @@ fn action_equivalent(a: &HookAction, b: &HookAction) -> bool {
         (HookAction::Invoke(HookBody::Kaish(s1)), HookAction::Invoke(HookBody::Kaish(s2))) => {
             s1 == s2
         }
+        (HookAction::Invoke(HookBody::KaishPath(p1)), HookAction::Invoke(HookBody::KaishPath(p2))) => {
+            p1 == p2
+        }
         (HookAction::ShortCircuit(r1), HookAction::ShortCircuit(r2)) => {
             r1.is_error == r2.is_error && short_circuit_text(r1) == short_circuit_text(r2)
         }
@@ -473,6 +476,7 @@ fn validate_action_for_phase(phase: McpHookPhase, action: &HookActionWire) -> Re
             | HookActionWire::ShortCircuit { .. }
             | HookActionWire::Kaish { .. }
             | HookActionWire::KaishScript { .. }
+            | HookActionWire::KaishPath { .. }
             | HookActionWire::Ask { .. } => {
                 return Err(
                     "list_tools is a list-filter phase; only 'deny' and 'log' actions have \
@@ -512,6 +516,9 @@ async fn build_hook_action(
                 )
             })?;
             (HookAction::Invoke(HookBody::Kaish(body)), Some(script_id))
+        }
+        HookActionWire::KaishPath { path } => {
+            (HookAction::Invoke(HookBody::KaishPath(path)), None)
         }
         HookActionWire::ShortCircuit { result_text, is_error } => (
             HookAction::ShortCircuit(crate::mcp::KernelToolResult {
@@ -573,6 +580,9 @@ fn entry_json(phase: McpHookPhase, entry: &HookEntry, full: bool) -> serde_json:
                 body.chars().take(64).collect()
             };
             serde_json::json!({ "type": "kaish", "body": preview })
+        }
+        HookAction::Invoke(HookBody::KaishPath(path)) => {
+            serde_json::json!({ "type": "kaish_path", "path": path })
         }
         HookAction::ShortCircuit(r) if full => serde_json::json!({
             "type": "short_circuit",
@@ -1062,10 +1072,14 @@ mod tests {
             "S45-shell-guard.kai's create lifecycle must install the pre_call hook, got: {:?}",
             hooks.pre_call.entries.iter().map(|e| &e.id.0).collect::<Vec<_>>()
         );
-        assert!(
-            matches!(&installed.unwrap().action, HookAction::Invoke(HookBody::Kaish(_))),
-            "installed action must be a kaish body, got {:?}",
-            installed.unwrap().action
-        );
+        // S45 installs a `KaishPath` action (docs/rc-on-disk.md, "slice
+        // 5"), not a snapshotted inline body: the guard's logic is read
+        // fresh from `S45-shell-guard.hook.kai` at every fire.
+        match &installed.unwrap().action {
+            HookAction::Invoke(HookBody::KaishPath(path)) => {
+                assert_eq!(path, "/etc/rc/lib/create/S45-shell-guard.hook.kai");
+            }
+            other => panic!("installed action must be a kaish_path, got {other:?}"),
+        }
     }
 }

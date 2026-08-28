@@ -97,10 +97,18 @@ pub struct LogSpec {
 /// `Kaish(body)` carries the script source directly. A separate script-
 /// storage table for shared/reusable bodies is a future follow-up; today
 /// each hook owns its own copy.
+///
+/// `KaishPath(path)` carries a VFS path instead of a body — the body is
+/// read fresh at every fire (`Broker::run_kaish_hook` via
+/// `Broker::read_kaish_hook_body`), never snapshotted. An edit to the
+/// file at `path` reaches the running hook with no reinstall
+/// (`docs/rc-on-disk.md`, "slice 5"). A path that cannot be read at fire
+/// time is a `Deny` — see `unreadable_hook_body_outcome` in `broker.rs`.
 #[derive(Clone)]
 pub enum HookBody {
     Builtin { name: String, hook: Arc<dyn Hook> },
     Kaish(String),
+    KaishPath(String),
 }
 
 impl std::fmt::Debug for HookBody {
@@ -113,6 +121,7 @@ impl std::fmt::Debug for HookBody {
                 let preview: String = body.chars().take(32).collect();
                 f.debug_tuple("Kaish").field(&preview).finish()
             }
+            HookBody::KaishPath(path) => f.debug_tuple("KaishPath").field(path).finish(),
         }
     }
 }

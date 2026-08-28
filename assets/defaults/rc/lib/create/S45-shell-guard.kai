@@ -48,118 +48,20 @@
 # place (`toolie`/`musician` get the safe, `ExternalExec::Deny` `shell`
 # tool only, which cannot invoke `sh -c` at all).
 #
-# The hook body is embedded below as an inline HookBody::Kaish action, not a
-# stored hook_scripts row (docs/gate-and-shell-split.md, "Slice 1"'s
-# `KaishScript` variant -- no admin path mints a script_id from rc yet). It
-# is captured with an UNQUOTED `$(cat <<'EOF' ... EOF)`, the same pattern
-# S50-lfm2d.kai in this directory uses: an unquoted assignment does not
-# word-split the captured value, so the body's own quotes, JSON, and the
-# nested jq filter's `\(...)` interpolation survive the capture intact. The
-# filter itself is passed to `jq` as a plain (not `-f`) program argument,
-# also unquoted, for the same reason.
+# The hook body lives at `S45-shell-guard.hook.kai` in this same directory,
+# not embedded here: `HookBody::KaishPath` reads it fresh from the VFS at
+# every pre_call fire (docs/rc-on-disk.md, "slice 5"), so editing that file
+# reaches the running hook with no reinstall -- unlike the old inline
+# `HookBody::Kaish` snapshot, which needed a fresh context create to pick up
+# an edit.
 
 set -e
 
-hook_body=$(cat <<'HOOK_BODY_EOF'
-# shell-escape-guard pre_call hook body (installed by S45-shell-guard.kai as
-# hook_id shell-escape-guard, match_tool shell_write). Scores KJ_TOOL_PLAN --
-# kaish's own parse of the command, descending into if/for/$(...) bodies --
-# rather than the raw command text, so quoting and wrapper commands cannot
-# hide the interpreter that will actually run. A pre_call hook that exits
-# non-zero denies the call (PhaseOutcome::Deny); every branch below ends in
-# an explicit exit 0 or exit 1, so nothing falls through to an implicit
-# allow.
-
-if test -z "${KJ_TOOL_PLAN:-}"; then
-  echo "blocked: no execution plan for this shell_write call (KJ_TOOL_PLAN_ERROR: ${KJ_TOOL_PLAN_ERROR:-none}) -- the shell-escape guard denies what it cannot see; run this as a plain kaish command instead" >&2
-  exit 1
-fi
-
-# Classifies KJ_TOOL_PLAN's flattened command list (every commands[] entry
-# from every statement, including if/for/$(...) bodies) and yields the first
-# deny reason, or "" when nothing matched. Shell interpreters (sh/bash/zsh/
-# dash/ksh/fish/busybox) deny outright by name -- there is no legitimate
-# reason a shell_write call needs to hand text to a second shell instead of
-# running it as kaish directly, and busybox's own applet name lives in its
-# args, unauditable from its name alone. Scripting interpreters (python/
-# python3/perl/ruby/node) deny only when an inline-code flag is present.
-# The flag is matched per interpreter as a pattern, not a fixed list, because
-# perl and ruby BUNDLE short flags -- `perl -ne` and `perl -pe` are inline
-# code and an exact-match list misses both. Only `e`/`E` mean eval in perl and
-# only `e` does in ruby (`-E` there is an encoding flag, and legitimate), so
-# each interpreter carries its own pattern rather than a shared one.
-# is also present -- running a script FILE through them is ordinary,
-# auditable work; an inline snippet on the command line is exactly as opaque
-# as `sh -c`. Wrapper commands (sudo/env/nice/timeout/nohup/stdbuf/xargs/
-# exec) are transparent: the real command lives in their OWN args rather
-# than their name, so their args get the same two checks.
-filter=$(cat <<'GUARD_FILTER_EOF'
-def shell_class: ["sh","bash","zsh","dash","ksh","fish","busybox"];
-def wrapper_class: ["sudo","env","nice","timeout","nohup","stdbuf","xargs","exec"];
-def scripting_class: {"python":"^-[A-Za-z]*c$","python3":"^-[A-Za-z]*c$","perl":"^-[A-Za-z]*[eE][A-Za-z]*$","ruby":"^-[A-Za-z]*e[A-Za-z]*$","node":"^(-e|-p|--eval|--print)$"};
-
-def destrip:
-  if (type == "string") and (length >= 2) and
-     ( (.[0:1] == "'" and .[-1:] == "'") or (.[0:1] == "\"" and .[-1:] == "\"") )
-  then .[1:-1] else . end;
-
-def all_commands:
-  [ (.statements // empty)[]?.plan.commands[]? ];
-
-def classify:
-  . as $c
-  | ($c.args // [] | map(.plain | destrip)) as $argv
-  | (
-      if (shell_class | index($c.name)) then
-        "shell interpreter \"\($c.name)\" invoked directly"
-      elif (scripting_class | has($c.name))
-           and ($argv | any(test(scripting_class[$c.name]))) then
-        "\"\($c.name)\" invoked with an inline-code flag"
-      elif (wrapper_class | index($c.name)) then
-        ( $argv | map(select(. as $a | shell_class | index($a))) | first ) as $wrapped_sh
-        | ( $argv | map(select(. as $a | scripting_class | has($a))) | first ) as $wrapped_name
-        | if $wrapped_sh then
-            "shell interpreter \"\($wrapped_sh)\" invoked via wrapper \"\($c.name)\""
-          elif ($wrapped_name != null)
-               and ($argv | any(test(scripting_class[$wrapped_name]))) then
-            "\"\($wrapped_name)\" invoked with an inline-code flag via wrapper \"\($c.name)\""
-          else null
-          end
-      else null
-      end
-    );
-
-if (.statements? // null) == null then
-  "KJ_TOOL_PLAN had no usable statements"
-else
-  ( [ all_commands[] | classify | select(. != null) ] | first ) // ""
-end
-GUARD_FILTER_EOF
-)
-
-reason="$(echo $KJ_TOOL_PLAN | jq -r $filter 2>/dev/null)"
-jq_rc=$?
-if [[ "$jq_rc" -ne 0 ]]; then
-  echo "blocked: KJ_TOOL_PLAN could not be read as JSON by the shell-escape guard -- denying rather than allowing an unreadable plan" >&2
-  exit 1
-fi
-
-case "$reason" in
-  ""|null)
-    exit 0
-    ;;
-  *)
-    echo "blocked: $reason -- opaque to the shell gate; run it as kaish directly, not through a shell interpreter or an inline-eval flag" >&2
-    exit 1
-    ;;
-esac
-HOOK_BODY_EOF
-)
-
 mt="shell_write"
 hid="shell-escape-guard"
-t="kaish"
+t="kaish_path"
+p="/etc/rc/lib/create/S45-shell-guard.hook.kai"
 match_json="$(jq -cn --arg mt $mt --arg hid $hid '{match_tool: $mt, hook_id: $hid}')"
-action_json="$(jq -cn --arg t $t --arg body $hook_body '{type: $t, body: $body}')"
+action_json="$(jq -cn --arg t $t --arg p $p '{type: $t, path: $p}')"
 
 kj hook add pre_call "$match_json" "$action_json"

@@ -264,6 +264,10 @@ pub struct HookRow {
     /// Provenance: if installed from a shared script, the originating
     /// `script_id`. Not re-resolved at hydrate; metadata only.
     pub action_kaish_script_id: Option<String>,
+    /// `action_kind = "kaish_path"`: a VFS path read fresh at every
+    /// fire, never snapshotted. Mutually exclusive with
+    /// `action_kaish_body` — a `kaish_path` row carries no body at all.
+    pub action_kaish_path: Option<String>,
     pub action_result_text: Option<String>,
     pub action_is_error: Option<bool>,
     pub action_deny_reason: Option<String>,
@@ -839,6 +843,11 @@ CREATE TABLE IF NOT EXISTS hooks (
     -- by admin tooling for traceability; NOT re-resolved at hydrate.
     -- Edits to the source script don't leak into existing hooks.
     action_kaish_script_id   TEXT,
+    -- A VFS path read fresh at every fire, never snapshotted
+    -- (`action_kind = 'kaish_path'`). Mutually exclusive with
+    -- `action_kaish_body` — editing the file at this path reaches the
+    -- running hook with no reinstall.
+    action_kaish_path        TEXT,
     action_result_text       TEXT,
     action_is_error          INTEGER,
     action_deny_reason       TEXT,
@@ -1883,6 +1892,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
+            "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -4579,6 +4589,7 @@ impl KernelDb {
                 match_instance, match_tool, match_context, match_principal,
                 action_kind,
                 action_builtin_name, action_kaish_body, action_kaish_script_id,
+                action_kaish_path,
                 action_result_text, action_is_error,
                 action_deny_reason,
                 action_log_target, action_log_level,
@@ -4589,10 +4600,11 @@ impl KernelDb {
                 ?4, ?5, ?6, ?7,
                 ?8,
                 ?9, ?10, ?11,
-                ?12, ?13,
-                ?14,
-                ?15, ?16,
-                ?17
+                ?12,
+                ?13, ?14,
+                ?15,
+                ?16, ?17,
+                ?18
              )",
             params![
                 row.hook_id,
@@ -4606,6 +4618,7 @@ impl KernelDb {
                 row.action_builtin_name,
                 row.action_kaish_body,
                 row.action_kaish_script_id,
+                row.action_kaish_path,
                 row.action_result_text,
                 is_error,
                 row.action_deny_reason,
@@ -4640,6 +4653,7 @@ impl KernelDb {
                 match_instance, match_tool, match_context, match_principal,
                 action_kind,
                 action_builtin_name, action_kaish_body, action_kaish_script_id,
+                action_kaish_path,
                 action_result_text, action_is_error,
                 action_deny_reason,
                 action_log_target, action_log_level,
@@ -4650,10 +4664,11 @@ impl KernelDb {
                 ?4, ?5, ?6, ?7,
                 ?8,
                 ?9, ?10, ?11,
-                ?12, ?13,
-                ?14,
-                ?15, ?16,
-                ?17
+                ?12,
+                ?13, ?14,
+                ?15,
+                ?16, ?17,
+                ?18
              )
              ON CONFLICT(hook_id) DO UPDATE SET
                 phase = excluded.phase,
@@ -4667,6 +4682,7 @@ impl KernelDb {
                 action_builtin_name = excluded.action_builtin_name,
                 action_kaish_body = excluded.action_kaish_body,
                 action_kaish_script_id = excluded.action_kaish_script_id,
+                action_kaish_path = excluded.action_kaish_path,
                 action_result_text = excluded.action_result_text,
                 action_is_error = excluded.action_is_error,
                 action_deny_reason = excluded.action_deny_reason,
@@ -4685,6 +4701,7 @@ impl KernelDb {
                 row.action_builtin_name,
                 row.action_kaish_body,
                 row.action_kaish_script_id,
+                row.action_kaish_path,
                 row.action_result_text,
                 is_error,
                 row.action_deny_reason,
@@ -4815,6 +4832,7 @@ impl KernelDb {
                     match_instance, match_tool, match_context, match_principal,
                     action_kind,
                     action_builtin_name, action_kaish_body, action_kaish_script_id,
+                    action_kaish_path,
                     action_result_text, action_is_error,
                     action_deny_reason,
                     action_log_target, action_log_level,
@@ -4845,7 +4863,7 @@ impl KernelDb {
                 })?),
                 None => None,
             };
-            let is_error_int: Option<i64> = row.get(12)?;
+            let is_error_int: Option<i64> = row.get(13)?;
             let action_is_error = is_error_int.map(|i| i != 0);
             Ok(HookRow {
                 hook_id: row.get(0)?,
@@ -4859,12 +4877,13 @@ impl KernelDb {
                 action_builtin_name: row.get(8)?,
                 action_kaish_body: row.get(9)?,
                 action_kaish_script_id: row.get(10)?,
-                action_result_text: row.get(11)?,
+                action_kaish_path: row.get(11)?,
+                action_result_text: row.get(12)?,
                 action_is_error,
-                action_deny_reason: row.get(13)?,
-                action_log_target: row.get(14)?,
-                action_log_level: row.get(15)?,
-                action_ask_description: row.get(16)?,
+                action_deny_reason: row.get(14)?,
+                action_log_target: row.get(15)?,
+                action_log_level: row.get(16)?,
+                action_ask_description: row.get(17)?,
             })
         })?;
         let mut out = Vec::new();
@@ -9449,6 +9468,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -9480,6 +9500,7 @@ mod tests {
             action_builtin_name: Some("tracing_audit".into()),
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -9502,6 +9523,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: Some("synthetic".into()),
             action_is_error: Some(true),
             action_deny_reason: None,
@@ -9524,6 +9546,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: Some("no writes".into()),
@@ -9552,6 +9575,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: Some("script-42".into()),
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -9576,6 +9600,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,

@@ -23,6 +23,7 @@ use crate::kernel_db::HookRow;
 
 pub const ACTION_BUILTIN_INVOKE: &str = "builtin_invoke";
 pub const ACTION_KAISH_INVOKE: &str = "kaish_invoke";
+pub const ACTION_KAISH_PATH: &str = "kaish_path";
 pub const ACTION_SHORT_CIRCUIT: &str = "shortcircuit";
 pub const ACTION_DENY: &str = "deny";
 pub const ACTION_LOG: &str = "log";
@@ -94,6 +95,7 @@ pub fn entry_to_row(phase: McpHookPhase, entry: &HookEntry) -> HookRow {
         action_builtin_name: None,
         action_kaish_body: None,
         action_kaish_script_id: None,
+        action_kaish_path: None,
         action_result_text: None,
         action_is_error: None,
         action_deny_reason: None,
@@ -120,6 +122,13 @@ pub fn entry_to_row(phase: McpHookPhase, entry: &HookEntry) -> HookRow {
             if let Some(script_id) = &entry.kaish_script_id {
                 row.action_kaish_script_id = Some(script_id.clone());
             }
+        }
+        HookAction::Invoke(HookBody::KaishPath(path)) => {
+            row.action_kind = ACTION_KAISH_PATH.into();
+            // No snapshot: `path` is the source of truth and is
+            // re-read at every fire. `action_kaish_body` stays unset —
+            // a `KaishPath` row must never carry a stale body.
+            row.action_kaish_path = Some(path.clone());
         }
         HookAction::ShortCircuit(result) => {
             row.action_kind = ACTION_SHORT_CIRCUIT.into();
@@ -172,6 +181,10 @@ pub enum RowParseError {
     /// fires at hook evaluation; `action_kaish_script_id` (provenance)
     /// alone is not sufficient to reconstruct a runnable hook.
     MissingKaishBody,
+    /// `action_kind = "kaish_path"` row without `action_kaish_path` —
+    /// shape invariant violated. Unlike `MissingKaishBody`, there is no
+    /// body to lose: the path itself is the persisted fact.
+    MissingKaishPath,
     /// `action_kind = "shortcircuit"` without a result_text; shape
     /// invariant violated.
     MissingShortCircuitText,
@@ -194,6 +207,9 @@ impl std::fmt::Display for RowParseError {
             }
             RowParseError::MissingKaishBody => {
                 f.write_str("kaish_invoke row missing action_kaish_body (the body is the snapshot)")
+            }
+            RowParseError::MissingKaishPath => {
+                f.write_str("kaish_path row missing action_kaish_path")
             }
             RowParseError::MissingShortCircuitText => {
                 f.write_str("shortcircuit without result_text")
@@ -240,6 +256,19 @@ pub fn row_to_entry(
                 .clone()
                 .ok_or(RowParseError::MissingKaishBody)?;
             HookAction::Invoke(HookBody::Kaish(body))
+        }
+        ACTION_KAISH_PATH => {
+            // No re-read here: hydrate reconstructs the `KaishPath`
+            // reference, and the body is read fresh from the VFS at
+            // every fire — that resolve-at-fire-time is the point of
+            // this variant (`docs/rc-on-disk.md`, "slice 5"), unlike
+            // `ACTION_KAISH_INVOKE` above, whose snapshot rule this
+            // variant deliberately reverses.
+            let path = row
+                .action_kaish_path
+                .clone()
+                .ok_or(RowParseError::MissingKaishPath)?;
+            HookAction::Invoke(HookBody::KaishPath(path))
         }
         ACTION_SHORT_CIRCUIT => {
             let result_text = row
@@ -348,6 +377,7 @@ mod tests {
             action_builtin_name: Some("removed_hook_name".into()),
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -465,6 +495,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: Some("echo hi".into()),
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -494,6 +525,7 @@ mod tests {
             action_builtin_name: None,
             action_kaish_body: None,
             action_kaish_script_id: None,
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -530,6 +562,7 @@ mod tests {
             // script body — proves there is no re-resolution.
             action_kaish_body: Some("snapshot-body".into()),
             action_kaish_script_id: Some("audit-1".into()),
+            action_kaish_path: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,

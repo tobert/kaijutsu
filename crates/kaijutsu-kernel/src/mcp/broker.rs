@@ -298,6 +298,23 @@ fn classify_kaish_hook_exit(code: i64, stderr: &str, fallback: &str) -> KaishHoo
     }
 }
 
+/// What a `HookBody::KaishPath` body's read failure decides: an unreadable
+/// path denies, rather than escalating. This is the one place that decision
+/// lives. `HookBody::Kaish` follows a different rule instead — documented on
+/// `HookActionWire::Kaish`: a fault running an inline body escalates rather
+/// than denies, because a runtime/DB fault is never a verdict — and
+/// reconciling the two is a one-line change here. See `docs/rc-on-disk.md`.
+fn unreadable_hook_body_outcome(
+    hook_id: &HookId,
+    path: &str,
+    err: &str,
+) -> PhaseOutcome {
+    PhaseOutcome::Deny {
+        hook_id: hook_id.clone(),
+        reason: format!("kaish hook body at {path:?} could not be read: {err}"),
+    }
+}
+
 /// What running the `shell_write` hook phases against a direct kaish exec
 /// decided (`Broker::shell_pre_call_hooks` / `shell_post_call_hooks`,
 /// `docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
@@ -422,14 +439,21 @@ impl Broker {
         if rows.is_empty() {
             return;
         }
-        // Snapshot semantics: each kaish hook row carries its own
-        // `action_kaish_body` snapshot taken at install time. We do
-        // NOT re-resolve `action_kaish_script_id` against the current
-        // hook_scripts table here — that would let script edits leak
-        // into existing hooks across restarts, violating
+        // Snapshot semantics for `HookBody::Kaish`: each kaish hook row
+        // carries its own `action_kaish_body` snapshot taken at install
+        // time. We do NOT re-resolve `action_kaish_script_id` against the
+        // current hook_scripts table here — that would let script edits
+        // leak into existing hooks across restarts, violating
         // [[feedback_script_snapshot_on_instantiation]]. The script_id
         // column is read by `row_to_entry` purely as provenance and
         // surfaced on `HookEntry.kaish_script_id`.
+        //
+        // `HookBody::KaishPath` is the deliberate opposite: hydrate just
+        // reconstructs the path reference (`row_to_entry`, `action_kind =
+        // "kaish_path"`), and the body is read fresh from the VFS at every
+        // fire (`Broker::read_kaish_hook_body`), not at hydrate time. A
+        // restart never staled a `KaishPath` hook because it never cached
+        // anything to begin with.
         let mut hooks = self.hooks.write().await;
         // Reconstruct in place: clear persisted entries first so `set_db` is
         // idempotent (it may be called more than once — e.g. bootstrap wiring
@@ -1955,46 +1979,36 @@ impl Broker {
                     }
                     HookBody::Kaish(script) => {
                         let _depth_guard = enter_hook_depth()?;
-                        match self
+                        let outcome = self
                             .run_kaish_hook(phase, &script, params, ctx, &payload)
+                            .await;
+                        if let Some(result) = self
+                            .resolve_kaish_hook_outcome(entry.id.clone(), outcome, params, ctx)
                             .await
                         {
-                            KaishHookOutcome::Continue => {}
-                            KaishHookOutcome::Deny(reason) => {
-                                return Ok(PhaseOutcome::Deny {
-                                    hook_id: entry.id,
-                                    reason,
-                                });
+                            return Ok(result);
+                        }
+                    }
+                    HookBody::KaishPath(path) => {
+                        // Read fresh from the VFS every fire — no cache, no
+                        // snapshot (`docs/rc-on-disk.md`, "slice 5"). An
+                        // unreadable path is a `Deny`, not an escalation;
+                        // see `unreadable_hook_body_outcome`.
+                        let body = match self.read_kaish_hook_body(&path).await {
+                            Ok(body) => body,
+                            Err(err) => {
+                                return Ok(unreadable_hook_body_outcome(&entry.id, &path, &err));
                             }
-                            KaishHookOutcome::Escalate(description) => {
-                                let ask_spec = AskSpec {
-                                    description: Some(description),
-                                };
-                                match self
-                                    .run_permission_ask(&entry.id, &ask_spec, params, ctx)
-                                    .await
-                                {
-                                    PermissionAskOutcome::Proceed => {}
-                                    PermissionAskOutcome::Denied(reason) => {
-                                        return Ok(PhaseOutcome::Deny {
-                                            hook_id: entry.id,
-                                            reason,
-                                        });
-                                    }
-                                    PermissionAskOutcome::Unavailable(reason) => {
-                                        return Ok(PhaseOutcome::GateUnavailable {
-                                            hook_id: entry.id,
-                                            reason,
-                                        });
-                                    }
-                                    PermissionAskOutcome::Pending(reason) => {
-                                        return Ok(PhaseOutcome::GatePending {
-                                            hook_id: entry.id,
-                                            reason,
-                                        });
-                                    }
-                                }
-                            }
+                        };
+                        let _depth_guard = enter_hook_depth()?;
+                        let outcome = self
+                            .run_kaish_hook(phase, &body, params, ctx, &payload)
+                            .await;
+                        if let Some(result) = self
+                            .resolve_kaish_hook_outcome(entry.id.clone(), outcome, params, ctx)
+                            .await
+                        {
+                            return Ok(result);
                         }
                     }
                 },
@@ -2323,6 +2337,63 @@ impl Broker {
                      a runtime fault is not a verdict",
                 );
                 KaishHookOutcome::Escalate(format!("kaish hook exec error: {e}"))
+            }
+        }
+    }
+
+    /// Read a `HookBody::KaishPath` body fresh from the VFS. Deliberately
+    /// uncached: every call re-reads `path`, which is the entire point of
+    /// slice 5 (`docs/rc-on-disk.md`) — an edit to the file reaches the
+    /// running hook with no reinstall. Reached the same way
+    /// `run_kaish_hook` reaches its `KjDispatcher`: upgrade the stashed
+    /// `Weak`, then `dispatcher.kernel().vfs()`.
+    async fn read_kaish_hook_body(&self, path: &str) -> Result<String, String> {
+        use crate::vfs::VfsOps as _;
+        let dispatcher = self
+            .kj_dispatcher()
+            .await
+            .ok_or_else(|| "no kj dispatcher wired; cannot reach the VFS".to_string())?;
+        let bytes = dispatcher
+            .kernel()
+            .vfs()
+            .read_all(std::path::Path::new(path))
+            .await
+            .map_err(|e| e.to_string())?;
+        String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Turn a `KaishHookOutcome` into a terminal `PhaseOutcome`, or `None`
+    /// to let `evaluate_phase` continue to the next hook entry. Shared by
+    /// `HookBody::Kaish` and `HookBody::KaishPath` — the two differ only
+    /// in where the body text came from; once it has run, the exit-code
+    /// handling (Amy's ruling, 2026-08-20, documented on
+    /// `KaishHookOutcome`) is identical.
+    async fn resolve_kaish_hook_outcome(
+        &self,
+        hook_id: HookId,
+        outcome: KaishHookOutcome,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+    ) -> Option<PhaseOutcome> {
+        match outcome {
+            KaishHookOutcome::Continue => None,
+            KaishHookOutcome::Deny(reason) => Some(PhaseOutcome::Deny { hook_id, reason }),
+            KaishHookOutcome::Escalate(description) => {
+                let ask_spec = AskSpec {
+                    description: Some(description),
+                };
+                match self.run_permission_ask(&hook_id, &ask_spec, params, ctx).await {
+                    PermissionAskOutcome::Proceed => None,
+                    PermissionAskOutcome::Denied(reason) => {
+                        Some(PhaseOutcome::Deny { hook_id, reason })
+                    }
+                    PermissionAskOutcome::Unavailable(reason) => {
+                        Some(PhaseOutcome::GateUnavailable { hook_id, reason })
+                    }
+                    PermissionAskOutcome::Pending(reason) => {
+                        Some(PhaseOutcome::GatePending { hook_id, reason })
+                    }
+                }
             }
         }
     }
@@ -6854,6 +6925,161 @@ mod tests {
         );
     }
 
+    // ── HookBody::KaishPath (docs/rc-on-disk.md, "slice 5") ──────────
+    //
+    // A path is read fresh from the VFS at every fire — no cache, no
+    // snapshot. The three tests below are the slice's whole point:
+    // (1) an edit to the file reaches the running hook with no reinstall;
+    // (2) an unreadable path denies, naming the path (Amy's ruling,
+    // 2026-08-28); (3) the persisted row never carries a snapshotted body.
+
+    /// The point of the whole slice: a `HookBody::KaishPath` hook fires,
+    /// the file is edited on disk, and the very next fire picks up the new
+    /// behavior — no `hook_add`, no reinstall, no new `HookEntry`.
+    #[tokio::test]
+    async fn kaish_path_hook_picks_up_an_edit_with_no_reinstall() {
+        use crate::vfs::VfsOps as _;
+        use crate::vfs::backends::MemoryBackend;
+
+        let (broker, kernel, _kj) = wired_kaish_broker("kaish-path-hot-reload").await;
+        kernel.mount("/mem", MemoryBackend::new()).await;
+        let path = "/mem/hook.kai";
+        kernel
+            .vfs()
+            .write_all(std::path::Path::new(path), b"exit 0")
+            .await
+            .unwrap();
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-path"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::KaishPath(path.into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let cc = CallContext::test();
+        let ok = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
+            .await
+            .expect("exit 0 body must let the call proceed");
+        assert!(!ok.is_error);
+
+        // Edit the file in place. No reinstall, no re-add — the next fire
+        // must read this version.
+        kernel
+            .vfs()
+            .write_all(std::path::Path::new(path), b"exit 1")
+            .await
+            .unwrap();
+
+        let err = broker
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
+            .await
+            .expect_err("the edited body (now exit 1) must deny the call");
+        assert!(
+            matches!(err, McpError::Denied { .. }),
+            "expected Denied, got {err:?}"
+        );
+    }
+
+    /// Amy's ruling, 2026-08-28 (`docs/rc-on-disk.md`, "slice 5"): a
+    /// `HookBody::KaishPath` whose file cannot be read is a `Deny` — the
+    /// opposite of `HookBody::Kaish`'s fault handling, which escalates
+    /// instead (see `unreadable_hook_body_outcome`). Calls `evaluate_phase`
+    /// directly so the tracing-only deny reason (never carried by
+    /// `McpError::Denied`) is observable to assert it names the path.
+    #[tokio::test]
+    async fn kaish_path_hook_unreadable_path_denies_naming_the_path() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-path-unreadable").await;
+
+        let path = "/mem/does-not-exist.kai";
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-path-missing"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::KaishPath(path.into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let cc = CallContext::test();
+        let call_params = params("svc", "t");
+        let outcome = broker
+            .evaluate_phase(McpHookPhase::PreCall, &call_params, &cc, PhasePayload::None)
+            .await
+            .expect("evaluate_phase itself must not error");
+        match outcome {
+            PhaseOutcome::Deny { reason, .. } => {
+                assert!(
+                    reason.contains(path),
+                    "deny reason must name the unreadable path, got: {reason}"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    /// A `KaishPath` hook round-trips through persistence as a `KaishPath`
+    /// — the row carries `action_kaish_path`, never a snapshotted
+    /// `action_kaish_body`. This is the opposite of `KaishScript`'s
+    /// snapshot-at-install rule, by design.
+    #[tokio::test]
+    async fn kaish_path_hook_round_trips_through_persistence_without_a_snapshot() {
+        let db = hook_db();
+        let broker = Arc::new(Broker::new());
+        broker.set_db(db.clone()).await;
+
+        let path = "/etc/rc/lib/create/S50-lfm2d.kai";
+        let entry = HookEntry {
+            id: hook_id("kaish-path-persist"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::KaishPath(path.into())),
+            priority: 0,
+            kaish_script_id: None,
+        };
+        broker
+            .persist_hook_insert(McpHookPhase::PreCall, &entry)
+            .await
+            .unwrap();
+
+        let rows = db.lock().load_all_hooks().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.action_kind, "kaish_path");
+        assert_eq!(row.action_kaish_path.as_deref(), Some(path));
+        assert_eq!(
+            row.action_kaish_body, None,
+            "a KaishPath row must never carry a snapshotted body"
+        );
+
+        // Rehydrate a fresh broker from the same DB — the reconstructed
+        // entry must still be a KaishPath reference, not a value that
+        // resolved the file at hydrate time.
+        let broker2 = Arc::new(Broker::new());
+        broker2.set_db(db).await;
+        let hooks = broker2.hooks().read().await;
+        assert_eq!(hooks.pre_call.entries.len(), 1);
+        match &hooks.pre_call.entries[0].action {
+            HookAction::Invoke(HookBody::KaishPath(p)) => assert_eq!(p, path),
+            other => panic!("expected Invoke(KaishPath), got {other:?}"),
+        }
+    }
+
     /// The other half of the ruling: a fault running the body at all — no
     /// `KjDispatcher` wired, same misconfiguration `a_hook_ask_with_no_dispatcher_wired_is_gate_unavailable_not_denied`
     /// covers for `HookAction::Ask` — must ALSO escalate rather than deny.
@@ -7063,7 +7289,21 @@ mod tests {
     /// exact benign-vs-deny shapes below.
     #[tokio::test]
     async fn shell_guard_denies_sh_dash_c_and_allows_benign_shapes() {
-        let (broker, _kernel, kj) = wired_kaish_broker("shell-guard-falsify").await;
+        let (broker, kernel, kj) = wired_kaish_broker("shell-guard-falsify").await;
+
+        // `HookBody::KaishPath` (docs/rc-on-disk.md, "slice 5") reads the
+        // guard's body fresh from `/etc/rc` at every fire, so this test
+        // needs a real seeded rc tree mounted — the same seed the create
+        // lifecycle installs from.
+        let rc_dir = tempfile::tempdir().expect("create rc test dir");
+        crate::seed_scripts::ensure_rc_seed_files(rc_dir.path())
+            .expect("seed rc test files");
+        kernel
+            .mount(
+                kaijutsu_types::paths::RC_ROOT,
+                crate::vfs::backends::LocalBackend::new(rc_dir.path()),
+            )
+            .await;
 
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker
@@ -7721,6 +7961,7 @@ mod tests {
                     action_builtin_name: None,
                     action_kaish_body: None,
                     action_kaish_script_id: None,
+                    action_kaish_path: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -7740,6 +7981,7 @@ mod tests {
                     action_builtin_name: None,
                     action_kaish_body: None,
                     action_kaish_script_id: None,
+                    action_kaish_path: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -7759,6 +8001,7 @@ mod tests {
                     action_builtin_name: None,
                     action_kaish_body: None,
                     action_kaish_script_id: None,
+                    action_kaish_path: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -7894,6 +8137,7 @@ mod tests {
                     action_builtin_name: Some("no_such_builtin".into()),
                     action_kaish_body: None,
                     action_kaish_script_id: None,
+                    action_kaish_path: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -7915,6 +8159,7 @@ mod tests {
                     action_builtin_name: None,
                     action_kaish_body: None,
                     action_kaish_script_id: None,
+                    action_kaish_path: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,

@@ -77,6 +77,15 @@ pub enum HookActionWire {
     /// new behavior, re-add the hook (which re-snapshots from the
     /// current script).
     KaishScript { script_id: String },
+    /// A VFS path (e.g. `/etc/rc/lib/create/S50-lfm2d.kai`) whose contents
+    /// are read fresh **at every fire**, never snapshotted. Persisted in
+    /// `hooks.action_kaish_path`, not `hooks.action_kaish_body`. Editing
+    /// the file at `path` reaches the running hook with no reinstall —
+    /// the opposite of `KaishScript`'s snapshot-at-install rule
+    /// (`docs/rc-on-disk.md`, "slice 5"). The path is not validated to
+    /// exist at install time; an unreadable path is a `Deny` at fire
+    /// time (`unreadable_hook_body_outcome` in `broker.rs`).
+    KaishPath { path: String },
     /// Return a synthetic result in lieu of calling the server.
     ShortCircuit {
         result_text: String,
@@ -230,6 +239,7 @@ fn validate_action_for_phase(phase: McpHookPhase, action: &HookActionWire) -> Mc
             | HookActionWire::ShortCircuit { .. }
             | HookActionWire::Kaish { .. }
             | HookActionWire::KaishScript { .. }
+            | HookActionWire::KaishPath { .. }
             // D-57: a list-filter can't block-wait for a permission
             // answer per tool any more than it can invoke a body.
             | HookActionWire::Ask { .. } => return Err(McpError::Unsupported),
@@ -303,6 +313,9 @@ async fn build_hook_action(
                 Some(script_id),
             )
         }
+        HookActionWire::KaishPath { path } => {
+            (HookAction::Invoke(HookBody::KaishPath(path)), None)
+        }
         HookActionWire::ShortCircuit {
             result_text,
             is_error,
@@ -344,6 +357,9 @@ fn entry_summary_json(phase: McpHookPhase, entry: &HookEntry, full: bool) -> ser
                 body.chars().take(64).collect()
             };
             serde_json::json!({ "type": "kaish", "body": preview })
+        }
+        HookAction::Invoke(HookBody::KaishPath(path)) => {
+            serde_json::json!({ "type": "kaish_path", "path": path })
         }
         HookAction::ShortCircuit(r) if full => serde_json::json!({
             "type": "short_circuit",
