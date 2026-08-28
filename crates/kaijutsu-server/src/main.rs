@@ -14,6 +14,9 @@
 //! kaijutsu-server list-keys [username]
 //! kaijutsu-server import <authorized_keys_file>
 //! kaijutsu-server set-nick <old> <new>
+//!
+//! # rc scripts (no running kernel needed)
+//! kaijutsu-server rc reseed [--force] [--dir <path>]
 //! ```
 
 use std::env;
@@ -40,6 +43,7 @@ COMMANDS:
     list-keys [username]          List keys (all or for a specific user)
     import <file>                 Import keys from authorized_keys file
     set-nick <old> <new>          Rename a user
+    rc reseed [--force] [--dir D] Install embedded rc scripts into the rc tree
 
 OPTIONS:
     --port <PORT>                 SSH port (default: {port})
@@ -55,6 +59,8 @@ EXAMPLES:
     kaijutsu-server list-keys amy
     kaijutsu-server set-nick xyz789ab amy
     kaijutsu-server remove-user olduser
+    kaijutsu-server rc reseed                 # install anything missing
+    kaijutsu-server rc reseed --force         # also restore edited scripts
 
 DATABASE:
     Keys are stored in: {db_path}
@@ -106,6 +112,7 @@ async fn main() -> ExitCode {
         "list-keys" => cmd_list_keys(&args[2..]),
         "import" => cmd_import(&args[2..]),
         "set-nick" => cmd_set_nick(&args[2..]),
+        "rc" => cmd_rc(&args[2..]),
         arg => {
             // Try parsing as port number for backwards compatibility
             if let Ok(port) = arg.parse::<u16>() {
@@ -130,6 +137,65 @@ async fn run_server(port: u16) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// `rc reseed` — write the embedded rc scripts into the rc tree.
+///
+/// This runs against a directory, not a kernel: no server, no context, no
+/// capability, and nothing to approve. That is the point — it is what you run
+/// before starting the kernel, and it cannot be blocked by the kernel it is
+/// about to configure.
+fn cmd_rc(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!("Usage: kaijutsu-server rc reseed [--force] [--dir <path>]");
+        return ExitCode::FAILURE;
+    };
+    if sub != "reseed" {
+        eprintln!("Unknown rc subcommand: {sub}");
+        eprintln!("Usage: kaijutsu-server rc reseed [--force] [--dir <path>]");
+        return ExitCode::FAILURE;
+    }
+
+    let mut force = false;
+    let mut dir: Option<PathBuf> = None;
+    let mut rest = args[1..].iter();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--force" | "-f" => force = true,
+            "--dir" => match rest.next() {
+                Some(d) => dir = Some(PathBuf::from(d)),
+                None => {
+                    eprintln!("--dir needs a path");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other => {
+                eprintln!("Unknown option: {other}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let root = dir.unwrap_or_else(kaijutsu_server::ssh::default_rc_dir);
+    match kaijutsu_kernel::seed_scripts::reseed_rc_files(&root, force) {
+        Ok(r) => {
+            println!(
+                "{}: {} written, {} replaced, {} unchanged",
+                root.display(),
+                r.written,
+                r.replaced,
+                r.skipped
+            );
+            if !force && r.skipped > 0 {
+                println!("Pass --force to restore scripts that differ from their defaults.");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rc reseed into {} failed: {e}", root.display());
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Add a public key to the database

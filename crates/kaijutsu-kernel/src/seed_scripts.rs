@@ -127,10 +127,48 @@ pub fn seed_body(canonical_path: &str) -> Option<&'static str> {
 /// swallowing them: a half-written seed tree is corruption, and the caller
 /// decides whether a fork can proceed without its stance script.
 pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
+    reseed_rc_files(root, false).map(|r| r.written)
+}
+
+/// What one reseed did, per entry in the embedded set.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RcSeedReport {
+    /// Entries that were absent and are now installed.
+    pub written: usize,
+    /// Entries that existed, differed from their seed, and were replaced.
+    /// Always 0 without `force`.
+    pub replaced: usize,
+    /// Entries left as they are.
+    pub skipped: usize,
+}
+
+/// Write the embedded seed tree into `root` (the host directory mounted at
+/// `/etc/rc`).
+///
+/// Without `force` this is install-if-absent: an entry that exists is left
+/// alone, so an edit survives and a script you removed stays removed. That is
+/// the bootstrap the server runs on a fresh tree.
+///
+/// With `force` an entry whose content differs from its embedded seed is
+/// replaced, and a removed one comes back. A composed seed is restored **as a
+/// symlink** even if something replaced it with a regular file — the entry is
+/// removed and recreated rather than written through, because writing through
+/// a link would edit the shared body instead of restoring the link.
+///
+/// `force` does not delete anything the embedded set does not name, so a
+/// script you added yourself is never touched. Use `git diff` to see what a
+/// forced reseed changed.
+///
+/// Per the crash-over-corruption stance this surfaces I/O errors rather than
+/// swallowing them: a half-written seed tree is corruption.
+pub fn reseed_rc_files(
+    root: &std::path::Path,
+    force: bool,
+) -> std::io::Result<RcSeedReport> {
     let seeds = seed_files();
     let known: std::collections::HashSet<String> =
         seeds.iter().map(|(p, _)| p.clone()).collect();
-    let mut written = 0usize;
+    let mut report = RcSeedReport::default();
     for (path, content) in &seeds {
         let Some(rel) = rc_relpath(path) else {
             continue;
@@ -139,8 +177,22 @@ pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
         // `symlink_metadata`, not `exists()`: `exists()` follows the link, so
         // a composed link whose target is not written yet would read as absent
         // and be created twice.
-        if std::fs::symlink_metadata(&dest).is_ok() {
-            continue;
+        let present = std::fs::symlink_metadata(&dest).is_ok();
+        if present {
+            if !force {
+                report.skipped += 1;
+                continue;
+            }
+            if seed_entry_matches(&dest, path, content, &known) {
+                report.skipped += 1;
+                continue;
+            }
+            // Remove and recreate rather than write through: a composed seed
+            // is a symlink, and writing through it would edit the shared body.
+            std::fs::remove_file(&dest)?;
+            report.replaced += 1;
+        } else {
+            report.written += 1;
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -159,9 +211,37 @@ pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
             }
             None => std::fs::write(&dest, content)?,
         }
-        written += 1;
     }
-    Ok(written)
+    Ok(report)
+}
+
+/// True if the entry at `dest` already is what the embedded seed says it
+/// should be — a link pointing at the right target, or a file with the right
+/// bytes. Used by a forced reseed so an untouched tree reports no churn.
+fn seed_entry_matches(
+    dest: &std::path::Path,
+    canonical: &str,
+    content: &str,
+    known: &std::collections::HashSet<String>,
+) -> bool {
+    match crate::runtime::config_doc_fs::seed_link_target(canonical, content, known) {
+        Some(target) => {
+            let want = canonical_link_target(canonical, &target);
+            let Some(target_rel) = rc_relpath(&want) else {
+                return false;
+            };
+            let Some(link_rel) = rc_relpath(canonical) else {
+                return false;
+            };
+            std::fs::read_link(dest)
+                .map(|got| got.to_string_lossy() == relative_link(link_rel, target_rel))
+                .unwrap_or(false)
+        }
+        None => std::fs::symlink_metadata(dest)
+            .map(|m| !m.file_type().is_symlink())
+            .unwrap_or(false)
+            && std::fs::read_to_string(dest).map(|got| got == *content).unwrap_or(false),
+    }
 }
 
 /// Resolve a seed link body to its canonical `/etc/rc` path. The body is
@@ -226,6 +306,70 @@ mod tests {
             read(dir.path(), "lib/create/S20-cache.kai"),
             "composed seed must read as its canonical body"
         );
+    }
+
+    #[test]
+    fn reseed_force_restores_a_diverged_file_and_a_clobbered_link() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        // Diverge a real script, and replace a composed link with a file.
+        let script = root.join("lib/create/S20-cache.kai");
+        std::fs::write(&script, "# diverged\n").expect("diverge");
+        let link = root.join("default/create/S20-cache.kai");
+        std::fs::remove_file(&link).expect("remove link");
+        std::fs::write(&link, "# not a link any more\n").expect("clobber");
+
+        let report = reseed_rc_files(root, true).expect("reseed --force");
+        assert!(report.replaced >= 2, "both divergences should be replaced");
+
+        assert!(
+            std::fs::read_to_string(&script)
+                .unwrap()
+                .contains("kj cache add --target=tools"),
+            "a diverged script is restored from its embedded seed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a link clobbered into a file is restored AS A LINK, not as a file \
+             holding the target path"
+        );
+    }
+
+    #[test]
+    fn reseed_without_force_leaves_a_diverged_file_alone() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        let script = root.join("lib/create/S20-cache.kai");
+        std::fs::write(&script, "# mine\n").expect("diverge");
+
+        let report = reseed_rc_files(root, false).expect("reseed");
+        assert_eq!(report.replaced, 0, "install-if-absent must replace nothing");
+        assert_eq!(report.written, 0, "nothing is absent");
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "# mine\n",
+            "an edit survives a non-forced reseed"
+        );
+    }
+
+    #[test]
+    fn reseed_force_restores_a_removed_script() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        let script = root.join("lib/create/S20-cache.kai");
+        std::fs::remove_file(&script).expect("remove");
+        let report = reseed_rc_files(root, true).expect("reseed --force");
+        assert!(report.written >= 1, "a removed script comes back");
+        assert!(script.exists(), "restored");
     }
 
     #[test]
