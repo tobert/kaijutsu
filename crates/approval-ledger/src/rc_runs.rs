@@ -42,12 +42,34 @@ pub fn finish_run(conn: &Connection, run_id: &str, outcome: RcOutcome) -> Result
     }
 }
 
+/// Record how many scripts this run intends to execute, once its script
+/// list has been loaded (before any of them run). Refuses a second write
+/// loudly rather than overwriting it (same immutability spirit as
+/// `finish_run`'s outcome): `script_count` is set exactly once per run, and
+/// a reader compares recorded `rc_run_scripts` rows against it to tell a
+/// run cancelled part-way from a run where a script actually failed — a
+/// silently-changing target would defeat that comparison.
+pub fn set_run_script_count(conn: &Connection, run_id: &str, count: usize) -> Result<()> {
+    let count = i64::try_from(count).expect("a run's script_count fits in i64");
+    let rows = conn.execute(
+        "UPDATE rc_runs SET script_count = ?1 WHERE run_id = ?2 AND script_count IS NULL",
+        params![count, run_id],
+    )?;
+    if rows > 0 {
+        return Ok(());
+    }
+    match get_run(conn, run_id)? {
+        None => Err(LedgerError::RunNotFound(run_id.to_string())),
+        Some(_) => Err(LedgerError::RunScriptCountAlreadySet(run_id.to_string())),
+    }
+}
+
 /// List every run, most recently started first — the "checklist of what
 /// ran" a human or `kj ledger runs` reads to answer "did the rc lifecycle
 /// actually fire" without already knowing a `run_id` to look up.
 pub fn list_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
     let mut stmt = conn.prepare(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count
          FROM rc_runs ORDER BY started_at DESC",
     )?;
     let rows = stmt.query_map([], row_to_run)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -100,7 +122,7 @@ pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(
         conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
 
     let select_sql = format!(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count
          FROM rc_runs {where_clause} ORDER BY started_at DESC LIMIT ?"
     );
     let mut select_params = params;
@@ -114,7 +136,7 @@ pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(
 
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RcRunRow>> {
     conn.query_row(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count
          FROM rc_runs WHERE run_id = ?1",
         params![run_id],
         row_to_run,
@@ -140,6 +162,7 @@ fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RcRunRow> {
         started_at: row.get(4)?,
         finished_at: row.get(5)?,
         outcome,
+        script_count: row.get(7)?,
     })
 }
 
@@ -257,6 +280,36 @@ mod tests {
         assert!(matches!(err, LedgerError::RunAlreadyFinished(_)));
         // Still `ok` — the second call's `Failed` must not have landed.
         assert_eq!(get_run(&conn, &run_id).unwrap().unwrap().outcome, Some(RcOutcome::Ok));
+    }
+
+    #[test]
+    fn set_run_script_count_round_trips_through_get_run() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        assert!(get_run(&conn, &run_id).unwrap().unwrap().script_count.is_none());
+
+        set_run_script_count(&conn, &run_id, 3).unwrap();
+        assert_eq!(get_run(&conn, &run_id).unwrap().unwrap().script_count, Some(3));
+    }
+
+    #[test]
+    fn set_run_script_count_on_an_unknown_run_is_not_found() {
+        let conn = open_memory();
+        assert!(matches!(
+            set_run_script_count(&conn, "nope", 1).unwrap_err(),
+            LedgerError::RunNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn setting_script_count_twice_is_refused_not_overwritten() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &run_id, 3).unwrap();
+        let err = set_run_script_count(&conn, &run_id, 5).unwrap_err();
+        assert!(matches!(err, LedgerError::RunScriptCountAlreadySet(_)));
+        // Still 3 — the second call's 5 must not have landed.
+        assert_eq!(get_run(&conn, &run_id).unwrap().unwrap().script_count, Some(3));
     }
 
     #[test]

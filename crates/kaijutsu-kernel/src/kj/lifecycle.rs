@@ -245,6 +245,13 @@ impl KjDispatcher {
             }
         };
 
+        // Recorded once, here: the set is snapshotted, so this is how many
+        // scripts the run intends to execute. Fewer script rows than this at
+        // read time means the run stopped early rather than that a script
+        // failed — the two are otherwise identical in the log, both landing
+        // as `Failed`.
+        run_guard.record_script_count(scripts.len());
+
         if scripts.is_empty() {
             run_guard.finish(RcOutcome::Ok);
             return Ok(());
@@ -694,6 +701,19 @@ struct RunGuard<'a> {
 impl<'a> RunGuard<'a> {
     fn new(dispatcher: &'a KjDispatcher, run_id: Option<String>) -> Self {
         Self { dispatcher, run_id }
+    }
+
+    /// Record how many scripts this run intends to execute, best-effort for
+    /// the same reason [`RunGuard::record_script`] is: the run log rides
+    /// alongside the lifecycle and never gates it.
+    fn record_script_count(&self, count: usize) {
+        let Some(run_id) = self.run_id.as_deref() else {
+            return;
+        };
+        let db = self.dispatcher.kernel_db().lock();
+        if let Err(e) = rc_runs::set_run_script_count(db.conn_for_ledger(), run_id, count) {
+            tracing::warn!("rc lifecycle: run log set_run_script_count failed for {run_id}: {e}");
+        }
     }
 
     /// Record one script's execution in the run log, best-effort. A failure
@@ -1838,6 +1858,54 @@ mod tests {
             Some(RcOutcome::Ok),
             "a genuinely absent rc directory is zero scripts, not a failed run"
         );
+    }
+
+    /// The run log records how many scripts the run intended to execute, so
+    /// a reader can tell a run that stopped early from one where a script
+    /// failed. Both outcomes are `Failed`; only the count separates them.
+    #[tokio::test]
+    async fn rc_run_records_intended_script_count() {
+        let d = test_dispatcher().await;
+        install_rc_script_file(&d, "/etc/rc/counted/create/S00-one.md", "first").await;
+        install_rc_script_file(&d, "/etc/rc/counted/create/S10-two.md", "second").await;
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-counted", "--type", "counted"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-counted");
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert_eq!(run.outcome, Some(RcOutcome::Ok));
+        assert_eq!(
+            run.script_count,
+            Some(2),
+            "the run log must say how many scripts were intended"
+        );
+    }
+
+    /// A verb with no scripts records a count of zero rather than leaving it
+    /// unset: zero-of-zero is a complete run, and only a run that failed
+    /// before the script list loaded should read as having no count at all.
+    #[tokio::test]
+    async fn rc_empty_verb_records_zero_script_count() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-zero", "--type", "nothinghere"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-zero");
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert_eq!(run.script_count, Some(0));
     }
 
     /// A `.kai` or `.md` file in a verb directory that is not a canonical

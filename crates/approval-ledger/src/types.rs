@@ -657,6 +657,13 @@ pub struct RcRunRow {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub outcome: Option<RcOutcome>,
+    /// How many scripts this run intended to execute, set once its script
+    /// list was loaded. NULL for a run that predates this field, or that
+    /// failed before its script list was ever loaded. Compare against the
+    /// number of recorded `rc_run_scripts` rows to tell a run cancelled
+    /// part-way from a run where a script actually failed — see
+    /// `schema.rs`'s `rc_runs` table comment.
+    pub script_count: Option<i64>,
 }
 
 /// One `rc_run_scripts` row.

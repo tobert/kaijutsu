@@ -1083,6 +1083,12 @@ impl KjDispatcher {
             ),
             format!("outcome:      {}", outcome.as_deref().unwrap_or("(none yet)")),
         ];
+        // `script_count` is NULL for a run that predates this field, or
+        // that failed before its script list was ever loaded — omit the
+        // line rather than print a count that was never recorded.
+        if let Some(expected) = run.script_count {
+            lines.push(format!("script_count: {expected}"));
+        }
         if scripts.is_empty() {
             lines.push(String::new());
             lines.push("(no scripts recorded for this run)".to_string());
@@ -1099,6 +1105,21 @@ impl KjDispatcher {
                 ));
             }
         }
+        // The point of `script_count`: fewer recorded rows than intended
+        // means the run was cut short (dropped mid-lifecycle, `RunGuard`'s
+        // `Drop` backstop stamped it `failed`) — not that a script itself
+        // failed. Say so explicitly rather than leaving a reader to guess
+        // from a gap in `SEQ`.
+        if let Some(expected) = run.script_count {
+            let recorded = scripts.len() as i64;
+            if recorded < expected {
+                lines.push(String::new());
+                lines.push(format!(
+                    "only {recorded} of {expected} scripts ran — the run stopped before the rest \
+                     started (cancelled or aborted, not a script failure)"
+                ));
+            }
+        }
 
         let data = serde_json::json!({
             "run_id": run.run_id,
@@ -1108,6 +1129,7 @@ impl KjDispatcher {
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "outcome": outcome,
+            "script_count": run.script_count,
             "scripts": scripts.iter().map(|s| serde_json::json!({
                 "seq": s.seq,
                 "path": s.path,
@@ -2332,6 +2354,88 @@ mod tests {
             scripts[0]["path"].as_str().unwrap().ends_with("S00-hello.kai"),
             "{obj}"
         );
+    }
+
+    /// `script_count` set and every intended script actually recorded:
+    /// the header carries the count, but no "cut short" line — a matching
+    /// count is not itself a signal of anything wrong.
+    #[tokio::test]
+    async fn ledger_runs_show_with_matching_script_count_has_no_short_run_line() {
+        use crate::kj::test_helpers::install_rc_script_file;
+
+        let d = test_dispatcher().await;
+        let c = unjoined_caller();
+        install_rc_script_file(&d, "/etc/rc/ledgertest3/create/S00-hello.kai", "echo hi").await;
+
+        let created = d
+            .dispatch(
+                &[s("context"), s("create"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
+                &c,
+            )
+            .await;
+        assert!(created.is_ok(), "context create failed: {}", created.message());
+
+        let list = d.dispatch(&[s("ledger"), s("runs")], &c).await;
+        let data = match &list {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("{other:?}"),
+        };
+        let run_id = data[0].as_str().expect("a run id string").to_string();
+
+        let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        // The count comes from the lifecycle itself, not from the test.
+        assert!(shown.message().contains("script_count: 1"), "{}", shown.message());
+        assert!(!shown.message().contains("scripts ran"), "{}", shown.message());
+        let obj = match &shown {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(obj["script_count"], serde_json::json!(1));
+    }
+
+    /// The whole point of `script_count`: fewer recorded script rows than
+    /// intended must render an explicit line naming the gap, distinguishing
+    /// a run cancelled part-way from a run where a script actually failed.
+    #[tokio::test]
+    async fn ledger_runs_show_with_short_script_count_names_the_gap() {
+        use approval_ledger::{rc_runs, types::RcOutcome};
+
+        let d = test_dispatcher().await;
+        let c = unjoined_caller();
+
+        // A run that stopped part-way cannot be produced by a lifecycle that
+        // finishes, so drive the same writer calls the lifecycle makes and
+        // simply stop early: three scripts intended, one recorded.
+        let ctx = kaijutsu_types::ContextId::new();
+        let run_id = {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let run_id = rc_runs::start_run(conn, ctx.as_bytes(), "ledgertest4", "create").unwrap();
+            rc_runs::set_run_script_count(conn, &run_id, 3).unwrap();
+            let sha = rc_runs::insert_script_body(conn, "echo hi").unwrap();
+            rc_runs::record_run_script(
+                conn,
+                &run_id,
+                "/etc/rc/ledgertest4/create/S00-hello.kai",
+                &sha,
+                Some(0),
+                1,
+                Some(2),
+            )
+            .unwrap();
+            rc_runs::finish_run(conn, &run_id, RcOutcome::Failed).unwrap();
+            run_id
+        };
+
+        let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(shown.message().contains("1 of 3 scripts ran"), "{}", shown.message());
+        let obj = match &shown {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(obj["script_count"], serde_json::json!(3));
     }
 
     /// An unknown run id errors loudly — never a blank "show" that could

@@ -120,6 +120,15 @@ pub enum LedgerError {
     #[error("rc run {0} was already finished")]
     RunAlreadyFinished(String),
 
+    /// `set_run_script_count` called on a run that already has a
+    /// `script_count` — same immutability spirit as `RunAlreadyFinished`:
+    /// the count is set exactly once, when the run's script list is
+    /// loaded, and a second write would mean either a caller bug or a
+    /// moving target, neither of which should silently overwrite the
+    /// original value a reader is comparing recorded rows against.
+    #[error("rc run {0} already has a recorded script_count")]
+    RunScriptCountAlreadySet(String),
+
     /// `redeem_ask` was asked to redeem a request that carries no answer —
     /// it is still `pending`/`claimed`, or it ended `expired`/`abandoned`
     /// without anyone deciding. A distinct variant from the plain

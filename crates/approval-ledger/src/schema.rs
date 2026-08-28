@@ -635,6 +635,15 @@ END;
 -- sweep visible on run one instead of by incident review — a durable,
 -- queryable record of which scripts actually fired, not just that the
 -- lifecycle verb was called.
+-- `script_count` is how many scripts this run intended to execute, set once
+-- the run's script list is loaded (before any of them run) — NULL until
+-- then, and forever NULL for a run that failed before reaching that point.
+-- It is what lets a reader tell a run cancelled part-way (recorded
+-- `rc_run_scripts` rows < `script_count`) apart from a run where a script
+-- actually failed (rows == `script_count`, one row's `exit_code` nonzero):
+-- both leave `outcome = 'failed'` and are otherwise indistinguishable. See
+-- `add_rc_runs_script_count_column_if_missing` below — an already-existing
+-- database does not get this column from `CREATE TABLE IF NOT EXISTS` alone.
 CREATE TABLE IF NOT EXISTS rc_runs (
     run_id       TEXT    NOT NULL PRIMARY KEY,
     context_id   BLOB    NOT NULL,
@@ -643,7 +652,8 @@ CREATE TABLE IF NOT EXISTS rc_runs (
     started_at   INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     finished_at  INTEGER,
-    outcome      TEXT CHECK (outcome IS NULL OR outcome IN ('ok', 'failed', 'abandoned'))
+    outcome      TEXT CHECK (outcome IS NULL OR outcome IN ('ok', 'failed', 'abandoned')),
+    script_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_rc_runs_context_started
     ON rc_runs(context_id, started_at);
@@ -684,7 +694,31 @@ CREATE TABLE IF NOT EXISTS script_bodies (
 /// docs); this crate's own invariants (guarantees 2, 3, 6) are enforced by
 /// `CHECK`s and triggers that do not depend on FK enforcement being on.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
-    conn.execute_batch(DDL)
+    conn.execute_batch(DDL)?;
+    add_rc_runs_script_count_column_if_missing(conn)
+}
+
+/// `rc_runs.script_count` was added to `DDL` above after real databases
+/// already existed with the old `rc_runs` shape — `CREATE TABLE IF NOT
+/// EXISTS` does nothing to a table that is already there, so those
+/// databases need an actual `ALTER TABLE` to gain the column. This is the
+/// crate's first ALTER-TABLE step (kernel_db's ALTER-TABLE ladder,
+/// `kaijutsu-kernel/src/kernel_db.rs`, is the pattern to reach for as more
+/// of these accumulate). Guarded by `PRAGMA table_info` so a fresh
+/// database — which already has the column from `DDL` — never re-runs the
+/// `ALTER TABLE` and fails on a duplicate column; `migrate` must stay safe
+/// to call on every process start.
+fn add_rc_runs_script_count_column_if_missing(conn: &Connection) -> SqliteResult<()> {
+    let has_column = conn
+        .prepare("PRAGMA table_info(rc_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<SqliteResult<Vec<String>>>()?
+        .iter()
+        .any(|name| name == "script_count");
+    if !has_column {
+        conn.execute_batch("ALTER TABLE rc_runs ADD COLUMN script_count INTEGER")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -695,6 +729,55 @@ mod tests {
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+    }
+
+    /// The regression this crate's live database would have hit: a
+    /// database that ran `migrate()` before `script_count` existed in
+    /// `DDL` must still gain the column on its NEXT `migrate()` call, not
+    /// silently stay on the old shape — and running `migrate()` a further
+    /// time after that must still be a no-op, not an "duplicate column"
+    /// error.
+    #[test]
+    fn migrate_adds_script_count_to_a_database_created_without_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build the pre-`script_count` shape rather than calling
+        // `migrate()` first — calling it would already create the column,
+        // defeating the point of this test.
+        conn.execute_batch(
+            "CREATE TABLE rc_runs (
+                run_id       TEXT    NOT NULL PRIMARY KEY,
+                context_id   BLOB    NOT NULL,
+                context_type TEXT    NOT NULL,
+                verb         TEXT    NOT NULL,
+                started_at   INTEGER NOT NULL,
+                finished_at  INTEGER,
+                outcome      TEXT
+            );
+            INSERT INTO rc_runs (run_id, context_id, context_type, verb, started_at)
+            VALUES ('r1', X'01', 'coder', 'create', 1000);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let has_column = conn
+            .prepare("PRAGMA table_info(rc_runs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<SqliteResult<Vec<String>>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == "script_count");
+        assert!(has_column, "script_count must be added to a pre-existing rc_runs table");
+
+        let script_count: Option<i64> = conn
+            .query_row("SELECT script_count FROM rc_runs WHERE run_id = 'r1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(script_count, None, "a pre-existing row gains the column as NULL, not a guessed value");
+
+        // A second migrate() must not try to add the column again.
         migrate(&conn).unwrap();
     }
 
