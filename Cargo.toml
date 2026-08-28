@@ -22,7 +22,6 @@ members = [
     "crates/kaijutsu-isotest",
     "crates/approval-ledger",
     "crates/claude-code-peer",
-    "crates/kaijutsu-configgit",
 ]
 
 [workspace.package]

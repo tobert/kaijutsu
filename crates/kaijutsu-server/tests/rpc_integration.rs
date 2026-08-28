@@ -226,12 +226,16 @@ fn test_get_config_reads_kernel_owned_theme() {
 
 /// `Vfs.snapshot` round-trip over the real wire: client → SSH → capnp →
 /// rpc.rs `VfsImpl::snapshot` → kernel `MountTable::snapshot` → recursive
-/// capnp `SnapshotNode` reply → client's owned tree. `/etc/rc` is a
-/// kernel-owned (virtual) mount seeded with lifecycle scripts at kernel boot,
-/// so it's guaranteed non-empty without touching the host filesystem — and
-/// it doubles as coverage that a virtual backend reports `ignored: false`
-/// (no gitignore semantics off the real filesystem) over the wire, not just
-/// in the kernel-side unit tests.
+/// capnp `SnapshotNode` reply → client's owned tree. `/etc/rc` is seeded with
+/// lifecycle scripts at kernel boot, so it is guaranteed non-empty — and it
+/// is a `LocalBackend` mount over a host directory (`docs/rc-on-disk.md`), so
+/// this is also the wire coverage for snapshotting a real filesystem.
+///
+/// The virtual-backend half moved to
+/// `test_vfs_snapshot_of_a_virtual_backend_is_never_ignored`: rc used to be
+/// the virtual mount that proved `ignored: false`, and once it became a real
+/// directory that assertion here would have passed only because the seeded
+/// tree happens to carry no `.gitignore`.
 #[test]
 fn test_vfs_snapshot_round_trips_over_rpc() {
     run_local(async {
@@ -251,20 +255,42 @@ fn test_vfs_snapshot_round_trips_over_rpc() {
             "seeded /etc/rc should have entries"
         );
         assert_eq!(result.generation, result.root.generation);
-        // Virtual backend: no gitignore semantics apply anywhere in the tree.
-        fn assert_never_ignored(node: &kaijutsu_client::SnapshotNode) {
-            assert!(!node.ignored, "virtual backend node reported ignored: {}", node.name);
-            for child in &node.children {
-                assert_never_ignored(child);
-            }
-        }
-        assert_never_ignored(&result.root);
 
         // A tiny cap forces a visible cut, proving truncated_here/truncated
         // survive the wire round-trip (not just the in-process walker).
         let cut = kernel.vfs_snapshot("/etc/rc", 3, 1).await.unwrap();
         assert!(cut.truncated, "max_entries=1 must truncate a populated tree");
         assert!(cut.root.truncated_here);
+    });
+}
+
+/// A document-backed mount reports `ignored: false` for every node over the
+/// wire: gitignore semantics come off a real filesystem, and there is none
+/// under `/etc/config`. `/etc/rc` carried this until it moved to disk.
+#[test]
+fn test_vfs_snapshot_of_a_virtual_backend_is_never_ignored() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let result = kernel.vfs_snapshot("/etc/config", 3, 500).await.unwrap();
+        assert!(
+            !result.root.children.is_empty(),
+            "seeded /etc/config should have entries"
+        );
+
+        fn assert_never_ignored(node: &kaijutsu_client::SnapshotNode) {
+            assert!(
+                !node.ignored,
+                "virtual backend node reported ignored: {}",
+                node.name
+            );
+            for child in &node.children {
+                assert_never_ignored(child);
+            }
+        }
+        assert_never_ignored(&result.root);
     });
 }
 

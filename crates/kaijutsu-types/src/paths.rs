@@ -191,14 +191,18 @@ pub fn is_midi_path(path: &str) -> bool {
     is_or_under(path, MIDI_ROOT)
 }
 
-/// True if `path` is under one of the four kernel-owned `ConfigDocFs` roots
-/// (rc, kernel-global config, per-client config, MIDI device profiles) —
-/// the trees `kaijutsu-server/src/rpc.rs` mounts with that backend and
-/// `VfsOps::owns_config_docs` answers `true` for. The mount table is the
-/// live authority on ownership; this predicate exists for call chains that
-/// cannot reach it (no async, or no mount table in scope) and must be kept
-/// in sync with the same four `kernel.mount(...)` calls by hand — a fifth
-/// `ConfigDocFs` root needs a fifth arm here. See `docs/file-buffers.md`.
+/// True if `path` is under one of the four `/etc` config-like trees — rc,
+/// kernel-global config, per-client config, MIDI device profiles. Each keeps
+/// a `FileDocumentCache` shadow behind the kaish `cat`/file-tool read path,
+/// so a writer that changes one of these paths must invalidate that shadow or
+/// the next read serves stale text.
+///
+/// Not a statement about which backend serves the tree: `/etc/rc` is a
+/// `LocalBackend` mount over a host directory (`docs/rc-on-disk.md`) while the
+/// other three are still `ConfigDocFs`. The mount table is the live authority
+/// on ownership; this predicate exists for call chains that cannot reach it
+/// (no async, or no mount table in scope), and a fifth such tree needs a fifth
+/// arm here. See `docs/file-buffers.md`.
 pub fn is_config_doc_root(path: &str) -> bool {
     is_rc_path(path) || is_config_path(path) || is_client_path(path) || is_midi_path(path)
 }
@@ -320,13 +324,12 @@ mod tests {
         assert!(!is_config_path(MIDI_ROOT));
     }
 
-    /// `is_config_doc_root` must enumerate exactly the same four roots
-    /// `kaijutsu-server/src/rpc.rs` mounts with `ConfigDocFs` — one list, one
-    /// place. A fifth root added to one side and not the other is exactly
-    /// the drift that reverted an edit under `is_config_doc_root`'s
-    /// predecessor (`docs/file-buffers.md`).
+    /// `is_config_doc_root` must enumerate exactly the four `/etc` trees that
+    /// keep a `FileDocumentCache` shadow — one list, one place. A fifth tree
+    /// added to one side and not the other is exactly the drift that reverted
+    /// an edit under this predicate's predecessor (`docs/file-buffers.md`).
     #[test]
-    fn is_config_doc_root_covers_exactly_the_four_configdocfs_roots() {
+    fn is_config_doc_root_covers_exactly_the_four_shadowed_etc_trees() {
         for root in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
             assert!(is_config_doc_root(root), "{root} must be a config-doc root");
         }

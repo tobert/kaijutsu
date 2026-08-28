@@ -875,7 +875,7 @@ CREATE TABLE IF NOT EXISTS hook_scripts (
 );
 
 -- rc lifecycle scripts are no longer table rows: they live as files under
--- /etc/rc (~/.config/kaijutsu/rc), seeded to disk at boot. See
+-- /etc/rc (~/.config/kaijutsu/etc/rc), seeded to disk at boot. See
 -- crate::seed_scripts and kj/lifecycle.rs. A legacy `rc_scripts` table may
 -- still exist in pre-files DBs; KernelDb::legacy_rc_scripts migrates it.
 

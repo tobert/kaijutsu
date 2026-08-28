@@ -1242,7 +1242,7 @@ fn create_block_store_with_kernel_db(
     Ok(store)
 }
 
-/// Get the config directory path.
+/// Canonicalize a `/etc/config` argument.
 /// Returns: ~/.config/kaijutsu/
 /// Map a config RPC `path` (a bare name like `theme.toml`, or an already-full
 /// `/etc/config/…` path) to its canonical path under the config mount. Config is

@@ -2,7 +2,7 @@
 //!
 //! Manages lifecycle script **files** at canonical paths
 //! `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
-//! `~/.config/kaijutsu/rc/`). The path itself is the user-facing key;
+//! `~/.config/kaijutsu/etc/rc/`). The path itself is the user-facing key;
 //! structural fields (context_type, verb, sort_key, name, extension) are
 //! derived from it via `parse_rc_path`.
 //!

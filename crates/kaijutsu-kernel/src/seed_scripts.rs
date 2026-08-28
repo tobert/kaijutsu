@@ -1,5 +1,9 @@
 //! Built-in rc lifecycle scripts, embedded at build time and seeded onto
-//! the deployed `/etc/rc` tree (`~/.config/kaijutsu/rc/`) on first boot.
+//! the deployed `/etc/rc` tree (`~/.config/kaijutsu/etc/rc/`) on first boot.
+//!
+//! A seed whose whole body is a path naming another seed is written as a real
+//! symlink, not as a file holding that text — this is the init.d composition
+//! format, and `include_dir!` cannot carry a link. See `docs/rc-on-disk.md`.
 //!
 //! These are the defaults a fresh kernel bootstraps with. Two purposes:
 //!
