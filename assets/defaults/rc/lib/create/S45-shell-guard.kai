@@ -48,19 +48,18 @@
 # place (`toolie`/`musician` get the safe, `ExternalExec::Deny` `shell`
 # tool only, which cannot invoke `sh -c` at all).
 #
-# The hook body lives at `S45-shell-guard.hook.kai` in this same directory,
-# not embedded here: `HookBody::KaishPath` reads it fresh from the VFS at
-# every pre_call fire (docs/rc-on-disk.md, "slice 5"), so editing that file
-# reaches the running hook with no reinstall -- unlike the old inline
-# `HookBody::Kaish` snapshot, which needed a fresh context create to pick up
-# an edit.
+# The hook body lives at `/etc/rc/lib/hooks/shell-guard.kai`, outside any
+# verb directory so the rc lifecycle never runs it as a script.
+# `HookBody::KaishPath` reads it fresh from the VFS at every pre_call fire,
+# so editing that file reaches the running hook with no reinstall
+# (docs/rc-on-disk.md).
 
 set -e
 
 mt="shell_write"
 hid="shell-escape-guard"
 t="kaish_path"
-p="/etc/rc/lib/create/S45-shell-guard.hook.kai"
+p="/etc/rc/lib/hooks/shell-guard.kai"
 match_json="$(jq -cn --arg mt $mt --arg hid $hid '{match_tool: $mt, hook_id: $hid}')"
 action_json="$(jq -cn --arg t $t --arg p $p '{type: $t, path: $p}')"
 

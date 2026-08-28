@@ -250,20 +250,44 @@ fn seed_resolved_body(path: &str) -> Option<&'static str> {
 
 /// Canonical rc path format. The verb alternation is built from
 /// [`crate::kj::lifecycle::RC_VERBS`] — the single source shared with the firing
-/// gate — so the validator can never reject a verb the scheduler fires (the
-/// rotate regression). `attach` is a reserved verb: scripts install fine but
-/// lifecycle dispatch is a no-op until that hook is wired (tracked in
-/// `docs/issues.md`). `tick` is the beat verb (fired by the beat scheduler on a
-/// context's OODA cadence); `rotate` is the page-turn verb.
+/// gate — so the validator can never reject a verb the scheduler fires.
+/// `tick` is the beat verb (fired by the beat scheduler on a context's OODA
+/// cadence); `rotate` is the page-turn verb.
+/// The filename half of a canonical rc path: `SXX-name.{kai,md}`. Shared
+/// with [`rc_path_pattern`] and with the lifecycle runner's own directory
+/// filter ([`is_rc_script_filename`]) so that "what counts as a script"
+/// has one definition. A runner that executes a file the validator would
+/// reject is the same class of trap as a verb the scheduler fires and the
+/// validator refuses.
+const RC_FILENAME_PATTERN: &str = r"(S\d{1,3})-([a-z][a-z0-9_-]*)\.(kai|md)";
+
 fn rc_path_pattern() -> String {
     let verbs = crate::kj::lifecycle::RC_VERBS.join("|");
     let root = paths::RC_ROOT;
-    format!(r"^{root}/([a-z][a-z0-9_-]*)/({verbs})/(S\d{{1,3}})-([a-z][a-z0-9_-]*)\.(kai|md)$")
+    let file = RC_FILENAME_PATTERN;
+    format!(r"^{root}/([a-z][a-z0-9_-]*)/({verbs})/{file}$")
 }
 
 fn rc_path_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(&rc_path_pattern()).expect("rc path regex compiles"))
+}
+
+/// Whether a bare filename is a canonical rc script name (`SXX-name.kai`
+/// or `SXX-name.md`).
+///
+/// The lifecycle runner uses this to decide what in a verb directory is a
+/// script. A `.kai` or `.md` file that fails this check is a hard error
+/// there rather than a silent skip: a `.md` in a verb directory reaches
+/// the model's system-prompt slot, so quietly ignoring an unexpected one
+/// hides exactly the mistake worth catching. Non-script data belongs
+/// outside a verb directory — see `docs/rc-on-disk.md`.
+pub fn is_rc_script_filename(name: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"^{RC_FILENAME_PATTERN}$")).expect("rc filename regex compiles")
+    })
+    .is_match(name)
 }
 
 /// Parsed components of a canonical rc path.

@@ -27,17 +27,16 @@ kj context set . --env LFM2D_MODE=escalate
 kj context set . --env LFM2D_URL=http://lfm2d-1.taila4abc.ts.net:8088
 kj context set . --env LFM2D_BENIGN_LABEL=informative
 
-# The hook body lives at `S50-lfm2d.hook.kai` in this same directory, not
-# embedded here: `HookBody::KaishPath` reads it fresh from the VFS at every
-# pre_call fire (docs/rc-on-disk.md, "slice 5"), so editing that file
-# reaches the running hook with no reinstall -- unlike the old inline
-# `HookBody::Kaish` snapshot, which needed a fresh context create to pick up
-# an edit.
+# The hook body lives at `/etc/rc/lib/hooks/lfm2d.kai`, outside any verb
+# directory so the rc lifecycle never runs it as a script.
+# `HookBody::KaishPath` reads it fresh from the VFS at every pre_call fire,
+# so editing that file reaches the running hook with no reinstall
+# (docs/rc-on-disk.md).
 
 mt="shell_write"
 hid="lfm2d-advisory"
 t="kaish_path"
-p="/etc/rc/lib/create/S50-lfm2d.hook.kai"
+p="/etc/rc/lib/hooks/lfm2d.kai"
 match_json="$(jq -cn --arg mt $mt --arg hid $hid '{match_tool: $mt, hook_id: $hid}')"
 action_json="$(jq -cn --arg t $t --arg p $p '{type: $t, path: $p}')"
 

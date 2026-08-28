@@ -1074,10 +1074,10 @@ mod tests {
         );
         // S45 installs a `KaishPath` action (docs/rc-on-disk.md, "slice
         // 5"), not a snapshotted inline body: the guard's logic is read
-        // fresh from `S45-shell-guard.hook.kai` at every fire.
+        // fresh from `/etc/rc/lib/hooks/shell-guard.kai` at every fire.
         match &installed.unwrap().action {
             HookAction::Invoke(HookBody::KaishPath(path)) => {
-                assert_eq!(path, "/etc/rc/lib/create/S45-shell-guard.hook.kai");
+                assert_eq!(path, "/etc/rc/lib/hooks/shell-guard.kai");
             }
             other => panic!("installed action must be a kaish_path, got {other:?}"),
         }

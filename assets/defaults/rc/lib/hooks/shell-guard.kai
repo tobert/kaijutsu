@@ -1,7 +1,8 @@
 # Hook body payload, read fresh from this path at every fire
-# (docs/rc-on-disk.md, "slice 5") -- editing this file changes the
-# running hook with no reinstall. NOT an rc lifecycle script itself:
-# never symlink this into a context type's create/ directory.
+# (docs/rc-on-disk.md) -- editing this file changes the running hook with
+# no reinstall. NOT an rc lifecycle script: it sits outside any verb
+# directory, and the lifecycle runner rejects a name that is not
+# SXX-name.{kai,md}, so it cannot be reached as one from either side.
 #
 # shell-escape-guard pre_call hook body (installed by S45-shell-guard.kai as
 # hook_id shell-escape-guard, match_tool shell_write). Scores KJ_TOOL_PLAN --

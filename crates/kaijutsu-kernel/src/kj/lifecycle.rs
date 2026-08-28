@@ -365,12 +365,29 @@ impl KjDispatcher {
         // shared script into this verb dir. The *link's* `SXX-name.ext` governs
         // ordering and which extension-handler runs; `read_all` auto-follows the
         // link to the target's content.
-        let mut names: Vec<String> = entries
+        let candidates = entries
             .into_iter()
             .filter(|e| e.kind.is_file() || e.kind.is_symlink())
             .map(|e| e.name)
-            .filter(|n| n.ends_with(".kai") || n.ends_with(".md"))
-            .collect();
+            .filter(|n| n.ends_with(".kai") || n.ends_with(".md"));
+
+        // A `.kai`/`.md` file here that is not a canonical `SXX-name.ext`
+        // fails the whole verb rather than being skipped. Both extensions
+        // are executable in the sense that matters: `.kai` runs as kaish and
+        // `.md` lands in the model's system-prompt slot, so a file nobody
+        // meant as a script must not be able to reach either by sitting in
+        // the directory. Non-script data belongs outside a verb directory.
+        let mut names: Vec<String> = Vec::new();
+        for name in candidates {
+            if !crate::kj::rc::is_rc_script_filename(&name) {
+                return Err(format!(
+                    "rc lifecycle: {dir}/{name} is not a valid rc script name; \
+                     expected SXX-name.kai or SXX-name.md — move non-script files \
+                     out of the verb directory"
+                ));
+            }
+            names.push(name);
+        }
         // Lexical filename sort == (sort_key, name) order: the filename is
         // `{sort_key}-{name}.{ext}`, so S00 < S10 and ties break on name.
         names.sort();
@@ -914,10 +931,9 @@ impl kaijutsu_index::BlockSource for BlockStoreSource {
 }
 
 fn log_unwired_verb_once(verb: &str) {
-    // All four verbs (create / fork / drift / attach) are now wired.
-    // Reserved-verb logging stays as a no-op for now so a future
-    // not-yet-wired verb can plug in here without touching the call
-    // site at lifecycle.rs:86.
+    // Every verb in RC_VERBS is wired to a call site. This stays a no-op
+    // so a future reserved verb can plug in here without touching the
+    // caller.
     let _ = verb;
 }
 
@@ -1821,6 +1837,76 @@ mod tests {
             run.outcome,
             Some(RcOutcome::Ok),
             "a genuinely absent rc directory is zero scripts, not a failed run"
+        );
+    }
+
+    /// A `.kai` or `.md` file in a verb directory that is not a canonical
+    /// `SXX-name.ext` fails the whole verb, and fails it before any script
+    /// runs. Both extensions reach the model — `.kai` executes, `.md` lands
+    /// in the system-prompt slot — so a file nobody meant as a script must
+    /// not be able to reach either by being dropped in the directory.
+    #[tokio::test]
+    async fn rc_non_canonical_script_name_fails_the_verb() {
+        let d = test_dispatcher().await;
+        install_rc_script_file(
+            &d,
+            "/etc/rc/stray/create/S00-benign.md",
+            "would reach the system-prompt slot",
+        )
+        .await;
+        // The shape that prompted this: a hook body parked beside its
+        // installer, named so it is data rather than a script.
+        install_rc_script_file(&d, "/etc/rc/stray/create/guard.hook.kai", "exit 0").await;
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-stray", "--type", "stray"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-stray");
+        let kinds = block_kinds_in(&d, new_id);
+        assert!(
+            kinds.is_empty(),
+            "the verb must fail before running anything, got blocks: {kinds:?}"
+        );
+
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert_eq!(
+            run.outcome,
+            Some(RcOutcome::Failed),
+            "a non-canonical script name is a failed run, not a silent skip"
+        );
+    }
+
+    /// A file whose extension is neither `.kai` nor `.md` is ignored, not an
+    /// error: it can neither execute nor reach the system-prompt slot, so it
+    /// is inert rather than a mistake worth failing a context create over.
+    #[tokio::test]
+    async fn rc_ignores_files_that_are_not_scripts() {
+        let d = test_dispatcher().await;
+        install_rc_script_file(&d, "/etc/rc/inert/create/S00-real.md", "the real script").await;
+        install_rc_script_file(&d, "/etc/rc/inert/create/README.txt", "notes").await;
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-inert", "--type", "inert"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-inert");
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        assert_eq!(run.outcome, Some(RcOutcome::Ok));
+        assert_eq!(
+            block_contents_in(&d, new_id),
+            vec!["the real script".to_string()],
+            "the .md script runs and the non-script file is ignored"
         );
     }
 
