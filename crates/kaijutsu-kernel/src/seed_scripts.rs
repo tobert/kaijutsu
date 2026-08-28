@@ -123,22 +123,65 @@ pub fn seed_body(canonical_path: &str) -> Option<&'static str> {
 /// swallowing them: a half-written seed tree is corruption, and the caller
 /// decides whether a fork can proceed without its stance script.
 pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
+    let seeds = seed_files();
+    let known: std::collections::HashSet<String> =
+        seeds.iter().map(|(p, _)| p.clone()).collect();
     let mut written = 0usize;
-    for (path, content) in seed_files() {
-        let Some(rel) = rc_relpath(&path) else {
+    for (path, content) in &seeds {
+        let Some(rel) = rc_relpath(path) else {
             continue;
         };
         let dest = root.join(rel);
-        if dest.exists() {
+        // `symlink_metadata`, not `exists()`: `exists()` follows the link, so
+        // a composed link whose target is not written yet would read as absent
+        // and be created twice.
+        if std::fs::symlink_metadata(&dest).is_ok() {
             continue;
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, content)?;
+        match crate::runtime::config_doc_fs::seed_link_target(path, content, &known) {
+            // An init.d-style composed seed becomes a real symlink. The body
+            // carries the target as a `/etc/rc` path, which is meaningless on
+            // disk, so it is rewritten relative to the link — that keeps the
+            // tree valid wherever it is mounted or copied.
+            Some(target) => {
+                let canonical = canonical_link_target(path, &target);
+                let Some(target_rel) = rc_relpath(&canonical) else {
+                    continue;
+                };
+                std::os::unix::fs::symlink(relative_link(rel, target_rel), &dest)?;
+            }
+            None => std::fs::write(&dest, content)?,
+        }
         written += 1;
     }
     Ok(written)
+}
+
+/// Resolve a seed link body to its canonical `/etc/rc` path. The body is
+/// absolute today; a relative one resolves against the link's own directory.
+fn canonical_link_target(link_path: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        crate::runtime::config_doc_fs::normalize_abs(target)
+    } else {
+        let parent = link_path.rsplit_once('/').map_or("", |(p, _)| p);
+        crate::runtime::config_doc_fs::normalize_abs(&format!("{parent}/{target}"))
+    }
+}
+
+/// A `../`-prefixed path from `link_rel`'s directory to `target_rel`, both
+/// relative to the rc root. Relative targets are what let the deployed tree be
+/// moved, copied, or checked into git somewhere else and still resolve.
+fn relative_link(link_rel: &str, target_rel: &str) -> String {
+    let depth = link_rel.matches('/').count();
+    let mut out = String::new();
+    for _ in 0..depth {
+        out.push_str("../");
+    }
+    out.push_str(target_rel);
+    out
 }
 
 #[cfg(test)]
@@ -171,13 +214,76 @@ mod tests {
         assert!(read(dir.path(), "lib/create/S20-cache.kai")
             .unwrap()
             .contains("kj cache add --target=tools"));
-        // …and the per-type copy is a seed symlink — its body is just the
-        // target path (ConfigDocFs reconstructs the link on seed; the legacy
-        // host-disk path writes the path string verbatim).
+        // …and the per-type copy is a symlink to it, so reading through
+        // reaches the same body. `composed_seeds_become_real_symlinks` pins
+        // the link-ness; this pins that the composition resolves.
         assert_eq!(
-            read(dir.path(), "default/create/S20-cache.kai").unwrap().trim(),
-            "/etc/rc/lib/create/S20-cache.kai"
+            read(dir.path(), "default/create/S20-cache.kai"),
+            read(dir.path(), "lib/create/S20-cache.kai"),
+            "composed seed must read as its canonical body"
         );
+    }
+
+    #[test]
+    fn composed_seeds_become_real_symlinks() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        ensure_rc_seed_files(dir.path()).expect("seed");
+        let root = dir.path();
+
+        // The per-type copy is a composed link, not a file whose body is a
+        // path. Reading through it reaches the canonical body in lib/.
+        let link = root.join("default/create/S20-cache.kai");
+        let md = std::fs::symlink_metadata(&link).expect("stat link");
+        assert!(
+            md.file_type().is_symlink(),
+            "composed seed must be a real symlink, not a file holding a path"
+        );
+        let target = std::fs::read_link(&link).expect("readlink");
+        assert!(
+            target.is_relative(),
+            "link target must be relative so the tree relocates: got {}",
+            target.display()
+        );
+        assert!(
+            std::fs::read_to_string(&link)
+                .expect("read through link")
+                .contains("kj cache add --target=tools"),
+            "link must resolve to the canonical body"
+        );
+
+        // The canonical body itself stays a regular file.
+        assert!(
+            !std::fs::symlink_metadata(root.join("lib/create/S20-cache.kai"))
+                .expect("stat canonical")
+                .file_type()
+                .is_symlink(),
+            "the canonical body is the link's target, never a link itself"
+        );
+
+        // Nothing is left un-materialized: no seeded regular file may hold a
+        // body that `seed_link_target` would have called a link. This is the
+        // assertion that fires when a new composed seed is added and the
+        // seeder does not learn about it.
+        let known: std::collections::HashSet<String> =
+            seed_files().into_iter().map(|(p, _)| p).collect();
+        for (canonical, _) in seed_files() {
+            let rel = rc_relpath(&canonical).expect("rc path");
+            let dest = root.join(rel);
+            if std::fs::symlink_metadata(&dest)
+                .expect("stat seed")
+                .file_type()
+                .is_symlink()
+            {
+                continue;
+            }
+            let body = std::fs::read_to_string(&dest).expect("read seed");
+            assert!(
+                crate::runtime::config_doc_fs::seed_link_target(&canonical, &body, &known)
+                    .is_none(),
+                "{canonical} seeded as a literal file but its body names another \
+                 seed \u{2014} it should have been materialized as a symlink"
+            );
+        }
     }
 
     #[test]
@@ -189,7 +295,11 @@ mod tests {
         // (file exists → skipped). The server only calls ensure on a fresh
         // tree, but the within-call "skip existing" contract is what keeps a
         // partial (migrated) tree from being clobbered.
-        let target = dir.path().join("default/create/S20-cache.kai");
+        // Edit a real file, not a composed link: writing through a link
+        // would land in lib/ and this assertion would then be reading back
+        // its own clobber. `edit_through_a_composed_link_reaches_the_shared_body`
+        // covers that path deliberately.
+        let target = dir.path().join("lib/create/S20-cache.kai");
         std::fs::write(&target, "# user-edited body").expect("edit");
         let n = ensure_rc_seed_files(dir.path()).expect("seed 2");
         assert_eq!(n, 0, "second ensure should write nothing");
@@ -197,6 +307,39 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "# user-edited body",
             "edit was clobbered by re-seed"
+        );
+    }
+
+    #[test]
+    fn edit_through_a_composed_link_reaches_the_shared_body() {
+        // On disk a composed seed is an ordinary symlink, so writing through
+        // it changes the body every linking context_type runs. The document
+        // backend refused this in `kj rc edit`; the filesystem does not, and
+        // that is the accepted trade for plain files. Pinned so the change in
+        // meaning is a decision on the record rather than a surprise.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        ensure_rc_seed_files(dir.path()).expect("seed");
+        let root = dir.path();
+
+        std::fs::write(root.join("default/create/S20-cache.kai"), "# edited\n")
+            .expect("write through link");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("lib/create/S20-cache.kai")).unwrap(),
+            "# edited\n",
+            "the shared body is what a write through the link reaches"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("coder/create/S20-cache.kai")).unwrap(),
+            "# edited\n",
+            "and every other linking type sees it"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("default/create/S20-cache.kai"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "writing through a link must not replace the link with a file"
         );
     }
 
