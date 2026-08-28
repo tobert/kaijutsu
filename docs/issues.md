@@ -25,6 +25,22 @@ bypass below — a second spelling of the same act that the ledger cannot see.
 
 Found while trying to answer the pending `kj rc reset` ask from a gated seat.
 
+**What the wide seat actually costs, measured 2026-08-28.** `default`,
+`coder` and `mcp` all symlink the *same* `lib/create/S10-binding.kai`, which
+grants `*`, `facade:*`, `operator`, `exec` and `editor`. So a `default` seat
+is not less capable than a `coder` one — it is exactly as capable. What it
+lacks is everything layered above the binding: no `S00-stance`, no
+`S15-governance`, and no `S50-lfm2d`, the advisory classifier that raises
+asks. It keeps `S45-shell-guard`, which denies outright and never escalates.
+Full authority, no stance, and the one gate that produces ledger rows absent.
+
+And it is reached without choosing it: `kj context create` with no `--type`
+falls back to `"default"` (`crates/kaijutsu-kernel/src/kj/context.rs:1149`).
+The single `default` run in 215 is almost certainly that, not a client
+picking a wide seat on purpose. The least-configured path is the
+least-observed one, which is the ordinary version of this problem and the
+one worth fixing first.
+
 **Not obviously a hole to close by refusing.** Two smaller moves are
 available and neither needs a policy: record the requested `context_type` on
 the context row so a wide seat is at least *countable*, and have the ask
@@ -37,6 +53,20 @@ at all — but it does not address this, because `default` is not a typo.
 2026-08-28): *"if we ever decide to do actual human auth thing, it'll likely
 be some kind of yubikey or passkey thing, and it's not a goal right now."*
 Do not design toward a principal check that separates human from model.
+
+## The `attach` verb fires and no type ships a script (2026-08-28)
+
+`attach` is wired end to end — `kj/attach.rs:75` runs the lifecycle before
+returning `Switch`, and an `Err` there rejects the attach — and not one of
+the nine context types has an `attach/` directory. Every attach loads zero
+scripts and records an `ok` run.
+
+Plumbing without content. Either it earns a script (the obvious candidate is
+re-stating the seat's stance to a model that just arrived in a context it
+did not boot) or it should be retired from `RC_VERBS` so the surface stops
+advertising a verb nothing uses. Found while auditing rc integration points;
+a stale comment in `kj/rc.rs` claimed this was already tracked here and it
+was not.
 
 ## Ctrl+Z lands in the wrong input on the second toggle (Amy, 2026-08-26)
 
