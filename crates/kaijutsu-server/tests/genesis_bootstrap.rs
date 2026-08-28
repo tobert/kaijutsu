@@ -17,7 +17,11 @@ async fn empty_kernel_seeds_one_root_director_context() {
 
     // config_dir = None → embedded rc/config defaults; data_dir = fresh tempdir
     // → an empty KernelDb, so the ROOT bootstrap must fire.
-    let shared = kaijutsu_server::rpc::create_shared_kernel(None, Some(tmp.path()))
+    let shared = kaijutsu_server::rpc::create_shared_kernel(
+        None,
+        &tmp.path().join("etc").join("rc"),
+        Some(tmp.path()),
+    )
         .await
         .expect("create_shared_kernel should succeed on an empty data dir");
 

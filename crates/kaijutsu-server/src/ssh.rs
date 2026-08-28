@@ -114,6 +114,10 @@ pub struct SshServerConfig {
     pub allow_anonymous: bool,
     /// Config directory override. None = use XDG default (~/.config/kaijutsu).
     pub config_dir: Option<PathBuf>,
+    /// Host directory mounted at `/etc/rc`. Required, and never `Option`: a
+    /// missing value must not be able to resolve to the user's real config
+    /// tree, which is what a test harness would silently write into.
+    pub rc_dir: PathBuf,
     /// Data directory override. None = use XDG default (~/.local/share/kaijutsu/kernel).
     pub data_dir: Option<PathBuf>,
     /// Maximum number of concurrent SSH connections. Default: 100.
@@ -137,6 +141,15 @@ impl Drop for TempDirGuard {
         // Best-effort: a failed cleanup must never panic a dropping server.
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// `~/.config/kaijutsu/etc/rc` — the one place the rc tree's default location
+/// is decided. Everything else takes the path it is handed.
+pub fn default_rc_dir() -> PathBuf {
+    kaish_kernel::xdg_config_home()
+        .join("kaijutsu")
+        .join("etc")
+        .join("rc")
 }
 
 impl SshServerConfig {
@@ -172,6 +185,7 @@ impl SshServerConfig {
             auth_db_path: None,
             allow_anonymous: true, // Tests need to accept any key
             config_dir: Some(path.clone()),
+            rc_dir: path.join("etc").join("rc"),
             data_dir: Some(path.clone()),
             max_connections: 100,
             _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
@@ -186,6 +200,7 @@ impl SshServerConfig {
             auth_db_path: Some(AuthDb::default_path()),
             allow_anonymous: false,
             config_dir: None, // Use XDG default
+            rc_dir: default_rc_dir(),
             data_dir: None,   // Use XDG default
             max_connections: 100,
             _cleanup: None,
@@ -306,6 +321,7 @@ impl SshServer {
         // All connections share this single kernel.
         let shared_kernel = crate::rpc::create_shared_kernel(
             self.config.config_dir.as_deref(),
+            &self.config.rc_dir,
             self.config.data_dir.as_deref(),
         )
         .await

@@ -1,7 +1,16 @@
 # Config on disk — melting the kernel-owned trees to real files
 
-**Status: ruled, unbuilt.** Amy ruled the shape on 2026-08-21; no code has
-moved. `docs/config-ownership.md` still describes the live system.
+**Status: slice 1 in progress (2026-08-28).** Amy ruled the shape on
+2026-08-21. Production now mounts `/etc/rc` from a host directory;
+`/etc/config`, `/etc/client` and `/etc/midi` are still documents, so
+`docs/config-ownership.md` still describes those three.
+
+**Amy ruled the git question on 2026-08-28: plain files, the kernel never
+runs git.** `crates/kaijutsu-configgit` — Lane B's write half in
+`docs/config-ownership.md`, built and never wired — is retired rather than
+left on the shelf. Git stays a choice about a directory (ours is shared from
+`~/.config` through a local gitea), never a mechanism the kernel performs.
+That closes the "unresolved" note in `config-ownership.md`.
 
     ~/.config/kaijutsu/etc/rc/coder/create/S00-stance.kai
 

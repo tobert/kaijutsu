@@ -90,11 +90,15 @@ The permission behind it, from the same conversation and recorded in CLAUDE.md
 as "Permission to get simpler": *"if the agent can see the files and edit them,
 that's fine, we don't need to complicate it just because it's config."*
 
-Whether `kaijutsu-configgit`'s git worktree is still the intended storage, or
-gets replaced outright by the simpler shape, is unresolved. **Read the rulings
-below as what was decided *if* the git-worktree shape ships — not as a settled
-design.** The invariant that survives either way is single kernel ownership: one
-source of truth, no host write-through.
+**Resolved 2026-08-28: the simpler shape wins and this lane is retired.** Amy
+chose plain files with the kernel never running git; `kaijutsu-configgit` is
+deleted rather than kept unwired. `docs/rc-on-disk.md` is the live design, and
+rc is already mounted from a host directory. The rulings below are kept as the
+record of a shape that did not ship — **do not build on them.**
+
+The invariant that survives is single ownership: one source of truth, no host
+write-through *and* no second index. On disk that means the directory is the
+truth, and `git diff` is the diff.
 
 ### Rulings (Amy, 2026-08-15)
 

@@ -1182,6 +1182,15 @@ impl Drop for ConnectionState {
 }
 
 /// Get the stable data directory for kernel persistent storage.
+/// True when `dir` holds no entries. A missing directory counts as empty —
+/// both mean "nothing has been seeded here yet".
+fn dir_is_empty(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
+    }
+}
+
 /// Creates the directory if it doesn't exist.
 /// Returns: ~/.local/share/kaijutsu/kernel/
 fn kernel_data_dir() -> std::path::PathBuf {
@@ -1767,6 +1776,10 @@ pub async fn create_shared_kernel(
     // defaults; the kernel never reads the user's host config). Tests point it
     // at a tempdir to inject config seeds.
     config_dir: Option<&Path>,
+    // Host directory mounted at `/etc/rc`. Required: `config_dir`'s `None`
+    // already means "seed /etc/config from embedded only", and a second
+    // meaning on the same parameter is how a test writes into a real home.
+    rc_dir: &Path,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
@@ -1888,30 +1901,22 @@ pub async fn create_shared_kernel(
     // or narrow it, update that test's fixture alongside.
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
-    // The rc tree at /etc/rc is kernel-owned (docs/config-ownership.md): no
-    // host mount, no host-disk seeding. It is mounted below, once the block
-    // store exists (the kernel-owned backend maps onto it) — and the mount table
-    // is frozen there, after every mount is in place.
-
-    // Mount the kernel-owned rc backend at /etc/rc (longest-prefix wins over the
-    // read-only `/`; the host's real /etc is never touched). The block store's
-    // load_from_db has already replayed any persisted rc Config docs; seed from
-    // the embedded defaults only when the rc namespace is still empty (a
-    // genuinely fresh kernel). After that the kernel owns the content: a script
-    // you `rm`'d stays gone, a repo-dropped seed does not resurrect. Per-file
+    // Mount /etc/rc from a host directory (longest-prefix wins over the
+    // read-only `/`; the host's real /etc is never touched). rc scripts are
+    // ordinary files an editor, `vim`, or git can reach — `docs/rc-on-disk.md`.
+    // Seed the embedded defaults only when the tree is still empty (a genuinely
+    // fresh install); after that the directory is the content: a script you
+    // `rm`'d stays gone, a repo-dropped seed does not resurrect. Per-file
     // recovery is `kj rc reset <path>`. Seeding failure is fatal — a kernel
     // without its stance scripts must not come up pretending all is well.
-    let rc_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
-        documents.clone(),
-        paths::RC_ROOT,
-    );
-    if rc_fs.is_empty() {
-        let n = rc_fs.seed_from_embedded().map_err(|e| {
-            capnp::Error::failed(format!("rc seed into the kernel failed: {e}"))
-        })?;
-        log::info!("seeded {n} rc script(s) (fresh kernel)");
+    std::fs::create_dir_all(rc_dir)
+        .map_err(|e| capnp::Error::failed(format!("rc tree {}: {e}", rc_dir.display())))?;
+    if dir_is_empty(rc_dir) {
+        let n = kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(rc_dir)
+            .map_err(|e| capnp::Error::failed(format!("rc seed into {}: {e}", rc_dir.display())))?;
+        log::info!("seeded {n} rc script(s) into {} (fresh tree)", rc_dir.display());
     }
-    kernel.mount(paths::RC_ROOT, rc_fs).await;
+    kernel.mount(paths::RC_ROOT, LocalBackend::new(rc_dir)).await;
 
     // Config files (theme/models/mcp.toml + system.md) at /etc/config are
     // kernel-owned too (slice 2, docs/config-ownership.md): the SAME backend
