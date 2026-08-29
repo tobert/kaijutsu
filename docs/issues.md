@@ -6,6 +6,57 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## An allowed ask was not redeemed on retry, and a second ask was minted (2026-08-29)
+
+Reproduced on zorak against the live kernel, immediately after the
+`approval_events.kind` CHECK fix (`362661d7`) made redemption possible at all.
+
+1. `kj ledger rc 2>&1 | head -14` → `lfm2d-advisory` escalates, ask
+   `01a04eaa-6a9c-79a1-be4d-d58cbd28384a` is raised, nothing runs.
+2. A peer session allows it. `kj ledger show` reads `allowed`, `allow_once`.
+3. The **exact same command** is re-run. Instead of redeeming, the gate mints
+   `01a04eb6-fb75-78e0-a8ed-55ee43a02fff` — same statement text, same
+   `context_id`, same `authorized_label`, same `origin: hook`, same
+   `hook_id`.
+
+So `find_redeemable` (`ask.rs:807`) did not match an allowed, unredeemed ask
+that looks identical on every field `kj ledger show` prints.
+
+**Ruled out by reading:** the digest. `statement_digest` (`kj/gate.rs:249`) is
+`format!("hook:v1:{rendered}")` — no hash, no nonce, deterministic in the
+rendered text, and both asks print the same `statement:` line. The candidate
+query's other filters (`authorized_label`, `context_id`) are equal, and the
+ask was not in `approval_redemptions` (it would not have read `allowed` and
+unspent otherwise).
+
+**The one field that is not observable from any `kj` verb is
+`principal_id`,** and it is the leading suspect precisely because it is the
+one that cannot be checked. `find_redeemable` filters on it, and
+`UndeliveredAnswer::principal_id`'s own doc says a caller "woken under a
+different one mints a fresh ask instead of collecting this answer" — which is
+the observed behavior exactly. The MCP session reconnected across the kernel
+restart, so a per-connection principal would produce this.
+
+**Do not assume the CHECK fix is what is being tested here.** That fix is
+correct and mutation-verified at the unit level, and the migration ran clean.
+What has *not* been demonstrated is a redemption on the live kernel. An
+earlier apparent success — a retried `kj context create` reaching clap — is
+not evidence: `lfm2d` had scored it `situation-normal 0.718, verdict
+escalate`, a borderline call that can flip to allow on a second run, which
+explains the observation without any redemption occurring.
+
+**First diagnostic step, and it needs no gate budget:** make the principal
+observable. `kj ledger show` prints `context_id` in its `.data` payload and
+not `principal_id`; adding it is small, and it either confirms this in one
+command or eliminates it and forces the next hypothesis. A ledger surface
+that cannot show the field its own matching turns on is the reason this took
+an afternoon to narrow rather than a minute.
+
+Second step, if principal matches: no `kj` verb reports whether an ask has
+been redeemed. `approval_redemptions` is invisible from the CLI, so
+"allowed" and "allowed and already spent" read identically. That gap is worth
+closing on its own merits.
+
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
 `context_type` on `register_session` is caller-chosen free text with no
