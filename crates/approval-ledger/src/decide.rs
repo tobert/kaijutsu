@@ -372,7 +372,7 @@ mod tests {
     use crate::ask::{create_ask, get_approval, list_events};
     use crate::error::LedgerError;
     use crate::ask::list_refusals;
-    use crate::fixtures::{ASKING_CONTEXT, PEER_CONTEXT, author, minimal_ask, open_memory, peer};
+    use crate::fixtures::{ASKING_CONTEXT, PEER_CONTEXT, author, minimal_ask, open_memory, open_memory_with_legacy_kind_check, peer};
     use crate::types::{ApprovalStatus, EventKind};
 
     use super::*;
@@ -504,6 +504,52 @@ mod tests {
     }
 
     // ── `redeem_ask` (single-use consumption of an allowed ask) ──────────
+
+    /// The regression a live kernel.db hit: a database that ran `migrate()`
+    /// before `redeemed` joined `approval_events.kind` kept the narrow
+    /// `CHECK`, so the redemption event was rejected — and because
+    /// `redeem_ask` writes the redemption row and the event in ONE
+    /// transaction, the rollback took the redemption with it. No answer,
+    /// allow or deny, could be consumed on such a database.
+    ///
+    /// Falsified by restoring `CHECK (kind IN (...))` to `approval_events`
+    /// in `schema::DDL` and reverting `drop_legacy_approval_events_kind_
+    /// check` to a no-op: `redeem_ask` then failed with "CHECK constraint
+    /// failed: kind IN (...)" instead of returning `true`. Reverted after.
+    #[test]
+    fn an_answer_is_redeemable_on_a_database_built_before_redeemed_was_a_kind() {
+        let conn = open_memory_with_legacy_kind_check();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &request_id, DecideInput { allow: true, ..Default::default() }).unwrap();
+
+        assert!(
+            redeem_ask(&conn, &request_id).unwrap(),
+            "an allowed ask must be redeemable on a pre-`redeemed` database"
+        );
+        let events = list_events(&conn, &request_id).unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.kind == EventKind::Redeemed).count(),
+            1,
+            "the redemption event must land, not be rejected by a stale CHECK"
+        );
+    }
+
+    /// The denial half of the same regression. `decide.rs`'s own rule is
+    /// that a denial is redeemed like an approval, so a stale `CHECK`
+    /// stranded denied callers in a retry loop exactly as it did allowed
+    /// ones — worth its own assertion because the two statuses take
+    /// different branches out of `redeem_ask`'s status guard.
+    #[test]
+    fn a_denial_is_redeemable_on_a_database_built_before_redeemed_was_a_kind() {
+        let conn = open_memory_with_legacy_kind_check();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &request_id, DecideInput { allow: false, ..Default::default() }).unwrap();
+
+        assert!(
+            redeem_ask(&conn, &request_id).unwrap(),
+            "a denied ask must be redeemable on a pre-`redeemed` database"
+        );
+    }
 
     /// Pins the single-use guarantee: the first redemption of an allowed
     /// ask wins (`Ok(true)`) and writes exactly one `Redeemed` event; a

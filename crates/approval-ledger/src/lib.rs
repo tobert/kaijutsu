@@ -117,6 +117,38 @@ pub(crate) mod fixtures {
         conn
     }
 
+    /// A database on the shape that shipped before `redeemed` was an event
+    /// kind: `approval_events.kind` still carries the value-enum `CHECK`.
+    /// Hand-built BEFORE `migrate()` on purpose — calling `migrate()` first
+    /// would create the current shape and defeat the point, the same
+    /// reasoning as `schema`'s `script_count` migration test.
+    ///
+    /// This is the only fixture that reaches a real deployed database's
+    /// shape. Every other test opens a fresh one, which is precisely why a
+    /// stale-constraint failure was invisible to the suite.
+    pub(crate) fn open_memory_with_legacy_kind_check() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE approval_events (
+                request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+                seq            INTEGER NOT NULL,
+                kind           TEXT    NOT NULL
+                    CHECK (kind IN ('claimed', 'decided', 'expired', 'abandoned', 'late_decision')),
+                actor          BLOB,
+                decided_option TEXT,
+                remember_scope TEXT,
+                auto_reason    TEXT,
+                note           TEXT,
+                created_at     INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                PRIMARY KEY (request_id, seq)
+            );",
+        )
+        .expect("legacy approval_events");
+        crate::schema::migrate(&conn).expect("migrate");
+        conn
+    }
+
     pub(crate) fn minimal_ask() -> NewAsk {
         NewAsk {
             context_id: ASKING_CONTEXT.to_vec(),

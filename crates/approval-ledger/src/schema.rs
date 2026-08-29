@@ -112,14 +112,23 @@
 //! write both: the snapshot (if the attempt wins) and an event row
 //! (always).
 
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult};
 
 /// The DDL, applied in dependency order (a table's `REFERENCES` target must
 /// already exist). Every statement is `IF NOT EXISTS` / `CREATE ... IF NOT
 /// EXISTS`, so `migrate` is safe to call every process start against an
-/// already-migrated database — there is no migration-version table because
-/// there is, so far, exactly one schema generation (kernel_db's
-/// ALTER-TABLE ladder is the pattern to reach for if that changes).
+/// already-migrated database.
+///
+/// **`IF NOT EXISTS` reaches a fresh database and no other.** Editing a
+/// table's definition here changes what a NEW database gets and nothing
+/// about an existing one — a widened `CHECK`, a new column, a changed
+/// default all stay invisible where the table already exists. Every such
+/// edit needs a step below (`add_rc_runs_script_count_column_if_missing`,
+/// `drop_legacy_approval_events_kind_check`) or it is a change that only
+/// works on a machine nobody has been using. There is still no
+/// migration-version table; kernel_db's ALTER-TABLE ladder
+/// (`kaijutsu-kernel/src/kernel_db.rs`) is the pattern to reach for as
+/// more of these accumulate.
 const DDL: &str = r#"
 -- ── Statement documents (content-addressed, immutable, shared) ─────────
 -- A `PlannedStatement` (kaish 0.14 `plan_program` returns one per
@@ -384,11 +393,19 @@ CREATE TABLE IF NOT EXISTS approval_signals (
 -- this table holds every truth that was ever attempted against it. `kind
 -- = 'late_decision'` is the specific row a rejected post-terminal decide()
 -- writes — never a `decided` row, because it never became the outcome.
+--
+-- `kind` carries no CHECK, for the same reason `approval_refusals.reason`
+-- below carries none: the set of kinds grows, and a value-enum CHECK
+-- cannot be widened on a database that already ran an earlier `migrate()`
+-- — `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already
+-- there. The set is `EventKind` in `types.rs`, enforced in Rust at the one
+-- write path (`events::append`), where a new variant cannot be forgotten.
+-- `drop_legacy_approval_events_kind_check` below rebuilds a table that
+-- still carries the old constraint.
 CREATE TABLE IF NOT EXISTS approval_events (
     request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
     seq            INTEGER NOT NULL,
-    kind           TEXT    NOT NULL
-        CHECK (kind IN ('claimed', 'decided', 'expired', 'abandoned', 'late_decision', 'redeemed')),
+    kind           TEXT    NOT NULL,
     actor          BLOB,
     decided_option TEXT,
     remember_scope TEXT,
@@ -695,7 +712,68 @@ CREATE TABLE IF NOT EXISTS script_bodies (
 /// `CHECK`s and triggers that do not depend on FK enforcement being on.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(DDL)?;
+    if drop_legacy_approval_events_kind_check(conn)? {
+        // The rebuild dropped `approval_events`, and SQLite drops a table's
+        // triggers with it, so `ledger_generation_bump_on_event_insert` went
+        // with it. A second `DDL` pass puts the trigger back; every other
+        // statement is `IF NOT EXISTS` and no-ops. Conditional because a
+        // normal start does not rebuild and should not pay for a second pass.
+        conn.execute_batch(DDL)?;
+    }
     add_rc_runs_script_count_column_if_missing(conn)
+}
+
+/// `approval_events.kind` carried a value-enum `CHECK` until `redeemed`
+/// needed to join the set. Widening it in `DDL` reaches a fresh database
+/// and no other: `CREATE TABLE IF NOT EXISTS` does nothing to a table that
+/// already exists, so an older database keeps the narrow constraint and
+/// rejects the new value — and because `redeem_ask` writes the redemption
+/// row and the event in one transaction, the rejection rolls back the
+/// redemption too and the gate can never consume an answer.
+///
+/// SQLite cannot alter a `CHECK`, so the table is rebuilt once: copy,
+/// drop, rename. Guarded on the stored DDL text so an already-rebuilt
+/// database no-ops, keeping `migrate` safe to call on every process start.
+/// Runs after `DDL` because the final `RENAME` resolves the new table's
+/// `REFERENCES approvals(request_id)` against the live schema, and fails
+/// with "no such table: main.approvals" if that table is not there yet.
+///
+/// Returns whether it rebuilt, because the caller must then re-run `DDL`
+/// to restore the trigger the `DROP` took with it.
+fn drop_legacy_approval_events_kind_check(conn: &Connection) -> SqliteResult<bool> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = existing else { return Ok(false) };
+    if !sql.contains("CHECK") {
+        return Ok(false);
+    }
+    conn.execute_batch(
+        "CREATE TABLE approval_events_rebuilt (
+            request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+            seq            INTEGER NOT NULL,
+            kind           TEXT    NOT NULL,
+            actor          BLOB,
+            decided_option TEXT,
+            remember_scope TEXT,
+            auto_reason    TEXT,
+            note           TEXT,
+            created_at     INTEGER NOT NULL
+                DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+            PRIMARY KEY (request_id, seq)
+        );
+        INSERT INTO approval_events_rebuilt
+            (request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at)
+        SELECT request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at
+        FROM approval_events;
+        DROP TABLE approval_events;
+        ALTER TABLE approval_events_rebuilt RENAME TO approval_events;",
+    )?;
+    Ok(true)
 }
 
 /// `rc_runs.script_count` was added to `DDL` above after real databases
@@ -779,6 +857,114 @@ mod tests {
 
         // A second migrate() must not try to add the column again.
         migrate(&conn).unwrap();
+    }
+
+    /// Bring a migrated database back to the shape that shipped before
+    /// `redeemed` was an event kind, and seed the `approvals` parent row
+    /// the rebuilt table's foreign key needs. Migrating first and putting
+    /// the old table back is closer to a real deployed database than
+    /// hand-building one table on a bare connection: the FK target and the
+    /// generation trigger both exist, exactly as they do in kernel.db.
+    fn put_approval_events_back_on_its_legacy_shape(conn: &Connection) {
+        migrate(conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE approval_events;
+             CREATE TABLE approval_events (
+                request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+                seq            INTEGER NOT NULL,
+                kind           TEXT    NOT NULL
+                    CHECK (kind IN ('claimed', 'decided', 'expired', 'abandoned', 'late_decision')),
+                actor          BLOB,
+                decided_option TEXT,
+                remember_scope TEXT,
+                auto_reason    TEXT,
+                note           TEXT,
+                created_at     INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                PRIMARY KEY (request_id, seq)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approvals (request_id, context_id, principal_id, origin, description)
+             VALUES ('r1', X'01', X'02', 'shell_gate', 'x')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// A database carrying the old value-enum `CHECK` on
+    /// `approval_events.kind` must lose it on the next `migrate()`, keep
+    /// every row it already had, and accept a value the old constraint
+    /// rejected. Falsified by reverting
+    /// `drop_legacy_approval_events_kind_check` to `Ok(())`: the INSERT
+    /// then failed with "CHECK constraint failed".
+    #[test]
+    fn migrate_drops_a_legacy_kind_check_and_keeps_the_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        put_approval_events_back_on_its_legacy_shape(&conn);
+        conn.execute(
+            "INSERT INTO approval_events (request_id, seq, kind, note, created_at)
+             VALUES ('r1', 0, 'decided', 'kept', 1000)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the value-enum CHECK must be gone, got: {sql}");
+
+        let (kind, note, created_at): (String, String, i64) = conn
+            .query_row(
+                "SELECT kind, note, created_at FROM approval_events WHERE request_id = 'r1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), note.as_str(), created_at), ("decided", "kept", 1000),
+            "the rebuild must carry every column across, timestamps included");
+
+        conn.execute(
+            "INSERT INTO approval_events (request_id, seq, kind) VALUES ('r1', 1, 'redeemed')",
+            [],
+        )
+        .expect("a kind the old CHECK rejected must now insert");
+
+        // Still safe to call on every process start.
+        migrate(&conn).unwrap();
+    }
+
+    /// The rebuild drops `approval_events`, and SQLite drops that table's
+    /// triggers with it. `migrate` runs the rebuild before `DDL` so the
+    /// trigger comes back; this pins that ordering. Falsified by moving
+    /// `drop_legacy_approval_events_kind_check` after `execute_batch(DDL)`,
+    /// which left the generation counter frozen at its starting value.
+    #[test]
+    fn the_generation_trigger_survives_the_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        put_approval_events_back_on_its_legacy_shape(&conn);
+
+        migrate(&conn).unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO approval_events (request_id, seq, kind) VALUES ('r1', 0, 'redeemed')",
+            [],
+        )
+        .unwrap();
+        let after: i64 = conn
+            .query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(after > before, "an event insert must still bump the generation counter");
     }
 
     #[test]
