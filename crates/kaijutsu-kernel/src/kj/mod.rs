@@ -1207,7 +1207,6 @@ pub(crate) mod test_helpers {
             binding.grant(crate::mcp::Capability::AllInstances);
             binding.grant(crate::mcp::Capability::AllFacades);
             binding.grant(crate::mcp::Capability::Admin);
-            binding.grant(crate::mcp::Capability::RcWrite);
             binding.grant(crate::mcp::Capability::Drive);
             binding.grant(crate::mcp::Capability::Fork);
             binding.grant(crate::mcp::Capability::Drift);

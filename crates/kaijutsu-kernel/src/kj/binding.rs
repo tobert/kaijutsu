@@ -67,7 +67,7 @@ enum BindingCommand {
     #[command(alias = "grant")]
     Allow {
         /// Capability: <instance> | <instance>:<tool> | facade:<name> | * |
-        /// facade:* | admin | rc-write | drive | fork | drift | transport |
+        /// facade:* | admin | drive | fork | drift | transport |
         /// operator | config-write | exec | editor
         cap: String,
         /// Target context: . (default) | .parent | <label> | <hex prefix>
@@ -97,14 +97,11 @@ enum BindingCommand {
 ///   `*`        → every broker instance (`AllInstances`)
 ///   `facade:*` → every facade surface (`AllFacades`)
 ///   `admin`    → binding-admin (may write any context's loadout)
-///   `rc-write` → may write /etc/rc lifecycle scripts via the file tools
-///                (dedicated; NOT implied by `*`/`facade:*`)
 fn parse_capability(s: &str) -> Result<Capability, String> {
     match s {
         "*" => return Ok(Capability::AllInstances),
         "facade:*" => return Ok(Capability::AllFacades),
         "admin" => return Ok(Capability::Admin),
-        "rc-write" => return Ok(Capability::RcWrite),
         _ => {}
     }
     // Authority caps: bare-word kj verb grants (drive/fork/drift/transport/
@@ -196,7 +193,6 @@ impl KjDispatcher {
                 "all_instances": b.all_instances,
                 "all_facades": b.all_facades,
                 "admin": b.binding_admin,
-                "rc_write": b.binding_rc_write,
                 "instances": b.allowed_instances.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
                 "tools": b.allowed_tools.iter()
                     .map(|(i, t)| format!("{}:{}", i.as_str(), t))
@@ -252,9 +248,6 @@ impl KjDispatcher {
                 }
                 if b.binding_admin {
                     flags.push("admin");
-                }
-                if b.binding_rc_write {
-                    flags.push("rc-write");
                 }
                 let flags = if flags.is_empty() {
                     "(none)".to_string()
@@ -395,7 +388,6 @@ pub(crate) fn cap_label(cap: &Capability) -> String {
         Capability::AllInstances => "*".to_string(),
         Capability::AllFacades => "facade:*".to_string(),
         Capability::Admin => "admin".to_string(),
-        Capability::RcWrite => "rc-write".to_string(),
         Capability::Drive
         | Capability::Fork
         | Capability::Drift
@@ -621,7 +613,6 @@ mod tests {
             Capability::Facade("shell".into())
         );
         assert_eq!(parse_capability("admin").unwrap(), Capability::Admin);
-        assert_eq!(parse_capability("rc-write").unwrap(), Capability::RcWrite);
         assert_eq!(parse_capability("drive").unwrap(), Capability::Drive);
         assert_eq!(parse_capability("fork").unwrap(), Capability::Fork);
         assert_eq!(parse_capability("drift").unwrap(), Capability::Drift);

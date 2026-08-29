@@ -62,48 +62,22 @@ pub fn resolve_str(cwd: &Path, path: &str) -> Result<String, PathError> {
     Ok(resolve(cwd, path)?.to_string_lossy().into_owned())
 }
 
-/// True if the (already-canonicalized) path is under the rc tree
-/// (`/etc/rc` or `/etc/rc/...`). Writing here via the file tools is gated on
-/// the `rc-write` capability; everything else under `/etc` is denied flat.
-/// Delegates to the canonical, component-boundary-correct predicate in
-/// `kaijutsu_types::paths` — the single source of truth for this check,
-/// shared with `editor::config_owned` and the SFTP gate.
-pub(crate) use kaijutsu_types::paths::is_rc_path;
-
-/// The denial returned when a context without `rc-write` tries to write an
-/// rc script via the file tools. Names the deliberate paths so the nudge is
-/// actionable, not a dead end.
-pub(crate) fn rc_write_denied(path: &str) -> crate::execution::ExecResult {
-    crate::execution::ExecResult::failure(
-        1,
-        format!(
-            "file write to '{path}' needs the rc-write capability \
-             (grant it with `kj binding allow rc-write`, or edit via `kj rc` / host editor)"
-        ),
-    )
-}
-
 /// Deny writes under `/etc` that are not one of kaijutsu's own config mounts.
 ///
 /// `/etc` is shared ground: the four kaijutsu mounts (`rc/`, `config/`,
 /// `client/`, `midi/`) sit alongside the host's read-only root, where
 /// `/etc/passwd` lives. This is the line between them.
 ///
-/// **Config, client and MIDI profiles are ordinary write surfaces** — an agent
-/// edits them with the same `file:write`/`edit` tools it uses for any other
-/// file, with no capability of their own. Config is not a special category
-/// owed its own machinery (Amy, 2026-08-15); the gate it used to have lived
-/// only in `kj config set/edit`, which reached the VFS directly and is being
-/// retired in favour of just editing the files.
-///
-/// `/etc/rc` is **not** handled here: rc is executable rather than data, and
-/// its `rc-write` capability is applied by the caller *before* this check.
+/// **All four mounts are ordinary write surfaces** — an agent edits them with
+/// the same `file:write`/`edit` tools it uses for any other file, with no
+/// capability of their own. None of the four is a special category owed its
+/// own machinery; see `docs/config-ownership.md` and `docs/rc-on-disk.md`.
 ///
 /// Returns `Some(failure)` for a denied path, else `None`.
 pub(crate) fn deny_etc_write(canonical_path: &str) -> Option<crate::execution::ExecResult> {
-    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT};
+    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, RC_ROOT};
 
-    let under_config_mount = [CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT].iter().any(|root| {
+    let under_config_mount = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT].iter().any(|root| {
         // Exact root, or a real child of it — never a sibling that merely
         // shares the prefix (`/etc/configuration` is the host's, not ours).
         canonical_path == *root
@@ -154,17 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn is_rc_path_identifies_the_rc_tree() {
-        assert!(is_rc_path("/etc/rc"));
-        assert!(is_rc_path("/etc/rc/coder/create/S00-stance.md"));
-        // Not the rc tree:
-        assert!(!is_rc_path("/etc/passwd"));
-        assert!(!is_rc_path("/etc"));
-        assert!(!is_rc_path("/etcrc")); // no slash boundary
-        assert!(!is_rc_path("/src/kaijutsu/foo.rs"));
-    }
-
-    #[test]
     fn deny_etc_write_blocks_the_host_root_but_passes_others() {
         // `/etc` itself and anything that is not one of kaijutsu's own config
         // mounts is the host's read-only root — never a write surface.
@@ -178,27 +141,30 @@ mod tests {
         assert!(deny_etc_write("/etcetera/x").is_none());
     }
 
-    /// Config is editable with the ordinary file tools, like any other file.
+    /// rc, config, client and MIDI are all editable with the ordinary file
+    /// tools, like any other file — none of the four carries a capability of
+    /// its own.
     ///
     /// This is the shared-trust stance applied literally (Amy, 2026-08-15: *"if
     /// the agent can see the files and edit them, that's fine, we don't need to
-    /// complicate it just because it's config"*). These three mounts used to be
-    /// unreachable here, so `kj config set` was the only way in — which is what
-    /// made deleting that verb a brick rather than a simplification.
-    ///
-    /// `/etc/rc` is deliberately NOT in this list: rc is executable, and its
-    /// `rc-write` gate is applied by the caller before this check.
+    /// complicate it just because it's config"*). These mounts used to be
+    /// unreachable here, so `kj config set`/`kj rc edit` were the only way in —
+    /// which is what made deleting those verbs a brick rather than a
+    /// simplification.
     #[test]
     fn config_mounts_are_ordinary_write_surfaces() {
+        assert!(deny_etc_write("/etc/rc/coder/create/S00-stance.md").is_none());
         assert!(deny_etc_write("/etc/config/theme.toml").is_none());
         assert!(deny_etc_write("/etc/config/system.md").is_none());
         assert!(deny_etc_write("/etc/client/metronome.toml").is_none());
         assert!(deny_etc_write("/etc/midi/devices/minibrute.md").is_none());
         // The mount roots themselves, too.
+        assert!(deny_etc_write("/etc/rc").is_none());
         assert!(deny_etc_write("/etc/config").is_none());
         assert!(deny_etc_write("/etc/client").is_none());
         assert!(deny_etc_write("/etc/midi").is_none());
         // But a near-miss sibling under /etc is still the host's.
+        assert!(deny_etc_write("/etc/rcfoo").is_some());
         assert!(deny_etc_write("/etc/configuration/x").is_some());
         assert!(deny_etc_write("/etc/midifoo").is_some());
     }

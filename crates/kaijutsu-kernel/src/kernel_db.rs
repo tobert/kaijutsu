@@ -748,7 +748,6 @@ CREATE TABLE IF NOT EXISTS context_bindings (
     all_instances INTEGER NOT NULL DEFAULT 0,  -- "*"        — every broker instance
     all_facades   INTEGER NOT NULL DEFAULT 0,  -- "facade:*" — every facade surface
     binding_admin INTEGER NOT NULL DEFAULT 0,  -- "admin"    — may write any context's loadout
-    binding_rc_write INTEGER NOT NULL DEFAULT 0, -- "rc-write" — may write /etc/rc via file tools
     updated_at    INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
@@ -798,7 +797,7 @@ CREATE TABLE IF NOT EXISTS context_binding_facades (
 -- Authority grants (BTreeSet<String>) — the bare-word `kj` verb caps
 -- (drive/fork/drift/transport/operator). A normalized set, not a flag column:
 -- a future authority is a new row, no schema migration. Deliberately NOT
--- implied by all_instances, mirroring binding_admin / binding_rc_write.
+-- implied by all_instances, mirroring binding_admin.
 CREATE TABLE IF NOT EXISTS context_binding_authorities (
     context_id BLOB NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
     authority  TEXT NOT NULL,
@@ -1880,7 +1879,6 @@ impl KernelDb {
     /// leaving the DB silently short a column that later code assumes exists.
     fn apply_additive_migrations(conn: &Connection) -> KernelDbResult<()> {
         let alters = [
-            "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
             "ALTER TABLE tracks ADD COLUMN clock_kind TEXT NOT NULL DEFAULT 'system'",
@@ -4284,20 +4282,18 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         conn.execute(
             "INSERT INTO context_bindings
-                 (context_id, all_instances, all_facades, binding_admin, binding_rc_write, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (context_id, all_instances, all_facades, binding_admin, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(context_id) DO UPDATE SET
                  all_instances    = excluded.all_instances,
                  all_facades      = excluded.all_facades,
                  binding_admin    = excluded.binding_admin,
-                 binding_rc_write = excluded.binding_rc_write,
                  updated_at       = excluded.updated_at",
             params![
                 blob_param(context_id.as_bytes()),
                 binding.all_instances as i64,
                 binding.all_facades as i64,
                 binding.binding_admin as i64,
-                binding.binding_rc_write as i64,
                 now_millis(),
             ],
         )?;
@@ -4384,10 +4380,10 @@ impl KernelDb {
         &self,
         context_id: ContextId,
     ) -> KernelDbResult<Option<ContextToolBinding>> {
-        let flags: Option<(bool, bool, bool, bool)> = self
+        let flags: Option<(bool, bool, bool)> = self
             .conn
             .query_row(
-                "SELECT all_instances, all_facades, binding_admin, binding_rc_write
+                "SELECT all_instances, all_facades, binding_admin
                  FROM context_bindings WHERE context_id = ?1",
                 params![blob_param(context_id.as_bytes())],
                 |row| {
@@ -4395,12 +4391,11 @@ impl KernelDb {
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
                     ))
                 },
             )
             .ok();
-        let Some((all_instances, all_facades, binding_admin, binding_rc_write)) = flags else {
+        let Some((all_instances, all_facades, binding_admin)) = flags else {
             return Ok(None);
         };
 
@@ -4496,7 +4491,6 @@ impl KernelDb {
             all_instances,
             all_facades,
             binding_admin,
-            binding_rc_write,
             allowed_instances,
             allowed_tools,
             allowed_facades,
@@ -9305,7 +9299,6 @@ mod tests {
         original.grant(Capability::AllInstances);
         original.grant(Capability::AllFacades);
         original.grant(Capability::Admin);
-        original.grant(Capability::RcWrite);
         db.upsert_context_binding(ctx.context_id, &original).unwrap();
 
         let loaded = db
@@ -9315,7 +9308,6 @@ mod tests {
         assert!(loaded.all_instances, "all_instances survived restart");
         assert!(loaded.all_facades, "all_facades survived restart");
         assert!(loaded.binding_admin, "binding_admin survived restart");
-        assert!(loaded.binding_rc_write, "binding_rc_write survived restart");
     }
 
     #[test]

@@ -12,7 +12,8 @@
 //! capability guarding one of the two doors. Both are gone, and with them the
 //! `config-write` gate on this surface: it would have denied `reset` to a
 //! caller who could achieve the identical result by writing the file.
-//! `rc-write` still guards `/etc/rc`, which is executable rather than data.
+//! `/etc/rc` has since joined this same shape — an ordinary write surface,
+//! no dedicated capability.
 //!
 //! What survives is what has no file-tool equivalent: `list`, `show`, and
 //! `reset` — restoring a file to the default embedded in the binary, which is
@@ -144,8 +145,7 @@ impl KjDispatcher {
         // write verbs: it is a file, and the file tools that can already write
         // it enforce nothing of their own. A gate here would have been theatre
         // — it would deny `kj config reset` to a caller who could achieve the
-        // identical result with `builtin.file:write`. `rc-write` still guards
-        // `/etc/rc`, which is executable rather than data.
+        // identical result with `builtin.file:write`.
         //
         // A `reset` touches the ConfigDocFs block, not the FileDocumentCache
         // shadow that backs kaish `cat`/file tools — capture the canonical path

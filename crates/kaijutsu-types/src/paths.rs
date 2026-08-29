@@ -164,10 +164,7 @@ fn is_or_under(path: &str, root: &str) -> bool {
     path == root || (path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/'))
 }
 
-/// True if `path` is under the rc tree (`/etc/rc` or `/etc/rc/...`). Writing
-/// here is gated on the `rc-write` capability at the call sites that enforce
-/// it (`file_tools/path.rs`, `kj/rc.rs`); this predicate only answers "is this
-/// the rc tree," not "is the write allowed."
+/// True if `path` is under the rc tree (`/etc/rc` or `/etc/rc/...`).
 pub fn is_rc_path(path: &str) -> bool {
     is_or_under(path, RC_ROOT)
 }

@@ -52,7 +52,7 @@ backend         list, show, set, remove, model set|remove, default show|set, res
                 SQL-native LLM endpoints (name + kind), their context windows,
                 and the kernel-wide defaults. Replaces models.toml entirely.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
-                (cap tokens incl. rc-write, config-write, drive, fork, drift, transport,
+                (cap tokens incl. config-write, drive, fork, drift, transport,
                 operator, exec, editor, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
 block           list, inspect, count, read, cat, append, history, diff, status, create,
                 edit (insert|delete|replace)

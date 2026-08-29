@@ -12,31 +12,34 @@ embodied — never preached — in the model-facing rc stances.)
 
 The kernel restates the cybernetic / 改善 / TDD posture in its own rc lifecycle:
 `/etc/rc/coder/create/S00-stance.kai` reaches the model via the system-prompt slot for
-every context with `context_type=coder`. rc scripts at `/etc/rc` are **kernel-owned** —
-one owner, no host file, no write-through; embedded defaults under
-`assets/defaults/rc/` seed a fresh kernel once. There is no host file to
-`vim`: edit a live script with `kj rc edit <path> --content <body>`, and `kj rc reset
-<path>` restores one to its embedded default. Change the shipped default by editing
-`assets/defaults/rc/` (the in-repo seed). See `docs/config-ownership.md`.
+every context with `context_type=coder`.
 
-**Config is different from rc, as of 2026-08-15: just write the file.**
-`/etc/config`, `/etc/client` and `/etc/midi` are ordinary write surfaces for
-the file tools and the editor — there is no `kj config set`/`edit` and no
-`config-write` capability on them. `kj config` keeps only what has no file-tool
-equivalent: `list`, `show`, and `reset` (restore the embedded default). `/etc/rc`
-stays gated by `rc-write` because rc is executable rather than data.
+**rc is host files. Just write the file.** rc scripts live under
+`~/.config/kaijutsu/etc/rc/`, mounted at `/etc/rc` through `LocalBackend`, and
+carry **no capability of their own** — the file tools, the editor, host `vim`,
+and git all reach them, and `file:write` is what governs the ones that route
+through the kernel. Every lifecycle run reads the latest body from disk.
+Change the shipped default by editing `assets/defaults/rc/` (the in-repo
+seed), then `kaijutsu-server rc reseed [--force]` to materialize it — Amy
+reseeds regularly, so treat the host tree as a materialization of the seed
+rather than a place to accumulate hand edits.
 
-*Open work:* rc/config are stored as **kernel documents** in the block store,
-not as host files. Melting them to real files on disk is unbuilt. **Single
-kernel ownership is the invariant that survives that change** — whatever the
-storage, config must never have two competing sources of truth.
+**Config works the same way**, and has since 2026-08-15. `/etc/config`,
+`/etc/client` and `/etc/midi` are ordinary write surfaces for the file tools
+and the editor — no `kj config set`/`edit`, no `config-write` capability.
+`kj config` keeps only what has no file-tool equivalent: `list`, `show`, and
+`reset` (restore the embedded default). Unlike rc, `/etc/config` is local,
+snowflake, and points at secrets — never reseed over it.
 
-**rc's melt is ruled and not yet built** (2026-08-21): rc scripts become host
-files under `~/.config/kaijutsu/etc/rc/` mounted at `/etc/rc`, `rc-write` is
-dropped, and hook bodies become path references read at call time. Everything
-above about `/etc/rc` describes the live system and stays true until that
-lands — but do not build new machinery on the parts it deletes. Design,
-evidence, and slices: `docs/rc-on-disk.md`.
+**Single kernel ownership is the invariant**, whatever the storage: config
+must never have two competing sources of truth.
+
+*Where the melt stands* (`docs/rc-on-disk.md` is canonical): rc is on disk,
+`rc-write` is deleted, and hook bodies are path references read at fire time.
+`/etc/config`, `/etc/client` and `/etc/midi` are **still kernel documents** —
+`docs/config-ownership.md` still describes those three, and `ConfigDocFs` and
+`DocKind::Symlink` are deleted when they melt. Do not build new machinery on
+the parts that melt deletes.
 
 **Permission to get simpler** (Amy, 2026-08-15): *"If the agent can see the
 files and edit them, that's fine, we don't need to complicate it just because

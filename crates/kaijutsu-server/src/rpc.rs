@@ -2517,7 +2517,7 @@ pub async fn create_shared_kernel(
 
     // ROOT bootstrap: a brand-new kernel (nothing recovered above) has no
     // contexts. Seed a single `director` context, `ROOT` — the binding-admin
-    // root of the tree (admin + rc-write). ROOT deliberately *can't* drive LLM
+    // root of the tree. ROOT deliberately *can't* drive LLM
     // turns (a director loadout has no drive/fork authority); the operator
     // creates a coder (or any other type) from it when a conversational context
     // is needed. Trigger is strictly *zero contexts at cold start*; once any

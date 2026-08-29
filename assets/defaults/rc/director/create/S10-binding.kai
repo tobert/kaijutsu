@@ -9,16 +9,15 @@ kj binding allow "builtin.bindings"
 # Binding administration: may write any context's loadout.
 kj binding allow "admin"
 # rc-lifecycle governance: a director owns the rc scripts. file:write/edit
-# enable the write tools; rc-write opens the /etc/rc subtree (deny-by-default,
-# not implied by the grants above). General code edits still delegate to a
+# reach both /etc/rc and general workspace files — rc carries no capability
+# of its own, same as /etc/config. General code edits still delegate to a
 # coder context — this is for lifecycle / governance artifacts.
 kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
-kj binding allow "rc-write"
 # config-write opens `kj config set/reset` over the kernel-owned /etc/config files
 # (system.md, theme.toml, mcp.toml) AND the SQL-native model config surfaces
-# (`kj backend`, `kj cast`, `kj alias`) — i.e. which model runs. The config
-# analogue of rc-write: dedicated, not implied by the grants above.
+# (`kj backend`, `kj cast`, `kj alias`) — i.e. which model runs. Dedicated,
+# not implied by the grants above.
 kj binding allow "config-write"
 # kj verb authorities: a director coordinates contexts end-to-end — drives and
 # forks them, merges drift, runs the transport, and performs context/workspace
@@ -40,9 +39,9 @@ kj binding allow "system"
 kj binding allow "exec"
 # The kernel-owned interactive editor's WRITE path (kj editor save, and a
 # `keys` batch that submits :w/:w!/:wq/:x/ZZ) — a director already holds
-# file:write/edit + rc-write above for governance artifacts, so it also gets
-# the editor's write surface. Dedicated authority, not implied by anything
-# above (docs/vi.md; Amy, 2026-08-20 — experiment ahead of a capability-names
+# file:write/edit above for governance artifacts, so it also gets the
+# editor's write surface. Dedicated authority, not implied by anything above
+# (docs/vi.md; Amy, 2026-08-20 — experiment ahead of a capability-names
 # sweep, docs/issues.md).
 kj binding allow "editor"
 # Facades: full interaction surface (shell + edit + submit). `facade:shell` is

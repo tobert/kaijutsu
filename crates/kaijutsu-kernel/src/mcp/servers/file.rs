@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::file_tools::{
     FileDocumentCache, WorkspaceGuard, CacheReadError,
-    path::{resolve_str, is_rc_path, rc_write_denied, deny_etc_write},
+    path::{resolve_str, deny_etc_write},
     hashline::line_hash,
     vfs_walker::VfsWalkerAdapter,
 };
@@ -222,17 +222,7 @@ impl McpServerLike for FileToolsServer {
                 let p: EditParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
-                if is_rc_path(&path) {
-                    if !self.guard.as_ref().is_some_and(|g| g.context_allows_rc_write(&tool_ctx)) {
-                        rc_write_denied(&path)
-                    } else if let Some(ref guard) = self.guard
-                        && let Err(denied) = guard.check_write(&tool_ctx, &path)
-                    {
-                        denied
-                    } else {
-                        self.apply_edit_plan(p, path, &tool_ctx).await
-                    }
-                } else if let Some(denied) = deny_etc_write(&path) {
+                if let Some(denied) = deny_etc_write(&path) {
                     denied
                 } else if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_write(&tool_ctx, &path)
@@ -246,17 +236,7 @@ impl McpServerLike for FileToolsServer {
                 let p: WriteParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
-                if is_rc_path(&path) {
-                    if !self.guard.as_ref().is_some_and(|g| g.context_allows_rc_write(&tool_ctx)) {
-                        rc_write_denied(&path)
-                    } else if let Some(ref guard) = self.guard
-                        && let Err(denied) = guard.check_write(&tool_ctx, &path)
-                    {
-                        denied
-                    } else {
-                        self.write_file(path, p.content).await
-                    }
-                } else if let Some(denied) = deny_etc_write(&path) {
+                if let Some(denied) = deny_etc_write(&path) {
                     denied
                 } else if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_write(&tool_ctx, &path)

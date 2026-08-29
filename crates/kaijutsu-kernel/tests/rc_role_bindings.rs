@@ -227,8 +227,8 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
     );
     assert!(binding.allows_tool(&block, "block_read"));
     // File access: read + the write tools. A director owns the rc lifecycle
-    // scripts, so it gets file:write/edit (and rc-write below) for governance
-    // artifacts — general code edits still delegate to a coder context. See
+    // scripts, so it gets file:write/edit for governance artifacts — general
+    // code edits still delegate to a coder context. See
     // assets/defaults/rc/director/create/S10-binding.kai.
     assert!(binding.allows_tool(&file, "read"), "director should allow file read");
     assert!(
@@ -239,11 +239,30 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
         binding.allows_tool(&file, "edit"),
         "director should allow file edit (rc-lifecycle governance)"
     );
-    // The dedicated /etc/rc subtree grant — deny-by-default, not implied by the
-    // file-tool grants above.
+    // `/etc/rc` carries no capability of its own — the file:write grant above
+    // is what reaches it, enforced at the call path exactly like any other
+    // write. A real write through the broker must succeed.
+    let call_ctx = CallContext::new(h.creator, ctx, SessionId::new(), KernelId::new())
+        .with_cwd(std::path::PathBuf::from("/"));
+    let written = h
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: file.clone(),
+                tool: "write".into(),
+                arguments: serde_json::json!({
+                    "path": "/etc/rc/director/create/S99-write-test.kai",
+                    "content": "true\n",
+                }),
+            },
+            &call_ctx,
+            CancellationToken::new(),
+        )
+        .await;
     assert!(
-        binding.allows(&Capability::RcWrite),
-        "director should hold rc-write for the /etc/rc subtree"
+        written.is_ok(),
+        "director's file:write must reach /etc/rc with no extra capability: {written:?}"
     );
 
     // Director is a binding admin — may write any context's loadout.
@@ -272,11 +291,13 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
 }
 
 #[tokio::test]
-async fn mcp_role_holds_rc_and_config_governance() {
+async fn mcp_role_holds_config_governance() {
     // The `mcp` context_type is the producer/orchestrator voice (Claude Code
     // over MCP, cheaper than API rates). On top of the shared broad loadout it
-    // adds the rc + config governance caps via S15-governance.kai, so it can
-    // iterate on the kernel's own kernel-owned config-as-code.
+    // adds the config governance cap via S15-governance.kai, so it can
+    // iterate on the kernel's own kernel-owned config-as-code. `/etc/rc`
+    // carries no capability of its own — the file:write grant from the
+    // shared loadout (S10 → lib) already reaches it, same as any other file.
     //
     // NB: the broad loadout itself (S10 → lib via a document symlink) is NOT asserted
     // here — this harness mounts /etc/rc as a host `LocalBackend`, which doesn't
@@ -292,11 +313,7 @@ async fn mcp_role_holds_rc_and_config_governance() {
         .await
         .expect("mcp rc must seed a binding");
 
-    // The governance caps added by S15 — deny-by-default, NOT implied by '*'.
-    assert!(
-        binding.allows(&Capability::RcWrite),
-        "mcp should hold rc-write so kj rc edit/reset + /etc/rc edits work"
-    );
+    // The governance cap added by S15 — deny-by-default, NOT implied by '*'.
     assert!(
         binding.allows(&Capability::ConfigWrite),
         "mcp should hold config-write for /etc/config governance"

@@ -343,22 +343,11 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj rc: {e}"));
             }
         };
-        // Writing /etc/rc lifecycle scripts is gated on `rc-write`. `kj rc`
-        // writes go through the admin-only rc_cache (not builtin.file:write), so
-        // this is the *only* place the rc-write capability is enforced for the
-        // kj surface. Reads (list/show, and a `reseed --dry-run`) stay ungated.
-        let writes = match &parsed.command {
-            RcCommand::Add { .. } | RcCommand::Rm { .. } | RcCommand::Edit { .. } | RcCommand::Reset { .. } => {
-                true
-            }
-            RcCommand::Reseed { dry_run, .. } => !*dry_run,
-            _ => false,
-        };
-        if writes
-            && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc")
-        {
-            return denied;
-        }
+        // No capability gate on writes. `/etc/rc` is an ordinary write
+        // surface like `/etc/config` — the same file tools that can already
+        // write it enforce nothing of their own, so a gate here would deny
+        // `kj rc edit` to a caller who could achieve the identical result
+        // with `builtin.file:write`.
         // A direct rc write touches the ConfigDocFs block, not the
         // FileDocumentCache shadow that backs kaish `cat`/file tools — capture
         // the path so we can drop that stale shadow after a successful write.
@@ -877,8 +866,7 @@ impl KjDispatcher {
     /// (`RcSeedStatus::NotInstalled`), and — with `overwrite` — also restore
     /// every path that differs from its seed (`RcSeedStatus::Differs`).
     /// `dry_run` computes and reports the identical plan without writing
-    /// anything (and, per the caller, is never gated on `rc-write`). A
-    /// no-seed path is never touched either way.
+    /// anything. A no-seed path is never touched either way.
     ///
     /// The plan (action + before/after text) is computed once, before any
     /// write happens, from [`seed_resolved_body`] rather than a live VFS
@@ -1652,7 +1640,7 @@ mod tests {
                 s("add"),
                 s("/etc/rc/lib/create/S00-binding.kai"),
                 s("--content"),
-                s("kj binding allow rc-write"),
+                s("kj binding allow drive"),
             ],
             &c,
         )
@@ -1709,7 +1697,7 @@ mod tests {
                 );
                 assert_eq!(
                     obj["content"].as_str(),
-                    Some("kj binding allow rc-write"),
+                    Some("kj binding allow drive"),
                     "show should follow the link to target content"
                 );
             }
@@ -2295,31 +2283,32 @@ mod tests {
         }
     }
 
-    /// `--dry-run` is a read: it must succeed for a caller that holds no
-    /// `rc-write` capability at all, while the same command without
-    /// `--dry-run` is denied for that caller.
+    /// `/etc/rc` carries no capability of its own — a caller with no binding
+    /// at all can both preview and perform a reseed, same as `kj config
+    /// reset`. This pins the ungated stance: a future capability check added
+    /// here would fail this test.
     #[tokio::test]
-    async fn rc_reseed_dry_run_does_not_require_rc_write_capability() {
+    async fn rc_reseed_needs_no_capability_dry_run_or_real() {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
         use kaijutsu_types::ContextId;
 
         let d = test_dispatcher_rc().await;
-        let unprivileged = caller_with_context(ContextId::new());
+        let uncapable = caller_with_context(ContextId::new());
         let s = |v: &str| v.to_string();
 
         let dry = d
-            .dispatch(&[s("rc"), s("reseed"), s("--dry-run")], &unprivileged)
+            .dispatch(&[s("rc"), s("reseed"), s("--dry-run")], &uncapable)
             .await;
         assert!(
             matches!(dry, KjResult::Ok { .. }),
             "a dry-run read must not be denied: {dry:?}"
         );
 
-        let real = d.dispatch(&[s("rc"), s("reseed")], &unprivileged).await;
+        let real = d.dispatch(&[s("rc"), s("reseed")], &uncapable).await;
         assert!(
-            matches!(real, KjResult::Err(_)),
-            "a real reseed write must still require rc-write: {real:?}"
+            matches!(real, KjResult::Ok { .. }),
+            "a real reseed write must succeed too — rc has no capability gate: {real:?}"
         );
     }
 

@@ -338,13 +338,13 @@ mod tests {
     // ── capability gate ───────────────────────────────────────────────────
 
     /// A second rc path for the capability tests, seeded by a privileged
-    /// caller (rc-write is a separate gate, not this task's concern) and
-    /// then driven by an unprivileged, editor-capability-less caller.
+    /// caller and then driven by an unprivileged, editor-capability-less
+    /// caller.
     const P2: &str = "/etc/rc/editorcaptest/create/S00-foo.kai";
 
     /// Bind a fresh, unprivileged context and return a caller for it.
     /// `register_context` seeds a broad test loadout (`*`, `facade:*`,
-    /// admin, rc-write, drive/fork/drift/transport/operator/config-write) so
+    /// admin, drive/fork/drift/transport/operator/config-write) so
     /// ordinary kj verb-mechanics tests don't trip the gates — it does NOT
     /// include `editor` (like every authority, deliberately not implied by
     /// `*`), so this is already the right fixture for "denied without

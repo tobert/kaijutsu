@@ -54,9 +54,9 @@ pub const KNOWN_FACADES: &[&str] = &["shell", "shell_write", "edit_input", "subm
 
 /// The `kj` *authority* capabilities — bare-word grants that gate the
 /// escalation-relevant `kj` verbs which never reach the broker `call_tool` path
-/// (so they have no `Instance`/`Tool` to hang off). Like `admin`/`rc-write`,
-/// these are **deliberately not implied by `*`**: a broad loadout (`coder` with
-/// "*") must not silently be able to self-drive, fork, merge drift, drive the
+/// (so they have no `Instance`/`Tool` to hang off). Like `admin`, these are
+/// **deliberately not implied by `*`**: a broad loadout (`coder` with "*")
+/// must not silently be able to self-drive, fork, merge drift, drive the
 /// transport, or perform context/workspace/preset/doc lifecycle. The narrow
 /// roles (`toolie`, `musician`) grant exactly the ones they need.
 ///
@@ -145,12 +145,6 @@ pub enum Capability {
     /// Deliberately separate from `AllInstances`: a broad role must not become
     /// an admin just by holding "*".
     Admin,
-    /// May write rc lifecycle scripts under `/etc/rc` via the `file:write`/
-    /// `edit` tools. Deliberately separate from `AllInstances`/`AllFacades`:
-    /// a broad role (e.g. `coder` with "*") must NOT be able to clobber a
-    /// privileged lifecycle script by accident — that's an ergonomic nudge,
-    /// not a hard wall (host `vim` and `kj rc` always work).
-    RcWrite,
     /// `kj drive` — clock an autonomous turn. The musician OODA tick runs under
     /// its context's loadout, so this is the cap that gates self-driving.
     Drive,
@@ -167,13 +161,11 @@ pub enum Capability {
     Operator,
     /// `kj config set/reset` — may write the kernel-owned config files at
     /// `/etc/config` (system.md, theme.toml, mcp.toml) AND the SQL-native model
-    /// config surfaces (`kj backend`/`kj cast`/`kj alias`). The config
-    /// analogue of [`RcWrite`]: dedicated so a broad loadout (e.g. `coder` with
-    /// "*") can't silently rewrite which model runs or the base system prompt.
-    /// `kj config` writes go straight through the VFS (not the gated file tool),
-    /// so this is enforced in the `kj config` dispatcher.
-    ///
-    /// [`RcWrite`]: Capability::RcWrite
+    /// config surfaces (`kj backend`/`kj cast`/`kj alias`). Dedicated so a
+    /// broad loadout (e.g. `coder` with "*") can't silently rewrite which
+    /// model runs or the base system prompt. `kj config` writes go straight
+    /// through the VFS (not the gated file tool), so this is enforced in the
+    /// `kj config` dispatcher.
     ConfigWrite,
     /// May spawn host subprocesses from the context shell (kaish external
     /// commands). Enforced at kaish materialization, not per-call: a context
@@ -276,10 +268,6 @@ pub struct ContextToolBinding {
     /// implied by `all_instances`.
     #[serde(default)]
     pub binding_admin: bool,
-    /// rc-write grant ("rc-write"): may write `/etc/rc` lifecycle scripts via
-    /// the file tools. Not implied by `all_instances`/`all_facades`.
-    #[serde(default)]
-    pub binding_rc_write: bool,
     /// Instance-wide grants; order is a tiebreaker for name resolution (§4.2).
     pub allowed_instances: Vec<InstanceId>,
     /// Tool-granular grants — `(instance, tool)` pairs allowed even when the
@@ -319,7 +307,6 @@ impl ContextToolBinding {
         !self.all_instances
             && !self.all_facades
             && !self.binding_admin
-            && !self.binding_rc_write
             && self.allowed_instances.is_empty()
             && self.allowed_tools.is_empty()
             && self.allowed_facades.is_empty()
@@ -335,12 +322,6 @@ impl ContextToolBinding {
     /// True if this context may administer bindings (its own and others').
     pub fn is_admin(&self) -> bool {
         self.binding_admin
-    }
-
-    /// True if this context may write rc lifecycle scripts under `/etc/rc`
-    /// via the file tools.
-    pub fn is_rc_write(&self) -> bool {
-        self.binding_rc_write
     }
 
     /// True if this binding grants `facade` — directly or via `facade:*`.
@@ -380,7 +361,6 @@ impl ContextToolBinding {
             Capability::AllInstances => self.all_instances,
             Capability::AllFacades => self.all_facades,
             Capability::Admin => self.binding_admin,
-            Capability::RcWrite => self.binding_rc_write,
             // Authority caps are explicit and **not** implied by `*`: a broad
             // loadout never silently self-drives/forks/merges. Checked against
             // the normalized set, never a flag.
@@ -426,7 +406,6 @@ impl ContextToolBinding {
             Capability::AllInstances => self.all_instances = true,
             Capability::AllFacades => self.all_facades = true,
             Capability::Admin => self.binding_admin = true,
-            Capability::RcWrite => self.binding_rc_write = true,
             c @ (Capability::Drive
             | Capability::Fork
             | Capability::Drift
@@ -477,7 +456,6 @@ impl ContextToolBinding {
             Capability::AllInstances => self.all_instances = false,
             Capability::AllFacades => self.all_facades = false,
             Capability::Admin => self.binding_admin = false,
-            Capability::RcWrite => self.binding_rc_write = false,
             Capability::Drive
             | Capability::Fork
             | Capability::Drift
@@ -594,12 +572,6 @@ mod tests {
         assert!(!b.is_admin(), "all_instances must NOT imply admin");
         // And "*" does not grant facades.
         assert!(!b.allows(&Capability::Facade("shell".into())));
-        // Nor rc-write: a broad loadout (coder) must not be able to clobber
-        // a privileged /etc/rc script by accident.
-        assert!(
-            !b.allows(&Capability::RcWrite),
-            "all_instances must NOT imply rc-write"
-        );
     }
 
     #[test]
@@ -657,33 +629,13 @@ mod tests {
     }
 
     #[test]
-    fn rc_write_is_a_dedicated_grant() {
-        // Even a maximally-broad loadout doesn't imply rc-write...
-        let mut b = ContextToolBinding::new();
-        b.grant(Capability::AllInstances);
-        b.grant(Capability::AllFacades);
-        b.grant(Capability::Admin);
-        assert!(!b.allows(&Capability::RcWrite), "broad loadout ≠ rc-write");
-        assert!(!b.is_rc_write());
-        // ...but an explicit grant does, and revoke is surgical.
-        b.grant(Capability::RcWrite);
-        assert!(b.allows(&Capability::RcWrite));
-        assert!(b.is_rc_write());
-        b.revoke_cap(&Capability::RcWrite);
-        assert!(!b.is_rc_write());
-        // Revoking rc-write left the other broad grants intact.
-        assert!(b.allows(&Capability::AllInstances) && b.is_admin());
-    }
-
-    #[test]
     fn authority_caps_are_explicit_and_not_implied_by_star() {
-        // The whole point: a broad loadout ("*" + "facade:*" + admin + rc-write)
+        // The whole point: a broad loadout ("*" + "facade:*" + admin)
         // must NOT silently grant any kj authority verb.
         let mut b = ContextToolBinding::new();
         b.grant(Capability::AllInstances);
         b.grant(Capability::AllFacades);
         b.grant(Capability::Admin);
-        b.grant(Capability::RcWrite);
         for cap in [
             Capability::Drive,
             Capability::Fork,
