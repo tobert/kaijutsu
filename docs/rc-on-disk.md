@@ -1,9 +1,17 @@
 # Config on disk — melting the kernel-owned trees to real files
 
-**Status: slice 1 in progress (2026-08-28).** Amy ruled the shape on
-2026-08-21. Production now mounts `/etc/rc` from a host directory;
-`/etc/config`, `/etc/client` and `/etc/midi` are still documents, so
+**Status: slices 1 and 5 shipped; 2, 3 and 4 open (2026-08-29).** Amy ruled
+the shape on 2026-08-21. Production mounts `/etc/rc` from a host directory
+and hook bodies are path references read at fire time. `/etc/config`,
+`/etc/client` and `/etc/midi` are still documents, so
 `docs/config-ownership.md` still describes those three.
+
+**Reseeding is routine, not a rescue** (Amy, 2026-08-29): *"my rc is in the
+code ... for the foreseeable future, we will reseed regularly."* So the host
+tree is a materialization of the in-repo seed, and `kaijutsu-server rc reseed
+--force` is an ordinary operation to design around. The snowflake TOML under
+`/etc/config` is the opposite case — local, secret-bearing, never reseeded
+over — which is one more reason the four roots do not all melt the same way.
 
 **Amy ruled the git question on 2026-08-28: plain files, the kernel never
 runs git.** `crates/kaijutsu-configgit` — Lane B's write half in
@@ -30,10 +38,31 @@ approval ledger's content-addressed store. Git is optional and unmanaged by us.
    script_bodies(sha256)` already exists and already dedupes by content. It
    stays. A hash nothing can resolve is a hash of nothing: git answers only for
    committed edits, and the record earns its place on the uncommitted one.
-3. **`rc-write` is dropped.** Its justification was that rc is executable
-   rather than data. Once rc is a directory the file tools reach, there is no
-   chokepoint left for the capability to sit on, and keeping it would be a gate
-   that gates nothing.
+3. **`rc-write` is dropped**, and not because it stopped working. The guard
+   is path-based — `is_rc_path` plus a loadout check (`file_tools/guard.rs`) —
+   so it sits above `VfsOps` and works identically over a `LocalBackend`
+   mount. An earlier draft of this decision claimed the melt left "no
+   chokepoint for the capability to sit on"; that was wrong, and it is
+   corrected here rather than quietly deleted, because the ruling was made on
+   other grounds and should not appear to rest on a false one.
+
+   The real reason is that the capability stopped naming a real distinction.
+   `rc-write` existed to say rc is executable and config is data, so the two
+   deserve different write surfaces. Once both are host files under
+   `~/.config/kaijutsu/etc/`, a player edits rc the way it edits anything —
+   the file tools, the editor, `vim` on the host, an sftp client, git. The
+   loadout check covers exactly one of those paths, so what it delivers is
+   not "rc is protected" but "rc is protected from the one player who
+   announced itself." An ergonomic nudge that a `vim` in the next terminal
+   walks past is not a nudge; it is a false reading of the system that costs
+   a capability to maintain.
+
+   What replaces it is what the melt made available: rc is a directory, so a
+   mistaken edit is visible in `git diff` and undone by `git checkout` — a
+   better answer than a denial, because it is recoverable *and* legible after
+   the fact, and the ledger already records what actually ran
+   (`rc_run_scripts.body_sha256`). Prefer deleting a mechanism to
+   generalizing it.
 4. **Hooks follow rc onto disk.** A hook body becomes a path read at call time,
    not a body snapshotted at install time, with the same digest recorded per
    call.
@@ -65,7 +94,7 @@ one most tests run on.
    `ensure_rc_seed_files`, delete the rc half of `ConfigDocFs`. Symlinks become
    real symlinks, which retires `DocKind::Symlink` for rc and the `read_all`
    symlink-sizing override.
-2. **Drop `rc-write`.** 58 hits across 14 files, mechanical: `kaijutsu-types/
+2. **Drop `rc-write`.** Mechanical, across: `kaijutsu-types/
    src/paths.rs`, `file_tools/{path,guard}.rs`, `kj/{rc,config,binding,editor,
    mod}.rs`, `mcp/binding.rs`, `runtime/config_doc_fs.rs`, `kernel_db.rs`,
    `kaijutsu-server/src/{rpc,sftp}.rs`, `tests/rc_role_bindings.rs`.
