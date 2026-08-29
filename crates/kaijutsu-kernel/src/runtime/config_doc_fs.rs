@@ -1157,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn symlink_read_follows_to_target() {
         let fs = fs();
-        fs.write_all(p("lib/create/binding.kai"), b"allow rc-write")
+        fs.write_all(p("lib/create/binding.kai"), b"allow drive")
             .await
             .unwrap();
         fs.symlink(
@@ -1169,7 +1169,7 @@ mod tests {
 
         // read auto-follows the link to the target's bytes.
         let got = fs.read_all(p("coder/create/S10-binding.kai")).await.unwrap();
-        assert_eq!(got, b"allow rc-write");
+        assert_eq!(got, b"allow drive");
 
         // readlink returns the raw stored target, unresolved.
         let target = fs.readlink(p("coder/create/S10-binding.kai")).await.unwrap();
