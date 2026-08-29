@@ -854,6 +854,24 @@ pub fn find_redeemable(
     Ok(None)
 }
 
+/// When an ask's answer was consumed, or `None` while it is still unspent.
+/// Milliseconds since the unix epoch, like every other `*_at` in this schema.
+///
+/// The read side of `approval_redemptions`, and the reason to have one:
+/// without it, `allowed` and `allowed but already spent` are
+/// indistinguishable from outside the ledger, so a caller that minted a
+/// second ask instead of redeeming the first reads exactly like one whose
+/// answer never arrived.
+pub fn redeemed_at(conn: &Connection, request_id: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT redeemed_at FROM approval_redemptions WHERE request_id = ?1",
+        params![request_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(LedgerError::from)
+}
+
 /// One answered ask nobody has collected yet.
 pub struct UndeliveredAnswer {
     pub request_id: String,
@@ -1500,6 +1518,41 @@ mod tests {
             find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None).unwrap(),
             None,
             "an already-redeemed ask must not be found again"
+        );
+    }
+
+    /// The redemption state an outside reader can actually observe: an
+    /// answered ask reports no redemption until one is taken, and reports
+    /// the stamp the moment it is. `find_redeemable` already refuses a
+    /// spent ask, but it refuses an absent one identically — this is the
+    /// only way to tell those apart without reading the table directly.
+    ///
+    /// Falsified by returning `Ok(None)` unconditionally from
+    /// `redeemed_at`: the post-redemption `expect` then panics. Reverted
+    /// afterward.
+    #[test]
+    fn redeemed_at_is_none_until_the_answer_is_spent() {
+        let conn = open_memory();
+        let ask = ask_with_statement("ra-digest", VarBinding::Bound, "rm target");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        allow(&conn, &request_id);
+
+        assert_eq!(
+            redeemed_at(&conn, &request_id).unwrap(),
+            None,
+            "an answered but unspent ask must report no redemption"
+        );
+
+        assert!(crate::decide::redeem_ask(&conn, &request_id).unwrap());
+        let at = redeemed_at(&conn, &request_id)
+            .unwrap()
+            .expect("a spent ask must report when its answer was consumed");
+        assert!(at > 0, "redeemed_at is a unix-epoch millisecond stamp, got {at}");
+
+        assert_eq!(
+            redeemed_at(&conn, "no-such-ask").unwrap(),
+            None,
+            "an unknown request is unspent, not an error"
         );
     }
 

@@ -38,7 +38,7 @@
 use approval_ledger::error::LedgerError;
 use approval_ledger::types::{ApprovalStatus, NewAsk, NewSignal, Origin, RuleScope, SignalSourceKind, SignalVerdict};
 use clap::{Parser, Subcommand};
-use kaijutsu_types::{ContentType, ContextId};
+use kaijutsu_types::{ContentType, ContextId, PrincipalId};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use super::{clap_help_for, refs, KjCaller, KjDispatcher, KjResult};
@@ -296,8 +296,10 @@ enum LedgerCommand {
         #[arg(long)]
         signals: bool,
     },
-    /// Show one ask in full, including the statement being authorized.
-    /// Works for a decided ask as well as a pending one.
+    /// Show one ask in full, including the statement being authorized, the
+    /// context and principal that raised it, and — once it is decided —
+    /// whether its answer has already been spent. Works for a decided ask
+    /// as well as a pending one.
     Show {
         /// The ask to show. Request ids come from `kj ledger list`.
         request_id: String,
@@ -664,6 +666,13 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
+    /// Render a stored id blob, saying so when it does not parse. A
+    /// malformed id here is a defect in whatever wrote the row, and `-`
+    /// would read as "absent" — which these columns never are.
+    fn ledger_id_display(parsed: Option<String>, raw: &[u8]) -> String {
+        parsed.unwrap_or_else(|| format!("<malformed {}-byte id>", raw.len()))
+    }
+
     fn ledger_show(&self, request_id: &str, show_signals: bool) -> KjResult {
         let db = self.kernel_db.lock();
         let conn = db.conn_for_ledger();
@@ -676,6 +685,10 @@ impl KjDispatcher {
         };
         let statements = match approval_ledger::ask::load_ask_statements(conn, request_id) {
             Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+        };
+        let redeemed_at = match approval_ledger::ask::redeemed_at(conn, request_id) {
+            Ok(at) => at,
             Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
         };
         let signal_rows = if show_signals {
@@ -697,6 +710,13 @@ impl KjDispatcher {
                 row.tool.as_deref().unwrap_or("-")
             ),
             format!("label:      {}", row.authorized_label.as_deref().unwrap_or("-")),
+            // `context` and `principal` are two thirds of what
+            // `find_redeemable` matches on, and the only reason to print
+            // them here: an answered ask that mints a second ask instead of
+            // redeeming has one of them differing, and no other verb shows
+            // either.
+            format!("context:    {}", Self::ledger_id_display(ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()), &row.context_id)),
+            format!("principal:  {}", Self::ledger_id_display(PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()), &row.principal_id)),
             format!("description: {}", row.description),
         ];
         for s in &statements {
@@ -707,6 +727,14 @@ impl KjDispatcher {
         }
         if let Some(reason) = &row.auto_reason {
             lines.push(format!("auto:       {reason}"));
+        }
+        // Only a decided ask can be spent, so `redeemed: no` on a pending
+        // one would state a fact about a question nobody has answered.
+        if matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied) {
+            match redeemed_at {
+                Some(at) => lines.push(format!("redeemed:   {at}")),
+                None => lines.push("redeemed:   no — this answer is still redeemable".into()),
+            }
         }
         if show_signals {
             for s in &signal_rows {
@@ -738,6 +766,8 @@ impl KjDispatcher {
         let mut data = serde_json::json!({
             "request_id": row.request_id,
             "context_id": ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()),
+            "principal_id": PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()),
+            "redeemed_at": redeemed_at,
             "status": row.status.to_string(),
             "origin": row.origin.to_string(),
             "instance": row.instance,
@@ -1564,6 +1594,90 @@ mod tests {
         d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat())
             .await;
         let _ = gate.await;
+    }
+
+    /// `show` reports the two identity fields redemption turns on, and
+    /// whether the answer has been spent. `find_redeemable` matches on
+    /// `principal_id` and `context_id`; until this landed, neither was
+    /// printed anywhere, so an answered ask that minted a SECOND ask
+    /// instead of redeeming looked identical to one nobody had answered.
+    ///
+    /// The three-phase walk is the point: pending (no redemption line at
+    /// all — nothing has been answered), answered-and-unspent, and spent.
+    ///
+    /// Falsified by dropping the `principal:` line, and separately by
+    /// making the spent phase's line unconditional — the pending assertion
+    /// then trips. Reverted afterward.
+    #[tokio::test]
+    async fn ledger_show_reports_the_principal_and_whether_the_answer_is_spent() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let first = gate_once(&d, &c, spec()).await;
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+
+        let show = |id: String| {
+            let d = &d;
+            let c = &c;
+            async move { d.dispatch(&[s("ledger"), s("show"), s(&id)], c).await }
+        };
+
+        let pending = show(request_id.clone()).await;
+        assert!(pending.is_ok(), "{pending:?}");
+        let msg = pending.message().to_string();
+        assert!(
+            msg.contains(&format!("principal:  {}", c.principal_id)),
+            "show must name the principal that raised the ask: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("context:    {}", c.context_id.expect("the test caller has a context"))),
+            "show must name the context the ask belongs to: {msg}"
+        );
+        assert!(
+            !msg.contains("redeemed:"),
+            "a pending ask has no answer to spend, so it must claim nothing about redemption: {msg}"
+        );
+
+        let allowed = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat())
+            .await;
+        assert!(allowed.is_ok(), "{allowed:?}");
+
+        let unspent = show(request_id.clone()).await;
+        assert!(
+            unspent.message().contains("redeemed:   no"),
+            "an answered ask nobody has collected must say so: {}",
+            unspent.message()
+        );
+        let data = match &unspent {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger show must emit structured data: {other:?}"),
+        };
+        assert_eq!(
+            data["principal_id"].as_str(),
+            Some(c.principal_id.to_string().as_str()),
+            "{data}"
+        );
+        assert!(data["redeemed_at"].is_null(), "an unspent answer has no redemption stamp: {data}");
+
+        // The retry collects the answer; that is what makes it spent.
+        let second = gate_once(&d, &c, spec()).await;
+        assert!(second.allowed(), "the stored answer must authorize the retry");
+
+        let spent = show(request_id).await;
+        let msg = spent.message().to_string();
+        assert!(
+            msg.contains("redeemed:") && !msg.contains("redeemed:   no"),
+            "a collected answer must report its redemption stamp: {msg}"
+        );
+        let data = match &spent {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger show must emit structured data: {other:?}"),
+        };
+        assert!(
+            data["redeemed_at"].as_i64().is_some_and(|at| at > 0),
+            "redeemed_at is a unix-epoch millisecond stamp: {data}"
+        );
     }
 
     /// Both decision verbs report themselves in correct English. The `deny`

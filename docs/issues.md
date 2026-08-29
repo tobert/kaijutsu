@@ -45,17 +45,23 @@ not evidence: `lfm2d` had scored it `situation-normal 0.718, verdict
 escalate`, a borderline call that can flip to allow on a second run, which
 explains the observation without any redemption occurring.
 
-**First diagnostic step, and it needs no gate budget:** make the principal
-observable. `kj ledger show` prints `context_id` in its `.data` payload and
-not `principal_id`; adding it is small, and it either confirms this in one
-command or eliminates it and forces the next hypothesis. A ledger surface
-that cannot show the field its own matching turns on is the reason this took
-an afternoon to narrow rather than a minute.
+**The diagnostic surface now exists — the bug does not have an answer yet.**
+`kj ledger show` prints `context:`, `principal:` and, for a decided ask,
+`redeemed:` (a stamp, or `no — this answer is still redeemable`); `.data`
+gains `principal_id` and `redeemed_at`. `approval_ledger::ask::redeemed_at`
+is the read side of `approval_redemptions`, which had none.
 
-Second step, if principal matches: no `kj` verb reports whether an ask has
-been redeemed. `approval_redemptions` is invisible from the CLI, so
-"allowed" and "allowed and already spent" read identically. That gap is worth
-closing on its own merits.
+**What to run next, on the live kernel, and it needs no gate budget:**
+
+```sh
+kj ledger show 01a04eaa-6a9c-79a1-be4d-d58cbd28384a   # the allowed original
+kj ledger show 01a04eb6-fb75-78e0-a8ed-55ee43a02fff   # the pending duplicate it minted
+```
+
+Two decided-and-unspent asks and one pending one are being kept as evidence.
+Compare `principal:` across the pair. Equal principals eliminate the leading
+hypothesis and force the next one; different principals confirm it, and the
+question becomes why the MCP session's principal moved across a restart.
 
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
