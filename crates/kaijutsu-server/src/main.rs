@@ -17,6 +17,10 @@
 //!
 //! # rc scripts (no running kernel needed)
 //! kaijutsu-server rc reseed [--force] [--dir <path>]
+//!
+//! `rc reseed` installs anything absent and NAMES anything present that
+//! differs from its embedded default, leaving it alone; `--force` overwrites
+//! those instead.
 //! ```
 
 use std::env;
@@ -43,7 +47,10 @@ COMMANDS:
     list-keys [username]          List keys (all or for a specific user)
     import <file>                 Import keys from authorized_keys file
     set-nick <old> <new>          Rename a user
-    rc reseed [--force] [--dir D] Install embedded rc scripts into the rc tree
+    rc reseed [--force] [--dir D] Install embedded rc scripts into the rc tree.
+                                  Names any script that differs from its
+                                  default and leaves it alone; --force
+                                  overwrites those.
 
 OPTIONS:
     --port <PORT>                 SSH port (default: {port})
@@ -59,8 +66,9 @@ EXAMPLES:
     kaijutsu-server list-keys amy
     kaijutsu-server set-nick xyz789ab amy
     kaijutsu-server remove-user olduser
-    kaijutsu-server rc reseed                 # install anything missing
-    kaijutsu-server rc reseed --force         # also restore edited scripts
+    kaijutsu-server rc reseed                 # install anything missing, name what differs
+    kaijutsu-server rc reseed --force         # also overwrite what differs
+    kaijutsu-server rc reseed --dir ./rc      # seed a directory of your choosing
 
 DATABASE:
     Keys are stored in: {db_path}
@@ -184,10 +192,20 @@ fn cmd_rc(args: &[String]) -> ExitCode {
                 root.display(),
                 r.written,
                 r.replaced,
-                r.skipped
+                r.unchanged
             );
-            if !force && r.skipped > 0 {
-                println!("Pass --force to restore scripts that differ from their defaults.");
+            // Name what was left alone, never just count it. A tree pointed
+            // at a checkout reports every entry here, which is the signal
+            // that the root is not where you thought it was.
+            if !r.diverged.is_empty() {
+                println!(
+                    "\n{} file(s) differ from their defaults and were left alone:",
+                    r.diverged.len()
+                );
+                for path in &r.diverged {
+                    println!("  {path}");
+                }
+                println!("\nPass --force to overwrite them with the embedded defaults.");
             }
             ExitCode::SUCCESS
         }

@@ -134,15 +134,25 @@ pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
 }
 
 /// What one reseed did, per entry in the embedded set.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RcSeedReport {
     /// Entries that were absent and are now installed.
     pub written: usize,
     /// Entries that existed, differed from their seed, and were replaced.
     /// Always 0 without `force`.
     pub replaced: usize,
-    /// Entries left as they are.
-    pub skipped: usize,
+    /// Entries already identical to their embedded seed. Nothing to do.
+    pub unchanged: usize,
+    /// Paths, relative to the rc root, that exist and differ from their
+    /// embedded seed and were left alone. Always empty with `force`, where
+    /// the same entries are counted in `replaced` instead.
+    ///
+    /// Named rather than counted on purpose: presence and agreement are
+    /// different facts, and a count folds them together. A caller that only
+    /// learns "73 left alone" cannot tell a pristine tree from 73 edits —
+    /// which is exactly the question worth answering when an rc root is
+    /// pointed somewhere other than its default.
+    pub diverged: Vec<String>,
 }
 
 /// Write the embedded seed tree into `root` (the host directory mounted at
@@ -150,7 +160,11 @@ pub struct RcSeedReport {
 ///
 /// Without `force` this is install-if-absent: an entry that exists is left
 /// alone, so an edit survives and a script you removed stays removed. That is
-/// the bootstrap the server runs on a fresh tree.
+/// the bootstrap the server runs on a fresh tree. It still *compares* every
+/// entry it leaves alone, and names the ones that differ from their seed in
+/// [`RcSeedReport::diverged`] — leaving a file alone silently and leaving it
+/// alone loudly cost the same, and only one of them tells you your rc root
+/// is not what you thought.
 ///
 /// With `force` an entry whose content differs from its embedded seed is
 /// replaced, and a removed one comes back. A composed seed is restored **as a
@@ -182,12 +196,16 @@ pub fn reseed_rc_files(
         // and be created twice.
         let present = std::fs::symlink_metadata(&dest).is_ok();
         if present {
-            if !force {
-                report.skipped += 1;
+            // Compare before consulting `force`: whether the entry agrees
+            // with its seed is worth reporting either way, and only the
+            // decision about what to DO with a disagreement depends on the
+            // flag.
+            if seed_entry_matches(&dest, path, content, &known) {
+                report.unchanged += 1;
                 continue;
             }
-            if seed_entry_matches(&dest, path, content, &known) {
-                report.skipped += 1;
+            if !force {
+                report.diverged.push(rel.to_string());
                 continue;
             }
             // Remove and recreate rather than write through: a composed seed
@@ -360,6 +378,54 @@ mod tests {
             "# mine\n",
             "an edit survives a non-forced reseed"
         );
+    }
+
+    /// A non-forced reseed must NAME what it left alone, not just count it.
+    ///
+    /// Presence and agreement are different facts, and reporting only the
+    /// count conflates them: seventy-three files matching their seed and
+    /// seventy-three hand-edits print the same line. Naming the divergent
+    /// ones is what makes an rc tree pointed at a checkout obvious instead
+    /// of silent.
+    ///
+    /// Falsified by reporting presence without comparing (the shape this
+    /// replaced): `diverged` comes back empty and `unchanged` counts the
+    /// edited file. Reverted afterward.
+    #[test]
+    fn reseed_without_force_names_the_files_it_left_alone() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        std::fs::write(root.join("lib/create/S20-cache.kai"), "# mine\n").expect("diverge");
+
+        let report = reseed_rc_files(root, false).expect("reseed");
+        assert_eq!(
+            report.diverged,
+            vec!["lib/create/S20-cache.kai".to_string()],
+            "the one edited script must be named, not folded into a count"
+        );
+        assert!(report.unchanged > 0, "the rest of the tree still matches its seed");
+        assert_eq!(report.replaced, 0, "naming is not overwriting");
+
+        // And with --force the same entry moves from `diverged` to `replaced`.
+        let forced = reseed_rc_files(root, true).expect("forced reseed");
+        assert!(forced.diverged.is_empty(), "force leaves nothing merely reported");
+        assert_eq!(forced.replaced, 1, "the named file is the one overwritten");
+    }
+
+    /// An untouched tree reports no divergence at all — the quiet case has to
+    /// stay quiet, or the warning is noise and gets ignored.
+    #[test]
+    fn reseed_on_an_untouched_tree_names_nothing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        let report = reseed_rc_files(root, false).expect("reseed");
+        assert!(report.diverged.is_empty(), "a pristine tree diverges nowhere: {report:?}");
+        assert_eq!(report.written, 0, "nothing is absent");
+        assert!(report.unchanged > 0, "every entry matched");
     }
 
     #[test]
