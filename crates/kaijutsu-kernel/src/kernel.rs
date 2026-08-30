@@ -1472,9 +1472,8 @@ impl Kernel {
         // fulfilled below: the async fetch happens *outside* the lock, so the
         // `!Send` `EditorCore` never crosses an await (the `SendSessions`
         // invariant); only the fetched `String` does.
-        let (path, file_path, outcome, io, io_cursor, io_opener) = {
+        let (file_path, outcome, io, io_cursor, io_opener) = {
             let mut sessions = self.editor_sessions.lock();
-            let path = sessions.0.session_path(id);
             // Captured now (session still exists) — `Closed` outcomes below
             // drop the session before the kernel ever sees it again.
             let file_path = sessions.0.session_path(id);
@@ -1491,7 +1490,7 @@ impl Kernel {
             // The opener context, captured at submit too — `:r !cmd` shells out
             // in it (the caller's context/capabilities, not the edited block's).
             let io_opener = io.as_ref().and_then(|_| sessions.0.session_opener(id));
-            (path, file_path, outcome, io, io_cursor, io_opener)
+            (file_path, outcome, io, io_cursor, io_opener)
         };
 
         // Fulfill a `:r` read: fetch the content, then splice it at the cursor
@@ -1510,11 +1509,6 @@ impl Kernel {
                         let mut sessions = self.editor_sessions.lock();
                         sessions.0.insert_text(id, &content, at, blocks)?
                     };
-                    // The block changed; drop the file-cache shadow of the
-                    // *edited* path.
-                    if let Some(path) = path.as_deref() {
-                        self.invalidate_config_file_cache(path);
-                    }
                     state
                 }
                 Err(msg) => {
@@ -1535,11 +1529,12 @@ impl Kernel {
             return Ok(state);
         }
 
-        // The mirror (and any ZZ/ZQ rollback) wrote the block; drop the file
-        // cache's now-stale shadow so a kaish `cat` re-reads fresh.
-        if let Some(path) = path.as_deref() {
-            self.invalidate_config_file_cache(path);
-        }
+        // No cache invalidation here. An editor edit lands *through* the
+        // file cache, so the cached entry is the authority, not a stale
+        // shadow of one — and `invalidate_document` deletes the backing
+        // document, taking an unflushed edit with it. Invalidation is for
+        // writes that bypass the cache (`kj rc add/rm`, `kj config reset`);
+        // see `invalidate_config_file_cache`.
         match outcome {
             crate::editor::KeysOutcome::Updated(update) => {
                 let mut state = update.state;
@@ -1799,12 +1794,11 @@ impl Kernel {
     /// of them. Only fires when the block genuinely changed — a no-op
     /// rollback must not spuriously dirty an already-clean entry.
     pub fn editor_quit(&self, id: crate::editor::EditorSessionId) -> Result<(), String> {
-        let (path, file_path, rolled_back) = {
+        let (file_path, rolled_back) = {
             let mut sessions = self.editor_sessions.lock();
-            let path = sessions.0.session_path(id);
-            let file_path = path.clone();
+            let file_path = sessions.0.session_path(id);
             let rolled_back = sessions.0.quit(id, self.blocks())?;
-            (path, file_path, rolled_back)
+            (file_path, rolled_back)
         };
         let mark_err = if rolled_back
             && let Some(fp) = file_path.as_deref()
@@ -1822,10 +1816,10 @@ impl Kernel {
         if let Some(fp) = file_path.as_deref() {
             self.file_cache.unpin(fp);
         }
-        // The rollback wrote the block; drop the file cache's stale shadow.
-        if let Some(path) = path.as_deref() {
-            self.invalidate_config_file_cache(path);
-        }
+        // Deliberately no cache invalidation — see `editor_keys`. The
+        // unpin above is what used to let it through: `invalidate_document`
+        // then deleted the document that had just received the rollback,
+        // while the `dirty_file_buffers` row survived pointing at it.
         self.editor_flows.publish(crate::flows::EditorFlow::Closed {
             session_id: id.as_u64(),
         });

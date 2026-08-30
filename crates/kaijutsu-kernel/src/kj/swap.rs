@@ -191,6 +191,16 @@ mod tests {
         d
     }
 
+    /// A config-tree mount, so tests can exercise the `is_config_doc_root`
+    /// branch that `/tmp` paths never reach.
+    async fn test_dispatcher_with_config() -> KjDispatcher {
+        let d = test_dispatcher().await;
+        d.kernel()
+            .mount(kaijutsu_types::paths::CONFIG_ROOT, MemoryBackend::new())
+            .await;
+        d
+    }
+
     async fn write_disk(d: &KjDispatcher, path: &str, content: &str) {
         d.kernel()
             .vfs()
@@ -495,6 +505,91 @@ mod tests {
             "unsaved-edit",
             "the ZQ'd-away edit must be flushable to disk, not stuck \
              behind a stale clean flag from the earlier ack"
+        );
+    }
+
+    /// The same `ZQ`-rollback contract as
+    /// `ack_then_zq_marks_dirty_so_the_discarded_rollback_still_reaches_disk`,
+    /// on a **config** path. That test runs on `/tmp`, so it never reached
+    /// the `is_config_doc_root` branch — and the two paths diverged there.
+    ///
+    /// `editor_quit` marks the entry dirty (recording the swap), **unpins**,
+    /// and then invalidated the config file cache. The unpin is what made
+    /// that call succeed: `invalidate_document` deletes the backing shadow
+    /// document — the one that just received the rollback — while the
+    /// `dirty_file_buffers` row survives in its own table, pointing at a
+    /// document that no longer exists. The next read served pre-rollback
+    /// disk bytes and the rolled-back content was gone.
+    ///
+    /// An editor edit is not a cache-bypassing write: it lands *through* the
+    /// cache. Invalidating there discards the authority instead of a stale
+    /// shadow. Falsify by restoring the `invalidate_config_file_cache` call
+    /// in `editor_quit`.
+    #[tokio::test]
+    async fn zq_on_a_config_path_keeps_the_rollback_recoverable() {
+        let d = test_dispatcher_with_config().await;
+        let c = test_caller();
+        let path = &kaijutsu_types::paths::config_path("system.md");
+
+        // Same setup as the /tmp test: make disk diverge from the
+        // checkpoint, so "we deleted the rollback and reloaded from disk"
+        // and "the rollback survived" are different answers. Without this
+        // divergence the bug is invisible — the first draft of this test
+        // rolled back to content that already matched disk and passed
+        // against the broken code.
+        write_disk(&d, path, "disk-v1").await;
+        dirty_then_go_cold(&d, path, "unsaved-edit").await;
+
+        let (id, st) = d.kernel().editor_open(path).await.unwrap();
+        assert_eq!(st.text, "unsaved-edit", "opens against the recovered swap");
+        d.kernel().editor_keys(id, "iMORE<Esc>").await.unwrap();
+
+        // `ack` flushes the *edited* buffer to disk and clears the row.
+        let acked = d.dispatch(&[s("swap"), s("ack"), s(path)], &c).await;
+        assert!(acked.is_ok(), "ack must succeed: {acked:?}");
+
+        // ZQ discards that edit: the block rolls back to "unsaved-edit",
+        // while disk holds "MOREunsaved-edit".
+        d.kernel().editor_quit(id).unwrap();
+
+        // The rolled-back content must still be readable. Before the fix
+        // this served "MOREunsaved-edit" — the pre-rollback disk bytes —
+        // because `invalidate_document` had deleted the document that just
+        // received the rollback.
+        assert_eq!(
+            d.kernel().file_cache().try_read_content(path).await.unwrap(),
+            "unsaved-edit",
+            "the rollback content must survive ZQ on a config path, not be \
+             replaced by a reload of pre-rollback disk bytes"
+        );
+
+        // And it must be recoverable as a swap: the row and the document it
+        // points at have to agree. A row whose document was deleted is the
+        // data-loss shape (`docs/file-buffers.md` rule 2).
+        assert!(
+            d.kernel()
+                .kernel_db()
+                .lock()
+                .get_dirty_file_buffer(path)
+                .unwrap()
+                .is_some(),
+            "a content-changing ZQ rollback must leave a recoverable swap row"
+        );
+
+        // The marking must be real, not cosmetic — a flush now reaches disk
+        // with the rolled-back content.
+        d.kernel().file_cache().flush_one(path).await.unwrap();
+        assert_eq!(
+            String::from_utf8(
+                d.kernel()
+                    .vfs()
+                    .read_all(std::path::Path::new(path))
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            "unsaved-edit",
+            "the ZQ'd-away rollback must be flushable on a config path too"
         );
     }
 
