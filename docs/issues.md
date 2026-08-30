@@ -103,8 +103,9 @@ file tools reproduce the defaulting or the policy is gone too, and the doc
 cannot be fixed by renaming a command; someone has to decide which.
 
 Found by the docs sweep for the rc melt's slice 3, which correctly declined to
-guess. It belongs to the config half of the melt, not the rc half — file it
-against whoever picks up `/etc/config`.
+guess. It belongs to the config half of the melt — `docs/config-namespace.md`,
+which moves these roots under `/config` and deletes `ConfigDocFs`. Answer the
+per-client write-target question there, since that melt has to answer it anyway.
 
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 

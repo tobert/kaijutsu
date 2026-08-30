@@ -86,8 +86,14 @@ driver it was in the first draft (see "Capability").
 6. **Don't make the front door the firehose.** You never `ls -R /sys`. Living under
    `/v` (a deliberate destination a project crawler never wanders into) is what lets
    `/v/ctx` hold *all* contexts safely.
-7. **Resist the `/proc` junk-drawer.** `/v/ctx` is *only* the context/block model;
-   `/v/session` is *only* live participants. Config stays at `/etc/config`.
+7. **Resist the `/proc` junk-drawer.** Each `/v` root is one thing. `/v/ctx` is
+   *only* the context/block model; `/v/session` is *only* live participants.
+   Neither is a place to put something that did not fit elsewhere. **Config is
+   not under `/v` at all** — it lives at `/config`, a sibling top-level tree
+   (`docs/config-namespace.md`), because a config directory is an ordinary host
+   directory and `/v` is for what the kernel synthesizes. *(This principle read
+   "Config stays at `/etc/config`" until 2026-08-29; only the destination
+   changed, and it changed away from `/v`, not into it.)*
 8. **The ABI is forever.** Conservative names, additive-only; `json` absorbs new
    object fields and `index` appends columns (never reorders).
 9. **Hot vs cold reads.** A streaming block is "hot" — its `content` grows and
@@ -160,9 +166,13 @@ operation and serve *both* `getattr` (exact byte length) and `read`/`read_all` f
 that generation — never a placeholder size, which the default `read_all` would
 silently truncate to. Until then `kj cas ls` lists the pool for humans.
 
-**Known papercut:** kaish's overlay *reserves* `/v/cas`, so `kaish ls /v/cas`
-shows an **empty shadow** while SFTP serves the real pool — verify over stock `sftp`,
-not kaish (`docs/devlog.md`, July 2).
+**Fixed papercut:** kaish 0.11's overlay *reserved* every `/v/*` path, so
+`kaish ls /v/cas` showed an **empty shadow** while SFTP served the real pool.
+kaish 0.12 made `is_virtual_path` mount-coverage based, so an unclaimed `/v/*`
+path falls through to the embedder's backend. Pinned by
+`kaish_ls_and_cat_reach_the_real_cas_mount_at_v_cas`
+(`crates/kaijutsu-kernel/src/runtime/embedded_kaish.rs`) so a kaish bump cannot
+reintroduce it — which is also what makes new `/v` roots safe to add.
 
 Residual non-blockers: CAS garbage collection (`kj cas rm` is unconditional; nothing
 refcounts object references from clip records — a kernel CAS concern; content-addressed

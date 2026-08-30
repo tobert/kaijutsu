@@ -1,9 +1,17 @@
 # Kernel-Owned Config — Design
 
 **Scope note (2026-08-29):** this document now covers `/etc/config`,
-`/etc/client`, and `/etc/midi`. rc melted to host files under
-`~/.config/kaijutsu/etc/rc/` — `docs/rc-on-disk.md` is canonical for rc, and
-`kj rc edit`, `kj rc reset`, and `kj rc reseed` no longer exist.
+`/etc/client`, and `/etc/midi`. rc melted to host files —
+`docs/rc-on-disk.md` is canonical for rc, and `kj rc edit`, `kj rc reset`, and
+`kj rc reseed` no longer exist.
+
+**And this document is on its way out.** `docs/config-namespace.md` (ruled
+2026-08-29) melts these three roots too and moves all four under `/config`,
+where each root's host directory is a mount declaration rather than a
+compiled-in path. Its premise replaces this one: there *will* be a host file, and
+the kernel will not be the sole owner of the content. Read that first; what
+survives here is the history of why kernel ownership was tried and what it
+bought.
 
 The kernel is the **sole owner** of `/etc/config`, `/etc/client`, and
 `/etc/midi`. Embedded Rust source (compiled into the binary, visible in-repo)

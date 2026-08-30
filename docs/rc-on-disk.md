@@ -132,10 +132,17 @@ one most tests run on.
 
 ## All four roots, and `ConfigDocFs` goes away
 
+**Superseded 2026-08-29 by `docs/config-namespace.md`, which is canonical for
+the remaining three roots and for where all four end up.** What changed: the
+trees do not stay under `/etc`, and their host location stops being a
+compiled-in constant. They become `/config/rc`, `/config/midi`,
+`/config/client` and the base `/config`, each a well-known name whose host
+directory is a mount declaration. Squatting `/etc` cost a guard
+(`deny_etc_write`) that exists for no other reason.
+
 **Ruled 2026-08-21.** `ConfigDocFs` serves `/etc/rc`, `/etc/config`,
-`/etc/client` and `/etc/midi`. All four become host directories under
-`~/.config/kaijutsu/etc/`, and `ConfigDocFs` is deleted rather than left
-serving a shrinking set of roots.
+`/etc/client` and `/etc/midi`. All four become host directories, and
+`ConfigDocFs` is deleted rather than left serving a shrinking set of roots.
 
 rc is the one with executable semantics and a lifecycle, so it is the harder
 melt and the one this document details. The other three are plain data on a
