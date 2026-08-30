@@ -82,12 +82,6 @@ pub enum KernelDbError {
     /// inferred from message text. See `classify_document_insert_error`.
     #[error("document already exists: {0}")]
     DuplicateDocument(ContextId),
-
-    /// A *different* document already claims this `(workspace_id, path)`
-    /// (the `idx_documents_path` partial-unique conflict) — read back from
-    /// the DB, never inferred from message text.
-    #[error("path '{path}' is already claimed by document {existing}")]
-    DocumentPathConflict { path: String, existing: ContextId },
 }
 
 pub type KernelDbResult<T> = Result<T, KernelDbError>;
@@ -2380,9 +2374,9 @@ impl KernelDb {
     /// Classify an `insert_document` constraint-violation failure by READING
     /// THE DB BACK, never by inspecting the SQLite/kaijutsu error message
     /// text — `map_unique_violation` flattens every UNIQUE conflict into the
-    /// same `LabelConflict` string, which happened to make "document already
-    /// exists" and "path already claimed" indistinguishable except by luck of
-    /// wording (docs/issues.md:361).
+    /// same `LabelConflict` string, which used to make a benign PRIMARY KEY
+    /// duplicate indistinguishable from other constraint violations except by
+    /// luck of wording (docs/issues.md:361).
     ///
     /// FK violations (extended code 787) and anything that isn't a
     /// constraint violation delegate straight to `map_unique_violation`,
@@ -2408,40 +2402,9 @@ impl KernelDb {
             Ok(None) => {}
             Err(read_err) => return read_err,
         }
-        if let Some(path) = row.path.as_deref() {
-            match self.document_id_at_path(row.workspace_id, path) {
-                Ok(Some(existing)) => {
-                    return KernelDbError::DocumentPathConflict {
-                        path: path.to_string(),
-                        existing,
-                    };
-                }
-                Ok(None) => {}
-                Err(read_err) => return read_err,
-            }
-        }
-        // Neither read-back explains the failure — don't fabricate a
+        // The read-back doesn't explain the failure — don't fabricate a
         // classification, fall through to the existing generic mapping.
         map_unique_violation(e, "document already exists or path conflict")
-    }
-
-    /// The `document_id` occupying `(workspace_id, path)`, if any. Backs
-    /// `classify_document_insert_error`'s read-back classification of the
-    /// `idx_documents_path` partial-unique conflict.
-    pub fn document_id_at_path(
-        &self,
-        workspace_id: WorkspaceId,
-        path: &str,
-    ) -> KernelDbResult<Option<ContextId>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT document_id FROM documents WHERE workspace_id = ?1 AND path = ?2")?;
-        let mut rows = stmt.query(params![blob_param(workspace_id.as_bytes()), path])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(read_context_id(row, 0)?))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Insert a document, ignoring if it already exists (idempotent).
@@ -2507,24 +2470,6 @@ impl KernelDb {
              ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![kind.as_str()], row_to_document_row)?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// List documents whose `path` falls strictly *under* `dir` (i.e. matches
-    /// `<dir>/...`), ordered by path. This is the prefix-scan that backs
-    /// `readdir` for the kernel-owned config/rc backend: the `documents` table
-    /// *is* the path manifest (every path-carrying doc is one entry). `dir`
-    /// must not end in `/`; the exact `dir` row itself is excluded.
-    pub fn list_documents_under_path(&self, dir: &str) -> KernelDbResult<Vec<DocumentRow>> {
-        // SQLite LIKE: rc/config paths contain no `%`/`_`, so no ESCAPE needed.
-        let pattern = format!("{dir}/%");
-        let mut stmt = self.conn.prepare(
-            "SELECT document_id, workspace_id, doc_kind,
-                    language, path, created_at, created_by
-             FROM documents WHERE path LIKE ?1
-             ORDER BY path",
-        )?;
-        let rows = stmt.query_map(params![pattern], row_to_document_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -12001,47 +11946,7 @@ mod tests {
         }
     }
 
-    /// 2. Inserting a *different* document whose `(workspace_id, path)` is
-    ///    already claimed must classify as `DocumentPathConflict`, carrying the
-    ///    path and the id of the document that actually holds it.
-    #[test]
-    fn insert_document_path_conflict_is_typed_document_path_conflict() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-        let first_id = ContextId::new();
-        db.insert_document(&DocumentRow {
-            document_id: first_id,
-            workspace_id: ws_id,
-            doc_kind: DocKind::Conversation,
-            language: None,
-            path: Some("/config/rc/shared.kai".into()),
-            created_at: now_millis(),
-            created_by: PrincipalId::system(),
-        })
-        .unwrap();
-
-        let second_id = ContextId::new();
-        let err = db
-            .insert_document(&DocumentRow {
-                document_id: second_id,
-                workspace_id: ws_id,
-                doc_kind: DocKind::Conversation,
-                language: None,
-                path: Some("/config/rc/shared.kai".into()),
-                created_at: now_millis(),
-                created_by: PrincipalId::system(),
-            })
-            .unwrap_err();
-        match err {
-            KernelDbError::DocumentPathConflict { path, existing } => {
-                assert_eq!(path, "/config/rc/shared.kai");
-                assert_eq!(existing, first_id);
-            }
-            other => panic!("expected DocumentPathConflict, got: {other}"),
-        }
-    }
-
-    /// 3. Guard: `idx_documents_path` is a *partial* unique index
+    /// 2. Guard: `idx_documents_path` is a *partial* unique index
     ///    (`WHERE path IS NOT NULL`) — two documents with `path: None` in the
     ///    same workspace must both insert cleanly. If someone "fixes" the index
     ///    into a full unique index, this must fail loudly.
@@ -12063,7 +11968,7 @@ mod tests {
         }
     }
 
-    // 4. The existing FK-violation test (test 22, `fk_violation_is_validation_error`)
+    // 3. The existing FK-violation test (test 22, `fk_violation_is_validation_error`)
     // stays green — see that test above; not duplicated here.
 
     // ── Roster: schema-level invariants ─────────────────────────────────

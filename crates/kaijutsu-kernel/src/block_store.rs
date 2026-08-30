@@ -71,17 +71,12 @@ pub enum BlockStoreError {
     Validation(String),
 
     /// A DB row already exists at this `document_id`, but it does NOT match
-    /// the row `create_document`/`create_document_with_path` intended to
-    /// write (`doc_kind`, `workspace_id`, or `path` differ) — divergence
-    /// must never be silently "recovered" the way a genuine duplicate is.
-    /// See `insert_or_reconcile_document`.
+    /// the row `create_document` intended to write (`doc_kind`,
+    /// `workspace_id`, or `path` differ) — divergence must never be
+    /// silently "recovered" the way a genuine duplicate is. See
+    /// `insert_or_reconcile_document`.
     #[error("document {id} diverged from its persisted row: {detail}")]
     DocumentDiverged { id: ContextId, detail: String },
-
-    /// A *different* document already claims this `(workspace, path)` — a
-    /// hard error, never recovered.
-    #[error("path '{path}' is already claimed by document {existing}")]
-    DocumentPathConflict { path: String, existing: ContextId },
 }
 
 /// Result type alias for BlockStore operations.
@@ -343,10 +338,8 @@ impl BlockStore {
         *self.principal_id.write() = principal_id;
     }
 
-    /// Insert `row` via `db.insert_document`, reconciling the typed
-    /// conflict variants `create_document`/`create_document_with_path` can
-    /// see (docs/issues.md:361). Shared by both so the classification logic
-    /// exists exactly once.
+    /// Insert `row` via `db.insert_document`, reconciling the typed conflict
+    /// variant `create_document` can see (docs/issues.md:361).
     ///
     /// - `Ok(())` — inserted cleanly.
     /// - `DuplicateDocument` — a row already exists at this `document_id`.
@@ -356,8 +349,6 @@ impl BlockStore {
     ///   logged but not divergence). Any of those three differing — or the
     ///   row vanishing between the insert and the read-back — is
     ///   `DocumentDiverged`, which must NOT be silently recovered.
-    /// - `DocumentPathConflict` — a *different* document already claims this
-    ///   path. Always a hard error.
     /// - anything else — wrapped as `BlockStoreError::Db`, as before.
     fn insert_or_reconcile_document(db: &KernelDb, row: &DocumentRow) -> BlockStoreResult<()> {
         match db.insert_document(row) {
@@ -412,9 +403,6 @@ impl BlockStore {
                 tracing::warn!(context_id = %id.to_hex(), "Document already in DB but not in memory, recovering");
                 Ok(())
             }
-            Err(KernelDbError::DocumentPathConflict { path, existing }) => {
-                Err(BlockStoreError::DocumentPathConflict { path, existing })
-            }
             Err(e) => Err(BlockStoreError::Db(e.to_string())),
         }
     }
@@ -457,71 +445,6 @@ impl BlockStore {
                 Ok(())
             }
         }
-    }
-
-    /// Create a document that carries a filesystem `path` in its `documents`
-    /// row, so the `documents` table can double as a readdir manifest
-    /// (`list_documents_under_path`) for a document-backed VFS mount — the
-    /// doc and its manifest entry are one write, not two stores to drift.
-    /// No production mount is document-backed today (`docs/config-namespace.md`);
-    /// this stays the general primitive for one that wants to be. Otherwise
-    /// identical to [`create_document`](Self::create_document).
-    pub fn create_document_with_path(
-        &self,
-        context_id: ContextId,
-        kind: DocKind,
-        language: Option<String>,
-        path: String,
-    ) -> BlockStoreResult<()> {
-        use dashmap::mapref::entry::Entry;
-
-        match self.documents.entry(context_id) {
-            Entry::Occupied(_) => Err(BlockStoreError::DocumentAlreadyExists(context_id)),
-            Entry::Vacant(vacant) => {
-                let principal_id = self.principal_id();
-
-                if let Some(db) = &self.db {
-                    let db_guard = db.lock();
-                    let row = DocumentRow {
-                        document_id: context_id,
-                        workspace_id: self.default_workspace_id.unwrap_or_default(),
-                        doc_kind: kind,
-                        language: language.clone(),
-                        path: Some(path),
-                        created_at: kaijutsu_types::now_millis() as i64,
-                        created_by: principal_id,
-                    };
-                    Self::insert_or_reconcile_document(&db_guard, &row)?;
-                }
-
-                let entry = DocumentEntry::new(context_id, kind, language, principal_id);
-                vacant.insert(entry);
-
-                Ok(())
-            }
-        }
-    }
-
-    /// List the persisted `documents` rows whose path falls under `dir`
-    /// (the readdir manifest for [`create_document_with_path`]). Empty when
-    /// there is no DB. Returns `(path, context_id, doc_kind)` for every
-    /// descendant — `doc_kind` lets a document-backed mount's `readdir` emit
-    /// `FileType::Symlink` for link docs without a second lookup per entry.
-    pub fn documents_under_path(
-        &self,
-        dir: &str,
-    ) -> BlockStoreResult<Vec<(String, ContextId, DocKind)>> {
-        let Some(db) = self.db.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let rows = db
-            .lock()
-            .list_documents_under_path(dir)
-            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| r.path.map(|p| (p, r.document_id, r.doc_kind)))
-            .collect())
     }
 
     /// Create a document from a serialized store snapshot (for sync from server).
@@ -593,14 +516,6 @@ impl BlockStore {
     /// Check if a document exists.
     pub fn contains(&self, context_id: ContextId) -> bool {
         self.documents.contains_key(&context_id)
-    }
-
-    /// The [`DocKind`] of a document, or `None` if it does not exist. For a
-    /// document-backed mount, distinguishes a symlink doc (`DocKind::Symlink`,
-    /// content = link target) from a regular file doc whose content happens
-    /// to look like a path — the git-style "mode bit" check.
-    pub fn document_kind(&self, context_id: ContextId) -> Option<DocKind> {
-        self.documents.get(&context_id).map(|r| r.kind)
     }
 
     /// Delete a document.
@@ -5963,11 +5878,10 @@ mod tests {
     }
 
     // ========================================================================
-    // docs/issues.md:361 — create_document / create_document_with_path must
-    // classify an insert_document failure via the typed KernelDbError
-    // variants (DuplicateDocument / DocumentPathConflict), not by matching
-    // error message text, and must tell a genuine benign duplicate apart
-    // from a divergent row claiming the same id or path.
+    // docs/issues.md:361 — create_document must classify an insert_document
+    // failure via the typed KernelDbError::DuplicateDocument variant, not by
+    // matching error message text, and must tell a genuine benign duplicate
+    // apart from a divergent row claiming the same id.
     // ========================================================================
 
     /// 5. A matching row already in the DB (same id, kind, path=None) is the
@@ -6051,61 +5965,6 @@ mod tests {
         assert!(
             store.get(ctx).is_none(),
             "a diverged document must not be inserted into memory"
-        );
-    }
-
-    /// 7. `create_document_with_path` where a DIFFERENT document already
-    ///    owns that `(workspace, path)` must return `DocumentPathConflict` —
-    ///    always a hard error, never recovered — and must NOT insert the
-    ///    in-memory entry.
-    #[test]
-    fn create_document_with_path_errors_on_path_conflict() {
-        use crate::kernel_db::{DocumentRow, KernelDb};
-        use kaijutsu_types::now_millis;
-
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
-        let creator = PrincipalId::system();
-        let ws_id = {
-            let db_guard = db.lock();
-            db_guard.get_or_create_default_workspace(creator).unwrap()
-        };
-
-        let existing_id = ContextId::new();
-        {
-            let db_guard = db.lock();
-            db_guard
-                .insert_document(&DocumentRow {
-                    document_id: existing_id,
-                    workspace_id: ws_id,
-                    doc_kind: DocumentKind::Conversation,
-                    language: None,
-                    path: Some("/config/rc/shared.kai".into()),
-                    created_at: now_millis() as i64,
-                    created_by: creator,
-                })
-                .unwrap();
-        }
-
-        let store = BlockStore::with_db(db.clone(), ws_id, creator);
-        let new_id = ContextId::new();
-        let err = store
-            .create_document_with_path(
-                new_id,
-                DocumentKind::Conversation,
-                None,
-                "/config/rc/shared.kai".to_string(),
-            )
-            .unwrap_err();
-        match &err {
-            BlockStoreError::DocumentPathConflict { path, existing } => {
-                assert_eq!(path, "/config/rc/shared.kai");
-                assert_eq!(*existing, existing_id);
-            }
-            other => panic!("expected DocumentPathConflict, got: {other}"),
-        }
-        assert!(
-            store.get(new_id).is_none(),
-            "a path-conflicting document must not be inserted into memory"
         );
     }
 
