@@ -203,7 +203,7 @@ Audit result: the promises hold, with one gap.
    capnp schema change now requires rebuilding FOUR clients.
 2. **maturin-in-workspace packaging**: pyproject.toml localized to the
    crate; `maturin develop` in-workspace for dev; sdists must carry the
-   workspace (the `diamond-types-extended` git pin is lost outside it);
+   workspace (path dependencies between the crates are lost outside it);
    mold linker assumption on build machines.
 3. **GIL/tokio deadlock** if events call inline into Python — forbidden by
    the channel rule above.

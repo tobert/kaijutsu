@@ -30,7 +30,7 @@ but is effectively a per-turn scratch buffer.
 Consequences:
 
 - Every prompt re-encodes the whole conversation into `RequestMessage`s.
-- `block exclude` / `block edit` quietly affect *live* conversations the
+- `stage exclude` / `block edit` quietly affect *live* conversations the
   next turn, which doesn't actually match what the Anthropic API can do
   (history already sent is history sent).
 - Big tool outputs balloon the wire payload every turn until they hit the
@@ -110,7 +110,7 @@ defer until Slice A is settled.
 - Two prompts in one context send only the delta on the second turn.
 - A `kj shell` call between LLM prompts shows up on the next turn
   (mailbox flush path).
-- `block exclude` on a block that's already in the session does not
+- `stage exclude` on a block that's already in the session does not
   remove it from the next wire payload (invariant #2).
 - Fork-then-prompt after exclude *does* drop the excluded block
   (boundary re-hydrate).

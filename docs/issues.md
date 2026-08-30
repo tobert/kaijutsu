@@ -1731,7 +1731,7 @@ model choose (`kj rc render musician | kj block create --role system`):
 - auto-injecting into the system prompt fights the `--target=system` cache
   breakpoint that `S20-cache.kai` sets, so every assimilation silently costs a
   cache write
-- there is no undo for a system block short of `block exclude` + fork, and
+- there is no undo for a system block short of `kj stage exclude` + fork, and
   "I want to know how musicians work" should not be a one-way door
 
 Admin-shaped and occasional, so it is a `kj` verb and earns no wire method —
@@ -5182,31 +5182,13 @@ script uses is load-bearing, not style.
   exit-3 stderr names the first so `kj ledger show` reaches the signals. The
   structured return path collapses them — see "The escalation seat" above.
 
-## Doc drift: `block exclude` is written everywhere, but the verb is `kj stage exclude` (found 2026-08-25)
+## Doc drift: `block exclude` in CLAUDE.md, awaiting Amy (found 2026-08-25)
 
-`kj block` has no `exclude` subcommand. Exclusion is `kj stage exclude`, alias
-`ex` (stage.rs:47); `kj block status` sets a status field and is not it. The
-old name survives in at least six places, some as a literal command example:
-
-- `CLAUDE.md:360` — the writing-style section's own example,
-  `kj block exclude <id> && kj fork`. It is teaching the wrong verb in the
-  guide about teaching syntax by example.
-- `CLAUDE.md:176` — "Conversation vs Context", as `block exclude` / `block edit`
-- `docs/architecture/README.md:135`, `docs/devlog.md:70`,
-  `docs/conversation-session.md:33` and `:113`, `docs/slash-v.md:291`/`:293`/`:341`
-- `docs/architecture/diagrams/03-context-vs-conversation.svg` — baked into the
-  rendered remediation caption
-
-**Checked, so the fix is a rename and nothing subtler:** there is no
-`block`→`stage` alias (`dispatch_block` is reached only by the literal `block`,
-mod.rs:503; the stage aliases are `go`/`st`/`in`/`ex` only, stage.rs:10-46), so
-`kj block exclude` is an unknown subcommand rather than an undocumented spelling.
-`block edit` did **not** drift — it is real (block.rs:227). Only `exclude` moved.
-
-Found while building the lfm2d probe corpus, where it would have taught a
-classifier severity for a verb that does not exist. `CLAUDE.md` is Amy's file
-and the two lines there are hers to change; the rest is a mechanical sweep,
-including the rendered SVG caption.
+The `docs/` sweep for the wrong verb (`block exclude` → `kj stage exclude`,
+alias `ex`, stage.rs:47) shipped 2026-08-30. Two lines are Amy's file and
+still carry the old name, hers to change: `CLAUDE.md:367`/`:370` (the
+writing-style section's own worked example) and `CLAUDE.md:183`
+("Conversation vs Context").
 
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 

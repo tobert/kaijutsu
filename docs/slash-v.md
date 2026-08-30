@@ -298,9 +298,9 @@ poll again to see growth (that's what `generation` is for). A free-running tail 
 possible explicit future mode, not the default.
 
 **Read-only.** A writable-attribute future (`echo 1 > .../excluded` →
-`block exclude`; edit `content` → `block edit`, landing at the next hydrate boundary
+`stage exclude`; edit `content` → `block edit`, landing at the next hydrate boundary
 per the context/conversation split) is noted but out of scope. Today you remediate
-via the existing verbs (`block exclude <key>`, then `kj fork`); `/v/ctx` *reflects*
+via the existing verbs (`kj stage exclude <key>`, then `kj fork`); `/v/ctx` *reflects*
 the result immediately.
 
 ## `/v/session` — live participants (read-only roster)
@@ -348,7 +348,7 @@ actually shipped to the LLM) is currently invisible. Each session that *runs* a
 conversation (app / MCP / SSH-shell, **not** SFTP) would gain a `conversation/`
 subdir for the hydrated sequence — append-only, ordinal-stable, read-only, with its
 own `index` — so a debugger can diff it against `/v/ctx/<id>/blocks/index` and *see*
-what a pending `block exclude` will drop at the next fork. Namespace reserved now;
+what a pending `stage exclude` will drop at the next fork. Namespace reserved now;
 built later.
 
 ### `self` resolution

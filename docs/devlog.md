@@ -67,15 +67,15 @@ cover.
 **Context vs conversation** is the load-bearing invariant underneath
 everything: the context is the durable, multi-writer side; the
 conversation is the append-only live session hydrated from it at boundary
-events. `block exclude`/`edit` land at the next hydrate — remediate a poisoned
-conversation by excluding in context, then forking. The per-context mailbox is
-the atomicity gate that keeps must-travel-together blocks from being split by
-unrelated writers.
+events. `stage exclude`/`block edit` land at the next hydrate — remediate a
+poisoned conversation by excluding in context, then forking. The per-context
+mailbox is the atomicity gate that keeps must-travel-together blocks from
+being split by unrelated writers.
 
 **No first-class "agent."** An actor is always a Principal; agent-ness emerges
 from fork and drift, not from a noun in the schema.
 
-## The kernel becomes sole owner of itself (mid-June)
+## The kernel becomes sole owner of itself, then gives it back (mid-June → August 29)
 
 A silent-fallback bug in rc loading turned into the biggest structural decision
 of June: rather than patch the dual-ownership cluster (stale-bytes reads,

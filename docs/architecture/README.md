@@ -132,7 +132,7 @@ This is the distinction that most shapes the system, so it gets its own diagram.
   (`kaijutsu-kernel/src/llm/mailbox.rs`). It is **hydrated** from the context at
   boundary events (fork, new, cold start, attach) and append-only thereafter.
 
-Because the conversation is hydrated, **`block exclude` / `block edit` only take
+Because the conversation is hydrated, **`stage exclude` / `block edit` only take
 effect at the next hydration boundary — typically a fork.** To remediate a
 poisoned conversation (a giant tool output, a bad turn) you exclude in the
 context, then fork; the fork hydrates a clean conversation.
