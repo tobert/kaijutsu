@@ -2,7 +2,7 @@
 //!
 //! Bridges `russh_sftp::server::Handler` onto the kernel's [`VfsOps`] mount
 //! tree, so any off-the-shelf SFTP client (sshfs, `sftp`, an editor's remote-FS
-//! plugin) reads and writes the unified tree — host FS, kernel-owned `/etc/rc`
+//! plugin) reads and writes the unified tree — host FS (including `/etc/rc`)
 //! and `/v/...`, and the memory scratch at `/tmp` — over the same SSH server
 //! that carries the Cap'n Proto RPC channel. See `docs/sftp.md`.
 //!
@@ -27,7 +27,6 @@ use kaijutsu_kernel::{
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
 };
 use kaijutsu_types::Principal;
-use kaijutsu_types::paths;
 
 use russh_sftp::extensions::{
     self, FsyncExtension, HardlinkExtension, Statvfs, StatvfsExtension,
@@ -221,30 +220,6 @@ fn status_for(err: &VfsError) -> StatusCode {
 /// (and our logs) see *why* an op failed rather than a bare code.
 fn reply(err: VfsError) -> StatusReply {
     status_for(&err).with_message(err.to_string())
-}
-
-/// Refuse SFTP writes to the capability-gated trees until the SFTP session
-/// carries a real loadout binding (slice 3 in `docs/sftp.md`).
-///
-/// `/etc/rc` and `/etc/config` are the two privileged write surfaces the file
-/// tools gate with `RcWrite`/`ConfigWrite` (`mcp/binding.rs`). Those gates live
-/// above `VfsOps`, so a raw SFTP write would *bypass* them. Rather than silently
-/// becoming a capability-bypass, an SFTP write here fails loud; the gate is
-/// wired through the shared guard in a later slice. Everything else is governed
-/// by the mount's own `read_only()` flag, which `VfsOps` already enforces.
-fn privileged_write_denied(path: &Path) -> Option<StatusReply> {
-    let s = path.to_string_lossy();
-    // Component-boundary match (so `/etc/rcfoo` is NOT mistaken for `/etc/rc`)
-    // via the shared predicate in `kaijutsu_types::paths` — the single source
-    // of truth for this boundary check, also used by `editor::config_owned`
-    // and the file-tools `is_rc_path` gate.
-    if paths::is_rc_path(&s) || paths::is_config_path(&s) {
-        Some(StatusCode::PermissionDenied.with_message(
-            "SFTP writes to /etc/rc and /etc/config are not yet capability-gated; refused",
-        ))
-    } else {
-        None
-    }
 }
 
 /// Extract the permission bits (low 12) an attr packet carries, or `default`.
@@ -494,12 +469,6 @@ impl Handler for SftpSession {
             pflags.intersects(OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::CREATE | OpenFlags::TRUNCATE);
         tracing::Span::current().record("sftp.write", wants_write);
 
-        if wants_write
-            && let Some(denied) = privileged_write_denied(&path)
-        {
-            return Err(denied);
-        }
-
         // Probe current state once. Rejecting a directory open happens *before*
         // any mutation — truncating or creating over a directory is nonsense
         // and could error or corrupt the backend mid-op.
@@ -634,9 +603,6 @@ impl Handler for SftpSession {
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
         let path = canonicalize(&path);
-        if let Some(denied) = privileged_write_denied(&path) {
-            return Err(denied);
-        }
         let mode = perm_from_attrs(&attrs, 0o755);
         self.vfs.mkdir(&path, mode).await.map_err(reply)?;
         Ok(ok_status(id))
@@ -645,9 +611,6 @@ impl Handler for SftpSession {
     #[tracing::instrument(name = "sftp.rmdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         let path = canonicalize(&path);
-        if let Some(denied) = privileged_write_denied(&path) {
-            return Err(denied);
-        }
         self.vfs.rmdir(&path).await.map_err(reply)?;
         Ok(ok_status(id))
     }
@@ -655,9 +618,6 @@ impl Handler for SftpSession {
     #[tracing::instrument(name = "sftp.remove", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %filename))]
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         let path = canonicalize(&filename);
-        if let Some(denied) = privileged_write_denied(&path) {
-            return Err(denied);
-        }
         self.vfs.unlink(&path).await.map_err(reply)?;
         Ok(ok_status(id))
     }
@@ -671,11 +631,6 @@ impl Handler for SftpSession {
     ) -> Result<Status, Self::Error> {
         let from = canonicalize(&oldpath);
         let to = canonicalize(&newpath);
-        // Either endpoint touching a privileged tree is a privileged write.
-        if let Some(denied) = privileged_write_denied(&from).or_else(|| privileged_write_denied(&to))
-        {
-            return Err(denied);
-        }
         // Base SFTPv3 RENAME must FAIL if the destination exists — overwrite is
         // the posix-rename@openssh.com extension's job (handled in `extended`).
         // Don't rely on backend rename semantics for this.
@@ -694,9 +649,6 @@ impl Handler for SftpSession {
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
         let path = canonicalize(&path);
-        if let Some(denied) = privileged_write_denied(&path) {
-            return Err(denied);
-        }
         self.vfs
             .setattr(&path, set_attr_from(&attrs))
             .await
@@ -724,9 +676,6 @@ impl Handler for SftpSession {
             Some(HandleEntry::Dir(d)) => (d.path.clone(), None),
             None => return Err(StatusReply::new(StatusCode::Failure).with_message("bad handle")),
         };
-        if let Some(denied) = privileged_write_denied(&path) {
-            return Err(denied);
-        }
 
         if let Some(expected) = expected {
             let current = self.vfs.getattr(&path).await.map_err(reply)?.generation;
@@ -763,9 +712,6 @@ impl Handler for SftpSession {
         targetpath: String,
     ) -> Result<Status, Self::Error> {
         let link = canonicalize(&linkpath);
-        if let Some(denied) = privileged_write_denied(&link) {
-            return Err(denied);
-        }
         // The target is stored verbatim (it may be relative); only the link
         // location is canonicalized.
         self.vfs
@@ -849,11 +795,6 @@ impl Handler for SftpSession {
                 let ext: PosixRenameExtension = decode_ext(data)?;
                 let from = canonicalize(&ext.oldpath);
                 let to = canonicalize(&ext.newpath);
-                if let Some(denied) =
-                    privileged_write_denied(&from).or_else(|| privileged_write_denied(&to))
-                {
-                    return Err(denied);
-                }
                 // Best-effort overwrite: remove an existing destination first,
                 // then rename. (A future slice can make this atomic in the VFS.)
                 if self.vfs.exists(&to).await {
@@ -866,9 +807,6 @@ impl Handler for SftpSession {
                 let ext: HardlinkExtension = decode_ext(data)?;
                 let old = canonicalize(&ext.oldpath);
                 let new = canonicalize(&ext.newpath);
-                if let Some(denied) = privileged_write_denied(&new) {
-                    return Err(denied);
-                }
                 self.vfs.link(&old, &new).await.map_err(reply)?;
                 Ok(Packet::Status(ok_status(id)))
             }
@@ -1220,18 +1158,6 @@ mod tests {
             .await
             .expect_err("memory backend has no hard links");
         assert_eq!(err.status_code, StatusCode::Failure);
-    }
-
-    #[test]
-    fn privileged_deny_matches_on_component_boundary() {
-        assert!(privileged_write_denied(Path::new(paths::RC_ROOT)).is_some());
-        assert!(privileged_write_denied(Path::new("/etc/rc/coder/S10.kai")).is_some());
-        assert!(privileged_write_denied(Path::new(paths::CONFIG_ROOT)).is_some());
-        assert!(privileged_write_denied(Path::new("/etc/config/models")).is_some());
-        // Not gated: a sibling whose name merely starts with the gated prefix.
-        assert!(privileged_write_denied(Path::new("/etc/rcfoo")).is_none());
-        assert!(privileged_write_denied(Path::new("/etc/configuration")).is_none());
-        assert!(privileged_write_denied(Path::new("/tmp/x")).is_none());
     }
 
     #[test]

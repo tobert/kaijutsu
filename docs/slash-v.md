@@ -356,9 +356,10 @@ unification." On reflection (with Amy, 2026-06-27) that whole apparatus was
 **SFTP-shaped scaffolding**: it existed only because SFTP is a bare file protocol
 with no `ExecContext`. Every *real* write surface already carries its acting context
 ambiently — the **kaish shell** has `ExecContext.context_id`, **MCP** has it, the
-**app** has its live current context — and the guard `context_allows_rc_write(ctx)`
-(`crates/kaijutsu-kernel/src/file_tools/guard.rs:71`) already keys on
-`ctx.context_id` alone. The "one axis, one guard" unification was *already true* for
+**app** has its live current context — and the guard of the day,
+`context_allows_rc_write(ctx)`, already keyed on `ctx.context_id` alone (that
+guard has since been deleted with `rc-write`; the reasoning it demonstrated is
+what survives). The "one axis, one guard" unification was *already true* for
 the real write paths; `bound` was a wart on it, not the prize.
 
 So the model is **per-operation join**: a privileged write joins a context as a
@@ -371,11 +372,14 @@ the current context is ordinary ambient state, like cwd, not a capability token.
   **live** from `SessionContextMap` per operation (a mid-line `kj attach` chains like
   `cd` — `docs/ssh-shell.md`); MCP/app act as the context they have joined, tracked
   the same live way. Writing `/etc/rc/coder/create/S00-stance.kai` while acting as a
-  privileged context routes `context_allows_rc_write(ctx)` and lands the write. No
-  binding, no TTL, no arm.
-- **SFTP** — read/view, by design. It keeps its lexical deny on privileged paths
-  (`privileged_write_denied`, `crates/kaijutsu-server/src/sftp.rs:234`). *If* SFTP
-  ever needs to write a privileged tree, the per-operation join is **path-derived**:
+  privileged context just lands the write — `/etc/rc` carries no capability of
+  its own any more. No binding, no TTL, no arm.
+- **SFTP** — writes like anything else now. It carried a lexical deny on
+  `/etc/rc` and `/etc/config` while those trees were capability-gated; both
+  gates are gone (`rc-write` is deleted and `/etc/rc` is host files —
+  `docs/rc-on-disk.md`), so the deny went with them and a mount's own
+  `read_only()` flag is what governs. If a future tree genuinely needs a
+  per-operation join over SFTP, the shape is **path-derived**:
   a context-projected writable view (e.g. `/v/ctx/<ab>/<id>/rc/...`) where the
   `context_id` falls out of the path and routes the same guard — privileged context →
   writable, everyone else → `EROFS`, fail-loud. Deferred until a real need appears;
@@ -534,7 +538,6 @@ Track V (`/v/ctx` + `/v/session`):
 - `crates/kaijutsu-kernel/src/blocks/block_store.rs:238` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
 - `crates/kaijutsu-kernel/src/block_store.rs:182,153,2020` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write, restored on remote `merge_ops`)
 - `crates/kaijutsu-kernel/src/kernel_db.rs:1823,284` — `list_all_contexts()` (context roster → `index`); `contexts.label` UNIQUE (the `label` column)
-- `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write` (keys on `ctx.context_id`; unchanged)
-- `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (`RcWrite`, `ConfigWrite`; unchanged)
-- `crates/kaijutsu-server/src/sftp.rs:107,234` — `SftpSession`; `privileged_write_denied` (lexical deny SFTP keeps — no guard injection)
+- `crates/kaijutsu-kernel/src/mcp/binding.rs` — `Capability` (`ConfigWrite`; `RcWrite` and `context_allows_rc_write` are deleted)
+- `crates/kaijutsu-server/src/sftp.rs` — `SftpSession` (the lexical deny it once carried is deleted)
 - `crates/kaijutsu-kernel/src/vfs/types.rs` — `FileAttr.generation` coherence stamp

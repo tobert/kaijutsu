@@ -24,9 +24,9 @@
 //! to reimplement this check by hand (correctly, as it happens); now there is
 //! one implementation, so a future site can't get it wrong.
 
-/// Root of the kernel-owned rc lifecycle-script tree
-/// (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`). kernel-owned: no host
-/// file, no write-through — see `docs/config-ownership.md`.
+/// Root of the rc lifecycle-script tree
+/// (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`). An ordinary host
+/// directory reached through `LocalBackend` — see `docs/rc-on-disk.md`.
 pub const RC_ROOT: &str = "/etc/rc";
 
 /// Root of the kernel-owned kernel-global config tree. A flat namespace:

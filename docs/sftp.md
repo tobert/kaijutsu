@@ -5,16 +5,19 @@
 landed. Slice 3 (capability binding) was extracted to **`docs/slash-v.md`** and
 then **dissolved there (2026-06-27)**: the per-session `bound`/arming-symlink/TTL
 apparatus was SFTP-shaped scaffolding, replaced by per-operation join on the
-ambient `context_id`. SFTP stays **read/view** and keeps its lexical deny on
-privileged paths — sections below that describe `bound` are superseded and
-marked. The first real SFTP consumer is **client CAS sync against `/v/cas`**
-(`docs/slash-v.md` track B).*
+ambient `context_id`. SFTP writes an ordinary path exactly like any other write
+surface now — sections below that describe `bound` are superseded and marked,
+and the lexical deny on `/etc/rc`/`/etc/config` those sections left behind is
+gone too: `/etc/rc` melted into host files (`docs/rc-on-disk.md`) and
+`/etc/config` dropped the file-write capability gate it used to duplicate
+(`docs/config-ownership.md`). The first real SFTP consumer is **client CAS
+sync against `/v/cas`** (`docs/slash-v.md` track B).*
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
 client (sshfs, `sftp`, Nautilus, an editor's remote-FS plugin) can read and
-write the unified tree — host FS, kernel-owned `/etc/rc` and `/v/...`, and the
-memory scratch at `/tmp` — through the same SSH server that already carries the
-Cap'n Proto RPC channel.
+write the unified tree — host FS (including `/etc/rc`), the kernel-owned
+`/etc/config` and `/v/...`, and the memory scratch at `/tmp` — through the same
+SSH server that already carries the Cap'n Proto RPC channel.
 
 This is plumbing, not new architecture. The VFS is already SFTP-shaped; the
 work was a channel-dispatch scaffold on the SSH session-channel surface, an
@@ -142,33 +145,33 @@ bare kernel identity. That much is straightforward — pass it into the adapter
 struct the way `run_rpc` takes `principal`.
 
 The subtlety: **capabilities in kaijutsu are bound to a *context loadout*, not
-to a principal.** The rc-write gate is
-`context_allows_rc_write(ctx: &ExecContext)`
-(`crates/kaijutsu-kernel/src/file_tools/guard.rs:71`), which looks up
-`get_context_binding(ctx.context_id)` and reads `binding.is_rc_write()`. A
+to a principal.** The rc-write gate of the day was
+`context_allows_rc_write(ctx: &ExecContext)`, which looked up
+`get_context_binding(ctx.context_id)` and read `binding.is_rc_write()`. A
 `Principal` has `id`, `username`, `display_name`
 (`crates/kaijutsu-types/src/principal.rs:16`) — and no loadout. So an SFTP
 session authenticates a *who* but arrives without the *context* that the
-existing capability machinery keys on. Plumbing the principal through is
-necessary but not sufficient.
+capability machinery of the day keyed on. Plumbing the principal through was
+necessary but not sufficient. (That gate is deleted; the section below is why
+it stopped mattering.)
 
 ### How an SFTP session reaches a capability verdict — superseded
 
 *(2026-06-27, design session with Amy — full reasoning in `docs/slash-v.md`
 "Capability — per-operation join, not per-session binding.")* The answer is:
-**it doesn't need to.** SFTP is read/view by design — it keeps the lexical deny
-on privileged paths (`privileged_write_denied`, `sftp.rs:234`), and privileged
-writes happen via the shell/MCP/app, where the acting context is ambient and
-`context_allows_rc_write(ctx)` already keys on it. The earlier design here — a
-per-connection `bound` context set by an arming symlink on
+**it doesn't need to.** The `context_allows_rc_write(ctx)` gate this section
+described no longer exists at all — `RcWrite` was deleted once `/etc/rc`
+melted into host files, and `ConfigWrite` no longer gates file writes either
+(`docs/rc-on-disk.md`, `docs/config-ownership.md`). SFTP needs no capability
+verdict for a plain file write because nothing in the file-tool path needs one:
+a write to any mount is governed only by that mount's own `read_only()` flag,
+same as `LocalBackend`, host `vim`, or the file tools. The earlier design
+here — a per-connection `bound` context set by an arming symlink on
 `/v/session/self/bound`, with a sliding TTL and default-deny — was scaffolding
 this bare file protocol seemed to need, and dissolving it kept the unification
-(one guard, one `context_id` axis) with less machinery. If SFTP ever genuinely
-needs to write a privileged tree, the shape is a *path-derived* per-operation
-join (a context-projected writable view where `context_id` falls out of the
-path) — deferred until a real need appears. Registering SFTP connections in the
-participant registry (so they appear under `/v/session`) survives as track V
-slice 2 work.
+(one guard, one `context_id` axis) with less machinery. Registering SFTP
+connections in the participant registry (so they appear under `/v/session`)
+survives as track V slice 2 work.
 
 ## Handle mapping — the one real impedance mismatch
 
@@ -240,9 +243,11 @@ above — so the handle guard and the cache now share one primitive.
 
 - SFTP is reachable only after the existing pubkey auth succeeds; there is no
   new authentication surface.
-- Privileged-path writes are lexically denied over SFTP (read/view by design);
-  privileged writes route through the shell/MCP/app, where the ambient context
-  hits the shared guard — SFTP cannot become a capability bypass.
+- There is no lexical deny on `/etc/rc` or `/etc/config` — every player is
+  inside one trust boundary, and capabilities are ergonomic nudges, not a
+  security control (CLAUDE.md "Shared trust, crosstalk-as-feature"). A write
+  there over SFTP is governed the same way a write anywhere else is: the
+  mount's own `read_only()` flag.
 - Mount `read_only()` flags are enforced by the VFS regardless of principal, so
   read-only mounts stay read-only over SFTP for free. **Note:** root `/` is a
   *read-only* host anchor (`LocalBackend::read_only("/")`); only the project
@@ -290,17 +295,19 @@ above — so the handle guard and the cache now share one primitive.
      conversions.
 3. **~~Capability binding~~ — dissolved (2026-06-27).** The `bound`/arming
    apparatus is gone (see "superseded" above; `docs/slash-v.md` "Capability").
-   SFTP stays read/view; the lexical deny stands. What survives here: register
-   each SFTP connection in the participant registry so it appears under
-   `/v/session` (rides `docs/slash-v.md` track V slice 2, not SFTP work).
+   SFTP writes an ordinary path exactly like the file tools and host `vim` —
+   the lexical deny is gone too (`docs/rc-on-disk.md`). What survives here:
+   register each SFTP connection in the participant registry so it appears
+   under `/v/session` (rides `docs/slash-v.md` track V slice 2, not SFTP
+   work).
 4. **Adapter-level limits.** Rate-limiting and traversal-depth/size caps to
    survive editor-indexer crawls (the `/v/ctx` tree makes this sharper);
    directory-handle eviction.
 5. **Tests.** A live test that mounts the SFTP endpoint, reads a host file,
-   writes a `/tmp` file, confirms a kernel-document round-trip (`/etc/rc` write visible to
-   `kj rc`/kaish), confirms an ungranted principal is denied `/etc/rc` writes,
-   and exercises the rename-replace TOCTOU guard. Grow it per slice, the way the
-   e2e live-eval harness does.
+   writes a `/tmp` file, confirms an `/etc/rc` write is an ordinary host-file
+   write (visible to `kj rc`/kaish), confirms an `/etc/config` write lands in
+   its kernel document, and exercises the rename-replace TOCTOU guard. Grow it
+   per slice, the way the e2e live-eval harness does.
 
 **Dependency order:** slices 0–2 + extensions + tracing are **done**; slice 3
 dissolved. The active consumer is **`/v/cas` client CAS sync**
@@ -320,8 +327,8 @@ later tenant of the same scaffold.
 - `crates/kaijutsu-client/src/ssh.rs:235` — client opened control/rpc/events in order (historical — now `connect_subsystem`, `ssh.rs:210`)
 - `crates/kaijutsu-client/src/rpc.rs:101` — `retain_ssh_channels` holds the dead control/events channels
 - russh 0.61.1 `server/mod.rs:633` (`subsystem_request`) / `channels/mod.rs:249` (`request_subsystem`)
-- `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (`RcWrite`, `ConfigWrite`)
-- `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write`
+- `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (historical — `RcWrite` is deleted; `ConfigWrite` remains but no longer gates file writes, see `docs/config-ownership.md`)
+- `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write` (historical — deleted along with `RcWrite`)
 - `crates/kaijutsu-types/src/principal.rs:16` — `Principal`
 - `crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:199,230,258,605` — kernel-document mtime (now-on-write, epoch default, setattr no-op)
 - `crates/kaijutsu-kernel/src/vfs/backends/local.rs:141` / `memory.rs:451` — host mtime / `MemoryBackend` honoring `setattr(mtime)`

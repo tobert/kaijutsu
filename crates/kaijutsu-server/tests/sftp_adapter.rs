@@ -3,15 +3,15 @@
 //! exercises `SftpSession` (the `VfsOps` bridge) at the wire level: the client
 //! speaks `SSH_FXP_*`, the adapter answers from a live `MountTable`.
 //!
-//! The read path lands first (see `docs/sftp.md` → Implementation slices); the
-//! write assertions here pin the current slice boundary and flip as write
-//! support arrives.
+//! See `docs/sftp.md` → Implementation slices for how the read and write
+//! paths landed.
 
 use std::sync::Arc;
 
-use kaijutsu_kernel::{MemoryBackend, MountTable, VfsOps};
+use kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs;
+use kaijutsu_kernel::{MemoryBackend, MountTable, VfsOps, shared_block_store};
 use kaijutsu_server::sftp::SftpSession;
-use kaijutsu_types::Principal;
+use kaijutsu_types::{Principal, PrincipalId};
 
 use russh_sftp::client::SftpSession as ClientSession;
 use tokio::io::AsyncWriteExt;
@@ -208,9 +208,10 @@ async fn statvfs_extension_reports_filesystem_stats() {
 }
 
 #[tokio::test]
-async fn writes_to_etc_rc_are_refused() {
-    // Until the SFTP session carries a capability binding (slice 3), a write to
-    // the capability-gated trees fails loud rather than bypassing the gate.
+async fn an_sftp_write_to_etc_rc_is_an_ordinary_file_write() {
+    // `/etc/rc` melted from a kernel document into a host directory
+    // (`docs/rc-on-disk.md`); an SFTP write there is governed by the mount's
+    // own `read_only()` flag, same as any other path — no lexical deny.
     let vfs = Arc::new(MountTable::new());
     vfs.mount("/", MemoryBackend::new()).await;
     vfs.mkdir(std::path::Path::new("/etc"), 0o755).await.unwrap();
@@ -220,14 +221,35 @@ async fn writes_to_etc_rc_are_refused() {
     russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
     let client = ClientSession::new(client_io).await.expect("handshake");
 
-    // `File` isn't `Debug`, so match rather than `expect_err`.
-    let err = match client.create("/etc/rc/evil.kai").await {
-        Ok(_) => panic!("etc/rc create must be refused"),
-        Err(e) => e,
-    };
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("permission") || msg.contains("capability-gated"),
-        "unexpected etc/rc error: {msg}"
+    put(&client, "/etc/rc/evil.kai", b"echo hi\n").await;
+    assert_eq!(
+        client.read("/etc/rc/evil.kai").await.expect("read back"),
+        b"echo hi\n"
+    );
+}
+
+#[tokio::test]
+async fn an_sftp_write_to_etc_config_lands_in_the_kernel_document() {
+    // `/etc/config` is still a kernel document (`ConfigDocFs`), unlike `/etc/rc`
+    // which is now host files — so this exercises the genuinely different write
+    // path: a plain SFTP create/write must land in the block store and read
+    // back, the same as any other unrestricted mount.
+    let vfs = Arc::new(MountTable::new());
+    vfs.mount("/", MemoryBackend::new()).await;
+    let blocks = shared_block_store(PrincipalId::system());
+    vfs.mount("/etc/config", ConfigDocFs::new(blocks, "/etc/config"))
+        .await;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
+    let client = ClientSession::new(client_io).await.expect("handshake");
+
+    put(&client, "/etc/config/theme.toml", b"accent = \"teal\"\n").await;
+    assert_eq!(
+        client
+            .read("/etc/config/theme.toml")
+            .await
+            .expect("read back"),
+        b"accent = \"teal\"\n"
     );
 }
