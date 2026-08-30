@@ -312,6 +312,112 @@ not require reconstructing a string byte-for-byte. See
   `Denied` for the same reason. Make the split **once**, as one distinction
   applied at both layers, rather than twice.
 
+## Three kaibo reviews of the 2026-08-30 config work — six live defects (2026-08-30)
+
+Three parallel reviews after the demolition: `deepseek` on what the deletion
+orphaned, `gpt` adversarial on path resolution, `crusoe` hunting hardcoded
+literals and silent-fallback shapes. Each found things the others did not.
+Where a finding also applies to kaish, it was cross-checked with them by test;
+results noted.
+
+### Silent wrong data, and data loss
+
+1. **`kj/context.rs:986` is a second copy of the system-prompt loader** with the
+   same hardcoded `/config/kernel/system.md` literal and the same fallback to
+   `DEFAULT_SYSTEM_PROMPT` behind one `warn!`. `llm_stream.rs` was fixed in
+   `4727dec8`; its twin was never grepped for. `kj context prompt` silently
+   serves the embedded default after any namespace move. Build the path from
+   `paths::config_path`, as its sibling now does.
+
+2. **`ZQ` on a config file deletes the rollback and orphans a swap row.**
+   `editor_quit` (`kernel.rs:1801-1835`) marks the buffer dirty to make a
+   recoverable swap, **unpins**, then calls `invalidate_config_file_cache`
+   (`:1827`) — which now succeeds *because* it is unpinned, and
+   `invalidate_document` deletes the document that just received the rollback
+   (`cache.rs:722-728`). The `dirty_file_buffers` row survives in its own
+   table. Next read loads pre-rollback disk bytes. A **non-config** file takes
+   the correct path, because `is_config_doc_root` gates the call — the exact
+   config-vs-file divergence the deleted two-branch tests would have caught.
+   `editor_keys`'s `Closed` arm does not call invalidate at all, so the two
+   quit paths already disagree. Fix: delete the three editor call sites
+   (`kernel.rs:1516`, `:1541`, `:1827`) and keep
+   `invalidate_config_file_cache` for the direct-VFS-write callers its own doc
+   names (`kj rc add/rm`, `kj config reset`).
+
+3. **`rmdir` through a symlink deletes the target directory.**
+   `local.rs:416` resolves with the following resolver, so an in-root link to
+   an in-root empty directory canonicalizes to the target and `remove_dir`
+   takes *that*, leaving the link. Reachable from ordinary shell removal:
+   `MountBackend::remove` dispatches on `attr.is_dir()`, and `getattr` reports
+   a working directory link as a directory. Clean in kaish at both layers
+   (kernel-routed tests since June) — ours alone.
+
+4. **`readlink` bypasses containment unless the path text contains `..`.**
+   `local.rs:320-346` joins the raw path and calls the syscall; the only check
+   is a `ParentDir` scan. With `<R>/out -> /outside` and
+   `/outside/host-link -> /secret`, `readlink("out/host-link")` follows the
+   intermediate and returns the outside target. No race, no `..`. Should use
+   `resolve_nofollow`. Refused by design in kaish (their `read_link` resolves
+   `LinkItself`); they added a test with this shape after the report.
+
+5. **Mount-root removal.** `rmdir("")`, `rmdir("/")`, `rmdir(".")` resolve to
+   the root and remove it when empty (`local.rs:118`). `MemoryBackend` refuses
+   explicitly (`memory.rs:346-351`), so our two backends disagree. **Real in
+   kaish too, same split** — they now refuse through one helper used by remove
+   and rename, with conformance rows for both.
+
+6. **`ROSTER_INDEX_PATH` duplicates a path instead of deriving it.**
+   `kaijutsu-app/src/connection/roster.rs:55` hardcodes `/run/roster/index`
+   rather than building from `ROSTER_RUN_ROOT`. The read's error handler treats
+   "not found" / "no mount point" as `RosterFetch::NoRoster` (`:518`), so a
+   renamed root makes the roster panel truthfully report an empty fleet.
+   `kaijutsu-app/src/midi_presence.rs:47-50` shows the correct derived pattern.
+
+### The keep-judgment in `dc8a5e92` was wrong
+
+`create_document_with_path`, `documents_under_path` and `document_kind` were
+kept as "generic primitives, same reasoning as `DocKind::Symlink`". That
+grouping is the flaw: `DocKind::Symlink` is a **persisted enum** with real
+migration cost to remove, and the three methods are pure code — deleting them
+changes no schema and no behavior. Zero production callers; one has a single
+test, two have none. Their tail goes with them: `list_documents_under_path`
+(`kernel_db.rs:2518`), `document_id_at_path` (`:2431`), and both
+`DocumentPathConflict` variants. The `documents.path` column and index must
+stay for legacy rows — but nothing should still be computing over them.
+
+### A capability name that no longer means what it says
+
+`config-write` gates no config file. It gates the SQL-native model verbs
+(`kj backend`/`cast`/`alias`), `kj hook add/remove`, and `kj mcp reload`.
+`kj config reset` is deliberately ungated. Its doc (`mcp/binding.rs:162-168`)
+still describes writing "the kernel-owned config files". Rename or re-scope;
+either way the doc is currently false.
+
+### Stale premises in published text
+
+`kaijutsu.capnp:2097-2101`'s config section header still says config files
+"are kernel documents — the kernel is their sole owner, and there is no host
+file". `kj/config.rs:194` says "There is no host file". `is_config_doc_root`
+(`paths.rs:237-249`) describes "the four `/etc` trees" and a
+`FileDocumentCache` shadow that is not what it now gates. `Capability::Editor`
+names "`resolve_editor_target`'s config-owned branch", deleted. Plus
+`kj/lifecycle.rs:405`, `kj/mod.rs:1097`, `actor_plugin.rs:981`,
+`docs/diff.md:169-174`, `tests/editor_wire.rs:21`.
+
+Also: `kj/rc.rs:1198-1205` asserts `LocalBackend::unlink` follows a resolvable
+symlink — true when written, false since `30730717` — and its test routes
+around the fixed path *because of that comment*. A stale comment did not just
+mislead a reader, it steered a test away from the code it covered.
+
+### Out of scope, deliberately
+
+TOCTOU: every op resolves to a `PathBuf`, drops it, then makes a second
+pathname-based syscall, so nothing survives a parent being swapped for a
+symlink in between. Shared trust makes this low priority between players, but
+host processes do write into these trees directly. The real guarantee is
+`openat2` with `RESOLVE_BENEATH` and dirfd-relative ops. Worth stating as
+out of scope rather than leaving it to be inferred.
+
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
 `context_type` on `register_session` is caller-chosen free text with no
