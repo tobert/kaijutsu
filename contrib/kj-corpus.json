@@ -1083,6 +1083,16 @@
       "note": "Restores one embedded default (docs/issues.md)."
     },
     {
+      "path": "config export",
+      "aliases": [],
+      "about": "Write every config file the kernel holds into a host directory, one subdirectory per tree (config/, client/, midi/)",
+      "clause": "kj config export dir",
+      "expect": "situation-normal",
+      "confirm_gated": false,
+      "mutates": true,
+      "note": "Writes the kernel's config documents into a host directory as the files that will back the same paths after the melt (docs/config-namespace.md). Creates only: an existing target is named and nothing is written, so it cannot destroy the config it is migrating to."
+    },
+    {
       "path": "block list",
       "aliases": [
         "ls"

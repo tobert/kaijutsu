@@ -68,17 +68,23 @@
 use std::path::{Path, PathBuf};
 
 use kaijutsu_types::DocKind;
-use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, RC_ROOT};
+use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT};
 
 use crate::block_store::{BlockStoreError, SharedBlockStore};
 use crate::config_doc;
 use crate::runtime::config_doc_fs::normalize_abs;
 
-/// The four kernel-owned config mount roots, in the fixed order this module
-/// always walks them. (Their lexical string order happens to match —
-/// `client` < `config` < `midi` < `rc` — but ordering is enforced explicitly
-/// by sorting output, not by relying on this array's order.)
-const MOUNT_ROOTS: [&str; 4] = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT];
+/// The document-backed config mount roots, in the fixed order this module
+/// always walks them. Ordering is enforced by sorting output, not by relying
+/// on this array's order.
+///
+/// **`RC_ROOT` is deliberately absent.** rc is host files
+/// (`docs/rc-on-disk.md`); the documents that once backed it were never
+/// deleted and are stale the moment a script is edited on disk. Exporting
+/// them would materialize a dead copy of the rc tree over a live one, so this
+/// walk must not see them. Anything that wants the rc tree reads the
+/// directory.
+const MOUNT_ROOTS: [&str; 3] = [CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT];
 
 /// Directory name a mount root materializes under, inside the export
 /// directory (`docs/config-ownership.md`, "Rulings (Amy, 2026-08-15)",
@@ -88,12 +94,11 @@ const MOUNT_ROOTS: [&str; 4] = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT];
 /// deriving some other subdir name.
 fn root_subdir(root: &str) -> &'static str {
     match root {
-        RC_ROOT => "rc",
         CONFIG_ROOT => "config",
         CLIENT_ROOT => "client",
         MIDI_ROOT => "midi",
         other => unreachable!(
-            "config_export only knows the four config mount roots; got {other}"
+            "config_export only knows the document-backed config mount roots; got {other}"
         ),
     }
 }
@@ -101,8 +106,8 @@ fn root_subdir(root: &str) -> &'static str {
 /// One config/rc document, captured exactly enough to reconstruct it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigTreeEntry {
-    /// Which mount root this document lives under (one of `RC_ROOT`,
-    /// `CONFIG_ROOT`, `CLIENT_ROOT`, `MIDI_ROOT`).
+    /// Which mount root this document lives under (one of `CONFIG_ROOT`,
+    /// `CLIENT_ROOT`, `MIDI_ROOT`).
     pub root: &'static str,
     /// Path relative to `root`, no leading slash (e.g.
     /// `"coder/create/S00-stance.kai"`).
@@ -111,6 +116,16 @@ pub struct ConfigTreeEntry {
 }
 
 impl ConfigTreeEntry {
+    /// Where this entry lands under an export directory, relative to it:
+    /// `<subdir>/<rel_path>`, e.g. `config/theme.toml`.
+    ///
+    /// The one place outside [`materialize`] that knows the on-disk layout, so
+    /// a caller can ask "would this overwrite anything?" without reimplementing
+    /// the join and drifting from it.
+    pub fn export_rel_path(&self) -> PathBuf {
+        Path::new(root_subdir(self.root)).join(&self.rel_path)
+    }
+
     /// The document's canonical path (`root/rel_path`) — the string
     /// `config_context_id` is keyed on.
     pub fn canonical_path(&self) -> String {
@@ -390,6 +405,8 @@ fn reject_if_escapes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the guard asserting stale rc documents never resurface needs this.
+    use kaijutsu_types::paths::RC_ROOT;
     use crate::block_store::shared_block_store_with_db;
     use crate::config_doc::config_context_id;
     use crate::kernel_db::KernelDb;
@@ -420,33 +437,43 @@ mod tests {
     #[tokio::test]
     async fn round_trip_seeded_store_is_lossless() {
         let blocks = blocks_with_db();
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc.seed_from_embedded().unwrap();
         let config = ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
         config
             .seed_entries(crate::config_seed::config_seed_files())
             .unwrap();
+        let client = ConfigDocFs::new(blocks.clone(), CLIENT_ROOT);
+        client
+            .seed_entries(crate::config_seed::client_seed_files())
+            .unwrap();
 
         // Add content that exercises symlinks and relative/dangling targets,
         // not just the seeded set.
-        rc.write_all(StdPath::new("coder/create/S30-extra.kai"), b"kj block create")
+        client
+            .write_all(StdPath::new("laptop/extra.toml"), b"gain = 2")
             .await
             .unwrap();
-        rc.symlink(
-            StdPath::new("coder/create/S31-link.kai"),
-            StdPath::new("S30-extra.kai"),
-        )
-        .await
-        .unwrap();
-        rc.symlink(
-            StdPath::new("coder/create/S32-dangling.kai"),
-            StdPath::new("/etc/rc/nowhere/S99-gone.kai"),
-        )
-        .await
-        .unwrap();
+        client
+            .symlink(StdPath::new("laptop/link.toml"), StdPath::new("extra.toml"))
+            .await
+            .unwrap();
+        client
+            .symlink(
+                StdPath::new("laptop/dangling.toml"),
+                StdPath::new("/etc/client/nowhere/gone.toml"),
+            )
+            .await
+            .unwrap();
 
         let exported = export_config_tree(&blocks).unwrap();
-        assert!(!exported.is_empty());
+        // 3 config seeds (theme/mcp/system) + 2 client seeds (metronome/scroll)
+        // + 3 extra client entries (file, relative link, dangling link) — a
+        // concrete count so this can't quietly regress to round-tripping zero
+        // entries and still pass.
+        assert_eq!(
+            exported.len(),
+            8,
+            "expected 3 config seeds + 2 client seeds + 3 extra client entries: {exported:#?}"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         materialize(&exported, tmp.path()).unwrap();
@@ -461,36 +488,36 @@ mod tests {
     #[tokio::test]
     async fn symlink_fidelity_relative_and_dangling() {
         let blocks = blocks_with_db();
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc.write_all(StdPath::new("coder/create/real.kai"), b"body")
+        let client = ConfigDocFs::new(blocks.clone(), CLIENT_ROOT);
+        client
+            .write_all(StdPath::new("laptop/real.toml"), b"body")
             .await
             .unwrap();
         // Relative target.
-        rc.symlink(
-            StdPath::new("coder/create/S05-link.kai"),
-            StdPath::new("real.kai"),
-        )
-        .await
-        .unwrap();
+        client
+            .symlink(StdPath::new("laptop/link.toml"), StdPath::new("real.toml"))
+            .await
+            .unwrap();
         // Dangling target.
-        rc.symlink(
-            StdPath::new("coder/create/S06-dangling.kai"),
-            StdPath::new("/etc/rc/nope/nothing.kai"),
-        )
-        .await
-        .unwrap();
+        client
+            .symlink(
+                StdPath::new("laptop/dangling.toml"),
+                StdPath::new("/etc/client/nope/nothing.toml"),
+            )
+            .await
+            .unwrap();
 
         let exported = export_config_tree(&blocks).unwrap();
-        let rel_link = find(&exported, RC_ROOT, "coder/create/S05-link.kai");
+        let rel_link = find(&exported, CLIENT_ROOT, "laptop/link.toml");
         assert_eq!(
             rel_link.kind,
-            ConfigTreeKind::Symlink { target: "real.kai".to_string() }
+            ConfigTreeKind::Symlink { target: "real.toml".to_string() }
         );
-        let dangling = find(&exported, RC_ROOT, "coder/create/S06-dangling.kai");
+        let dangling = find(&exported, CLIENT_ROOT, "laptop/dangling.toml");
         assert_eq!(
             dangling.kind,
             ConfigTreeKind::Symlink {
-                target: "/etc/rc/nope/nothing.kai".to_string()
+                target: "/etc/client/nope/nothing.toml".to_string()
             }
         );
 
@@ -499,7 +526,7 @@ mod tests {
 
         // The dangling link must exist on disk as an actual (broken) symlink,
         // never resolved or copied as a file.
-        let dangling_path = tmp.path().join("rc/coder/create/S06-dangling.kai");
+        let dangling_path = tmp.path().join("client/laptop/dangling.toml");
         let meta = std::fs::symlink_metadata(&dangling_path).unwrap();
         assert!(meta.file_type().is_symlink());
         assert!(
@@ -514,12 +541,10 @@ mod tests {
     #[tokio::test]
     async fn ordering_is_deterministic_and_lexical_not_iteration_order() {
         let blocks = blocks_with_db();
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
+        let config = ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
         // Write out of lexical order on purpose.
         for name in ["zzz.kai", "aaa.kai", "mmm.kai"] {
-            rc.write_all(StdPath::new(&format!("t/create/{name}")), b"x")
-                .await
-                .unwrap();
+            config.write_all(StdPath::new(name), b"x").await.unwrap();
         }
 
         let export1 = export_config_tree(&blocks).unwrap();
@@ -528,7 +553,7 @@ mod tests {
 
         let names: Vec<&str> = export1
             .iter()
-            .filter(|e| e.root == RC_ROOT)
+            .filter(|e| e.root == CONFIG_ROOT)
             .map(|e| e.rel_path.as_str())
             .collect();
         let mut sorted = names.clone();
@@ -539,21 +564,22 @@ mod tests {
     #[tokio::test]
     async fn non_ascii_content_round_trips() {
         let blocks = blocks_with_db();
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
+        let config = ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
         let body = "# 会術\n練習になります — 日本語のテスト 🎵\n";
-        rc.write_all(StdPath::new("coder/create/S00-ja.md"), body.as_bytes())
+        config
+            .write_all(StdPath::new("ja.md"), body.as_bytes())
             .await
             .unwrap();
 
         let exported = export_config_tree(&blocks).unwrap();
-        let entry = find(&exported, RC_ROOT, "coder/create/S00-ja.md");
+        let entry = find(&exported, CONFIG_ROOT, "ja.md");
         assert_eq!(entry.kind, ConfigTreeKind::File { content: body.to_string() });
 
         let tmp = tempfile::tempdir().unwrap();
         materialize(&exported, tmp.path()).unwrap();
         let imported = import_config_tree(tmp.path()).unwrap();
         assert_eq!(exported, imported);
-        let round_tripped = find(&imported, RC_ROOT, "coder/create/S00-ja.md");
+        let round_tripped = find(&imported, CONFIG_ROOT, "ja.md");
         assert_eq!(
             round_tripped.kind,
             ConfigTreeKind::File { content: body.to_string() }
@@ -563,10 +589,8 @@ mod tests {
     #[tokio::test]
     async fn import_rejects_symlink_escaping_mount_root() {
         let blocks = blocks_with_db();
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc.write_all(StdPath::new("coder/create/S00-x.kai"), b"x")
-            .await
-            .unwrap();
+        let config = ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
+        config.write_all(StdPath::new("x.kai"), b"x").await.unwrap();
         let exported = export_config_tree(&blocks).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -575,8 +599,8 @@ mod tests {
         // Hand-craft an escaping symlink directly on disk, as if a bad actor
         // (or a bug) had written outside the mount's own tree — import must
         // refuse it, not silently accept it.
-        let evil_path = tmp.path().join("rc/coder/create/S99-evil.kai");
-        std::os::unix::fs::symlink("/etc/config/theme.toml", &evil_path).unwrap();
+        let evil_path = tmp.path().join("config/S99-evil.kai");
+        std::os::unix::fs::symlink("/etc/client/theme.toml", &evil_path).unwrap();
 
         let err = import_config_tree(tmp.path()).unwrap_err();
         assert!(
@@ -590,7 +614,7 @@ mod tests {
         let blocks = blocks_with_db();
         // Register a document directly (bypassing ConfigDocFs::put_content),
         // leaving it blockless — the halted-replay case.
-        let canonical = format!("{RC_ROOT}/coder/create/S00-halted.kai");
+        let canonical = format!("{CONFIG_ROOT}/halted.kai");
         let ctx = config_context_id(&canonical);
         blocks
             .create_document_with_path(ctx, DocKind::File, None, canonical)
@@ -604,20 +628,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_covers_all_four_mount_roots() {
+    async fn export_covers_every_document_backed_mount_root() {
         let blocks = blocks_with_db();
-        for root in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
+        for &root in &MOUNT_ROOTS {
             let fs = ConfigDocFs::new(blocks.clone(), root);
             fs.write_all(StdPath::new("probe.txt"), b"present")
                 .await
                 .unwrap();
         }
+        // rc melted onto host files (docs/rc-on-disk.md); a document left
+        // over under RC_ROOT must never resurface through the export, even
+        // though this test never removes it from the block store.
+        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
+        rc.write_all(StdPath::new("probe.txt"), b"stale").await.unwrap();
+
         let exported = export_config_tree(&blocks).unwrap();
-        for root in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
+        for &root in &MOUNT_ROOTS {
             assert!(
                 exported.iter().any(|e| e.root == root && e.rel_path == "probe.txt"),
                 "missing probe under {root}: {exported:#?}"
             );
         }
+        assert!(
+            !exported.iter().any(|e| e.root == RC_ROOT),
+            "RC_ROOT documents must never surface in the export: {exported:#?}"
+        );
     }
 }

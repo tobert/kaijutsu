@@ -107,6 +107,31 @@ guess. It belongs to the config half of the melt — `docs/config-namespace.md`,
 which moves these roots under `/config` and deletes `ConfigDocFs`. Answer the
 per-client write-target question there, since that melt has to answer it anyway.
 
+## The rc melt orphaned its documents and nothing deletes them (2026-08-29)
+
+`/etc/rc` moved from `ConfigDocFs` to a `LocalBackend` over a host directory,
+but the documents that used to back it were never removed from the block
+store. They are still in `kernel.db`, unreachable through the VFS, and **stale
+the moment a script is edited on disk**.
+
+Found while wiring `kj config export`: `config_export::MOUNT_ROOTS` still
+listed `RC_ROOT`, so the migration tool would have walked those dead documents
+and materialized a dead copy of the rc tree over a live one. `MOUNT_ROOTS` is
+now the three document-backed roots and a test asserts no exported path starts
+with `rc/`.
+
+Two things follow.
+
+**A cleanup pass belongs in the `/config` melt** (`docs/config-namespace.md`).
+Once the other three roots melt, every document under all four roots is an
+orphan. `kernel.db` is 932 MB and nobody has measured how much of that is
+config documents nothing can reach.
+
+**The general rule this is an instance of:** melting a tree off the block store
+leaves its documents behind, because the melt changes what is *mounted*, not
+what is *stored*. Whoever melts the remaining three roots must delete the
+documents in the same change or file the same entry again.
+
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
 `context_type` on `register_session` is caller-chosen free text with no

@@ -78,6 +78,14 @@ enum ConfigCommand {
         /// Config file name (e.g. theme.toml) or full /etc/config path
         path: String,
     },
+    /// Write every config file the kernel holds into a host directory, one
+    /// subdirectory per tree (config/, client/, midi/). Refuses to overwrite:
+    /// an existing file is named and left alone. rc is not included — it is
+    /// already host files.
+    Export {
+        /// Host directory to write into. Created if absent.
+        dir: String,
+    },
 }
 
 /// Canonicalize a user-supplied config arg to its `/etc/config/<name>` path.
@@ -158,6 +166,7 @@ impl KjDispatcher {
             ConfigCommand::List { json } => self.config_list(json).await,
             ConfigCommand::Show { path, json, raw } => self.config_show(&path, json, raw).await,
             ConfigCommand::Reset { path } => self.config_reset(&path).await,
+            ConfigCommand::Export { dir } => self.config_export(&dir),
         };
         if let Some(canonical) = write_path
             && matches!(result, KjResult::Ok { .. })
@@ -165,6 +174,76 @@ impl KjDispatcher {
             self.kernel().invalidate_config_file_cache(&canonical);
         }
         result
+    }
+
+    /// Write every document-backed config file into a host directory, one
+    /// subdirectory per tree.
+    ///
+    /// The migration step off kernel-owned config (`docs/config-namespace.md`):
+    /// it turns documents the kernel holds into the files that will back the
+    /// same paths afterward. rc is not included — it is already host files, and
+    /// the documents that once backed it are stale.
+    ///
+    /// **Refuses to overwrite.** An existing target is named and nothing is
+    /// written, because the thing this would clobber is the config you are
+    /// migrating *to*. Point it at an empty directory, or move what is in the
+    /// way. Same posture as `rc reseed`: name the obstacle, never silently
+    /// resolve it.
+    fn config_export(&self, dir: &str) -> KjResult {
+        let dir = std::path::Path::new(dir);
+        let entries = match crate::config_export::export_config_tree(self.block_store()) {
+            Ok(e) => e,
+            Err(e) => return KjResult::Err(format!("kj config export: {e}")),
+        };
+        if entries.is_empty() {
+            return KjResult::Err(
+                "kj config export: the kernel holds no config documents — nothing to export"
+                    .to_string(),
+            );
+        }
+
+        let occupied: Vec<String> = entries
+            .iter()
+            .map(|e| e.export_rel_path())
+            .filter(|rel| dir.join(rel).symlink_metadata().is_ok())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .collect();
+        if !occupied.is_empty() {
+            let mut lines = vec![format!(
+                "kj config export: {} file(s) already exist under {} — nothing written:",
+                occupied.len(),
+                dir.display()
+            )];
+            for rel in &occupied {
+                lines.push(format!("  {rel}"));
+            }
+            lines.push("export into an empty directory instead.".into());
+            return KjResult::Err(lines.join("\n"));
+        }
+
+        if let Err(e) = crate::config_export::materialize(&entries, dir) {
+            return KjResult::Err(format!("kj config export: {e}"));
+        }
+
+        let mut lines = vec![format!("exported {} config file(s) to {}", entries.len(), dir.display())];
+        let mut by_root: std::collections::BTreeMap<&str, usize> = Default::default();
+        for e in &entries {
+            *by_root.entry(e.root).or_default() += 1;
+        }
+        for (root, n) in &by_root {
+            lines.push(format!("  {root}: {n}"));
+        }
+        KjResult::ok_with_data(
+            lines.join("\n"),
+            serde_json::json!({
+                "dir": dir.to_string_lossy(),
+                "exported": entries.len(),
+                "paths": entries
+                    .iter()
+                    .map(|e| e.export_rel_path().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            }),
+        )
     }
 
     /// Read a config file's content from the VFS. `Ok(None)` for an absent file
@@ -388,6 +467,89 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// `kj config export` turns the kernel's config documents into the files
+    /// that will back the same paths after the melt
+    /// (`docs/config-namespace.md`), laid out one subdirectory per tree.
+    ///
+    /// **rc must not appear.** rc is host files already, and the documents
+    /// that once backed it were never deleted — exporting them would write a
+    /// dead copy of the rc tree over a live one. This is the assertion that
+    /// keeps `MOUNT_ROOTS` honest from the verb's side.
+    #[tokio::test]
+    async fn config_export_writes_the_document_trees_and_never_rc() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let out = tempfile::tempdir().expect("tmpdir");
+
+        let result = d
+            .dispatch(
+                &[s("config"), s("export"), s(&out.path().to_string_lossy())],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        assert!(
+            out.path().join("config/theme.toml").is_file(),
+            "the seeded theme must land as a real file: {}",
+            result.message()
+        );
+        assert!(
+            !out.path().join("rc").exists(),
+            "rc is host files; its stale documents must never be exported"
+        );
+
+        let data = match &result {
+            KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("export must emit structured data: {other:?}"),
+        };
+        let paths: Vec<&str> = data["paths"]
+            .as_array()
+            .expect("paths is an array")
+            .iter()
+            .map(|v| v.as_str().expect("path is a string"))
+            .collect();
+        assert!(paths.contains(&"config/theme.toml"), "{paths:?}");
+        assert!(
+            paths.iter().all(|p| !p.starts_with("rc/")),
+            "no exported path may be under rc/: {paths:?}"
+        );
+    }
+
+    /// Export refuses rather than overwrites, and names what is in the way.
+    /// The thing a silent overwrite would destroy is the config being migrated
+    /// *to*, so this is the one direction where clobbering is unrecoverable.
+    ///
+    /// Falsified by dropping the `occupied` pre-check: the second export
+    /// succeeds and the planted file is replaced.
+    #[tokio::test]
+    async fn config_export_refuses_to_overwrite_and_names_the_obstacle() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let out = tempfile::tempdir().expect("tmpdir");
+        let argv = [s("config"), s("export"), s(&out.path().to_string_lossy())];
+
+        assert!(d.dispatch(&argv, &c).await.is_ok(), "first export lands");
+
+        // Plant a change in the export, as if a human had edited it, then
+        // export again over the top.
+        let planted = out.path().join("config/theme.toml");
+        std::fs::write(&planted, "# mine\n").expect("plant");
+
+        let second = d.dispatch(&argv, &c).await;
+        assert!(!second.is_ok(), "a second export must refuse: {second:?}");
+        assert!(
+            second.message().contains("config/theme.toml"),
+            "the obstacle must be named, not just counted: {}",
+            second.message()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&planted).unwrap(),
+            "# mine\n",
+            "the refusal must leave the existing file untouched"
+        );
     }
 
     /// `kj config list` emits the seeded file names as a JSON array.
