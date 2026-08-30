@@ -176,7 +176,7 @@ One-line change; the app's two-step resolution
 | Thing | Lines | Why it goes |
 |---|---|---|
 | `runtime/config_doc_fs.rs` | 1339 | The backend itself. Nothing left to back. |
-| `config_export.rs` | 623 | Built for the cancelled git-worktree flip; zero production callers. |
+| `config_export.rs` | 623 | Built for a migration that was never run; zero production callers. |
 | `config_doc.rs` | 60 | The shared config-document model. |
 | `deny_etc_write` + tests | — | Only exists to draw a line inside `/etc`. |
 | `VfsOps::owns_config_docs` | — | Only ever `true` on `ConfigDocFs`. |
@@ -192,33 +192,27 @@ as `ensure_rc_seed_files`; reset-to-embedded already exists as
 host directory at bootstrap. That last one is this design in miniature, written
 months ago and used once per install.
 
-## Migration — one flag day
+## There is no migration
 
-`config_context_id` is a UUIDv5 of the canonical path (`config_doc.rs:28`), so
-**moving a path changes a document's identity.** Move and melt must be the same
-change; doing them in sequence would mint a second set of documents nobody
-reads.
+Every root seeds from its embedded default (`assets/defaults/`) while it is
+empty, the same way `ensure_rc_seed_files` already seeded rc. A fresh
+`--config-root` picks up the shipped defaults with no export, import, or
+flag day.
 
-1. `kj config export <dir>`, **run against a kernel built BEFORE this melt.**
-
-   This is the one ordering that cannot be recovered from. `export_config_tree`
-   walks *documents*; after the melt the trees are `LocalBackend` and hold none,
-   so the verb correctly reports nothing to export — and the documents holding
-   your real theme, `mcp.toml`, and the MIDI profiles pulled from actual
-   hardware are still in `kernel.db`, unreachable, with no verb left that reads
-   them.
-
-   So per machine: deploy a binary at `122fbef4` (or any commit after it and
-   before this melt), run `kj config export <dir>`, and only then deploy the
-   melt with `--config-root <dir>`.
-2. Move `~/.config/kaijutsu/etc/rc/` to the new config root.
-3. Declare the mounts; drop the four `/etc` mounts.
-4. Delete the table above.
-5. Repoint the `paths.rs` constants, the seeds, and every consumer.
-
-**`config_export.rs` earns its keep on the way out.** Dead code today, written
-for a flip that was cancelled, and its one legitimate job is step 1. Run it once
-per machine, then delete it in step 4.
+`kj config export` was built to carry the pre-melt documents in `kernel.db`
+forward, on the theory that a real theme edit or a MIDI profile pulled from
+actual hardware was worth keeping. Amy ruled otherwise: those documents are
+not worth a migration path. The `rc` tree's own documents were already found
+orphaned and measured — `docs/issues.md`, "The rc melt orphaned its documents
+and nothing deletes them" — at under 1 MB across all of `/etc/*`, and the
+same is true of the other three roots now that they have melted too. What is
+in them is stale besides: the `mcp.toml` document is the pre-2026-08-15
+default (the current shipped one is better), and the `system.md` document
+still claims the workspace is shared "over a CRDT substrate," which stopped
+being true when the CRDT was removed. Nothing reads these documents any
+more — `ConfigDocFs` is gone, so they are unreachable through the VFS — and
+nothing deletes them either; they simply sit in `kernel.db` as dead rows.
+`config_export.rs` is deleted with no migration ever having run against it.
 
 ## `docs/slash-v.md` principle 7
 

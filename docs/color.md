@@ -47,14 +47,17 @@ carries:
   the 3D identity hues (hex sRGB in the file, linearized on parse), the
   brightness **tier ladder**, and the live-signal **gains**.
 - **`[scene.post]`** → the camera's post chain: bloom intensity/boost and the
-  tonemapper by name. Applied **live** on theme change (the one part of the
-  scene lane that hot-applies), so `kj config set … theme.toml` is a live
-  color-management console.
+  tonemapper by name. Applied the moment the app receives `ThemeReceived` —
+  but that message has exactly one send site, the connect-time bootstrap
+  fetch, so editing `theme.toml` reaches a running app only on the next
+  reconnect (`docs/issues.md`, "Theme changes never reach a running app").
 
 Apply semantics: UI colors and `[scene.post]` apply immediately on
 `ThemeReceived`; `[scene]` hues/tiers are read at **spawn time**, so a running
 room re-skins on the next room entry. (Materials are built once at spawn — this
-is a documented trade, not an accident.)
+is a documented trade, not an accident.) `ThemeReceived` itself only fires at
+connect — there is no live config push yet, so both apply-semantics above wait
+for a reconnect in practice.
 
 `view/palette.rs` keeps two jobs only: the **compiled-in defaults** that
 `ScenePalette::default()` mirrors (so the app renders correctly before the
@@ -104,18 +107,22 @@ One shared HDR `Camera3d` (`main.rs::setup_camera`): bloom `intensity 0.12 /
 low_frequency_boost 0.25 / threshold 1.0 / OLD_SCHOOL`, tonemapper
 **TonyMcMapface**, no exposure/grading components. `[scene.post]` overrides
 intensity/boost/tonemapper; threshold stays 1.0 — it's the HDR-tell boundary,
-not a style knob. Tonemapper A/B is live: change the value, `kj config set`,
-watch the room. (BRP `world_mutate_components` on the camera works too.)
+not a style knob. Tonemapper A/B: edit the value in `theme.toml`, reconnect,
+watch the room. For a live A/B without a reconnect, use BRP
+`world_mutate_components` on the camera directly instead.
 
 ## How to
 
 - **Add a colored element**: decide its lane. Scene → pick an identity hue from
   `ScenePalette` (add one if genuinely new) × a tier; live signals get a gain.
   UI → add a `theme.toml` key + `Theme` field; no literals in view code.
-- **Re-skin the app**: edit `theme.toml` (`kj config set /config/kernel/theme.toml
-  --content "$(cat file)"`), UI + post apply live, re-enter the room for scene
-  hues. The shipped default skin lives in `assets/defaults/theme.toml`
-  (seeded once — a fresh kernel picks it up; a live one needs `kj config set`).
+- **Re-skin the app**: edit `/config/kernel/theme.toml` directly — with the
+  file tools, `kj editor /config/kernel/theme.toml`, or vim — then reconnect
+  the app (UI + post apply on `ThemeReceived`; there is no live push, so a
+  running app keeps the old theme until it reconnects). Re-enter the room for
+  scene hues, which are read at spawn time. The shipped default skin lives in
+  `assets/defaults/theme.toml`, seeded into `/config/kernel/theme.toml` only
+  while that file is empty.
 - **Check a color at a pixel**: BRP screenshot + eyedropper; remember the
   screenshot is post-tonemap sRGB.
 

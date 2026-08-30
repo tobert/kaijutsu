@@ -91,8 +91,9 @@ the other three roots melt, since that is when the answer changes again.
 `kj config set` used to default a write to the caller's own
 `/config/client/<id>/<name>` and need an explicit path to reach the shared
 `/config/client/default/<name>` — a client tweaking its metronome never
-touched a neighbor's. That verb is gone; `kj config` is `list`, `show`,
-`reset`, and `export` (`docs/config-namespace.md`). Nothing has taken over the
+touched a neighbor's. That verb is gone; `kj config` is `list`, `show`, and
+`reset` (`docs/config-namespace.md`) — `export` shipped and was then deleted
+with the migration it existed for. Nothing has taken over the
 defaulting. Either the file tools (or something above them) need to reproduce
 it from the caller's client-id, or the policy is simply gone and every
 per-client write names its full path by hand. Undecided.

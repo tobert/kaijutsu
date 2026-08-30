@@ -106,9 +106,12 @@ kj mcp reload            # re-read mcp.toml, reconcile (see component 4)
 ```
 
 `list` is a read, ungated. `reload` materializes `mcp.toml` as running
-processes — the same authority tier as editing the file
-(`kj config set/edit mcp.toml`) — so it's gated on `Capability::ConfigWrite`
-rather than a bespoke capability.
+processes — spawning and killing subprocesses, not a file edit — so it's
+gated on `Capability::ConfigWrite`, the same authority that gates `kj config
+reset` and the other administrative config verbs (`kj backend`, `kj cast`,
+`kj alias`), rather than a bespoke capability. Editing `mcp.toml` itself —
+with the file tools, `kj editor`, or vim — carries no capability gate: config
+is an ordinary write surface (`docs/config-namespace.md`).
 
 ## Transport (`mcp/servers/external.rs`)
 
