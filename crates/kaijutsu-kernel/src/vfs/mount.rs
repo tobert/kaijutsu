@@ -2169,7 +2169,7 @@ mod tests {
         use crate::vfs::backends::LocalBackend;
         let dir = tempfile::TempDir::new().unwrap();
         // Deliberately do NOT create `dir/v` — the mount root exists, its
-        // "/v" child does not, matching the real "/etc/rc" shape this
+        // "/v" child does not, matching the real "/config/rc" shape this
         // guards.
         let table = MountTable::new();
         table.mount("/", LocalBackend::new(dir.path())).await;

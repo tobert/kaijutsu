@@ -85,8 +85,7 @@ status line and leaving the session open and dirty; `:w!` overrides.
   floats above the dock rather than integrating with its status row.
 
 Tracked in `docs/issues.md` (not repeated here): the slice-3 polish
-runner-verify, `:e <path>`, and the residual `config_owned` sync prefix on the
-cache-invalidation path.
+runner-verify and `:e <path>`.
 
 ---
 
@@ -274,39 +273,30 @@ The same surface a test drives is what a model plays.
    squats it. Open + save surface permission errors loudly — crash over
    corruption.
 
-### Path resolution — bind to the owner, not a copy
+### Path resolution — one branch, the file cache
 
-`resolve_editor_target(path, blocks, file_cache, mounts)` in
-`crates/kaijutsu-kernel/src/editor.rs` is **ownership-aware**, and that is
-load-bearing:
+`resolve_editor_target(path, file_cache)` in
+`crates/kaijutsu-kernel/src/editor.rs` resolves every path the same way:
+`FileDocumentCache::try_get_or_load(path)` mints or loads the working-copy
+file-doc that owns the path's text, and the editor binds to its
+`(context_id, block_id)`. Every `/config` tree — `rc`, `kernel`, `client`,
+`midi` — mounts as an ordinary host directory (`docs/config-namespace.md`),
+the same as any other path, so there is no second branch to route a config
+path down.
 
-- **config-owned**: the mount table answers — `MountTable::owner_of(path)` +
-  `VfsOps::owns_config_docs()` (the config-doc backends answer for themselves;
-  `ConfigDocFs` returns `true`). Bind to
-  `(config_doc::config_context_id(path), config_doc::first_block_id(..))` —
-  the `ConfigDocFs`-owned block, the sole source of truth. A config path is
-  config-owned only when its backend is actually *mounted* (you can't edit an
-  unmounted tree).
-- **ordinary file**: `FileDocumentCache::get_or_load(path)`.
-
-**`/config/rc` takes the ordinary-file branch now**, because the mount table is
-the authority and rc's mount is a `LocalBackend` over a host directory
-(`docs/rc-on-disk.md`). That the answer comes from the mount table and not a
-path prefix is what let rc change sides without touching this code, and it is
-pinned by `resolve_editor_target_marks_config_owned_from_the_mount_table_not_a_path_prefix`
-in `crates/kaijutsu-kernel/src/editor.rs`. **The other three roots take it too
-now** — `/config/kernel`, `/config/client` and `/config/midi` also mount
-through `LocalBackend` (`docs/config-namespace.md`), so `config_owned` is
-always `false` in production today; `ConfigDocFs` sits unmounted, and
-deleting it is the follow-up `docs/config-namespace.md` names.
-
-A config document was a sole-owned single-block `DocKind::File`. Running a
-config path through `get_or_load` would have minted a *separate*
-`FileDocumentCache` copy shadowing that owner — the dual-ownership
-write-through bug class the kernel-owned design existed to prevent
-(`docs/devlog.md`, "The kernel becomes sole owner of itself, then gives it
-back"). Missing config docs **fail loud** (no empty editor) on any mount
-that still answers `owns_config_docs()`.
+**The ownership-aware branch is gone** (`dc8a5e92`, 2026-08-30):
+`ConfigDocFs`, `EditorTarget::config_owned`, `VfsOps::owns_config_docs`,
+`config_doc.rs`, and the four-argument
+`resolve_editor_target(path, blocks, file_cache, mounts)` signature all went
+together. What that branch guarded against — a config path running through
+`get_or_load` and minting a *separate* `FileDocumentCache` copy shadowing a
+kernel-owned document, the dual-ownership write-through bug class the
+kernel-owned design existed to prevent (`docs/devlog.md`, "The kernel
+becomes sole owner of itself, then gives it back") — cannot happen once
+every config tree is an ordinary host file: there is exactly one owner, the
+file cache, for any path. A missing file still **fails loud** (no empty
+editor) — `try_get_or_load` surfaces the open error rather than serving a
+phantom block.
 
 ---
 
@@ -456,5 +446,4 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `sync_editor_cursor`) |
 | Precedent: input-doc surface | `kaijutsu-kernel/src/input_doc.rs` |
 | Compose vim (untouched) | `kaijutsu-app/src/input/vim/` (`mod.rs`, `dispatch.rs`) |
-| Config doc owner | `kaijutsu-kernel/src/config_doc.rs` (`config_context_id`, `first_block_id`) |
-| File doc cache | `kaijutsu-kernel/src/file_tools/cache.rs` (`get_or_load`) |
+| File doc cache | `kaijutsu-kernel/src/file_tools/cache.rs` (`get_or_load`, `try_get_or_load`) |

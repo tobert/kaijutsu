@@ -2,7 +2,7 @@
 //! session and fire the rc `attach` lifecycle on it.
 //!
 //! Distinct from `kj context switch`: switch is pure focus-change,
-//! while attach also runs `/etc/rc/<context_type>/attach/SXX-*.{kai,md}`
+//! while attach also runs `/config/rc/<context_type>/attach/SXX-*.{kai,md}`
 //! scripts on the target. Use cases include "set up state when joining a
 //! shared/team context" or "show a banner block on resume." The session
 //! is moved to the target context (via `KjResult::Switch`) regardless

@@ -7,7 +7,7 @@
 //! model gets per-call awareness without losing the static base.
 //!
 //! Additional context-specific sections (the rc `.md` mechanism — task or
-//! mode instructions installed at `/etc/rc/<context_type>/create/`) layer
+//! mode instructions installed at `/config/rc/<context_type>/create/`) layer
 //! between the static base and the situation block: `base → rc → situation`.
 
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, ContextState, Role};

@@ -6079,7 +6079,7 @@ mod tests {
                     workspace_id: ws_id,
                     doc_kind: DocumentKind::Conversation,
                     language: None,
-                    path: Some("/etc/rc/shared.kai".into()),
+                    path: Some("/config/rc/shared.kai".into()),
                     created_at: now_millis() as i64,
                     created_by: creator,
                 })
@@ -6093,12 +6093,12 @@ mod tests {
                 new_id,
                 DocumentKind::Conversation,
                 None,
-                "/etc/rc/shared.kai".to_string(),
+                "/config/rc/shared.kai".to_string(),
             )
             .unwrap_err();
         match &err {
             BlockStoreError::DocumentPathConflict { path, existing } => {
-                assert_eq!(path, "/etc/rc/shared.kai");
+                assert_eq!(path, "/config/rc/shared.kai");
                 assert_eq!(*existing, existing_id);
             }
             other => panic!("expected DocumentPathConflict, got: {other}"),

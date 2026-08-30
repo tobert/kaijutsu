@@ -7106,15 +7106,6 @@ key-value store demolished 2026-07-04.*
   **step 4 `:e <path>`** (rebind the session to another
   block) deferred; the Ctrl+Z shell may become a **shadow context** (its own
   design pass; `project_shadow_context_shell` memory).
-- **Vi editor — residual `config_owned` prefix on the cache-invalidation path.**
-  `resolve_editor_target` now decides config-ownership via the mount table
-  (`MountTable::owner_of` + `VfsOps::owns_config_docs`, 2026-06-27), but
-  `Kernel::invalidate_config_file_cache` still uses the hardcoded `config_owned`
-  prefix check. It's the **sync** guard on the sync `editor_quit` path; routing it
-  through the async mount-table query would cascade `editor_quit` (+ its wire
-  handlers) to async. Unify when that path is reworked, or add a sync
-  mount-ownership lookup. Low stakes (cache-coherence optimization), but it's a
-  second source of truth for config-ownership.
 - **User presence (novel surface):** The compose input is a shared draft block. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.

@@ -160,7 +160,7 @@ pub enum Capability {
     /// distinct from `Admin` (which is narrowly loadout-write).
     Operator,
     /// `kj config set/reset` — may write the kernel-owned config files at
-    /// `/etc/config` (system.md, theme.toml, mcp.toml) AND the SQL-native model
+    /// `/config/kernel` (system.md, theme.toml, mcp.toml) AND the SQL-native model
     /// config surfaces (`kj backend`/`kj cast`/`kj alias`). Dedicated so a
     /// broad loadout (e.g. `coder` with "*") can't silently rewrite which
     /// model runs or the base system prompt. `kj config` writes go straight

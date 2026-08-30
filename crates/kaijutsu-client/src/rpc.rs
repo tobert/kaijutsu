@@ -781,7 +781,7 @@ impl KernelHandle {
 
     /// Create a new context with a label and an explicit `context_type`.
     ///
-    /// The type selects which `/etc/rc/<context_type>/create/*` lifecycle
+    /// The type selects which `/config/rc/<context_type>/create/*` lifecycle
     /// scripts run server-side. An empty `context_type` is treated as
     /// `"default"` by the server.
     #[tracing::instrument(skip(self), name = "rpc_client.create_context_typed")]
@@ -2697,7 +2697,7 @@ impl KernelHandle {
     /// asking any of them for a size first.
     ///
     /// The app's device-profile fetch rides this: a sink reads
-    /// `/etc/midi/devices/<name>` for its match strings the same way any
+    /// `/config/midi/devices/<name>` for its match strings the same way any
     /// other config reaches a client (`docs/midi-next.md` "Presence is
     /// sink-fed": *profiles reach the app the same way any config does*).
     #[tracing::instrument(skip(self), name = "rpc_client.vfs_read_all")]

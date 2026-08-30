@@ -1339,7 +1339,7 @@ fn config_canonical(path: &str) -> String {
     }
 }
 
-/// One-time seed override for a `/etc/config/<name>` path: the body of a host
+/// One-time seed override for a `/config/kernel/<name>` path: the body of a host
 /// file under `config_dir`, if both the dir and file exist. Returns `None`
 /// (→ caller uses the embedded default) when no dir is given or no host file is
 /// present. This is a bootstrap source only — never read again after seeding.
@@ -1846,7 +1846,7 @@ mod context_bootstrap_tests {
 /// persistence, default context, config backend, block tools, LLM, and MCP.
 /// The returned `SharedKernel` is shared across all connections via `Arc`.
 pub async fn create_shared_kernel(
-    // One-time config seed source on a fresh kernel (see the /etc/config
+    // One-time config seed source on a fresh kernel (see the /config/kernel
     // mount below). NOT ongoing ownership: production passes None (embedded
     // defaults; the kernel never reads the user's host config). Tests point it
     // at a tempdir to inject config seeds.

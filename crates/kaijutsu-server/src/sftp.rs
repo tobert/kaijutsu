@@ -2,7 +2,7 @@
 //!
 //! Bridges `russh_sftp::server::Handler` onto the kernel's [`VfsOps`] mount
 //! tree, so any off-the-shelf SFTP client (sshfs, `sftp`, an editor's remote-FS
-//! plugin) reads and writes the unified tree — host FS (including `/etc/rc`)
+//! plugin) reads and writes the unified tree — host FS (including `/config/rc`)
 //! and `/v/...`, and the memory scratch at `/tmp` — over the same SSH server
 //! that carries the Cap'n Proto RPC channel. See `docs/sftp.md`.
 //!

@@ -5,13 +5,16 @@ on 2026-08-21. Production mounts `/config/rc` from a host directory,
 `rc-write` is deleted, `kj rc` is down to `add`/`list`/`rm`/`show`, and hook
 bodies are path references read at fire time. `docs/config-namespace.md`
 is canonical for `/config/kernel`, `/config/client` and `/config/midi`, and
-for the mount registry all four roots live under.
+for the mount registry all four roots live under. `ConfigDocFs` itself — the
+document-backed backend all four trees mounted before this melt — is deleted
+(`dc8a5e92`, 2026-08-30); every reference to it below is now history, not a
+pending blocker.
 
 **Reseeding is routine, not a rescue** (Amy, 2026-08-29): *"my rc is in the
 code ... for the foreseeable future, we will reseed regularly."* So the host
 tree is a materialization of the in-repo seed, and `kaijutsu-server rc reseed
 --force` is an ordinary operation to design around. The snowflake TOML under
-`/etc/config` is the opposite case — local, secret-bearing, never reseeded
+`/config/kernel` is the opposite case — local, secret-bearing, never reseeded
 over — which is one more reason the four roots do not all melt the same way.
 
 **Amy ruled the git question on 2026-08-28: plain files, the kernel never
@@ -21,20 +24,25 @@ choice about a directory (ours is shared from `~/.config` through a local
 gitea), never a mechanism the kernel performs. That closes the question the
 earlier kernel-owned design had left open.
 
-    ~/.config/kaijutsu/etc/rc/coder/create/S00-stance.kai
+    ~/.config/kaijutsu/config/rc/coder/create/S00-stance.kai
 
-rc scripts become ordinary host files under `~/.config/kaijutsu/etc/rc/`,
-mounted at `/etc/rc` through `LocalBackend`. The kernel reads the latest bodies
-from disk at the start of every lifecycle run and records what it ran in the
-approval ledger's content-addressed store. Git is optional and unmanaged by us.
+rc scripts are ordinary host files under `~/.config/kaijutsu/config/rc/` (the
+`<config-root>/<name>` default; `docs/config-namespace.md`'s mount registry
+can point `/config/rc` anywhere), mounted at `/config/rc` through
+`LocalBackend`. The kernel reads the latest bodies from disk at the start of
+every lifecycle run and records what it ran in the approval ledger's
+content-addressed store. Git is optional and unmanaged by us.
 
 ## The four decisions
 
-1. **Location: `~/.config/kaijutsu/etc/rc/`**, configurable later. *"Users can
-   always use git there, or they can remap. defaults should just work with or
-   without git."* The kernel never runs git and never requires a repo — ours is
-   shared from `~/.config` through a local gitea, which is a user's choice about
-   a directory, not a kernel feature.
+1. **Location: `~/.config/kaijutsu/config/rc/`** (`~/.config/kaijutsu/etc/rc/`
+   at the time of this ruling — the tree renamed off `/etc` in the melt below),
+   configurable later. *"Users can always use git there, or they can remap.
+   defaults should just work with or without git."* The kernel never runs git
+   and never requires a repo — ours is shared from `~/.config` through a local
+   gitea, which is a user's choice about a directory, not a kernel feature.
+   "Configurable later" landed as the mount registry — `--mount` and
+   `mounts.toml` remap the default (`docs/config-namespace.md`).
 2. **Bodies are stored on use.** `rc_run_scripts.body_sha256 →
    script_bodies(sha256)` already exists and already dedupes by content. It
    stays. A hash nothing can resolve is a hash of nothing: git answers only for
@@ -50,7 +58,7 @@ approval ledger's content-addressed store. Git is optional and unmanaged by us.
    The real reason is that the capability stopped naming a real distinction.
    `rc-write` existed to say rc is executable and config is data, so the two
    deserve different write surfaces. Once both are host files under
-   `~/.config/kaijutsu/etc/`, a player edits rc the way it edits anything —
+   `~/.config/kaijutsu/config/`, a player edits rc the way it edits anything —
    the file tools, the editor, `vim` on the host, an sftp client, git. The
    loadout check covers exactly one of those paths, so what it delivers is
    not "rc is protected" but "rc is protected from the one player who
@@ -79,11 +87,17 @@ one most tests run on.
   set and a script editing its neighbor mid-run cannot tear it. That is the
   "load the latest from disk before running" semantics already, against a
   different backend.
-- **The broadly-used test dispatcher already mounts `/etc/rc` from
+- **The broadly-used test dispatcher already mounts `/config/rc` from
   `LocalBackend`** over a real host directory (`kj/mod.rs:988`), seeded by
   `seed_scripts::ensure_rc_seed_files` (`seed_scripts.rs:125`) — an
   install-if-absent disk seeder that already skips paths that exist. The
-  document-backed `ConfigDocFs` is the path needing its own special tests.
+  document-backed `ConfigDocFs` was the path that had needed its own special
+  tests; those fixtures were migrated onto real host directories and real
+  symlinks when `ConfigDocFs` was deleted (`dc8a5e92`, 2026-08-30), which also
+  surfaced a bug the document-backed fixtures had been masking: `rc_seed_status`
+  compared a seed body's absolute path against a live symlink's host-relative
+  target, so every composed rc script reported "differs from seed" until real
+  symlinks made the mismatch visible.
 - **The ledger record is built.** `approval-ledger/src/schema.rs:602` — one row
   per script per run, in order, pointing at a deduped body, `exit_code` and
   timings alongside.
@@ -91,14 +105,18 @@ one most tests run on.
 ## Slices
 
 1. **Point production at disk.** Mount `LocalBackend` on `~/.config/kaijutsu/
-   etc/rc` (path from config, with the default above), seed with
+   config/rc` (path from config, with the default above), seed with
    `ensure_rc_seed_files`, delete the rc half of `ConfigDocFs`. Symlinks become
    real symlinks, which retires `DocKind::Symlink` for rc and the `read_all`
-   symlink-sizing override.
+   symlink-sizing override. (`ConfigDocFs` itself outlived this slice as the
+   backend for the other three roots and for test fixtures, until it was
+   deleted outright — `dc8a5e92`, 2026-08-30, below.)
 2. **Drop `rc-write`.** Mechanical, across: `kaijutsu-types/
    src/paths.rs`, `file_tools/{path,guard}.rs`, `kj/{rc,config,binding,editor,
    mod}.rs`, `mcp/binding.rs`, `runtime/config_doc_fs.rs`, `kernel_db.rs`,
-   `kaijutsu-server/src/{rpc,sftp}.rs`, `tests/rc_role_bindings.rs`.
+   `kaijutsu-server/src/{rpc,sftp}.rs`, `tests/rc_role_bindings.rs`. (`runtime/
+   config_doc_fs.rs` named here no longer exists at all — deleted whole,
+   `dc8a5e92`.)
 3. **Shrink `kj rc`. Shipped.** `edit`, `reset` and `reseed` are deleted —
    with `reseed` went its unified-diff machinery, because on disk `git diff` is
    the diff, and reseeding is `kaijutsu-server rc reseed [--force]` off the
@@ -108,8 +126,9 @@ one most tests run on.
 
    Two things fell out that were not planned for. `kj rc`'s call into
    `config_doc_fs::seed_link_target` went with `reset`, leaving the disk seeder
-   as its only remaining caller — the `ConfigDocFs` blocker is that much
-   smaller. And the lexical deny on SFTP writes to `/etc/rc` and `/etc/config`
+   as its only remaining caller — the `ConfigDocFs` blocker was that much
+   smaller, and gone entirely once `ConfigDocFs` itself was deleted
+   (`dc8a5e92`, 2026-08-30). And the lexical deny on SFTP writes to `/etc/rc` and `/etc/config`
    (`privileged_write_denied`) was deleted in the same pass: it existed to stop
    an SFTP write bypassing `RcWrite`/`ConfigWrite`, and neither gates a file
    write any more, so it was denying writes every other path already allowed.
@@ -138,11 +157,18 @@ trees do not stay under `/etc`, and their host location stops being a
 compiled-in constant. They become `/config/rc`, `/config/midi`,
 `/config/client` and the base `/config`, each a well-known name whose host
 directory is a mount declaration. Squatting `/etc` cost a guard
-(`deny_etc_write`) that exists for no other reason.
+(`deny_etc_write`) that existed for no other reason, and it is deleted along
+with the rename.
 
 **Ruled 2026-08-21.** `ConfigDocFs` serves `/etc/rc`, `/etc/config`,
 `/etc/client` and `/etc/midi`. All four become host directories, and
 `ConfigDocFs` is deleted rather than left serving a shrinking set of roots.
+
+**Done 2026-08-30 (`dc8a5e92`).** All four roots mount `LocalBackend`, and
+`ConfigDocFs` — the file, the `owns_config_docs`/`config_owned` predicates
+that answered for it, and `config_doc.rs`, its kernel-document model — no
+longer exist in the tree. No migration ran against the documents it used to
+serve; `docs/config-namespace.md`, "There is no migration" has the reasoning.
 
 rc is the one with executable semantics and a lifecycle, so it is the harder
 melt and the one this document details. The other three are plain data on a
@@ -158,6 +184,7 @@ way, and getting it right teaches the other three.
 Nothing is waiting on a ruling. The work is unbuilt.
 
 **Multi-machine.** kaijutsu runs on moltar, zorak and a MacBook Pro, each with
-its own kernel documents today. A shared `~/.config` checkout is the first
-design where an rc change can travel between them. Nothing here depends on
-that; it is what the location makes possible.
+its own local `~/.config/kaijutsu/config/` directory today. A shared
+`~/.config` checkout is the first design where an rc change can travel
+between them. Nothing here depends on that; it is what the location makes
+possible.

@@ -198,7 +198,7 @@ pub struct TimeoutPolicy {
     pub kaish_request_timeout: Duration,
 
     /// Per-rc-script bound used by `KjDispatcher::run_kai_script`. Overrides
-    /// `kaish_request_timeout` for `/etc/rc/<context_type>/<verb>/SXX-name.kai`
+    /// `kaish_request_timeout` for `/config/rc/<context_type>/<verb>/SXX-name.kai`
     /// scripts. On elapse, kaish returns exit 124 and the failure block lands
     /// via `insert_rc_failure_block` like any other non-zero exit.
     pub rc_script_timeout: Duration,

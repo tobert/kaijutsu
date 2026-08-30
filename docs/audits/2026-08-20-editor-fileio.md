@@ -1,5 +1,11 @@
 # Editor + file-I/O tech-debt audit (2026-08-20)
 
+> **Resolved by deletion, not by fix (2026-08-30, `dc8a5e92`).** The
+> `config_owned` / `ConfigDocFs` machinery this audit's B1 finding depends on no
+> longer exists — every `/config` tree (renamed from `/etc` on 2026-08-29)
+> mounts `LocalBackend` over a host directory, and `resolve_editor_target` has
+> one branch. The findings stand below as the record of why.
+
 Read-only audit of the lane that churned on 2026-08-18/19. No edits, no git
 mutations. `cargo check -p kaijutsu-kernel --all-targets` is clean at
 `7f3ab694`; every claim below is from reading the current source.

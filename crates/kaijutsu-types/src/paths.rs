@@ -1,5 +1,6 @@
 //! Canonical VFS path constants, builders, and predicates for kaijutsu's
-//! well-known mount points (`/etc/rc`, `/etc/config`, `/etc/client`, `/v/*`).
+//! well-known mount points (`/config/rc`, `/config/kernel`, `/config/client`,
+//! `/v/*`).
 //!
 //! This is the **one source of truth** for these strings. Every mount, gate,
 //! `format!`, and regex that addresses one of these trees builds its path (or
@@ -18,9 +19,9 @@
 //!
 //! # Boundary semantics
 //!
-//! Every predicate here is **component-boundary correct**: `/etc/rc` matches
-//! itself and any real path-component child (`/etc/rc/foo`), never a string
-//! that merely shares the prefix (`/etc/rcfoo`). Half a dozen call sites used
+//! Every predicate here is **component-boundary correct**: `/config/rc`
+//! matches itself and any real path-component child (`/config/rc/foo`), never
+//! a string that merely shares the prefix (`/config/rcfoo`). Half a dozen call sites used
 //! to reimplement this check by hand (correctly, as it happens); now there is
 //! one implementation, so a future site can't get it wrong.
 
@@ -182,7 +183,7 @@ pub fn midi_device_path(name: &str) -> String {
 
 /// One device's presence record path: `/run/midi/<device>`. The leaf name is
 /// the same `<device>` key as [`midi_device_path`] — presence is keyed by
-/// profile name, so `/etc/midi/devices/<name>` and `/run/midi/<name>` are the
+/// profile name, so `/config/midi/devices/<name>` and `/run/midi/<name>` are the
 /// durable and ephemeral halves of one device.
 pub fn midi_presence_path(device: &str) -> String {
     format!("{MIDI_RUN_ROOT}/{device}")
@@ -204,31 +205,31 @@ pub fn r_share_path(client_id: &str, share: &str) -> String {
 
 /// True if `path` is `root` itself or a real path-component child of it
 /// (`root` followed by `/`) — never merely a string that shares the prefix
-/// (`/etc/rc` vs `/etc/rcfoo`).
+/// (`/config/rc` vs `/config/rcfoo`).
 fn is_or_under(path: &str, root: &str) -> bool {
     path == root || (path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/'))
 }
 
-/// True if `path` is under the rc tree (`/etc/rc` or `/etc/rc/...`).
+/// True if `path` is under the rc tree (`/config/rc` or `/config/rc/...`).
 pub fn is_rc_path(path: &str) -> bool {
     is_or_under(path, RC_ROOT)
 }
 
-/// True if `path` is under the kernel-global config tree (`/etc/config` or
-/// `/etc/config/...`). Does not include the per-client tree — see
+/// True if `path` is under the kernel-global config tree (`/config/kernel`
+/// or `/config/kernel/...`). Does not include the per-client tree — see
 /// [`is_client_path`].
 pub fn is_config_path(path: &str) -> bool {
     is_or_under(path, CONFIG_ROOT)
 }
 
-/// True if `path` is under the per-client config tree (`/etc/client` or
-/// `/etc/client/...`).
+/// True if `path` is under the per-client config tree (`/config/client` or
+/// `/config/client/...`).
 pub fn is_client_path(path: &str) -> bool {
     is_or_under(path, CLIENT_ROOT)
 }
 
-/// True if `path` is under the MIDI device profile tree (`/etc/midi` or
-/// `/etc/midi/...`).
+/// True if `path` is under the MIDI device profile tree (`/config/midi` or
+/// `/config/midi/...`).
 pub fn is_midi_path(path: &str) -> bool {
     is_or_under(path, MIDI_ROOT)
 }

@@ -33,7 +33,7 @@ fn acp_peer_instance() -> &'static str {
 /// alphanumerics plus `-`/`_`/`.` survive, everything else (spaces, CJK,
 /// punctuation) collapses to `-`, and runs of `-` merge. Shared core for
 /// [`peer_nick_for_client`] (peer-registry nick) and [`client_config_id`]
-/// (`/etc/client` cascade key) — ACP names are programmatic identifiers
+/// (`/config/client` cascade key) — ACP names are programmatic identifiers
 /// supplied by another process, so keep the useful identifier characters
 /// rather than putting arbitrary display text into either address.
 fn slugify(name: &str) -> String {
@@ -73,7 +73,7 @@ pub fn client_config_id(name: &str) -> String {
     if slug.is_empty() { "acp-client".to_string() } else { format!("acp-{slug}") }
 }
 
-/// Pull the named cast out of a `/etc/client/<id>/cast.toml`-shaped
+/// Pull the named cast out of a `/config/client/<id>/cast.toml`-shaped
 /// document (`{ cast = "<label>" }`). Pure and RPC-free so it is
 /// unit-testable without a live kernel connection. Malformed TOML, a
 /// missing `cast` key, a non-string value, or an all-whitespace string all
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn client_config_id_shares_the_slug_but_not_the_peer_nicks_slash() {
-        // A `/etc/client/<id>/…` id is ONE path segment — a literal
+        // A `/config/client/<id>/…` id is ONE path segment — a literal
         // `acp/toad` (the peer nick) would misroute into a THIRD segment
         // that `config_canonical` rejects. `acp-toad` keeps the same slug,
         // disjoint namespace.

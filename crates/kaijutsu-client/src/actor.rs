@@ -1152,7 +1152,7 @@ impl ActorHandle {
 
     /// Create a context with an explicit `context_type` (mode bundle).
     ///
-    /// The type selects which `/etc/rc/<context_type>/create/*` scripts run
+    /// The type selects which `/config/rc/<context_type>/create/*` scripts run
     /// server-side. Empty `context_type` is treated as `"default"`.
     #[tracing::instrument(skip(self))]
     pub async fn create_context_typed(
@@ -1563,7 +1563,7 @@ impl ActorHandle {
     }
 
     /// Read a whole VFS file through the kernel's existing `Vfs` capability.
-    /// The sink's device-profile fetch rides this (`/etc/midi/devices/<name>`).
+    /// The sink's device-profile fetch rides this (`/config/midi/devices/<name>`).
     #[tracing::instrument(skip(self))]
     pub async fn vfs_read_all(&self, path: impl Into<String> + std::fmt::Debug) -> Result<Vec<u8>, CallError> {
         let path = path.into();

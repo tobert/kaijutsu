@@ -1311,7 +1311,8 @@ kaish), and exits 1 with a stderr hint ("run it as kaish directly, not
 through `sh -c`") on a match — a hard deny, not an escalation, per Amy's
 own "good for testing" framing. Symlinked (the seed-file convention
 `seed_scripts.rs` documents — the per-type file's body is just the link
-target path, reconstructed into a real symlink by `ConfigDocFs::seed`) into
+target path, reconstructed into a real symlink by the rc disk seeder
+(`seed_scripts::ensure_rc_seed_files`)) into
 `coder`, `default`, `mcp`, and `director`'s `create/` — every context type
 that holds `Capability::Exec` today; `musician`/`toolie` don't and are left
 alone (they only ever see the `ExternalExec::Deny` safe `shell`, which
@@ -1326,8 +1327,8 @@ shell_guard_denies_sh_dash_c_and_allows_benign_shapes` reads the literal
 seed file via `include_str!` (not a hand-copied duplicate) so it falsifies
 the guard's own logic against the exact body rc installs, and
 `kj::hook::tests::s45_shell_guard_installs_via_the_real_create_lifecycle`
-runs the seed through the REAL `create` rc lifecycle (seed →
-`ConfigDocFs`-reconstructed symlink → dispatch → `kj hook add`) and asserts
+runs the seed through the REAL `create` rc lifecycle (seed → the disk
+seeder's reconstructed symlink → dispatch → `kj hook add`) and asserts
 the hook actually lands.
 
 **A kaish 0.15.0 quoting rule this script's authoring surfaced** (confirmed

@@ -184,7 +184,7 @@ mod tests {
     use crate::vfs::VfsOps;
 
     /// Every test here needs a plain-file VFS mount, which `test_dispatcher`
-    /// doesn't provide by default (only `/etc/rc` is mounted).
+    /// doesn't provide by default (only `/config/rc` is mounted).
     async fn test_dispatcher_with_tmp() -> KjDispatcher {
         let d = test_dispatcher().await;
         d.kernel().mount("/tmp", MemoryBackend::new()).await;

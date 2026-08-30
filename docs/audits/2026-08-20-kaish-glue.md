@@ -91,8 +91,11 @@ in-script. Recorded so nobody proposes the script version without that cost.
   `/v/cas` shadowing fix.
 - `OutputProfile::Internal` — deliberate divergence until the upstream knob.
 - `background_exec.rs` not using `JobManager` — documented structural reasons.
-- `KaijutsuBackend` symlink refusal — rc composition routes through
-  `ConfigDocFs` on purpose.
+- `KaijutsuBackend` symlink refusal — rc composition routed through
+  `ConfigDocFs` on purpose. *(Superseded 2026-08-30, `dc8a5e92`: `ConfigDocFs`
+  is deleted and rc composition is real host symlinks through `LocalBackend`.
+  The refusal on conversation blocks still stands — symlinks have no meaning
+  there — but the reason named here no longer exists.)*
 - `--json` handling in `KjBuiltin::execute` — correct adoption of kaish 0.13
   output ownership; `kj` does not build its own envelope.
 - Latch-on-baggage (`kj_builtin.rs:850-923`) — the correct post-0.14 shape.

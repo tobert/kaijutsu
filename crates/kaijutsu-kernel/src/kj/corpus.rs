@@ -207,7 +207,7 @@ fn placeholder_for(arg_id: &str) -> String {
     if id.contains("context") || id.contains("id") || id.contains("block") {
         "019a2f3c".to_string()
     } else if id.contains("path") || id.contains("file") {
-        "/etc/rc/coder/create/S00-stance.kai".to_string()
+        "/config/rc/coder/create/S00-stance.kai".to_string()
     } else if id.contains("hash") {
         "sha256-abc123def".to_string()
     } else {

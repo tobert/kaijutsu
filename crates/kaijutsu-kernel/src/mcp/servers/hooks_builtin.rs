@@ -77,7 +77,7 @@ pub enum HookActionWire {
     /// new behavior, re-add the hook (which re-snapshots from the
     /// current script).
     KaishScript { script_id: String },
-    /// A VFS path (e.g. `/etc/rc/lib/create/S50-lfm2d.kai`) whose contents
+    /// A VFS path (e.g. `/config/rc/lib/create/S50-lfm2d.kai`) whose contents
     /// are read fresh **at every fire**, never snapshotted. Persisted in
     /// `hooks.action_kaish_path`, not `hooks.action_kaish_body`. Editing
     /// the file at `path` reaches the running hook with no reinstall —

@@ -1,12 +1,17 @@
 # The config namespace — `/config` as a bind-mount registry
 
-**Status: built 2026-08-29.** The registry, the namespace move and the melt
-of all four trees have landed; `ConfigDocFs` deletion and the `DocKind::Symlink`
-retirement follow. This supersedes the earlier kernel-owned-config design, whose premise — the
-kernel is the sole owner and there is no host file — stops being true when
-this lands (that design's history is in `docs/devlog.md`, "The kernel
-becomes sole owner of itself, then gives it back"). It continues
-`docs/rc-on-disk.md`, which melted rc and left the other three roots.
+**Status: built 2026-08-29, `ConfigDocFs` deleted 2026-08-30.** The registry,
+the namespace move and the melt of all four trees landed 2026-08-29;
+`ConfigDocFs` itself — the document-backed backend every tree mounted before
+the melt — was deleted the next day (`dc8a5e92`), on Amy's ruling that the
+documents it served were not worth a migration path (see "There is no
+migration" below). `DocKind::Symlink` was **not** retired alongside it — see
+"Settled since". This supersedes the earlier kernel-owned-config design,
+whose premise — the kernel is the sole owner and there is no host file —
+stopped being true when this landed (that design's history is in
+`docs/devlog.md`, "The kernel becomes sole owner of itself, then gives it
+back"). It continues `docs/rc-on-disk.md`, which melted rc and left the
+other three roots.
 
 ## The rule
 
@@ -176,14 +181,15 @@ One-line change; the app's two-step resolution
 | Thing | Lines | Why it goes |
 |---|---|---|
 | `runtime/config_doc_fs.rs` | 1339 | The backend itself. Nothing left to back. |
-| `config_export.rs` | 623 | Built for a migration that was never run; zero production callers. |
+| `config_export.rs` | 657 | Built for a migration that was never run; zero production callers. |
 | `config_doc.rs` | 60 | The shared config-document model. |
 | `deny_etc_write` + tests | — | Only exists to draw a line inside `/etc`. |
 | `VfsOps::owns_config_docs` | — | Only ever `true` on `ConfigDocFs`. |
 | `EditorTarget::config_owned` + its branch | — | Binds to a block because there was no file. There is a file. |
-| `DocKind::Symlink` | — | Nothing creates one once rc composition is real symlinks. |
 
-Above 2000 lines. `ConfigDocFs` goes away entirely rather than shrinking again.
+Above 2000 lines. `ConfigDocFs` went away entirely rather than shrinking
+again — deleted (`dc8a5e92`, 2026-08-30), not shrunk. `DocKind::Symlink` was
+planned as part of this table but survived; see "Settled since".
 
 **What replaces the machinery is nothing.** Absent-only seeding already exists
 as `ensure_rc_seed_files`; reset-to-embedded already exists as
@@ -225,18 +231,25 @@ The junk-drawer rule stands and this design obeys it — config does not move in
 top-level tree, the same way `/r` is a sibling because it names remote clients
 rather than kernel-local virtual filesystems (`paths.rs:95-100`).
 
-## To measure, not assume
+## Settled since
 
-- **Does `Kernel::invalidate_config_file_cache` survive?** Two readings
-  disagree. `file_tools/cache.rs:706` argues the explicit call is required
-  because the editor writes the block directly and never advances the backend's
-  generation counter — an argument about `ConfigDocFs`, which dies with it.
-  Against that, a mutation on 2026-08-29 showed the rc shadow self-healing
-  without the hook, because a host file's stat moved. Settle it with a mutation
-  on each surviving write path.
-- **`DocKind::Symlink` is a persisted enum.** Removing a variant touches the
-  schema and possibly the wire; `migrate()` has no ALTER-TABLE path and
-  interface ordinals must stay sequential. Likely its own commit, after the rest.
+- **`Kernel::invalidate_config_file_cache` survives, for a different reason
+  than the one that was in question.** `dc8a5e92` (2026-08-30) rewrote
+  `file_tools/cache.rs:706`'s rationale: the explicit call has nothing to do
+  with `ConfigDocFs`. It is required because a composition symlink's write
+  can defeat the disk-generation staleness check `try_get_or_load` relies on
+  for everything else, so a cache entry still resident in memory has no
+  coherence signal telling it the file changed underneath it. `kj rc
+  add`/`rm` and `kj config reset` still call it explicitly for that reason.
+- **`DocKind::Symlink` was not retired.** `dc8a5e92` kept it — a persisted
+  enum with zero callers, on the same reasoning that kept
+  `BlockStore::create_document_with_path` and `documents_under_path`:
+  generic primitives, not config machinery. Removing it stays possible later
+  (it still touches the schema, and `migrate()` has no ALTER-TABLE path, and
+  interface ordinals must stay sequential) but it is not part of this arc.
+
+## Still open
+
 - **Does the registry stay config-only?** The same mechanism could bind a
   workspace or a samples pool. Do not build for that; note it and see whether a
   second caller appears.

@@ -4,7 +4,7 @@
 //! Division of labour, decided and not re-litigated here: **the app matches,
 //! the kernel records.** A sink (today `kaijutsu-app`, tomorrow a CoreMIDI
 //! one) watches platform hotplug, matches port facts against the match
-//! strings in `/etc/midi/devices/<name>`, and reports
+//! strings in `/config/midi/devices/<name>`, and reports
 //! `{device, present, backend, ports, at}` over the wire
 //! (`reportMidiPresence`). This module is the kernel side of that report: an
 //! in-memory store plus the read-only `/run/midi` view over it. The kernel
@@ -127,7 +127,7 @@ pub struct MidiIdentityFact {
 /// One device's presence record, exactly as the reporting sink stated it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MidiPresenceRecord {
-    /// Profile key — the `<name>` in both `/etc/midi/devices/<name>` and
+    /// Profile key — the `<name>` in both `/config/midi/devices/<name>` and
     /// `/run/midi/<name>`.
     pub device: String,
     /// Live right now (as of `at_ns`) per the reporting sink. `false` is a

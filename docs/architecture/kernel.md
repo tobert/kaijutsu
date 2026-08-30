@@ -119,10 +119,11 @@ oneshot with a timeout.
 on restart). `execution.rs` — `ExecContext`/`ExecResult` data shims.
 `config_seed.rs` — the embedded default bodies (`theme.toml`, `mcp.toml`,
 `system.md`) that seed the `/config` host directories only while empty
-(`docs/config-namespace.md`). `config_doc.rs` is `ConfigDocFs`'s retired
-kernel-document model, unmounted in production and pending deletion.
-`seed_presets.rs`, `seed_scripts.rs` — idempotent boot-time seeding (presets; the
-`/config/rc` tree via `include_dir!`).
+(`docs/config-namespace.md`). `config_doc.rs` and the `ConfigDocFs` backend it
+served are gone (`dc8a5e92`, 2026-08-30) — every `/config` tree mounts
+`LocalBackend` over a real host directory. `seed_presets.rs`, `seed_scripts.rs`
+— idempotent boot-time seeding (presets; the `/config/rc` tree via
+`include_dir!`).
 
 ---
 

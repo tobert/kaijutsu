@@ -296,7 +296,7 @@ mod tests {
     use crate::vfs::VfsOps;
     use kaijutsu_types::paths;
 
-    /// A dispatcher whose `/etc/config` is the real kernel-owned backend
+    /// A dispatcher whose `/config/kernel` is the real host-file backend
     /// (`test_dispatcher_rc` seeds every config file including
     /// mcp.toml), with mcp.toml then overwritten to the given body — enough
     /// to exercise `kj mcp list`/`reload` through the real VFS path without

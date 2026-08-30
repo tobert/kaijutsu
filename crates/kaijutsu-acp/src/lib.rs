@@ -317,7 +317,8 @@ async fn handle_new_session(
 /// Every ACP context otherwise gets the LLM registry's row-stamped default
 /// cast (today `deepseek-v4-flash`) regardless of which frontend connected.
 /// If the client's `initialize.clientInfo` named an operator-configured cast
-/// (`/etc/client/<id>/cast.toml` or the shared `/etc/client/cast.toml` —
+/// (`/config/client/<id>/cast.toml` or the shared
+/// `/config/client/default/cast.toml` —
 /// `KernelBridge::resolve_client_cast`), assign it to the FRESH context via
 /// the same `kj context set --cast <label>` path a human would type. Only
 /// called for a genuinely new context (`!opened.resumed`): reattaching to a

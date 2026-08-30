@@ -2744,7 +2744,7 @@ mod tests {
                     None,
                     ToolKind::Mcp,
                     "read",
-                    serde_json::json!({"path": "/etc/config"}),
+                    serde_json::json!({"path": "/config/kernel"}),
                     BlockRole::Model,
                     Some("toolu_read".into()),
                 ),

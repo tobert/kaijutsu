@@ -28,7 +28,7 @@
 //!                                         {"offset_ms":250,"data":"800c00"}]}
 //! ```
 //!
-//! - `device` is the **profile key** (`/etc/midi/devices/<name>`, the same key
+//! - `device` is the **profile key** (`/config/midi/devices/<name>`, the same key
 //!   `/run/midi/<name>` presence uses). The sink resolves it through its own
 //!   match/presence state to a real port address — the kernel never learns
 //!   what a sequencer address is.
@@ -97,7 +97,7 @@ impl MidiControlEvent {
 pub struct MidiControl {
     /// Envelope version. Must equal [`MIDI_CONTROL_VERSION`].
     pub v: u32,
-    /// The device profile key to route to (`/etc/midi/devices/<device>`).
+    /// The device profile key to route to (`/config/midi/devices/<device>`).
     /// **Never** a port address: the kernel composes this cue and has no idea
     /// what the rig's addresses are, by design.
     pub device: String,
