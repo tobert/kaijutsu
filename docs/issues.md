@@ -6,6 +6,36 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The terminal client — `kaijutsu-tui` (RULED 2026-08-30, unbuilt)
+
+Design: [`tui.md`](tui.md). Standalone ratatui binary on `kaijutsu-client`, the
+`kaijutsu-acp` shape minus the protocol; inline viewport; one process is the
+mux; `docs/ssh-shell.md` retired into it. Lanes, in order:
+
+1. Move `rank.rs` and the ledger round trip of `permission.rs` from
+   `kaijutsu-acp` down into `kaijutsu-client`; ACP consumes them from there.
+2. Presentation crate: lift `view/format.rs`, `text/markdown.rs`,
+   `kaish/mod.rs`, the `Action` enum and `WellBeats` out of `kaijutsu-app`
+   with the `bevy::Color` leaks replaced by a semantic color enum.
+3. Skeleton: event loop, `Backend`-generic renderer, `present.rs`, the actor
+   wiring. Then five parallel lanes: transcript printer + wrap cache, compose
+   (modalkit over the input block) + shell surface, picker + status line +
+   beat timer, asks + the ledger view + slash completion, editor + diff
+   screens. Paste rule throughout: nothing you would paste is inside a box.
+4. `bindings.toml` keyed by vim notation, commentary reviewed by two
+   flash-tier kaibo casts; then a lane to convert the app to the same file.
+5. **Cache-health projection (kernel + wire, small, can go first).** Project
+   the rest of `ContextUsageRow` (`kernel_db.rs:375`) onto
+   `ContextHandleInfo` next to `contextWindow`/`contextUsedTokens`
+   (`rpc.rs`, `resolve_usage_wire_fields`): `lastCallAt` (= `updated_at`),
+   `cacheReadTokens`, `cacheWriteTokens`, and a new `cacheTtlSecs` column
+   recorded at call completion from the request's `CacheTtl`
+   (`llm/stream.rs`: Ephemeral 300, Extended 3600; 0 = provider declares
+   none). Sentinels stay honest: 0 on the wire = unknown, never a guess.
+   Consumers: the TUI status line (`docs/tui.md`, "Cache health"), the app's
+   bottom-dock gauge, ACP `UsageUpdate`. Amy: *"how long since the last api
+   turn; a proxy for KV health … expose the data we have."*
+
 ## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
 
 The 08-29 entry claimed an allowed ask was not redeemed on retry and that a
@@ -312,111 +342,27 @@ not require reconstructing a string byte-for-byte. See
   `Denied` for the same reason. Make the split **once**, as one distinction
   applied at both layers, rather than twice.
 
-## Three kaibo reviews of the 2026-08-30 config work — six live defects (2026-08-30)
+## MCP server config cannot read a secret from a file or a command (2026-08-30)
 
-Three parallel reviews after the demolition: `deepseek` on what the deletion
-orphaned, `gpt` adversarial on path resolution, `crusoe` hunting hardcoded
-literals and silent-fallback shapes. Each found things the others did not.
-Where a finding also applies to kaish, it was cross-checked with them by test;
-results noted.
+`mcp.toml` carries server definitions inline, so an API key or token has to be
+written into the file as a literal. There is no way to say "read this value
+from a file" or "run this command and use its output" — which is how the
+backends table already resolves LLM credentials (file→env sources, no inline
+key; see `docs/` on credential resolution and `[[project_llm_credential_resolution]]`).
 
-### Silent wrong data, and data loss
+Amy, 2026-08-30: *"we need to look at MCP configs and add a way to get values
+like keys from a file or command."*
 
-1. **`kj/context.rs:986` is a second copy of the system-prompt loader** with the
-   same hardcoded `/config/kernel/system.md` literal and the same fallback to
-   `DEFAULT_SYSTEM_PROMPT` behind one `warn!`. `llm_stream.rs` was fixed in
-   `4727dec8`; its twin was never grepped for. `kj context prompt` silently
-   serves the embedded default after any namespace move. Build the path from
-   `paths::config_path`, as its sibling now does.
+Two shapes to bring to the design, not one: a `key_file` / `key_command` pair
+of fields per server, mirroring what the backends table does — or a general
+value-resolution syntax usable in any `mcp.toml` field. The first is smaller
+and consistent with an existing surface; the second stops the question
+recurring per-field. Decide which before building.
 
-2. **`ZQ` on a config file deletes the rollback and orphans a swap row.**
-   `editor_quit` (`kernel.rs:1801-1835`) marks the buffer dirty to make a
-   recoverable swap, **unpins**, then calls `invalidate_config_file_cache`
-   (`:1827`) — which now succeeds *because* it is unpinned, and
-   `invalidate_document` deletes the document that just received the rollback
-   (`cache.rs:722-728`). The `dirty_file_buffers` row survives in its own
-   table. Next read loads pre-rollback disk bytes. A **non-config** file takes
-   the correct path, because `is_config_doc_root` gates the call — the exact
-   config-vs-file divergence the deleted two-branch tests would have caught.
-   `editor_keys`'s `Closed` arm does not call invalidate at all, so the two
-   quit paths already disagree. Fix: delete the three editor call sites
-   (`kernel.rs:1516`, `:1541`, `:1827`) and keep
-   `invalidate_config_file_cache` for the direct-VFS-write callers its own doc
-   names (`kj rc add/rm`, `kj config reset`).
+Worth settling at the same time: whether a resolved secret is read once at
+server launch or on every reconnect, and what a failed resolution does — it
+must fail loudly rather than launch a server with an empty key.
 
-3. **`rmdir` through a symlink deletes the target directory.**
-   `local.rs:416` resolves with the following resolver, so an in-root link to
-   an in-root empty directory canonicalizes to the target and `remove_dir`
-   takes *that*, leaving the link. Reachable from ordinary shell removal:
-   `MountBackend::remove` dispatches on `attr.is_dir()`, and `getattr` reports
-   a working directory link as a directory. Clean in kaish at both layers
-   (kernel-routed tests since June) — ours alone.
-
-4. **`readlink` bypasses containment unless the path text contains `..`.**
-   `local.rs:320-346` joins the raw path and calls the syscall; the only check
-   is a `ParentDir` scan. With `<R>/out -> /outside` and
-   `/outside/host-link -> /secret`, `readlink("out/host-link")` follows the
-   intermediate and returns the outside target. No race, no `..`. Should use
-   `resolve_nofollow`. Refused by design in kaish (their `read_link` resolves
-   `LinkItself`); they added a test with this shape after the report.
-
-5. **Mount-root removal.** `rmdir("")`, `rmdir("/")`, `rmdir(".")` resolve to
-   the root and remove it when empty (`local.rs:118`). `MemoryBackend` refuses
-   explicitly (`memory.rs:346-351`), so our two backends disagree. **Real in
-   kaish too, same split** — they now refuse through one helper used by remove
-   and rename, with conformance rows for both.
-
-6. **`ROSTER_INDEX_PATH` duplicates a path instead of deriving it.**
-   `kaijutsu-app/src/connection/roster.rs:55` hardcodes `/run/roster/index`
-   rather than building from `ROSTER_RUN_ROOT`. The read's error handler treats
-   "not found" / "no mount point" as `RosterFetch::NoRoster` (`:518`), so a
-   renamed root makes the roster panel truthfully report an empty fleet.
-   `kaijutsu-app/src/midi_presence.rs:47-50` shows the correct derived pattern.
-
-### The keep-judgment in `dc8a5e92` was wrong
-
-`create_document_with_path`, `documents_under_path` and `document_kind` were
-kept as "generic primitives, same reasoning as `DocKind::Symlink`". That
-grouping is the flaw: `DocKind::Symlink` is a **persisted enum** with real
-migration cost to remove, and the three methods are pure code — deleting them
-changes no schema and no behavior. Zero production callers; one has a single
-test, two have none. Their tail goes with them: `list_documents_under_path`
-(`kernel_db.rs:2518`), `document_id_at_path` (`:2431`), and both
-`DocumentPathConflict` variants. The `documents.path` column and index must
-stay for legacy rows — but nothing should still be computing over them.
-
-### A capability name that no longer means what it says
-
-`config-write` gates no config file. It gates the SQL-native model verbs
-(`kj backend`/`cast`/`alias`), `kj hook add/remove`, and `kj mcp reload`.
-`kj config reset` is deliberately ungated. Its doc (`mcp/binding.rs:162-168`)
-still describes writing "the kernel-owned config files". Rename or re-scope;
-either way the doc is currently false.
-
-### Stale premises in published text
-
-`kaijutsu.capnp:2097-2101`'s config section header still says config files
-"are kernel documents — the kernel is their sole owner, and there is no host
-file". `kj/config.rs:194` says "There is no host file". `is_config_doc_root`
-(`paths.rs:237-249`) describes "the four `/etc` trees" and a
-`FileDocumentCache` shadow that is not what it now gates. `Capability::Editor`
-names "`resolve_editor_target`'s config-owned branch", deleted. Plus
-`kj/lifecycle.rs:405`, `kj/mod.rs:1097`, `actor_plugin.rs:981`,
-`docs/diff.md:169-174`, `tests/editor_wire.rs:21`.
-
-Also: `kj/rc.rs:1198-1205` asserts `LocalBackend::unlink` follows a resolvable
-symlink — true when written, false since `30730717` — and its test routes
-around the fixed path *because of that comment*. A stale comment did not just
-mislead a reader, it steered a test away from the code it covered.
-
-### Out of scope, deliberately
-
-TOCTOU: every op resolves to a `PathBuf`, drops it, then makes a second
-pathname-based syscall, so nothing survives a parent being swapped for a
-symlink in between. Shared trust makes this low priority between players, but
-host processes do write into these trees directly. The real guarantee is
-`openat2` with `RESOLVE_BENEATH` and dirfd-relative ops. Worth stating as
-out of scope rather than leaving it to be inferred.
 
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
@@ -6503,13 +6449,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   for PCM, ALSA-seq for MIDI) — `midi.md`'s "first kernel-owned compute node" (M4)
   and `pcm.md` slice 4. Reuses the exact wire `RenderCue` the app consumes; the
   speculation-lead `at`→`lead` scheduling already travels with it.
-- **SSH shell subsystem (`kaijutsu-shell`):** give an `ssh` user an interactive kaish
-  with `kj` that starts in a lobby and attaches into contexts (VFS reflows on switch).
-  Design + wiring captured in [`ssh-shell.md`](ssh-shell.md). Start after the SFTP
-  read-path work settles (shared subsystem plumbing). Open decisions noted there:
-  per-principal home vs shared lobby anchor (copy the `lost+found` `ensure_*` pattern —
-  *not* the global-singleton `scratch` context), and whether `Send`-ness lets it run
-  SFTP-style or needs the RPC dedicated-thread treatment.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **`context_type` newtype — declined, not deferred (2026-06-28).** The beat

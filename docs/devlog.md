@@ -2247,3 +2247,29 @@ The kernel announces, the client may block locally, and when the answer lands
 the kernel performs the action itself. An approval at 3am runs at 3am. The
 four-hop ladder built to keep a call alive across human thinking time becomes
 dead code, four days after it shipped.
+
+## The seat you ssh into (August 30)
+
+The question was where a terminal client should live. Kaijutsu had an ACP
+bridge that "sorta works", a design note for a kaish shell served as an SSH
+subsystem, and a Bevy app whose conversation view is a custom render pass. A
+survey settled it faster than argument would have: the client crate has no
+Bevy in it and the ACP bridge is proof it renders anywhere; the server
+implements no PTY at all; and of the app's ninety thousand lines, the part a
+terminal could reuse fits in three thousand.
+
+So the TUI is a standalone binary in the ACP bridge's exact shape — kernel
+side, pure mapper, edge — with ratatui as the edge. A kernel-served TUI was
+feasible (russh ships the example) and declined for the reason the wire rules
+were written: a client inside the kernel process reaches around them the first
+time they are inconvenient. Amy ruled inline viewport, not fullscreen; one
+process as the mux, so `ssh -t zorak kaijutsu-tui` replaces the terminal
+multiplexer rather than living inside it; and one `bindings.toml` for both
+clients, keyed by vim notation, which the TUI ships first and the app inherits.
+
+The ssh shell design retired into it. Its hardest open question — which
+context a contextless login lands in — dissolved, because a picker needs no
+context. Two paragraphs survived the melt, the two cursors and the principal
+model, and they are in `docs/tui.md` now. The beat phasor everyone assumed
+would need extracting turned out to have been in `kaijutsu-audio` since July;
+only a map of them was still app-side. Reading before planning, again.

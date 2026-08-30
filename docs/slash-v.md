@@ -310,8 +310,8 @@ A `VfsBackend` view over the kernel's **live participant registry**, `/proc`-sty
 `PeerRegistry` (`crates/kaijutsu-kernel/src/peers.rs:103`) already tracks the app and
 MCP servers with `nick`, a unique-per-process `instance`, a **server-stamped
 `principal`** (never trusted from the client), and `attached_at` (`PeerInfo`,
-`peers.rs:50`); it gains a session *kind* field (none today). SFTP and SSH-shell
-connections register as new kinds (`docs/ssh-shell.md`).
+`peers.rs:50`); it gains a session *kind* field (none today). SFTP and terminal
+client connections register as new kinds (`docs/tui.md`).
 
 ```
 /v/session/
@@ -380,7 +380,7 @@ the current context is ordinary ambient state, like cwd, not a capability token.
 
 - **Shell / MCP / app** — context is ambient. The shell resolves its current context
   **live** from `SessionContextMap` per operation (a mid-line `kj attach` chains like
-  `cd` — `docs/ssh-shell.md`); MCP/app act as the context they have joined, tracked
+  `cd` — `docs/tui.md`, "Two cursors, never mixed"); MCP/app act as the context they have joined, tracked
   the same live way. Writing `/config/rc/coder/create/S00-stance.kai` while acting as a
   privileged context just lands the write — `/config/rc` carries no capability of
   its own any more. No binding, no TTL, no arm.
