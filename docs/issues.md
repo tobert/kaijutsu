@@ -151,6 +151,53 @@ comment should say which, because the redundancy currently looks accidental.
 Found while answering "how much of kernel.db is reclaimable" (answer: none —
 `freelist_count` is 0).
 
+## `LocalBackend::resolve` follows the final symlink component (2026-08-30)
+
+`resolve` (`crates/kaijutsu-kernel/src/vfs/backends/local.rs`) canonicalizes
+the **whole** path, so any operation routed through it acts on a symlink's
+target rather than on the link. The file already knows this — `read_all` says
+so in a comment and works around it — but the workaround was never generalized.
+
+**`unlink` is FIXED** (this commit): it deletes the link now, via a new
+`resolve_nofollow` that canonicalizes only the parent. The bug was real and
+reproduced — `unlink_removes_the_link_not_its_target` fails when `unlink` is
+routed back through `resolve()`, leaving the link in place and the target
+gone. This was data loss on the composed rc tree, where many per-type names
+link to one shared script: removing one link deleted the script every other
+context type depends on.
+
+**Two siblings are NOT fixed**, same root cause, both verified by reading:
+
+- **`rename`** (`local.rs:390`) resolves `from` through `resolve()`, so
+  renaming a symlink moves its target instead.
+- **`getattr`** (`local.rs:225-226`) calls `symlink_metadata` — correct by
+  itself — on a path `resolve()` already canonicalized, so it lstats the
+  target and never reports `FileType::Symlink` for a resolvable link. A
+  dangling link reports correctly, which is why this hid.
+
+Both want `resolve_nofollow`. `getattr` is the riskier change: callers may
+depend on a symlink reporting as its target, so it needs its own pass with
+tests rather than a one-line swap. `readdir` is already correct — it reads
+file types from the directory iterator, not through `resolve`.
+
+Found while migrating the rc test fixtures off `ConfigDocFs`: the old
+document-backed fixtures never ran a real resolvable symlink through a real
+filesystem, so this whole class was invisible to the suite.
+
+## kaish `ln -s` with an absolute /config path creates a dangling link (2026-08-30)
+
+`LocalBackend::symlink` stores the target verbatim, so
+`ln -s /config/rc/lib/hooks/foo.kai /config/rc/coder/create/S45-foo.kai`
+writes a host symlink pointing at the host's literal `/config/...`, which does
+not exist. Only `seed_scripts::reseed_rc_files` does the absolute→relative
+translation, so a reseeded tree is correct and a hand-composed one is not.
+
+`ln -s` over `/config/rc` is the documented composition surface
+(`docs/rc-symlinks` guidance, and there is deliberately no `kj rc link`), so
+the natural idiom silently produces a link that resolves to nothing. Either
+`symlink` translates an in-mount absolute target to a relative one, or the
+surface has to say "relative targets only" and fail loudly on an absolute one.
+
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
 `context_type` on `register_session` is caller-chosen free text with no

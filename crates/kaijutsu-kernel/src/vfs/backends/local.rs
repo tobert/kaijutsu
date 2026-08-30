@@ -131,6 +131,47 @@ impl LocalBackend {
         Ok(canonical)
     }
 
+    /// Resolve without following a final-component symlink — lstat semantics.
+    ///
+    /// [`Self::resolve`] canonicalizes the whole path, so a path naming a
+    /// symlink comes back as the target it points at. An operation that acts on
+    /// the *link* must use this instead, or it acts on the target: deleting one
+    /// name in the composed rc tree would take the shared script every other
+    /// context type links to.
+    ///
+    /// The parent is still canonicalized, so `..` cannot escape the root.
+    async fn resolve_nofollow(&self, path: &Path) -> VfsResult<PathBuf> {
+        let path = path.strip_prefix("/").unwrap_or(path);
+        if path.as_os_str().is_empty() {
+            return Ok(self.root.clone());
+        }
+        let full = self.root.join(path);
+        let parent = full
+            .parent()
+            .ok_or_else(|| VfsError::invalid_path("no parent"))?;
+        let filename = full
+            .file_name()
+            .ok_or_else(|| VfsError::invalid_path("no filename"))?;
+        let resolved = if parent.exists() {
+            parent.canonicalize().map_err(VfsError::from)?.join(filename)
+        } else {
+            full.clone()
+        };
+
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        if !resolved.starts_with(&canonical_root) {
+            return Err(VfsError::path_escapes_root(format!(
+                "{} is not under {}",
+                resolved.display(),
+                canonical_root.display()
+            )));
+        }
+        Ok(resolved)
+    }
+
     /// Check if write operations are allowed.
     fn check_writable(&self) -> VfsResult<()> {
         if self.read_only {
@@ -332,7 +373,9 @@ impl VfsOps for LocalBackend {
 
     async fn unlink(&self, path: &Path) -> VfsResult<()> {
         self.check_writable()?;
-        let full_path = self.resolve(path).await?;
+        // NOT `resolve()` — it canonicalizes the final component, so deleting a
+        // symlink would delete what it points at.
+        let full_path = self.resolve_nofollow(path).await?;
         fs::remove_file(&full_path).await.map_err(VfsError::from)
     }
 
@@ -675,6 +718,36 @@ mod tests {
 
         let got = backend.read_all(Path::new("l.txt")).await.unwrap();
         assert_eq!(got, body, "read_all truncated a followed symlink");
+    }
+
+    /// `unlink` on a symlink removes the LINK, never what it points at.
+    ///
+    /// `resolve()` canonicalizes the final component, so routing a delete
+    /// through it hands `remove_file` the target's real path. The composed rc
+    /// tree links many per-type names at one shared script, so deleting one
+    /// link that way would take the script every other context type depends on.
+    ///
+    /// Falsified by routing `unlink` back through `resolve()`.
+    #[tokio::test]
+    async fn unlink_removes_the_link_not_its_target() {
+        let (backend, dir) = setup().await;
+        backend.create(Path::new("target.txt"), 0o644).await.unwrap();
+        backend.write(Path::new("target.txt"), 0, b"keep me").await.unwrap();
+        backend
+            .symlink(Path::new("link.txt"), Path::new("target.txt"))
+            .await
+            .unwrap();
+
+        backend.unlink(Path::new("link.txt")).await.unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("link.txt")).is_err(),
+            "the link itself must be gone"
+        );
+        assert!(
+            dir.path().join("target.txt").exists(),
+            "unlink followed the link and deleted its target"
+        );
     }
 
     #[tokio::test]
