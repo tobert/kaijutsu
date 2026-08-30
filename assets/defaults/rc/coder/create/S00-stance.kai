@@ -23,7 +23,8 @@
 # written — the rc shell has no `fmt`, and a wrapped system prompt costs the
 # model nothing.
 #
-# To tune: edit this script, or `kj rc edit` the live one. A new tier is a new
+# To tune: edit this script in the repo, or the live file under
+# `~/.config/kaijutsu/etc/rc/` — they are ordinary files. A new tier is a new
 # `case` arm.
 #
 # `.resolved_model` is the EFFECTIVE model. The row's `.model` is only the

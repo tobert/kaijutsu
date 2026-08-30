@@ -1,10 +1,15 @@
 # Kernel-Owned Config — Design
 
-The kernel is the **sole owner** of config and rc scripts. Embedded Rust source
-(compiled into the binary, visible in-repo) is the **seed**; after that, the
-kernel owns the content. There is no host-disk write-through, no
-reload-from-host, and no mtime staleness — one source of truth cannot disagree
-with itself.
+**Scope note (2026-08-29):** this document now covers `/etc/config`,
+`/etc/client`, and `/etc/midi`. rc melted to host files under
+`~/.config/kaijutsu/etc/rc/` — `docs/rc-on-disk.md` is canonical for rc, and
+`kj rc edit`, `kj rc reset`, and `kj rc reseed` no longer exist.
+
+The kernel is the **sole owner** of `/etc/config`, `/etc/client`, and
+`/etc/midi`. Embedded Rust source (compiled into the binary, visible in-repo)
+is the **seed**; after that, the kernel owns the content. There is no
+host-disk write-through, no reload-from-host, and no mtime staleness — one
+source of truth cannot disagree with itself.
 
 **Project repo source files are permanently out of scope.** There the host disk
 is the truth (cargo, git, and editors read real files) and write-through stays.
@@ -22,8 +27,10 @@ file tools and the editor reach them directly; `deny_etc_write` covers only the
 host's real `/etc`. `kj config` keeps `list`, `show`, and `reset` — the three
 verbs with no file-tool equivalent.
 
-`/etc/rc` is gated by the `rc-write` capability — rc is executable rather than
-data.
+`/etc/rc` carries no capability of its own. `rc-write` gated it once, on the
+premise that rc is executable rather than data; it is dropped now that rc is
+a host directory (`docs/rc-on-disk.md`), and a script is reached the way any
+file is — the file tools, the editor, host `vim`, git.
 
 ---
 
@@ -40,23 +47,38 @@ immediate children derived in Rust. The document and its manifest row are writte
 by the same `create_document` call — a separate manifest table would be a second
 copy of the truth, free to drift.
 
-**Read-path routing.** rc reads and writes route through the VFS (`MountTable →
-ConfigCrdtFs`) directly, bypassing `FileDocumentCache` for the kernel-internal
-callers (`kj rc`, `load_rc_scripts`). The one remaining cache consumer is an
-agent's `builtin.file:read /etc/rc/…`; `ConfigCrdtFs` returns an in-memory
+**Read-path routing.** Config reads and writes route through the VFS
+(`MountTable → ConfigDocFs`) directly, bypassing `FileDocumentCache` for the
+kernel-internal caller (`kj config`). The one remaining cache consumer is an
+agent's `builtin.file:read /etc/config/…`; `ConfigDocFs` returns an in-memory
 advancing mtime from `getattr`, bumped on write, so the cache's staleness check
 reloads after a write. That mtime is a version stamp on the single source of
 truth, not a sync between two.
+
+rc read the same way until it melted onto disk; `docs/rc-on-disk.md` has
+where it went.
 
 **Seeding is namespace-bootstrap-only.** A fresh kernel seeds once and never
 again. A file the operator deletes stays deleted, and a shipped default added
 after a kernel already exists does not retroactively appear on it. There are no
 tombstones.
 
-**There is no host file to edit.** Change a live script with `kj rc edit <path>
---content <body>`; restore one to its embedded default with `kj rc reset <path>`.
-Change the shipped default by editing `assets/defaults/rc/`, the in-repo seed,
-then reseeding.
+**Config has no host file to edit.** `/etc/config`, `/etc/client`, and
+`/etc/midi` stay kernel documents — no host-disk write-through, so there is
+nothing on disk for git or `vim` to see. Change a live one with the ordinary
+write surfaces (the file tools, `kj editor open <path>` / the `vi` builtin); `kj
+config reset <path>` restores one to its embedded default. Changing the
+shipped default itself means editing the compiled-in seed under
+`assets/defaults/` and rebuilding — `kj config` has no reseed verb, so the
+"seeds once and never again" rule above applies to it too.
+
+**rc is different: it has a host file now.** rc melted onto disk under
+`~/.config/kaijutsu/etc/rc/`, mounted through `LocalBackend` —
+`docs/rc-on-disk.md` is canonical. A live rc script is a file like any other
+(the file tools, `vi`, host `vim`, git); `kaijutsu-server rc reseed [--force]`
+— a host CLI subcommand, off the kernel — installs anything missing from the
+in-repo seed and, with `--force`, restores scripts that differ. `kj rc
+edit`/`reset`/`reseed` no longer exist.
 
 `theme.toml` carries both color lanes: the flat keys and `[ansi]` feed the UI
 `Theme`, and `[scene.hues/tiers/gains/post]` feed the 3D `ScenePalette`
@@ -252,6 +274,9 @@ prune verb can collect orphans later.
 2. **Config-changed push** so a live `kj config set` reaches the client without
    a reconnect. A document subscription on the client's config documents; scope
    it with the patch bay.
-3. **Reseed semantics.** Confirm `kj rc reseed` and the staleness-vs-embedded
-   story: drift is now document-vs-embedded, surfaced by an explicit reseed, not
-   silent host drift.
+3. **Reseed semantics — settled for rc.** `docs/rc-on-disk.md` has the answer:
+   `kaijutsu-server rc reseed` installs anything missing; `--force` also
+   restores paths that differ from their embedded seed. Drift is
+   file-vs-embedded, surfaced by an explicit reseed, not silent host drift.
+   Config's own reseed story (`/etc/config`, `/etc/client`, `/etc/midi`) is
+   still open — `kj config` has no reseed, only per-path `reset`.

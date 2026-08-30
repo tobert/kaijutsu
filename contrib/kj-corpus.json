@@ -649,7 +649,7 @@
     {
       "path": "ledger show",
       "aliases": [],
-      "about": "Show one ask in full, including the statement being authorized",
+      "about": "Show one ask in full, including the statement being authorized, the context and principal that raised it, and — once it is decided — whether its answer has already been spent",
       "clause": "kj ledger show 019a2f3c",
       "expect": "informative",
       "confirm_gated": false,
@@ -904,7 +904,7 @@
       "expect": "data-critical",
       "confirm_gated": false,
       "mutates": true,
-      "note": "Only partly recoverable. 'kj rc reset' restores the embedded seed, not what was removed; a diverged script loses the divergence permanently and a no-seed user-authored script cannot be reset at all (docs/issues.md; rc.rs:1493-1516)."
+      "note": "Only partly recoverable. `kaijutsu-server rc reseed --force` restores the embedded seed, not what was removed; a diverged script loses the divergence permanently and a no-seed user-authored script has no seed to restore at all. That reseed runs off the kernel, so it is not a kj leaf and has no entry here."
     },
     {
       "path": "rc show",
@@ -917,38 +917,6 @@
       "confirm_gated": false,
       "mutates": false,
       "note": null
-    },
-    {
-      "path": "rc edit",
-      "aliases": [
-        "update"
-      ],
-      "about": "Edit a script",
-      "clause": "kj rc edit /etc/rc/coder/create/S00-stance.kai",
-      "expect": "situation-normal",
-      "confirm_gated": false,
-      "mutates": true,
-      "note": "Ruled situation-normal under Amy's 2026-08-25 calibration: a gate is set to a command's TYPICAL instance, not its worst one (docs/issues.md). Editing a live script IS the sanctioned surface for changing one (CLAUDE.md: there is no host file to vim). A botched edit is only partly recoverable -- `kj rc reset` restores the embedded seed, not the prior body -- but that is the ordinary risk of the ordinary path."
-    },
-    {
-      "path": "rc reset",
-      "aliases": [],
-      "about": "Restore one script to its embedded seed (targeted recovery from a botched edit; recreates the file if it was removed)",
-      "clause": "kj rc reset /etc/rc/coder/create/S00-stance.kai",
-      "expect": "situation-normal",
-      "confirm_gated": false,
-      "mutates": true,
-      "note": "Restores the embedded seed; loses local divergence only (docs/issues.md)."
-    },
-    {
-      "path": "rc reseed",
-      "aliases": [],
-      "about": "Install every path whose embedded seed never landed — repair a kernel lagging several seeds without resetting them one at a time",
-      "clause": "kj rc reseed",
-      "expect": "data-critical",
-      "confirm_gated": false,
-      "mutates": true,
-      "note": "STAYS data-critical after review. Unlike `rc edit`, this overwrites every diverged script it finds in ONE ungated invocation, and an overwritten path cannot be recovered. It is the single command on this surface that can lose the most, and its typical instance -- repairing a lagging kernel -- still carries that blast radius. `--dry-run` exists and a human should see the diff."
     },
     {
       "path": "editor open",

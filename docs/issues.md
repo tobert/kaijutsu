@@ -63,6 +63,49 @@ Compare `principal:` across the pair. Equal principals eliminate the leading
 hypothesis and force the next one; different principals confirm it, and the
 question becomes why the MCP session's principal moved across a restart.
 
+## The rc half of `invalidate_config_file_cache` may be dead weight (2026-08-29)
+
+Found by mutation testing during the `kj rc` shrink, not by reading. Dropping
+`RcCommand::Add` from the `write_path` match in `kj/rc.rs` — the arm that
+fires `Kernel::invalidate_config_file_cache` after a successful write — leaves
+`an_rc_add_is_visible_to_a_later_kaish_read` **passing**. The shadow
+self-heals, because `/etc/rc` is host files now and the file's stat changed.
+
+Dropping `RcCommand::Rm` does fail its test, and that asymmetry is the whole
+finding: a removed file has no stat left to disagree with the shadow, so the
+hook is load-bearing on delete and belt-and-braces on write.
+
+`invalidate_config_file_cache`'s own doc says the shadow "can't self-heal"
+from an lstat mtime. That was written for the document-backed trees, where it
+is still true. It stopped being true for rc when rc melted onto disk, and
+nothing said so.
+
+Small, and not a bug — an unnecessary invalidation is cheap and correct.
+Worth resolving deliberately rather than leaving a comment that is half
+right: either narrow the hook to the roots that still need it (which is the
+`ConfigDocFs` three, and they melt too), or keep it and say why. Do it when
+the other three roots melt, since that is when the answer changes again.
+
+## `docs/config-ownership.md` still writes against `kj config set` (2026-08-29)
+
+Four passages instruct a reader to run `kj config set`, at
+`docs/config-ownership.md:86, 229, 237, 274`. That verb is deleted — `kj
+config` is `list`, `show` and `reset` only, and `kj/config.rs`'s own module
+doc says so: `set` and `edit` existed because `/etc/config` used to be
+unreachable from `builtin.file:write`, and both went with the `config-write`
+gate.
+
+Two of the four are the harder kind. `:229` and `:237` describe the
+**per-client write-target policy** — that `kj config set` defaults to the
+caller's own `/etc/client/<id>/<name>` and needs an explicit path to write the
+shared default. That policy lived in the verb. With the verb gone, either the
+file tools reproduce the defaulting or the policy is gone too, and the doc
+cannot be fixed by renaming a command; someone has to decide which.
+
+Found by the docs sweep for the rc melt's slice 3, which correctly declined to
+guess. It belongs to the config half of the melt, not the rc half — file it
+against whoever picks up `/etc/config`.
+
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
 `context_type` on `register_session` is caller-chosen free text with no
@@ -80,7 +123,7 @@ the lfm2d lane counts asks raised, so a seat that never raises any is
 indistinguishable from a seat that never needed to. Same shape as the alias
 bypass below — a second spelling of the same act that the ledger cannot see.
 
-Found while trying to answer the pending `kj rc reset` ask from a gated seat.
+Found while trying to answer a pending rc ask from a gated seat.
 
 **What the wide seat actually costs, measured 2026-08-28.** `default`,
 `coder` and `mcp` all symlink the *same* `lib/create/S10-binding.kai`, which
@@ -232,18 +275,6 @@ up. The two mechanisms are complements: quiesce saves the work that was
 running, and the boot-time abandon sweep honestly buries the asks that were
 waiting. That is the argument that made restart-surviving gate actions
 unnecessary (`docs/gate-resume.md`).
-
-## `kj rc reseed --overwrite` may clobber a concurrent edit (2026-08-23, UNVERIFIED)
-
-Reported by an audit and **not independently checked** — verify before acting.
-The claim: `rc_reseed` in `kj/rc.rs` reads current content into `plan.old` in
-one loop, builds diffs from it, then writes in a separate later loop with no
-re-check between. A concurrent `kj rc edit` in that window is silently
-clobbered, and the returned diff misreports what was replaced.
-
-Ranked low if true: an admin verb, human-run, short window, and the content is
-recoverable from the embedded seeds. Listed because it is the same
-capture-then-write-without-recheck shape as the cwd defect fixed today.
 
 ## Two silent kaish 0.16 behavior changes, adapted (2026-08-23)
 
@@ -488,8 +519,8 @@ bodies become path references read at call time.
 
 This is mostly deletion, not construction — `load_rc_scripts` is already
 backend-agnostic and `LocalBackend` is already what the broadly-used test
-dispatcher mounts. It **retires `kj rc reseed --overwrite`'s diff machinery**,
-shipped the same morning: on disk, `git diff` is the diff.
+dispatcher mounts. It retired `kj rc reseed --overwrite`'s diff machinery
+along with the verb: on disk, `git diff` is the diff.
 
 Not ruled: whether `/etc/config`, `/etc/client` and `/etc/midi` follow, which
 would delete `ConfigDocFs` entirely. Ask before building it.
@@ -547,9 +578,9 @@ and the devlog. What remains:
   and `kj rc list` now reports the gap as `not installed`, so this is no longer
   silent — what remains is that `rpc.rs` has **no `mod tests` at all**, so the
   partially-populated case (namespace non-empty, one seed path absent) has no
-  coverage, and there is no bulk `kj rc reseed` for a kernel missing several.
-  Order matters when installing by hand: a symlink seed's target must exist
-  first. S–M. *`kj rc reseed` is in flight 2026-08-21.*
+  coverage. The bulk install exists now — `kaijutsu-server rc reseed`, which
+  handles link ordering itself; what is missing is `rpc.rs` coverage of the
+  partially-populated seed path. S–M.
 - **A third link in the same chain, found 2026-08-21 and fixed the same day:**
   `cargo` did not rebuild when `assets/defaults/rc/` changed. `include_dir!` is
   not a tracked build input, so an edit to a seed file was invisible until some
@@ -2002,17 +2033,18 @@ honour the flag under `serve` or refuse the combination. The fix is a design
 call rather than a patch — which of the two declarations wins, or whether the
 top-level copies are deleted outright — so it is recorded rather than changed.
 
-## `kj rc reseed` seeds from the BINARY, not the repo (2026-08-22)
+## `rc reseed` seeds from the BINARY, not the repo (2026-08-22)
 
-`assets/defaults/rc/` is the in-repo seed, but `kj rc reseed` installs the
-defaults **embedded in the running `kaijutsu-server`**. Editing the repo file
-and reseeding reports `install 0, overwrite 0` and changes nothing, because the
-live document already matches the binary's (stale) copy.
+`assets/defaults/rc/` is the in-repo seed, but a reseed installs the defaults
+**embedded in the running binary**. Editing the repo file and reseeding reports
+`0 written` and changes nothing, because the live file already matches the
+binary's (stale) copy.
 
-Editing a shipped default therefore needs: edit → **rebuild** → **restart** →
-`kj rc reseed --overwrite`. Missing the rebuild looks exactly like a successful
-no-op. Related: `docs/config-ownership.md`, and the rc-on-disk melt
-(`docs/rc-on-disk.md`) removes this trap by making rc real files.
+Editing a shipped default therefore needs: edit → **rebuild** →
+`kaijutsu-server rc reseed --force`. Missing the rebuild looks exactly like a
+successful no-op. The verb moved off the kernel (`kj rc reseed` is deleted), so
+a restart is no longer part of the dance, but `include_dir!` still bakes the
+seed into the binary and that is the half that traps you.
 
 ## The rc lifecycle shell has a narrower tool set than the interactive one (2026-08-22)
 
@@ -4874,7 +4906,7 @@ mapping escalates anything that is not the benign label, so 6,956 sn winners
 against 202 dc means our ask volume is now almost entirely sn — and the lfm2d
 lane correctly notes the mapping is our policy, not their recall. It is still
 the wrong knob to turn today, because sn is exactly where v10 puts the shapes
-we hold destructive: `kj rc rm` sn 0.975, `kj rc reset` sn 0.956, `kj cas rm`
+we hold destructive: `kj rc rm` sn 0.975, `kj cas rm`
 sn 0.827, `kj context demote` sn 0.620. It is also where `git checkout --
 crates/` (sn 0.967) sits, and Amy ruled that placement correct — which makes
 sn-prompting the *only* thing that still gates it.
@@ -4910,8 +4942,7 @@ agreeing. Reproduce with `contrib/lfm2d-probe.py`.
 | `kj context archive <id> --confirm` | **inf 0.651** | situation-normal | Soft-delete, latched, recoverable. Confirm-gated (context.rs:1719) |
 | `kj context demote <id>` | sn 0.620 | data-critical | Its last ladder step sets `ContextState::Archived` — the same state `archive` demands `--confirm` for — and is **ungated** (context.rs:1899) |
 | `kj cas rm <hash>` | sn 0.827 | situation-normal | Unconditional: no reference check, no gate (cas.rs:245-257) |
-| `kj rc rm <path>` | **sn 0.975** | data-critical | Only partly recoverable. `kj rc reset` restores the *embedded seed*, not what was removed; a diverged script loses the divergence permanently and a no-seed user-authored script cannot be reset at all (rc.rs:1493-1516) |
-| `kj rc reset <path>` | sn 0.956 | situation-normal | Restores the embedded seed; loses local divergence only |
+| `kj rc rm <path>` | **sn 0.975** | data-critical | Only partly recoverable. A reseed restores the *embedded seed*, not what was removed; a diverged script loses the divergence permanently and a no-seed user-authored script has no seed to restore |
 | `kj hook remove <id>` | dc 0.839 | data-critical | Removes a gate. **v10 is already right here** |
 | `kj binding reset` | dc 0.675 | situation-normal | Clears the binding to deny-all — fails closed |
 | `kj cast remove <name>` | sn 0.725 | situation-normal | Slots cascade away with it |
@@ -5904,7 +5935,7 @@ Scheduled background operations as **tracks**: a slow clock + probe
 attachments (`ooda_armed: false`) firing kai scripts on beats. Kinship:
 chameleon's cue traps are "cron in musical time" (`docs/chameleon.md`,
 unbuilt); this is the same machinery at ops tempo, and the rc synergy is
-direct (groomer scripts are kernel-owned, `kj rc edit`-able). Use cases
+direct (groomer scripts are rc files, editable like any other). Use cases
 queued up: device-profile refresh (`kj midi identify`/`pull` sweeps,
 `/run/midi` staleness, pulled-vs-document drift flags — likely first
 consumer, `docs/midi-next.md` "Keeping it current"), archive rotation,
@@ -5918,7 +5949,7 @@ catch up once after a grace window (half-period, clamped 120s–2h), then
 fast-forward, no backlog replay (`cron/jobs.py:2155` in the research clone);
 Hermes' no-NL-parsing stance (curated shorthand like `every 30m` + raw cron,
 compiled up front); QwenPaw's `HEARTBEAT.md` — a user-editable "what should I
-check on" prompt re-read each beat (in kj that's a block, `kj rc edit`-able);
+check on" prompt re-read each beat (in kj that's an rc file, editable);
 QwenPaw's idle trigger (proactive check-in after N idle minutes, gated on
 agent-not-busy); Hermes' per-job model pinning → per-track cast binding, which
 casts already shape-match (local toil vs. deepseek/claude cognition).
@@ -6030,10 +6061,11 @@ Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
 the `"sftp"` arm in `ssh.rs`). Two DeepSeek reviews + a Gemini Pro batch
 whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
 
-- **Slice 3 dissolved (2026-06-27, `docs/slash-v.md` "Capability")** — SFTP stays
-  read/view with the lexical `privileged_write_denied` deny; per-operation join
-  on the ambient `context_id` covers the real write surfaces. Surviving crumb:
-  register SFTP connections in the participant registry (slash-v track V slice 2).
+- **Slice 3 dissolved (2026-06-27, `docs/slash-v.md` "Capability")** — and the
+  lexical deny it left behind is deleted too, once `rc-write` went and `/etc/rc`
+  became host files: an SFTP write is governed by the mount's `read_only()`
+  flag like any other. Surviving crumb: register SFTP connections in the
+  participant registry (slash-v track V slice 2).
   Hygiene note (slice-4-adjacent): the lexical deny sits *above* symlink
   resolution — verified not-a-bypass (twice: `LocalBackend::resolve`
   canonicalizes *and* re-clamps with `canonical.starts_with(canonical_root)`,
@@ -6221,9 +6253,9 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   - Per-principal budgets + fair queuing.
   - **Live contexts need re-create/restart:** broadened role loadouts only reach
     newly-created contexts; existing ones keep their old (now authority-less)
-    binding until they're re-created or the kernel restarts. (Editing the seed
-    via `kj rc edit` / `kj rc reset` changes what *new* contexts get, not live
-    ones — rc fires at lifecycle boundaries, not retroactively.)
+    binding until they're re-created or the kernel restarts. (Editing an rc
+    script changes what *new* contexts get, not live ones — rc fires at
+    lifecycle boundaries, not retroactively.)
 - **RPC session reaping — residual only (mostly closed 2026-06-14).** Keepalive
   reaps dead peers (30s × 3) and the watchdog is activity-gated. Residual (by
   design, low): a *truly* wedged `current_thread` LocalSet can't be force-killed
@@ -6607,7 +6639,7 @@ key-value store demolished 2026-07-04.*
   compaction is threshold-triggered and a quiet document may never be
   re-snapshotted.
 - **Kernel-owned config/rc (design: `docs/config-ownership.md`) — shipped and
-  long since exercised live** (`kj rc edit` is the daily surface). Remaining: the
+  long since exercised live** (editing an rc file is the daily surface). Remaining: the
   deferred scratch mount.
 - **rc cutover follow-ups (from slice 1):**
   - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_rc`
@@ -6978,9 +7010,9 @@ key-value store demolished 2026-07-04.*
   flag through as `.data` instead of a discarded message, or drop the dead
   branch + local `json` field entirely) next time one of these files is
   touched.
-- **`kj config set`/`kj config edit` (write branch) and `kj rc edit`
-  (content branch)/`reset`/`rm` have no `.data` on success (found 2026-07-18,
-  kaish 0.13 `--json` migration).** They return a plain `KjResult::ok(msg)`.
+- **`kj rc add`/`rm` have no `.data` on success (found 2026-07-18, kaish 0.13
+  `--json` migration).** They return a plain `KjResult::ok(msg)`. The other
+  verbs this entry named are deleted.
   Under kaish's `--json`, a text-only success with no `.data`/`.output` wraps
   the human message as a JSON *string* (`"set config 'theme.toml' (7
   bytes)"`), not a structured record — matches kaish's documented contract,
@@ -7080,9 +7112,9 @@ key-value store demolished 2026-07-04.*
   from a stale `S10-binding.kai` missing newer authorities. The *detection*
   half shipped: `kj rc list` now marks each script in-sync / differs-from-seed
   / no-seed (live body vs `seed_body()`, seed-shape-aware for symlink seeds),
-  with per-entry records under a new `--json` flag; `kj rc reset <path>`
-  remains the manual pull (live is truth, no auto-overwrite). Remaining gap —
-  the worse half: `reset`/`reseed` only fix *future* contexts. A context
+  with per-entry records under a new `--json` flag; `kaijutsu-server rc
+  reseed` is the pull (live is truth, no auto-overwrite). Remaining gap —
+  the worse half: a reseed only fixes *future* contexts. A context
   already created from a stale seed keeps its broken loadout and must be
   repaired from a binding-admin context. **No longer structurally blocked**
   (2026-08-11): cold start now seeds a ROOT director with admin + rc-write
@@ -7800,7 +7832,7 @@ key-value store demolished 2026-07-04.*
 Invalidation after a direct config write is by the written/opened path only
 (`Kernel::invalidate_config_file_cache`, the fixed common case), so writing one
 symlink alias and reading another stays stale until cache eviction — e.g.
-`kj rc reset lib/S20` then `cat coder/S20` (coder→lib). Cosmetic (cat path
+writing `lib/S20` then `cat coder/S20` (coder→lib). Cosmetic (cat path
 only), self-heals on LRU/TTL. A full fix needs alias-aware invalidation
 (forward-resolve the written path to its terminal *and* reverse-scan symlinks
 that point at it) — deferred.

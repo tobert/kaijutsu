@@ -1,7 +1,8 @@
 # Config on disk — melting the kernel-owned trees to real files
 
-**Status: slices 1 and 5 shipped; 2, 3 and 4 open (2026-08-29).** Amy ruled
-the shape on 2026-08-21. Production mounts `/etc/rc` from a host directory
+**Status: slices 1, 2, 3 and 5 shipped; slice 4 open (2026-08-29).** Amy
+ruled the shape on 2026-08-21. Production mounts `/etc/rc` from a host
+directory, `rc-write` is deleted, `kj rc` is down to `add`/`list`/`rm`/`show`,
 and hook bodies are path references read at fire time. `/etc/config`,
 `/etc/client` and `/etc/midi` are still documents, so
 `docs/config-ownership.md` still describes those three.
@@ -98,11 +99,20 @@ one most tests run on.
    src/paths.rs`, `file_tools/{path,guard}.rs`, `kj/{rc,config,binding,editor,
    mod}.rs`, `mcp/binding.rs`, `runtime/config_doc_fs.rs`, `kernel_db.rs`,
    `kaijutsu-server/src/{rpc,sftp}.rs`, `tests/rc_role_bindings.rs`.
-3. **Shrink `kj rc`.** `reseed --overwrite` and its unified-diff machinery go —
-   `git diff` is the diff, and reseed returns to install-if-absent. `kj rc
-   edit`/`reset` lose their reason to exist once the file tools and the editor
-   reach the files directly; keep `list` while it still reports something the
-   filesystem does not.
+3. **Shrink `kj rc`. Shipped.** `edit`, `reset` and `reseed` are deleted —
+   with `reseed` went its unified-diff machinery, because on disk `git diff` is
+   the diff, and reseeding is `kaijutsu-server rc reseed [--force]` off the
+   kernel. `add`, `rm` and `show` stay; `list` earns its keep because it marks
+   each entry against its embedded seed (in-sync / differs / no-seed /
+   not-installed / dangling), which the filesystem cannot report.
+
+   Two things fell out that were not planned for. `kj rc`'s call into
+   `config_doc_fs::seed_link_target` went with `reset`, leaving the disk seeder
+   as its only remaining caller — the `ConfigDocFs` blocker is that much
+   smaller. And the lexical deny on SFTP writes to `/etc/rc` and `/etc/config`
+   (`privileged_write_denied`) was deleted in the same pass: it existed to stop
+   an SFTP write bypassing `RcWrite`/`ConfigWrite`, and neither gates a file
+   write any more, so it was denying writes every other path already allowed.
 4. **Record git provenance next to the digest.** Commit sha plus a dirty flag on
    the run row. Clean tree, the sha is the answer and git owns the history;
    dirty tree, `script_bodies` keeps the record honest. Optional by

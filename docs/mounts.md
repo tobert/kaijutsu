@@ -97,8 +97,9 @@ survives the inversion (later slices only narrow what's visible and what
 
 Deploy note: rc seeds are **once-only** on a fresh kernel — the live
 kernel's copies of `lib/create/S10-binding.kai` and
-`director/create/S10-binding.kai` need a `kj rc reset <path>` (or live
-edit) to pick up the `exec` grant, and only *newly created* contexts run
+`director/create/S10-binding.kai` need `kaijutsu-server rc reseed --force`
+(or a plain file edit — rc is a host file now, `docs/rc-on-disk.md`) to pick
+up the `exec` grant, and only *newly created* contexts run
 create-rc; existing coder/director contexts need a one-time
 `kj binding allow "exec"` from a binding-admin context.
 

@@ -29,8 +29,8 @@
 //!
 //! ## Seed contract — bootstrap-once, not a floor
 //!
-//! The deployed tree is the **live source of truth**: what you edit (via
-//! `kj rc edit`, the in-app `vi`, or host `vim`) and what dispatch runs. The
+//! The deployed tree is the **live source of truth**: what you edit (via the
+//! in-app `vi`, the file tools, or host `vim`) and what dispatch runs. The
 //! embedded defaults bootstrap it **once**, on a genuinely fresh install:
 //!
 //! - Fresh install (rc tree absent/empty): [`ensure_rc_seed_files`] writes
@@ -39,16 +39,18 @@
 //! - Re-open with files intact: untouched. Boot never auto-writes the live
 //!   tree again — a script you `rm`'d stays gone, a repo-dropped seed does
 //!   not linger or resurrect. Live is truth.
-//! - Botched an edit? `kj rc reset <path>` restores that one file from its
-//!   embedded seed ([`seed_body`]) — targeted recovery without the repo
-//!   checked out. There is no bulk reseed: moving config between live and the
-//!   repo is left to the user and kai scripts (git is the bridge).
+//! - Botched an edit? `kaijutsu-server rc reseed` reinstalls anything
+//!   missing from the embedded seed ([`seed_body`]), and `--force` also
+//!   restores what differs — recovery without the repo checked out. It runs
+//!   off the kernel, so a botched rc script cannot lock you out of the fix.
+//!   The scripts are host files, so `git checkout` reaches them too.
 //!
 //! ## Updating the seed
 //!
 //! Edit (or add/remove) the asset file under `assets/defaults/rc/` to change
 //! what fresh installs bootstrap with. This does not touch already-deployed
-//! trees (live is truth); `kj rc reset <path>` is the explicit per-file pull.
+//! trees (live is truth); `kaijutsu-server rc reseed [--force]` is the
+//! explicit pull.
 
 use include_dir::{include_dir, Dir, DirEntry};
 
@@ -107,8 +109,9 @@ pub fn seed_files() -> Vec<(String, &'static str)> {
 }
 
 /// The embedded seed body for one canonical rc path, or `None` if no seed
-/// ships for it. Powers `kj rc reset <path>`: targeted restore-from-default
-/// without the repo checked out.
+/// ships for it. Powers `kaijutsu-server rc reseed`: restore-from-default
+/// without the repo checked out, and the seed half of `kj rc list`'s
+/// in-sync/differs comparison.
 pub fn seed_body(canonical_path: &str) -> Option<&'static str> {
     let rel = rc_relpath(canonical_path)?;
     RC_SEED_DIR.get_file(rel).and_then(|f| f.contents_utf8())
@@ -462,9 +465,9 @@ mod tests {
     fn edit_through_a_composed_link_reaches_the_shared_body() {
         // On disk a composed seed is an ordinary symlink, so writing through
         // it changes the body every linking context_type runs. The document
-        // backend refused this in `kj rc edit`; the filesystem does not, and
-        // that is the accepted trade for plain files. Pinned so the change in
-        // meaning is a decision on the record rather than a surprise.
+        // backend refused this through an rc verb; the filesystem does not,
+        // and that is the accepted trade for plain files. Pinned so the change
+        // in meaning is a decision on the record rather than a surprise.
         let dir = tempfile::tempdir().expect("tmpdir");
         ensure_rc_seed_files(dir.path()).expect("seed");
         let root = dir.path();
@@ -522,7 +525,8 @@ mod tests {
             seed_body("/etc/rc/default/create/S20-cache.kai").unwrap().trim(),
             "/etc/rc/lib/create/S20-cache.kai"
         );
-        // …and a path with no embedded seed is None (the `kj rc reset` guard).
+        // …and a path with no embedded seed is None, which is what marks it
+        // `no seed` in `kj rc list` rather than `differs`.
         assert!(
             seed_body("/etc/rc/none/create/S00-noop.kai").is_none(),
             "unseeded path must not resolve a body"

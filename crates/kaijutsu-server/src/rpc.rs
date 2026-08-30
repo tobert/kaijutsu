@@ -1906,8 +1906,8 @@ pub async fn create_shared_kernel(
     // ordinary files an editor, `vim`, or git can reach — `docs/rc-on-disk.md`.
     // Seed the embedded defaults only when the tree is still empty (a genuinely
     // fresh install); after that the directory is the content: a script you
-    // `rm`'d stays gone, a repo-dropped seed does not resurrect. Per-file
-    // recovery is `kj rc reset <path>`. Seeding failure is fatal — a kernel
+    // `rm`'d stays gone, a repo-dropped seed does not resurrect. Recovery is
+    // `kaijutsu-server rc reseed`. Seeding failure is fatal — a kernel
     // without its stance scripts must not come up pretending all is well.
     std::fs::create_dir_all(rc_dir)
         .map_err(|e| capnp::Error::failed(format!("rc tree {}: {e}", rc_dir.display())))?;

@@ -101,7 +101,7 @@ pub const VERB_ROTATE: &str = "rotate";
 /// both the firing gate ([`verb_is_wired`]) and the path validator
 /// (`parse_rc_path`'s regex in `kj::rc`). They MUST agree: a verb the scheduler
 /// fires but the management surface rejects is a latent migration trap — exactly
-/// the rotate regression where `kj rc reset`/`edit` refused a path the beat
+/// the rotate regression where an rc verb refused a path the beat
 /// scheduler runs. Derive both from here so they can't drift again.
 pub const RC_VERBS: &[&str] = &[
     VERB_CREATE,

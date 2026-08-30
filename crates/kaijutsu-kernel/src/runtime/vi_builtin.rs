@@ -5,7 +5,7 @@
 //! block and opens a session, returning the session handle + initial state. It
 //! does **no editing logic of its own** — it is a thin alias onto the kernel's
 //! shared `editor_open` primitive, the same primitive `kj editor open` and (when
-//! it needs to open an editor) `kj rc edit` route through. One primitive, many
+//! it needs to open an editor) `kj editor open` route through. One primitive, many
 //! front doors.
 //!
 //! Opening signals the submitter's app windows to pop a renderer (the

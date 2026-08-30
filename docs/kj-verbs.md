@@ -124,9 +124,6 @@ the flag; and all of `fork`, `drive`, `play`, `cp`, `drift push/pull/merge/flush
 | `kj rc list` | List installed scripts, optionally filtered | no | no |
 | `kj rc rm` | Remove a script | yes-destructive | no |
 | `kj rc show` | Print one script's content + metadata | no | no |
-| `kj rc edit` | Edit a script. With `--content` it replaces the body; with no body it opens an interactive vi editor session | yes-destructive | no |
-| `kj rc reset` | Restore one script to its embedded seed | yes-destructive | no |
-| `kj rc reseed` | Install every path whose embedded seed never landed | yes-destructive | no |
 | `kj editor open` | Open an editor on a path, binding to the kernel block that owns it | no | no |
 | `kj editor keys` | Feed vim keys to a session | yes | no |
 | `kj editor state` | Print a session's current buffer/cursor/mode/dirty state | no | no |
@@ -236,13 +233,6 @@ one outcome, one locked. `kj context promote` is the documented resurrection
 path back out, which is why the row is `yes-destructive` rather than
 irrecoverable.
 
-**`kj rc reseed`'s warning is not a gate.** The help says "Prints a unified
-diff of every change; read it before overwriting for real, because an
-overwritten path cannot be recovered afterward" — which reads like a two-step
-or dry-run flow. It is not. The diff prints and the overwrite lands in the same
-invocation; `--dry-run` is an opt-in flag, not the default (rc.rs:939), and
-there is no `caller.confirmed` check anywhere in rc.rs.
-
 **`kj backend reseed` clobbers more than its help admits.** The description
 says "Operator-added backends are left alone," which is true of backend rows,
 but `reseed_factory_backends` unconditionally calls
@@ -263,10 +253,11 @@ the help says.
   provenance, not delivered content.
 - **`kj play` has no capability gate**, in either play-now or durable
   `--track` commit mode — the only write-capable verb audited without one.
-- **`kj rc rm` is only partly recoverable.** `kj rc reset <path>` restores the
-  *embedded seed*, not what was removed. A script that had diverged from its
-  seed loses the divergence permanently; a no-seed user-authored script cannot
-  be reset at all (rc.rs:1493-1516).
+- **`kj rc rm` is only partly recoverable.** `kaijutsu-server rc reseed`
+  restores the *embedded seed*, not what was removed. A script that had
+  diverged from its seed loses the divergence permanently; a no-seed
+  user-authored script has no seed to restore. That reseed runs off the
+  kernel, so it is not a `kj` verb and has no row above.
 - **`kj transport delete`'s tombstone claim is true in code** —
   `tombstone_track` (kernel_db.rs:5211) renames the row and sets `deleted_at`;
   the hard-deleting `delete_track` exists but is never reached from this verb.

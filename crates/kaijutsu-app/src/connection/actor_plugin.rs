@@ -428,7 +428,7 @@ impl Plugin for ActorPlugin {
 /// `poll_bootstrap_results`'s `ActorReady` arm. That is correct for cold
 /// start but leaves the app silently running whatever theme/metronome/scroll
 /// config it booted with even after a kernel bounce onto a fresh or edited
-/// config (`kj rc reset`, a config wipe, a different kernel instance on
+/// config (a reseed, a config wipe, a different kernel instance on
 /// the same port during dev) — reconnected at the transport layer but not
 /// re-initialized at the domain layer, the exact bug this task exists to
 /// close. `ServerEvent::Reconnected` is never emitted for the first connect

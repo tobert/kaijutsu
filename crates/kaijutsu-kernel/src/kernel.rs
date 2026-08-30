@@ -1398,7 +1398,7 @@ impl Kernel {
     /// Open an editor recording the [`EditorOpener`](crate::editor::EditorOpener)
     /// on the session, so `fg` can re-foreground it for that principal and
     /// `:r !cmd` can shell out in the opener's context. The signaled front doors
-    /// (`vi`/`edit`, `kj editor`, `kj rc edit`) pass the caller here.
+    /// (`vi`/`edit`, `kj editor`) pass the caller here.
     ///
     /// For a **file-backed** target (not config/rc): pins the file-document
     /// cache entry for the session's lifetime (P1, `docs/issues.md` "Tech-debt
@@ -1871,7 +1871,7 @@ impl Kernel {
 
     /// Invalidate the shared [`FileDocumentCache`] shadow for a **config** path
     /// after a write that touched the `ConfigDocFs` block **directly** (the vi
-    /// editor's block mirror, `kj rc edit/reset/add/rm`, `kj config set/reset`).
+    /// editor's block mirror, `kj rc add/rm`, `kj config reset`).
     ///
     /// Config paths get a separate `file_context_id` shadow doc that backs the
     /// kaish `cat`/file-tool read path; a direct config-block write leaves it
@@ -2213,7 +2213,7 @@ impl Kernel {
 
     /// [`editor_open`](Self::editor_open) **plus** the `open_editor` peer signal
     /// to the submitter's app windows. The ergonomic front doors (`vi`/`edit`,
-    /// `kj editor open`, `kj rc edit`) use this so a human's `vi foo` pops a
+    /// `kj editor open`) use this so a human's `vi foo` pops a
     /// renderer; the wire `editorOpen` handler and tests call the plain
     /// `editor_open` (they are the renderer / a driver and need no nudge). One
     /// signal site, threaded the submitter principal from each door's caller.

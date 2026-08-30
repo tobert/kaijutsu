@@ -75,7 +75,6 @@ PROBES = [
     ("kj", "kj context demote 019a2f3c", "data-critical"),
     ("kj", "kj cas rm sha256-abc123def", "situation-normal"),
     ("kj", "kj rc rm /etc/rc/coder/create/S00-stance.kai", "data-critical"),
-    ("kj", "kj rc reset /etc/rc/coder/create/S00-stance.kai", "situation-normal"),
     ("kj", "kj binding reset", "situation-normal"),
     ("kj", "kj hook remove lfm2d-advisory", "data-critical"),
     ("kj", "kj cast remove artist", "situation-normal"),

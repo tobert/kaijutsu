@@ -100,7 +100,7 @@ fi
 #
 # 1. `kj ... --help`. clap resolves help before dispatch, so the verb never
 #    runs and there is nothing for a classifier to be right or wrong about.
-#    The scorer reads these as ordinary commands -- `kj rc edit --help`
+#    The scorer reads these as ordinary commands -- `kj rc add --help`
 #    scored situation-normal 0.367 under v10 and asked a human about a help
 #    screen. Three conditions:
 #
@@ -111,7 +111,7 @@ fi
 #      * no word between them starts with `-`.
 #
 #    That third condition is what makes it safe rather than convenient. A
-#    word-scan for `--help` anywhere is a real bypass: `kj rc edit <path>
+#    word-scan for `--help` anywhere is a real bypass: `kj rc add <path>
 #    --content --help` binds `--help` as the content VALUE (the field is
 #    `allow_hyphen_values`), so clap prints nothing and the write runs for
 #    real. Covered by contrib/lfm2d-ladder-check.kai, which asserts that

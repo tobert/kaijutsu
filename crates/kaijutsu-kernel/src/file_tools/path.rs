@@ -145,12 +145,11 @@ mod tests {
     /// tools, like any other file — none of the four carries a capability of
     /// its own.
     ///
-    /// This is the shared-trust stance applied literally (Amy, 2026-08-15: *"if
-    /// the agent can see the files and edit them, that's fine, we don't need to
-    /// complicate it just because it's config"*). These mounts used to be
-    /// unreachable here, so `kj config set`/`kj rc edit` were the only way in —
-    /// which is what made deleting those verbs a brick rather than a
-    /// simplification.
+    /// This is the shared-trust stance applied literally: if a player can see
+    /// a file and edit it, config is not a special category deserving its own
+    /// machinery. This test is what makes deleting a config-writing verb a
+    /// simplification rather than a brick — the mount has to stay reachable
+    /// here first. Reasoning: `docs/rc-on-disk.md`.
     #[test]
     fn config_mounts_are_ordinary_write_surfaces() {
         assert!(deny_etc_write("/etc/rc/coder/create/S00-stance.md").is_none());

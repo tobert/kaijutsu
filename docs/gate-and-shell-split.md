@@ -389,8 +389,8 @@ the checklist above:
   just a file in this repo.** Editing `assets/defaults/rc/**` reseeds a
   *fresh* kernel only (`docs/config-ownership.md`); a running kernel's
   `director`/`toolie` rc scripts keep the pre-rename grant text until an
-  operator runs `kj rc reset /etc/rc/director/create/S10-binding.kai` and `kj
-  rc reset /etc/rc/toolie/create/S10-binding.kai` by hand.
+  operator restores both `S10-binding.kai` scripts by hand (a file write, or
+  `kaijutsu-server rc reseed --force`).
 
 ## The crux: the plan API is all-or-nothing per statement, and that's real
 
@@ -1550,8 +1550,8 @@ does. Its header says so.
 
 ## A pending ask has a block status of its own: `Status::Waiting`
 
-`kj rc reset /etc/rc/lib/create/S50-lfm2d.kai` → the gate records an ask,
-nothing runs, and the command's two blocks settle `waiting`, not `error`.
+A gated rc verb → the gate records an ask, nothing runs, and the command's
+two blocks settle `waiting`, not `error`.
 
 Rendering was fixed first: the message a model reads no longer calls a
 pending gate a denial. The blocks behind that message still did, because

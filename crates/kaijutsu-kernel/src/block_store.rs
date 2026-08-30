@@ -7293,7 +7293,7 @@ mod tests {
                 None,
                 Role::Tool,
                 BlockKind::ToolCall,
-                "kj rc reset",
+                "kj rc list",
                 Status::Waiting,
                 ContentType::Plain,
             )

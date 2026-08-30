@@ -1,8 +1,8 @@
 # In-App vi Editor
 
-`vi /etc/rc/thing/whatever.kai` (and bare `kj rc edit <path>`) opens a real
-vi-like editor on that file's block. The editor is a **kernel-owned
-session** driven through a small tool-shaped surface; the Bevy app is one
+`vi /etc/rc/thing/whatever.kai` opens a real vi-like editor on that file's
+block. The editor is a **kernel-owned session** driven through a small
+tool-shaped surface; the Bevy app is one
 *renderer* of it, a model is another *player* of it, and a headless test is a
 third *driver* of it. Same surface for all three.
 
@@ -21,10 +21,10 @@ hazard real.
 resolver → `kaijutsu-editor` `EditorCore` (pure modalkit vim) → kernel
 `EditorSessions` → capnp wire surface (`editorOpen/Keys/State/Save/Quit @74–78`
 + push `subscribeEditor @79`) → `Screen::Editor` MSDF renderer with a real
-cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin,
-`kj editor` verbs, and bare `kj rc edit <path>` — all funneling to one
-`Kernel::editor_open` and one `EditorState::to_json` shape. The `:` command
-dialect shipped (core verbs, a hand-rolled `:s`, `:r <file>` / `:r !cmd`),
+cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin and
+`kj editor` verbs — both funneling to one `Kernel::editor_open` and one
+`EditorState::to_json` shape. The `:` command dialect shipped (core verbs, a
+hand-rolled `:s`, `:r <file>` / `:r !cmd`),
 as did Ctrl+Z suspend / `fg` resume. The cache-coherence and restart-staleness
 issues are fixed. The editor now participates in the file-buffer layer it
 sits on (`docs/file-buffers.md`): an edit to a file-backed session marks the
@@ -231,9 +231,9 @@ The same surface a test drives is what a model plays.
 
 1. **Dispatch is a kaish builtin.** `vi`/`edit <path>` is a real kaish `Tool`
    (`runtime/vi_builtin.rs`, registered in `kj/context_shell.rs`) — not a
-   `kj editor open` alias. `kj editor` and bare `kj rc edit` reach the editor
-   through the same shared `Kernel::editor_open` primitive; three front doors,
-   one kernel method, one `EditorState::to_json` shape.
+   `kj editor open` alias. `kj editor` reaches the editor through the same
+   shared `Kernel::editor_open` primitive; two front doors, one kernel
+   method, one `EditorState::to_json` shape.
 2. **Save model: the session buffer binds to the block.** Typing lands as
    range edits (`block_store.edit_text`), never a whole-file replace. The
    kernel sequences every write, so concurrent merge into a block is
@@ -266,9 +266,12 @@ The same surface a test drives is what a model plays.
 8. **No generic `edit_block` RPC.** The app sends *keys*; the kernel writes via
    `block_store.edit_text`. A generic block-edit RPC is off the editor's
    critical path — don't build it for vi.
-9. **rc-write capability applies.** `/etc/rc/*` needs rc-write; the rest of
-   `/etc` is denied flat. Open + save surface permission errors loudly — crash
-   over corruption.
+9. **No capability gates `/etc/rc`.** rc melted to host files
+   (`docs/rc-on-disk.md`) and `rc-write` is dropped with it — a script is
+   protected the way any file is, through the file tools and the editor, not
+   a loadout check. The rest of `/etc` — the host's real one — is still
+   denied flat. Open + save surface permission errors loudly — crash over
+   corruption.
 
 ### Path resolution — bind to the owner, not a copy
 
@@ -278,14 +281,22 @@ load-bearing:
 
 - **config-owned**: the mount table answers — `MountTable::owner_of(path)` +
   `VfsOps::owns_config_docs()` (the config-doc backends answer for themselves;
-  `ConfigCrdtFs` returns `true`). Bind to
+  `ConfigDocFs` returns `true`). Bind to
   `(config_doc::config_context_id(path), config_doc::first_block_id(..))` —
-  the ConfigCrdtFs-owned block, the sole source of truth. A config path is
+  the `ConfigDocFs`-owned block, the sole source of truth. A config path is
   config-owned only when its backend is actually *mounted* (you can't edit an
   unmounted tree).
 - **ordinary file**: `FileDocumentCache::get_or_load(path)`.
 
-rc/config are sole-owned single-block `DocKind::File` documents. Running a
+**`/etc/rc` takes the ordinary-file branch now**, because the mount table is
+the authority and rc's mount is a `LocalBackend` over a host directory
+(`docs/rc-on-disk.md`). That the answer comes from the mount table and not a
+path prefix is what let rc change sides without touching this code, and it is
+pinned by `resolve_editor_target_marks_config_owned_from_the_mount_table_not_a_path_prefix`
+in `crates/kaijutsu-kernel/src/editor.rs`. The other three roots are still
+config-owned.
+
+A config document is a sole-owned single-block `DocKind::File`. Running a
 config path through `get_or_load` would mint a *separate* `FileDocumentCache`
 copy shadowing that owner — reviving the dual-ownership write-through bug
 class (`docs/config-ownership.md`). Missing config docs **fail loud** (no
@@ -429,7 +440,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Editor sessions + resolver + state shape | `kaijutsu-kernel/src/editor.rs` (`resolve_editor_target`, `EditorSessions`, `EditorState::to_json`, `APP_PEER_NICK`) |
 | Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`) |
 | `vi`/`edit` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `kj/context_shell.rs` |
-| `kj editor` / `kj rc edit` | `kaijutsu-kernel/src/kj/editor.rs`, `kj/rc.rs` (`rc_edit`) |
+| `kj editor` | `kaijutsu-kernel/src/kj/editor.rs` |
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |

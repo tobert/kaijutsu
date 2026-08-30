@@ -110,7 +110,12 @@ play            Play a sample now, or commit it as a clip cell onto a track with
                 --track/--at/--label (docs/pcm.md)
 policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove, reseed
-rc              add, list, rm, show, edit, reset — lifecycle scripts (/etc/rc/<type>/<verb>/)
+rc              add, list, rm, show — lifecycle scripts (/etc/rc/<type>/<verb>/).
+                They are host files: edit one with `vi <path>` or the file
+                tools, and restore the shipped defaults with
+                `kaijutsu-server rc reseed`. `rc list` marks each entry
+                against its seed (in-sync / differs / not-installed /
+                dangling), which the filesystem cannot tell you
 roster          status <text> [--availability], list — the live roster: post
                 your own self-reported status (identity is always the
                 caller's own) or list who's around right now

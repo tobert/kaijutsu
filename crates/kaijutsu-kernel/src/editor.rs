@@ -1,5 +1,5 @@
 //! In-app editor: the kernel-owned editing surface (the `vi`/`edit` builtin +
-//! `kj rc edit` default).
+//! `vi` default).
 //!
 //! Two parts:
 //! - [`resolve_editor_target`] maps a VFS path to the `(context, block)`
@@ -261,7 +261,7 @@ pub struct EditorState {
 impl EditorState {
     /// Structured `.data` for one session, stamped with its handle — the single
     /// shape every editor front door emits (`kj editor`, the `vi`/`edit`
-    /// builtin, `kj rc edit`). Object form (inspect-style) so a driver reads one
+    /// builtin). Object form (inspect-style) so a driver reads one
     /// record. Keeping it here means the shape can't drift between front doors.
     pub fn to_json(&self, session: EditorSessionId) -> serde_json::Value {
         serde_json::json!({
@@ -277,7 +277,7 @@ impl EditorState {
 }
 
 /// Who opened a session, and the shell context they opened from — captured at
-/// the front door (`vi`/`edit`, `kj editor`, `kj rc edit`) and recorded on the
+/// the front door (`vi`/`edit`, `kj editor`) and recorded on the
 /// session. Two consumers:
 ///
 /// - **`fg`** re-foregrounds the caller's most-recent session by `principal`.

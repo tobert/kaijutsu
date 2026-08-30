@@ -69,7 +69,7 @@ check informative      escalate "$v6" kube_ordinal_v6 || fails=1
 #
 #   1. `kj ... --help`. clap resolves help before dispatch, so nothing runs.
 #      The predicate is narrow on purpose and the `--content --help` case is
-#      why: `kj rc edit`'s content field is `allow_hyphen_values`, so clap
+#      why: `kj rc add`'s content field is `allow_hyphen_values`, so clap
 #      binds `--help` as the VALUE and performs a real write — a word-scan
 #      for `--help` anywhere would auto-allow it.
 #   2. `kj ledger ...`, the gate's own answer path. Scoring it deadlocked the
@@ -108,16 +108,16 @@ check_exempt() {
   fi
 }
 
-check_exempt '[{"clause":"kj rc edit --help"}]' true "kj rc edit --help" || fails=1
+check_exempt '[{"clause":"kj rc add --help"}]' true "kj rc add --help" || fails=1
 check_exempt '[{"clause":"kj ledger list --help"}]' true "kj ledger list --help" || fails=1
 check_exempt '[{"clause":"kj -h"}]' true "kj -h" || fails=1
 check_exempt '[{"clause":"kj rc rm /etc/rc/coder/create/S00.kai --help"}]' true "positional then --help" || fails=1
-check_exempt '[{"clause":"kj rc edit --help"},{"clause":"kj rc rm --help"}]' true "two help clauses" || fails=1
+check_exempt '[{"clause":"kj rc add --help"},{"clause":"kj rc rm --help"}]' true "two help clauses" || fails=1
 # The bypass. This one must stay false.
-check_exempt '[{"clause":"kj rc edit /etc/rc/x --content --help"}]' false "--content --help is a WRITE, not help" || fails=1
+check_exempt '[{"clause":"kj rc add /etc/rc/x --content --help"}]' false "--content --help is a WRITE, not help" || fails=1
 check_exempt '[{"clause":"kj rc rm /etc/rc/x"}]' false "a real rm" || fails=1
 check_exempt '[{"clause":"cargo test --help"}]' false "not kj, not covered" || fails=1
-check_exempt '[{"clause":"kj rc edit --help"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: one real clause scores the call" || fails=1
+check_exempt '[{"clause":"kj rc add --help"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: one real clause scores the call" || fails=1
 check_exempt '[{"clause":"kj"}]' false "bare kj" || fails=1
 
 # The gate's own answer path. Every `kj ledger` verb is exempt, because the

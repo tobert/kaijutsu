@@ -133,10 +133,17 @@ the acting surface; `/v/ctx` is the browse surface, already specced.
 
 ## Capability — writes are gated by your current context
 
-Per `docs/slash-v.md`, there is no per-session capability token: a privileged write is
-authorized by the context it **runs in** (`ExecContext.context_id`), and
-`context_allows_rc_write(ctx)` (`file_tools/guard.rs:71`) is the one gate. The shell
-gets this for free because each line's kaish is materialized with the current context.
+Per `docs/slash-v.md`, there is no per-session capability token: where a write is
+gated at all, it is authorized by the context it **runs in**
+(`ExecContext.context_id`). The shell gets this for free because each line's kaish is
+materialized with the current context.
+
+**`/etc/rc` is no longer one of those writes.** This section was written when
+`context_allows_rc_write(ctx)` gated it; `rc-write` is deleted and rc scripts are host
+files (`docs/rc-on-disk.md`), so an rc write is governed by the mount's `read_only()`
+flag like any other path. The context-resolution question below is unchanged and is
+why the section stays — it is about *which* context a line acts as, which still
+decides every capability the loadout does gate.
 
 **Where the current context comes from — the decision that matters.** A "line" is one
 kaish *materialization*: read a line, build one kaish, run the whole line, drop it.
@@ -180,7 +187,9 @@ Playing the shell out, smallest surprises first:
   current context, so this works from the lobby.
 - **Switch, then write.** Privileged edits are two lines (switch, then write) per the
   Capability rule. Interactive `vi`/`edit` needs a PTY (deferred), so v1 rc editing is
-  the non-interactive `kj rc edit <path> --content <body>`.
+  a non-interactive file write (`builtin.file:write <path>`) — rc scripts are
+  ordinary host files under `~/.config/kaijutsu/etc/rc/` (`docs/rc-on-disk.md`),
+  reachable the same way any file is.
 - **Watch a hot block.** `cat /v/ctx/<shard>/<ctx>/blocks/<key>/content` snapshots at
   open and each line re-materializes, so "watch it grow" is a poll loop — no follow
   mode in v1. Acceptable; the `generation` stamp is what a poller keys on.

@@ -210,7 +210,9 @@ candidates, not commitments.
   bundles MCP servers + hooks + commands + context as one versioned, git-URL-installable
   unit. An `extension.toml` (rc scripts + contrib adapters + context configs) installable
   via `kj extension install <git-url>` — configures the instrument, doesn't host it.
-- **Hook fingerprinting / trust.** Kernel ownership is the integrity model but there's
-  no change-detection warning when an rc/hook body changes via `kj rc reset` or sync
-  (extends the existing "stale rc seed" item). gemini fingerprints project hooks and
-  warns on change. Track hook-body hashes; warn/block-by-default on unexpected change.
+- **Hook fingerprinting / trust.** The approval ledger's recorded digest is the
+  integrity model but there's no change-detection warning when an rc/hook body
+  changes on disk — a file write, `kaijutsu-server rc reseed --force`, or a
+  `git checkout` in `~/.config/kaijutsu/etc/rc/` all land silently (extends the
+  existing "stale rc seed" item). gemini fingerprints project hooks and warns
+  on change. Track hook-body hashes; warn/block-by-default on unexpected change.
