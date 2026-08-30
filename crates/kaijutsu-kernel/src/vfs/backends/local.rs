@@ -75,6 +75,43 @@ impl LocalBackend {
         &self.root
     }
 
+    /// Canonicalize the deepest ancestor that exists and append the rest
+    /// literally.
+    ///
+    /// A component that does not exist cannot be a symlink, so canonical
+    /// containment on the existing prefix is containment on the whole path.
+    /// Resolving only the immediate parent is not enough: when the parent is
+    /// itself missing, an intermediate symlink never gets resolved, the
+    /// containment check sees a path the kernel will not use, and a create
+    /// walks through the link and lands outside the root.
+    ///
+    /// A dangling link canonicalizes as an error, so it joins the literal tail
+    /// and the operation fails on it rather than traversing it.
+    fn canonicalize_deepest_existing(full: &Path) -> PathBuf {
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cursor = full.to_path_buf();
+        loop {
+            if let Ok(resolved) = cursor.canonicalize() {
+                let mut out = resolved;
+                for part in tail.iter().rev() {
+                    out.push(part);
+                }
+                return out;
+            }
+            let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+                return full.to_path_buf();
+            };
+            let Some(parent) = cursor.parent().map(|p| p.to_path_buf()) else {
+                return full.to_path_buf();
+            };
+            if parent.as_os_str().is_empty() {
+                return full.to_path_buf();
+            }
+            tail.push(name);
+            cursor = parent;
+        }
+    }
+
     /// Refuse a path that climbs above the mount root — lexically, before any
     /// I/O touches it.
     ///
@@ -125,28 +162,7 @@ impl LocalBackend {
 
         // Canonicalize to resolve symlinks and ..
         // For non-existent paths, we need to check parent
-        let canonical = if full.exists() {
-            full.canonicalize().map_err(VfsError::from)?
-        } else {
-            // For new files, canonicalize parent and append filename
-            let parent = full
-                .parent()
-                .ok_or_else(|| VfsError::invalid_path("no parent"))?;
-
-            let filename = full
-                .file_name()
-                .ok_or_else(|| VfsError::invalid_path("no filename"))?;
-
-            if parent.exists() {
-                parent
-                    .canonicalize()
-                    .map_err(VfsError::from)?
-                    .join(filename)
-            } else {
-                // Parent doesn't exist, will fail on actual operation
-                full
-            }
-        };
+        let canonical = Self::canonicalize_deepest_existing(&full);
 
         // Verify we haven't escaped the root
         let canonical_root = self
@@ -186,11 +202,7 @@ impl LocalBackend {
         let filename = full
             .file_name()
             .ok_or_else(|| VfsError::invalid_path("no filename"))?;
-        let resolved = if parent.exists() {
-            parent.canonicalize().map_err(VfsError::from)?.join(filename)
-        } else {
-            full.clone()
-        };
+        let resolved = Self::canonicalize_deepest_existing(parent).join(filename);
 
         let canonical_root = self
             .root
@@ -783,6 +795,37 @@ mod tests {
             !tmp.path().join("sibling").exists(),
             "create escaped the mount root and made a directory beside it"
         );
+    }
+
+    /// A missing parent reached THROUGH a symlink must not escape either.
+    ///
+    /// The lexical `..` refusal closes one escape; this is the other. When the
+    /// parent does not exist, resolution appends the whole remainder to the
+    /// root literally, so an intermediate symlink is never resolved and the
+    /// component-wise containment check sees an inside-the-root path. `create`
+    /// then `create_dir_all`s through the link, outside the root.
+    ///
+    /// Falsified by resolving a missing parent to a literal `root.join(path)`
+    /// instead of canonicalizing the deepest ancestor that does exist.
+    #[tokio::test]
+    async fn a_symlinked_intermediate_cannot_escape_when_the_parent_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let backend = LocalBackend::new(&root);
+
+        let result = backend
+            .create(Path::new("link/newdir/escaped.txt"), 0o644)
+            .await;
+
+        assert!(
+            !outside.join("newdir").exists(),
+            "created a directory outside the root through a symlinked intermediate"
+        );
+        assert!(result.is_err(), "the escape must be refused, not merely contained");
     }
 
     /// `unlink` on a symlink removes the LINK, never what it points at.
