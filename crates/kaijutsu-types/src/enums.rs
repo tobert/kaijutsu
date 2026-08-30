@@ -197,8 +197,10 @@ pub enum DocKind {
     File,
     /// Symbolic link. Git-style: the single block's content *is* the link
     /// target path; this kind is the authoritative "mode bit" that tells a
-    /// reader to follow rather than treat the content as a file body. See
-    /// `ConfigDocFs`.
+    /// reader to follow rather than treat the content as a file body. No
+    /// backend creates one today — config/rc are ordinary host directories
+    /// (`docs/config-namespace.md`) — but the kind is a persisted enum and
+    /// stays for any document-backed mount that wants it.
     #[strum(serialize = "symlink")]
     Symlink,
 }

@@ -18,8 +18,6 @@ pub mod blocks;
 pub mod block_tools;
 pub mod cc_inbox;
 pub mod image;
-pub mod config_doc;
-pub mod config_export;
 pub mod config_seed;
 pub mod control;
 pub mod drift;

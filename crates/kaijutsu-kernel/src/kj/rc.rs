@@ -486,9 +486,10 @@ impl KjDispatcher {
     /// target` annotation, so this reuses it instead of re-issuing the same
     /// VFS readlink).
     ///
-    /// A seed whose body is itself a link-target path ([`config_doc_fs::
-    /// seed_link_target`], the init.d composition seeding reconstructs as a
-    /// symlink) compares link-target-to-link-target; every other seed compares
+    /// A seed whose body is itself a link-target path
+    /// ([`crate::seed_scripts::seed_link_target`], the init.d composition
+    /// seeding reconstructs as a symlink) compares link-target-to-link-target;
+    /// every other seed compares
     /// literal body-to-body. Mixing the two (a live file where the seed wants
     /// a link, or vice versa) is `Differs`, never silently treated as a match.
     async fn rc_seed_status(&self, path: &str, live_link: Option<&str>) -> RcSeedStatus {
@@ -510,10 +511,18 @@ impl KjDispatcher {
             .into_iter()
             .map(|(p, _)| p)
             .collect();
-        let expected_link =
-            crate::runtime::config_doc_fs::seed_link_target(path, seed, &known);
+        let expected_link = crate::seed_scripts::seed_link_target(path, seed, &known);
 
-        match (expected_link.as_deref(), live_link) {
+        // `expected_link` is the seed body verbatim — always an absolute
+        // `/config/rc` path. `live_link` is whatever the real on-disk
+        // symlink carries, which for a properly reseeded tree is
+        // host-relative (`reseed_rc_files` writes relative targets so the
+        // tree stays valid wherever it's mounted or copied). Canonicalize
+        // both to the same absolute coordinate before comparing, or a
+        // relative live symlink would never match its own seed.
+        let live_absolute = live_link.map(|l| crate::seed_scripts::canonical_link_target(path, l));
+
+        match (expected_link.as_deref(), live_absolute.as_deref()) {
             (Some(want), Some(got)) => {
                 if want == got {
                     RcSeedStatus::InSync
@@ -983,12 +992,13 @@ mod tests {
             &c,
         )
         .await;
-        // Compose it into `coder` by symlink (the init.d move).
+        // Compose it into `coder` by symlink (the init.d move). A real host
+        // symlink target, same shape `reseed_rc_files` writes.
         d.kernel()
             .vfs()
             .symlink(
                 std::path::Path::new("/config/rc/composed/create/S10-binding.kai"),
-                std::path::Path::new("/config/rc/lib/create/S00-binding.kai"),
+                std::path::Path::new("../../lib/create/S00-binding.kai"),
             )
             .await
             .expect("create rc symlink");
@@ -1010,7 +1020,7 @@ mod tests {
                 );
                 assert!(
                     message.contains(
-                        "/config/rc/composed/create/S10-binding.kai → /config/rc/lib/create/S00-binding.kai"
+                        "/config/rc/composed/create/S10-binding.kai → ../../lib/create/S00-binding.kai"
                     ),
                     "list message lacks arrow annotation: {message}"
                 );
@@ -1030,7 +1040,7 @@ mod tests {
                 let obj = v.as_object().expect("object");
                 assert_eq!(
                     obj["symlink"].as_str(),
-                    Some("/config/rc/lib/create/S00-binding.kai"),
+                    Some("../../lib/create/S00-binding.kai"),
                     "show should report link target"
                 );
                 assert_eq!(
@@ -1164,7 +1174,7 @@ mod tests {
         match result {
             KjResult::Ok { message, .. } => assert!(
                 message.contains(
-                    "/config/rc/default/create/S20-cache.kai → /config/rc/lib/create/S20-cache.kai [in-sync]"
+                    "/config/rc/default/create/S20-cache.kai → ../../lib/create/S20-cache.kai [in-sync]"
                 ),
                 "expected in-sync symlink marker: {message}"
             ),
@@ -1185,11 +1195,24 @@ mod tests {
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
-        d.dispatch(
-            &[s("rc"), s("rm"), s("/config/rc/default/create/S20-cache.kai")],
-            &c,
-        )
-        .await;
+        // Remove the seeded symlink at the host level, not via `kj rc rm`:
+        // `LocalBackend::unlink` resolves its path through `canonicalize()`,
+        // which follows a *resolvable* symlink to its target before
+        // unlinking — so `rc rm` on a live composed symlink deletes the
+        // shared target file instead of the per-type link (see
+        // docs/issues.md). `std::fs::remove_file` never follows the final
+        // symlink component (POSIX `unlink()`), so it removes the link
+        // itself, matching this test's actual scenario.
+        use crate::vfs::VfsOps as _;
+        let rc_host_root = d
+            .kernel()
+            .vfs()
+            .real_path(std::path::Path::new("/config/rc"))
+            .await
+            .expect("real_path")
+            .expect("rc mount has a host path");
+        std::fs::remove_file(rc_host_root.join("default/create/S20-cache.kai"))
+            .expect("remove the seeded symlink at the host level");
         d.dispatch(
             &[
                 s("rc"),
@@ -1376,6 +1399,10 @@ mod tests {
         let s = |v: &str| v.to_string();
         let target = "/config/rc/lib/create/S20-cache.kai";
         let link = "/config/rc/coder/create/S20-cache.kai";
+        // The listing shows the real on-disk symlink target, which
+        // `reseed_rc_files` writes host-relative — not the absolute
+        // `target` path above (used below for the `rc rm` VFS call).
+        let target_display = "../../lib/create/S20-cache.kai";
 
         // Precondition: the link is a real seed symlink onto the shared target.
         let before = d
@@ -1386,7 +1413,7 @@ mod tests {
             .await;
         match before {
             KjResult::Ok { message, .. } => assert!(
-                message.contains(&format!("{link} → {target} [in-sync]")),
+                message.contains(&format!("{link} → {target_display} [in-sync]")),
                 "expected a healthy seed symlink first: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
@@ -1410,7 +1437,7 @@ mod tests {
             .await;
         match after {
             KjResult::Ok { message, .. } => assert!(
-                message.contains(&format!("{link} → {target} [dangling — target missing]")),
+                message.contains(&format!("{link} → {target_display} [dangling — target missing]")),
                 "a link resolving to nothing must not read in-sync: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
@@ -1428,8 +1455,11 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let target = "/config/rc/bassist/create/S05-chair.md";
-        let link = "/config/rc/bassist/create/S00-stance.md";
+        // A fresh, unshipped context_type — `bassist`/`coder`/etc. all ship
+        // real seeded files under `create/` that would collide with this
+        // test's "user-authored, no seed" setup.
+        let target = "/config/rc/tmpuser/create/S05-chair.md";
+        let link = "/config/rc/tmpuser/create/S00-stance.md";
 
         // Point a user-authored link at another user-authored path, then
         // remove the target out from under it.
@@ -1437,23 +1467,26 @@ mod tests {
             .await;
         d.dispatch(&[s("rc"), s("rm"), s(link)], &c).await;
         use crate::vfs::VfsOps;
+        // A real host symlink target, same shape `reseed_rc_files` writes —
+        // `link` and `target` share a directory, so the relative form is
+        // just the bare filename.
         let made = d
             .kernel()
             .vfs()
-            .symlink(std::path::Path::new(link), std::path::Path::new(target))
+            .symlink(std::path::Path::new(link), std::path::Path::new("S05-chair.md"))
             .await;
         assert!(made.is_ok(), "symlink setup failed: {made:?}");
         d.dispatch(&[s("rc"), s("rm"), s(target)], &c).await;
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("bassist"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--type"), s("tmpuser"), s("--verb"), s("create")],
                 &c,
             )
             .await;
         match result {
             KjResult::Ok { message, .. } => assert!(
-                message.contains(&format!("{link} → {target} [dangling — target missing]")),
+                message.contains(&format!("{link} → S05-chair.md [dangling — target missing]")),
                 "an unseeded dangling link must report dangling, not no-seed: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),

@@ -1,10 +1,11 @@
-//! Embedded default MIDI device profile seeds, seeded onto the kernel-owned
+//! Embedded default MIDI device profile seeds, seeded onto the
 //! `/config/midi/devices/<name>` tree (`docs/midi-next.md` "Storage and
 //! identity", slice 1 step 2).
 //!
-//! Same ownership contract as rc/config (`docs/config-ownership.md`):
-//! the kernel is the **sole owner** of `/config/midi` — no host file, no
-//! write-through. The bodies live as real files under
+//! Same seed contract as rc/config: `/config/midi` is an ordinary host
+//! directory reached through `LocalBackend` (`docs/config-namespace.md`),
+//! seeded from these embedded defaults only while the tree is empty. The
+//! bodies live as real files under
 //! `assets/defaults/midi/devices/` and are embedded here via [`include_dir!`],
 //! exactly like `crate::seed_scripts` embeds `assets/defaults/rc/`. The
 //! embedded tree IS the manifest: dropping a new `<device>.md` file under
@@ -16,8 +17,8 @@
 //!
 //! Each embedded `<name>.md` seeds one canonical path:
 //! `/config/midi/devices/<name>` — the `.md` extension is dropped. Today that's
-//! a single prose+JSON document per device; the mount is the same
-//! directory-capable `ConfigDocFs` backend `/config/rc` uses, so a device can
+//! a single prose+JSON document per device; the mount is the same host
+//! directory `/config/rc` is, so a device can
 //! grow into an rc-style bucket of `SXX-*.{md,kai}` files later
 //! (`docs/midi-next.md` "The core split") without a storage migration — only
 //! this collector (and `kj midi list/show`'s traversal) would need to widen
@@ -26,9 +27,9 @@
 //! ## Seed contract — bootstrap-once, not a floor
 //!
 //! Identical to rc/config: [`seed_files`] feeds
-//! [`crate::runtime::config_doc_fs::ConfigDocFs::seed_entries`], which
-//! writes only paths the kernel does not already hold (a live edit or a deleted profile
-//! is never resurrected by a later boot). There is no bulk reseed for a
+//! [`crate::config_seed::seed_entries_into_dir`], which
+//! writes only paths not already present in the host directory (a live edit or
+//! a deleted profile is never resurrected by a later boot). There is no bulk reseed for a
 //! single device yet (nothing needs `kj midi reset` today — profiles are
 //! read-only in slice 1); the embedded default remains available via
 //! [`seed_body`] for when a write verb lands.

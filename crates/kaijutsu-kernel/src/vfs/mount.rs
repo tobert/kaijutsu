@@ -606,10 +606,7 @@ impl MountTable {
 
     /// The mount point owning `path` (longest-prefix match) paired with its
     /// backend — the "what owns this path?" question. `None` when nothing is
-    /// mounted over `path`. Used by the editor resolver to decide config-owned
-    /// (bind straight to the kernel block) vs. an ordinary file, and to recover the
-    /// config mount root without a hardcoded prefix — see
-    /// [`VfsOps::owns_config_docs`].
+    /// mounted over `path`.
     pub async fn owner_of(&self, path: &Path) -> Option<(PathBuf, Arc<dyn VfsOps>)> {
         let path_str = path.to_string_lossy();
         let normalized = if path_str.starts_with('/') {
@@ -895,8 +892,8 @@ impl VfsOps for MountTable {
     /// default (getattr + read). The default sizes from `getattr`, which is
     /// lstat-like for a symlink and reports the *link path* length — that would
     /// truncate a followed target (e.g. a short link path masking a long rc
-    /// script). A backend that follows symlinks (`ConfigDocFs`) sizes from the
-    /// resolved target in its own `read_all`, so the read must reach it.
+    /// script). A backend that follows symlinks (`LocalBackend`) sizes from
+    /// the resolved target in its own `read_all`, so the read must reach it.
     async fn read_all(&self, path: &Path) -> VfsResult<Vec<u8>> {
         let (fs, relative) = self.find_mount(path).await?;
         fs.read_all(&relative).await

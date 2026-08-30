@@ -18,19 +18,12 @@
 //! | `kj diff <a> <b>`                 | [`DiffSource::Document`] | [`DiffSource::Document`] |
 //! | `kj diff <path> --from N [--to M]`| [`DiffSource::DocumentAt`] | document (or `--to`) |
 //!
-//! ## Ownership-aware resolution
+//! ## Shared resolution
 //!
 //! [`DiffSource::Document`] resolves through
 //! [`resolve_editor_target`](crate::editor::resolve_editor_target) — the same
-//! function the vi editor binds with, for the same reason. The mount table
-//! answers "what owns this path?": a config-owned path (`/config/rc/*`,
-//! `/config/kernel/*`) binds straight to its `ConfigDocFs` block, everything else
-//! goes through the file-doc cache. Running a config path through
-//! `FileDocumentCache::get_or_load` would mint a *second* kernel document
-//! shadowing the original — the dual-ownership bug class
-//! `docs/config-ownership.md` deleted by construction. Reusing the
-//! editor's resolver rather than reimplementing it means the two surfaces
-//! cannot drift on what owns a path.
+//! function the vi editor binds with, so the two surfaces cannot drift on
+//! what document a path names.
 //!
 //! ## `FileChange` is an input
 //!
@@ -100,8 +93,8 @@ pub(crate) enum DiffSource {
     /// The bytes on the backing store behind a VFS path — what a cold reader
     /// sees, ignoring any document edits that have not been flushed.
     Disk(String),
-    /// The live kernel document that owns a path's text (ownership-aware: config
-    /// documents answer through the mount table, never the file-doc cache).
+    /// The live kernel document that owns a path's text, through the
+    /// file-doc cache.
     Document(String),
     /// A path's owning document as of oplog sequence `seq`, reconstructed by
     /// replaying its journal.
@@ -225,10 +218,7 @@ impl KjDispatcher {
     /// The backing store's bytes for `path`, or `None` when nothing is there.
     ///
     /// Deliberately a raw VFS read, bypassing the file-doc cache: this side
-    /// exists to answer "what would a cold reader see?". Note that for a
-    /// config-owned path there *is* no host file — the kernel is the backend —
-    /// so disk and document agree by construction and the diff is empty. That
-    /// is the honest answer, not a missing feature.
+    /// exists to answer "what would a cold reader see?".
     async fn read_disk(&self, path: &str) -> Result<Option<String>, String> {
         match self
             .kernel()
@@ -248,10 +238,6 @@ impl KjDispatcher {
     }
 
     /// The text of the kernel document that owns `path`.
-    ///
-    /// Ownership-aware by delegation: `resolve_editor_target` asks the mount
-    /// table, so a config document answers as itself and never as a shadow copy
-    /// minted by the file-doc cache.
     async fn read_document(&self, path: &str) -> Result<String, String> {
         let target = self.editor_target(path).await?;
         self.block_store()
@@ -275,12 +261,11 @@ impl KjDispatcher {
             })
     }
 
-    /// Shared ownership-aware resolution step. Both document sources go
-    /// through it so neither can drift from the editor's notion of ownership.
+    /// Shared resolution step. Both document sources go through it so
+    /// neither can drift from the editor's notion of ownership.
     async fn editor_target(&self, path: &str) -> Result<crate::editor::EditorTarget, String> {
-        let blocks = self.block_store();
         let file_cache = self.kernel().file_cache().clone();
-        crate::editor::resolve_editor_target(path, blocks, &file_cache, self.kernel().vfs()).await
+        crate::editor::resolve_editor_target(path, &file_cache).await
     }
 
     /// The seq range a `--from`/`--to` may address for this side's document,
@@ -645,39 +630,6 @@ mod tests {
             )
             .await;
         assert!(!result.is_ok(), "a seq past head must error: {result:?}");
-    }
-
-    /// Ownership-awareness, asserted by absence: a config-owned path must
-    /// answer through the mount table's `ConfigDocFs` block and must NOT mint
-    /// a `FileDocumentCache` copy shadowing it. That shadow is the exact bug
-    /// class `docs/config-ownership.md` deleted by construction, and
-    /// `resolve_editor_target` is what keeps it deleted here.
-    #[tokio::test]
-    async fn a_config_path_answers_through_its_owner_and_mints_no_shadow_document() {
-        use crate::kj::test_helpers::test_dispatcher_rc;
-
-        let dispatcher = Arc::new(test_dispatcher_rc().await);
-        dispatcher.set_self_arc();
-        let path = "/config/rc/coder/create/S00-stance.kai";
-
-        let result = dispatcher
-            .dispatch_diff(&argv(&[path]), &test_caller())
-            .await;
-        assert!(result.is_ok(), "kj diff on an rc script failed: {result:?}");
-        // There is no host file behind a config path — the kernel *is* the
-        // backend — so both sides read the same document and agree. Honest
-        // answer, not a missing feature.
-        assert!(
-            result.message().contains("no differences"),
-            "got: {}",
-            result.message()
-        );
-
-        let shadow = crate::file_tools::cache::file_context_id(path);
-        assert!(
-            !dispatcher.block_store().contains(shadow),
-            "kj diff must not mint a file-doc shadow of a config-owned path"
-        );
     }
 
     #[tokio::test]

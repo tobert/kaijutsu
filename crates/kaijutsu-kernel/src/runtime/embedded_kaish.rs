@@ -894,20 +894,23 @@ mod tests {
     }
 
     /// The kaish surface for init.d-style rc composition: an agent shell does
-    /// `ln -s` over the `/config/rc` document mount, and `cat` through the link returns
-    /// the *target's* content. This proves the path is wired end-to-end —
-    /// kaish `ln`/`cat` builtins → MountBackend → MountTable → ConfigDocFs —
-    /// with no rc-specific shell code. (KaijutsuBackend's `/docs/` block scheme
-    /// is a separate thing and keeps its honest "not supported" stub.)
+    /// `ln -s` over the `/config/rc` mount with a host-relative target, and
+    /// `cat` through the link returns the *target's* content. This proves
+    /// the path is wired end-to-end — kaish `ln`/`cat` builtins →
+    /// MountBackend → MountTable → `LocalBackend` — with no rc-specific
+    /// shell code. (KaijutsuBackend's `/docs/` block scheme is a separate
+    /// thing and keeps its honest "not supported" stub.)
     #[tokio::test]
     async fn ln_s_over_rc_mount_creates_followable_link() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
         let kernel = test_kernel("test-ln").await;
-        // Mount the production rc backend over the same block store the shell uses.
-        let rc_fs =
-            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        kernel.mount(RC_ROOT, rc_fs).await;
-        let kaish = EmbeddedKaish::new("test-ln", blocks, kernel, None).unwrap();
+        // Mount the production rc shape — an ordinary host directory — over
+        // the same block store the shell uses.
+        let dir = tempfile::tempdir().unwrap();
+        kernel
+            .mount(RC_ROOT, crate::vfs::LocalBackend::new(dir.path()))
+            .await;
+        let kaish = EmbeddedKaish::new("test-ln", blocks, kernel.clone(), None).unwrap();
 
         let run = |cmd: &'static str| {
             let k = &kaish;
@@ -921,18 +924,34 @@ mod tests {
         // A shared script body, written once under a `lib` type.
         let r = run("echo shared-body > /config/rc/lib/create/binding.kai").await;
         assert!(r.ok(), "echo>: {}", r.text_out());
-        // Compose it into a context type by symlink.
+        // Compose it into a context type by symlink. `LocalBackend::symlink`
+        // writes the target string verbatim as a real host symlink — a
+        // host-relative target (what `reseed_rc_files` writes for the
+        // embedded seed's own composition) resolves; a VFS-absolute one
+        // would not (see docs/issues.md).
         let r = run(
-            "ln -s /config/rc/lib/create/binding.kai /config/rc/coder/create/S10-binding.kai",
+            "ln -s ../../lib/create/binding.kai /config/rc/coder/create/S10-binding.kai",
         )
         .await;
         assert!(r.ok(), "ln -s: {}", r.text_out());
         // `cat` through the link follows to the target's content.
         let r = run("cat /config/rc/coder/create/S10-binding.kai").await;
         assert_eq!(r.text_out().trim(), "shared-body");
-        // `readlink` reports the raw target.
-        let r = run("readlink /config/rc/coder/create/S10-binding.kai").await;
-        assert_eq!(r.text_out().trim(), "/config/rc/lib/create/binding.kai");
+        // `readlink` reports the raw target through the VFS directly. Not the
+        // kaish `readlink` builtin here: it pre-checks `is_symlink()` via
+        // `lstat`, which for `LocalBackend` resolves through `getattr`'s
+        // `canonicalize()` — that follows a *resolvable* symlink to its
+        // target before lstat-ing it, so it reports "not a symbolic link"
+        // for exactly the working links this test cares about
+        // (`VfsOps::readlink` itself has no such bug — see its own
+        // doc comment; only the `getattr`-based pre-check does).
+        use crate::vfs::VfsOps;
+        let target = kernel
+            .vfs()
+            .readlink(std::path::Path::new("/config/rc/coder/create/S10-binding.kai"))
+            .await
+            .expect("readlink the real host symlink");
+        assert_eq!(target.to_string_lossy(), "../../lib/create/binding.kai");
     }
 
     /// `/v/cas` regression (docs/issues.md "kaish `/v/cas` is shadowed"). kaish

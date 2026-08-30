@@ -299,11 +299,10 @@ async fn mcp_role_holds_config_governance() {
     // carries no capability of its own — the file:write grant from the
     // shared loadout (S10 → lib) already reaches it, same as any other file.
     //
-    // NB: the broad loadout itself (S10 → lib via a document symlink) is NOT asserted
-    // here — this harness mounts /config/rc as a host `LocalBackend`, which doesn't
-    // follow the `ConfigDocFs` symlink the shared binding is composed through.
-    // S15 is a plain script, so it runs and grants regardless; the symlink
-    // composition is covered where ConfigDocFs is in play.
+    // NB: the broad loadout itself (S10 → lib via the rc composition symlink)
+    // is NOT asserted here — this test only checks the config-governance cap
+    // S15 adds on top of it. S15 is a plain script, so it runs and grants
+    // regardless of whether the symlink resolved.
     let h = harness().await;
     let ctx = create_typed(&h, "mcp-role", "mcp").await;
     let binding = h

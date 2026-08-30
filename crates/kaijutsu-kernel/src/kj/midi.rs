@@ -1,10 +1,10 @@
-//! `kj midi` — read the kernel-owned MIDI device profile library.
+//! `kj midi` — read the MIDI device profile library.
 //!
-//! Device profiles live at `/config/midi/devices/<name>` on the same kernel-owned
-//! backend that owns `/config/rc` and `/config/kernel`
-//! (`docs/config-ownership.md`): the kernel is the sole owner, no host
-//! file, no write-through. Embedded seeds (`assets/defaults/midi/devices/*.md`,
-//! `crate::midi_seed`) bootstrap a fresh kernel once — see `docs/midi-next.md`
+//! Device profiles live at `/config/midi/devices/<name>`, the same kind of
+//! ordinary host directory as `/config/rc` and `/config/kernel`
+//! (`docs/config-namespace.md`). Embedded seeds
+//! (`assets/defaults/midi/devices/*.md`, `crate::midi_seed`) bootstrap a
+//! fresh tree once — see `docs/midi-next.md`
 //! "Storage and identity" (slice 1 step 2).
 //!
 //! `list` enumerates the devices tree, `show` prints one profile document,
@@ -1160,14 +1160,12 @@ mod tests {
     /// A directory under `/config/midi/devices` (the shape a future rc-style
     /// bucket device will take, `docs/midi-next.md` "The core split") must
     /// render as a visible, clearly-labelled row — not silently vanish behind
-    /// the old `is_file()` filter. Built through the real kernel-owned
-    /// `/config/midi` mount (same fixture `fresh_kernel_seeds_midi_devices_into_the_vfs`
-    /// uses): `ConfigDocFs` synthesizes directories from descendant paths
-    /// (see `readdir_synthesizes_virtual_directories` in
-    /// `runtime::config_doc_fs`), so writing a leaf file under
-    /// `/config/midi/devices/<bucket>/...` is enough to make `<bucket>` itself
-    /// appear as a real `FileType::Directory` readdir entry — no fixture
-    /// workaround needed.
+    /// the old `is_file()` filter. Built through the real `/config/midi`
+    /// mount (same fixture `fresh_kernel_seeds_midi_devices_into_the_vfs`
+    /// uses, an ordinary host directory, `docs/config-namespace.md`): writing
+    /// a leaf file under `/config/midi/devices/<bucket>/...` creates the
+    /// real host directory `<bucket>`, which `readdir` reports as an
+    /// ordinary `FileType::Directory` entry — no fixture workaround needed.
     #[tokio::test]
     async fn list_renders_a_placeholder_row_for_a_bucket_directory() {
         use crate::vfs::VfsOps;

@@ -239,12 +239,10 @@ pub fn is_midi_path(path: &str) -> bool {
 /// so a writer that changes one of these paths must invalidate that shadow or
 /// the next read serves stale text.
 ///
-/// Not a statement about which backend serves the tree: `/etc/rc` is a
-/// `LocalBackend` mount over a host directory (`docs/rc-on-disk.md`) while the
-/// other three are still `ConfigDocFs`. The mount table is the live authority
-/// on ownership; this predicate exists for call chains that cannot reach it
-/// (no async, or no mount table in scope), and a fifth such tree needs a fifth
-/// arm here. See `docs/file-buffers.md`.
+/// All four are `LocalBackend` mounts over host directories
+/// (`docs/config-namespace.md`); this predicate exists for call chains that
+/// cannot reach the mount table (no async, or no mount table in scope), and a
+/// fifth such tree needs a fifth arm here. See `docs/file-buffers.md`.
 pub fn is_config_doc_root(path: &str) -> bool {
     is_rc_path(path) || is_config_path(path) || is_client_path(path) || is_midi_path(path)
 }

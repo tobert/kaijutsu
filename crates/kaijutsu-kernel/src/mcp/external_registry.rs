@@ -1,4 +1,5 @@
-//! Reconciles the kernel-owned `mcp.toml` (docs/config-ownership.md) with
+//! Reconciles `/config/kernel/mcp.toml`, an ordinary host file
+//! (docs/config-namespace.md), with
 //! the broker's live external-MCP registrations — the caller
 //! `ExternalMcpServer` always lacked. `external.rs`'s own doc comment says it
 //! plainly: "Phase 1 covers… reconnect is a follow-up" — but nothing ever

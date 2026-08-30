@@ -8,10 +8,9 @@
 
 use std::sync::Arc;
 
-use kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs;
-use kaijutsu_kernel::{MemoryBackend, MountTable, VfsOps, shared_block_store};
+use kaijutsu_kernel::{MemoryBackend, MountTable, VfsOps};
 use kaijutsu_server::sftp::SftpSession;
-use kaijutsu_types::{Principal, PrincipalId};
+use kaijutsu_types::Principal;
 
 use russh_sftp::client::SftpSession as ClientSession;
 use tokio::io::AsyncWriteExt;
@@ -225,31 +224,5 @@ async fn an_sftp_write_to_etc_rc_is_an_ordinary_file_write() {
     assert_eq!(
         client.read("/config/rc/evil.kai").await.expect("read back"),
         b"echo hi\n"
-    );
-}
-
-#[tokio::test]
-async fn an_sftp_write_to_etc_config_lands_in_the_kernel_document() {
-    // `/config/kernel` is still a kernel document (`ConfigDocFs`), unlike `/config/rc`
-    // which is now host files — so this exercises the genuinely different write
-    // path: a plain SFTP create/write must land in the block store and read
-    // back, the same as any other unrestricted mount.
-    let vfs = Arc::new(MountTable::new());
-    vfs.mount("/", MemoryBackend::new()).await;
-    let blocks = shared_block_store(PrincipalId::system());
-    vfs.mount("/config/kernel", ConfigDocFs::new(blocks, "/config/kernel"))
-        .await;
-
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
-    let client = ClientSession::new(client_io).await.expect("handshake");
-
-    put(&client, "/config/kernel/theme.toml", b"accent = \"teal\"\n").await;
-    assert_eq!(
-        client
-            .read("/config/kernel/theme.toml")
-            .await
-            .expect("read back"),
-        b"accent = \"teal\"\n"
     );
 }

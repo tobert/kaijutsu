@@ -179,9 +179,9 @@ impl SftpSession {
 /// the root (a pop on an empty stack is a no-op) and treating a relative path
 /// as relative to `/`, so `realpath(".")` resolves to `/`. Its job is to hand
 /// `MountTable` a clean absolute path that routes to the right mount; the
-/// authoritative escape check (symlinks resolved, `starts_with(root)`) lives in
-/// the backends (`LocalBackend::resolve`, `ConfigDocFs::resolve`), which a
-/// lexical normalizer structurally cannot replace.
+/// authoritative escape check (symlinks resolved, `starts_with(root)`) lives
+/// in the owning backend's own `resolve` (e.g. `LocalBackend::resolve`),
+/// which a lexical normalizer structurally cannot replace.
 fn canonicalize(raw: &str) -> PathBuf {
     let mut out: Vec<std::ffi::OsString> = Vec::new();
     for comp in Path::new(raw).components() {

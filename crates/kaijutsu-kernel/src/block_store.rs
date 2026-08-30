@@ -460,11 +460,12 @@ impl BlockStore {
     }
 
     /// Create a document that carries a filesystem `path` in its `documents`
-    /// row. Used by the kernel-owned config/rc backend (`ConfigDocFs`): the
-    /// path makes the `documents` table double as the readdir manifest
-    /// (`list_documents_under_path`), so the doc and its manifest entry are one
-    /// write, not two stores to drift. Otherwise identical to
-    /// [`create_document`](Self::create_document).
+    /// row, so the `documents` table can double as a readdir manifest
+    /// (`list_documents_under_path`) for a document-backed VFS mount — the
+    /// doc and its manifest entry are one write, not two stores to drift.
+    /// No production mount is document-backed today (`docs/config-namespace.md`);
+    /// this stays the general primitive for one that wants to be. Otherwise
+    /// identical to [`create_document`](Self::create_document).
     pub fn create_document_with_path(
         &self,
         context_id: ContextId,
@@ -504,7 +505,7 @@ impl BlockStore {
     /// List the persisted `documents` rows whose path falls under `dir`
     /// (the readdir manifest for [`create_document_with_path`]). Empty when
     /// there is no DB. Returns `(path, context_id, doc_kind)` for every
-    /// descendant — `doc_kind` lets `ConfigDocFs::readdir` emit
+    /// descendant — `doc_kind` lets a document-backed mount's `readdir` emit
     /// `FileType::Symlink` for link docs without a second lookup per entry.
     pub fn documents_under_path(
         &self,
@@ -594,10 +595,10 @@ impl BlockStore {
         self.documents.contains_key(&context_id)
     }
 
-    /// The [`DocKind`] of a document, or `None` if it does not exist. Used by
-    /// `ConfigDocFs` to tell a symlink doc (`DocKind::Symlink`, content = link
-    /// target) apart from a regular file doc whose content happens to look like
-    /// a path — the git-style "mode bit" check.
+    /// The [`DocKind`] of a document, or `None` if it does not exist. For a
+    /// document-backed mount, distinguishes a symlink doc (`DocKind::Symlink`,
+    /// content = link target) from a regular file doc whose content happens
+    /// to look like a path — the git-style "mode bit" check.
     pub fn document_kind(&self, context_id: ContextId) -> Option<DocKind> {
         self.documents.get(&context_id).map(|r| r.kind)
     }

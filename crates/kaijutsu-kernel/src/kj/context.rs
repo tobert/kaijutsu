@@ -973,8 +973,8 @@ impl KjDispatcher {
             None => (None, None),
         };
 
-        // base: the kernel-owned /config/kernel/system.md — never a host file
-        // (docs/config-ownership.md). Fallback mirrors
+        // base: /config/kernel/system.md, an ordinary host file under the
+        // kernel config tree (docs/config-namespace.md). Fallback mirrors
         // llm_stream.rs's `spawn_llm_for_prompt` exactly: a read/UTF-8
         // failure falls back to the embedded default, loudly logged, never
         // a silent empty prompt.

@@ -2693,7 +2693,7 @@ impl KernelHandle {
     /// Read a whole VFS file over the existing `Vfs` capability — no new wire
     /// method. Chunked at [`VFS_READ_CHUNK`] and stopping on the documented
     /// zero-length-read EOF signal, so it works against every backend
-    /// (`ConfigDocFs`, `MemoryBackend`, `MidiPresenceFs`, a share) without
+    /// (`LocalBackend`, `MemoryBackend`, `MidiPresenceFs`, a share) without
     /// asking any of them for a size first.
     ///
     /// The app's device-profile fetch rides this: a sink reads

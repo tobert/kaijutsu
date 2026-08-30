@@ -1,9 +1,9 @@
 //! TOML config loader for app-side configuration.
 //!
 //! Loads **bindings** from the host `bindings.toml` (app-only config). The
-//! **theme** is no longer a host file: it lives in the kernel-owned
-//! `/config/kernel` (a plain file written through the file tools, see
-//! `docs/config-ownership.md`'s superseded note) and is fetched over RPC
+//! **theme** is a separate host file, `/config/kernel/theme.toml` — an
+//! ordinary file under the kernel config tree (`docs/config-namespace.md`)
+//! written through the file tools — and is fetched over RPC
 //! on connect (`apply_theme_from_rpc`), so the app starts on
 //! `Theme::default()` and the real theme arrives once connected. Bindings
 //! stay host-side because they are purely client-local and the kernel has no

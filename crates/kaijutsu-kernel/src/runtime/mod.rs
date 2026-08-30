@@ -17,7 +17,6 @@
 //! - `curl_tool` — the `curl` kaish Tool (kaish-extras' `kaish-tools-curl`),
 //!   one configuration shared by every materialized shell.
 
-pub mod config_doc_fs;
 pub mod context_engine;
 pub mod curl_tool;
 pub mod docs_filesystem;

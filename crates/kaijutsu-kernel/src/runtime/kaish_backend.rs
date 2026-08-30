@@ -596,9 +596,9 @@ impl KernelBackend for KaijutsuBackend {
     // Symlinks are unsupported in *this* backend on purpose: it serves the
     // `/docs/{ctx_hex}/{block}` conversation-block scheme, where a link between
     // blocks has no meaning. This is NOT the rc path — `ln -s /etc/rc/…` routes
-    // through MountBackend → MountTable → ConfigDocFs, which does support links
-    // (init.d-style rc composition). Failing loud here keeps the two schemes
-    // from quietly conflating.
+    // through MountBackend → MountTable → `LocalBackend`, which does support
+    // real host links (init.d-style rc composition). Failing loud here keeps
+    // the two schemes from quietly conflating.
     async fn read_link(&self, _path: &Path) -> BackendResult<std::path::PathBuf> {
         Err(BackendError::InvalidOperation(
             "symlinks not supported on conversation blocks (/docs); use /etc/rc for rc composition".into(),

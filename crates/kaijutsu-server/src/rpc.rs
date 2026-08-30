@@ -1319,17 +1319,15 @@ fn create_block_store_with_kernel_db(
     Ok(store)
 }
 
-/// Canonicalize a `/etc/config` argument.
-/// Returns: ~/.config/kaijutsu/
 /// Map a config RPC `path` (a bare name like `theme.toml`, or an already-full
-/// `/etc/config/…` path) to its canonical path under the config mount. Config is
+/// `/config/kernel/…` path) to its canonical path under the config mount. Config is
 /// a flat namespace, so this is just a root prepend when the caller passed a
 /// bare name.
 fn config_canonical(path: &str) -> String {
     let trimmed = path.trim();
     // Already an absolute config-namespace path — the flat kernel-global
-    // `/etc/config`, or the per-client `/etc/client` (hierarchical:
-    // `<root>/<client-id>/<file>`, docs/config-ownership.md). Pass it
+    // `/config/kernel`, or the per-client `/config/client` (hierarchical:
+    // `<root>/<client-id>/<file>`, docs/config-namespace.md). Pass it
     // through so per-client config is reachable through the same config RPCs.
     // The boundary check (component-correct, not a bare prefix match) comes
     // from the shared `kaijutsu_types::paths` predicates.

@@ -4,7 +4,8 @@
 //! cargo does not track as an input. Without these directives an edit to a
 //! seed script is invisible until some `.rs` in this crate changes, so the
 //! seed tests run against the previously embedded copy and pass while the
-//! binary carries the old script. See `docs/config-ownership.md`.
+//! binary carries the old script. See `docs/config-namespace.md` for how the
+//! embedded tree seeds a fresh host directory.
 //!
 //! The path is workspace-relative because `rerun-if-changed` resolves
 //! against the PACKAGE root while `include_dir!` reads

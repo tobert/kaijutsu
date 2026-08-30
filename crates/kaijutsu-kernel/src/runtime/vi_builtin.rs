@@ -173,7 +173,7 @@ mod tests {
     const P: &str = "/config/rc/vitest/create/S00-foo.kai";
 
     /// Build an `EmbeddedKaish` wired with the `vi` + `edit` builtins against the
-    /// rc dispatcher (so `/config/rc` is the real ConfigDocFs mount).
+    /// rc dispatcher (so `/config/rc` is the real seeded host-directory mount).
     async fn embedded_with_vi(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
         let blocks = dispatcher.block_store().clone();
         let kernel = dispatcher.kernel().clone();

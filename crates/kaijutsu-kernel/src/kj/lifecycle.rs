@@ -1066,9 +1066,10 @@ mod tests {
     #[tokio::test]
     async fn rc_create_follows_symlinked_md() {
         use crate::vfs::VfsOps;
-        // The kernel-owned /config/rc mount (production backend) — symlink targets
-        // are VFS-absolute paths it resolves within the mount, unlike the
-        // host-backed LocalBackend the plain test_dispatcher uses.
+        // `/config/rc` is an ordinary host directory (`LocalBackend`) — a
+        // real POSIX symlink, resolved host-relative to the link's own
+        // directory, same shape `reseed_rc_files` writes for the embedded
+        // seed's init.d composition.
         let d = test_dispatcher_rc().await;
         // The shared, canonical stance lives once under a `lib` type.
         install_rc_script_file(
@@ -1082,7 +1083,7 @@ mod tests {
             .vfs()
             .symlink(
                 std::path::Path::new("/config/rc/test/create/S00-stance.md"),
-                std::path::Path::new("/config/rc/lib/create/S00-shared.md"),
+                std::path::Path::new("../../lib/create/S00-shared.md"),
             )
             .await
             .expect("create rc symlink");
@@ -2696,13 +2697,8 @@ esac
     // synthetic install_script fixtures, because the mechanism under test is
     // the per-type `SXX-datetime.kai` seed *and* its init.d-style symlink
     // composition (`coder/create/S25-datetime.kai` → `lib/create/S25-
-    // datetime.kai`). That composition only resolves over the kernel-owned
-    // `/config/rc` backend (`ConfigDocFs::seed_from_embedded` reconstructs a
-    // real symlink from a seed body that's just a path); the plain
-    // `test_dispatcher()`'s host-disk seeding writes the path string
-    // verbatim and does not follow it (see `rc_create_follows_symlinked_md`
-    // for the same distinction). So all tests below use
-    // `test_dispatcher_rc()`.
+    // datetime.kai`, reconstructed as a real host symlink by
+    // `ensure_rc_seed_files`). So all tests below use `test_dispatcher_rc()`.
 
     /// The marker every rc-seeded datetime notification's content starts
     /// with — kept in one place so a wording tweak in the seed scripts

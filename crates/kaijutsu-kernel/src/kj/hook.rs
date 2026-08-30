@@ -1028,16 +1028,11 @@ mod tests {
     /// (`mcp::broker::tests::shell_guard_denies_sh_dash_c_and_allows_benign_shapes`
     /// covers the guard's own matching logic).
     ///
-    /// Deliberately `test_dispatcher_rc`, not the plain `test_dispatcher`:
-    /// the seed convention for a per-type script is a symlink whose body is
-    /// just the link target path (`seed_scripts.rs`), reconstructed into a
-    /// REAL symlink only by the document-backed `ConfigDocFs` seed —
-    /// `test_dispatcher`'s host-backed `LocalBackend` writes that path
-    /// string as a literal file instead, so `kj rc dispatch` tries to run
-    /// the path text itself as a command (`command not found:
-    /// /config/rc/lib/create/S05-kaish.kai`) for EVERY symlinked script in
-    /// `default/create/`, not just this one — confirmed by probe, not
-    /// assumed, before switching helpers.
+    /// `test_dispatcher_rc` also seeds `/config/kernel`/`/config/client`/
+    /// `/config/midi`, exercising the same real host-directory shape (rc's
+    /// per-type scripts are symlinks whose body is just the link target
+    /// path, `seed_scripts.rs`, reconstructed into a REAL symlink on disk)
+    /// production runs.
     #[tokio::test]
     async fn s45_shell_guard_installs_via_the_real_create_lifecycle() {
         let d = std::sync::Arc::new(test_helpers::test_dispatcher_rc().await);

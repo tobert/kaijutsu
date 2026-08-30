@@ -61,11 +61,11 @@ pub fn peer_nick_for_client(name: &str) -> String {
 }
 
 /// Turn an ACP implementation name into the client-id key used by the
-/// `/etc/client/<id>/…` config cascade (docs/config-ownership.md — the
+/// `/config/client/<id>/…` config cascade (docs/config-namespace.md — the
 /// metronome/patchbay consumer pattern). **Not** `peer_nick_for_client`'s
 /// `acp/<slug>` — a client-id is one path segment
 /// (`kaijutsu-kernel/src/kj/config.rs`'s `config_canonical` rejects more than
-/// `<client-id>/<file>` under `/etc/client`), so a `/` here would silently
+/// `<client-id>/<file>` under `/config/client`), so a `/` here would silently
 /// misroute every read. `acp-<slug>` keeps the same slug core, in a
 /// disjoint namespace from the peer nick.
 pub fn client_config_id(name: &str) -> String {
@@ -286,9 +286,9 @@ impl KernelBridge {
             .context("execute addressed kj command")
     }
 
-    /// Look up this client's preferred cast label from the `/etc/client`
-    /// cascade (docs/config-ownership.md): `/etc/client/<client_id>/cast.toml`
-    /// (this client's override), then the shared `/etc/client/cast.toml`.
+    /// Look up this client's preferred cast label from the `/config/client`
+    /// cascade (docs/config-namespace.md): `/config/client/<client_id>/cast.toml`
+    /// (this client's override), then the shared `/config/client/default/cast.toml`.
     /// Mirrors the two-layer read the app's metronome/scroll bootstrap does
     /// (`kaijutsu-app/src/connection/actor_plugin.rs`'s
     /// `fetch_layered_config`) rather than inventing a second cascade

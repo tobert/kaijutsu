@@ -1003,21 +1003,19 @@ pub(crate) mod test_helpers {
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 
-    /// A dispatcher whose `/config/rc` (plus `/config/kernel`, `/config/client`, and
-    /// `/config/midi`) is the **real document-backed backend** ([`ConfigDocFs`]),
-    /// seeded from the embedded defaults — the production wiring. Use this for
-    /// `kj rc` / `kj config` / `kj midi` / lifecycle tests that must exercise
-    /// the kernel-document path end-to-end (readdir over the `documents`
-    /// manifest + VFS-direct reads/writes), not just the backend-agnostic kj
-    /// layer.
+    /// A dispatcher whose four config trees (`/config/rc`, `/config/kernel`,
+    /// `/config/client`, `/config/midi`) are ordinary host directories
+    /// (`LocalBackend`), each seeded from its embedded defaults — the
+    /// production wiring (`docs/config-namespace.md`). Use this for `kj rc` /
+    /// `kj config` / `kj midi` / lifecycle tests that must exercise the real
+    /// mount end-to-end, not just the backend-agnostic kj layer.
     ///
-    /// It uses a **DB-backed block store** (the manifest needs the `documents`
-    /// table populated). That is faithful to production but currently deadlocks
-    /// the `kj::fork` tests under a shared in-memory DB handle — a latent
-    /// lock-ordering issue tracked separately — so it is deliberately *not* the
-    /// global `test_dispatcher`; only rc-scoped tests (which never fork) use it.
-    ///
-    /// [`ConfigDocFs`]: crate::runtime::config_doc_fs::ConfigDocFs
+    /// It uses a **DB-backed block store** (needed once a test loads a path
+    /// through the file-doc cache, which populates the `documents` table).
+    /// That is faithful to production but currently deadlocks the `kj::fork`
+    /// tests under a shared in-memory DB handle — a latent lock-ordering
+    /// issue tracked separately — so it is deliberately *not* the global
+    /// `test_dispatcher`; only rc-scoped tests (which never fork) use it.
     pub async fn test_dispatcher_rc() -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
@@ -1036,37 +1034,47 @@ pub(crate) mod test_helpers {
         let kernel = Arc::new(
             Kernel::new("test", &kernel_data, blocks.clone(), kernel_db.clone())
                 .await
-                .with_temp_cleanup(root),
+                .with_temp_cleanup(root.clone()),
         );
-        let rc_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc_fs.seed_from_embedded().expect("seed rc into the kernel");
-        kernel.mount(RC_ROOT, rc_fs).await;
-        // Config files live on the same kernel-owned backend type at /config/kernel
-        // (slice 2) — seed it too so `kj config` tests exercise the real path.
-        let config_fs =
-            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
-        config_fs
-            .seed_entries(crate::config_seed::config_seed_files())
-            .expect("seed config into the kernel");
-        kernel.mount(CONFIG_ROOT, config_fs).await;
-        // Per-client config lives on the same backend type at /config/client
-        // (mirrors production's `create_shared_kernel` mount trio) — seed and
-        // mount it too so `kj config list` tests exercise the real path.
-        let client_fs =
-            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CLIENT_ROOT);
-        client_fs
-            .seed_entries(crate::config_seed::client_seed_files())
-            .expect("seed client config into the kernel");
-        kernel.mount(CLIENT_ROOT, client_fs).await;
-        // MIDI device profiles live on the same backend type at /config/midi
-        // (docs/midi-next.md "Storage and identity") — seed and mount it too
-        // so `kj midi list/show` tests exercise the real path.
-        let midi_fs =
-            crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), MIDI_ROOT);
-        midi_fs
-            .seed_entries(crate::midi_seed::seed_files())
-            .expect("seed midi devices into the kernel");
-        kernel.mount(MIDI_ROOT, midi_fs).await;
+        let rc_dir = root.join("rc");
+        std::fs::create_dir_all(&rc_dir).expect("create rc dir");
+        crate::seed_scripts::ensure_rc_seed_files(&rc_dir).expect("seed rc into the tree");
+        kernel.mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_dir)).await;
+        // Config files live on the same host-directory shape at /config/kernel
+        // — seed it too so `kj config` tests exercise the real path.
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        crate::config_seed::seed_entries_into_dir(
+            CONFIG_ROOT,
+            crate::config_seed::config_seed_files(),
+            &config_dir,
+        )
+        .expect("seed config into the tree");
+        kernel.mount(CONFIG_ROOT, crate::vfs::LocalBackend::new(&config_dir)).await;
+        // Per-client config lives on the same host-directory shape at
+        // /config/client (mirrors production's mount trio) — seed and mount
+        // it too so `kj config list` tests exercise the real path.
+        let client_dir = root.join("client");
+        std::fs::create_dir_all(&client_dir).expect("create client dir");
+        crate::config_seed::seed_entries_into_dir(
+            CLIENT_ROOT,
+            crate::config_seed::client_seed_files(),
+            &client_dir,
+        )
+        .expect("seed client config into the tree");
+        kernel.mount(CLIENT_ROOT, crate::vfs::LocalBackend::new(&client_dir)).await;
+        // MIDI device profiles live on the same host-directory shape at
+        // /config/midi (docs/midi-next.md "Storage and identity") — seed and
+        // mount it too so `kj midi list/show` tests exercise the real path.
+        let midi_dir = root.join("midi");
+        std::fs::create_dir_all(&midi_dir).expect("create midi dir");
+        crate::config_seed::seed_entries_into_dir(
+            MIDI_ROOT,
+            crate::midi_seed::seed_files(),
+            &midi_dir,
+        )
+        .expect("seed midi devices into the tree");
+        kernel.mount(MIDI_ROOT, crate::vfs::LocalBackend::new(&midi_dir)).await;
         // The ephemeral, sink-fed presence view over the same kernel's store
         // (docs/midi-next.md "Presence is sink-fed") — mounted here too so
         // `kj midi list`'s presence column reads the real `/run/midi` path.

@@ -703,15 +703,16 @@ impl FileDocumentCache {
     /// read" means "read disk"), plain `invalidate` is already enough to pick up
     /// a change.
     ///
-    /// A **config shadow** still needs the stronger call. Its real owner is the
-    /// `config_context_id` block, and the vi editor / `kj rc` write it there via
-    /// `block_store.edit_text` directly — never through `ConfigDocFs::write_all`.
-    /// That write never advances `ConfigDocFs`'s per-path generation counter, so
-    /// a shadow entry still resident in memory (not yet invalidated) has no
-    /// coherence signal telling it the config changed underneath it, and would
-    /// go on serving pre-edit content indefinitely. Every direct config write
-    /// must invalidate the shadow explicitly rather than rely on disk-generation
-    /// staleness detection. `invalidate_document` drops both the in-memory entry
+    /// A **config path** still needs the stronger call. `kj rc add/rm` and
+    /// `kj config reset` write straight to the host file over the VFS,
+    /// bypassing this cache entirely; a composition symlink's write can
+    /// defeat the disk-generation staleness check `try_get_or_load` relies
+    /// on for everything else, so a cache entry still resident in memory
+    /// (not yet invalidated) has no coherence signal telling it the file
+    /// changed underneath it, and would go on serving pre-edit content
+    /// indefinitely. Every such direct write must invalidate the entry
+    /// explicitly rather than rely on that staleness detection.
+    /// `invalidate_document` drops both the in-memory entry
     /// and the shadow document itself, so the next read reloads fresh from the
     /// VFS. The shadow is a pure cache materialization, so dropping it is safe;
     /// a delete failure is surfaced (never a swallowed stale serve). Refuses
@@ -1125,10 +1126,9 @@ impl FileDocumentCache {
 /// File documents aren't real contexts, but BlockStore is keyed by ContextId.
 /// We use UUIDv5 (namespace: URL) so the same path always maps to the same ID.
 ///
-/// `pub(crate)` so ownership tests can assert the *absence* of a document at
-/// this id: for a config-owned path the file-doc id must never be minted at all
-/// (`docs/config-ownership.md`), and only this function knows where such a
-/// shadow would live.
+/// `pub(crate)` so callers elsewhere in the crate (`kernel.rs`'s cache
+/// invalidation) can address a path's cache entry without going through the
+/// cache's own API.
 pub(crate) fn file_context_id(path: &str) -> ContextId {
     let uuid = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,

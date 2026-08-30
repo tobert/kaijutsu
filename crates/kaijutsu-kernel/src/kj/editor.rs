@@ -265,8 +265,8 @@ mod tests {
     }
 
     /// The headline e2e for the kj surface: `open` → `keys` mutates the *actual*
-    /// rc document (read back through the VFS, proving editor → block →
-    /// ConfigDocFs), and `quit` rolls it back to the opened content.
+    /// rc file (read back through the VFS, proving editor → block → disk),
+    /// and `quit` rolls it back to the opened content.
     #[tokio::test]
     async fn kj_editor_edits_the_rc_doc_and_quit_rolls_back() {
         let d = test_dispatcher_rc().await;
@@ -279,13 +279,15 @@ mod tests {
         let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
         let id = session_of(&opened);
 
-        // Type "X" at the start; the edit must reach the rc doc on disk-of-record.
+        // Type "X" at the start; the edit mirrors onto the owning block, but
+        // a plain edit alone must not reach disk — only `:w`/`:wq`/`ZZ`
+        // flush (docs/file-buffers.md).
         d.dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &c)
             .await;
         assert_eq!(
             read_rc(&d, P).await.as_deref(),
-            Some("Xhello"),
-            "kj editor keys must mutate the owning rc doc"
+            Some("hello"),
+            "a plain edit alone must not reach disk"
         );
 
         // State reports the live buffer + dirty.
@@ -300,13 +302,24 @@ mod tests {
             other => panic!("expected state data, got {other:?}"),
         }
 
-        // ZQ rolls the rc doc back to what we opened.
+        // `:w` flushes the edit to the rc doc on disk-of-record.
+        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s(":w<CR>")], &c)
+            .await;
+        assert_eq!(
+            read_rc(&d, P).await.as_deref(),
+            Some("Xhello"),
+            "kj editor keys ':w' must flush the edit to the owning rc doc"
+        );
+
+        // A further, unsaved edit; ZQ rolls the block back to the last save.
+        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s("iY<Esc>")], &c)
+            .await;
         d.dispatch(&[s("editor"), s("quit"), id.to_string()], &c)
             .await;
         assert_eq!(
             read_rc(&d, P).await.as_deref(),
-            Some("hello"),
-            "kj editor quit must roll the rc doc back to the checkpoint"
+            Some("Xhello"),
+            "kj editor quit must roll the rc doc back to the last save"
         );
     }
 
@@ -431,12 +444,10 @@ mod tests {
         );
     }
 
-    /// A **file-backed** dispatcher, not `test_dispatcher_rc`'s ConfigDocFs
-    /// one: a config-owned session has no separate flush step (the block
-    /// mirror IS the persisted content the instant a key lands), so it can't
-    /// tell "the edit landed" apart from "the write reached disk." Only a
-    /// file-backed session has that separation — the exact thing the
-    /// capability gate needs to prove it refuses.
+    /// A dispatcher with a plain `MemoryBackend` mount — an ordinary
+    /// file-backed session, with the edit/flush separation (`iX<Esc>` mirrors
+    /// onto the block; only `:w` reaches "disk") the capability gate needs to
+    /// prove it refuses.
     async fn test_dispatcher_with_mem() -> KjDispatcher {
         use crate::vfs::backends::MemoryBackend;
         let d = test_dispatcher().await;

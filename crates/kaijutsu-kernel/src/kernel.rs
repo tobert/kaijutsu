@@ -1384,10 +1384,9 @@ impl Kernel {
 
     // ── Editor sessions ───────────────────────────────────────────────────
 
-    /// Open an in-app editor on `path`, binding to the kernel block that owns its
-    /// text (config/rc → the ConfigDocFs block; ordinary file → its file-doc).
-    /// Returns the session handle + initial state; fails loud if the path names
-    /// no editable document.
+    /// Open an in-app editor on `path`, binding to the kernel file-doc that
+    /// owns its text. Returns the session handle + initial state; fails loud
+    /// if the path names no editable document.
     pub async fn editor_open(
         &self,
         path: &str,
@@ -1400,15 +1399,14 @@ impl Kernel {
     /// `:r !cmd` can shell out in the opener's context. The signaled front doors
     /// (`vi`/`edit`, `kj editor`) pass the caller here.
     ///
-    /// For a **file-backed** target (not config/rc): pins the file-document
-    /// cache entry for the session's lifetime (P1, `docs/issues.md` "Tech-debt
-    /// audits, 2026-08-20"; `docs/file-buffers.md`). Before this, a session
-    /// held no reference into the cache, so unrelated reads of *other* paths
-    /// could evict its entry while the buffer sat clean — `mark_dirty`/
-    /// `flush_one` then silently no-op'd on the now-uncached path, so `:w`
-    /// reported success and wrote nothing. `editor_keys`' `Closed` arm and
-    /// [`editor_quit`](Self::editor_quit) release the pin when the session
-    /// closes.
+    /// Pins the file-document cache entry for the session's lifetime (P1,
+    /// `docs/issues.md` "Tech-debt audits, 2026-08-20"; `docs/file-buffers.md`).
+    /// Before this, a session held no reference into the cache, so unrelated
+    /// reads of *other* paths could evict its entry while the buffer sat
+    /// clean — `mark_dirty`/`flush_one` then silently no-op'd on the
+    /// now-uncached path, so `:w` reported success and wrote nothing.
+    /// `editor_keys`' `Closed` arm and [`editor_quit`](Self::editor_quit)
+    /// release the pin when the session closes.
     pub async fn editor_open_as(
         &self,
         path: &str,
@@ -1417,19 +1415,11 @@ impl Kernel {
         let blocks = self.blocks();
         let file_cache = self.file_cache().clone();
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
-        // `!Send` `EditorCore` never coexists with an await. The mount table is
-        // the authority on what owns the path (config-doc backend vs. file).
-        let target =
-            crate::editor::resolve_editor_target(path, blocks, &file_cache, self.vfs()).await?;
-        // Config/rc targets have no file-cache entry to pin — resolve_editor_target
-        // bound straight to the ConfigDocFs block, never touching file_cache. Read
-        // the mount-table answer it already carries rather than re-deriving it.
-        let file_backed = !target.config_owned;
-        if file_backed {
-            file_cache.pin(path)?;
-        }
+        // `!Send` `EditorCore` never coexists with an await.
+        let target = crate::editor::resolve_editor_target(path, &file_cache).await?;
+        file_cache.pin(path)?;
         let opened = self.editor_sessions.lock().0.open(path, target, blocks, opener);
-        if opened.is_err() && file_backed {
+        if opened.is_err() {
             // The session never came to exist — don't leak the pin.
             file_cache.unpin(path);
         }
@@ -1447,9 +1437,7 @@ impl Kernel {
     /// (`file_cache.mark_dirty`) so unsaved work survives a restart; a batch
     /// that executed a checkpoint (`:w`/`:wq`/`:x`/`ZZ`) flushes to disk
     /// (`file_cache.flush_one_guarded`) instead — refusing on the W12
-    /// changed-under-us condition unless `:w!` set `update.forced`. A
-    /// config/rc session has no host file and never touches the file cache
-    /// (`EditorSessions::file_backed_path`).
+    /// changed-under-us condition unless `:w!` set `update.forced`.
     ///
     /// Unrestricted (`can_write: true`) — the shape every caller in this
     /// crate outside `kj/editor.rs` uses. See
@@ -1489,7 +1477,7 @@ impl Kernel {
             let path = sessions.0.session_path(id);
             // Captured now (session still exists) — `Closed` outcomes below
             // drop the session before the kernel ever sees it again.
-            let file_path = sessions.0.file_backed_path(id);
+            let file_path = sessions.0.session_path(id);
             let outcome = sessions.0.keys_checked(id, keys, blocks, can_write)?;
             let io = if matches!(outcome, crate::editor::KeysOutcome::Updated(_)) {
                 sessions.0.take_io(id)
@@ -1574,40 +1562,26 @@ impl Kernel {
                         format!("editor keys: failed to mark {fp} dirty: {e}")
                     })?;
                 }
-                if update.saved {
-                    match file_path.as_deref() {
-                        Some(fp) => {
-                            // File-backed: `state` still reads dirty here —
-                            // `EditorSessions` deferred the checkpoint (see
-                            // `KeysUpdate`). Flush to disk FIRST; the
-                            // checkpoint must not advance unless the bytes
-                            // actually landed. Guarded (docs/file-buffers.md
-                            // rule 3, W12): a plain `:w` refuses when disk
-                            // moved under the buffer, `:w!` overrides via
-                            // `update.forced`.
-                            if let Err(e) =
-                                self.file_cache.flush_one_guarded(fp, update.forced).await
-                            {
-                                // Leave the swap row and the cache entry alone
-                                // — the entry is legitimately dirty and the
-                                // block IS the player's live buffer, not a
-                                // speculative write with nothing else reading
-                                // it. Invalidating (as `mount_backend.rs`'s
-                                // *external*-write rollback correctly does)
-                                // would turn a retry `:w` into a cold miss
-                                // that recovers as an unacknowledged swap —
-                                // the wrong error for a player retrying a
-                                // write that just failed.
-                                state.message = Some(flush_error_message(fp, &e, self.id()));
-                            } else {
-                                state = self.editor_sessions.lock().0.save(id)?;
-                            }
-                        }
-                        None => {
-                            // Config/rc: no file to flush — the block write
-                            // already IS the durable persistence.
-                            state = self.editor_sessions.lock().0.save(id)?;
-                        }
+                if update.saved && let Some(fp) = file_path.as_deref() {
+                    // `state` still reads dirty here — `EditorSessions`
+                    // deferred the checkpoint (see `KeysUpdate`). Flush to
+                    // disk FIRST; the checkpoint must not advance unless the
+                    // bytes actually landed. Guarded (docs/file-buffers.md
+                    // rule 3, W12): a plain `:w` refuses when disk moved
+                    // under the buffer, `:w!` overrides via `update.forced`.
+                    if let Err(e) = self.file_cache.flush_one_guarded(fp, update.forced).await {
+                        // Leave the swap row and the cache entry alone — the
+                        // entry is legitimately dirty and the block IS the
+                        // player's live buffer, not a speculative write with
+                        // nothing else reading it. Invalidating (as
+                        // `mount_backend.rs`'s *external*-write rollback
+                        // correctly does) would turn a retry `:w` into a
+                        // cold miss that recovers as an unacknowledged swap
+                        // — the wrong error for a player retrying a write
+                        // that just failed.
+                        state.message = Some(flush_error_message(fp, &e, self.id()));
+                    } else {
+                        state = self.editor_sessions.lock().0.save(id)?;
                     }
                 }
                 self.publish_editor_state(id, &state);
@@ -1749,10 +1723,9 @@ impl Kernel {
         self.editor_sessions.lock().0.list()
     }
 
-    /// `ZZ` (direct call) — for a file-backed session (`docs/file-buffers.md`),
-    /// flush to disk FIRST and only advance the checkpoint once the bytes
-    /// land; a config/rc session has no flush step, so its checkpoint
-    /// advances immediately. The flush is W12-guarded and unforced (this call
+    /// `ZZ` (direct call) — flush to disk FIRST (`docs/file-buffers.md`) and
+    /// only advance the checkpoint once the bytes land. The flush is
+    /// W12-guarded and unforced (this call
     /// carries no `:w!` bang), so it refuses if disk moved under the buffer.
     /// Publishes the resulting state so renderers reflect it — clean on
     /// success, still dirty on failure.
@@ -1786,23 +1759,18 @@ impl Kernel {
     ) -> Result<crate::editor::EditorState, String> {
         let (file_path, mut state) = {
             let mut sessions = self.editor_sessions.lock();
-            let file_path = sessions.0.file_backed_path(id);
+            let file_path = sessions.0.session_path(id);
             let state = sessions.0.state(id)?;
             (file_path, state)
         };
-        match file_path.as_deref() {
-            Some(fp) => {
-                // Guarded, unforced: this direct-call path (the wire
-                // `editorSave`, `kj editor save`) carries no bang, so it is a
-                // plain `:w` and refuses on the W12 changed-under-us
-                // condition (docs/file-buffers.md rule 3).
-                if let Err(e) = self.file_cache.flush_one_guarded(fp, false).await {
-                    state.message = Some(flush_error_message(fp, &e, self.id()));
-                } else {
-                    state = self.editor_sessions.lock().0.save(id)?;
-                }
-            }
-            None => {
+        if let Some(fp) = file_path.as_deref() {
+            // Guarded, unforced: this direct-call path (the wire
+            // `editorSave`, `kj editor save`) carries no bang, so it is a
+            // plain `:w` and refuses on the W12 changed-under-us
+            // condition (docs/file-buffers.md rule 3).
+            if let Err(e) = self.file_cache.flush_one_guarded(fp, false).await {
+                state.message = Some(flush_error_message(fp, &e, self.id()));
+            } else {
                 state = self.editor_sessions.lock().0.save(id)?;
             }
         }
@@ -1828,15 +1796,13 @@ impl Kernel {
     /// recovered as a swap rather than quietly lost. `docs/file-buffers.md`
     /// rule 2 ("a dirty buffer is a swap file") only holds if every path
     /// that changes the block without flushing marks it dirty — this is one
-    /// of them. Only fires for a **file-backed** session (`file_path` is
-    /// `None` for config/rc, which has no file-cache entry to mark) and only
-    /// when the block genuinely changed — a no-op rollback must not
-    /// spuriously dirty an already-clean entry.
+    /// of them. Only fires when the block genuinely changed — a no-op
+    /// rollback must not spuriously dirty an already-clean entry.
     pub fn editor_quit(&self, id: crate::editor::EditorSessionId) -> Result<(), String> {
         let (path, file_path, rolled_back) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
-            let file_path = sessions.0.file_backed_path(id);
+            let file_path = path.clone();
             let rolled_back = sessions.0.quit(id, self.blocks())?;
             (path, file_path, rolled_back)
         };
@@ -1869,17 +1835,16 @@ impl Kernel {
         }
     }
 
-    /// Invalidate the shared [`FileDocumentCache`] shadow for a **config** path
-    /// after a write that touched the `ConfigDocFs` block **directly** (the vi
-    /// editor's block mirror, `kj rc add/rm`, `kj config reset`).
+    /// Invalidate the shared [`FileDocumentCache`] shadow for a **config**
+    /// path after a write that bypassed the cache entirely (`kj rc add/rm`,
+    /// `kj config reset` — a raw VFS write straight to the host file).
     ///
-    /// Config paths get a separate `file_context_id` shadow doc that backs the
-    /// kaish `cat`/file-tool read path; a direct config-block write leaves it
-    /// stale (and the symlink-lstat mtime can't self-heal it). Every such writer
-    /// calls this so the next read reloads. A no-op for non-config paths.
+    /// The cache's disk-generation staleness check (`try_get_or_load`) can't
+    /// self-heal this: an rc write through a composition symlink doesn't
+    /// necessarily move the mtime the check reads. Every such writer calls
+    /// this so the next read reloads. A no-op for non-config paths.
     pub fn invalidate_config_file_cache(&self, path: &str) {
-        // Called from an open session (which already knows the mount-table
-        // answer via `EditorTarget::config_owned`) and from callers with no
+        // Called from an open editor session and from callers with no
         // session in scope (`kj rc`/`kj config`, always on their own trees)
         // alike — the latter is why this stays a path predicate rather than
         // taking the fact as a parameter. `is_config_doc_root` is the one
@@ -2386,30 +2351,35 @@ mod tests {
         assert_eq!(kernel.name().await, "test");
     }
 
+    /// A kernel with `/config/rc` mounted as an ordinary `LocalBackend` over a
+    /// tempdir — the production shape (`docs/config-namespace.md`). The
+    /// tempdir must stay alive for the test's duration: `:r`/`:w` continue to
+    /// touch the real files, not just an initial load.
+    async fn kernel_with_rc_dir() -> (Kernel, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let kernel = Kernel::new_ephemeral("test").await;
+        kernel
+            .mount(RC_ROOT, crate::vfs::LocalBackend::new(dir.path()))
+            .await;
+        (kernel, dir)
+    }
+
+    /// Write one rc script into a `kernel_with_rc_dir` tempdir at its
+    /// canonical relative path, creating parent directories as needed.
+    fn write_rc_file(dir: &tempfile::TempDir, rel: &str, content: &[u8]) {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("rel has a parent"))
+            .expect("create rc script parent dir");
+        std::fs::write(path, content).expect("write rc script");
+    }
+
     /// Drive the kernel-owned editor surface end to end: open an rc block, type,
     /// observe state, roll back. Proves the methods + the `!Send` registry
     /// integration work through the shared kernel.
     #[tokio::test]
     async fn editor_session_roundtrip_through_kernel() {
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use std::path::Path;
-
-        let kernel = Kernel::new_ephemeral("test").await;
-
-        // Seed an rc script through its owning ConfigDocFs backend, over the
-        // kernel's own block store — the same one its file_cache() is built
-        // over, so editor_open below resolves through one coherent instance.
-        let blocks = kernel.blocks().clone();
-        ConfigDocFs::new(blocks.clone(), RC_ROOT)
-            .write_all(Path::new("coder/create/S00.kai"), b"hello")
-            .await
-            .unwrap();
-        // Mount it so the resolver's mount-table query routes the path to the
-        // config backend (same blocks, so it finds the seeded block).
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"hello");
         let path = "/config/rc/coder/create/S00.kai";
 
         // Open → type → state reflects, all through the kernel surface.
@@ -2427,92 +2397,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editor_edit_invalidates_the_file_cache_shadow() {
-        // A config path gets a *shadow* copy in the FileDocumentCache (keyed by
-        // file_context_id) separate from the ConfigDocFs block the editor writes
-        // (config_context_id). A direct editor block write would leave that shadow
-        // stale — so a kaish `cat` after an in-app edit would serve old bytes.
-        // Kernel::editor_keys must invalidate the shadow so the next read reloads.
-        use crate::block_store::SharedBlockStore;
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use kaijutsu_types::{BlockId, ContextId};
-        use std::path::Path;
-
-        fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {
-            blocks
-                .block_snapshots(ctx)
-                .unwrap()
-                .into_iter()
-                .find(|s| s.id == *block)
-                .expect("shadow block present")
-                .content
-        }
-
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-
-        // Mount the rc backend on the kernel VFS (so the cache reads through it),
-        // then seed a config script over the same store.
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        ConfigDocFs::new(blocks.clone(), RC_ROOT)
-            .write_all(Path::new("coder/create/S00.kai"), b"hello")
-            .await
-            .unwrap();
-        let path = "/config/rc/coder/create/S00.kai";
-
-        // The kernel's own file cache, over the same store + kernel VFS —
-        // the editor's invalidation and our reads must hit the same instance.
-        let cache = kernel.file_cache().clone();
-
-        // Populate the shadow from the source.
-        let (sctx, sblock) = cache.try_get_or_load(path).await.unwrap();
-        assert_eq!(
-            block_content(&blocks, sctx, &sblock),
-            "hello",
-            "shadow loads the source content"
-        );
-
-        // Edit the config block through the editor (insert X at the front).
-        let (id, _) = kernel.editor_open(path).await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-
-        // The next read must reflect the edit — proving the shadow was dropped and
-        // reloaded, not re-served stale. (With a plain cache-entry invalidate the
-        // surviving shadow doc would re-serve "hello" and this fails.)
-        let (sctx2, sblock2) = cache.try_get_or_load(path).await.unwrap();
-        assert_eq!(
-            block_content(&blocks, sctx2, &sblock2),
-            "Xhello",
-            "kaish read sees the editor's edit after invalidation"
-        );
-    }
-
-    #[tokio::test]
     async fn editor_colon_r_reads_a_file_into_the_buffer() {
         // `:r <file>` slurps a file's contents at the cursor — the async fetch
         // (try_read_content via the FileDocumentCache) happens inside Kernel::editor_keys
         // *outside* the session lock; the result mirrors onto the editor's block.
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use std::path::Path;
-
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
+        let (kernel, dir) = kernel_with_rc_dir().await;
         // The block we'll edit, and a separate file we'll read into it.
-        rc.write_all(Path::new("coder/create/S00.kai"), b"AB")
-            .await
-            .unwrap();
-        rc.write_all(Path::new("coder/create/snippet.kai"), b"INSERTED")
-            .await
-            .unwrap();
+        write_rc_file(&dir, "coder/create/S00.kai", b"AB");
+        write_rc_file(&dir, "coder/create/snippet.kai", b"INSERTED");
         let edit_path = "/config/rc/coder/create/S00.kai";
         let read_path = "/config/rc/coder/create/snippet.kai";
 
@@ -2533,20 +2425,10 @@ mod tests {
     async fn resume_editor_finds_the_opener_session_or_fails_loud() {
         // `fg`: with nothing suspended → fail loud; after a signaled open for a
         // principal → resume_editor returns that session's current state.
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
         use kaijutsu_types::{ContextId, PrincipalId};
-        use std::path::Path;
 
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        ConfigDocFs::new(blocks.clone(), RC_ROOT)
-            .write_all(Path::new("coder/create/S00.kai"), b"hello")
-            .await
-            .unwrap();
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"hello");
         let path = "/config/rc/coder/create/S00.kai";
 
         // Nothing open at all → fail loud (no session to foreground).
@@ -2629,19 +2511,8 @@ mod tests {
         // must fail loud pointing at the interactive shell, never silently no-op.
         // "Loud" means the `:` status line (the dialect-level channel), NOT an
         // RPC error: the session stays open and the message rides the state.
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use std::path::Path;
-
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        ConfigDocFs::new(blocks.clone(), RC_ROOT)
-            .write_all(Path::new("coder/create/S00.kai"), b"hi")
-            .await
-            .unwrap();
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"hi");
 
         // `editor_open` records no opener.
         let (id, _) = kernel
@@ -2666,19 +2537,8 @@ mod tests {
         // `:r <missing>` is a dialect-level failure: the fetch error rides the
         // `:` status line and the session stays open — never a silent no-op,
         // never an RPC error the GUI can't display.
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use std::path::Path;
-
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        ConfigDocFs::new(blocks.clone(), RC_ROOT)
-            .write_all(Path::new("coder/create/S00.kai"), b"hi")
-            .await
-            .unwrap();
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"hi");
 
         let (id, _) = kernel
             .editor_open("/config/rc/coder/create/S00.kai")
@@ -2703,10 +2563,9 @@ mod tests {
     // session records the durable swap marker, and `:w`/`:wq`/`ZZ` flush to
     // disk through the same cache every other writer uses.
 
-    /// Mount a `MemoryBackend` (an ordinary, non-config VFS backend — no
-    /// `owns_config_docs`) so `resolve_editor_target` routes through
-    /// `FileDocumentCache::try_get_or_load`, the "ordinary file" branch, not the
-    /// config-doc branch the other editor tests in this module exercise.
+    /// Mount an ordinary `MemoryBackend` so `resolve_editor_target` routes
+    /// through `FileDocumentCache::try_get_or_load`, same as every other
+    /// editor target.
     async fn kernel_with_mem_fs() -> Kernel {
         use crate::vfs::backends::MemoryBackend;
         let kernel = Kernel::new_ephemeral("test").await;
@@ -2971,101 +2830,6 @@ mod tests {
                 .any(|r| r.path == "/mem/note.txt"),
             "a :q! that rolled the block back past what disk holds must leave a \
              recoverable swap row"
-        );
-    }
-
-    #[tokio::test]
-    async fn editor_edit_on_a_config_owned_session_never_touches_the_file_cache() {
-        // Config/rc blocks have no host file — flushing the FileDocumentCache's
-        // *shadow* entry for a config path would write the wrong content (a
-        // stale read-through copy, not the block the editor is bound to) to
-        // the wrong place. A config-owned session must never mark or flush it.
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use std::path::Path;
-
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-        kernel
-            .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        ConfigDocFs::new(blocks.clone(), RC_ROOT)
-            .write_all(Path::new("coder/create/S00.kai"), b"hello")
-            .await
-            .unwrap();
-        let path = "/config/rc/coder/create/S00.kai";
-
-        let (id, _) = kernel.editor_open(path).await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
-        assert!(
-            st.message.is_none(),
-            "a config-owned :w must not report a (nonexistent) flush failure"
-        );
-
-        assert!(
-            kernel
-                .kernel_db()
-                .lock()
-                .list_dirty_file_buffers()
-                .unwrap()
-                .is_empty(),
-            "a config-owned session has no host file and must never record a \
-             file-cache swap row"
-        );
-    }
-
-    #[tokio::test]
-    async fn colon_w_on_a_cat_ed_client_path_does_not_revert_the_edit() {
-        // `/config/client` is a ConfigDocFs-owned tree exactly like `/config/rc` —
-        // an editor session on it must never be treated as file-backed, even
-        // after an unrelated `cat` (any FileDocumentCache read) has minted a
-        // shadow cache entry for the same path. See docs/file-buffers.md.
-        use crate::runtime::config_doc_fs::ConfigDocFs;
-        use crate::vfs::VfsOps as _;
-        use kaijutsu_types::paths::CLIENT_ROOT;
-        use std::path::Path;
-
-        let kernel = Kernel::new_ephemeral("test").await;
-        let blocks = kernel.blocks().clone();
-        kernel
-            .mount(CLIENT_ROOT, ConfigDocFs::new(blocks.clone(), CLIENT_ROOT))
-            .await;
-        ConfigDocFs::new(blocks.clone(), CLIENT_ROOT)
-            .write_all(Path::new("theme.toml"), b"orig")
-            .await
-            .unwrap();
-        let path = "/config/client/theme.toml";
-
-        // Mint the FileDocumentCache shadow the same way a kaish `cat` or an
-        // MCP read would — this is the precondition B1 names as "one shell
-        // read away".
-        kernel.file_cache().try_get_or_load(path).await.unwrap();
-
-        let (id, st) = kernel.editor_open(path).await.unwrap();
-        assert_eq!(st.text, "orig");
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
-        assert!(
-            st.message.is_none(),
-            "a config-owned :w must not report a (nonexistent) flush failure, got: {:?}",
-            st.message
-        );
-
-        assert_eq!(
-            String::from_utf8(kernel.vfs().read_all(Path::new(path)).await.unwrap()).unwrap(),
-            "Xorig",
-            "the config block must carry the edit, not the stale pre-edit shadow"
-        );
-        assert!(
-            kernel
-                .kernel_db()
-                .lock()
-                .list_dirty_file_buffers()
-                .unwrap()
-                .is_empty(),
-            "a config-owned session has no host file and must never record a \
-             file-cache swap row"
         );
     }
 

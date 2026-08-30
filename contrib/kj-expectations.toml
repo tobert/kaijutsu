@@ -248,11 +248,6 @@ expect = "situation-normal"
 mutates = true
 note = "External side effect (delivers into a live session's inbox); gated by the approval ledger, not --confirm (cc.rs:110-118)."
 
-["config export"]
-expect = "situation-normal"
-mutates = true
-note = "Writes the kernel's config documents into a host directory as the files that will back the same paths after the melt (docs/config-namespace.md). Creates only: an existing target is named and nothing is written, so it cannot destroy the config it is migrating to."
-
 ["config list"]
 expect = "informative"
 mutates = false

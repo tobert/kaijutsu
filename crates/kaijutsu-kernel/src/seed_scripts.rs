@@ -218,7 +218,7 @@ pub fn reseed_rc_files(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match crate::runtime::config_doc_fs::seed_link_target(path, content, &known) {
+        match seed_link_target(path, content, &known) {
             // An init.d-style composed seed becomes a real symlink. The body
             // carries the target as a `/config/rc` path, which is meaningless on
             // disk, so it is rewritten relative to the link — that keeps the
@@ -245,7 +245,7 @@ fn seed_entry_matches(
     content: &str,
     known: &std::collections::HashSet<String>,
 ) -> bool {
-    match crate::runtime::config_doc_fs::seed_link_target(canonical, content, known) {
+    match seed_link_target(canonical, content, known) {
         Some(target) => {
             let want = canonical_link_target(canonical, &target);
             let Some(target_rel) = rc_relpath(&want) else {
@@ -265,14 +265,64 @@ fn seed_entry_matches(
     }
 }
 
-/// Resolve a seed link body to its canonical `/config/rc` path. The body is
-/// absolute today; a relative one resolves against the link's own directory.
-fn canonical_link_target(link_path: &str, target: &str) -> String {
-    if target.starts_with('/') {
-        crate::runtime::config_doc_fs::normalize_abs(target)
+/// Normalize an absolute path string: collapse `//`, drop `.`, resolve `..`
+/// (popping the prior segment). Returns a clean absolute path (`/a/b/c`).
+pub(crate) fn normalize_abs(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// If `body` is a **seed symlink** — its sole content a path resolving to
+/// another seeded path in `known` — return the raw target string; otherwise
+/// `None` (seed it as a literal file).
+///
+/// This is the in-repo init.d composition format: a checked-in seed file whose
+/// content is just the target path seeds as a symlink instead of a literal
+/// file. `include_dir!` can't carry real symlinks (it follows them and embeds
+/// the target's bytes), so the link relationship rides in the file *content*
+/// and is reconstructed here. Detection is deliberately confined to the
+/// authored, closed seed set and guarded by "the target must be a real seeded
+/// path", so a one-line script can't be mistaken for a link.
+pub(crate) fn seed_link_target(
+    link_path: &str,
+    body: &str,
+    known: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let t = body.trim();
+    // A link body is a single path token, not a script: one line, path-shaped.
+    if t.is_empty() || t.contains('\n') || !t.contains('/') {
+        return None;
+    }
+    let resolved = if t.starts_with('/') {
+        normalize_abs(t)
     } else {
         let parent = link_path.rsplit_once('/').map_or("", |(p, _)| p);
-        crate::runtime::config_doc_fs::normalize_abs(&format!("{parent}/{target}"))
+        normalize_abs(&format!("{parent}/{t}"))
+    };
+    (resolved != link_path && known.contains(&resolved)).then(|| t.to_string())
+}
+
+/// Resolve a seed link body — or a live on-disk symlink's raw readlink
+/// target — to its canonical `/config/rc` path. Absolute resolves as-is;
+/// relative (what a real host symlink carries, `relative_link` below)
+/// resolves against the link's own directory. `pub(crate)` so `kj rc`'s
+/// seed-staleness comparison (`kj/rc.rs`) can canonicalize a live target to
+/// the same coordinate the seed body is already in.
+pub(crate) fn canonical_link_target(link_path: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        normalize_abs(target)
+    } else {
+        let parent = link_path.rsplit_once('/').map_or("", |(p, _)| p);
+        normalize_abs(&format!("{parent}/{target}"))
     }
 }
 
@@ -495,7 +545,7 @@ mod tests {
             }
             let body = std::fs::read_to_string(&dest).expect("read seed");
             assert!(
-                crate::runtime::config_doc_fs::seed_link_target(&canonical, &body, &known)
+                seed_link_target(&canonical, &body, &known)
                     .is_none(),
                 "{canonical} seeded as a literal file but its body names another \
                  seed \u{2014} it should have been materialized as a symlink"
@@ -586,7 +636,7 @@ mod tests {
             .expect("lib cache seed must exist");
         assert!(body.contains("kj cache add --target=tools"));
         // …and a per-type path's seed body is just the link target (a seed
-        // symlink — reconstructed into an actual link by ConfigDocFs::seed).
+        // symlink — reconstructed into an actual link by `reseed_rc_files`).
         assert_eq!(
             seed_body("/config/rc/default/create/S20-cache.kai").unwrap().trim(),
             "/config/rc/lib/create/S20-cache.kai"
@@ -709,7 +759,7 @@ mod tests {
             if !bare_path_token {
                 continue;
             }
-            if crate::runtime::config_doc_fs::seed_link_target(path, body, &known).is_none() {
+            if seed_link_target(path, body, &known).is_none() {
                 broken.push(format!("{path} → {t}"));
             }
         }

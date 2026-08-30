@@ -3,39 +3,21 @@
 //!
 //! Two parts:
 //! - [`resolve_editor_target`] maps a VFS path to the `(context, block)`
-//!   that *owns* its text, so an editor binds to the source of truth — never a
-//!   copy (see "Bind to the owner" below).
+//!   that *owns* its text, through
+//!   [`FileDocumentCache::try_get_or_load`](crate::file_tools::FileDocumentCache),
+//!   which mints/loads a working-copy file-doc. Every `/config` tree mounts
+//!   as an ordinary host directory (`docs/config-namespace.md`), same as any
+//!   other path.
 //! - [`EditorSessions`] is the registry of open editors. Each session is a pure
 //!   [`EditorCore`](kaijutsu_editor::EditorCore) bound to a target; keystrokes
 //!   mirror onto the kernel block, and a checkpoint backs `ZQ` rollback. This is
 //!   the tool-shaped surface the app renders, a model plays, and tests drive —
 //!   all headless. See `docs/vi.md`.
-//!
-//! ## Bind to the owner, not a copy
-//!
-//! Resolution is **path-kind aware**, and this is load-bearing, not cosmetic:
-//!
-//! - **config-owned** paths (`/config/rc/*`, `/config/kernel/*`) are sole-owned
-//!   single-block [`DocKind::File`] documents
-//!   ([`ConfigDocFs`](crate::runtime::ConfigDocFs)). The kernel *is* the owner —
-//!   there is no host file. We resolve straight to that document's block.
-//! - **ordinary files** resolve through
-//!   [`FileDocumentCache::try_get_or_load`](crate::file_tools::FileDocumentCache),
-//!   which mints/loads a working-copy file-doc.
-//!
-//! Running a config path through `try_get_or_load` would create a *second* document
-//! (a `FileDocumentCache` copy) shadowing the ConfigDocFs original —
-//! reintroducing the dual-ownership write-through bug class the kernel-owned-config
-//! work (`docs/config-ownership.md`) deleted by construction. So the branch
-//! is the whole point. See `docs/vi.md` ("Path resolution").
 
 use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::{PrincipalId, SessionId};
-#[cfg(test)]
-use kaijutsu_types::paths::RC_ROOT;
 
 use crate::block_store::SharedBlockStore;
-use crate::config_doc::{config_context_id, first_block_id};
 use crate::file_tools::FileDocumentCache;
 
 /// The well-known nick the Bevy app registers under (see `peers/mod.rs`). The
@@ -61,58 +43,15 @@ pub const WRITE_CAPABILITY_REFUSED: &str =
 pub struct EditorTarget {
     pub context_id: ContextId,
     pub block_id: BlockId,
-    /// Whether this target is one of the kernel-owned `ConfigDocFs` documents
-    /// (rc/config/client/midi) rather than an ordinary file-backed document.
-    /// Decided once, here, by [`resolve_editor_target`]'s mount-table query —
-    /// every other consumer (`EditorSessions::file_backed_path`, the
-    /// checkpoint-deferral branch in `run_commands`, `Kernel::editor_open_as`'s
-    /// pin decision) reads this stored fact instead of re-deriving it from
-    /// the path, so there is one place this question gets asked. See
-    /// `docs/file-buffers.md`.
-    pub config_owned: bool,
 }
 
 /// Resolve `path` to the `(context, block)` of the kernel document that owns its
-/// text. The mount table answers "what owns this path?": a backend that
-/// [`owns_config_docs`](crate::vfs::VfsOps::owns_config_docs) (the rc/config
-/// `ConfigDocFs`) binds straight to its block; anything else goes through the
-/// file-doc cache. Fails loud (no silent empty/placeholder) when a config path
-/// names a document that does not exist — an editor must not open on a phantom
-/// block.
+/// text, through the file-doc cache. Fails loud (no silent empty/placeholder)
+/// when the path names nothing — an editor must not open on a phantom block.
 pub async fn resolve_editor_target(
     path: &str,
-    blocks: &SharedBlockStore,
     file_cache: &FileDocumentCache,
-    mounts: &crate::vfs::MountTable,
 ) -> Result<EditorTarget, String> {
-    // Ask the VFS which backend owns this path. The config-doc backends answer
-    // for themselves — no hardcoded `/config/rc` prefix to drift from the mounts.
-    if let Some((mount_root, fs)) = mounts.owner_of(std::path::Path::new(path)).await
-        && fs.owns_config_docs()
-    {
-        // Follow any rc/config symlink to its terminal document FIRST, exactly
-        // as the read/exec path (`ConfigDocFs`) does. Without this the editor
-        // binds the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
-        // composition) while reads resolve to the target — so saved edits land
-        // on a block nothing else reads (docs/issues.md). Resolving here makes
-        // the editor and the executor agree on one block. A fresh
-        // `ConfigDocFs` at the mount root does the lexical walk (it is
-        // stateless — blocks + root); `resolve_canonical` is not on `VfsOps`.
-        let root = mount_root.to_string_lossy().into_owned();
-        let config_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), root);
-        let resolved = config_fs
-            .resolve_canonical(path)
-            .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
-        let context_id = config_context_id(&resolved);
-        let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
-            format!("open editor: config document '{path}' does not exist (nothing to edit)")
-        })?;
-        return Ok(EditorTarget {
-            context_id,
-            block_id,
-            config_owned: true,
-        });
-    }
     let (context_id, block_id) = file_cache
         .try_get_or_load(path)
         .await
@@ -120,7 +59,6 @@ pub async fn resolve_editor_target(
     Ok(EditorTarget {
         context_id,
         block_id,
-        config_owned: false,
     })
 }
 
@@ -170,10 +108,9 @@ pub enum KeysOutcome {
 /// buffer on its own (e.g. an undo) — only the former means "flush to disk."
 ///
 /// `saved: true` does NOT always mean the checkpoint has already advanced.
-/// For a `Closed` outcome, or an `Updated` one from a config/rc session, it
-/// has (there is no separate flush step to gate on). For an `Updated`
-/// outcome from an ordinary file session — a plain `:w` that leaves the
-/// session open — it has **not**: `state.dirty` is still `true`, and the
+/// For a `Closed` outcome it has (there is no separate flush step to gate
+/// on). For an `Updated` outcome — a plain `:w` that leaves the session
+/// open — it has **not**: `state.dirty` is still `true`, and the
 /// kernel layer must flush to disk first and only then checkpoint, or the
 /// buffer would read clean before the bytes land (docs/file-buffers.md).
 ///
@@ -553,22 +490,19 @@ impl EditorSessions {
     /// batch ran a `Write`, including inside `:wq`/`:x`) is the kernel layer's
     /// cue to flush a file-backed session.
     ///
-    /// **`Write` does not checkpoint by itself for a file-backed session.**
-    /// The checkpoint must not advance until the write actually lands, and
-    /// this pure registry has no file cache to flush through — that lives in
-    /// the kernel layer (`Kernel::editor_keys`/`editor_save`), which flushes
-    /// first and checkpoints only on success (docs/file-buffers.md). A
-    /// config/rc session has no such flush step: the block write the
-    /// keystrokes already mirrored IS the durable persistence, so its
-    /// checkpoint can still advance right here, same as before this rule
-    /// existed. A `Quit` in the same batch (`:wq`/`:x`) is the one case that
-    /// checkpoints unconditionally, file-backed or not: the session is about
-    /// to be dropped, `quit`'s rollback reads the checkpoint to know what to
-    /// restore, and there is no later kernel-layer moment left to defer to —
-    /// deferring here would let quit roll back the very edit `:wq` promised
-    /// to keep. The disk flush that follows in the kernel layer can still
-    /// fail; that surfaces as the existing session-lost hard error on
-    /// `KeysOutcome::Closed`, never a reverted edit.
+    /// **`Write` does not checkpoint by itself.** The checkpoint must not
+    /// advance until the write actually lands, and this pure registry has no
+    /// file cache to flush through — that lives in the kernel layer
+    /// (`Kernel::editor_keys`/`editor_save`), which flushes first and
+    /// checkpoints only on success (docs/file-buffers.md). A `Quit` in the
+    /// same batch (`:wq`/`:x`) is the one case that checkpoints
+    /// unconditionally: the session is about to be dropped, `quit`'s
+    /// rollback reads the checkpoint to know what to restore, and there is
+    /// no later kernel-layer moment left to defer to — deferring here would
+    /// let quit roll back the very edit `:wq` promised to keep. The disk
+    /// flush that follows in the kernel layer can still fail; that surfaces
+    /// as the existing session-lost hard error on `KeysOutcome::Closed`,
+    /// never a reverted edit.
     ///
     /// `can_write: false` refuses the `Write` command outright — same
     /// message and outcome shape as [`refuse_write`](Self::refuse_write) —
@@ -634,20 +568,9 @@ impl EditorSessions {
                 }
             }
         }
-        // No `Quit` ran — a bare `:w`/`:w!`, or an empty `:` line. A config/rc
-        // session checkpoints immediately (see the doc above); an ordinary
-        // file session defers, so `state` here still reads dirty and the
-        // kernel layer flushes-then-checkpoints.
-        if write_requested {
-            let is_config = self
-                .sessions
-                .get(&id)
-                .map(|s| s.target.config_owned)
-                .ok_or_else(|| no_session(id))?;
-            if is_config {
-                self.save(id)?;
-            }
-        }
+        // No `Quit` ran — a bare `:w`/`:w!`, or an empty `:` line. The
+        // checkpoint defers to the kernel layer's flush-then-checkpoint, so
+        // `state` here still reads dirty.
         let state = self.state(id)?;
         Ok(KeysOutcome::Updated(KeysUpdate {
             state,
@@ -687,10 +610,8 @@ impl EditorSessions {
         // The block's text is the merged truth; reconcile against its normalized
         // (terminator-stripped) view, matching EditorCore's normalized buffer.
         // Reuse a bound session's own target (every bound session shares this
-        // (context_id, block_id), so they share its `config_owned` too) rather
-        // than constructing a fresh `EditorTarget` — there is exactly one place
-        // that decides `config_owned` (`resolve_editor_target`), not a second
-        // ad hoc one here.
+        // (context_id, block_id)) rather than constructing a fresh
+        // `EditorTarget`.
         let target = self.sessions[&bound[0]].target;
         let raw = match block_text(blocks, &target) {
             Ok(t) => t,
@@ -771,24 +692,10 @@ impl EditorSessions {
         self.sessions.get(&id).map(|s| s.path.clone())
     }
 
-    /// `session_path`, filtered to the sessions the kernel's file-document
-    /// cache actually owns a flushable entry for. `None` covers both "no such
-    /// session" and "config/rc session" — a config/rc block has no host file
-    /// and its `FileDocumentCache` entry (if any) is a separate read-through
-    /// shadow, not the block the editor is writing (`docs/vi.md` → "Path
-    /// resolution"); flushing that shadow would write the wrong content to
-    /// the wrong place. Only a `Some` here is safe to hand to `mark_dirty`/
-    /// `flush_one`.
-    pub fn file_backed_path(&self, id: EditorSessionId) -> Option<String> {
-        let session = self.sessions.get(&id)?;
-        (!session.target.config_owned).then(|| session.path.clone())
-    }
-
     /// `ZZ` — checkpoint the current buffer as saved, returning the now-clean
-    /// state. For config/rc blocks the kernel is already the persistent owner;
-    /// for an ordinary file, the kernel layer (which holds the file-document
-    /// cache this pure session registry does not) flushes it to disk after
-    /// this call — see `Kernel::editor_save`/`Kernel::editor_keys`.
+    /// state. The kernel layer (which holds the file-document cache this pure
+    /// session registry does not) flushes it to disk after this call — see
+    /// `Kernel::editor_save`/`Kernel::editor_keys`.
     pub fn save(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         session.saved_content = session.core.text();
@@ -944,226 +851,41 @@ fn block_text(blocks: &SharedBlockStore, target: &EditorTarget) -> Result<String
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block_store::shared_block_store_with_db;
-    use crate::kernel_db::KernelDb;
-    use crate::runtime::config_doc_fs::ConfigDocFs;
-    use crate::vfs::VfsOps as _;
-    use kaijutsu_types::PrincipalId;
-    use std::path::Path;
-    use std::sync::Arc;
-
-    /// A block store backed by a temporary KernelDb, so config docs created via
-    /// `create_document_with_path` land in the `documents` manifest (mirrors the
-    /// ConfigDocFs test fixture). Returns the db handle too, since
-    /// `FileDocumentCache::new` also requires one.
-    fn blocks_with_db() -> (SharedBlockStore, Arc<parking_lot::Mutex<KernelDb>>) {
-        let creator = PrincipalId::system();
-        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
-        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
-        (shared_block_store_with_db(db.clone(), ws_id, creator), db)
-    }
-
-    /// A mount table with the rc `ConfigDocFs` mounted at `/config/rc` — the
-    /// production shape the resolver queries to decide config-ownership.
-    async fn mounts_with_rc(blocks: &SharedBlockStore) -> Arc<crate::vfs::MountTable> {
-        let mt = crate::vfs::MountTable::new();
-        mt.mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-            .await;
-        Arc::new(mt)
-    }
-
-    #[tokio::test]
-    async fn resolves_rc_path_to_its_configdocfs_owner_block() {
-        let (blocks, db) = blocks_with_db();
-        // Seed an rc script through the owning backend, exactly as `kj rc` does.
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc.write_all(Path::new("coder/create/S00-stance.kai"), b"be kind")
-            .await
-            .unwrap();
-
-        // The mount table owns the answer: it routes the path to the rc
-        // ConfigDocFs (config-owned), so the file cache is never consulted.
-        let mounts = mounts_with_rc(&blocks).await;
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
-
-        let full = "/config/rc/coder/create/S00-stance.kai";
-        let target = resolve_editor_target(full, &blocks, &file_cache, &mounts)
-            .await
-            .expect("rc path resolves to its owning block");
-
-        // The target is the ConfigDocFs-owned document, NOT a file-doc copy.
-        let expected_ctx = config_context_id(full);
-        assert_eq!(
-            target.context_id, expected_ctx,
-            "must bind the config owner"
-        );
-        assert_eq!(
-            target.block_id,
-            first_block_id(&blocks, expected_ctx).unwrap(),
-            "must bind the owning block",
-        );
-        assert!(
-            target.config_owned,
-            "the mount table's owns_config_docs() answer must ride the target"
-        );
-    }
-
-    /// `resolve_editor_target` marks `config_owned` from the mount table's
-    /// answer, not a path prefix — so any `ConfigDocFs` root (not just rc)
-    /// comes back marked, and an ordinary file never does. Regression for
-    /// B1 (`docs/file-buffers.md`): `:w` on `/config/client/*`/`/config/midi/*`
-    /// used to revert the edit because a separate, narrower path predicate
-    /// disagreed with this exact mount-table answer.
-    #[tokio::test]
-    async fn resolve_editor_target_marks_config_owned_from_the_mount_table_not_a_path_prefix() {
-        use crate::vfs::backends::MemoryBackend;
-
-        let (blocks, db) = blocks_with_db();
-        let mounts = crate::vfs::MountTable::new();
-        mounts
-            .mount(
-                kaijutsu_types::paths::CLIENT_ROOT,
-                ConfigDocFs::new(blocks.clone(), kaijutsu_types::paths::CLIENT_ROOT),
-            )
-            .await;
-        mounts.mount("/mem", MemoryBackend::new()).await;
-        let mounts = Arc::new(mounts);
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
-
-        ConfigDocFs::new(blocks.clone(), kaijutsu_types::paths::CLIENT_ROOT)
-            .write_all(Path::new("theme.toml"), b"orig")
-            .await
-            .unwrap();
-        let client_target = resolve_editor_target(
-            "/config/client/theme.toml",
-            &blocks,
-            &file_cache,
-            &mounts,
-        )
-        .await
-        .expect("client path resolves");
-        assert!(
-            client_target.config_owned,
-            "a ConfigDocFs root other than rc must still be marked config_owned"
-        );
-
-        mounts
-            .write_all(Path::new("/mem/note.txt"), b"hello")
-            .await
-            .unwrap();
-        let file_target = resolve_editor_target("/mem/note.txt", &blocks, &file_cache, &mounts)
-            .await
-            .expect("ordinary file path resolves");
-        assert!(
-            !file_target.config_owned,
-            "an ordinary file-backed target must not be marked config_owned"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolves_symlinked_rc_path_to_its_target_block() {
-        // The init.d composition: `coder/*` rc scripts are symlinks to the
-        // shared `lib/*` source. The editor must bind the TARGET's block — the
-        // one the executor reads — not the symlink's own block, or saved edits
-        // land on a doc nothing else reads (docs/issues.md, fixed here).
-        let (blocks, db) = blocks_with_db();
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        // The real source lives under lib/.
-        rc.write_all(Path::new("lib/create/S10-binding.kai"), b"kj binding allow \"*\"")
-            .await
-            .unwrap();
-        // coder/ composes it in via a symlink (absolute target, like the seed).
-        rc.symlink(
-            Path::new("coder/create/S10-binding.kai"),
-            Path::new("/config/rc/lib/create/S10-binding.kai"),
-        )
-        .await
-        .unwrap();
-
-        let mounts = mounts_with_rc(&blocks).await;
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
-
-        let link_path = "/config/rc/coder/create/S10-binding.kai";
-        let target = resolve_editor_target(link_path, &blocks, &file_cache, &mounts)
-            .await
-            .expect("symlinked rc path resolves to its target block");
-
-        // Binds the TARGET (lib) document — what the executor reads…
-        let target_ctx = config_context_id("/config/rc/lib/create/S10-binding.kai");
-        assert_eq!(
-            target.context_id, target_ctx,
-            "must bind the symlink target's owner"
-        );
-        assert_eq!(
-            target.block_id,
-            first_block_id(&blocks, target_ctx).unwrap(),
-            "must bind the target block",
-        );
-        // …and NOT the symlink doc's own (coder-path) context.
-        assert_ne!(
-            target.context_id,
-            config_context_id(link_path),
-            "must not bind the symlink doc itself"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_config_doc_fails_loud_not_empty() {
-        let (blocks, db) = blocks_with_db();
-        let mounts = mounts_with_rc(&blocks).await;
-        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
-
-        // No document was ever seeded at this path, but the mount table still
-        // routes it to the config backend → fail loud (not a file-cache miss).
-        let err =
-            resolve_editor_target("/config/rc/nope/create/S00.kai", &blocks, &file_cache, &mounts)
-                .await
-                .expect_err("a phantom config doc must error, not open an empty editor");
-        assert!(
-            err.contains("does not exist"),
-            "fail-loud message, got: {err}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod session_tests {
     //! e2e editor-session lifecycle against a live block store. No GUI: drives
     //! the same surface the app/model/test all share (vi.md test layer 2).
     use super::*;
     use crate::block_store::shared_block_store_with_db;
     use crate::kernel_db::KernelDb;
-    use crate::runtime::config_doc_fs::ConfigDocFs;
-    use crate::vfs::{MountTable, VfsOps as _};
+    use crate::vfs::{LocalBackend, MountTable};
     use kaijutsu_types::PrincipalId;
-    use std::path::Path;
+    use kaijutsu_types::paths::RC_ROOT;
     use std::sync::Arc;
 
     const RC_PATH: &str = "/config/rc/coder/create/S00.kai";
 
-    /// A block store seeded with one rc script (`"hello"`) through its owning
-    /// ConfigDocFs backend, plus the resolved editor target for it.
+    /// A block store seeded with one file loaded through an ordinary
+    /// `LocalBackend` mount over a tempdir — the production shape for
+    /// `/config/rc` (`docs/config-namespace.md`) — plus the resolved editor
+    /// target for it. The tempdir is dropped before this returns: resolution
+    /// loads the content into the block store once, and every session
+    /// operation after that reads/writes the block directly, never the file.
     async fn seeded(initial: &[u8]) -> (SharedBlockStore, EditorTarget) {
         let creator = PrincipalId::system();
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db.clone(), ws, creator);
-        let rc = ConfigDocFs::new(blocks.clone(), RC_ROOT);
-        rc.write_all(Path::new("coder/create/S00.kai"), initial)
-            .await
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("coder/create/S00.kai");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, initial).unwrap();
         let mounts = Arc::new({
             let mt = MountTable::new();
-            mt.mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
-                .await;
+            mt.mount(RC_ROOT, LocalBackend::new(dir.path())).await;
             mt
         });
         let fc = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
-        let target = resolve_editor_target(RC_PATH, &blocks, &fc, &mounts)
-            .await
-            .unwrap();
+        let target = resolve_editor_target(RC_PATH, &fc).await.unwrap();
         (blocks, target)
     }
 
@@ -1539,7 +1261,13 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn colon_w_saves_and_stays_open() {
+    async fn colon_w_defers_the_checkpoint_to_the_kernel_layer() {
+        // At this pure `EditorSessions` level, `:w` mirrors the edit and
+        // reports `saved: true` (the kernel layer's cue to flush), but does
+        // NOT itself advance the checkpoint — that happens only once the
+        // kernel layer's flush to disk (`Kernel::editor_keys`) actually
+        // lands (docs/file-buffers.md). `save` is what a successful flush
+        // calls to clear dirty.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
@@ -1550,8 +1278,15 @@ mod session_tests {
             matches!(outcome, KeysOutcome::Updated(_)),
             ":w keeps the session open"
         );
-        assert!(!outcome.state().dirty, ":w clears dirty");
+        assert!(outcome.saved(), ":w reports a write intent");
+        assert!(
+            outcome.state().dirty,
+            "the checkpoint has not advanced yet — that's the kernel layer's job"
+        );
         assert!(sessions.is_open(id));
+
+        let st = sessions.save(id).unwrap();
+        assert!(!st.dirty, "save (the kernel layer's post-flush call) clears dirty");
         // A clean `:q` now succeeds.
         let outcome = sessions.keys(id, ":q<CR>", &blocks).unwrap();
         assert!(matches!(outcome, KeysOutcome::Closed(_)));

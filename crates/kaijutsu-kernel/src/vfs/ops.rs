@@ -101,17 +101,6 @@ pub trait VfsOps: Send + Sync {
     /// Returns true if this filesystem is read-only.
     fn read_only(&self) -> bool;
 
-    /// Whether this backend owns its paths as single-block *config
-    /// documents* (the rc/config trees). The editor binds such a path straight
-    /// to its owning block; routing it through a file-doc cache would mint a
-    /// shadow copy and revive the dual-ownership write-through bug class
-    /// (`docs/config-ownership.md`). Default `false`; `ConfigDocFs`
-    /// overrides to `true`. Asking the owning backend keeps the editor and the
-    /// VFS from disagreeing on ownership — no hardcoded path prefix.
-    fn owns_config_docs(&self) -> bool {
-        false
-    }
-
     /// Get filesystem statistics.
     async fn statfs(&self) -> VfsResult<StatFs>;
 
