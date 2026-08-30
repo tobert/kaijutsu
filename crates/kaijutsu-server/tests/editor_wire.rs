@@ -18,7 +18,7 @@ use common::{connect_client, run_local, start_server};
 use kaijutsu_client::{EditorState, PeerConfig, ServerEvent, editor_events_channel};
 
 /// A script the server seeds into rc on a fresh kernel — guaranteed to
-/// exist, so `editorOpen` binds to a real config-owned block.
+/// exist, so `editorOpen` binds to a real block backing an rc host file.
 const RC_PATH: &str = "/config/rc/coder/create/S00-stance.kai";
 
 /// Drain the editor push channel until a `EditorStateChanged` arrives (or fail
@@ -73,7 +73,7 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
         kernel.subscribe_editor(callback).await.unwrap();
 
         // Open a kernel-seeded rc script over the wire. A freshly opened block
-        // is clean and binds to its config-owned kernel block.
+        // is clean and binds to the block backing that host file.
         let opened = kernel.editor_open(RC_PATH).await.unwrap();
         assert!(!opened.dirty, "a freshly opened block must be clean");
         let session = opened.session;

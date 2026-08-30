@@ -402,8 +402,8 @@ impl KjDispatcher {
         let mut scripts = Vec::with_capacity(names.len());
         for name in names {
             let path = paths::rc_script_path(context_type, verb, &name);
-            // Read straight from the kernel-owned rc backend (no FileDocumentCache
-            // mirror). Any read failure on a file we just enumerated is
+            // Read straight through the VFS to the host rc tree (no
+            // FileDocumentCache mirror). Any read failure on a file we just enumerated is
             // corruption — boot WITHOUT the stance is worse than failing loud
             // (stance = the model's ethical posture), so this stays fatal.
             let bytes = match vfs.read_all(std::path::Path::new(&path)).await {

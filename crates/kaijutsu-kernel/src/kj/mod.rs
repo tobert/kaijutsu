@@ -1094,8 +1094,8 @@ pub(crate) mod test_helpers {
     }
 
     /// Install an rc script in the mounted `/config/rc` tree, through the same
-    /// VFS-direct path `kj rc` uses (write straight to the kernel-owned backend,
-    /// no FileDocumentCache mirror).
+    /// VFS-direct path `kj rc` uses (write straight to the mounted host
+    /// backend, no FileDocumentCache mirror).
     pub async fn install_rc_script_file(dispatcher: &KjDispatcher, path: &str, content: &str) {
         use crate::vfs::VfsOps;
         dispatcher

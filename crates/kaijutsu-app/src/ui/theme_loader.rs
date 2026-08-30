@@ -1,9 +1,9 @@
 //! TOML-based theme parser for Kaijutsu.
 //!
-//! The theme arrives over RPC from the kernel's kernel-owned config (see
+//! The theme arrives over RPC from `/config/kernel/theme.toml` (see
 //! `connection/actor_plugin.rs`); this module only parses the TOML payload.
-//! There is no host-side theme file and no disk-load path — the kernel is
-//! the sole owner of theme configuration.
+//! The app has no disk-load path of its own — it reads the file the kernel
+//! reads, over the wire, never straight off the app's own host.
 //!
 //! One payload, two color lanes (docs/color.md): [`parse_theme_data`] yields
 //! the raw `ThemeData`, from which the caller derives both the UI `Theme`

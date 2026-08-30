@@ -294,10 +294,11 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
 async fn mcp_role_holds_config_governance() {
     // The `mcp` context_type is the producer/orchestrator voice (Claude Code
     // over MCP, cheaper than API rates). On top of the shared broad loadout it
-    // adds the config governance cap via S15-governance.kai, so it can
-    // iterate on the kernel's own kernel-owned config-as-code. `/config/rc`
-    // carries no capability of its own — the file:write grant from the
-    // shared loadout (S10 → lib) already reaches it, same as any other file.
+    // adds the config governance cap via S15-governance.kai, so it can drive
+    // the SQL-native model surfaces (`kj backend`/`kj cast`/`kj alias`) and
+    // `kj hook add/remove`/`kj mcp reload`. `/config/rc` and `/config/kernel`
+    // carry no capability of their own — the file:write grant from the
+    // shared loadout (S10 → lib) already reaches them, same as any other file.
     //
     // NB: the broad loadout itself (S10 → lib via the rc composition symlink)
     // is NOT asserted here — this test only checks the config-governance cap
@@ -315,6 +316,6 @@ async fn mcp_role_holds_config_governance() {
     // The governance cap added by S15 — deny-by-default, NOT implied by '*'.
     assert!(
         binding.allows(&Capability::ConfigWrite),
-        "mcp should hold config-write for /config/kernel governance"
+        "mcp should hold config-write for model-config governance"
     );
 }

@@ -166,12 +166,11 @@ per-slice "Build notes" sections below correct it where the build disagreed.
    fragile; ~20 lines, decouples merge semantics from declaration order
    before the new variant lands).
 3. **SHIPPED.** Kernel: `kj diff` + `diff_block`, wire e2e asserting a typed block lands.
-   Source resolution is **ownership-aware from day one** — the
-   `resolve_editor_target` pattern (config-owned docs answer through the
-   mount table; never raw `get_or_load` for a config path, which would mint a
-   shadow document — the exact dual-ownership bug class the June-to-August
-   config melt killed, `docs/devlog.md`, "The kernel becomes sole owner of
-   itself, then gives it back"). Internally a typed source descriptor even while the CLI stays
+   Source resolution reuses the `resolve_editor_target` pattern: every path,
+   `/config` included, resolves through the same `FileDocumentCache` lookup —
+   no separate config branch to keep in sync, since the config melt made
+   `/config` an ordinary mount (`docs/devlog.md`, "The kernel becomes sole
+   owner of itself, then gives it back"). Internally a typed source descriptor even while the CLI stays
    simple. **Hydration is a projection, not a passthrough**: the canonical
    block keeps the full diff; the model-facing envelope gets diffstat +
    whole-hunk-bounded content with an explicit complete/truncated marker

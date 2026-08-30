@@ -1195,24 +1195,20 @@ mod tests {
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
-        // Remove the seeded symlink at the host level, not via `kj rc rm`:
-        // `LocalBackend::unlink` resolves its path through `canonicalize()`,
-        // which follows a *resolvable* symlink to its target before
-        // unlinking — so `rc rm` on a live composed symlink deletes the
-        // shared target file instead of the per-type link (see
-        // docs/issues.md). `std::fs::remove_file` never follows the final
-        // symlink component (POSIX `unlink()`), so it removes the link
-        // itself, matching this test's actual scenario.
-        use crate::vfs::VfsOps as _;
-        let rc_host_root = d
-            .kernel()
-            .vfs()
-            .real_path(std::path::Path::new("/config/rc"))
-            .await
-            .expect("real_path")
-            .expect("rc mount has a host path");
-        std::fs::remove_file(rc_host_root.join("default/create/S20-cache.kai"))
-            .expect("remove the seeded symlink at the host level");
+        // Remove the seeded symlink itself, matching this test's scenario
+        // (`kj rc rm` unlinks the link, not its target — see
+        // `unlink_removes_the_link_not_its_target` in `vfs/backends/local.rs`).
+        let removed = d
+            .dispatch(
+                &[s("rc"), s("rm"), s("/config/rc/default/create/S20-cache.kai")],
+                &c,
+            )
+            .await;
+        assert!(
+            removed.is_ok(),
+            "removing the composed link is this test's premise: {}",
+            removed.message()
+        );
         d.dispatch(
             &[
                 s("rc"),

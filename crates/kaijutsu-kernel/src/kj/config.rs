@@ -191,8 +191,9 @@ impl KjDispatcher {
             .map_err(|e| format!("not valid UTF-8: {e}"))
     }
 
-    /// Write `content` straight through the VFS to the kernel-owned config
-    /// backend. There is no host file and no FileDocumentCache mirror.
+    /// Write `content` straight through the VFS to the host file mounted at
+    /// `canonical`, bypassing the `FileDocumentCache` mirror kaish `cat` and
+    /// the file tools read through — the caller must invalidate that shadow.
     async fn write_config_content(&self, canonical: &str, content: &str) -> Result<(), String> {
         use crate::vfs::VfsOps;
         self.kernel()

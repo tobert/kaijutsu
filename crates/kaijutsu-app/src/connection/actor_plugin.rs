@@ -978,8 +978,9 @@ fn poll_bootstrap_results(
                             }
                         }
 
-                        // 0/0b/0c. Fetch the kernel-owned theme + per-client
-                        // metronome/scroll configs over RPC. Shared with
+                        // 0/0b/0c. Fetch the theme + per-client metronome/scroll
+                        // configs over RPC — the one config read that has no `kj`
+                        // context yet to run through. Shared with
                         // `refetch_config_on_reconnect` — see that fn's doc
                         // comment for why cold start and reconnect must run
                         // the exact same fetch, not two copies of it.

@@ -204,7 +204,7 @@ fn test_kernel_appears_in_list() {
     });
 }
 
-/// get_config reads the kernel-owned config over the wire (client → SSH → capnp →
+/// get_config reads a config host file over the wire (client → SSH → capnp →
 /// rpc.rs → /config/kernel VFS). A fresh kernel seeds the embedded defaults, so
 /// theme.toml comes back non-empty; an unknown file is a loud error, not "".
 #[test]

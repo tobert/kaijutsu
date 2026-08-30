@@ -234,7 +234,7 @@ pub fn is_midi_path(path: &str) -> bool {
     is_or_under(path, MIDI_ROOT)
 }
 
-/// True if `path` is under one of the four `/etc` config-like trees — rc,
+/// True if `path` is under one of the four `/config` trees — rc,
 /// kernel-global config, per-client config, MIDI device profiles. Each keeps
 /// a `FileDocumentCache` shadow behind the kaish `cat`/file-tool read path,
 /// so a writer that changes one of these paths must invalidate that shadow or
@@ -385,7 +385,7 @@ mod tests {
         assert!(!is_config_path(MIDI_ROOT));
     }
 
-    /// `is_config_doc_root` must enumerate exactly the four `/etc` trees that
+    /// `is_config_doc_root` must enumerate exactly the four `/config` trees that
     /// keep a `FileDocumentCache` shadow — one list, one place. A fifth tree
     /// added to one side and not the other is exactly the drift that reverted
     /// an edit under this predicate's predecessor (`docs/file-buffers.md`).

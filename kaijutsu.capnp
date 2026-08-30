@@ -2094,11 +2094,13 @@ interface Kernel {
   replayDeadLetter @55 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
 
   # ==========================================================================
-  # Configuration (config as kernel documents)
+  # Configuration
   # ==========================================================================
 
-  # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are kernel
-  # documents — the kernel is their sole owner, and there is no host file.
+  # Config files (theme.toml, bindings.toml, mcp.toml, etc.) are ordinary host
+  # files under /config, reached through the VFS. This RPC exists for a client
+  # that has no `kj` context yet — bootstrap, before whoami — everything else
+  # reads config the way it reads any other file.
 
   # Get config content
   getConfig @56 (path :Text) -> (content :Text, error :Text);

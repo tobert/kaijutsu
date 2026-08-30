@@ -69,10 +69,12 @@ impl KjDispatcher {
             }
         };
 
-        // `reload` re-reads the kernel-owned mcp.toml and materializes it as
-        // running processes — the same authority tier as being able to edit
-        // that file (`kj config set/reset mcp.toml`), so it's gated on the
-        // same capability rather than a bespoke one. `list` is a read.
+        // `reload` re-reads mcp.toml and materializes it as running
+        // processes — spawning and killing them, not just reading text — so
+        // it carries more authority than the file write that produced the
+        // new content. Gated on `ConfigWrite`, the same capability the
+        // SQL-native model-config verbs use, rather than a bespoke one.
+        // `list` is a read.
         if matches!(parsed.command, McpCommand::Reload {})
             && let Err(denied) = self.require_cap(caller, Capability::ConfigWrite, "mcp reload")
         {

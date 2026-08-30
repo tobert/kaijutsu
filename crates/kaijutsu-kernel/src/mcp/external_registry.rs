@@ -244,8 +244,8 @@ pub async fn reconcile_with_toml(
     report
 }
 
-/// The real entry point: read `/config/kernel/mcp.toml` through the VFS (the
-/// kernel is the sole owner — no host file), then reconcile.
+/// The real entry point: read `/config/kernel/mcp.toml` through the VFS (an
+/// ordinary host file), then reconcile.
 ///
 /// A read or whole-file parse failure falls back to the **embedded
 /// default**, loudly — same shape as `initialize_kernel_models`'s handling

@@ -149,8 +149,9 @@ impl KjDispatcher {
 
         // `add`/`remove` mutate broker-wide hook tables — the same authority
         // tier as `kj mcp reload` (materializing mcp.toml as running
-        // processes) and `kj config set` (kernel-owned config files), so
-        // they're gated on the same capability rather than a bespoke one.
+        // processes) and the SQL-native model verbs (`kj backend`/`cast`/
+        // `alias`), so they're gated on the same capability rather than a
+        // bespoke one.
         // `list`/`show` are reads. This is `kj`'s OWN loadout check
         // (`require_cap`) — a third enforcement surface, independent of and
         // never routing through the broker's `evaluate_phase`, which is the

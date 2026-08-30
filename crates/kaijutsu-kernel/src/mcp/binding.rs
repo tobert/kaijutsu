@@ -159,13 +159,13 @@ pub enum Capability {
     /// and `kj attach`. Operator authority over the durable structure, kept
     /// distinct from `Admin` (which is narrowly loadout-write).
     Operator,
-    /// `kj config set/reset` — may write the kernel-owned config files at
-    /// `/config/kernel` (system.md, theme.toml, mcp.toml) AND the SQL-native model
-    /// config surfaces (`kj backend`/`kj cast`/`kj alias`). Dedicated so a
-    /// broad loadout (e.g. `coder` with "*") can't silently rewrite which
-    /// model runs or the base system prompt. `kj config` writes go straight
-    /// through the VFS (not the gated file tool), so this is enforced in the
-    /// `kj config` dispatcher.
+    /// Gates the SQL-native model surfaces — `kj backend`/`kj cast`/`kj
+    /// alias` set/create/remove verbs — plus `kj hook add/remove` and `kj mcp
+    /// reload`. Dedicated so a broad loadout (e.g. `coder` with "*") can't
+    /// silently rewrite which model runs. Does **not** gate `/config/kernel`
+    /// file writes: those are ordinary host files, reachable by anyone who
+    /// holds `builtin.file:write`, and `kj config reset` is deliberately
+    /// ungated for the same reason (`kj/config.rs`).
     ConfigWrite,
     /// May spawn host subprocesses from the context shell (kaish external
     /// commands). Enforced at kaish materialization, not per-call: a context
@@ -182,12 +182,12 @@ pub enum Capability {
     /// like `read_input`.
     ///
     /// Deliberately its own authority, not a reuse of `Tool{builtin.file,
-    /// edit}`: the editor also writes rc/config documents
-    /// (`resolve_editor_target`'s config-owned branch,
-    /// `crates/kaijutsu-kernel/src/editor.rs`) that never pass through the
-    /// `builtin.file` tool at all, so gating on that tool would leave rc/
-    /// config writes through the editor ungated regardless. Like every
-    /// authority, not implied by `*`.
+    /// edit}`: the editor writes through `resolve_editor_target`
+    /// (`crates/kaijutsu-kernel/src/editor.rs`), which never passes through
+    /// the `builtin.file` tool at all — including for rc/config paths, which
+    /// resolve the same way as any other path since the config melt — so
+    /// gating on that tool would leave every editor write ungated regardless.
+    /// Like every authority, not implied by `*`.
     ///
     /// Added 2026-08-20 (Amy) as a first cut, not a settled name: `kj swap
     /// ack`/`discard` gated on the file-edit tool capability the same
