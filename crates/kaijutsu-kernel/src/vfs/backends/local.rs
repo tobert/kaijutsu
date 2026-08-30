@@ -218,6 +218,28 @@ impl LocalBackend {
         Ok(resolved)
     }
 
+    /// Refuse an operation aimed at the mount root itself.
+    ///
+    /// `rmdir("")`, `rmdir("/")` and `rmdir(".")` all resolve to the root, and
+    /// an empty root would then be removed — taking the mount with it.
+    /// `MemoryBackend` has always refused this; one helper, used by every
+    /// operation that removes or moves a name, keeps the two backends from
+    /// disagreeing again.
+    ///
+    /// A path is the root when it names no ordinary component: `..` alone is
+    /// already refused by [`Self::reject_lexical_escape`].
+    fn refuse_mount_root(path: &Path) -> VfsResult<()> {
+        let path = path.strip_prefix("/").unwrap_or(path);
+        let names_something = path
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)));
+        if names_something {
+            Ok(())
+        } else {
+            Err(VfsError::permission_denied("cannot remove the mount root"))
+        }
+    }
+
     /// Check if write operations are allowed.
     fn check_writable(&self) -> VfsResult<()> {
         if self.read_only {
@@ -267,8 +289,15 @@ impl LocalBackend {
 
 #[async_trait]
 impl VfsOps for LocalBackend {
+    /// `lstat`, not `stat`: a symlink reports as a symlink, whether or not it
+    /// resolves. Resolving with [`Self::resolve`] first would follow the final
+    /// component, leaving `symlink_metadata` to describe the *target* — so a
+    /// working link came back as its target's type and only a dangling one
+    /// came back as a link. Callers dispatch on `is_dir()`, so that split
+    /// decided whether a directory link was removed as a link or as a
+    /// directory.
     async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
-        let full_path = self.resolve(path).await?;
+        let full_path = self.resolve_nofollow(path).await?;
         let meta = fs::symlink_metadata(&full_path)
             .await
             .map_err(VfsError::from)?;
@@ -329,31 +358,13 @@ impl VfsOps for LocalBackend {
         fs::read(&full_path).await.map_err(VfsError::from)
     }
 
+    /// Reads the link itself, so the final component is never followed — and
+    /// containment covers the whole path, not just a literal `..` in its
+    /// text. The hand-rolled check this replaces only ran when the path
+    /// *spelled* a `..`, so an intermediate link pointing outside the mount
+    /// carried the read out of it with no `..` and no race.
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
-        // Don't use resolve() here - it follows symlinks via canonicalize()
-        // Instead, just join and do a simpler security check
-        let path = path.strip_prefix("/").unwrap_or(path);
-        let full_path = self.root.join(path);
-
-        // Security check: ensure path doesn't escape root via components
-        for component in path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                // Could escape - do a more thorough check
-                let canonical_root = self
-                    .root
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.root.clone());
-                let parent = full_path.parent().unwrap_or(&full_path);
-                if parent.exists() {
-                    let canonical_parent = parent.canonicalize().map_err(VfsError::from)?;
-                    if !canonical_parent.starts_with(&canonical_root) {
-                        return Err(VfsError::path_escapes_root(path.display().to_string()));
-                    }
-                }
-                break;
-            }
-        }
-
+        let full_path = self.resolve_nofollow(path).await?;
         fs::read_link(&full_path).await.map_err(VfsError::from)
     }
 
@@ -419,22 +430,42 @@ impl VfsOps for LocalBackend {
 
     async fn unlink(&self, path: &Path) -> VfsResult<()> {
         self.check_writable()?;
+        Self::refuse_mount_root(path)?;
         // NOT `resolve()` — it canonicalizes the final component, so deleting a
         // symlink would delete what it points at.
         let full_path = self.resolve_nofollow(path).await?;
         fs::remove_file(&full_path).await.map_err(VfsError::from)
     }
 
+    /// Removes the directory named, never what a link points at. `resolve`
+    /// would canonicalize a directory link to its target and remove that,
+    /// leaving the link behind; on the composed rc tree removing one context
+    /// type's link would take the directory every other type shares. A
+    /// `rmdir` aimed at a symlink fails (`ENOTDIR`), which is the POSIX
+    /// answer — remove the link with `unlink`.
     async fn rmdir(&self, path: &Path) -> VfsResult<()> {
         self.check_writable()?;
-        let full_path = self.resolve(path).await?;
+        Self::refuse_mount_root(path)?;
+        let full_path = self.resolve_nofollow(path).await?;
         fs::remove_dir(&full_path).await.map_err(VfsError::from)
     }
 
+    /// Moves the names given, never what they point at. `resolve` would
+    /// canonicalize both ends, so renaming a symlink moved its *target* and
+    /// left the link behind — the same defect `unlink`, `rmdir` and
+    /// `getattr` carried, in the operation that also has a destination.
+    ///
+    /// There is deliberately no identity fast-path. `fs::rename` on one name
+    /// spelled two ways is already a POSIX no-op that keeps the file; a guard
+    /// that compared the two spellings itself would have to fold `..` exactly
+    /// as the kernel does, and one that drops those components instead turns
+    /// a self-rename into a destination-clearing move.
     async fn rename(&self, from: &Path, to: &Path) -> VfsResult<()> {
         self.check_writable()?;
-        let from_path = self.resolve(from).await?;
-        let to_path = self.resolve(to).await?;
+        Self::refuse_mount_root(from)?;
+        Self::refuse_mount_root(to)?;
+        let from_path = self.resolve_nofollow(from).await?;
+        let to_path = self.resolve_nofollow(to).await?;
 
         // Ensure parent of destination exists
         if let Some(parent) = to_path.parent() {
@@ -516,9 +547,12 @@ impl VfsOps for LocalBackend {
         self.getattr(path).await
     }
 
+    /// `path` is the link to create, `target` is the text it will hold.
+    /// Resolved without following the final component: the name being created
+    /// is a name, not something to chase.
     async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
         self.check_writable()?;
-        let full_path = self.resolve(path).await?;
+        let full_path = self.resolve_nofollow(path).await?;
 
         // Ensure parent directory exists
         if let Some(parent) = full_path.parent() {
@@ -1069,5 +1103,201 @@ mod tests {
             .unwrap();
         let data = backend.read(Path::new("root.txt"), 0, 100).await.unwrap();
         assert_eq!(data, b"root");
+    }
+
+    // ── The symlink/containment family ──────────────────────────────────
+    //
+    // These mirror the rows `kaish_vfs::conformance` pins for the same
+    // resolver shape, which both trees shipped from a common ancestor. The
+    // policy each operation follows is stated on the operation itself; see
+    // `docs/config-namespace.md` for why the composed rc tree makes the
+    // follow/no-follow split load-bearing rather than academic.
+
+    /// `rmdir` on the mount root removes the mount itself when it happens to
+    /// be empty. `MemoryBackend` refuses this explicitly, so the two backends
+    /// disagreed; this pins the refusal on both spellings of "the root".
+    #[tokio::test]
+    async fn rmdir_refuses_the_mount_root() {
+        let (backend, dir) = setup().await;
+
+        for spelling in ["", "/", ".", "/."] {
+            let r = backend.rmdir(Path::new(spelling)).await;
+            assert!(
+                r.is_err(),
+                "rmdir({spelling:?}) must refuse the mount root, got {r:?}"
+            );
+        }
+        assert!(dir.path().exists(), "the mount root must survive");
+    }
+
+    /// Same rule for `unlink`: the root is not a name this backend will
+    /// remove, whatever it is spelled as.
+    #[tokio::test]
+    async fn unlink_refuses_the_mount_root() {
+        let (backend, dir) = setup().await;
+
+        for spelling in ["", "/", "."] {
+            assert!(
+                backend.unlink(Path::new(spelling)).await.is_err(),
+                "unlink({spelling:?}) must refuse the mount root"
+            );
+        }
+        assert!(dir.path().exists(), "the mount root must survive");
+    }
+
+    /// `getattr` is `lstat`, not `stat`. It reads `symlink_metadata`, but it
+    /// used to resolve the path *following* the final component first — so a
+    /// working link reported its target's type and only a dangling link came
+    /// back as a symlink. That split is what let a directory link be removed
+    /// as a directory.
+    #[tokio::test]
+    async fn getattr_reports_a_working_symlink_as_a_symlink() {
+        let (backend, _dir) = setup().await;
+        backend.mkdir(Path::new("realdir"), 0o755).await.unwrap();
+        backend.create(Path::new("realfile"), 0o644).await.unwrap();
+        backend.symlink(Path::new("dirlink"), Path::new("realdir")).await.unwrap();
+        backend.symlink(Path::new("filelink"), Path::new("realfile")).await.unwrap();
+
+        let dl = backend.getattr(Path::new("dirlink")).await.unwrap();
+        assert_eq!(dl.kind, FileType::Symlink, "a working directory link is a symlink, not a directory");
+        assert!(!dl.is_dir(), "is_dir() decides remove's dispatch — it must not say directory here");
+
+        let fl = backend.getattr(Path::new("filelink")).await.unwrap();
+        assert_eq!(fl.kind, FileType::Symlink, "a working file link is a symlink");
+
+        // The targets themselves still report their own types.
+        assert!(backend.getattr(Path::new("realdir")).await.unwrap().is_dir());
+        assert_eq!(backend.getattr(Path::new("realfile")).await.unwrap().kind, FileType::File);
+    }
+
+    /// `rmdir` acts on the name it is given. Through a directory link it used
+    /// to canonicalize to the target and remove *that*, leaving the link
+    /// dangling — on the composed rc tree, removing one context type's link
+    /// would take the shared directory every other type points at.
+    #[tokio::test]
+    async fn rmdir_through_a_directory_symlink_spares_the_target() {
+        let (backend, _dir) = setup().await;
+        backend.mkdir(Path::new("target"), 0o755).await.unwrap();
+        backend.symlink(Path::new("link"), Path::new("target")).await.unwrap();
+
+        // POSIX: rmdir on a symlink is ENOTDIR. Either way the target lives.
+        let r = backend.rmdir(Path::new("link")).await;
+        assert!(r.is_err(), "rmdir on a symlink must not succeed, got {r:?}");
+        assert!(
+            backend.getattr(Path::new("target")).await.unwrap().is_dir(),
+            "the target directory must survive an rmdir aimed at the link"
+        );
+        assert_eq!(
+            backend.getattr(Path::new("link")).await.unwrap().kind,
+            FileType::Symlink,
+            "and the link must survive too"
+        );
+    }
+
+    /// `readlink` joined the raw path and checked only for a literal `..`,
+    /// so an *intermediate* symlink pointing outside the root carried the
+    /// read straight out of the mount. No race and no `..` required.
+    #[tokio::test]
+    async fn readlink_refuses_a_path_that_leaves_the_root_through_an_intermediate_link() {
+        let (backend, _dir) = setup().await;
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("/secret", outside.path().join("host-link")).unwrap();
+
+        // An in-root name pointing at a directory outside the mount.
+        std::os::unix::fs::symlink(outside.path(), _dir.path().join("out")).unwrap();
+
+        let r = backend.readlink(Path::new("out/host-link")).await;
+        assert!(
+            r.is_err(),
+            "readlink must not follow an intermediate link out of the mount, got {r:?}"
+        );
+    }
+
+    /// The in-root case still works — containment is the rule, not a blanket
+    /// refusal of links.
+    #[tokio::test]
+    async fn readlink_reads_an_in_root_link() {
+        let (backend, _dir) = setup().await;
+        backend.create(Path::new("target.txt"), 0o644).await.unwrap();
+        backend.mkdir(Path::new("sub"), 0o755).await.unwrap();
+        backend.symlink(Path::new("sub/link"), Path::new("../target.txt")).await.unwrap();
+
+        assert_eq!(
+            backend.readlink(Path::new("sub/link")).await.unwrap(),
+            Path::new("../target.txt"),
+            "readlink returns the link's own target text"
+        );
+    }
+
+    /// Renaming a name onto itself keeps the file. Trivially true here
+    /// because there is no identity fast-path to get wrong — pinned so that
+    /// adding one has to keep it true.
+    #[tokio::test]
+    async fn rename_to_itself_keeps_the_file() {
+        let (backend, _dir) = setup().await;
+        backend.mkdir(Path::new("d"), 0o755).await.unwrap();
+        backend.create(Path::new("d/file"), 0o644).await.unwrap();
+        backend.write(Path::new("d/file"), 0, b"keep me").await.unwrap();
+
+        backend.rename(Path::new("d/file"), Path::new("d/file")).await.unwrap();
+
+        assert_eq!(backend.read_all(Path::new("d/file")).await.unwrap(), b"keep me");
+    }
+
+    /// The same rename spelled with a `..` that folds back to the same file.
+    /// An identity guard that *drops* `..` instead of folding it reads this
+    /// as a move between two different names and clears the destination —
+    /// which is the source.
+    #[tokio::test]
+    async fn rename_to_itself_spelled_with_dotdot_keeps_the_file() {
+        let (backend, _dir) = setup().await;
+        backend.mkdir(Path::new("d"), 0o755).await.unwrap();
+        backend.create(Path::new("d/file"), 0o644).await.unwrap();
+        backend.write(Path::new("d/file"), 0, b"keep me").await.unwrap();
+
+        backend.rename(Path::new("d/../d/file"), Path::new("d/file")).await.unwrap();
+
+        assert_eq!(
+            backend.read_all(Path::new("d/file")).await.unwrap(),
+            b"keep me",
+            "a self-rename spelled with .. must not clear the file"
+        );
+    }
+
+    /// `rename` moves the link, not the file the link points at.
+    #[tokio::test]
+    async fn rename_moves_the_link_not_its_target() {
+        let (backend, _dir) = setup().await;
+        backend.create(Path::new("target.txt"), 0o644).await.unwrap();
+        backend.write(Path::new("target.txt"), 0, b"target body").await.unwrap();
+        backend.symlink(Path::new("link"), Path::new("target.txt")).await.unwrap();
+
+        backend.rename(Path::new("link"), Path::new("moved")).await.unwrap();
+
+        assert_eq!(
+            backend.getattr(Path::new("moved")).await.unwrap().kind,
+            FileType::Symlink,
+            "the link moved"
+        );
+        assert_eq!(
+            backend.read_all(Path::new("target.txt")).await.unwrap(),
+            b"target body",
+            "the target stayed where it was"
+        );
+        assert!(
+            backend.getattr(Path::new("link")).await.is_err(),
+            "the old link name is gone"
+        );
+    }
+
+    /// Neither end of a rename may be the mount root.
+    #[tokio::test]
+    async fn rename_refuses_the_root() {
+        let (backend, _dir) = setup().await;
+        backend.create(Path::new("f"), 0o644).await.unwrap();
+
+        assert!(backend.rename(Path::new(""), Path::new("f")).await.is_err());
+        assert!(backend.rename(Path::new("f"), Path::new("/")).await.is_err());
+        assert!(backend.rename(Path::new("f"), Path::new(".")).await.is_err());
     }
 }
