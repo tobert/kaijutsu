@@ -19,8 +19,8 @@
 #
 # `kj mcp reload` re-reads this file and reconciles it against what's
 # actually running; `kj mcp list` shows configured-vs-running with health.
-# Editing this file (`kj config set/edit mcp.toml`) has no live effect on its
-# own — run `kj mcp reload` afterward.
+# Editing this file has no live effect on its own — run `kj mcp reload`
+# afterward.
 #
 # ── This file ships EMPTY, on purpose (2026-08-15) ──────────────────────────
 #
@@ -38,9 +38,9 @@
 # YOUR kernel. Existing kernels are unaffected — this file is seeded once, so
 # their configured servers stay exactly as they are.
 #
-# Add one with:
-#
-#   kj config edit mcp.toml     # then `kj mcp reload`
+# Add one by editing this file. It is an ordinary host file under
+# /config/kernel (docs/config-namespace.md), so the file tools, `kj editor`,
+# vim and git all reach it. Then run `kj mcp reload`.
 #
 # The two we actually run on moltar, for reference:
 #

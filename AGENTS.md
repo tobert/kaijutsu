@@ -34,9 +34,9 @@ regularly, so treat the host rc tree as a materialization of the seed rather
 than a place to accumulate hand edits. A reseed **names** every file it
 leaves alone that differs from its default, so a tree pointed somewhere
 unexpected says so. `kj config` keeps only what has no file-tool equivalent:
-`list`, `show`, `reset` (restore the embedded default) and `export` (write the
-trees out to a host directory). Unlike rc, `/config/kernel` is local,
-snowflake, and points at secrets — never reseed over it.
+`list`, `show` and `reset` (restore the embedded default). Unlike rc,
+`/config/kernel` is local, snowflake, and points at secrets — never reseed
+over it.
 
 **Single kernel ownership is the invariant**, whatever the storage: config
 must never have two competing sources of truth.
@@ -180,7 +180,7 @@ beat/clock/cue code with that section open.
 
 **Conversation** is the live session: an append-only message sequence shipped to the LLM. Hydrated from context once at boundary events (fork, new, cold start, attach) and append-only thereafter.
 
-`block exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) reach the next turn through a per-context mailbox, which is a **pull-based cursor over the durable block log**, not a queue: a background writer inserts into the block store and the mailbox discovers the delta on the next turn's `catch_up`. **There is no insert-time atomicity gate**, so an unrelated writer can still land a block between a tool_use and its tool_result; what exists is repair at `snapshot()` time, which fixes the conversation shape and leaves the durable blocks interleaved. The gate is a named follow-up — `docs/conversation-session.md`, "Out of scope for Slice A".
+`stage exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) reach the next turn through a per-context mailbox, which is a **pull-based cursor over the durable block log**, not a queue: a background writer inserts into the block store and the mailbox discovers the delta on the next turn's `catch_up`. **There is no insert-time atomicity gate**, so an unrelated writer can still land a block between a tool_use and its tool_result; what exists is repair at `snapshot()` time, which fixes the conversation shape and leaves the durable blocks interleaved. The gate is a named follow-up — `docs/conversation-session.md`, "Out of scope for Slice A".
 
 ## Machines
 
@@ -364,10 +364,10 @@ Teach syntax with examples. Repeat a rule in the error that enforces it.
 Show the correct example before explaining it. Make the example carry the rule
 by itself, so the explanation is confirmation rather than the only source.
 
-> Before: **Exclude, then fork.** `block exclude` operates on the context and
+> Before: **Exclude, then fork.** `stage exclude` operates on the context and
 > only takes effect at the next hydrate boundary.
 >
-> After: `kj block exclude <id> && kj fork` — exclusion lands at the next
+> After: `kj stage exclude <id> && kj fork` — exclusion lands at the next
 > hydrate boundary, and fork is the boundary you can reach on demand.
 
 Avoid incorrect examples. When one is necessary, put the correct form first and
