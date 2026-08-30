@@ -6,62 +6,36 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## An allowed ask was not redeemed on retry, and a second ask was minted (2026-08-29)
+## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
 
-Reproduced on zorak against the live kernel, immediately after the
-`approval_events.kind` CHECK fix (`362661d7`) made redemption possible at all.
+The 08-29 entry claimed an allowed ask was not redeemed on retry and that a
+second ask was minted instead. **Both asks carry redemption stamps, and their
+principals are identical**, which kills the leading hypothesis (a per-connection
+principal moving across the kernel restart) outright.
 
-1. `kj ledger rc 2>&1 | head -14` → `lfm2d-advisory` escalates, ask
-   `01a04eaa-6a9c-79a1-be4d-d58cbd28384a` is raised, nothing runs.
-2. A peer session allows it. `kj ledger show` reads `allowed`, `allow_once`.
-3. The **exact same command** is re-run. Instead of redeeming, the gate mints
-   `01a04eb6-fb75-78e0-a8ed-55ee43a02fff` — same statement text, same
-   `context_id`, same `authorized_label`, same `origin: hook`, same
-   `hook_id`.
-
-So `find_redeemable` (`ask.rs:807`) did not match an allowed, unredeemed ask
-that looks identical on every field `kj ledger show` prints.
-
-**Ruled out by reading:** the digest. `statement_digest` (`kj/gate.rs:249`) is
-`format!("hook:v1:{rendered}")` — no hash, no nonce, deterministic in the
-rendered text, and both asks print the same `statement:` line. The candidate
-query's other filters (`authorized_label`, `context_id`) are equal, and the
-ask was not in `approval_redemptions` (it would not have read `allowed` and
-unspent otherwise).
-
-**The one field that is not observable from any `kj` verb is
-`principal_id`,** and it is the leading suspect precisely because it is the
-one that cannot be checked. `find_redeemable` filters on it, and
-`UndeliveredAnswer::principal_id`'s own doc says a caller "woken under a
-different one mints a fresh ask instead of collecting this answer" — which is
-the observed behavior exactly. The MCP session reconnected across the kernel
-restart, so a per-connection principal would produce this.
-
-**Do not assume the CHECK fix is what is being tested here.** That fix is
-correct and mutation-verified at the unit level, and the migration ran clean.
-What has *not* been demonstrated is a redemption on the live kernel. An
-earlier apparent success — a retried `kj context create` reaching clap — is
-not evidence: `lfm2d` had scored it `situation-normal 0.718, verdict
-escalate`, a borderline call that can flip to allow on a second run, which
-explains the observation without any redemption occurring.
-
-**The diagnostic surface now exists — the bug does not have an answer yet.**
-`kj ledger show` prints `context:`, `principal:` and, for a decided ask,
-`redeemed:` (a stamp, or `no — this answer is still redeemable`); `.data`
-gains `principal_id` and `redeemed_at`. `approval_ledger::ask::redeemed_at`
-is the read side of `approval_redemptions`, which had none.
-
-**What to run next, on the live kernel, and it needs no gate budget:**
-
-```sh
-kj ledger show 01a04eaa-6a9c-79a1-be4d-d58cbd28384a   # the allowed original
-kj ledger show 01a04eb6-fb75-78e0-a8ed-55ee43a02fff   # the pending duplicate it minted
+```
+01a04eaa  redeemed 2026-08-29 13:58:31   principal 019c86a7-...-d66a45d6b370
+01a04eb6  redeemed 2026-08-30 06:15:52   principal 019c86a7-...-d66a45d6b370
 ```
 
-Two decided-and-unspent asks and one pending one are being kept as evidence.
-Compare `principal:` across the pair. Equal principals eliminate the leading
-hypothesis and force the next one; different principals confirm it, and the
-question becomes why the MCP session's principal moved across a restart.
+The original was redeemed four minutes after the fixed kernel came up. The
+second ask was then minted **correctly**: `allow_once` authorizes exactly once,
+so a third invocation after the answer was spent has no redeemable answer and
+must raise a fresh one. That is the documented contract, and the gate honored
+it the whole time.
+
+**What actually went wrong was observability, not the gate.** The `redeemed:`
+field did not exist on 08-29 — `approval_ledger::ask::redeemed_at` was the read
+side `approval_redemptions` never had, and it shipped in `cccd4afa` *after* the
+observation. Without it, "the same command raised a new ask" is
+indistinguishable from "the answer was never consumed", and we filed the wrong
+one as a P1.
+
+So `362661d7` (dropping the value-enum CHECK) is confirmed correct and
+sufficient end to end on a live kernel. The lesson worth keeping is the one
+that cost two days: **a state machine whose transitions are invisible will be
+diagnosed from its symptoms, and the diagnosis will be wrong.** The fix was to
+ship the read side, and it paid for itself the first time it was queried.
 
 ## The rc half of `invalidate_config_file_cache` may be dead weight (2026-08-29)
 
