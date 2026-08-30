@@ -169,7 +169,9 @@ per-slice "Build notes" sections below correct it where the build disagreed.
    Source resolution is **ownership-aware from day one** — the
    `resolve_editor_target` pattern (config-owned docs answer through the
    mount table; never raw `get_or_load` for a config path, which would mint a
-   shadow document — the exact bug class `docs/config-ownership.md` killed). Internally a typed source descriptor even while the CLI stays
+   shadow document — the exact dual-ownership bug class the June-to-August
+   config melt killed, `docs/devlog.md`, "The kernel becomes sole owner of
+   itself, then gives it back"). Internally a typed source descriptor even while the CLI stays
    simple. **Hydration is a projection, not a passthrough**: the canonical
    block keeps the full diff; the model-facing envelope gets diffstat +
    whole-hunk-bounded content with an explicit complete/truncated marker

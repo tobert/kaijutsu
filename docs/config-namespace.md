@@ -2,9 +2,10 @@
 
 **Status: built 2026-08-29.** The registry, the namespace move and the melt
 of all four trees have landed; `ConfigDocFs` deletion and the `DocKind::Symlink`
-retirement follow. This supersedes
-`docs/config-ownership.md`, whose premise — the kernel is the sole owner and
-there is no host file — stops being true when this lands. It continues
+retirement follow. This supersedes the earlier kernel-owned-config design, whose premise — the
+kernel is the sole owner and there is no host file — stops being true when
+this lands (that design's history is in `docs/devlog.md`, "The kernel
+becomes sole owner of itself, then gives it back"). It continues
 `docs/rc-on-disk.md`, which melted rc and left the other three roots.
 
 ## The rule

@@ -180,7 +180,7 @@ context on the LLM registry's row-stamped default, unchanged from before.
 Identity is ergonomic routing and presence, not a security boundary.
 
 Not done: nothing writes `/config/client/<id>/cast.toml` for an operator yet —
-it is a plain file (docs/config-ownership.md's "just write the file" rule),
+it is a plain file (config is host files now, `docs/config-namespace.md`),
 so today that means `kj editor` or the file tools, by hand, per client.
 Client-identity-driven **presets** (system prompt + consent mode alongside
 the cast) are also not built — `kj context set` has no `--preset` flag, only

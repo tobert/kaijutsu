@@ -386,11 +386,13 @@ the checklist above:
   ("builtin.shell"))`) — collateral of the `ShellServer::INSTANCE` identity
   swap, not a regression in the rename's own logic.
 - **Every rc-owning `S10-binding.kai` is a document in the live kernel, not
-  just a file in this repo.** Editing `assets/defaults/rc/**` reseeds a
-  *fresh* kernel only (`docs/config-ownership.md`); a running kernel's
-  `director`/`toolie` rc scripts keep the pre-rename grant text until an
-  operator restores both `S10-binding.kai` scripts by hand (a file write, or
-  `kaijutsu-server rc reseed --force`).
+  just a file in this repo.** (Predates rc melting onto disk;
+  `docs/rc-on-disk.md` is canonical for how rc is stored today, but the
+  reseed behavior below still holds.) Editing `assets/defaults/rc/**` reseeds
+  a *fresh* kernel only; a running kernel's `director`/`toolie` rc scripts
+  keep the pre-rename grant text until an operator restores both
+  `S10-binding.kai` scripts by hand (a file write, or `kaijutsu-server rc
+  reseed --force`).
 
 ## The crux: the plan API is all-or-nothing per statement, and that's real
 

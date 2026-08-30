@@ -84,8 +84,23 @@ the kernel became the sole owner of `/etc/rc` and `/etc/config`, seeded once fro
 embedded defaults under `assets/defaults/`, with no host file and no
 write-through. There is nothing to `vim`; `kj rc edit` / `kj config set` are
 the surfaces, and `kj rc reset` restores an embedded default. The bespoke
-debounced-flush/watcher backend was deleted rather than fixed. Design:
-`docs/config-ownership.md`.
+debounced-flush/watcher backend was deleted rather than fixed. It bought real
+things — the corruption class above stopped being reachable — at a real cost:
+nothing on disk for git or an editor's remote-FS plugin to see, and a growing
+list of surfaces (SFTP, the file tools, the vi editor) that had to special-case
+config paths to reach a block instead of a file.
+
+That ownership did not survive the summer. **Permission to get simpler**
+(Amy, August 15): *"if the agent can see the files and edit them, that's fine,
+we don't need to complicate it just because it's config."* rc melted back onto
+disk first (`docs/rc-on-disk.md`, ruled August 21), then the other three roots
+followed it under one mount registry — `/config/rc`, `/config/kernel`,
+`/config/client`, `/config/midi`, each an ordinary host directory reached
+through `LocalBackend`, seeded once when empty and never again
+(`docs/config-namespace.md`, `be9244c1`). The dual-ownership bug the June
+decision fixed does not reopen: git stays a choice about a directory, never a
+mechanism the kernel runs, so there is still exactly one place the content
+lives.
 
 The same weeks put teeth in the fail-loud posture:
 

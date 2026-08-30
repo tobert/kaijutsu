@@ -5,8 +5,9 @@
 > compiled out three layers deep. **Slice 1 (subprocess enablement) shipped
 > the same day** — see "Slice 1" below. The rest is direction, not
 > commitment; code is truth. Companions: `docs/instrument-design.md` (the
-> shared-trust doctrine this leans on), `docs/config-ownership.md`
-> (the kernel-owned mounts that stay untouched by all of this), and the kaish-side
+> shared-trust doctrine this leans on), `docs/config-namespace.md`
+> (the config mount registry, since melted onto host directories under
+> `/config`), and the kaish-side
 > mounts rework in flight for the next kaish release (`/dev` kernel-owned in
 > the `with_backend` path — fixes `> /dev/null` under our read-only root).
 

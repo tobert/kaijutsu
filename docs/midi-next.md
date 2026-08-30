@@ -10,7 +10,8 @@
 > Companions: `docs/midi.md` (transport/clock/realtime doctrine — settled
 > direction), `docs/tracks.md` (the substrate), `docs/chameleon.md` (the
 > music application; its "per-track MIDI channel" open item is what slice 2
-> pays for), `docs/config-ownership.md` (the storage + rc precedent).
+> pays for), `docs/config-namespace.md` (the storage precedent; `docs/rc-on-disk.md`
+> for rc specifically).
 
 ## The problem
 
@@ -173,10 +174,10 @@ tweaks. Side channel now, promotable later.
 
 ## Storage and identity
 
-- **`/config/midi/devices/<name>`** — kernel-owned per
-  `docs/config-ownership.md`: kernel sole owner, edited via `kj` (a
-  `kj midi` verb family), no host files. Optional embedded seeds for gear we
-  ship knowledge of.
+- **`/config/midi/devices/<name>`** — a host file reached through
+  `LocalBackend` (`docs/config-namespace.md`), edited via `kj` (a `kj midi`
+  verb family) or directly. Optional embedded seeds for gear we ship
+  knowledge of.
 - **Identity**: the universal **MIDI Identity Request** (`F0 7E 7F 06 01 F7`)
   fingerprints nearly any device (manufacturer/model/firmware) — build first;
   tiny and vendor-neutral. Profiles carry the fingerprint plus

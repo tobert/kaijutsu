@@ -160,10 +160,13 @@ content is outside" — fits panels-as-screens cleanly but is undecided.
 ## Ownership zones and object states
 
 - **Zones follow the mount table** (`docs/mounts.md`,
-  `docs/config-ownership.md`). The pre-world reading — kernel-owned
+  `docs/config-namespace.md`). The pre-world reading — kernel-owned
   regions warm amber, read-only regions cool cyan behind glass
   (`read_only_shell` made visible) — predates the magenta-violet-at-rest
-  decision. Proposed reconciliation, to test in a future wave: at-rest
+  decision, and predates the config melt too: "kernel-owned" is no longer a
+  storage fact for any config tree, so a future pass over this reading
+  should read it as a zone identity (the mount registry's roots), not a
+  backend fact. Proposed reconciliation, to test in a future wave: at-rest
   joint hue stays magenta-violet everywhere; *zone identity tints the
   boundary/glass treatment* (read-only = cool glass, kernel-owned = warm seam
   accents); activity always warms toward gold. Not yet decided.

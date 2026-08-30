@@ -13,8 +13,9 @@ is the direction; that file is why.** Claims here cite code and are meant to
 be re-verified by grepping next to them.
 
 Related: [`crdt-position-2026-08.md`](crdt-position-2026-08.md) (the DTE
-doctrine this sits under), [`config-ownership.md`](config-ownership.md)
-(the ownership pattern deliberately *not* used here),
+doctrine this sits under), [`devlog.md`](devlog.md) — "The kernel becomes
+sole owner of itself, then gives it back" (the kernel-ownership pattern
+deliberately *not* used here, and why it was later given up anyway),
 [`issues.md`](issues.md) (open work).
 
 ---

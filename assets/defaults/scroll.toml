@@ -1,5 +1,6 @@
 # Mouse-wheel scroll sensitivity — the app's scroll feel.
-# (docs/config-ownership.md "Per-client config".)
+# (docs/config-namespace.md for the mount registry and namespace this
+# cascade lives under.)
 #
 # This is the shared client default (/config/client/default/scroll.toml). A specific
 # client overrides it at /config/client/<client-id>/scroll.toml; the app reads

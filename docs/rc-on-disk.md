@@ -1,11 +1,11 @@
 # Config on disk — melting the kernel-owned trees to real files
 
-**Status: slices 1, 2, 3 and 5 shipped; slice 4 open (2026-08-29).** Amy
-ruled the shape on 2026-08-21. Production mounts `/etc/rc` from a host
-directory, `rc-write` is deleted, `kj rc` is down to `add`/`list`/`rm`/`show`,
-and hook bodies are path references read at fire time. `/etc/config`,
-`/etc/client` and `/etc/midi` are still documents, so
-`docs/config-ownership.md` still describes those three.
+**Status: slices 1, 2, 3 and 5 shipped; slice 4 open.** Amy ruled the shape
+on 2026-08-21. Production mounts `/config/rc` from a host directory,
+`rc-write` is deleted, `kj rc` is down to `add`/`list`/`rm`/`show`, and hook
+bodies are path references read at fire time. `docs/config-namespace.md`
+is canonical for `/config/kernel`, `/config/client` and `/config/midi`, and
+for the mount registry all four roots live under.
 
 **Reseeding is routine, not a rescue** (Amy, 2026-08-29): *"my rc is in the
 code ... for the foreseeable future, we will reseed regularly."* So the host
@@ -15,11 +15,11 @@ tree is a materialization of the in-repo seed, and `kaijutsu-server rc reseed
 over — which is one more reason the four roots do not all melt the same way.
 
 **Amy ruled the git question on 2026-08-28: plain files, the kernel never
-runs git.** `crates/kaijutsu-configgit` — Lane B's write half in
-`docs/config-ownership.md`, built and never wired — is retired rather than
-left on the shelf. Git stays a choice about a directory (ours is shared from
-`~/.config` through a local gitea), never a mechanism the kernel performs.
-That closes the "unresolved" note in `config-ownership.md`.
+runs git.** `crates/kaijutsu-configgit` — the git-worktree write seam, built
+and never wired — is retired rather than left on the shelf. Git stays a
+choice about a directory (ours is shared from `~/.config` through a local
+gitea), never a mechanism the kernel performs. That closes the question the
+earlier kernel-owned design had left open.
 
     ~/.config/kaijutsu/etc/rc/coder/create/S00-stance.kai
 

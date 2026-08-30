@@ -265,8 +265,8 @@ retroactively).
 | `KernelDb` | SQLite (WAL) | Contexts, edges, presets, workspaces, document registry, the **oplog + snapshots**, input-doc oplog, per-context shell cwd/env, tool bindings, hooks, cache breakpoints, hydration markers. |
 | Block documents | in-memory + oplog | Live block stores; cold start = latest snapshot + oplog replay. |
 | CAS (`FileStore`) | sharded files | Content-addressed blobs (BLAKE3-truncated 128-bit hash), images, large bodies. |
-| Config | kernel documents | `theme.toml`, `mcp.toml`, `system.md`. The kernel is the sole owner and there is no host file (`docs/config-ownership.md`). Model config is NOT here — it lives in kernel-db tables (`kj backend/cast/alias`). |
-| rc scripts | kernel documents | `/config/rc/...` lifecycle scripts, seeded once from embedded defaults. There is no host file to edit. |
+| Config | host directories | `theme.toml`, `mcp.toml`, `system.md` under `/config/kernel`, plus `/config/client` and `/config/midi`. Ordinary files reached through `LocalBackend`, seeded from embedded defaults only while empty (`docs/config-namespace.md`). Model config is NOT here — it lives in kernel-db tables (`kj backend/cast/alias`). |
+| rc scripts | host directory | `/config/rc/...` lifecycle scripts, a `LocalBackend` mount seeded from embedded defaults only while empty (`docs/rc-on-disk.md`). |
 | `auth.db` | SQLite | Principals + SSH credentials. |
 
 Codec everywhere is **versioned CBOR** (`kaijutsu-types/src/codec.rs`): a 1-byte

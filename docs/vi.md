@@ -294,14 +294,19 @@ the authority and rc's mount is a `LocalBackend` over a host directory
 (`docs/rc-on-disk.md`). That the answer comes from the mount table and not a
 path prefix is what let rc change sides without touching this code, and it is
 pinned by `resolve_editor_target_marks_config_owned_from_the_mount_table_not_a_path_prefix`
-in `crates/kaijutsu-kernel/src/editor.rs`. The other three roots are still
-config-owned.
+in `crates/kaijutsu-kernel/src/editor.rs`. **The other three roots take it too
+now** — `/config/kernel`, `/config/client` and `/config/midi` also mount
+through `LocalBackend` (`docs/config-namespace.md`), so `config_owned` is
+always `false` in production today; `ConfigDocFs` sits unmounted, and
+deleting it is the follow-up `docs/config-namespace.md` names.
 
-A config document is a sole-owned single-block `DocKind::File`. Running a
-config path through `get_or_load` would mint a *separate* `FileDocumentCache`
-copy shadowing that owner — reviving the dual-ownership write-through bug
-class (`docs/config-ownership.md`). Missing config docs **fail loud** (no
-empty editor).
+A config document was a sole-owned single-block `DocKind::File`. Running a
+config path through `get_or_load` would have minted a *separate*
+`FileDocumentCache` copy shadowing that owner — the dual-ownership
+write-through bug class the kernel-owned design existed to prevent
+(`docs/devlog.md`, "The kernel becomes sole owner of itself, then gives it
+back"). Missing config docs **fail loud** (no empty editor) on any mount
+that still answers `owns_config_docs()`.
 
 ---
 

@@ -86,26 +86,16 @@ right: either narrow the hook to the roots that still need it (which is the
 `ConfigDocFs` three, and they melt too), or keep it and say why. Do it when
 the other three roots melt, since that is when the answer changes again.
 
-## `docs/config-ownership.md` still writes against `kj config set` (2026-08-29)
+## Per-client config write-target defaulting has no owner (2026-08-30)
 
-Four passages instruct a reader to run `kj config set`, at
-`docs/config-ownership.md:86, 229, 237, 274`. That verb is deleted — `kj
-config` is `list`, `show` and `reset` only, and `kj/config.rs`'s own module
-doc says so: `set` and `edit` existed because `/etc/config` used to be
-unreachable from `builtin.file:write`, and both went with the `config-write`
-gate.
-
-Two of the four are the harder kind. `:229` and `:237` describe the
-**per-client write-target policy** — that `kj config set` defaults to the
-caller's own `/etc/client/<id>/<name>` and needs an explicit path to write the
-shared default. That policy lived in the verb. With the verb gone, either the
-file tools reproduce the defaulting or the policy is gone too, and the doc
-cannot be fixed by renaming a command; someone has to decide which.
-
-Found by the docs sweep for the rc melt's slice 3, which correctly declined to
-guess. It belongs to the config half of the melt — `docs/config-namespace.md`,
-which moves these roots under `/config` and deletes `ConfigDocFs`. Answer the
-per-client write-target question there, since that melt has to answer it anyway.
+`kj config set` used to default a write to the caller's own
+`/config/client/<id>/<name>` and need an explicit path to reach the shared
+`/config/client/default/<name>` — a client tweaking its metronome never
+touched a neighbor's. That verb is gone; `kj config` is `list`, `show`,
+`reset`, and `export` (`docs/config-namespace.md`). Nothing has taken over the
+defaulting. Either the file tools (or something above them) need to reproduce
+it from the caller's client-id, or the policy is simply gone and every
+per-client write names its full path by hand. Undecided.
 
 ## The rc melt orphaned its documents and nothing deletes them (2026-08-29)
 
@@ -2146,25 +2136,6 @@ Also from the same slice: `init_or_open` hand-writes `HEAD` and a minimal
 `gix-repository`, deliberately outside the aligned set). Two `fs::write` calls,
 but it is one more piece of git's on-disk format this crate now owns and must
 keep correct by hand.
-
-## Lane B storage half is unbuilt — config documents are not files (2026-08-16)
-
-`kaijutsu-configgit` (the git write seam above) is tested and unwired — see
-`docs/config-ownership.md`, "Lane B — the git-worktree seam". `/etc/config`,
-`/etc/client`, and `/etc/midi` are still `ConfigDocFs` mounts backed by
-`kernel.db`; nothing reads or writes `<data_dir>/config`. What shipped
-2026-08-15/16 (`988122f9`) was only the write *gate* — the file tools can now
-reach the kernel-owned mounts directly — not a storage migration.
-
-Two shapes are live candidates, not decided: wire `kaijutsu-configgit` in as
-designed (one git worktree, auto-commit per mutation, service-authored
-commits — the rulings in `docs/config-ownership.md`), or go simpler per
-Amy's 2026-08-15 lean — plain files on disk, keep the reset-to-embedded-
-default tool, and demote git to a skill invoked through rc or the help
-system rather than kernel machinery. Whoever picks this up should settle
-that question first; building the kernel-wiring slice for the git-worktree
-shape before it is confirmed as the plan would be work a later decision
-could throw away.
 
 ## `kaijutsu-crdt` is a block store now, not a CRDT (2026-08-16)
 
@@ -6674,9 +6645,9 @@ key-value store demolished 2026-07-04.*
   `kaijutsu-types/src/codec.rs`) — today they must live forever, because
   compaction is threshold-triggered and a quiet document may never be
   re-snapshotted.
-- **Kernel-owned config/rc (design: `docs/config-ownership.md`) — shipped and
-  long since exercised live** (editing an rc file is the daily surface). Remaining: the
-  deferred scratch mount.
+- **Config and rc are host files now (`docs/config-namespace.md`,
+  `docs/rc-on-disk.md`) — shipped and long since exercised live** (editing an
+  rc file is the daily surface). Remaining: the deferred scratch mount.
 - **rc cutover follow-ups (from slice 1):**
   - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_rc`
 
@@ -7509,16 +7480,18 @@ key-value store demolished 2026-07-04.*
   `halt_on_connection_loss` resets the phasor on any non-`Connected` status — no
   more free-running onto a wired synth after a kernel restart) and the
   configurable click (`feat/metronome-config` merge: note/channel/velocity/gate/
-  enabled from a per-client `/etc/client/metronome.toml`, cascade + app apply).
+  enabled from a per-client `/config/client/metronome.toml`, cascade + app apply).
   **Still open:**
     - **Downbeat accent** — a different note on bar-one needs meter info the
       `BeatRef` doesn't carry yet.
     - **Write ergonomics** — `--global` flag + caller-scoped write default (so a
-      client tweaks its own `/etc/client/<id>/…` without spelling the id); needs
-      `kj` to resolve the caller's client-id, the same MCP/headless durable-id
-      prereq (`docs/config-ownership.md` "Per-client config" → Open).
+      client tweaks its own `/config/client/<id>/…` without spelling the id);
+      needs `kj` to resolve the caller's client-id, the same MCP/headless
+      durable-id prereq. The per-client namespace and cascade are canonical
+      in `docs/config-namespace.md`; see "Per-client config write-target
+      defaulting has no owner" for the policy question underneath this.
     - **Config-change push** — the app applies `metronome.toml` once per
-      (re)connect; a live `kj config set` doesn't reach it without a reconnect.
+      (re)connect; a live edit doesn't reach it without a reconnect.
 - **Metronome controller — graduate to PI/PID later.** The slosh was fixed
   (`d2b1f55c`, P-phase correction with feedforward tempo — diagnosis in
   `79c4b6b5`'s message). Remaining: graduate to a full PI/PID (damping + integral

@@ -8,16 +8,17 @@ apparatus was SFTP-shaped scaffolding, replaced by per-operation join on the
 ambient `context_id`. SFTP writes an ordinary path exactly like any other write
 surface now — sections below that describe `bound` are superseded and marked,
 and the lexical deny on `/etc/rc`/`/etc/config` those sections left behind is
-gone too: `/etc/rc` melted into host files (`docs/rc-on-disk.md`) and
-`/etc/config` dropped the file-write capability gate it used to duplicate
-(`docs/config-ownership.md`). The first real SFTP consumer is **client CAS
-sync against `/v/cas`** (`docs/slash-v.md` track B).*
+gone too: all four config trees melted into host files under `/config`
+(`docs/rc-on-disk.md`, `docs/config-namespace.md`) and config dropped the
+file-write capability gate it used to duplicate. The first real SFTP
+consumer is **client CAS sync against `/v/cas`** (`docs/slash-v.md` track
+B).*
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
 client (sshfs, `sftp`, Nautilus, an editor's remote-FS plugin) can read and
-write the unified tree — host FS (including `/config/rc`), the kernel-owned
-`/config/kernel` and `/v/...`, and the memory scratch at `/tmp` — through the same
-SSH server that already carries the Cap'n Proto RPC channel.
+write the unified tree — host FS (including `/config/rc` and `/config/kernel`)
+and `/v/...`, and the memory scratch at `/tmp` — through the same SSH server
+that already carries the Cap'n Proto RPC channel.
 
 This is plumbing, not new architecture. The VFS is already SFTP-shaped; the
 work was a channel-dispatch scaffold on the SSH session-channel surface, an
@@ -162,7 +163,7 @@ it stopped mattering.)
 **it doesn't need to.** The `context_allows_rc_write(ctx)` gate this section
 described no longer exists at all — `RcWrite` was deleted once `/etc/rc`
 melted into host files, and `ConfigWrite` no longer gates file writes either
-(`docs/rc-on-disk.md`, `docs/config-ownership.md`). SFTP needs no capability
+(`docs/rc-on-disk.md`, `docs/config-namespace.md`). SFTP needs no capability
 verdict for a plain file write because nothing in the file-tool path needs one:
 a write to any mount is governed only by that mount's own `read_only()` flag,
 same as `LocalBackend`, host `vim`, or the file tools. The earlier design
@@ -327,7 +328,7 @@ later tenant of the same scaffold.
 - `crates/kaijutsu-client/src/ssh.rs:235` — client opened control/rpc/events in order (historical — now `connect_subsystem`, `ssh.rs:210`)
 - `crates/kaijutsu-client/src/rpc.rs:101` — `retain_ssh_channels` holds the dead control/events channels
 - russh 0.61.1 `server/mod.rs:633` (`subsystem_request`) / `channels/mod.rs:249` (`request_subsystem`)
-- `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (historical — `RcWrite` is deleted; `ConfigWrite` remains but no longer gates file writes, see `docs/config-ownership.md`)
+- `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (historical — `RcWrite` is deleted; `ConfigWrite` remains but no longer gates file writes, see `docs/config-namespace.md`)
 - `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write` (historical — deleted along with `RcWrite`)
 - `crates/kaijutsu-types/src/principal.rs:16` — `Principal`
 - `crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:199,230,258,605` — kernel-document mtime (now-on-write, epoch default, setattr no-op)

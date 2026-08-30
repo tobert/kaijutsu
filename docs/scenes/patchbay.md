@@ -9,8 +9,9 @@ patching stays **CLI-only for a good long time** — the scene's first job is
 to render observed reality, look cool, and guide the backend's design by
 being looked at. If our backend ever grows complex, that is the signal to
 lean into PipeWire control rather than overbuild our own. Backend design
-homes when it matures: `docs/config-ownership.md` (per-client
-namespace), `docs/mounts.md` (the wire-ownership note), `docs/midi.md`
+homes when it matures: `docs/config-namespace.md` (the mount registry and
+namespace; the per-client cascade under `/config/client` has no dedicated
+section yet), `docs/mounts.md` (the wire-ownership note), `docs/midi.md`
 (distribute intent, not pulses).
 
 ## What the station shows

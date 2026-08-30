@@ -35,9 +35,10 @@ Rules that keep the lanes honest:
 
 ## One source of truth: `theme.toml`
 
-The theme is **kernel-owned** (`/config/kernel/theme.toml`, seeded from
-`assets/defaults/theme.toml` — see `docs/config-ownership.md`) and reaches
-the app over RPC on connect. It carries:
+The theme lives at `/config/kernel/theme.toml`, a host file reached through
+`LocalBackend` and seeded from `assets/defaults/theme.toml` only while empty
+(`docs/config-namespace.md`), and reaches the app over RPC on connect. It
+carries:
 
 - **Flat keys + `[ansi]`** → `ui/theme.rs::Theme` — every conversation-view,
   dock, overlay, and text-effect color. This system predates the pass and is
