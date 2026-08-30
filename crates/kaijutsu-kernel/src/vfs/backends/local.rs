@@ -828,6 +828,38 @@ mod tests {
         assert!(result.is_err(), "the escape must be refused, not merely contained");
     }
 
+    /// A DANGLING final link must not become a write target outside the root.
+    ///
+    /// `canonicalize` fails on a dangling link, so resolution puts it in the
+    /// literal tail and containment sees an inside-the-root path. Whether that
+    /// is exploitable is decided by the syscall: an `O_CREAT` without
+    /// `O_EXCL` would follow the dangling chain and create the target outside.
+    /// `create` uses `create_new` (`O_EXCL`) and `write`/`truncate` pass no
+    /// `O_CREAT`, so every writing path here refuses instead of following.
+    ///
+    /// Pins that pairing. Falsified by relaxing `create_new` to `create`.
+    #[tokio::test]
+    async fn a_dangling_final_link_is_never_written_through() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        // Dangling: `outside/evil` does not exist yet.
+        std::os::unix::fs::symlink("../outside/evil", root.join("link")).unwrap();
+        let backend = LocalBackend::new(&root);
+
+        let created = backend.create(Path::new("link"), 0o644).await;
+        let written = backend.write_all(Path::new("link"), b"pwned").await;
+
+        assert!(
+            !outside.join("evil").exists(),
+            "followed a dangling link and created the target outside the root"
+        );
+        assert!(created.is_err(), "create through a dangling link must refuse");
+        assert!(written.is_err(), "write_all through a dangling link must refuse");
+    }
+
     /// `unlink` on a symlink removes the LINK, never what it points at.
     ///
     /// `resolve()` canonicalizes the final component, so routing a delete
