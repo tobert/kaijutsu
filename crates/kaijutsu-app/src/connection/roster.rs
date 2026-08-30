@@ -52,7 +52,13 @@ use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 /// The kernel's roster index — the filtered view (rows the kernel considers
 /// "around"). `index-all` exists beside it for the unfiltered set; the panel
 /// wants the same "who is around" answer the kernel itself would give.
-pub const ROSTER_INDEX_PATH: &str = "/run/roster/index";
+///
+/// Derived from [`kaijutsu_types::paths::ROSTER_RUN_ROOT`] rather than
+/// written out, so this path cannot drift from the kernel's roster tree when
+/// the root moves — the same pattern `midi_presence::DEVICES_DIR` uses for
+/// `/run/midi`.
+pub static ROSTER_INDEX_PATH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}/index", kaijutsu_types::paths::ROSTER_RUN_ROOT));
 
 /// The exact header line `RosterFs::index_bytes` writes. A document whose
 /// first line is not this is not a roster index we understand, and is
@@ -448,10 +454,10 @@ fn poll_roster_index(
 
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
-            let result = match handle.vfs_read_all(ROSTER_INDEX_PATH).await {
+            let result = match handle.vfs_read_all(ROSTER_INDEX_PATH.as_str()).await {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(body) => Ok(body),
-                    Err(e) => Err(format!("{ROSTER_INDEX_PATH}: not UTF-8: {e}")),
+                    Err(e) => Err(format!("{}: not UTF-8: {e}", ROSTER_INDEX_PATH.as_str())),
                 },
                 Err(e) => Err(format!("{e}")),
             };
@@ -495,8 +501,9 @@ fn drain_roster_index(
                     Ok(parsed) => {
                         if parsed.unparsed > 0 {
                             warn!(
-                                "roster: {} unparsable row(s) in {ROSTER_INDEX_PATH}",
-                                parsed.unparsed
+                                "roster: {} unparsable row(s) in {}",
+                                parsed.unparsed,
+                                ROSTER_INDEX_PATH.as_str()
                             );
                         }
                         feed.rows = parsed.rows;
@@ -780,5 +787,21 @@ mod tests {
         assert_eq!(feed.state, RosterFetch::Never);
         assert!(feed.rows.is_empty());
         assert_eq!(feed.age_secs(10.0), None, "never fetched has no age");
+    }
+
+    /// `ROSTER_INDEX_PATH` must track `ROSTER_RUN_ROOT`, not spell it out a
+    /// second time. A hardcoded literal here is invisible today (the two
+    /// values happen to agree) and only shows up the day the root moves —
+    /// which is exactly the day a stale literal makes the panel misreport an
+    /// empty fleet instead of failing loudly. Recomputing the expected value
+    /// from the root, rather than pinning the literal `"/run/roster/index"`,
+    /// is what lets this test catch that drift instead of just restating it.
+    #[test]
+    fn roster_index_path_tracks_the_run_root() {
+        assert_eq!(
+            ROSTER_INDEX_PATH.as_str(),
+            format!("{}/index", kaijutsu_types::paths::ROSTER_RUN_ROOT)
+        );
+        assert!(ROSTER_INDEX_PATH.starts_with(kaijutsu_types::paths::ROSTER_RUN_ROOT));
     }
 }
