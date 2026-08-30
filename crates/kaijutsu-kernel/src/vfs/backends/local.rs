@@ -75,12 +75,45 @@ impl LocalBackend {
         &self.root
     }
 
+    /// Refuse a path that climbs above the mount root — lexically, before any
+    /// I/O touches it.
+    ///
+    /// The containment check after resolution compares path *components*, so an
+    /// un-normalized `<root>/../sibling` "starts with" `<root>` and passes it.
+    /// Resolution only normalizes when the parent already exists, so a path
+    /// with a missing parent reaches that check un-normalized and escapes.
+    ///
+    /// A `..` that stays inside the root is fine; only a net climb above it is
+    /// refused.
+    fn reject_lexical_escape(path: &Path) -> VfsResult<()> {
+        let mut depth: isize = 0;
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(VfsError::path_escapes_root(format!(
+                            "{} climbs above the mount root",
+                            path.display()
+                        )));
+                    }
+                }
+                std::path::Component::Normal(_) => depth += 1,
+                std::path::Component::CurDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a relative path to an absolute path within the root.
     ///
     /// Returns an error if the path escapes the root (via `..`).
     async fn resolve(&self, path: &Path) -> VfsResult<PathBuf> {
         // Strip leading slash if present
         let path = path.strip_prefix("/").unwrap_or(path);
+        Self::reject_lexical_escape(path)?;
 
         // Handle empty path (root)
         if path.as_os_str().is_empty() {
@@ -142,6 +175,7 @@ impl LocalBackend {
     /// The parent is still canonicalized, so `..` cannot escape the root.
     async fn resolve_nofollow(&self, path: &Path) -> VfsResult<PathBuf> {
         let path = path.strip_prefix("/").unwrap_or(path);
+        Self::reject_lexical_escape(path)?;
         if path.as_os_str().is_empty() {
             return Ok(self.root.clone());
         }
@@ -718,6 +752,37 @@ mod tests {
 
         let got = backend.read_all(Path::new("l.txt")).await.unwrap();
         assert_eq!(got, body, "read_all truncated a followed symlink");
+    }
+
+    /// A path whose parent does not exist must not escape the mount root.
+    ///
+    /// `resolve`'s missing-parent fallback returns an un-normalized
+    /// `root.join(path)`, and `Path::starts_with` compares components — so
+    /// `<root>/../sibling` "starts with" `<root>` and passes containment. The
+    /// fallback's own comment claims it "will fail on actual operation", but
+    /// `create` calls `create_dir_all` on the parent first, so the write lands
+    /// beside the root instead of failing.
+    ///
+    /// Falsified by removing the lexical `..` refusal from `resolve`.
+    #[tokio::test]
+    async fn a_missing_parent_cannot_escape_the_root_via_dotdot() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let backend = LocalBackend::new(&root);
+
+        let result = backend
+            .create(Path::new("../sibling/escaped.txt"), 0o644)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a `..` path with a missing parent must be refused"
+        );
+        assert!(
+            !tmp.path().join("sibling").exists(),
+            "create escaped the mount root and made a directory beside it"
+        );
     }
 
     /// `unlink` on a symlink removes the LINK, never what it points at.
