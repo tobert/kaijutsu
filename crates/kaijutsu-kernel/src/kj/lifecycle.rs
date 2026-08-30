@@ -1,7 +1,7 @@
 //! Run-control (rc) lifecycle dispatch.
 //!
 //! Fires at context lifecycle moments (`create`, `fork`; `attach` and
-//! `drift` reserved). Looks up scripts at `/etc/rc/<context_type>/<verb>/`,
+//! `drift` reserved). Looks up scripts at `/config/rc/<context_type>/<verb>/`,
 //! runs them in lexical sort order. `.md` scripts become blocks; `.kai`
 //! scripts execute via `kaish_kernel::Kernel::execute_with_options` with the
 //! kernel's `TimeoutPolicy::rc_script_timeout` applied per call.
@@ -41,8 +41,8 @@ use kaijutsu_types::{
 
 use super::{KjCaller, KjDispatcher};
 
-/// One rc script resolved from the `/etc/rc` file tree for a single
-/// lifecycle run. The path is canonical (`/etc/rc/<type>/<verb>/SXX-name.ext`);
+/// One rc script resolved from the `/config/rc` file tree for a single
+/// lifecycle run. The path is canonical (`/config/rc/<type>/<verb>/SXX-name.ext`);
 /// `sort_key` and `extension` are parsed from the filename for ordering and
 /// dispatch. Content is read through the kernel's `FileDocumentCache`.
 pub(crate) struct RcScript {
@@ -342,7 +342,7 @@ impl KjDispatcher {
         Ok(())
     }
 
-    /// Load the rc scripts for `(context_type, verb)` from the `/etc/rc`
+    /// Load the rc scripts for `(context_type, verb)` from the `/config/rc`
     /// file tree, ordered lexically by filename (which is exactly
     /// `(sort_key, name)` order). A missing directory means "no scripts for
     /// this verb" — the common case — and returns empty, not an error. A
@@ -963,7 +963,7 @@ mod tests {
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{ContextId, PrincipalId};
 
-    /// Install an rc script as a file in the mounted `/etc/rc` tree. The
+    /// Install an rc script as a file in the mounted `/config/rc` tree. The
     /// structural args (type/verb/sort/name/ext) are redundant now that the
     /// path encodes them — kept so existing call sites stay unchanged — and
     /// only `path` + `content` are used.
@@ -1036,7 +1036,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-prompt.md",
+            "/config/rc/test/create/S00-prompt.md",
             "test",
             "create",
             "S00",
@@ -1066,14 +1066,14 @@ mod tests {
     #[tokio::test]
     async fn rc_create_follows_symlinked_md() {
         use crate::vfs::VfsOps;
-        // The kernel-owned /etc/rc mount (production backend) — symlink targets
+        // The kernel-owned /config/rc mount (production backend) — symlink targets
         // are VFS-absolute paths it resolves within the mount, unlike the
         // host-backed LocalBackend the plain test_dispatcher uses.
         let d = test_dispatcher_rc().await;
         // The shared, canonical stance lives once under a `lib` type.
         install_rc_script_file(
             &d,
-            "/etc/rc/lib/create/S00-shared.md",
+            "/config/rc/lib/create/S00-shared.md",
             "You are composed from a shared stance fragment. Be terse.",
         )
         .await;
@@ -1081,8 +1081,8 @@ mod tests {
         d.kernel()
             .vfs()
             .symlink(
-                std::path::Path::new("/etc/rc/test/create/S00-stance.md"),
-                std::path::Path::new("/etc/rc/lib/create/S00-shared.md"),
+                std::path::Path::new("/config/rc/test/create/S00-stance.md"),
+                std::path::Path::new("/config/rc/lib/create/S00-shared.md"),
             )
             .await
             .expect("create rc symlink");
@@ -1108,7 +1108,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-noop.kai",
+            "/config/rc/test/create/S00-noop.kai",
             "test",
             "create",
             "S00",
@@ -1139,7 +1139,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-echo.kai",
+            "/config/rc/test/create/S00-echo.kai",
             "test",
             "create",
             "S00",
@@ -1213,7 +1213,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-color.kai",
+            "/config/rc/test/create/S00-color.kai",
             "test",
             "create",
             "S00",
@@ -1280,7 +1280,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/tick/S00-report.kai",
+            "/config/rc/test/tick/S00-report.kai",
             "test",
             "tick",
             "S00",
@@ -1327,7 +1327,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/tick/S00-report.kai",
+            "/config/rc/test/tick/S00-report.kai",
             "test",
             "tick",
             "S00",
@@ -1376,7 +1376,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/tick/S00-stance.md",
+            "/config/rc/test/tick/S00-stance.md",
             "test",
             "tick",
             "S00",
@@ -1430,7 +1430,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/tick/S00-report.kai",
+            "/config/rc/test/tick/S00-report.kai",
             "test",
             "tick",
             "S00",
@@ -1483,7 +1483,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/tick/S00-broken.zzz",
+            "/config/rc/test/tick/S00-broken.zzz",
             "test",
             "tick",
             "S00",
@@ -1496,7 +1496,7 @@ mod tests {
         // to reach the failure path through a supported extension.
         install_script(
             &d,
-            "/etc/rc/test/tick/S01-fail.kai",
+            "/config/rc/test/tick/S01-fail.kai",
             "test",
             "tick",
             "S01",
@@ -1557,7 +1557,7 @@ mod tests {
         // dispatches it — pins the test to the actual seeded body, not a copy.
         install_rc_script_file(
             &d,
-            "/etc/rc/test/fork/S40-hydrate.kai",
+            "/config/rc/test/fork/S40-hydrate.kai",
             include_str!("../../../../assets/defaults/rc/musician/fork/S40-hydrate.kai"),
         )
         .await;
@@ -1627,7 +1627,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-silent.kai",
+            "/config/rc/test/create/S00-silent.kai",
             "test",
             "create",
             "S00",
@@ -1661,7 +1661,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-echo.kai",
+            "/config/rc/test/create/S00-echo.kai",
             "test",
             "create",
             "S00",
@@ -1722,7 +1722,7 @@ mod tests {
         // timeout to exit 124 with a "timed out" message in stderr.
         install_script(
             &d,
-            "/etc/rc/test/create/S00-slow.kai",
+            "/config/rc/test/create/S00-slow.kai",
             "test",
             "create",
             "S00",
@@ -1798,7 +1798,7 @@ mod tests {
         // callable. Exit 0 → no error block; non-zero → error block.
         install_script(
             &d,
-            "/etc/rc/test/create/S00-introspect.kai",
+            "/config/rc/test/create/S00-introspect.kai",
             "test",
             "create",
             "S00",
@@ -1823,7 +1823,7 @@ mod tests {
         );
     }
 
-    /// `context_type = "nonexistent"` has no `/etc/rc/nonexistent/` directory
+    /// `context_type = "nonexistent"` has no `/config/rc/nonexistent/` directory
     /// at all — not even the type-level ancestor — under `test_dispatcher()`'s
     /// host-backed `LocalBackend` mount. `dispatch`'s own `Ok` and an empty
     /// context alone don't distinguish "load_rc_scripts correctly saw zero
@@ -1866,8 +1866,8 @@ mod tests {
     #[tokio::test]
     async fn rc_run_records_intended_script_count() {
         let d = test_dispatcher().await;
-        install_rc_script_file(&d, "/etc/rc/counted/create/S00-one.md", "first").await;
-        install_rc_script_file(&d, "/etc/rc/counted/create/S10-two.md", "second").await;
+        install_rc_script_file(&d, "/config/rc/counted/create/S00-one.md", "first").await;
+        install_rc_script_file(&d, "/config/rc/counted/create/S10-two.md", "second").await;
 
         let caller = unjoined_caller();
         let result = d
@@ -1918,13 +1918,13 @@ mod tests {
         let d = test_dispatcher().await;
         install_rc_script_file(
             &d,
-            "/etc/rc/stray/create/S00-benign.md",
+            "/config/rc/stray/create/S00-benign.md",
             "would reach the system-prompt slot",
         )
         .await;
         // The shape that prompted this: a hook body parked beside its
         // installer, named so it is data rather than a script.
-        install_rc_script_file(&d, "/etc/rc/stray/create/guard.hook.kai", "exit 0").await;
+        install_rc_script_file(&d, "/config/rc/stray/create/guard.hook.kai", "exit 0").await;
 
         let caller = unjoined_caller();
         let result = d
@@ -1956,8 +1956,8 @@ mod tests {
     #[tokio::test]
     async fn rc_ignores_files_that_are_not_scripts() {
         let d = test_dispatcher().await;
-        install_rc_script_file(&d, "/etc/rc/inert/create/S00-real.md", "the real script").await;
-        install_rc_script_file(&d, "/etc/rc/inert/create/README.txt", "notes").await;
+        install_rc_script_file(&d, "/config/rc/inert/create/S00-real.md", "the real script").await;
+        install_rc_script_file(&d, "/config/rc/inert/create/README.txt", "notes").await;
 
         let caller = unjoined_caller();
         let result = d
@@ -1984,7 +1984,7 @@ mod tests {
         // S00 returns non-zero; S10 is benign.
         install_script(
             &d,
-            "/etc/rc/test/create/S00-fail.kai",
+            "/config/rc/test/create/S00-fail.kai",
             "test",
             "create",
             "S00",
@@ -1994,7 +1994,7 @@ mod tests {
         ).await;
         install_script(
             &d,
-            "/etc/rc/test/create/S10-after.md",
+            "/config/rc/test/create/S10-after.md",
             "test",
             "create",
             "S10",
@@ -2025,7 +2025,7 @@ mod tests {
         assert!(
             contents
                 .iter()
-                .any(|c| c.contains("/etc/rc/test/create/S00-fail.kai")),
+                .any(|c| c.contains("/config/rc/test/create/S00-fail.kai")),
             "error block should reference rc path, got: {contents:?}"
         );
     }
@@ -2036,7 +2036,7 @@ mod tests {
         // `.md` script lands its content as a block on the target.
         install_script(
             &d,
-            "/etc/rc/test/attach/S00-banner.md",
+            "/config/rc/test/attach/S00-banner.md",
             "test",
             "attach",
             "S00",
@@ -2067,7 +2067,7 @@ mod tests {
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-noop.md",
+            "/config/rc/test/create/S00-noop.md",
             "test",
             "create",
             "S00",
@@ -2101,7 +2101,7 @@ mod tests {
     }
 
     /// Set a registered context's type to `t` so rc dispatch finds scripts
-    /// under `/etc/rc/<t>/...`. `register_context` defaults to "default".
+    /// under `/config/rc/<t>/...`. `register_context` defaults to "default".
     fn set_context_type(d: &KjDispatcher, ctx: ContextId, t: &str) {
         let db = d.kernel_db().lock();
         db.update_context_type(ctx, t).expect("update_context_type");
@@ -2122,7 +2122,7 @@ mod tests {
         // No `kj` calls — so set_self_arc is unnecessary.
         install_script(
             &d,
-            "/etc/rc/test/drift/S00-introspect.kai",
+            "/config/rc/test/drift/S00-introspect.kai",
             "test",
             "drift",
             "S00",
@@ -2179,7 +2179,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/drift/S00-introspect.kai",
+            "/config/rc/test/drift/S00-introspect.kai",
             "test",
             "drift",
             "S00",
@@ -2234,7 +2234,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/drift/S00-marker.md",
+            "/config/rc/test/drift/S00-marker.md",
             "test",
             "drift",
             "S00",
@@ -2284,7 +2284,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/drift/S00-fail.kai",
+            "/config/rc/test/drift/S00-fail.kai",
             "test",
             "drift",
             "S00",
@@ -2294,7 +2294,7 @@ esac
         ).await;
         install_script(
             &d,
-            "/etc/rc/test/drift/S10-after.md",
+            "/config/rc/test/drift/S10-after.md",
             "test",
             "drift",
             "S10",
@@ -2345,7 +2345,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/fork/S00-fork.md",
+            "/config/rc/test/fork/S00-fork.md",
             "test",
             "fork",
             "S00",
@@ -2355,7 +2355,7 @@ esac
         ).await;
         install_script(
             &d,
-            "/etc/rc/test/drift/S00-drift.md",
+            "/config/rc/test/drift/S00-drift.md",
             "test",
             "drift",
             "S00",
@@ -2448,7 +2448,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/fork/S00-assert-parent-count.kai",
+            "/config/rc/test/fork/S00-assert-parent-count.kai",
             "test",
             "fork",
             "S00",
@@ -2545,7 +2545,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-no-parent-count.kai",
+            "/config/rc/test/create/S00-no-parent-count.kai",
             "test",
             "create",
             "S00",
@@ -2582,7 +2582,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-only-create.md",
+            "/config/rc/test/create/S00-only-create.md",
             "test",
             "create",
             "S00",
@@ -2592,7 +2592,7 @@ esac
         ).await;
         install_script(
             &d,
-            "/etc/rc/test/fork/S00-only-fork.md",
+            "/config/rc/test/fork/S00-only-fork.md",
             "test",
             "fork",
             "S00",
@@ -2661,7 +2661,7 @@ esac
 
         install_script(
             &d,
-            "/etc/rc/test/create/S00-slow.kai",
+            "/config/rc/test/create/S00-slow.kai",
             "test",
             "create",
             "S00",
@@ -2697,7 +2697,7 @@ esac
     // the per-type `SXX-datetime.kai` seed *and* its init.d-style symlink
     // composition (`coder/create/S25-datetime.kai` → `lib/create/S25-
     // datetime.kai`). That composition only resolves over the kernel-owned
-    // `/etc/rc` backend (`ConfigDocFs::seed_from_embedded` reconstructs a
+    // `/config/rc` backend (`ConfigDocFs::seed_from_embedded` reconstructs a
     // real symlink from a seed body that's just a path); the plain
     // `test_dispatcher()`'s host-disk seeding writes the path string
     // verbatim and does not follow it (see `rc_create_follows_symlinked_md`
@@ -2957,7 +2957,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-fail.kai",
+            "/config/rc/test/create/S00-fail.kai",
             "test",
             "create",
             "S00",
@@ -2998,7 +2998,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-noop.kai",
+            "/config/rc/test/create/S00-noop.kai",
             "test",
             "create",
             "S00",
@@ -3032,7 +3032,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-first.kai",
+            "/config/rc/test/create/S00-first.kai",
             "test",
             "create",
             "S00",
@@ -3043,7 +3043,7 @@ esac
         .await;
         install_script(
             &d,
-            "/etc/rc/test/create/S10-second.kai",
+            "/config/rc/test/create/S10-second.kai",
             "test",
             "create",
             "S10",
@@ -3095,7 +3095,7 @@ esac
         let d = test_dispatcher().await;
         install_script(
             &d,
-            "/etc/rc/test/create/S00-noop.md",
+            "/config/rc/test/create/S00-noop.md",
             "test",
             "create",
             "S00",
@@ -3133,7 +3133,7 @@ esac
         let d = test_dispatcher().await;
         install_rc_script_file(
             &d,
-            "/etc/rc/emptytype/create/README.txt",
+            "/config/rc/emptytype/create/README.txt",
             "not an rc script — just here to make the directory exist",
         )
         .await;

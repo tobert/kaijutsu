@@ -1035,7 +1035,7 @@ mod tests {
     /// `test_dispatcher`'s host-backed `LocalBackend` writes that path
     /// string as a literal file instead, so `kj rc dispatch` tries to run
     /// the path text itself as a command (`command not found:
-    /// /etc/rc/lib/create/S05-kaish.kai`) for EVERY symlinked script in
+    /// /config/rc/lib/create/S05-kaish.kai`) for EVERY symlinked script in
     /// `default/create/`, not just this one — confirmed by probe, not
     /// assumed, before switching helpers.
     #[tokio::test]
@@ -1074,10 +1074,10 @@ mod tests {
         );
         // S45 installs a `KaishPath` action (docs/rc-on-disk.md, "slice
         // 5"), not a snapshotted inline body: the guard's logic is read
-        // fresh from `/etc/rc/lib/hooks/shell-guard.kai` at every fire.
+        // fresh from `/config/rc/lib/hooks/shell-guard.kai` at every fire.
         match &installed.unwrap().action {
             HookAction::Invoke(HookBody::KaishPath(path)) => {
-                assert_eq!(path, "/etc/rc/lib/hooks/shell-guard.kai");
+                assert_eq!(path, "/config/rc/lib/hooks/shell-guard.kai");
             }
             other => panic!("installed action must be a kaish_path, got {other:?}"),
         }

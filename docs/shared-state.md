@@ -82,11 +82,11 @@ This is the load-bearing reason the space must be reachable by agents, not just 
 HUD. A future OODA context that watches system state ("how's the GPU doing?") uses
 the shared space as its **Observe surface**, built entirely from existing primitives:
 
-- **Observe = an `rc` verb.** `/etc/rc/<ooda-type>/observe/SXX-*.kai` runs kaish that
+- **Observe = an `rc` verb.** `/config/rc/<ooda-type>/observe/SXX-*.kai` runs kaish that
   `cat`s `/run/pulse/...` (and `/v/ctx`, `/v/session`) and **assembles blocks**: `.kai`
   stdout already routes to `Trace` blocks, `.md` to the system-prompt slot. No new
   machinery — rc + kaish + blocks composed. (myaku design in git history; rc lifecycle in
-  `crates/kaijutsu-kernel` `/etc/rc`.)
+  `crates/kaijutsu-kernel` `/config/rc`.)
 - **Pull and push.** The agent *pulls* by reading a file when it decides to look; the
   space can *push* by drifting a threshold crossing (`temp_c > 85`) into the
   context's mailbox to flush next turn — the async-event path that already exists.

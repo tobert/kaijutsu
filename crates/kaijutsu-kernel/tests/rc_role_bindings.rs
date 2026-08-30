@@ -41,7 +41,7 @@ async fn harness() -> Harness {
 
     let kernel = Arc::new(Kernel::new("rc-role-test", tmp.path(), store.clone(), db.clone()).await);
 
-    // Seed and mount a private `/etc/rc` tree — the same setup the server RPC
+    // Seed and mount a private `/config/rc` tree — the same setup the server RPC
     // boot path (kaijutsu-server/src/rpc.rs) and the unit-test helper
     // (kj::test_helpers) perform. Without it, `load_rc_scripts` hits
     // `NoMountPoint`, finds no scripts, and the role lifecycle never runs —
@@ -50,7 +50,7 @@ async fn harness() -> Harness {
     std::fs::create_dir_all(&rc_dir).expect("create rc dir");
     kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir).expect("seed rc files");
     kernel
-        .mount("/etc/rc", kaijutsu_kernel::vfs::LocalBackend::new(&rc_dir))
+        .mount("/config/rc", kaijutsu_kernel::vfs::LocalBackend::new(&rc_dir))
         .await;
 
     let file_cache = kernel.file_cache().clone();
@@ -239,7 +239,7 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
         binding.allows_tool(&file, "edit"),
         "director should allow file edit (rc-lifecycle governance)"
     );
-    // `/etc/rc` carries no capability of its own — the file:write grant above
+    // `/config/rc` carries no capability of its own — the file:write grant above
     // is what reaches it, enforced at the call path exactly like any other
     // write. A real write through the broker must succeed.
     let call_ctx = CallContext::new(h.creator, ctx, SessionId::new(), KernelId::new())
@@ -252,7 +252,7 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
                 instance: file.clone(),
                 tool: "write".into(),
                 arguments: serde_json::json!({
-                    "path": "/etc/rc/director/create/S99-write-test.kai",
+                    "path": "/config/rc/director/create/S99-write-test.kai",
                     "content": "true\n",
                 }),
             },
@@ -262,7 +262,7 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
         .await;
     assert!(
         written.is_ok(),
-        "director's file:write must reach /etc/rc with no extra capability: {written:?}"
+        "director's file:write must reach /config/rc with no extra capability: {written:?}"
     );
 
     // Director is a binding admin — may write any context's loadout.
@@ -295,12 +295,12 @@ async fn mcp_role_holds_config_governance() {
     // The `mcp` context_type is the producer/orchestrator voice (Claude Code
     // over MCP, cheaper than API rates). On top of the shared broad loadout it
     // adds the config governance cap via S15-governance.kai, so it can
-    // iterate on the kernel's own kernel-owned config-as-code. `/etc/rc`
+    // iterate on the kernel's own kernel-owned config-as-code. `/config/rc`
     // carries no capability of its own — the file:write grant from the
     // shared loadout (S10 → lib) already reaches it, same as any other file.
     //
     // NB: the broad loadout itself (S10 → lib via a document symlink) is NOT asserted
-    // here — this harness mounts /etc/rc as a host `LocalBackend`, which doesn't
+    // here — this harness mounts /config/rc as a host `LocalBackend`, which doesn't
     // follow the `ConfigDocFs` symlink the shared binding is composed through.
     // S15 is a plain script, so it runs and grants regardless; the symlink
     // composition is covered where ConfigDocFs is in play.
@@ -316,6 +316,6 @@ async fn mcp_role_holds_config_governance() {
     // The governance cap added by S15 — deny-by-default, NOT implied by '*'.
     assert!(
         binding.allows(&Capability::ConfigWrite),
-        "mcp should hold config-write for /etc/config governance"
+        "mcp should hold config-write for /config/kernel governance"
     );
 }

@@ -1076,7 +1076,7 @@
       "path": "config reset",
       "aliases": [],
       "about": "Restore a config file to its embedded default",
-      "clause": "kj config reset /etc/config/theme.toml",
+      "clause": "kj config reset /config/kernel/theme.toml",
       "expect": "situation-normal",
       "confirm_gated": false,
       "mutates": true,

@@ -114,10 +114,11 @@ pub struct SshServerConfig {
     pub allow_anonymous: bool,
     /// Config directory override. None = use XDG default (~/.config/kaijutsu).
     pub config_dir: Option<PathBuf>,
-    /// Host directory mounted at `/etc/rc`. Required, and never `Option`: a
-    /// missing value must not be able to resolve to the user's real config
-    /// tree, which is what a test harness would silently write into.
-    pub rc_dir: PathBuf,
+    /// Where every `/config` tree comes from (`crate::config_mounts`,
+    /// `docs/config-namespace.md`). Required, and never `Option`: a missing
+    /// value must not be able to resolve to the user's real config trees,
+    /// which is what a test harness would silently write into.
+    pub config_mounts: crate::config_mounts::ConfigMounts,
     /// Data directory override. None = use XDG default (~/.local/share/kaijutsu/kernel).
     pub data_dir: Option<PathBuf>,
     /// Maximum number of concurrent SSH connections. Default: 100.
@@ -143,13 +144,17 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// `~/.config/kaijutsu/etc/rc` — the one place the rc tree's default location
-/// is decided. Everything else takes the path it is handed.
+/// `~/.config/kaijutsu/config/rc` — the rc tree's default host directory.
+///
+/// Kept as a named function because callers ask for exactly this one, but it
+/// is now derived rather than decided here: the config root is the one place a
+/// default location is chosen (`ConfigMounts::default_root`), and every tree
+/// falls out of it.
 pub fn default_rc_dir() -> PathBuf {
-    kaish_kernel::xdg_config_home()
-        .join("kaijutsu")
-        .join("etc")
-        .join("rc")
+    crate::config_mounts::ConfigMounts::new(
+        crate::config_mounts::ConfigMounts::default_root(),
+    )
+    .host_dir(kaijutsu_types::paths::RC_ROOT)
 }
 
 impl SshServerConfig {
@@ -185,7 +190,7 @@ impl SshServerConfig {
             auth_db_path: None,
             allow_anonymous: true, // Tests need to accept any key
             config_dir: Some(path.clone()),
-            rc_dir: path.join("etc").join("rc"),
+            config_mounts: crate::config_mounts::ConfigMounts::new(path.join("config")),
             data_dir: Some(path.clone()),
             max_connections: 100,
             _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
@@ -200,7 +205,9 @@ impl SshServerConfig {
             auth_db_path: Some(AuthDb::default_path()),
             allow_anonymous: false,
             config_dir: None, // Use XDG default
-            rc_dir: default_rc_dir(),
+            config_mounts: crate::config_mounts::ConfigMounts::new(
+                crate::config_mounts::ConfigMounts::default_root(),
+            ),
             data_dir: None,   // Use XDG default
             max_connections: 100,
             _cleanup: None,
@@ -321,7 +328,7 @@ impl SshServer {
         // All connections share this single kernel.
         let shared_kernel = crate::rpc::create_shared_kernel(
             self.config.config_dir.as_deref(),
-            &self.config.rc_dir,
+            &self.config.config_mounts,
             self.config.data_dir.as_deref(),
         )
         .await

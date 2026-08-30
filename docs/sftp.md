@@ -15,8 +15,8 @@ sync against `/v/cas`** (`docs/slash-v.md` track B).*
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
 client (sshfs, `sftp`, Nautilus, an editor's remote-FS plugin) can read and
-write the unified tree — host FS (including `/etc/rc`), the kernel-owned
-`/etc/config` and `/v/...`, and the memory scratch at `/tmp` — through the same
+write the unified tree — host FS (including `/config/rc`), the kernel-owned
+`/config/kernel` and `/v/...`, and the memory scratch at `/tmp` — through the same
 SSH server that already carries the Cap'n Proto RPC channel.
 
 This is plumbing, not new architecture. The VFS is already SFTP-shaped; the
@@ -243,7 +243,7 @@ above — so the handle guard and the cache now share one primitive.
 
 - SFTP is reachable only after the existing pubkey auth succeeds; there is no
   new authentication surface.
-- There is no lexical deny on `/etc/rc` or `/etc/config` — every player is
+- There is no lexical deny on `/config/rc` or `/config/kernel` — every player is
   inside one trust boundary, and capabilities are ergonomic nudges, not a
   security control (CLAUDE.md "Shared trust, crosstalk-as-feature"). A write
   there over SFTP is governed the same way a write anywhere else is: the
@@ -304,8 +304,8 @@ above — so the handle guard and the cache now share one primitive.
    survive editor-indexer crawls (the `/v/ctx` tree makes this sharper);
    directory-handle eviction.
 5. **Tests.** A live test that mounts the SFTP endpoint, reads a host file,
-   writes a `/tmp` file, confirms an `/etc/rc` write is an ordinary host-file
-   write (visible to `kj rc`/kaish), confirms an `/etc/config` write lands in
+   writes a `/tmp` file, confirms an `/config/rc` write is an ordinary host-file
+   write (visible to `kj rc`/kaish), confirms an `/config/kernel` write lands in
    its kernel document, and exercises the rename-replace TOCTOU guard. Grow it
    per slice, the way the e2e live-eval harness does.
 

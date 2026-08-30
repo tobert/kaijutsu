@@ -35,7 +35,7 @@ Rules that keep the lanes honest:
 
 ## One source of truth: `theme.toml`
 
-The theme is **kernel-owned** (`/etc/config/theme.toml`, seeded from
+The theme is **kernel-owned** (`/config/kernel/theme.toml`, seeded from
 `assets/defaults/theme.toml` — see `docs/config-ownership.md`) and reaches
 the app over RPC on connect. It carries:
 
@@ -111,7 +111,7 @@ watch the room. (BRP `world_mutate_components` on the camera works too.)
 - **Add a colored element**: decide its lane. Scene → pick an identity hue from
   `ScenePalette` (add one if genuinely new) × a tier; live signals get a gain.
   UI → add a `theme.toml` key + `Theme` field; no literals in view code.
-- **Re-skin the app**: edit `theme.toml` (`kj config set /etc/config/theme.toml
+- **Re-skin the app**: edit `theme.toml` (`kj config set /config/kernel/theme.toml
   --content "$(cat file)"`), UI + post apply live, re-enter the room for scene
   hues. The shipped default skin lives in `assets/defaults/theme.toml`
   (seeded once — a fresh kernel picks it up; a live one needs `kj config set`).

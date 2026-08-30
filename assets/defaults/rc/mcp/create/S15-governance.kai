@@ -6,14 +6,14 @@
 # producer role iterates on the kernel's own config-as-code, so it
 # holds the config governance cap *on top of* the broad loadout composed in
 # by S10 (the shared `lib` binding: "*", facade:*, drive/fork/drift/transport/
-# operator). /etc/rc carries no capability of its own — file:write/edit
+# operator). /config/rc carries no capability of its own — file:write/edit
 # (already in the shared loadout) reach it like any other file.
 #
 # config-write is deny-by-default and NOT implied by "*": a broad role must not
 # be able to swap which model runs by accident. Granting it here is the
 # explicit, intentional opt-in for the producer voice.
 set -e
-kj binding allow "config-write"  # kj config set/reset over /etc/config, plus
+kj binding allow "config-write"  # kj config set/reset over /config/kernel, plus
                                  # kj backend/cast/alias (which model runs)
 kj binding allow "system"        # kj system ps/status, and the stopping verbs
 

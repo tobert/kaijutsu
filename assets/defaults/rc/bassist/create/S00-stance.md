@@ -1,1 +1,1 @@
-/etc/rc/musician/create/S00-stance.md
+/config/rc/musician/create/S00-stance.md

@@ -205,7 +205,7 @@ fn test_kernel_appears_in_list() {
 }
 
 /// get_config reads the kernel-owned config over the wire (client → SSH → capnp →
-/// rpc.rs → /etc/config VFS). A fresh kernel seeds the embedded defaults, so
+/// rpc.rs → /config/kernel VFS). A fresh kernel seeds the embedded defaults, so
 /// theme.toml comes back non-empty; an unknown file is a loud error, not "".
 #[test]
 fn test_get_config_reads_kernel_owned_theme() {
@@ -214,7 +214,7 @@ fn test_get_config_reads_kernel_owned_theme() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        // Seeded theme.toml round-trips (bare name resolves under /etc/config).
+        // Seeded theme.toml round-trips (bare name resolves under /config/kernel).
         let theme = kernel.get_config("theme.toml").await.unwrap();
         assert!(theme.contains("bg"), "seeded theme.toml should carry bg: {theme}");
 
@@ -226,7 +226,7 @@ fn test_get_config_reads_kernel_owned_theme() {
 
 /// `Vfs.snapshot` round-trip over the real wire: client → SSH → capnp →
 /// rpc.rs `VfsImpl::snapshot` → kernel `MountTable::snapshot` → recursive
-/// capnp `SnapshotNode` reply → client's owned tree. `/etc/rc` is seeded with
+/// capnp `SnapshotNode` reply → client's owned tree. `/config/rc` is seeded with
 /// lifecycle scripts at kernel boot, so it is guaranteed non-empty — and it
 /// is a `LocalBackend` mount over a host directory (`docs/rc-on-disk.md`), so
 /// this is also the wire coverage for snapshotting a real filesystem.
@@ -243,7 +243,7 @@ fn test_vfs_snapshot_round_trips_over_rpc() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let result = kernel.vfs_snapshot("/etc/rc", 3, 500).await.unwrap();
+        let result = kernel.vfs_snapshot("/config/rc", 3, 500).await.unwrap();
 
         assert_eq!(result.root.name, "rc");
         assert!(matches!(
@@ -252,13 +252,13 @@ fn test_vfs_snapshot_round_trips_over_rpc() {
         ));
         assert!(
             !result.root.children.is_empty(),
-            "seeded /etc/rc should have entries"
+            "seeded /config/rc should have entries"
         );
         assert_eq!(result.generation, result.root.generation);
 
         // A tiny cap forces a visible cut, proving truncated_here/truncated
         // survive the wire round-trip (not just the in-process walker).
-        let cut = kernel.vfs_snapshot("/etc/rc", 3, 1).await.unwrap();
+        let cut = kernel.vfs_snapshot("/config/rc", 3, 1).await.unwrap();
         assert!(cut.truncated, "max_entries=1 must truncate a populated tree");
         assert!(cut.root.truncated_here);
     });
@@ -266,7 +266,7 @@ fn test_vfs_snapshot_round_trips_over_rpc() {
 
 /// A document-backed mount reports `ignored: false` for every node over the
 /// wire: gitignore semantics come off a real filesystem, and there is none
-/// under `/etc/config`. `/etc/rc` carried this until it moved to disk.
+/// under `/config/kernel`. `/config/rc` carried this until it moved to disk.
 #[test]
 fn test_vfs_snapshot_of_a_virtual_backend_is_never_ignored() {
     run_local(async {
@@ -274,10 +274,10 @@ fn test_vfs_snapshot_of_a_virtual_backend_is_never_ignored() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let result = kernel.vfs_snapshot("/etc/config", 3, 500).await.unwrap();
+        let result = kernel.vfs_snapshot("/config/kernel", 3, 500).await.unwrap();
         assert!(
             !result.root.children.is_empty(),
-            "seeded /etc/config should have entries"
+            "seeded /config/kernel should have entries"
         );
 
         fn assert_never_ignored(node: &kaijutsu_client::SnapshotNode) {

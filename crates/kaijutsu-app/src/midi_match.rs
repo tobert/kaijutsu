@@ -96,7 +96,7 @@ pub struct PortRoleMatch {
 /// this module needs, and nothing else from the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceMatch {
-    /// Profile key: the `<name>` in `/etc/midi/devices/<name>`, which is also
+    /// Profile key: the `<name>` in `/config/midi/devices/<name>`, which is also
     /// the `/run/midi/<name>` presence key.
     pub device: String,
     /// `vendor:product` ids, lowercased.

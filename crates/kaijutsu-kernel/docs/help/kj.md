@@ -66,8 +66,8 @@ cc              list — roster of live Claude Code sessions on this machine,
                 read from ~/.claude/sessions/*.json (never reads *.key files);
                 send — deliver a message into a live session's inbox, gated
                 behind the approval ledger (`--dry-run` exempt)
-config          list, show, set, edit, reset — CRDT-owned config at /etc/config
-                (system.md, theme.toml, mcp.toml) + per-client at /etc/client
+config          list, show, set, edit, reset — CRDT-owned config at /config/kernel
+                (system.md, theme.toml, mcp.toml) + per-client at /config/client
 context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,
                 rename, archive, conclude, promote, demote, pause, resume, remove,
                 retag, hydrate
@@ -103,14 +103,14 @@ ledger          list, show, allow, deny, rules, forget, runs — answer pending
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
                 bevy_brp, …); configured-vs-actually-running visibility + reconcile
 midi            list, show — CRDT-owned MIDI device profiles at
-                /etc/midi/devices/<name> (docs/midi-next.md)
+                /config/midi/devices/<name> (docs/midi-next.md)
 model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
 play            Play a sample now, or commit it as a clip cell onto a track with
                 --track/--at/--label (docs/pcm.md)
 policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove, reseed
-rc              add, list, rm, show — lifecycle scripts (/etc/rc/<type>/<verb>/).
+rc              add, list, rm, show — lifecycle scripts (/config/rc/<type>/<verb>/).
                 They are host files: edit one with `vi <path>` or the file
                 tools, and restore the shipped defaults with
                 `kaijutsu-server rc reseed`. `rc list` marks each entry

@@ -84,7 +84,7 @@ skips them.** That is what makes seppuku honest rather than merely violent.
 ## rc owns the cancellation policy
 
 Quiesce does not decide what to do about a turn already running. It runs
-`/etc/rc/<context_type>/shutdown/SXX-*.kai` and lets rc decide, the same
+`/config/rc/<context_type>/shutdown/SXX-*.kai` and lets rc decide, the same
 way rc already owns stance, loadout, and scoring policy.
 
 This is the right seam because the answer differs by what is running, and

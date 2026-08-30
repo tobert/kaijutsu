@@ -1,18 +1,18 @@
 //! `kj config` — read config files, and restore one to its shipped default.
 //!
-//! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at `/etc/config`
+//! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at `/config/kernel`
 //! (`docs/config-ownership.md`), with per-client overrides at
-//! `/etc/client`.
+//! `/config/client`.
 //!
 //! **There is no write verb here, deliberately.** Config is a file: write it
 //! with the ordinary file tools, or open it with `kj editor <path>` / the `vi`
-//! builtin. `set` and `edit` existed only because `/etc/config` used to be
+//! builtin. `set` and `edit` existed only because `/config/kernel` used to be
 //! unreachable from `builtin.file:write` — once that flat deny was narrowed to
 //! the host's own `/etc`, they were a second way to do one thing, with a
 //! capability guarding one of the two doors. Both are gone, and with them the
 //! `config-write` gate on this surface: it would have denied `reset` to a
 //! caller who could achieve the identical result by writing the file.
-//! `/etc/rc` has since joined this same shape — an ordinary write surface,
+//! `/config/rc` has since joined this same shape — an ordinary write surface,
 //! no dedicated capability.
 //!
 //! What survives is what has no file-tool equivalent: `list`, `show`, and
@@ -27,14 +27,14 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
-use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT};
+use kaijutsu_types::paths::{CLIENT_DEFAULT_DIR, CLIENT_ROOT, CONFIG_ROOT};
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "Read config: kernel-global at /etc/config (system.md, theme.toml, mcp.toml) + per-client at /etc/client (metronome.toml). To CHANGE a config file, just write it with the file tools or open it with `kj editor` — there is no set/edit verb. Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
+    about = "Read config: kernel-global at /config/kernel (system.md, theme.toml, mcp.toml) + per-client at /config/client (metronome.toml). To CHANGE a config file, just write it with the file tools or open it with `kj editor` — there is no set/edit verb. Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -55,7 +55,7 @@ enum ConfigCommand {
     /// Print one config file's content.
     #[command(alias = "cat")]
     Show {
-        /// Config file name (e.g. theme.toml) or full /etc/config path
+        /// Config file name (e.g. theme.toml) or full /config/kernel path
         path: String,
         /// Emit a JSON object instead of a labelled view
         #[arg(long)]
@@ -70,12 +70,12 @@ enum ConfigCommand {
     // builtin, exactly as you would any other file. Config is not a special
     // category owed its own write verbs (Amy, 2026-08-15). `show --raw` still
     // round-trips byte-identical, now into `builtin.file:write` rather than
-    // into a verb that existed only because `/etc/config` used to be
+    // into a verb that existed only because `/config/kernel` used to be
     // unreachable from the file tools.
     /// Restore a config file to its embedded default. Errors if the path ships
     /// no built-in seed — there is nothing to reset it to.
     Reset {
-        /// Config file name (e.g. theme.toml) or full /etc/config path
+        /// Config file name (e.g. theme.toml) or full /config/kernel path
         path: String,
     },
     /// Write every config file the kernel holds into a host directory, one
@@ -88,14 +88,17 @@ enum ConfigCommand {
     },
 }
 
-/// Canonicalize a user-supplied config arg to its `/etc/config/<name>` path.
+/// Canonicalize a user-supplied config arg to its `/config/kernel/<name>` path.
 /// Accepts a bare name (`theme.toml`) or an already-full path. Rejects nested
 /// paths and parent escapes — config is a flat namespace.
 fn config_canonical(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
-    // Per-client config namespace: hierarchical. `<root>/<file>` (shared client
-    // default) or `<root>/<client-id>/<file>` (one client's override) — at most
-    // one nesting level, no parent escapes.
+    // Per-client config namespace: hierarchical, always exactly two segments —
+    // `<root>/default/<file>` (the shared client default) or
+    // `<root>/<client-id>/<file>` (one client's override). The `default/`
+    // segment is a real path component (see `CLIENT_DEFAULT_DIR`), so there is
+    // no flat one-segment form any more: a bare `<root>/<file>` no longer names
+    // anything a client reads.
     if trimmed == CLIENT_ROOT || trimmed.starts_with(&format!("{CLIENT_ROOT}/")) {
         let rest = trimmed
             .strip_prefix(&format!("{CLIENT_ROOT}/"))
@@ -103,19 +106,19 @@ fn config_canonical(path: &str) -> Result<String, String> {
             .trim_matches('/');
         if rest.is_empty() {
             return Err(format!(
-                "missing config file name under {CLIENT_ROOT} (e.g. metronome.toml)"
+                "missing config file name under {CLIENT_ROOT} (e.g. {CLIENT_DEFAULT_DIR}/metronome.toml)"
             ));
         }
         let segments: Vec<&str> = rest.split('/').collect();
-        if segments.len() > 2 || segments.iter().any(|s| s.is_empty() || *s == ".." || *s == ".") {
+        if segments.len() != 2 || segments.iter().any(|s| s.is_empty() || *s == ".." || *s == ".") {
             return Err(format!(
                 "invalid client config path '{path}': expected \
-                 {CLIENT_ROOT}/<file> or {CLIENT_ROOT}/<client-id>/<file>"
+                 {CLIENT_ROOT}/{CLIENT_DEFAULT_DIR}/<file> or {CLIENT_ROOT}/<client-id>/<file>"
             ));
         }
         return Ok(format!("{CLIENT_ROOT}/{rest}"));
     }
-    // Kernel-global config: a flat namespace under /etc/config.
+    // Kernel-global config: a flat namespace under /config/kernel.
     let name = trimmed
         .strip_prefix(&format!("{CONFIG_ROOT}/"))
         .unwrap_or(trimmed)
@@ -303,11 +306,11 @@ impl KjDispatcher {
             .map(|e| e.name)
             .collect();
 
-        // Per-client config namespace (config_canonical's "at most one nesting
-        // level" shape): shared defaults flat at /etc/client/<file>, one
-        // override level at /etc/client/<client-id>/<file>. Listed as full
-        // paths (not bare names) since `kj config show` needs the CLIENT_ROOT
-        // prefix to disambiguate them from /etc/config names.
+        // Per-client config namespace (config_canonical's "always two segments"
+        // shape): the shared default lives at /config/client/default/<file>,
+        // one override level at /config/client/<client-id>/<file>. Listed as
+        // full paths (not bare names) since `kj config show` needs the
+        // CLIENT_ROOT prefix to disambiguate them from /config/kernel names.
         let client_top = match dir_entries(vfs, CLIENT_ROOT).await {
             Ok(e) => e,
             Err(e) => return KjResult::Err(format!("kj config list: {e}")),
@@ -329,7 +332,7 @@ impl KjDispatcher {
         names.sort();
 
         // Iteration handles accepted by `kj config show/set`: bare names for
-        // /etc/config, full /etc/client/... paths for the per-client namespace.
+        // /config/kernel, full /config/client/... paths for the per-client namespace.
         let data = serde_json::Value::Array(
             names
                 .iter()
@@ -418,34 +421,38 @@ mod tests {
     fn canonical_accepts_bare_and_full_rejects_nesting() {
         assert_eq!(
             config_canonical("theme.toml").unwrap(),
-            "/etc/config/theme.toml"
+            "/config/kernel/theme.toml"
         );
         assert_eq!(
-            config_canonical("/etc/config/system.md").unwrap(),
-            "/etc/config/system.md"
+            config_canonical("/config/kernel/system.md").unwrap(),
+            "/config/kernel/system.md"
         );
         assert!(config_canonical("sub/dir.toml").is_err());
-        assert!(config_canonical("/etc/config/a/b.toml").is_err());
+        assert!(config_canonical("/config/kernel/a/b.toml").is_err());
         assert!(config_canonical("").is_err());
     }
 
     #[test]
     fn canonical_accepts_the_hierarchical_client_namespace() {
-        // Shared client default (flat under /etc/client).
+        // Shared client default: a real `default/` segment, not a flat file.
         assert_eq!(
-            config_canonical("/etc/client/metronome.toml").unwrap(),
-            "/etc/client/metronome.toml"
+            config_canonical("/config/client/default/metronome.toml").unwrap(),
+            "/config/client/default/metronome.toml"
         );
-        // One client's override: exactly one nesting level (<client-id>/<file>).
+        // One client's override: the same shape, one segment is a client id.
         assert_eq!(
-            config_canonical("/etc/client/abc-123/metronome.toml").unwrap(),
-            "/etc/client/abc-123/metronome.toml"
+            config_canonical("/config/client/abc-123/metronome.toml").unwrap(),
+            "/config/client/abc-123/metronome.toml"
         );
+        // A bare one-segment path — the pre-`default/` flat shape — no longer
+        // names anything a client reads, so it is rejected rather than
+        // silently accepted as an orphaned path.
+        assert!(config_canonical("/config/client/metronome.toml").is_err());
         // Deeper nesting, parent escapes, and a bare mount root are rejected.
-        assert!(config_canonical("/etc/client/a/b/c.toml").is_err());
-        assert!(config_canonical("/etc/client/../secret").is_err());
-        assert!(config_canonical("/etc/client").is_err(), "needs a file name");
-        assert!(config_canonical("/etc/client/").is_err());
+        assert!(config_canonical("/config/client/a/b/c.toml").is_err());
+        assert!(config_canonical("/config/client/../secret").is_err());
+        assert!(config_canonical("/config/client").is_err(), "needs a file name");
+        assert!(config_canonical("/config/client/").is_err());
     }
 
     /// `kj config show theme.toml` round-trips the seeded default.
@@ -459,7 +466,7 @@ mod tests {
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 let obj = v.as_object().expect("show emits an object");
-                assert_eq!(obj["path"].as_str(), Some("/etc/config/theme.toml"));
+                assert_eq!(obj["path"].as_str(), Some("/config/kernel/theme.toml"));
                 assert!(
                     obj["content"].as_str().is_some_and(|s| !s.is_empty()),
                     "seeded content present"
@@ -575,14 +582,15 @@ mod tests {
     }
 
     /// `kj config list` also surfaces the per-client namespace at
-    /// `/etc/client` — the shared metronome default at the mount root, plus a
-    /// per-client override written under a client id — not just `/etc/config`.
+    /// `/config/client` — the shared metronome default under `default/`, plus
+    /// a per-client override written under a client id — not just
+    /// `/config/kernel`.
     #[tokio::test]
     async fn list_also_surfaces_client_namespace() {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         // A per-client override, written the way anything writes config now.
-        d.write_config_content("/etc/client/abc-123/metronome.toml", "enabled = false")
+        d.write_config_content("/config/client/abc-123/metronome.toml", "enabled = false")
             .await
             .expect("client override is writable");
 
@@ -595,16 +603,16 @@ mod tests {
                     .iter()
                     .filter_map(|x| x.as_str())
                     .collect();
-                // /etc/config entries are still there, as bare names.
+                // /config/kernel entries are still there, as bare names.
                 assert!(names.contains(&"theme.toml"), "names: {names:?}");
-                // The shared client default, seeded at the mount root.
+                // The shared client default, seeded under the `default/` segment.
                 assert!(
-                    names.contains(&"/etc/client/metronome.toml"),
+                    names.contains(&"/config/client/default/metronome.toml"),
                     "names: {names:?}"
                 );
                 // The per-client override, one nesting level down.
                 assert!(
-                    names.contains(&"/etc/client/abc-123/metronome.toml"),
+                    names.contains(&"/config/client/abc-123/metronome.toml"),
                     "names: {names:?}"
                 );
             }
@@ -617,7 +625,7 @@ mod tests {
     async fn a_write_then_show_reflects_new_content() {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
-        d.write_config_content("/etc/config/theme.toml", "bg = \"#000000\"")
+        d.write_config_content("/config/kernel/theme.toml", "bg = \"#000000\"")
             .await
             .expect("theme is writable");
 
@@ -640,7 +648,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let body = "bg = \"#123456\"\nfg = \"#abcdef\"\n";
-        d.write_config_content("/etc/config/theme.toml", body)
+        d.write_config_content("/config/kernel/theme.toml", body)
             .await
             .expect("theme is writable");
 
@@ -654,7 +662,7 @@ mod tests {
         assert_eq!(raw_message, body, "raw output must be exactly the content");
 
         // Round-trip: write it right back using the raw output as the body.
-        d.write_config_content("/etc/config/theme.toml", &raw_message)
+        d.write_config_content("/config/kernel/theme.toml", &raw_message)
             .await
             .expect("round-trip write");
 
@@ -674,7 +682,7 @@ mod tests {
     async fn reset_restores_embedded_default() {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
-        d.write_config_content("/etc/config/theme.toml", "# clobbered")
+        d.write_config_content("/config/kernel/theme.toml", "# clobbered")
             .await
             .expect("clobber the theme");
         // Prove the clobber landed — otherwise `reset` would be "restoring" a
@@ -730,23 +738,18 @@ mod tests {
     /// A config file is written with the ordinary file tools, and `show` sees
     /// it immediately — the claim that made `kj config set` deletable.
     ///
-    /// `deny_etc_write` used to refuse every path under `/etc`, so this write
-    /// was impossible and the verb was the only door. The assertion is that
-    /// the door is now the same one every other file uses.
+    /// A path guard used to refuse every write under `/etc`, so this write was
+    /// impossible and the verb was the only door. Config left `/etc` entirely
+    /// (`docs/config-namespace.md`) and the guard went with it; the assertion
+    /// is that the door is now the same one every other file uses.
     #[tokio::test]
     async fn a_file_tool_write_reaches_config_and_show_sees_it() {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let body = "bg = \"#0d0d0d\"\n";
 
-        // The path guard is what stood in the way; assert it lets config through.
-        assert!(
-            crate::file_tools::path::deny_etc_write("/etc/config/theme.toml").is_none(),
-            "config must be an ordinary write surface for the file tools"
-        );
-
         // Write it the way a file tool does — straight through the VFS.
-        d.write_config_content("/etc/config/theme.toml", body)
+        d.write_config_content("/config/kernel/theme.toml", body)
             .await
             .expect("config is writable through the VFS");
 

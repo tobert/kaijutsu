@@ -1,7 +1,7 @@
 //! `vi` / `edit` kaish builtin — open a kernel-owned editor session on a path.
 //!
 //! The canonical, ergonomic front door to the editor surface (`docs/vi.md`).
-//! `vi /etc/rc/coder/create/S00-stance.kai` resolves the path to its owning
+//! `vi /config/rc/coder/create/S00-stance.kai` resolves the path to its owning
 //! block and opens a session, returning the session handle + initial state. It
 //! does **no editing logic of its own** — it is a thin alias onto the kernel's
 //! shared `editor_open` primitive, the same primitive `kj editor open` and (when
@@ -70,7 +70,7 @@ impl Tool for ViBuiltin {
         )
         .example(
             "Edit a coder stance script",
-            "vi /etc/rc/coder/create/S00-stance.kai",
+            "vi /config/rc/coder/create/S00-stance.kai",
         )
     }
 
@@ -170,10 +170,10 @@ mod tests {
     use kaish_kernel::ExecuteOptions;
 
     /// Unique rc path (parse_rc_path needs SXX-name form), off the seeded tree.
-    const P: &str = "/etc/rc/vitest/create/S00-foo.kai";
+    const P: &str = "/config/rc/vitest/create/S00-foo.kai";
 
     /// Build an `EmbeddedKaish` wired with the `vi` + `edit` builtins against the
-    /// rc dispatcher (so `/etc/rc` is the real ConfigDocFs mount).
+    /// rc dispatcher (so `/config/rc` is the real ConfigDocFs mount).
     async fn embedded_with_vi(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
         let blocks = dispatcher.block_store().clone();
         let kernel = dispatcher.kernel().clone();
@@ -269,7 +269,7 @@ mod tests {
     async fn vi_on_a_missing_config_path_fails_loud() {
         let d = Arc::new(test_dispatcher_rc().await);
         let kaish = embedded_with_vi(d.clone(), ContextId::new()).await;
-        let missing = "/etc/rc/vitest/create/S99-nope.kai";
+        let missing = "/config/rc/vitest/create/S99-nope.kai";
         let res = kaish
             .execute_with_options(&format!("vi {missing}"), ExecuteOptions::default())
             .await

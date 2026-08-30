@@ -1,9 +1,9 @@
 //! Embedded default MIDI device profile seeds, seeded onto the kernel-owned
-//! `/etc/midi/devices/<name>` tree (`docs/midi-next.md` "Storage and
+//! `/config/midi/devices/<name>` tree (`docs/midi-next.md` "Storage and
 //! identity", slice 1 step 2).
 //!
 //! Same ownership contract as rc/config (`docs/config-ownership.md`):
-//! the kernel is the **sole owner** of `/etc/midi` — no host file, no
+//! the kernel is the **sole owner** of `/config/midi` — no host file, no
 //! write-through. The bodies live as real files under
 //! `assets/defaults/midi/devices/` and are embedded here via [`include_dir!`],
 //! exactly like `crate::seed_scripts` embeds `assets/defaults/rc/`. The
@@ -15,9 +15,9 @@
 //! ## Path shape
 //!
 //! Each embedded `<name>.md` seeds one canonical path:
-//! `/etc/midi/devices/<name>` — the `.md` extension is dropped. Today that's
+//! `/config/midi/devices/<name>` — the `.md` extension is dropped. Today that's
 //! a single prose+JSON document per device; the mount is the same
-//! directory-capable `ConfigDocFs` backend `/etc/rc` uses, so a device can
+//! directory-capable `ConfigDocFs` backend `/config/rc` uses, so a device can
 //! grow into an rc-style bucket of `SXX-*.{md,kai}` files later
 //! (`docs/midi-next.md` "The core split") without a storage migration — only
 //! this collector (and `kj midi list/show`'s traversal) would need to widen
@@ -35,7 +35,7 @@
 
 use include_dir::{include_dir, Dir, DirEntry};
 
-/// The embedded `/etc/midi/devices` seed tree — a 1:1 mirror of
+/// The embedded `/config/midi/devices` seed tree — a 1:1 mirror of
 /// `assets/defaults/midi/devices/`, embedded at build time.
 static MIDI_DEVICE_SEED_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/../../assets/defaults/midi/devices");
@@ -44,7 +44,7 @@ static MIDI_DEVICE_SEED_DIR: Dir<'static> =
 /// [`kaijutsu_types::paths::MIDI_ROOT`] — the single source of truth.
 pub use kaijutsu_types::paths::MIDI_ROOT as MIDI_VFS_ROOT;
 
-/// Strip the `/etc/midi/devices/` prefix from a canonical device path.
+/// Strip the `/config/midi/devices/` prefix from a canonical device path.
 /// Returns `None` for a path that isn't a direct child of the devices tree
 /// (including the devices dir itself, which has no seed body of its own).
 fn device_name(canonical: &str) -> Option<&str> {
@@ -55,7 +55,7 @@ fn device_name(canonical: &str) -> Option<&str> {
 }
 
 /// Recursively collect every embedded `<name>.md` seed file as
-/// `(canonical /etc/midi/devices/<name> path, body)`. Only `.md` files are
+/// `(canonical /config/midi/devices/<name> path, body)`. Only `.md` files are
 /// seeds today (the static prose+JSON profile half of the future rc-style
 /// bucket split, `docs/midi-next.md`) — a stray non-`.md` asset under the
 /// seed tree is skipped rather than silently seeded under the wrong shape.
@@ -140,13 +140,13 @@ mod tests {
 
     #[test]
     fn seed_body_resolves_and_rejects_unknown() {
-        let minibrute = seed_body("/etc/midi/devices/minibrute").expect("minibrute must seed");
+        let minibrute = seed_body("/config/midi/devices/minibrute").expect("minibrute must seed");
         assert!(minibrute.contains("MiniBrute"));
-        assert!(seed_body("/etc/midi/devices/nonesuch").is_none());
+        assert!(seed_body("/config/midi/devices/nonesuch").is_none());
         // A bare name is not a canonical key.
         assert!(seed_body("minibrute").is_none());
         // Neither is the devices directory itself.
-        assert!(seed_body("/etc/midi/devices").is_none());
+        assert!(seed_body("/config/midi/devices").is_none());
     }
 
     /// Extract every ` ```json ` fenced block from a markdown body, in order.

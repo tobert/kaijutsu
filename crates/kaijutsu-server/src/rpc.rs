@@ -1226,6 +1226,83 @@ fn kernel_data_dir() -> std::path::PathBuf {
     dir
 }
 
+/// Seed one config tree's host directory from its embedded defaults.
+///
+/// Each tree has its own manifest and rc has its own writer (it is the only
+/// tree with composition symlinks to reconstruct), so this is a `match` rather
+/// than one generic call — an unhandled tree is a compile error the day a
+/// fifth is added, not a directory that silently seeds nothing.
+fn seed_config_tree(
+    tree: &str,
+    host_dir: &Path,
+    config_dir: Option<&Path>,
+) -> std::io::Result<usize> {
+    use kaijutsu_kernel::config_seed;
+    use kaijutsu_types::paths;
+
+    match tree {
+        paths::RC_ROOT => kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(host_dir),
+        paths::CONFIG_ROOT => {
+            // `config_dir` is a seed SOURCE, not ongoing ownership: for each
+            // kernel-global file a host file under that dir supplies the body
+            // if present, else the embedded default. Production passes None.
+            // Model config is not here — it is SQL-native (`kj backend`).
+            let entries: Vec<(String, &'static str)> = config_seed::config_seed_files();
+            let overridden: Vec<(String, String)> = entries
+                .iter()
+                .map(|(canonical, embedded)| {
+                    let body = config_seed_override(config_dir, canonical)
+                        .unwrap_or_else(|| (*embedded).to_string());
+                    (canonical.clone(), body)
+                })
+                .collect();
+            seed_owned_entries(paths::CONFIG_ROOT, overridden, host_dir)
+        }
+        paths::CLIENT_ROOT => config_seed::seed_entries_into_dir(
+            paths::CLIENT_ROOT,
+            config_seed::client_seed_files(),
+            host_dir,
+        ),
+        paths::MIDI_ROOT => config_seed::seed_entries_into_dir(
+            paths::MIDI_ROOT,
+            kaijutsu_kernel::midi_seed::seed_files(),
+            host_dir,
+        ),
+        other => Err(std::io::Error::other(format!(
+            "no seed manifest for config tree {other}"
+        ))),
+    }
+}
+
+/// [`kaijutsu_kernel::config_seed::seed_entries_into_dir`] for bodies owned at
+/// runtime rather than embedded — the host-file seed override is the only
+/// producer of those.
+fn seed_owned_entries(
+    tree_root: &str,
+    entries: Vec<(String, String)>,
+    dir: &Path,
+) -> std::io::Result<usize> {
+    let prefix = format!("{tree_root}/");
+    let mut written = 0;
+    for (canonical, body) in entries {
+        let Some(rel) = canonical.strip_prefix(&prefix) else {
+            return Err(std::io::Error::other(format!(
+                "seed entry {canonical} is not under {tree_root}"
+            )));
+        };
+        let dest = dir.join(rel);
+        if dest.symlink_metadata().is_ok() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, body)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 /// Create a BlockStore backed by the shared KernelDb.
 fn create_block_store_with_kernel_db(
     db: Arc<parking_lot::Mutex<KernelDb>>,
@@ -1776,10 +1853,12 @@ pub async fn create_shared_kernel(
     // defaults; the kernel never reads the user's host config). Tests point it
     // at a tempdir to inject config seeds.
     config_dir: Option<&Path>,
-    // Host directory mounted at `/etc/rc`. Required: `config_dir`'s `None`
-    // already means "seed /etc/config from embedded only", and a second
-    // meaning on the same parameter is how a test writes into a real home.
-    rc_dir: &Path,
+    // Where every `/config` tree comes from. Required, and never `Option`:
+    // a kernel with no config trees has no stance scripts and no system
+    // prompt. `config_dir`'s `None` is a different question — it means "seed
+    // the kernel-global tree from embedded defaults only" — and a second
+    // meaning on one parameter is how a test writes into a real home.
+    config_mounts: &crate::config_mounts::ConfigMounts,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
@@ -1901,96 +1980,36 @@ pub async fn create_shared_kernel(
     // or narrow it, update that test's fixture alongside.
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
-    // Mount /etc/rc from a host directory (longest-prefix wins over the
-    // read-only `/`; the host's real /etc is never touched). rc scripts are
-    // ordinary files an editor, `vim`, or git can reach — `docs/rc-on-disk.md`.
-    // Seed the embedded defaults only when the tree is still empty (a genuinely
-    // fresh install); after that the directory is the content: a script you
-    // `rm`'d stays gone, a repo-dropped seed does not resurrect. Recovery is
-    // `kaijutsu-server rc reseed`. Seeding failure is fatal — a kernel
-    // without its stance scripts must not come up pretending all is well.
-    std::fs::create_dir_all(rc_dir)
-        .map_err(|e| capnp::Error::failed(format!("rc tree {}: {e}", rc_dir.display())))?;
-    if dir_is_empty(rc_dir) {
-        let n = kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(rc_dir)
-            .map_err(|e| capnp::Error::failed(format!("rc seed into {}: {e}", rc_dir.display())))?;
-        log::info!("seeded {n} rc script(s) into {} (fresh tree)", rc_dir.display());
-    }
-    kernel.mount(paths::RC_ROOT, LocalBackend::new(rc_dir)).await;
-
-    // Config files (theme/models/mcp.toml + system.md) at /etc/config are
-    // kernel-owned too (slice 2, docs/config-ownership.md): the SAME backend
-    // type as rc, one rule, no host file. Seed the embedded defaults only when
-    // the config namespace is still empty (a genuinely fresh kernel); after that
-    // the kernel owns the content. Per-file recovery is `kj config reset`. Seeding
-    // failure is fatal — a kernel without a system prompt is useless.
-    let config_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
-        documents.clone(),
-        paths::CONFIG_ROOT,
-    );
-    if config_fs.is_empty() {
-        // One-time bootstrap seed of a fresh config namespace. `config_dir`
-        // (when provided) is a seed *source*, NOT ongoing ownership: for each
-        // config file, a host file under that dir supplies the body if present,
-        // else the embedded default. Production passes None → embedded only (the
-        // hard-reset cutover: the kernel never reads the user's host config).
-        // Model config is NOT here — it is SQL-native (`kj backend`).
-        // After this, the kernel is the sole owner — no host read/flush/reload.
-        let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::config_seed_files()
-            .into_iter()
-            .map(|(canonical, embedded)| {
-                let body = config_seed_override(config_dir, &canonical)
-                    .unwrap_or_else(|| embedded.to_string());
-                (canonical, body)
-            })
-            .collect();
-        let n = config_fs
-            .seed_entries(seed)
-            .map_err(|e| capnp::Error::failed(format!("config seed into the kernel failed: {e}")))?;
-        log::info!("seeded {n} config file(s) (fresh kernel)");
-    }
-    kernel.mount(paths::CONFIG_ROOT, config_fs).await;
-
-    // Per-client config at /etc/client (docs/config-ownership.md
-    // "Per-client config"): the SAME kernel-owned backend, one more mount. Seeded
-    // with the shared *client* defaults (the metronome click today) at the mount
-    // root; per-client overrides at /etc/client/<client-id>/… are written lazily
-    // and never seeded (there is no client id at build time). Seed only on a
-    // fresh (empty) namespace — new even on an already-seeded kernel, so a
-    // restart brings the shared defaults up once, then the kernel owns them.
-    let client_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
-        documents.clone(),
-        paths::CLIENT_ROOT,
-    );
-    if client_fs.is_empty() {
-        let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::client_seed_files()
-            .into_iter()
-            .map(|(canonical, embedded)| (canonical, embedded.to_string()))
-            .collect();
-        let n = client_fs.seed_entries(seed).map_err(|e| {
-            capnp::Error::failed(format!("client config seed into the kernel failed: {e}"))
+    // Every configuration tree comes from a host directory named by the mount
+    // registry (`config_mounts`, `docs/config-namespace.md`): `/config/<name>`
+    // is a well-known name, and where it lands is a declaration. Longest-prefix
+    // routing puts these ahead of the read-only `/`, and `/config` itself has no
+    // backend — the mount table lists it from these mount points.
+    //
+    // Each tree is seeded from its embedded defaults only when its directory is
+    // still empty (a genuinely fresh install); after that the directory is the
+    // content, so a file you edited survives and one you deleted stays deleted.
+    // Recovery is `kaijutsu-server rc reseed` for rc and `kj config reset` for a
+    // single config file. Seeding failure is fatal — a kernel without its stance
+    // scripts or its system prompt must not come up pretending all is well.
+    for (tree, host_dir) in config_mounts.resolved() {
+        std::fs::create_dir_all(&host_dir).map_err(|e| {
+            capnp::Error::failed(format!("config tree {tree} at {}: {e}", host_dir.display()))
         })?;
-        log::info!("seeded {n} client config default(s) (fresh kernel)");
+        if dir_is_empty(&host_dir) {
+            let n = seed_config_tree(tree, &host_dir, config_dir).map_err(|e| {
+                capnp::Error::failed(format!("seed {tree} into {}: {e}", host_dir.display()))
+            })?;
+            log::info!("seeded {n} file(s) into {tree} at {} (fresh tree)", host_dir.display());
+        }
+        // Say where a tree came from when it is NOT the default. A tree read
+        // from an unexpected directory is the fact hardest to reconstruct
+        // later from a running kernel.
+        if config_mounts.is_declared(tree) {
+            log::info!("{tree} is declared at {}", host_dir.display());
+        }
+        kernel.mount(tree, LocalBackend::new(&host_dir)).await;
     }
-    kernel.mount(paths::CLIENT_ROOT, client_fs).await;
-
-    // MIDI device profiles at /etc/midi/devices/<name> are kernel-owned too
-    // (docs/midi-next.md "Storage and identity"): the SAME backend type as
-    // rc/config/client, one more mount. Seeded from the embedded profiles
-    // (`assets/defaults/midi/devices/*.md`, `kaijutsu_kernel::midi_seed`) only
-    // when the namespace is still empty (a genuinely fresh kernel); after that
-    // the kernel owns the content. `kj midi list`/`show` read it.
-    let midi_fs = kaijutsu_kernel::runtime::config_doc_fs::ConfigDocFs::new(
-        documents.clone(),
-        paths::MIDI_ROOT,
-    );
-    if midi_fs.is_empty() {
-        let n = midi_fs
-            .seed_entries(kaijutsu_kernel::midi_seed::seed_files())
-            .map_err(|e| capnp::Error::failed(format!("midi seed into the kernel failed: {e}")))?;
-        log::info!("seeded {n} midi device profile(s) (fresh kernel)");
-    }
-    kernel.mount(paths::MIDI_ROOT, midi_fs).await;
 
     // The ephemeral other half of a device: sink-fed presence at
     // /run/midi/<device> (docs/midi-next.md "Presence is sink-fed"). Read-only

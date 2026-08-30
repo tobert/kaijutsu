@@ -24,28 +24,63 @@
 //! to reimplement this check by hand (correctly, as it happens); now there is
 //! one implementation, so a future site can't get it wrong.
 
+/// Parent of every configuration tree. **Has no backend of its own** — the
+/// mount table lists it from the mount points beneath it, so `ls /config`
+/// shows `rc`, `kernel`, `client` and `midi` with nothing serving `/config`
+/// itself.
+///
+/// Each child is a well-known *name* whose host directory is a mount
+/// declaration, not a compiled-in constant. `docs/config-namespace.md` is
+/// canonical.
+///
+/// The four children are siblings rather than a base plus subtrees on
+/// purpose: [`is_or_under`]-style predicates are component-correct but not
+/// sibling-aware, so a root that contained the others would make
+/// `is_config_path("/config/rc/x")` true.
+pub const CONFIG_NAMESPACE_ROOT: &str = "/config";
+
 /// Root of the rc lifecycle-script tree
-/// (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`). An ordinary host
+/// (`/config/rc/<context_type>/<verb>/SXX-name.{kai,md}`). An ordinary host
 /// directory reached through `LocalBackend` — see `docs/rc-on-disk.md`.
-pub const RC_ROOT: &str = "/etc/rc";
+pub const RC_ROOT: &str = "/config/rc";
 
-/// Root of the kernel-owned kernel-global config tree. A flat namespace:
-/// `/etc/config/<name>` (e.g. `theme.toml`, `mcp.toml`).
-pub const CONFIG_ROOT: &str = "/etc/config";
+/// Root of the kernel-global config tree. A flat namespace:
+/// `/config/kernel/<name>` (e.g. `theme.toml`, `mcp.toml`, `system.md`) —
+/// the kernel's own settings, as opposed to a client's or a device's.
+pub const CONFIG_ROOT: &str = "/config/kernel";
 
-/// Root of the kernel-owned per-client config tree. Hierarchical:
-/// `/etc/client/<name>` is the shared client default; `/etc/client/<client_id>/<name>`
-/// is one client's override.
-pub const CLIENT_ROOT: &str = "/etc/client";
+/// Root of the per-client config tree. Hierarchical:
+/// `/config/client/default/<name>` is the shared default,
+/// `/config/client/<client_id>/<name>` is one client's override. The
+/// `default/` level exists so a segment is never ambiguously a filename or a
+/// client id — see [`client_config_path`].
+pub const CLIENT_ROOT: &str = "/config/client";
 
-/// Root of the kernel-owned MIDI device profile tree
-/// (`docs/midi-next.md` "Storage and identity"): kernel sole owner, no host
-/// file, optional embedded seeds for gear we ship knowledge of. Devices live
-/// under `/etc/midi/devices/<name>` — today a single `.md` document per
-/// device, but the tree is directory-capable on the same kernel-owned backend
-/// as `/etc/rc`, so a device can grow into an rc-style bucket of
-/// `SXX-*.{md,kai}` files later without a storage migration.
-pub const MIDI_ROOT: &str = "/etc/midi";
+/// Root of the MIDI device profile tree (`docs/midi-next.md` "Storage and
+/// identity"), with optional embedded seeds for gear we ship knowledge of.
+/// Devices live under `/config/midi/devices/<name>` — today a single `.md`
+/// per device, but the tree is an ordinary directory, so a device can grow
+/// into an rc-style bucket of `SXX-*.{md,kai}` files later without a storage
+/// migration.
+pub const MIDI_ROOT: &str = "/config/midi";
+
+/// Every configuration tree, in mount-declaration order. The one list a
+/// caller iterates to answer "what does `/config` contain" — a fifth tree is
+/// added here and nowhere else.
+pub const CONFIG_TREES: [&str; 4] = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT];
+
+/// The single path component naming a config tree: `/config/rc` → `rc`. This
+/// is also its default directory name under the config root, which is what
+/// makes "declare nothing and every tree is an ordinary subdirectory" true
+/// without a second table mapping one to the other.
+///
+/// `None` for any path that is not one of [`CONFIG_TREES`].
+pub fn config_tree_name(tree_root: &str) -> Option<&'static str> {
+    CONFIG_TREES
+        .into_iter()
+        .find(|t| *t == tree_root)
+        .and_then(|t| t.strip_prefix(&format!("{CONFIG_NAMESPACE_ROOT}/")))
+}
 
 /// Root of the kernel's **ephemeral runtime state** tree. Nothing under `/run`
 /// is kernel-owned, nothing is a host file, and nothing survives a kernel
@@ -104,33 +139,43 @@ pub const R_ROOT: &str = "/r";
 // ---------------------------------------------------------------------
 
 /// The directory a `(context_type, verb)` pair's rc scripts live in:
-/// `/etc/rc/<context_type>/<verb>`.
+/// `/config/rc/<context_type>/<verb>`.
 pub fn rc_dir(context_type: &str, verb: &str) -> String {
     format!("{RC_ROOT}/{context_type}/{verb}")
 }
 
-/// One rc script's canonical path: `/etc/rc/<context_type>/<verb>/<name>`.
+/// One rc script's canonical path: `/config/rc/<context_type>/<verb>/<name>`.
 /// `name` is the full filename (`SXX-name.{kai,md}`).
 pub fn rc_script_path(context_type: &str, verb: &str, name: &str) -> String {
     format!("{}/{name}", rc_dir(context_type, verb))
 }
 
-/// One kernel-global config file's canonical path: `/etc/config/<name>`.
+/// One kernel-global config file's canonical path: `/config/kernel/<name>`.
 pub fn config_path(name: &str) -> String {
     format!("{CONFIG_ROOT}/{name}")
 }
 
+/// The directory name holding the shared client default, as opposed to one
+/// client's override. A real path segment so a client id can never collide
+/// with a config filename.
+pub const CLIENT_DEFAULT_DIR: &str = "default";
+
 /// One client config file's canonical path. `client_id = None` is the shared
-/// default at the mount root (`/etc/client/<name>`); `Some(id)` is that
-/// client's override (`/etc/client/<id>/<name>`).
+/// default (`/config/client/default/<name>`); `Some(id)` is that client's
+/// override (`/config/client/<id>/<name>`).
+///
+/// Both forms are `<root>/<segment>/<name>`. The shared default used to sit at
+/// `<root>/<name>`, which made a segment after the root a filename OR a client
+/// id depending on which happened to be there — survivable on kernel
+/// documents, a collision waiting to happen on a real filesystem.
 pub fn client_config_path(client_id: Option<&str>, name: &str) -> String {
     match client_id {
         Some(id) => format!("{CLIENT_ROOT}/{id}/{name}"),
-        None => format!("{CLIENT_ROOT}/{name}"),
+        None => format!("{CLIENT_ROOT}/{CLIENT_DEFAULT_DIR}/{name}"),
     }
 }
 
-/// One MIDI device profile's canonical path: `/etc/midi/devices/<name>`.
+/// One MIDI device profile's canonical path: `/config/midi/devices/<name>`.
 pub fn midi_device_path(name: &str) -> String {
     format!("{MIDI_ROOT}/devices/{name}")
 }
@@ -218,27 +263,35 @@ mod tests {
 
     #[test]
     fn rc_builders_join_components() {
-        assert_eq!(rc_dir("coder", "create"), "/etc/rc/coder/create");
+        assert_eq!(rc_dir("coder", "create"), "/config/rc/coder/create");
         assert_eq!(
             rc_script_path("coder", "create", "S00-stance.kai"),
-            "/etc/rc/coder/create/S00-stance.kai"
+            "/config/rc/coder/create/S00-stance.kai"
         );
     }
 
     #[test]
     fn config_builder_joins_the_flat_namespace() {
-        assert_eq!(config_path("theme.toml"), "/etc/config/theme.toml");
+        assert_eq!(config_path("theme.toml"), "/config/kernel/theme.toml");
     }
 
     #[test]
     fn client_config_builder_covers_shared_and_override() {
+        // Both forms are `<root>/<segment>/<name>`: the shared default gets a
+        // real `default/` segment so a client id can never be mistaken for a
+        // filename, or a filename for a client id.
         assert_eq!(
             client_config_path(None, "metronome.toml"),
-            "/etc/client/metronome.toml"
+            "/config/client/default/metronome.toml"
         );
         assert_eq!(
             client_config_path(Some("abc-123"), "metronome.toml"),
-            "/etc/client/abc-123/metronome.toml"
+            "/config/client/abc-123/metronome.toml"
+        );
+        assert_eq!(
+            client_config_path(None, "metronome.toml").matches('/').count(),
+            client_config_path(Some("abc-123"), "metronome.toml").matches('/').count(),
+            "shared and override must sit at the same depth, or a segment is ambiguous"
         );
     }
 
@@ -252,7 +305,7 @@ mod tests {
     fn midi_builder_joins_the_devices_namespace() {
         assert_eq!(
             midi_device_path("minibrute"),
-            "/etc/midi/devices/minibrute"
+            "/config/midi/devices/minibrute"
         );
     }
 
@@ -271,24 +324,36 @@ mod tests {
 
     #[test]
     fn predicates_match_root_and_children_only() {
-        assert!(is_rc_path("/etc/rc"));
-        assert!(is_rc_path("/etc/rc/coder/create/S00-stance.md"));
-        assert!(!is_rc_path("/etc/rcfoo"));
-        assert!(!is_rc_path("/etc"));
-        assert!(!is_rc_path("/etc/passwd"));
+        assert!(is_rc_path("/config/rc"));
+        assert!(is_rc_path("/config/rc/coder/create/S00-stance.md"));
+        assert!(!is_rc_path("/config/rcfoo"));
+        assert!(!is_rc_path("/config"));
+        assert!(!is_rc_path("/etc/rc"), "the host's /etc is not ours any more");
 
-        assert!(is_config_path("/etc/config"));
-        assert!(is_config_path("/etc/config/theme.toml"));
-        assert!(!is_config_path("/etc/configuration"));
+        assert!(is_config_path("/config/kernel"));
+        assert!(is_config_path("/config/kernel/theme.toml"));
+        assert!(!is_config_path("/config/kernelish"));
 
-        assert!(is_client_path("/etc/client"));
-        assert!(is_client_path("/etc/client/metronome.toml"));
-        assert!(is_client_path("/etc/client/abc-123/metronome.toml"));
-        assert!(!is_client_path("/etc/clientele"));
+        assert!(is_client_path("/config/client"));
+        assert!(is_client_path("/config/client/default/metronome.toml"));
+        assert!(is_client_path("/config/client/abc-123/metronome.toml"));
+        assert!(!is_client_path("/config/clientele"));
 
-        assert!(is_midi_path("/etc/midi"));
-        assert!(is_midi_path("/etc/midi/devices/minibrute"));
-        assert!(!is_midi_path("/etc/midifoo"));
+        assert!(is_midi_path("/config/midi"));
+        assert!(is_midi_path("/config/midi/devices/minibrute"));
+        assert!(!is_midi_path("/config/midifoo"));
+
+        // The four are SIBLINGS, never nested: a root that contained the
+        // others would make every predicate below it true. This is why the
+        // kernel-global tree is `/config/kernel` and not `/config` itself.
+        for path in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
+            let others = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT]
+                .into_iter()
+                .filter(|r| *r != path)
+                .filter(|r| is_or_under(path, r))
+                .collect::<Vec<_>>();
+            assert!(others.is_empty(), "{path} must not sit under {others:?}");
+        }
 
         assert!(is_midi_run_path("/run/midi"));
         assert!(is_midi_run_path("/run/midi/keystep-pro"));
@@ -326,14 +391,16 @@ mod tests {
     /// added to one side and not the other is exactly the drift that reverted
     /// an edit under this predicate's predecessor (`docs/file-buffers.md`).
     #[test]
-    fn is_config_doc_root_covers_exactly_the_four_shadowed_etc_trees() {
+    fn is_config_doc_root_covers_exactly_the_four_config_trees() {
         for root in [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT] {
-            assert!(is_config_doc_root(root), "{root} must be a config-doc root");
+            assert!(is_config_doc_root(root), "{root} must be a config root");
         }
-        assert!(is_config_doc_root("/etc/rc/coder/create/S00.kai"));
-        assert!(is_config_doc_root("/etc/config/theme.toml"));
-        assert!(is_config_doc_root("/etc/client/metronome.toml"));
-        assert!(is_config_doc_root("/etc/midi/devices/minibrute"));
+        assert!(is_config_doc_root("/config/rc/coder/create/S00.kai"));
+        assert!(is_config_doc_root("/config/kernel/theme.toml"));
+        assert!(is_config_doc_root("/config/client/default/metronome.toml"));
+        assert!(is_config_doc_root("/config/midi/devices/minibrute"));
+        // The namespace parent has no backend and is not itself a root.
+        assert!(!is_config_doc_root(CONFIG_NAMESPACE_ROOT));
         assert!(!is_config_doc_root("/etc"));
         assert!(!is_config_doc_root("/etc/passwd"));
         assert!(!is_config_doc_root(MIDI_RUN_ROOT), "the ephemeral presence tree is not a doc root");

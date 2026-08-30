@@ -19,7 +19,7 @@ async fn empty_kernel_seeds_one_root_director_context() {
     // → an empty KernelDb, so the ROOT bootstrap must fire.
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         None,
-        &tmp.path().join("etc").join("rc"),
+        &kaijutsu_server::config_mounts::ConfigMounts::new(tmp.path().join("config")),
         Some(tmp.path()),
     )
         .await

@@ -81,7 +81,7 @@ pull re-routes bindings automatically.
 **Profiles are rc-style buckets, not single files (Amy, 2026-07-15).** The
 first TiMidity draft exposed it: a static `settings` section bakes in
 host-current facts (which box, which client) that don't carry to the next
-machine TiMidity runs on. So `/etc/midi/devices/<name>/` is a bucket of
+machine TiMidity runs on. So `/config/midi/devices/<name>/` is a bucket of
 `SXX-*.{md,kai}` exactly like rc: **static knowledge is `.md`** (capabilities,
 skill prose — document ground truth), **the current picture is `.kai`
 output** (locate the device now, synthesize settings from live state). The
@@ -111,7 +111,7 @@ Everything needed already exists:
 
 - **rc symlinks are the injection mechanism.** A `subharmonicon`
   context_type's rc bucket symlinks the profile
-  (`ln -s /etc/midi/devices/subharmonicon /etc/rc/subharmonicon/create/S20-device.md`);
+  (`ln -s /config/midi/devices/subharmonicon /config/rc/subharmonicon/create/S20-device.md`);
   the `.md` routes into the system-prompt slot at hydrate. No new machinery —
   init.d-style composition doing its job.
 - **The narrow loadout is what makes a cheap model workable.** The chameleon
@@ -173,7 +173,7 @@ tweaks. Side channel now, promotable later.
 
 ## Storage and identity
 
-- **`/etc/midi/devices/<name>`** — kernel-owned per
+- **`/config/midi/devices/<name>`** — kernel-owned per
   `docs/config-ownership.md`: kernel sole owner, edited via `kj` (a
   `kj midi` verb family), no host files. Optional embedded seeds for gear we
   ship knowledge of.
@@ -445,7 +445,7 @@ Three moves change that:
    1. ~~Verify the shipped hotplug/ear path against live gear~~ — **done
       2026-08-02** on moltar: rack power-on auto-subscribed KeyLab + KSP,
       zero changes.
-   2. Embed the `assets/defaults/midi/devices/` seeds; `/etc/midi/devices/`
+   2. Embed the `assets/defaults/midi/devices/` seeds; `/config/midi/devices/`
       namespace; `kj midi list|show`. Draft **KeyStep Pro** and **KeyLab**
       profiles alongside the existing minibrute/timidity seeds — live bench
       gear beats the roster order.

@@ -1,6 +1,8 @@
 # The config namespace — `/config` as a bind-mount registry
 
-**Status: shape ruled 2026-08-29, unbuilt.** This supersedes
+**Status: built 2026-08-29.** The registry, the namespace move and the melt
+of all four trees have landed; `ConfigDocFs` deletion and the `DocKind::Symlink`
+retirement follow. This supersedes
 `docs/config-ownership.md`, whose premise — the kernel is the sole owner and
 there is no host file — stops being true when this lands. It continues
 `docs/rc-on-disk.md`, which melted rc and left the other three roots.
@@ -13,12 +15,16 @@ declaration, not a compiled-in constant.**
 ```
 /config/            # no backend of its own — listed from its mount points
     rc/             # lifecycle scripts
-    midi/           # device profiles
-    client/         # per-client preferences
-    theme.toml      # }
-    mcp.toml        # } the base mount's own files
-    system.md       # }
+    kernel/         # theme.toml, mcp.toml, system.md
+    client/         # default/<name>, <client-id>/<name>
+    midi/           # devices/<name>
 ```
+
+**The four are siblings, never a base plus subtrees.** The kernel-global tree
+is `/config/kernel` rather than `/config` itself because the path predicates
+are component-correct but not sibling-aware: a root containing the others
+would make `is_config_path("/config/rc/x")` true. `paths.rs` carries a test
+asserting no tree sits under another.
 
 Everything under `/config` is a real host directory reached through
 `LocalBackend`. The kernel looks up `/config/rc`; it does not know or care
@@ -64,6 +70,13 @@ kaijutsu-server --mount /config/rc=/home/amy/src/kaijutsu/assets/defaults/rc
 "/config/rc"   = "~/src/kaijutsu/assets/defaults/rc"
 "/config/midi" = "~/sync/kaijutsu-midi"
 ```
+
+An unknown tree name is refused and the error lists the valid ones; a
+malformed `mounts.toml` fails the boot rather than being skipped, because it
+was written on purpose and mounting something else instead is the silent
+fallback this repo refuses. Mounts resolve **before** the "Starting kaijutsu
+server" line, so a bad declaration reports a server that never began rather
+than one that came up and died.
 
 There is no bootstrap cycle: the root comes from a flag or the default, and the
 file inside it only ever names its own children.
@@ -185,10 +198,18 @@ months ago and used once per install.
 change; doing them in sequence would mint a second set of documents nobody
 reads.
 
-1. `kaijutsu-server config export <dir>` — a one-shot subcommand beside
-   `rc reseed`, off the kernel, walking the live documents out to a real
-   directory. `config_export::export_config_tree` + `materialize` already do
-   exactly this and have a lossless round-trip test.
+1. `kj config export <dir>`, **run against a kernel built BEFORE this melt.**
+
+   This is the one ordering that cannot be recovered from. `export_config_tree`
+   walks *documents*; after the melt the trees are `LocalBackend` and hold none,
+   so the verb correctly reports nothing to export — and the documents holding
+   your real theme, `mcp.toml`, and the MIDI profiles pulled from actual
+   hardware are still in `kernel.db`, unreachable, with no verb left that reads
+   them.
+
+   So per machine: deploy a binary at `122fbef4` (or any commit after it and
+   before this melt), run `kj config export <dir>`, and only then deploy the
+   melt with `--config-root <dir>`.
 2. Move `~/.config/kaijutsu/etc/rc/` to the new config root.
 3. Declare the mounts; drop the four `/etc` mounts.
 4. Delete the table above.

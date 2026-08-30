@@ -120,7 +120,7 @@ on restart). `execution.rs` — `ExecContext`/`ExecResult` data shims.
 `config_doc.rs`, `config_seed.rs` — config and rc as kernel documents, one per
 path, with no host file and no write-through (`docs/config-ownership.md`).
 `seed_presets.rs`, `seed_scripts.rs` — idempotent boot-time seeding (presets; the
-`/etc/rc` tree via `include_dir!`).
+`/config/rc` tree via `include_dir!`).
 
 ---
 
@@ -155,8 +155,9 @@ routes by longest-prefix match, errors on cross-mount rename, and can `freeze()`
 (after which mount/unmount are rejected — mounts are fixed at startup).
 `LocalBackend` (real FS, canonicalized + root-jailed) and `MemoryBackend`
 (in-memory; note it uses a *blocking* `std::sync::RwLock`). Server mount layout
-(`rpc.rs:1019`): read-only `/`, read-write `~/src`, `/tmp`, and `/etc/rc`; then
-frozen.
+(`rpc.rs:1955`, `create_shared_kernel`): read-only `/`, read-write `~/src`,
+`/tmp`, and the `/config` trees (`/config/rc`, `/config/kernel`,
+`/config/client`, `/config/midi`); then frozen.
 
 ### File cache (`src/file_tools/cache.rs:45`)
 
@@ -232,7 +233,7 @@ server.
 ## Lifecycle: how fork/new/drift hook in
 
 Context creation writes `KernelDb` rows, then `DriftRouter::register[_fork]`, then
-runs the **rc lifecycle scripts** under `/etc/rc/<context_type>/<verb>/` (kaish
+runs the **rc lifecycle scripts** under `/config/rc/<context_type>/<verb>/` (kaish
 scripts, sort-key order): `create` on new, `fork` on fork, `drift` on drift,
 `tick` on each beat. These set cache breakpoints, tool bindings, and the
 hydration marker. On fork, `fork_document_filtered` copies the parent document,

@@ -27,6 +27,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use kaijutsu_server::config_mounts::ConfigMounts;
 use kaijutsu_server::constants::DEFAULT_SSH_PORT;
 use kaijutsu_server::{AuthDb, SshServer, SshServerConfig};
 use russh::keys::ssh_key::{self, HashAlg};
@@ -53,6 +54,12 @@ COMMANDS:
                                   overwrites those.
 
 OPTIONS:
+    --config-root <DIR>           Where the /config trees live
+                                  (default: ~/.config/kaijutsu/config).
+                                  Each tree is a subdirectory unless declared.
+    --mount <TREE>=<DIR>          Point one tree elsewhere, e.g.
+                                  --mount /config/rc=./assets/defaults/rc.
+                                  Beats <config-root>/mounts.toml.
     --port <PORT>                 SSH port (default: {port})
     --nick <NAME>                 Username for the key (default: derived from fingerprint)
     --help, -h                    Show this help
@@ -99,7 +106,21 @@ async fn main() -> ExitCode {
 
     // Parse command
     if args.len() < 2 {
-        return run_server(DEFAULT_SSH_PORT).await;
+        return run_server(DEFAULT_SSH_PORT, ServerPaths::default()).await;
+    }
+
+    // Server-shaped flags may appear in any order and are consumed before the
+    // subcommand match, so `--mount X=Y --port 2222` and `--port 2222 --mount
+    // X=Y` mean the same thing.
+    let (args, server_paths) = match ServerPaths::take_from(&args) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.len() < 2 {
+        return run_server(DEFAULT_SSH_PORT, server_paths).await;
     }
 
     match args[1].as_str() {
@@ -112,7 +133,7 @@ async fn main() -> ExitCode {
                 .get(2)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_SSH_PORT);
-            run_server(port).await
+            run_server(port, server_paths).await
         }
         "add-key" => cmd_add_key(&args[2..]),
         "remove-user" => cmd_remove_user(&args[2..]),
@@ -124,7 +145,7 @@ async fn main() -> ExitCode {
         arg => {
             // Try parsing as port number for backwards compatibility
             if let Ok(port) = arg.parse::<u16>() {
-                return run_server(port).await;
+                return run_server(port, server_paths).await;
             }
             eprintln!("Unknown command: {}", arg);
             print_usage();
@@ -133,10 +154,73 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_server(port: u16) -> ExitCode {
-    tracing::info!("Starting kaijutsu server on SSH port {}...", port);
+/// The `--config-root` / `--mount` half of the command line: where every
+/// `/config` tree comes from (`docs/config-namespace.md`).
+#[derive(Debug, Default)]
+struct ServerPaths {
+    root: Option<PathBuf>,
+    mounts: Vec<String>,
+}
 
-    let config = SshServerConfig::production(port);
+impl ServerPaths {
+    /// Consume the path flags from `argv`, returning what is left plus what
+    /// was found. Flags are removed so the subcommand match below sees only
+    /// its own arguments.
+    fn take_from(args: &[String]) -> Result<(Vec<String>, Self), String> {
+        let mut out = Vec::with_capacity(args.len());
+        let mut me = Self::default();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--config-root" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or("--config-root needs a directory")?;
+                    me.root = Some(PathBuf::from(v));
+                    i += 2;
+                }
+                "--mount" => {
+                    let v = args.get(i + 1).ok_or("--mount needs <tree>=<dir>")?;
+                    me.mounts.push(v.clone());
+                    i += 2;
+                }
+                other => {
+                    out.push(other.to_string());
+                    i += 1;
+                }
+            }
+        }
+        Ok((out, me))
+    }
+
+    /// Resolve to a registry: the root, then `mounts.toml` inside it, then the
+    /// `--mount` flags, each beating the last.
+    fn into_mounts(self) -> Result<ConfigMounts, String> {
+        let mut mounts =
+            ConfigMounts::new(self.root.unwrap_or_else(ConfigMounts::default_root));
+        mounts.load_declarations()?;
+        for arg in &self.mounts {
+            mounts.set_from_arg(arg)?;
+        }
+        Ok(mounts)
+    }
+}
+
+async fn run_server(port: u16, paths: ServerPaths) -> ExitCode {
+    // Resolve the config mounts BEFORE announcing a start. A bad declaration
+    // is a refusal to boot, and saying "Starting..." first would report a
+    // server that came up and died rather than one that never began.
+    let mounts = match paths.into_mounts() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("config mounts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    tracing::info!("Starting kaijutsu server on SSH port {}...", port);
+    let mut config = SshServerConfig::production(port);
+    config.config_mounts = mounts;
     let server = SshServer::new(config);
 
     if let Err(e) = server.run().await {

@@ -1,7 +1,7 @@
 # Arturia KeyStep Pro — device profile
 
 > Draft seed, authored 2026-08-02 (`docs/midi-next.md` slice 1.2); seeded to
-> `/etc/midi/devices/keystep-pro`. Convention: MIDI channels
+> `/config/midi/devices/keystep-pro`. Convention: MIDI channels
 > are **1–16** in every profile (the wire byte is channel−1). Match strings are
 > **backend-neutral** — port display-name substrings and USB `vendor:product`
 > IDs only, never ALSA client numbers (2026-08-02 amendment).

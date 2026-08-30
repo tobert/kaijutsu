@@ -11,35 +11,39 @@ embodied — never preached — in the model-facing rc stances.)
 ## Stance
 
 The kernel restates the cybernetic / 改善 / TDD posture in its own rc lifecycle:
-`/etc/rc/coder/create/S00-stance.kai` reaches the model via the system-prompt slot for
-every context with `context_type=coder`.
+`/config/rc/coder/create/S00-stance.kai` reaches the model via the
+system-prompt slot for every context with `context_type=coder`.
 
-**rc is host files. Just write the file.** rc scripts live under
-`~/.config/kaijutsu/etc/rc/`, mounted at `/etc/rc` through `LocalBackend`, and
-carry **no capability of their own** — the file tools, the editor, host `vim`,
-and git all reach them, and `file:write` is what governs the ones that route
-through the kernel. Every lifecycle run reads the latest body from disk.
-Change the shipped default by editing `assets/defaults/rc/` (the in-repo
-seed), then `kaijutsu-server rc reseed [--force]` to materialize it — Amy
-reseeds regularly, so treat the host tree as a materialization of the seed
-rather than a place to accumulate hand edits.
+**Config is host files. Just write the file.** All four trees — `/config/rc`,
+`/config/kernel`, `/config/client`, `/config/midi` — are ordinary host
+directories reached through `LocalBackend`, and carry **no capability of their
+own**. The file tools, the editor, host `vim` and git all reach them, and
+`file:write` is what governs the ones that route through the kernel. Every
+lifecycle run reads the latest body from disk.
 
-**Config works the same way**, and has since 2026-08-15. `/etc/config`,
-`/etc/client` and `/etc/midi` are ordinary write surfaces for the file tools
-and the editor — no `kj config set`/`edit`, no `config-write` capability.
-`kj config` keeps only what has no file-tool equivalent: `list`, `show`, and
-`reset` (restore the embedded default). Unlike rc, `/etc/config` is local,
+**A `/config` path is a well-known name; where it comes from is a mount
+declaration** — `--config-root <dir>`, a `mounts.toml` inside it, or
+`--mount /config/rc=<dir>`. Declare nothing and every tree is an ordinary
+subdirectory of one root. `/config` itself has no backend: the mount table
+lists it from the mount points beneath it. `docs/config-namespace.md` is
+canonical.
+
+Change a shipped default by editing `assets/defaults/` (the in-repo seed),
+then `kaijutsu-server rc reseed [--force]` to materialize rc — Amy reseeds
+regularly, so treat the host rc tree as a materialization of the seed rather
+than a place to accumulate hand edits. A reseed **names** every file it
+leaves alone that differs from its default, so a tree pointed somewhere
+unexpected says so. `kj config` keeps only what has no file-tool equivalent:
+`list`, `show`, `reset` (restore the embedded default) and `export` (write the
+trees out to a host directory). Unlike rc, `/config/kernel` is local,
 snowflake, and points at secrets — never reseed over it.
 
 **Single kernel ownership is the invariant**, whatever the storage: config
 must never have two competing sources of truth.
 
-*Where the melt stands* (`docs/rc-on-disk.md` is canonical): rc is on disk,
-`rc-write` is deleted, and hook bodies are path references read at fire time.
-`/etc/config`, `/etc/client` and `/etc/midi` are **still kernel documents** —
-`docs/config-ownership.md` still describes those three, and `ConfigDocFs` and
-`DocKind::Symlink` are deleted when they melt. Do not build new machinery on
-the parts that melt deletes.
+**kaijutsu does not squat `/etc`.** The host's `/etc` is a plain read-only
+host path, and the `deny_etc_write` guard that drew a line inside it is gone
+with the move.
 
 **Permission to get simpler** (Amy, 2026-08-15): *"If the agent can see the
 files and edit them, that's fine, we don't need to complicate it just because
@@ -332,7 +336,7 @@ Published in kaijutsu:
 - **MCP tool schemas.** Tool and parameter descriptions reach every connected
   client.
 - **`docs/kj-help/`.** Help topics, read by models mid-task.
-- **rc scripts** under `/etc/rc` — a `.md` block lands in the system-prompt
+- **rc scripts** under `/config/rc` — a `.md` block lands in the system-prompt
   slot. This is the most expensive prose in the repo; every token competes.
 - **Error blocks.** `BlockKind::Error` text is read by the model that caused it.
 

@@ -647,7 +647,7 @@ impl Tool for KjBuiltin {
         // Stdin → --content for `kj rc add`/`edit`. Lets shell pipelines
         // author multi-line .md / .kai scripts without the
         // `--content "$(cat …)"` dance:
-        //   cat prompt.md | kj rc add /etc/rc/coder/create/S00-stance.md
+        //   cat prompt.md | kj rc add /config/rc/coder/create/S00-stance.md
         // Only kicks in when --content was not given explicitly. `kj config
         // set`/`edit` were here too until config stopped having write verbs;
         // a config body now goes to `builtin.file:write` like any other file.
@@ -1105,7 +1105,7 @@ mod tests {
         // Inert banner: proves the lifecycle ran (pre-fix) or was refused (post-fix).
         install_rc_script_file(
             &dispatcher,
-            "/etc/rc/rdtest/create/S00-banner.md",
+            "/config/rc/rdtest/create/S00-banner.md",
             "rdtest-would-run",
         )
         .await;
@@ -1185,7 +1185,7 @@ mod tests {
         let home = register_context(&dispatcher, Some("chain-home"), None, principal);
         install_rc_script_file(
             &dispatcher,
-            "/etc/rc/chaintest/create/S00-recreate.kai",
+            "/config/rc/chaintest/create/S00-recreate.kai",
             "kj context create \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
         )
         .await;
@@ -1481,15 +1481,15 @@ mod tests {
         let stdout = res.text_out();
 
         assert!(
-            stdout.contains("/etc/rc/default/"),
+            stdout.contains("/config/rc/default/"),
             "filtered list should include default paths: {stdout}"
         );
         // The filter must EXCLUDE other types — the whole point of --type.
         for other in [
-            "/etc/rc/coder/",
-            "/etc/rc/mcp/",
-            "/etc/rc/director/",
-            "/etc/rc/toolie/",
+            "/config/rc/coder/",
+            "/config/rc/mcp/",
+            "/config/rc/director/",
+            "/config/rc/toolie/",
         ] {
             assert!(
                 !stdout.contains(other),
@@ -1883,8 +1883,8 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
         let script = r#"
-            echo 'hello from pipe' | kj rc add /etc/rc/stditest/create/S00-from-pipe.kai
-            kj rc show /etc/rc/stditest/create/S00-from-pipe.kai
+            echo 'hello from pipe' | kj rc add /config/rc/stditest/create/S00-from-pipe.kai
+            kj rc show /config/rc/stditest/create/S00-from-pipe.kai
         "#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
@@ -1916,8 +1916,8 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
         let script = r#"
-            echo 'from stdin' | kj rc add /etc/rc/stditest2/create/S00-flag-wins.kai --content 'from flag'
-            kj rc show /etc/rc/stditest2/create/S00-flag-wins.kai
+            echo 'from stdin' | kj rc add /config/rc/stditest2/create/S00-flag-wins.kai --content 'from flag'
+            kj rc show /config/rc/stditest2/create/S00-flag-wins.kai
         "#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
@@ -1952,8 +1952,8 @@ mod tests {
         let ctx = register_context(&dispatcher, Some("jsonliteralhost"), None, principal);
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
-        let path = "/etc/rc/jsonliteral/create/S00-x.kai";
-        let script = r#"kj rc add /etc/rc/jsonliteral/create/S00-x.kai --content "--json""#;
+        let path = "/config/rc/jsonliteral/create/S00-x.kai";
+        let script = r#"kj rc add /config/rc/jsonliteral/create/S00-x.kai --content "--json""#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
             .await
@@ -2003,7 +2003,7 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
         let script =
-            r#"kj rc add /etc/rc/jsonboth/create/S00-x.kai --content "--json" --json"#;
+            r#"kj rc add /config/rc/jsonboth/create/S00-x.kai --content "--json" --json"#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
             .await
@@ -2020,7 +2020,7 @@ mod tests {
 
         let show = kaish
             .execute_with_options(
-                "kj rc show /etc/rc/jsonboth/create/S00-x.kai --json",
+                "kj rc show /config/rc/jsonboth/create/S00-x.kai --json",
                 ExecuteOptions::default(),
             )
             .await

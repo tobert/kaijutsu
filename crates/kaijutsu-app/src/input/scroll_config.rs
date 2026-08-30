@@ -18,7 +18,7 @@
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::prelude::*;
 
-/// Per-client scroll gains, resolved from `/etc/client/scroll.toml` — a
+/// Per-client scroll gains, resolved from `/config/client/default/scroll.toml` — a
 /// plain, kernel-owned file written through the file tools
 /// (`docs/config-ownership.md` "Per-client config"). Serde `default` makes
 /// every field optional in the TOML — falls back to the shipped gains — so
@@ -74,7 +74,7 @@ pub fn wheel_delta_px(unit: MouseScrollUnit, y: f32, scale_factor: f32, cfg: &Sc
 
 /// Apply a per-client `scroll.toml` fetched over RPC (the bootstrap sends it
 /// as [`RpcResultMessage::ScrollConfigReceived`][crate::connection::actor_plugin::RpcResultMessage::ScrollConfigReceived],
-/// resolved through the `/etc/client/<id>/…` → `/etc/client/…` cascade). A
+/// resolved through the `/config/client/<id>/…` → `/config/client/…` cascade). A
 /// parse failure keeps the current config and logs loudly — never a silent
 /// revert to the shipped gains (mirrors `metronome::apply_metronome_config`).
 pub fn apply_scroll_config(

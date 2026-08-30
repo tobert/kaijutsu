@@ -213,6 +213,6 @@ candidates, not commitments.
 - **Hook fingerprinting / trust.** The approval ledger's recorded digest is the
   integrity model but there's no change-detection warning when an rc/hook body
   changes on disk — a file write, `kaijutsu-server rc reseed --force`, or a
-  `git checkout` in `~/.config/kaijutsu/etc/rc/` all land silently (extends the
+  `git checkout` in `~/.config/kaijutsu/config/rc/` all land silently (extends the
   existing "stale rc seed" item). gemini fingerprints project hooks and warns
   on change. Track hook-body hashes; warn/block-by-default on unexpected change.

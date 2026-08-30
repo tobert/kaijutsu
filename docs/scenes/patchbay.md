@@ -22,7 +22,7 @@ namespace), `docs/mounts.md` (the wire-ownership note), `docs/midi.md`
 - **Per-client, by nature.** The audio graph is machine-local; each client's
   patch bay shows *its own* fabric. Anything durable is **ClientId-keyed**
   (decided during the metronome/per-client-config work — don't re-litigate;
-  precedent: `client_views` in `kernel_db.rs`, namespace: `/etc/client/`).
+  precedent: `client_views` in `kernel_db.rs`, namespace: `/config/client/`).
 - **Endpoints are symbolic names, resolved live.** The app's own source
   endpoint is the ALSA seq port opened by `MidiOut::open()` in
   `crates/kaijutsu-app/src/dj/midi.rs` (client `"kaijutsu-app"`, port

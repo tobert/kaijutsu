@@ -1,7 +1,7 @@
 # TiMidity++ (zorak) — device profile
 
 > Draft seed, authored 2026-07-15 (`docs/midi-next.md` slice 1); seeded to
-> `/etc/midi/devices/timidity` since 2026-08-02. Convention: MIDI channels
+> `/config/midi/devices/timidity` since 2026-08-02. Convention: MIDI channels
 > are **1–16** in every profile (the wire byte is channel−1). Match strings
 > are **backend-neutral** — port display-name substrings only for a software
 > synth (2026-08-02 amendment; never ALSA client numbers). This is the

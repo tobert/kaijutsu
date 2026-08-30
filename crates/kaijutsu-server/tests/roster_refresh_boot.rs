@@ -31,7 +31,7 @@ async fn boot_refreshes_the_roster_without_a_reader() {
 
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         None,
-        &tmp.path().join("etc").join("rc"),
+        &kaijutsu_server::config_mounts::ConfigMounts::new(tmp.path().join("config")),
         Some(tmp.path()),
     )
         .await
@@ -67,7 +67,7 @@ async fn dropping_the_shared_kernel_cancels_the_refresh_loop() {
 
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         None,
-        &tmp.path().join("etc").join("rc"),
+        &kaijutsu_server::config_mounts::ConfigMounts::new(tmp.path().join("config")),
         Some(tmp.path()),
     )
         .await

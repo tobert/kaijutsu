@@ -102,8 +102,8 @@ async fn file_tool(
 //
 // Production mounts `/` read-only over the whole filesystem (`rpc.rs`:
 // `kernel.mount("/", LocalBackend::read_only("/"))`). `/opt` isn't covered
-// by any of the writable overrides (`~/src`, `/tmp`, `/etc/rc`, `/etc/config`,
-// `/etc/client`, `/etc/midi`, `/run/midi`), so a probe there exercises the
+// by any of the writable overrides (`~/src`, `/tmp`, `/config/rc`, `/config/kernel`,
+// `/config/client`, `/config/midi`, `/run/midi`), so a probe there exercises the
 // exact same read-only mount a real deployment relies on — not a synthetic
 // stand-in for it.
 

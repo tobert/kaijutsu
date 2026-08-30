@@ -682,7 +682,7 @@ fn test_rpc_created_context_runs_rc_create() {
 
         // Create a context with the "coder" mode bundle over the RPC path —
         // the same path the GUI app and MCP facade take. Its rc create
-        // lifecycle (`/etc/rc/coder/create/S00-stance.kai`) emits the coder
+        // lifecycle (`/config/rc/coder/create/S00-stance.kai`) emits the coder
         // stance as a System/Text block via `kj block create`.
         let ctx = kernel
             .create_context_typed("rc-coder", "coder")

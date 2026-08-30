@@ -334,13 +334,13 @@ pub enum RpcResultMessage {
     /// `view::editor` to advance its ordered keystroke pipe — ship the next
     /// batch, or retry/drop the failed one.
     EditorKeysOutcome { session: u64, ok: bool },
-    /// The per-client metronome config (`/etc/client/<id>/metronome.toml`,
-    /// cascading to the shared `/etc/client/metronome.toml`), fetched over RPC on
+    /// The per-client metronome config (`/config/client/<id>/metronome.toml`,
+    /// cascading to the shared `/config/client/default/metronome.toml`), fetched over RPC on
     /// (re)connect. Drained by [`crate::metronome::apply_metronome_config`] into
     /// the `Metronome` resource. Carries the resolved TOML body.
     MetronomeConfigReceived(String),
-    /// The per-client mouse-wheel scroll config (`/etc/client/<id>/scroll.toml`,
-    /// cascading to the shared `/etc/client/scroll.toml`), fetched over RPC on
+    /// The per-client mouse-wheel scroll config (`/config/client/<id>/scroll.toml`,
+    /// cascading to the shared `/config/client/default/scroll.toml`), fetched over RPC on
     /// (re)connect. Drained by
     /// [`crate::input::scroll_config::apply_scroll_config`] into the
     /// `ScrollConfig` resource. Carries the resolved TOML body.
@@ -542,7 +542,7 @@ async fn fetch_startup_configs_with<F, Fut>(
     .await;
 }
 
-/// Shared two-layer (`/etc/client/<id>/<name>` then `/etc/client/<name>`)
+/// Shared two-layer (`/config/client/<id>/<name>` then `/config/client/<name>`)
 /// config fetch used by both the metronome and scroll-gain legs of
 /// [`fetch_startup_configs_with`]. Only surfaces a failure (log + optional
 /// toast) when at least one layer actually errored — both layers coming back

@@ -28,7 +28,7 @@ pub(crate) struct EditorArgs {
 enum EditorCommand {
     /// Open an editor on a path, binding to the kernel block that owns it.
     Open {
-        /// File or rc/config path to edit (e.g. /etc/rc/coder/create/S00.kai).
+        /// File or rc/config path to edit (e.g. /config/rc/coder/create/S00.kai).
         path: String,
     },
     /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>"). A batch
@@ -241,7 +241,7 @@ mod tests {
     use crate::kj::{KjCaller, KjDispatcher, KjResult};
 
     /// Unique rc path (parse_rc_path needs SXX-name form), avoiding the seeded tree.
-    const P: &str = "/etc/rc/editortest/create/S00-foo.kai";
+    const P: &str = "/config/rc/editortest/create/S00-foo.kai";
 
     fn session_of(r: &KjResult) -> u64 {
         match r {
@@ -340,7 +340,7 @@ mod tests {
     /// A second rc path for the capability tests, seeded by a privileged
     /// caller and then driven by an unprivileged, editor-capability-less
     /// caller.
-    const P2: &str = "/etc/rc/editorcaptest/create/S00-foo.kai";
+    const P2: &str = "/config/rc/editorcaptest/create/S00-foo.kai";
 
     /// Bind a fresh, unprivileged context and return a caller for it.
     /// `register_context` seeds a broad test loadout (`*`, `facade:*`,

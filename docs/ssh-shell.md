@@ -10,7 +10,7 @@ to move into real contexts — working with each context's blocks through the VF
 
 Since `docs/slash-v.md` made SFTP a **read-only** view, this shell is now the primary
 interactive surface for two things SFTP no longer does: **privileged writes** (editing
-`/etc/rc`, `/etc/config`) and **acting in** a context. It also mounts the read-only
+`/config/rc`, `/config/kernel`) and **acting in** a context. It also mounts the read-only
 introspection trees `/v/ctx` and `/v/session` from that note, so what SFTP shows
 passively, the shell lets you explore *and* act in. The capability story is already
 solved — see Capability below — so this subsystem is mostly plumbing.
@@ -138,7 +138,7 @@ gated at all, it is authorized by the context it **runs in**
 (`ExecContext.context_id`). The shell gets this for free because each line's kaish is
 materialized with the current context.
 
-**`/etc/rc` is no longer one of those writes.** This section was written when
+**`/config/rc` is no longer one of those writes.** This section was written when
 `context_allows_rc_write(ctx)` gated it; `rc-write` is deleted and rc scripts are host
 files (`docs/rc-on-disk.md`), so an rc write is governed by the mount's `read_only()`
 flag like any other path. The context-resolution question below is unchanged and is
@@ -188,7 +188,7 @@ Playing the shell out, smallest surprises first:
 - **Switch, then write.** Privileged edits are two lines (switch, then write) per the
   Capability rule. Interactive `vi`/`edit` needs a PTY (deferred), so v1 rc editing is
   a non-interactive file write (`builtin.file:write <path>`) — rc scripts are
-  ordinary host files under `~/.config/kaijutsu/etc/rc/` (`docs/rc-on-disk.md`),
+  ordinary host files under `~/.config/kaijutsu/config/rc/` (`docs/rc-on-disk.md`),
   reachable the same way any file is.
 - **Watch a hot block.** `cat /v/ctx/<shard>/<ctx>/blocks/<key>/content` snapshots at
   open and each line re-materializes, so "watch it grow" is a poll loop — no follow

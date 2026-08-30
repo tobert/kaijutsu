@@ -15,7 +15,7 @@
 //!
 //! Resolution is **path-kind aware**, and this is load-bearing, not cosmetic:
 //!
-//! - **config-owned** paths (`/etc/rc/*`, `/etc/config/*`) are sole-owned
+//! - **config-owned** paths (`/config/rc/*`, `/config/kernel/*`) are sole-owned
 //!   single-block [`DocKind::File`] documents
 //!   ([`ConfigDocFs`](crate::runtime::ConfigDocFs)). The kernel *is* the owner —
 //!   there is no host file. We resolve straight to that document's block.
@@ -86,7 +86,7 @@ pub async fn resolve_editor_target(
     mounts: &crate::vfs::MountTable,
 ) -> Result<EditorTarget, String> {
     // Ask the VFS which backend owns this path. The config-doc backends answer
-    // for themselves — no hardcoded `/etc/rc` prefix to drift from the mounts.
+    // for themselves — no hardcoded `/config/rc` prefix to drift from the mounts.
     if let Some((mount_root, fs)) = mounts.owner_of(std::path::Path::new(path)).await
         && fs.owns_config_docs()
     {
@@ -965,7 +965,7 @@ mod tests {
         (shared_block_store_with_db(db.clone(), ws_id, creator), db)
     }
 
-    /// A mount table with the rc `ConfigDocFs` mounted at `/etc/rc` — the
+    /// A mount table with the rc `ConfigDocFs` mounted at `/config/rc` — the
     /// production shape the resolver queries to decide config-ownership.
     async fn mounts_with_rc(blocks: &SharedBlockStore) -> Arc<crate::vfs::MountTable> {
         let mt = crate::vfs::MountTable::new();
@@ -988,7 +988,7 @@ mod tests {
         let mounts = mounts_with_rc(&blocks).await;
         let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
 
-        let full = "/etc/rc/coder/create/S00-stance.kai";
+        let full = "/config/rc/coder/create/S00-stance.kai";
         let target = resolve_editor_target(full, &blocks, &file_cache, &mounts)
             .await
             .expect("rc path resolves to its owning block");
@@ -1013,7 +1013,7 @@ mod tests {
     /// `resolve_editor_target` marks `config_owned` from the mount table's
     /// answer, not a path prefix — so any `ConfigDocFs` root (not just rc)
     /// comes back marked, and an ordinary file never does. Regression for
-    /// B1 (`docs/file-buffers.md`): `:w` on `/etc/client/*`/`/etc/midi/*`
+    /// B1 (`docs/file-buffers.md`): `:w` on `/config/client/*`/`/config/midi/*`
     /// used to revert the edit because a separate, narrower path predicate
     /// disagreed with this exact mount-table answer.
     #[tokio::test]
@@ -1037,7 +1037,7 @@ mod tests {
             .await
             .unwrap();
         let client_target = resolve_editor_target(
-            "/etc/client/theme.toml",
+            "/config/client/theme.toml",
             &blocks,
             &file_cache,
             &mounts,
@@ -1077,7 +1077,7 @@ mod tests {
         // coder/ composes it in via a symlink (absolute target, like the seed).
         rc.symlink(
             Path::new("coder/create/S10-binding.kai"),
-            Path::new("/etc/rc/lib/create/S10-binding.kai"),
+            Path::new("/config/rc/lib/create/S10-binding.kai"),
         )
         .await
         .unwrap();
@@ -1085,13 +1085,13 @@ mod tests {
         let mounts = mounts_with_rc(&blocks).await;
         let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone(), db);
 
-        let link_path = "/etc/rc/coder/create/S10-binding.kai";
+        let link_path = "/config/rc/coder/create/S10-binding.kai";
         let target = resolve_editor_target(link_path, &blocks, &file_cache, &mounts)
             .await
             .expect("symlinked rc path resolves to its target block");
 
         // Binds the TARGET (lib) document — what the executor reads…
-        let target_ctx = config_context_id("/etc/rc/lib/create/S10-binding.kai");
+        let target_ctx = config_context_id("/config/rc/lib/create/S10-binding.kai");
         assert_eq!(
             target.context_id, target_ctx,
             "must bind the symlink target's owner"
@@ -1118,7 +1118,7 @@ mod tests {
         // No document was ever seeded at this path, but the mount table still
         // routes it to the config backend → fail loud (not a file-cache miss).
         let err =
-            resolve_editor_target("/etc/rc/nope/create/S00.kai", &blocks, &file_cache, &mounts)
+            resolve_editor_target("/config/rc/nope/create/S00.kai", &blocks, &file_cache, &mounts)
                 .await
                 .expect_err("a phantom config doc must error, not open an empty editor");
         assert!(
@@ -1141,7 +1141,7 @@ mod session_tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    const RC_PATH: &str = "/etc/rc/coder/create/S00.kai";
+    const RC_PATH: &str = "/config/rc/coder/create/S00.kai";
 
     /// A block store seeded with one rc script (`"hello"`) through its owning
     /// ConfigDocFs backend, plus the resolved editor target for it.

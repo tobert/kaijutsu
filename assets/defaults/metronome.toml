@@ -2,8 +2,8 @@
 # (docs/midi.md "The relative-lead timebase"; docs/config-ownership.md
 # "Per-client config".)
 #
-# This is the shared client default (/etc/client/metronome.toml). A specific
-# client overrides it at /etc/client/<client-id>/metronome.toml; the app reads
+# This is the shared client default (/config/client/default/metronome.toml). A specific
+# client overrides it at /config/client/<client-id>/metronome.toml; the app reads
 # its own first, then falls back here, then to this compiled-in default.
 #
 # Independent of these knobs, the metronome only clicks while it is following a

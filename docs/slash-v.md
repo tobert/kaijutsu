@@ -27,7 +27,7 @@ literal: `grep`, `less`, `ls -l` over live kernel state.
 and `/v/input` are **kaish-side** mounts (`embedded_kaish.rs:300` — objects on each
 materialized kaish's own VFS), *not* kernel-`MountTable` backends, and therefore not
 visible over SFTP. The surfaces in this doc mount on the **kernel `MountTable`**
-(like `/etc/rc`'s `ConfigCrdtFs` and the shipped `/v/cas` `CasFs`), the table every
+(like `/config/rc`'s `ConfigCrdtFs` and the shipped `/v/cas` `CasFs`), the table every
 surface reaches: SFTP serves it directly (`SftpSession::new(principal, vfs)`), kaish
 through `MountBackend` longest-prefix routing. Note for implementers: the kernel
 mount table **freezes** after setup (`MountTable::freeze()`) — new mounts must land
@@ -381,8 +381,8 @@ the current context is ordinary ambient state, like cwd, not a capability token.
 - **Shell / MCP / app** — context is ambient. The shell resolves its current context
   **live** from `SessionContextMap` per operation (a mid-line `kj attach` chains like
   `cd` — `docs/ssh-shell.md`); MCP/app act as the context they have joined, tracked
-  the same live way. Writing `/etc/rc/coder/create/S00-stance.kai` while acting as a
-  privileged context just lands the write — `/etc/rc` carries no capability of
+  the same live way. Writing `/config/rc/coder/create/S00-stance.kai` while acting as a
+  privileged context just lands the write — `/config/rc` carries no capability of
   its own any more. No binding, no TTL, no arm.
 - **SFTP** — writes like anything else now. It carried a lexical deny on
   `/etc/rc` and `/etc/config` while those trees were capability-gated; both

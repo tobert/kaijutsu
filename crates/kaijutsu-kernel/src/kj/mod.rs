@@ -976,7 +976,7 @@ pub(crate) mod test_helpers {
                 .unwrap();
         }
         // One throwaway root holds BOTH the kernel data_dir and the seeded
-        // /etc/rc tree, so the kernel's cleanup guard removes them together when
+        // /config/rc tree, so the kernel's cleanup guard removes them together when
         // the dispatcher (and its kernel) drops — no leaked `/tmp` dirs across
         // repeated test runs. `Kernel::new` takes a required data_dir (no XDG
         // fallback), so a test can never resolve CAS to the user's real store.
@@ -992,7 +992,7 @@ pub(crate) mod test_helpers {
                 .with_timeouts(policy)
                 .with_temp_cleanup(root),
         );
-        // Mount a host-backed /etc/rc tree (LocalBackend). `kj rc` is now
+        // Mount a host-backed /config/rc tree (LocalBackend). `kj rc` is now
         // VFS-direct, so it works over either backend; this keeps the broadly-
         // used dispatcher db-less (a DB-backed block store deadlocks unrelated
         // fork tests — see test_dispatcher_rc). The document-backed backend is
@@ -1003,8 +1003,8 @@ pub(crate) mod test_helpers {
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 
-    /// A dispatcher whose `/etc/rc` (plus `/etc/config`, `/etc/client`, and
-    /// `/etc/midi`) is the **real document-backed backend** ([`ConfigDocFs`]),
+    /// A dispatcher whose `/config/rc` (plus `/config/kernel`, `/config/client`, and
+    /// `/config/midi`) is the **real document-backed backend** ([`ConfigDocFs`]),
     /// seeded from the embedded defaults — the production wiring. Use this for
     /// `kj rc` / `kj config` / `kj midi` / lifecycle tests that must exercise
     /// the kernel-document path end-to-end (readdir over the `documents`
@@ -1041,7 +1041,7 @@ pub(crate) mod test_helpers {
         let rc_fs = crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), RC_ROOT);
         rc_fs.seed_from_embedded().expect("seed rc into the kernel");
         kernel.mount(RC_ROOT, rc_fs).await;
-        // Config files live on the same kernel-owned backend type at /etc/config
+        // Config files live on the same kernel-owned backend type at /config/kernel
         // (slice 2) — seed it too so `kj config` tests exercise the real path.
         let config_fs =
             crate::runtime::config_doc_fs::ConfigDocFs::new(blocks.clone(), CONFIG_ROOT);
@@ -1049,7 +1049,7 @@ pub(crate) mod test_helpers {
             .seed_entries(crate::config_seed::config_seed_files())
             .expect("seed config into the kernel");
         kernel.mount(CONFIG_ROOT, config_fs).await;
-        // Per-client config lives on the same backend type at /etc/client
+        // Per-client config lives on the same backend type at /config/client
         // (mirrors production's `create_shared_kernel` mount trio) — seed and
         // mount it too so `kj config list` tests exercise the real path.
         let client_fs =
@@ -1058,7 +1058,7 @@ pub(crate) mod test_helpers {
             .seed_entries(crate::config_seed::client_seed_files())
             .expect("seed client config into the kernel");
         kernel.mount(CLIENT_ROOT, client_fs).await;
-        // MIDI device profiles live on the same backend type at /etc/midi
+        // MIDI device profiles live on the same backend type at /config/midi
         // (docs/midi-next.md "Storage and identity") — seed and mount it too
         // so `kj midi list/show` tests exercise the real path.
         let midi_fs =
@@ -1085,7 +1085,7 @@ pub(crate) mod test_helpers {
         KjDispatcher::new_with_roster(drift, blocks, kernel_db, kernel, roster)
     }
 
-    /// Install an rc script in the mounted `/etc/rc` tree, through the same
+    /// Install an rc script in the mounted `/config/rc` tree, through the same
     /// VFS-direct path `kj rc` uses (write straight to the kernel-owned backend,
     /// no FileDocumentCache mirror).
     pub async fn install_rc_script_file(dispatcher: &KjDispatcher, path: &str, content: &str) {

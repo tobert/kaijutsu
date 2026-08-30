@@ -17,7 +17,7 @@
 //! Three deliberate properties:
 //!
 //! - **The app matches, the kernel records.** Profiles reach us the way any
-//!   config does (a VFS read of `/etc/midi/devices/<name>`); the *matching*
+//!   config does (a VFS read of `/config/midi/devices/<name>`); the *matching*
 //!   is a pure function ([`crate::midi_match`]) so the CoreMIDI backend
 //!   reuses it; only the outcome crosses the wire.
 //! - **Unplug is first class.** A device that stops matching is reported
@@ -42,7 +42,12 @@ use crate::midi_match::{DeviceMatch, MatchedPort, PortFacts, match_ports, parse_
 
 /// Where device profiles live. The durable half of a device; `/run/midi` (the
 /// kernel's ephemeral half) is written by our reports.
-const DEVICES_DIR: &str = "/etc/midi/devices";
+/// Derived from the shared path builder rather than written out, so the app
+/// cannot drift from the kernel's device tree when a root moves.
+static DEVICES_DIR: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let one = kaijutsu_types::paths::midi_device_path("x");
+    one.rsplit_once('/').expect("device path has a parent").0.to_string()
+});
 
 /// This sink's platform backend, as reported to the kernel. One line to
 /// change when the CoreMIDI backend lands (`docs/midi-next.md` "Platform
@@ -143,7 +148,7 @@ pub struct PresenceReport {
 pub struct MidiPresenceState {
     profiles: Vec<DeviceMatch>,
     /// True once a profile fetch has completed (even with zero profiles —
-    /// a kernel with no `/etc/midi` mount is a valid, matchable-nothing rig).
+    /// a kernel with no `/config/midi` mount is a valid, matchable-nothing rig).
     profiles_loaded: bool,
     fetch_in_flight: bool,
     /// device → last state we told the kernel about.
@@ -264,13 +269,13 @@ fn fetch_profiles(
         .spawn(async move {
             let mut profiles = Vec::new();
             let mut errors = Vec::new();
-            match handle.vfs_snapshot(DEVICES_DIR, 1, MAX_PROFILES).await {
+            match handle.vfs_snapshot(&DEVICES_DIR, 1, MAX_PROFILES).await {
                 Ok(listing) => {
                     for child in listing.root.children.iter() {
                         if child.kind != kaijutsu_client::VfsFileType::File {
                             continue;
                         }
-                        let path = format!("{DEVICES_DIR}/{}", child.name);
+                        let path = format!("{}/{}", *DEVICES_DIR, child.name);
                         match handle.vfs_read_all(path.clone()).await {
                             Ok(bytes) => match String::from_utf8(bytes) {
                                 Ok(doc) => match parse_profile(&child.name, &doc) {
@@ -286,7 +291,7 @@ fn fetch_profiles(
                         }
                     }
                 }
-                Err(e) => errors.push(format!("{DEVICES_DIR}: listing failed: {e}")),
+                Err(e) => errors.push(format!("{}: listing failed: {e}", *DEVICES_DIR)),
             }
             let _ = tx.send(ProfileFetch { profiles, errors });
         })
@@ -300,8 +305,9 @@ fn drain_profiles(mut state: ResMut<MidiPresenceState>, channel: Res<ProfileChan
             warn!("MIDI presence: {e}");
         }
         info!(
-            "MIDI presence: {} device profile(s) loaded from {DEVICES_DIR}",
-            fetch.profiles.len()
+            "MIDI presence: {} device profile(s) loaded from {}",
+            fetch.profiles.len(),
+            *DEVICES_DIR
         );
         state.profiles = fetch.profiles;
         state.profiles_loaded = true;

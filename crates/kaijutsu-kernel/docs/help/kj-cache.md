@@ -37,7 +37,7 @@ the cap with a `tracing::warn` line.
 
 ## rc env vars
 
-rc lifecycle scripts (`/etc/rc/<context_type>/<verb>/SXX-*.kai`)
+rc lifecycle scripts (`/config/rc/<context_type>/<verb>/SXX-*.kai`)
 receive these variables from the kernel (see
 `kaijutsu-kernel/src/kj/lifecycle.rs`):
 
@@ -57,7 +57,7 @@ receive these variables from the kernel (see
 ### rc-on-create — durable per-session targets
 
 ```sh
-# /etc/rc/default/create/S20-cache.kai
+# /config/rc/default/create/S20-cache.kai
 kj cache add --target tools  --ttl extended    # fixed toolset → 1h
 kj cache add --target system --ttl ephemeral   # may drift → 5m
 ```
@@ -65,7 +65,7 @@ kj cache add --target system --ttl ephemeral   # may drift → 5m
 ### rc-on-fork — cache the prefix shared with parent
 
 ```sh
-# /etc/rc/default/fork/S30-cache.kai
+# /config/rc/default/fork/S30-cache.kai
 # The last shared message with the parent is at index N-1, where
 # N is the parent's block count at fork time.
 kj cache add \
@@ -77,7 +77,7 @@ kj cache add \
 ### rc-on-drift — clear and rebuild
 
 ```sh
-# /etc/rc/default/drift/S40-cache.kai
+# /config/rc/default/drift/S40-cache.kai
 # Drift events (compact, model swap, doc inject) reshape the
 # conversation — old MessageIndex breakpoints point at the wrong
 # message now. Clear and re-seed the stable bits.

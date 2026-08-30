@@ -65,7 +65,7 @@ block (file doc at `:9`). `// ===` banners are the navigation aid. (Splitting it
 tracked in [issues](../issues.md).)
 
 `create_shared_kernel` (`:974`) is the whole-stack constructor: FlowBus → KernelDb
-→ Kernel → mounts (RO `/`, RW `~/src`,`/tmp`,`/etc/rc`, then freeze) → block store
+→ Kernel → mounts (RO `/`, RW `~/src`,`/tmp`, the `/config` trees, then freeze) → block store
 → config backend → LLM registry → optional ONNX semantic index → `KjDispatcher` →
 context recovery from KernelDb.
 

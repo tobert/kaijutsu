@@ -1,5 +1,5 @@
 //! Built-in rc lifecycle scripts, embedded at build time and seeded onto
-//! the deployed `/etc/rc` tree (`~/.config/kaijutsu/etc/rc/`) on first boot.
+//! the deployed `/config/rc` tree (`~/.config/kaijutsu/config/rc/`) on first boot.
 //!
 //! A seed whose whole body is a path naming another seed is written as a real
 //! symlink, not as a file holding that text — this is the init.d composition
@@ -7,12 +7,12 @@
 //!
 //! These are the defaults a fresh kernel bootstraps with. Two purposes:
 //!
-//! - `/etc/rc/default/{create,fork,drift}/*-cache.kai` — the prompt-cache
+//! - `/config/rc/default/{create,fork,drift}/*-cache.kai` — the prompt-cache
 //!   recipe documented in `crates/kaijutsu-kernel/docs/help/kj-cache.md`,
 //!   applied to every context that doesn't opt into a different
 //!   `context_type`. Without this seed, fresh kernels miss all cache
 //!   breakpoints until the user installs them by hand.
-//! - `/etc/rc/<type>/**` — the worked examples of real context_types
+//! - `/config/rc/<type>/**` — the worked examples of real context_types
 //!   (coder, mcp, toolie, director, musician). Most ship an `S00-stance`
 //!   (`.md`, or `.kai` when the stance tunes itself to the bound model) so the
 //!   kernel-side contract is self-contained (independent of any per-client
@@ -21,7 +21,7 @@
 //! ## Storage
 //!
 //! rc scripts are **files**, not table rows. The bodies live as real files
-//! under `assets/defaults/rc/` (a 1:1 mirror of the `/etc/rc` tree),
+//! under `assets/defaults/rc/` (a 1:1 mirror of the `/config/rc` tree),
 //! embedded here via [`include_dir!`]. The embedded tree IS the manifest:
 //! adding or removing a seed is just adding or removing a file under
 //! `assets/defaults/rc/` — no Rust edit. Dispatch reads the deployed files;
@@ -54,7 +54,7 @@
 
 use include_dir::{include_dir, Dir, DirEntry};
 
-/// The embedded `/etc/rc` seed tree — a 1:1 mirror of `assets/defaults/rc/`,
+/// The embedded `/config/rc` seed tree — a 1:1 mirror of `assets/defaults/rc/`,
 /// embedded at build time. This is the manifest: every `.kai`/`.md` file
 /// under it is a seed, keyed by its path.
 static RC_SEED_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../assets/defaults/rc");
@@ -68,14 +68,14 @@ static RC_SEED_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../asset
 /// `relpath`.
 pub use kaijutsu_types::paths::RC_ROOT as RC_VFS_ROOT;
 
-/// Strip the `/etc/rc/` prefix from a canonical rc path. Returns `None`
+/// Strip the `/config/rc/` prefix from a canonical rc path. Returns `None`
 /// for a path that isn't under the rc root.
 fn rc_relpath(canonical: &str) -> Option<&str> {
     canonical.strip_prefix(RC_VFS_ROOT)?.strip_prefix('/')
 }
 
 /// Recursively collect every embedded `.kai`/`.md` seed file as
-/// `(canonical /etc/rc path, body)`.
+/// `(canonical /config/rc path, body)`.
 fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str)>) {
     for entry in dir.entries() {
         match entry {
@@ -97,7 +97,7 @@ fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str
     }
 }
 
-/// The embedded seed set as `(canonical /etc/rc path, body)` pairs, derived
+/// The embedded seed set as `(canonical /config/rc path, body)` pairs, derived
 /// by walking [`RC_SEED_DIR`]. The path encodes
 /// `context_type / verb / sort_key / name / ext`; nothing else is stored
 /// (provenance comes from the kernel block's principal on write).
@@ -118,7 +118,7 @@ pub fn seed_body(canonical_path: &str) -> Option<&'static str> {
 }
 
 /// Write the embedded seed tree into `root` (the host dir mounted at
-/// `/etc/rc`), creating only files that don't already exist. Returns the
+/// `/config/rc`), creating only files that don't already exist. Returns the
 /// number of files newly written.
 ///
 /// This is **bootstrap**, not a per-boot floor: the caller invokes it only
@@ -156,7 +156,7 @@ pub struct RcSeedReport {
 }
 
 /// Write the embedded seed tree into `root` (the host directory mounted at
-/// `/etc/rc`).
+/// `/config/rc`).
 ///
 /// Without `force` this is install-if-absent: an entry that exists is left
 /// alone, so an edit survives and a script you removed stays removed. That is
@@ -220,7 +220,7 @@ pub fn reseed_rc_files(
         }
         match crate::runtime::config_doc_fs::seed_link_target(path, content, &known) {
             // An init.d-style composed seed becomes a real symlink. The body
-            // carries the target as a `/etc/rc` path, which is meaningless on
+            // carries the target as a `/config/rc` path, which is meaningless on
             // disk, so it is rewritten relative to the link — that keeps the
             // tree valid wherever it is mounted or copied.
             Some(target) => {
@@ -265,7 +265,7 @@ fn seed_entry_matches(
     }
 }
 
-/// Resolve a seed link body to its canonical `/etc/rc` path. The body is
+/// Resolve a seed link body to its canonical `/config/rc` path. The body is
 /// absolute today; a relative one resolves against the link's own directory.
 fn canonical_link_target(link_path: &str, target: &str) -> String {
     if target.starts_with('/') {
@@ -565,10 +565,10 @@ mod tests {
         let paths: Vec<String> = seed_files().into_iter().map(|(p, _)| p).collect();
         // Spot-check the roles the embedded tree ships.
         for expected in [
-            "/etc/rc/default/create/S20-cache.kai",
-            "/etc/rc/coder/create/S00-stance.kai",
-            "/etc/rc/musician/tick/S10-drive.kai",
-            "/etc/rc/musician/create/S00-stance.md",
+            "/config/rc/default/create/S20-cache.kai",
+            "/config/rc/coder/create/S00-stance.kai",
+            "/config/rc/musician/tick/S10-drive.kai",
+            "/config/rc/musician/create/S00-stance.md",
         ] {
             assert!(paths.contains(&expected.to_string()), "missing seed: {expected}");
         }
@@ -582,19 +582,19 @@ mod tests {
     #[test]
     fn seed_body_resolves_embedded_default() {
         // The canonical cache body lives in lib/ …
-        let body = seed_body("/etc/rc/lib/create/S20-cache.kai")
+        let body = seed_body("/config/rc/lib/create/S20-cache.kai")
             .expect("lib cache seed must exist");
         assert!(body.contains("kj cache add --target=tools"));
         // …and a per-type path's seed body is just the link target (a seed
         // symlink — reconstructed into an actual link by ConfigDocFs::seed).
         assert_eq!(
-            seed_body("/etc/rc/default/create/S20-cache.kai").unwrap().trim(),
-            "/etc/rc/lib/create/S20-cache.kai"
+            seed_body("/config/rc/default/create/S20-cache.kai").unwrap().trim(),
+            "/config/rc/lib/create/S20-cache.kai"
         );
         // …and a path with no embedded seed is None, which is what marks it
         // `no seed` in `kj rc list` rather than `differs`.
         assert!(
-            seed_body("/etc/rc/none/create/S00-noop.kai").is_none(),
+            seed_body("/config/rc/none/create/S00-noop.kai").is_none(),
             "unseeded path must not resolve a body"
         );
     }
@@ -604,15 +604,15 @@ mod tests {
     #[test]
     fn musician_seeds_include_beat_tick_verb() {
         assert!(
-            seed_body("/etc/rc/musician/tick/S10-drive.kai").is_some(),
+            seed_body("/config/rc/musician/tick/S10-drive.kai").is_some(),
             "musician must seed a tick/beat script"
         );
         assert!(
-            seed_body("/etc/rc/musician/create/S00-stance.md").is_some(),
+            seed_body("/config/rc/musician/create/S00-stance.md").is_some(),
             "musician must seed a stance"
         );
         // The tick verb is wired into the rc path grammar.
-        let parts = crate::kj::rc::parse_rc_path("/etc/rc/musician/tick/S10-drive.kai")
+        let parts = crate::kj::rc::parse_rc_path("/config/rc/musician/tick/S10-drive.kai")
             .expect("tick rc path must parse");
         assert_eq!(parts.context_type, "musician");
         assert_eq!(parts.verb, "tick");
@@ -632,21 +632,21 @@ mod tests {
     #[test]
     fn kaish_primer_seeded_for_every_shell_seat_not_musician() {
         for with_shell in ["coder", "default", "mcp", "director", "toolie"] {
-            let path = format!("/etc/rc/{with_shell}/create/S05-kaish.kai");
+            let path = format!("/config/rc/{with_shell}/create/S05-kaish.kai");
             assert_eq!(
                 seed_body(&path).map(str::trim),
-                Some("/etc/rc/lib/create/S05-kaish.kai"),
+                Some("/config/rc/lib/create/S05-kaish.kai"),
                 "{with_shell} must symlink the shared kaish primer script"
             );
         }
         assert!(
-            seed_body("/etc/rc/musician/create/S05-kaish.kai").is_none(),
+            seed_body("/config/rc/musician/create/S05-kaish.kai").is_none(),
             "musician grants no shell facade — it must not seed a kaish primer"
         );
         // The canonical body itself: composes `kj kaish primer` into a
         // Role::System/BlockKind::Text block, mirroring S00-stance.kai's
         // `kj block create --role system --kind text` shape.
-        let canonical = seed_body("/etc/rc/lib/create/S05-kaish.kai")
+        let canonical = seed_body("/config/rc/lib/create/S05-kaish.kai")
             .expect("lib kaish primer seed must exist");
         assert!(canonical.contains("kj kaish primer"));
         assert!(canonical.contains("kj block create --role system --kind text"));
@@ -657,7 +657,7 @@ mod tests {
     /// musician doesn't re-hydrate its whole history every turn (the cost guard).
     #[test]
     fn musician_seeds_include_hydration_window() {
-        let body = seed_body("/etc/rc/musician/create/S30-hydrate.kai")
+        let body = seed_body("/config/rc/musician/create/S30-hydrate.kai")
             .expect("musician must seed the hydration-window script");
         assert!(
             body.contains("kj context hydrate"),
@@ -671,7 +671,7 @@ mod tests {
     /// window a thin fork, skip a full clone (which would pin its whole log).
     #[test]
     fn musician_fork_seeds_include_hydration_window() {
-        let body = seed_body("/etc/rc/musician/fork/S40-hydrate.kai")
+        let body = seed_body("/config/rc/musician/fork/S40-hydrate.kai")
             .expect("musician must seed a fork-side hydration script");
         assert!(
             body.contains("kj context hydrate"),
@@ -702,7 +702,7 @@ mod tests {
         for (path, body) in &seeds {
             let t = body.trim();
             // A link body is one bare path token. Anything carrying whitespace
-            // is a script line (`. /etc/rc/lib/x.kai`), not a link, and is
+            // is a script line (`. /config/rc/lib/x.kai`), not a link, and is
             // correctly seeded as content.
             let bare_path_token =
                 !t.is_empty() && t.contains('/') && !t.contains(char::is_whitespace);

@@ -23,8 +23,8 @@
 //! [`DiffSource::Document`] resolves through
 //! [`resolve_editor_target`](crate::editor::resolve_editor_target) — the same
 //! function the vi editor binds with, for the same reason. The mount table
-//! answers "what owns this path?": a config-owned path (`/etc/rc/*`,
-//! `/etc/config/*`) binds straight to its `ConfigDocFs` block, everything else
+//! answers "what owns this path?": a config-owned path (`/config/rc/*`,
+//! `/config/kernel/*`) binds straight to its `ConfigDocFs` block, everything else
 //! goes through the file-doc cache. Running a config path through
 //! `FileDocumentCache::get_or_load` would mint a *second* kernel document
 //! shadowing the original — the dual-ownership bug class
@@ -658,7 +658,7 @@ mod tests {
 
         let dispatcher = Arc::new(test_dispatcher_rc().await);
         dispatcher.set_self_arc();
-        let path = "/etc/rc/coder/create/S00-stance.kai";
+        let path = "/config/rc/coder/create/S00-stance.kai";
 
         let result = dispatcher
             .dispatch_diff(&argv(&[path]), &test_caller())

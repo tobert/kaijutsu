@@ -9,12 +9,12 @@ kj binding allow "builtin.bindings"
 # Binding administration: may write any context's loadout.
 kj binding allow "admin"
 # rc-lifecycle governance: a director owns the rc scripts. file:write/edit
-# reach both /etc/rc and general workspace files — rc carries no capability
-# of its own, same as /etc/config. General code edits still delegate to a
+# reach both /config/rc and general workspace files — rc carries no capability
+# of its own, same as /config/kernel. General code edits still delegate to a
 # coder context — this is for lifecycle / governance artifacts.
 kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
-# config-write opens `kj config set/reset` over the kernel-owned /etc/config files
+# config-write opens `kj config set/reset` over the kernel-owned /config/kernel files
 # (system.md, theme.toml, mcp.toml) AND the SQL-native model config surfaces
 # (`kj backend`, `kj cast`, `kj alias`) — i.e. which model runs. Dedicated,
 # not implied by the grants above.

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::file_tools::{
     FileDocumentCache, WorkspaceGuard, CacheReadError,
-    path::{resolve_str, deny_etc_write},
+    path::resolve_str,
     hashline::line_hash,
     vfs_walker::VfsWalkerAdapter,
 };
@@ -222,9 +222,7 @@ impl McpServerLike for FileToolsServer {
                 let p: EditParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
-                if let Some(denied) = deny_etc_write(&path) {
-                    denied
-                } else if let Some(ref guard) = self.guard
+                if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_write(&tool_ctx, &path)
                 {
                     denied
@@ -236,9 +234,7 @@ impl McpServerLike for FileToolsServer {
                 let p: WriteParams =
                     serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
-                if let Some(denied) = deny_etc_write(&path) {
-                    denied
-                } else if let Some(ref guard) = self.guard
+                if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_write(&tool_ctx, &path)
                 {
                     denied

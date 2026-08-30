@@ -2399,7 +2399,7 @@ mod tests {
 
         let d = test_dispatcher().await;
         let c = unjoined_caller();
-        install_rc_script_file(&d, "/etc/rc/ledgertest/create/S00-noop.kai", "true").await;
+        install_rc_script_file(&d, "/config/rc/ledgertest/create/S00-noop.kai", "true").await;
 
         let created = d
             .dispatch(
@@ -2431,7 +2431,7 @@ mod tests {
 
         let d = test_dispatcher().await;
         let c = unjoined_caller();
-        install_rc_script_file(&d, "/etc/rc/ledgertest2/create/S00-hello.kai", "echo hi").await;
+        install_rc_script_file(&d, "/config/rc/ledgertest2/create/S00-hello.kai", "echo hi").await;
 
         let created = d
             .dispatch(
@@ -2479,7 +2479,7 @@ mod tests {
 
         let d = test_dispatcher().await;
         let c = unjoined_caller();
-        install_rc_script_file(&d, "/etc/rc/ledgertest3/create/S00-hello.kai", "echo hi").await;
+        install_rc_script_file(&d, "/config/rc/ledgertest3/create/S00-hello.kai", "echo hi").await;
 
         let created = d
             .dispatch(
@@ -2531,7 +2531,7 @@ mod tests {
             rc_runs::record_run_script(
                 conn,
                 &run_id,
-                "/etc/rc/ledgertest4/create/S00-hello.kai",
+                "/config/rc/ledgertest4/create/S00-hello.kai",
                 &sha,
                 Some(0),
                 1,

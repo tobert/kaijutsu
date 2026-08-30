@@ -7041,7 +7041,7 @@ mod tests {
         let broker = Arc::new(Broker::new());
         broker.set_db(db.clone()).await;
 
-        let path = "/etc/rc/lib/create/S50-lfm2d.kai";
+        let path = "/config/rc/lib/create/S50-lfm2d.kai";
         let entry = HookEntry {
             id: hook_id("kaish-path-persist"),
             match_instance: None,
@@ -7292,7 +7292,7 @@ mod tests {
         let (broker, kernel, kj) = wired_kaish_broker("shell-guard-falsify").await;
 
         // `HookBody::KaishPath` (docs/rc-on-disk.md, "slice 5") reads the
-        // guard's body fresh from `/etc/rc` at every fire, so this test
+        // guard's body fresh from `/config/rc` at every fire, so this test
         // needs a real seeded rc tree mounted — the same seed the create
         // lifecycle installs from.
         let rc_dir = tempfile::tempdir().expect("create rc test dir");

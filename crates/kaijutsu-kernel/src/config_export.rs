@@ -3,8 +3,8 @@
 //! flip (`docs/config-ownership.md`, "Lane B — the git-worktree seam,
 //! shipped and deliberately unwired").
 //!
-//! [`ConfigDocFs`] mounts four roots — `/etc/rc`, `/etc/config`,
-//! `/etc/client`, `/etc/midi` — all sharing one doc model
+//! [`ConfigDocFs`] mounts four roots — `/config/rc`, `/config/kernel`,
+//! `/config/client`, `/config/midi` — all sharing one doc model
 //! ([`crate::config_doc`]): a document is either a [`DocKind::File`] or a
 //! [`DocKind::Symlink`], and directories are virtual, synthesized from
 //! the set of document paths (see `runtime::config_doc_fs` module docs).
@@ -61,9 +61,9 @@
 //! (`FileDocumentCache`) lives under a *different* id derivation and is only
 //! ever consulted for non-config-owned paths (`owns_config_docs()` is `true`
 //! for every `ConfigDocFs` mount, which short-circuits the file cache
-//! entirely — see `editor.rs`). So there is nothing under `/etc/rc`,
-//! `/etc/config`, `/etc/client`, or `/etc/midi` that this enumeration could
-//! silently skip.
+//! entirely — see `editor.rs`). So there is nothing under `/config/rc`,
+//! `/config/kernel`, `/config/client`, or `/config/midi` that this enumeration
+//! could silently skip.
 
 use std::path::{Path, PathBuf};
 
@@ -459,7 +459,7 @@ mod tests {
         client
             .symlink(
                 StdPath::new("laptop/dangling.toml"),
-                StdPath::new("/etc/client/nowhere/gone.toml"),
+                StdPath::new("/config/client/nowhere/gone.toml"),
             )
             .await
             .unwrap();
@@ -502,7 +502,7 @@ mod tests {
         client
             .symlink(
                 StdPath::new("laptop/dangling.toml"),
-                StdPath::new("/etc/client/nope/nothing.toml"),
+                StdPath::new("/config/client/nope/nothing.toml"),
             )
             .await
             .unwrap();
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(
             dangling.kind,
             ConfigTreeKind::Symlink {
-                target: "/etc/client/nope/nothing.toml".to_string()
+                target: "/config/client/nope/nothing.toml".to_string()
             }
         );
 
@@ -600,7 +600,7 @@ mod tests {
         // (or a bug) had written outside the mount's own tree — import must
         // refuse it, not silently accept it.
         let evil_path = tmp.path().join("config/S99-evil.kai");
-        std::os::unix::fs::symlink("/etc/client/theme.toml", &evil_path).unwrap();
+        std::os::unix::fs::symlink("/config/client/theme.toml", &evil_path).unwrap();
 
         let err = import_config_tree(tmp.path()).unwrap_err();
         assert!(

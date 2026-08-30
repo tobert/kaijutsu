@@ -164,21 +164,22 @@ same `initialize` handler spawns `KernelBridge::attach_client_peer` the
 moment `clientInfo` arrives, replayed on reconnect like every other actor
 peer.
 
-Client identity now also feeds the `/etc/client` cascade for cast selection
+Client identity now also feeds the `/config/client` cascade for cast selection
 (2026-08-17): `bridge::client_config_id` derives a **separate** slug —
-`acp-<name>`, not the peer nick's `acp/<name>` — because a `/etc/client/<id>`
+`acp-<name>`, not the peer nick's `acp/<name>` — because a `/config/client/<id>`
 path segment can't itself contain `/`. On `session/new`, for a genuinely
 fresh context only (never on `session/load`/`resume`, which must not stomp a
 cast already in effect), `KernelBridge::resolve_client_cast` reads
-`/etc/client/<client_id>/cast.toml` then the shared `/etc/client/cast.toml`
-(`{ cast = "<label>" }`); if either layer names a cast, `apply_client_cast_preset`
+`/config/client/<client_id>/cast.toml` then the shared
+`/config/client/default/cast.toml` (`{ cast = "<label>" }`); if either layer
+names a cast, `apply_client_cast_preset`
 (`lib.rs`) runs the same `kj context set --cast <label>` a human would type,
 via the existing `execute_kj` addressed-command path — no new RPC. Absence on
 both layers (the default — nobody has written a `cast.toml` yet) leaves the
 context on the LLM registry's row-stamped default, unchanged from before.
 Identity is ergonomic routing and presence, not a security boundary.
 
-Not done: nothing writes `/etc/client/<id>/cast.toml` for an operator yet —
+Not done: nothing writes `/config/client/<id>/cast.toml` for an operator yet —
 it is a plain file (docs/config-ownership.md's "just write the file" rule),
 so today that means `kj editor` or the file tools, by hand, per client.
 Client-identity-driven **presets** (system prompt + consent mode alongside
@@ -227,10 +228,10 @@ a Toad flight before the next one needs to start.
    recoverable in kj.
 3. **Client identity and presence — shipped.** `clientInfo` is retained,
    `acp/<name>` attaches as a peer, and `session/new` on a fresh context now
-   feeds the `/etc/client` cascade for cast selection (see "Client identity
+   feeds the `/config/client` cascade for cast selection (see "Client identity
    and parity" above). Not done: a full preset (system prompt + consent, not
    just cast), and the seed data itself — nobody has written a
-   `/etc/client/<id>/cast.toml` for toad/Zed/Happy yet, that's an operator
+   `/config/client/<id>/cast.toml` for toad/Zed/Happy yet, that's an operator
    action.
 4. **Commands and usage — shipped.** The curated kj-backed catalog and slash
    invocation path are built. The usage gauge is also built, but complete

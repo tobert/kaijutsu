@@ -1,6 +1,6 @@
 # In-App vi Editor
 
-`vi /etc/rc/thing/whatever.kai` opens a real vi-like editor on that file's
+`vi /config/rc/thing/whatever.kai` opens a real vi-like editor on that file's
 block. The editor is a **kernel-owned session** driven through a small
 tool-shaped surface; the Bevy app is one
 *renderer* of it, a model is another *player* of it, and a headless test is a
@@ -266,11 +266,12 @@ The same surface a test drives is what a model plays.
 8. **No generic `edit_block` RPC.** The app sends *keys*; the kernel writes via
    `block_store.edit_text`. A generic block-edit RPC is off the editor's
    critical path — don't build it for vi.
-9. **No capability gates `/etc/rc`.** rc melted to host files
+9. **No capability gates `/config/rc`.** rc melted to host files
    (`docs/rc-on-disk.md`) and `rc-write` is dropped with it — a script is
    protected the way any file is, through the file tools and the editor, not
-   a loadout check. The rest of `/etc` — the host's real one — is still
-   denied flat. Open + save surface permission errors loudly — crash over
+   a loadout check. The host's real `/etc` is a plain read-only host path,
+   like any other path under the read-only `/` mount — kaijutsu no longer
+   squats it. Open + save surface permission errors loudly — crash over
    corruption.
 
 ### Path resolution — bind to the owner, not a copy
@@ -288,7 +289,7 @@ load-bearing:
   unmounted tree).
 - **ordinary file**: `FileDocumentCache::get_or_load(path)`.
 
-**`/etc/rc` takes the ordinary-file branch now**, because the mount table is
+**`/config/rc` takes the ordinary-file branch now**, because the mount table is
 the authority and rc's mount is a `LocalBackend` over a host directory
 (`docs/rc-on-disk.md`). That the answer comes from the mount table and not a
 path prefix is what let rc change sides without touching this code, and it is

@@ -503,7 +503,7 @@ impl Kernel {
 
     /// Builder-style attach of a throwaway-dir cleanup guard (test support).
     /// The given dir is removed when the kernel drops — use it to root a kernel
-    /// (and any sibling test scaffolding, e.g. a mounted `/etc/rc` tree) under
+    /// (and any sibling test scaffolding, e.g. a mounted `/config/rc` tree) under
     /// one temp dir that self-cleans, instead of leaking it for the process
     /// lifetime. Must be called pre-`Arc::new` (consumes `self`, like
     /// `with_timeouts`). `new_ephemeral` sets this for you; this is for tests
@@ -2410,7 +2410,7 @@ mod tests {
         kernel
             .mount(RC_ROOT, ConfigDocFs::new(blocks.clone(), RC_ROOT))
             .await;
-        let path = "/etc/rc/coder/create/S00.kai";
+        let path = "/config/rc/coder/create/S00.kai";
 
         // Open → type → state reflects, all through the kernel surface.
         let (id, st) = kernel.editor_open(path).await.unwrap();
@@ -2461,7 +2461,7 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
-        let path = "/etc/rc/coder/create/S00.kai";
+        let path = "/config/rc/coder/create/S00.kai";
 
         // The kernel's own file cache, over the same store + kernel VFS —
         // the editor's invalidation and our reads must hit the same instance.
@@ -2513,8 +2513,8 @@ mod tests {
         rc.write_all(Path::new("coder/create/snippet.kai"), b"INSERTED")
             .await
             .unwrap();
-        let edit_path = "/etc/rc/coder/create/S00.kai";
-        let read_path = "/etc/rc/coder/create/snippet.kai";
+        let edit_path = "/config/rc/coder/create/S00.kai";
+        let read_path = "/config/rc/coder/create/snippet.kai";
 
         let (id, st) = kernel.editor_open(edit_path).await.unwrap();
         assert_eq!(st.text, "AB");
@@ -2547,7 +2547,7 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
-        let path = "/etc/rc/coder/create/S00.kai";
+        let path = "/config/rc/coder/create/S00.kai";
 
         // Nothing open at all → fail loud (no session to foreground).
         let me = PrincipalId::system();
@@ -2595,7 +2595,7 @@ mod tests {
         d.kernel().broker().set_kj_dispatcher(&d).await;
         let kernel = d.kernel();
 
-        let path = "/etc/rc/vitest/create/S00-foo.kai";
+        let path = "/config/rc/vitest/create/S00-foo.kai";
         install_rc_script_file(&d, path, "hello").await;
 
         // A real registered context for `:r !cmd` to run in.
@@ -2645,7 +2645,7 @@ mod tests {
 
         // `editor_open` records no opener.
         let (id, _) = kernel
-            .editor_open("/etc/rc/coder/create/S00.kai")
+            .editor_open("/config/rc/coder/create/S00.kai")
             .await
             .unwrap();
         let state = kernel
@@ -2681,7 +2681,7 @@ mod tests {
             .unwrap();
 
         let (id, _) = kernel
-            .editor_open("/etc/rc/coder/create/S00.kai")
+            .editor_open("/config/rc/coder/create/S00.kai")
             .await
             .unwrap();
         let state = kernel
@@ -2993,7 +2993,7 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
-        let path = "/etc/rc/coder/create/S00.kai";
+        let path = "/config/rc/coder/create/S00.kai";
 
         let (id, _) = kernel.editor_open(path).await.unwrap();
         kernel.editor_keys(id, "iX<Esc>").await.unwrap();
@@ -3017,7 +3017,7 @@ mod tests {
 
     #[tokio::test]
     async fn colon_w_on_a_cat_ed_client_path_does_not_revert_the_edit() {
-        // `/etc/client` is a ConfigDocFs-owned tree exactly like `/etc/rc` —
+        // `/config/client` is a ConfigDocFs-owned tree exactly like `/config/rc` —
         // an editor session on it must never be treated as file-backed, even
         // after an unrelated `cat` (any FileDocumentCache read) has minted a
         // shadow cache entry for the same path. See docs/file-buffers.md.
@@ -3035,7 +3035,7 @@ mod tests {
             .write_all(Path::new("theme.toml"), b"orig")
             .await
             .unwrap();
-        let path = "/etc/client/theme.toml";
+        let path = "/config/client/theme.toml";
 
         // Mint the FileDocumentCache shadow the same way a kaish `cat` or an
         // MCP read would — this is the precondition B1 names as "one shell

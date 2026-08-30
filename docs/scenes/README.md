@@ -43,7 +43,7 @@ kernel (thin-client rule, as everywhere). Consequences, in order of weight:
   the human's view. If a scene knows something the kernel doesn't, that's a
   bug.
 - **Per-client state stays local** — camera pose, focus, quality tier — the
-  same split `/etc/client/` already made.
+  same split `/config/client/` already made.
 - Multiplayer *presence* (rendering whose hand moved a wire) is deferred, but
   this principle makes it cheap later: "player X is touching Y" is a row, not
   a rendering trick.

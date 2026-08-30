@@ -1,6 +1,6 @@
 # Tokyo Night — kaijutsu's original UI theme (default until the 2026-07-12
 # synthwave re-skin; see docs/color.md). Apply with:
-#   kj config set /etc/config/theme.toml --content "$(cat contrib/themes/tokyo-night.toml)"
+#   kj config set /config/kernel/theme.toml --content "$(cat contrib/themes/tokyo-night.toml)"
 # No [scene] section on purpose: the 3D scene lane keeps its compiled
 # defaults under this theme.
 # Kaijutsu Default Theme — Tokyo Night

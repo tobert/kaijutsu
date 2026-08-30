@@ -46,7 +46,7 @@ transport = "carrier_pigeon"
 
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         Some(config_dir.path()),
-        &config_dir.path().join("etc").join("rc"),
+        &kaijutsu_server::config_mounts::ConfigMounts::new(config_dir.path().join("config")),
         Some(data_dir.path()),
     )
     .await

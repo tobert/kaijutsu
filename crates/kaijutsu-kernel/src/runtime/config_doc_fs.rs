@@ -1,7 +1,7 @@
 //! `ConfigDocFs` — a kernel-owned VFS backend for config/rc content.
 //!
 //! This is the backend that lets the kernel be the **sole owner** of the
-//! `/etc/rc` tree (and, later, the config TOMLs): file ops map straight onto
+//! `/config/rc` tree (and, later, the config TOMLs): file ops map straight onto
 //! `BlockStore` documents, with **no host-disk backing, no write-through flush,
 //! and no mtime-vs-disk reload**. That deletes — by construction, for this
 //! mount — the dual-ownership silent-fallback cluster documented in
@@ -22,7 +22,7 @@
 //! every write). It is **not** a host-file sync — there is no host file. It is a
 //! version stamp on the single source of truth, kept only so that the one
 //! remaining `FileDocumentCache` consumer (an agent `builtin.file:read
-//! /etc/rc/…`) re-reads after a `kj rc set` instead of serving a stale mirror.
+//! /config/rc/…`) re-reads after a `kj rc set` instead of serving a stale mirror.
 //! The "which is truth?" bug class stays gone: there is nothing to disagree.
 
 use async_trait::async_trait;
@@ -43,11 +43,11 @@ use crate::vfs::{DirEntry, FileAttr, FileType, SetAttr, StatFs, VfsError, VfsOps
 /// composition needs only one or two hops, so 8 is generous.
 const MAX_SYMLINK_DEPTH: usize = 8;
 
-/// kernel-owned VFS backend owning a path subtree (e.g. `/etc/rc`).
+/// kernel-owned VFS backend owning a path subtree (e.g. `/config/rc`).
 pub struct ConfigDocFs {
     /// kernel document/block storage — the single source of truth.
     blocks: SharedBlockStore,
-    /// Canonical mount root (e.g. `/etc/rc`). The MountTable hands us
+    /// Canonical mount root (e.g. `/config/rc`). The MountTable hands us
     /// mount-relative paths; we re-prepend this to key documents by their
     /// canonical path, so the manifest stays coherent with how `kj rc` and the
     /// lifecycle dispatch reason about scripts.
@@ -69,7 +69,7 @@ pub struct ConfigDocFs {
 }
 
 impl ConfigDocFs {
-    /// Create a backend rooted at canonical path `root` (e.g. `/etc/rc`).
+    /// Create a backend rooted at canonical path `root` (e.g. `/config/rc`).
     pub fn new(blocks: SharedBlockStore, root: impl Into<String>) -> Self {
         let mut root = root.into();
         // Normalize: leading slash, no trailing slash.
@@ -192,7 +192,7 @@ impl ConfigDocFs {
     }
 
     /// Follow any symlink chain at `canonical` (an absolute path **already under
-    /// this mount root**, e.g. `/etc/rc/coder/create/S10-binding.kai`) to its
+    /// this mount root**, e.g. `/config/rc/coder/create/S10-binding.kai`) to its
     /// terminal canonical path. Public so off-backend callers that bind to a
     /// document by path — notably the vi editor's `resolve_editor_target` — land
     /// on the SAME terminal block this backend reads/executes, instead of the
@@ -860,7 +860,7 @@ mod tests {
     async fn mkdir_on_a_never_populated_path_fails_loud() {
         // Directories are virtual — synthesized from descendant file paths —
         // so there is no way to durably record an *empty* one. The old
-        // behavior returned `Ok` unconditionally: `mkdir /etc/rc/foo`
+        // behavior returned `Ok` unconditionally: `mkdir /config/rc/foo`
         // "succeeded" but created nothing, and `foo` never showed up in a
         // listing. That's a silent no-op dressed as success; it must fail
         // loud instead.
@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(fs.seed_from_embedded().unwrap(), 0);
     }
 
-    /// The same backend, mounted at `/etc/config`, owns the config files via
+    /// The same backend, mounted at `/config/kernel`, owns the config files via
     /// the shared `seed_entries` core — proving one backend type serves rc AND
     /// config (slice 2). A known config file round-trips through the VFS.
     #[tokio::test]
@@ -1071,9 +1071,9 @@ mod tests {
     #[test]
     fn seed_link_target_detects_resolving_paths_only() {
         let known: std::collections::HashSet<String> = [
-            "/etc/rc/lib/create/S20-cache.kai",
-            "/etc/rc/coder/create/S20-cache.kai",
-            "/etc/rc/coder/create/S00-stance.kai",
+            "/config/rc/lib/create/S20-cache.kai",
+            "/config/rc/coder/create/S20-cache.kai",
+            "/config/rc/coder/create/S00-stance.kai",
         ]
         .into_iter()
         .map(String::from)
@@ -1082,16 +1082,16 @@ mod tests {
         // Absolute path resolving to a known seed → link (raw target returned).
         assert_eq!(
             seed_link_target(
-                "/etc/rc/coder/create/S20-cache.kai",
-                "/etc/rc/lib/create/S20-cache.kai\n",
+                "/config/rc/coder/create/S20-cache.kai",
+                "/config/rc/lib/create/S20-cache.kai\n",
                 &known,
             ),
-            Some("/etc/rc/lib/create/S20-cache.kai".to_string())
+            Some("/config/rc/lib/create/S20-cache.kai".to_string())
         );
         // Relative path resolving against the link's parent → link.
         assert_eq!(
             seed_link_target(
-                "/etc/rc/coder/create/S20-cache.kai",
+                "/config/rc/coder/create/S20-cache.kai",
                 "../../lib/create/S20-cache.kai",
                 &known,
             ),
@@ -1100,7 +1100,7 @@ mod tests {
         // A real (multi-line) script body → NOT a link.
         assert_eq!(
             seed_link_target(
-                "/etc/rc/coder/create/S00-stance.kai",
+                "/config/rc/coder/create/S00-stance.kai",
                 "# stance\nkj block create --role system\n",
                 &known,
             ),
@@ -1110,8 +1110,8 @@ mod tests {
         // link (the guard against mistaking a one-line script for a link).
         assert_eq!(
             seed_link_target(
-                "/etc/rc/coder/create/S00-stance.kai",
-                "/etc/rc/nope/create/x.kai",
+                "/config/rc/coder/create/S00-stance.kai",
+                "/config/rc/nope/create/x.kai",
                 &known,
             ),
             None
@@ -1119,8 +1119,8 @@ mod tests {
         // A self-referential path is not a link.
         assert_eq!(
             seed_link_target(
-                "/etc/rc/coder/create/S20-cache.kai",
-                "/etc/rc/coder/create/S20-cache.kai",
+                "/config/rc/coder/create/S20-cache.kai",
+                "/config/rc/coder/create/S20-cache.kai",
                 &known,
             ),
             None
@@ -1133,12 +1133,12 @@ mod tests {
         // Two entries: a canonical body and a path-content link to it.
         let entries = vec![
             (
-                "/etc/rc/lib/create/S20-cache.kai".to_string(),
+                "/config/rc/lib/create/S20-cache.kai".to_string(),
                 "kj cache add --target=tools --ttl=extended",
             ),
             (
-                "/etc/rc/coder/create/S20-cache.kai".to_string(),
-                "/etc/rc/lib/create/S20-cache.kai",
+                "/config/rc/coder/create/S20-cache.kai".to_string(),
+                "/config/rc/lib/create/S20-cache.kai",
             ),
         ];
         let n = fs.seed_entries(entries).unwrap();
@@ -1162,7 +1162,7 @@ mod tests {
             .unwrap();
         fs.symlink(
             p("coder/create/S10-binding.kai"),
-            Path::new("/etc/rc/lib/create/binding.kai"),
+            Path::new("/config/rc/lib/create/binding.kai"),
         )
         .await
         .unwrap();
@@ -1173,7 +1173,7 @@ mod tests {
 
         // readlink returns the raw stored target, unresolved.
         let target = fs.readlink(p("coder/create/S10-binding.kai")).await.unwrap();
-        assert_eq!(target, Path::new("/etc/rc/lib/create/binding.kai"));
+        assert_eq!(target, Path::new("/config/rc/lib/create/binding.kai"));
 
         // getattr is lstat-like: it reports the link itself.
         let attr = fs.getattr(p("coder/create/S10-binding.kai")).await.unwrap();
@@ -1188,7 +1188,7 @@ mod tests {
             .unwrap();
         fs.symlink(
             p("coder/create/S00-stance.md"),
-            Path::new("/etc/rc/lib/create/stance.md"),
+            Path::new("/config/rc/lib/create/stance.md"),
         )
         .await
         .unwrap();
@@ -1224,10 +1224,10 @@ mod tests {
     #[tokio::test]
     async fn symlink_cycle_fails_loud() {
         let fs = fs();
-        fs.symlink(p("a/create/S00-x.kai"), Path::new("/etc/rc/a/create/S00-y.kai"))
+        fs.symlink(p("a/create/S00-x.kai"), Path::new("/config/rc/a/create/S00-y.kai"))
             .await
             .unwrap();
-        fs.symlink(p("a/create/S00-y.kai"), Path::new("/etc/rc/a/create/S00-x.kai"))
+        fs.symlink(p("a/create/S00-y.kai"), Path::new("/config/rc/a/create/S00-x.kai"))
             .await
             .unwrap();
         assert!(matches!(
@@ -1242,14 +1242,14 @@ mod tests {
         // Creating a link to a non-existent target succeeds (git/POSIX).
         fs.symlink(
             p("coder/create/S00-gone.md"),
-            Path::new("/etc/rc/lib/create/missing.md"),
+            Path::new("/config/rc/lib/create/missing.md"),
         )
         .await
         .unwrap();
         // The link exists (getattr/readlink work)…
         assert_eq!(
             fs.readlink(p("coder/create/S00-gone.md")).await.unwrap(),
-            Path::new("/etc/rc/lib/create/missing.md")
+            Path::new("/config/rc/lib/create/missing.md")
         );
         // …but reading through it fails loud, not as empty content.
         assert!(matches!(
@@ -1261,7 +1261,7 @@ mod tests {
     #[tokio::test]
     async fn symlink_target_escaping_mount_fails_on_read() {
         let fs = fs();
-        fs.symlink(p("coder/create/S00-evil.md"), Path::new("/etc/config/theme.toml"))
+        fs.symlink(p("coder/create/S00-evil.md"), Path::new("/config/kernel/theme.toml"))
             .await
             .unwrap();
         // Resolution is confined to the mount root — a cross-mount target is
@@ -1279,7 +1279,7 @@ mod tests {
         fs.write_all(p("lib/create/real.kai"), b"v1").await.unwrap();
         fs.symlink(
             p("coder/create/S10-real.kai"),
-            Path::new("/etc/rc/lib/create/real.kai"),
+            Path::new("/config/rc/lib/create/real.kai"),
         )
         .await
         .unwrap();
@@ -1301,7 +1301,7 @@ mod tests {
         fs.write_all(p("lib/create/real.kai"), b"keep").await.unwrap();
         fs.symlink(
             p("coder/create/S10-real.kai"),
-            Path::new("/etc/rc/lib/create/real.kai"),
+            Path::new("/config/rc/lib/create/real.kai"),
         )
         .await
         .unwrap();
@@ -1317,7 +1317,7 @@ mod tests {
         let fs = fs();
         fs.write_all(p("coder/create/S00-x.kai"), b"file").await.unwrap();
         assert!(matches!(
-            fs.symlink(p("coder/create/S00-x.kai"), Path::new("/etc/rc/lib/y.kai"))
+            fs.symlink(p("coder/create/S00-x.kai"), Path::new("/config/rc/lib/y.kai"))
                 .await,
             Err(VfsError::AlreadyExists(_))
         ));

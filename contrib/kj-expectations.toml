@@ -260,7 +260,7 @@ mutates = false
 ["config reset"]
 expect = "situation-normal"
 mutates = true
-clause = "kj config reset /etc/config/theme.toml"
+clause = "kj config reset /config/kernel/theme.toml"
 note = "Restores one embedded default (docs/issues.md)."
 
 ["config show"]

@@ -19,7 +19,7 @@ The direction inverts the default:
 
 - **Nothing visible by default.** Drop the host-root mount. The VFS
   namespace is the curated set: `/mnt/project` (or `~/src`), `/tmp`,
-  `/etc/rc` + `/etc/config` (kernel-owned), `/v/*`, `/dev` (kaish-owned, next
+  `/config/rc` + `/config/kernel` (kernel-owned), `/v/*`, `/dev` (kaish-owned, next
   release), plus the bin mounts below.
 - **PATH dirs mounted deliberately.** At kernel startup, read the host
   `PATH`, canonicalize + dedupe its directories, and hold them as the

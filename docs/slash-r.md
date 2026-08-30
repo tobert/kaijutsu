@@ -95,7 +95,7 @@ from a different connection is rejected loudly (no silent rebind of
 `/r/<id>` mid-session); and claiming an id grants nothing — the share server
 only ever serves its own jail. Cross-*reconnect* squatting remains possible
 and is shared-trust crosstalk, not an enforced boundary; a durable
-principal↔client-id pin via the `/etc/client` namespace is the escalation
+principal↔client-id pin via the `/config/client` namespace is the escalation
 if it ever bites in practice.
 
 Control operations stay capnp/kj: `kj share ls` (roster), a future

@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn split_parent_round_trips_with_join_path() {
-        for path in ["/etc", "/etc/rc", "/a/b/c/d"] {
+        for path in ["/etc", "/config/rc", "/a/b/c/d"] {
             let (parent, name) = split_parent(path).unwrap();
             assert_eq!(join_path(parent, name), path, "{path} must round-trip");
         }

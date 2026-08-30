@@ -344,7 +344,7 @@ rename doesn't wait for it).
 
 **Default grants stay per-rc, as today** — no `context_type` gets an
 unconditional `facade:shell_write` grant baked into the kernel; each
-`/etc/rc/<type>/create/S10-binding.kai` decides for itself, the same
+`/config/rc/<type>/create/S10-binding.kai` decides for itself, the same
 mechanism `S10-binding.kai`'s `kj binding allow` lines already use for
 every other capability. A context type that never had shell-write before
 the rename does not get it after; a type that granted `facade:shell`

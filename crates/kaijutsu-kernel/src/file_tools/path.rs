@@ -62,40 +62,6 @@ pub fn resolve_str(cwd: &Path, path: &str) -> Result<String, PathError> {
     Ok(resolve(cwd, path)?.to_string_lossy().into_owned())
 }
 
-/// Deny writes under `/etc` that are not one of kaijutsu's own config mounts.
-///
-/// `/etc` is shared ground: the four kaijutsu mounts (`rc/`, `config/`,
-/// `client/`, `midi/`) sit alongside the host's read-only root, where
-/// `/etc/passwd` lives. This is the line between them.
-///
-/// **All four mounts are ordinary write surfaces** — an agent edits them with
-/// the same `file:write`/`edit` tools it uses for any other file, with no
-/// capability of their own. None of the four is a special category owed its
-/// own machinery; see `docs/config-ownership.md` and `docs/rc-on-disk.md`.
-///
-/// Returns `Some(failure)` for a denied path, else `None`.
-pub(crate) fn deny_etc_write(canonical_path: &str) -> Option<crate::execution::ExecResult> {
-    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, RC_ROOT};
-
-    let under_config_mount = [RC_ROOT, CONFIG_ROOT, CLIENT_ROOT, MIDI_ROOT].iter().any(|root| {
-        // Exact root, or a real child of it — never a sibling that merely
-        // shares the prefix (`/etc/configuration` is the host's, not ours).
-        canonical_path == *root
-            || canonical_path.starts_with(&format!("{root}/"))
-    });
-    if under_config_mount {
-        return None;
-    }
-
-    if canonical_path == "/etc" || canonical_path.starts_with("/etc/") {
-        return Some(crate::execution::ExecResult::failure(
-            1,
-            format!("file write denied under /etc: '{canonical_path}'"),
-        ));
-    }
-    None
-}
-
 fn normalize(path: &Path, original: &str) -> Result<PathBuf, PathError> {
     let mut parts: Vec<Component> = Vec::new();
     for component in path.components() {
@@ -125,47 +91,6 @@ mod tests {
 
     fn cwd(s: &str) -> PathBuf {
         PathBuf::from(s)
-    }
-
-    #[test]
-    fn deny_etc_write_blocks_the_host_root_but_passes_others() {
-        // `/etc` itself and anything that is not one of kaijutsu's own config
-        // mounts is the host's read-only root — never a write surface.
-        assert!(deny_etc_write("/etc").is_some());
-        assert!(deny_etc_write("/etc/passwd").is_some());
-        assert!(deny_etc_write("/etc/shadow").is_some());
-        // Everything outside /etc is allowed through (workspace guard applies).
-        assert!(deny_etc_write("/src/kaijutsu/foo.rs").is_none());
-        assert!(deny_etc_write("/tmp/scratch").is_none());
-        // Not fooled by a prefix that merely starts with the letters "etc".
-        assert!(deny_etc_write("/etcetera/x").is_none());
-    }
-
-    /// rc, config, client and MIDI are all editable with the ordinary file
-    /// tools, like any other file — none of the four carries a capability of
-    /// its own.
-    ///
-    /// This is the shared-trust stance applied literally: if a player can see
-    /// a file and edit it, config is not a special category deserving its own
-    /// machinery. This test is what makes deleting a config-writing verb a
-    /// simplification rather than a brick — the mount has to stay reachable
-    /// here first. Reasoning: `docs/rc-on-disk.md`.
-    #[test]
-    fn config_mounts_are_ordinary_write_surfaces() {
-        assert!(deny_etc_write("/etc/rc/coder/create/S00-stance.md").is_none());
-        assert!(deny_etc_write("/etc/config/theme.toml").is_none());
-        assert!(deny_etc_write("/etc/config/system.md").is_none());
-        assert!(deny_etc_write("/etc/client/metronome.toml").is_none());
-        assert!(deny_etc_write("/etc/midi/devices/minibrute.md").is_none());
-        // The mount roots themselves, too.
-        assert!(deny_etc_write("/etc/rc").is_none());
-        assert!(deny_etc_write("/etc/config").is_none());
-        assert!(deny_etc_write("/etc/client").is_none());
-        assert!(deny_etc_write("/etc/midi").is_none());
-        // But a near-miss sibling under /etc is still the host's.
-        assert!(deny_etc_write("/etc/rcfoo").is_some());
-        assert!(deny_etc_write("/etc/configuration/x").is_some());
-        assert!(deny_etc_write("/etc/midifoo").is_some());
     }
 
     #[test]

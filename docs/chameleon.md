@@ -153,7 +153,7 @@ player role exactly the shape small models are good at.
 - **Hearing** (M2, landed 2026-07-06): the app's ear captures incoming MIDI,
   stamps it with ALSA receipt time, and batches it to the kernel as score
   blocks (telemetry, not realtime). Device knowledge lives in profiles
-  (`/etc/midi/devices/`, `kj midi list/show/send/identify/panic`); device
+  (`/config/midi/devices/`, `kj midi list/show/send/identify/panic`); device
   contexts are **side channels** — they tweak the gear while the band plays,
   never on the beat (`docs/midi-next.md`).
 

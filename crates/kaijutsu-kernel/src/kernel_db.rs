@@ -883,7 +883,7 @@ CREATE TABLE IF NOT EXISTS hook_scripts (
 );
 
 -- rc lifecycle scripts are no longer table rows: they live as files under
--- /etc/rc (~/.config/kaijutsu/etc/rc), seeded to disk at boot. See
+-- /config/rc (~/.config/kaijutsu/config/rc), seeded to disk at boot. See
 -- crate::seed_scripts and kj/lifecycle.rs. A legacy `rc_scripts` table may
 -- still exist in pre-files DBs; KernelDb::legacy_rc_scripts migrates it.
 
@@ -2154,7 +2154,7 @@ impl KernelDb {
     /// `ALTER TABLE ... ADD COLUMN` array (new columns land in both places).
     /// Anything beyond an additive column bump requires wiping the DB. rc
     /// lifecycle scripts are no longer table rows — they live as files under
-    /// `/etc/rc` (see `seed_scripts` and `kj/lifecycle.rs`), seeded to disk
+    /// `/config/rc` (see `seed_scripts` and `kj/lifecycle.rs`), seeded to disk
     /// at server boot.
     pub fn open<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -2236,7 +2236,7 @@ impl KernelDb {
 
     /// Read any legacy `rc_scripts` rows from a pre-files DB, as
     /// `(canonical_path, content)` pairs. Used once at boot to migrate a
-    /// user's customizations onto the `/etc/rc` file tree. New DBs never
+    /// user's customizations onto the `/config/rc` file tree. New DBs never
     /// create the table, so a missing table yields an empty vec (not an
     /// error) — the migration simply no-ops.
     pub fn legacy_rc_scripts(&self) -> Vec<(String, String)> {
@@ -12014,7 +12014,7 @@ mod tests {
             workspace_id: ws_id,
             doc_kind: DocKind::Conversation,
             language: None,
-            path: Some("/etc/rc/shared.kai".into()),
+            path: Some("/config/rc/shared.kai".into()),
             created_at: now_millis(),
             created_by: PrincipalId::system(),
         })
@@ -12027,14 +12027,14 @@ mod tests {
                 workspace_id: ws_id,
                 doc_kind: DocKind::Conversation,
                 language: None,
-                path: Some("/etc/rc/shared.kai".into()),
+                path: Some("/config/rc/shared.kai".into()),
                 created_at: now_millis(),
                 created_by: PrincipalId::system(),
             })
             .unwrap_err();
         match err {
             KernelDbError::DocumentPathConflict { path, existing } => {
-                assert_eq!(path, "/etc/rc/shared.kai");
+                assert_eq!(path, "/config/rc/shared.kai");
                 assert_eq!(existing, first_id);
             }
             other => panic!("expected DocumentPathConflict, got: {other}"),

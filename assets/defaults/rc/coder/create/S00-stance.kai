@@ -24,7 +24,7 @@
 # model nothing.
 #
 # To tune: edit this script in the repo, or the live file under
-# `~/.config/kaijutsu/etc/rc/` — they are ordinary files. A new tier is a new
+# `~/.config/kaijutsu/config/rc/` — they are ordinary files. A new tier is a new
 # `case` arm.
 #
 # `.resolved_model` is the EFFECTIVE model. The row's `.model` is only the

@@ -1,8 +1,8 @@
 //! Run-control (rc) subcommands: add, list, rm, show.
 //!
 //! Manages lifecycle script **files** at canonical paths
-//! `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
-//! `~/.config/kaijutsu/etc/rc/`). The path itself is the user-facing key;
+//! `/config/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
+//! `~/.config/kaijutsu/config/rc/`). The path itself is the user-facing key;
 //! structural fields (context_type, verb, sort_key, name, extension) are
 //! derived from it via `parse_rc_path`.
 //!
@@ -26,7 +26,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "rc",
-    about = "Run-control lifecycle scripts at /etc/rc/<type>/<verb>/SXX-name.{kai,md}",
+    about = "Run-control lifecycle scripts at /config/rc/<type>/<verb>/SXX-name.{kai,md}",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -39,7 +39,7 @@ pub(crate) struct RcArgs {
 enum RcCommand {
     /// Install a script. `--content <body>` (or piped stdin) is the script text.
     Add {
-        /// Canonical path: /etc/rc/<type>/<verb>/SXX-name.{kai,md}
+        /// Canonical path: /config/rc/<type>/<verb>/SXX-name.{kai,md}
         path: String,
         /// Script body (stdin is piped here for `kj rc add` when omitted).
         /// Free text: a body may legitimately begin with `-`, so this must
@@ -104,7 +104,7 @@ enum RcSeedStatus {
     /// differing.
     NoSeed,
     /// A seed ships for this path and nothing is live at it. The kernel owns
-    /// `/etc/rc` and seeds the namespace only when it is entirely empty, so a
+    /// `/config/rc` and seeds the namespace only when it is entirely empty, so a
     /// script added to the embedded set after this kernel was first seeded
     /// never lands on its own. `kaijutsu-server rc reseed` installs it; a path
     /// you deliberately removed keeps reporting this until you do.
@@ -194,7 +194,7 @@ pub struct RcPathParts {
 
 /// Validate and split a canonical rc path.
 ///
-/// Format: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`. Type and
+/// Format: `/config/rc/<context_type>/<verb>/SXX-name.{kai,md}`. Type and
 /// name are lowercase identifiers (`[a-z][a-z0-9_-]*`); sort_key matches
 /// `S\d{1,3}`. Valid verbs are [`crate::kj::lifecycle::RC_VERBS`].
 pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
@@ -202,7 +202,7 @@ pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
         let verbs = crate::kj::lifecycle::RC_VERBS.join(", ");
         format!(
             "invalid rc path: '{path}'\n\
-             expected /etc/rc/<context_type>/<verb>/SXX-name.{{kai,md}}\n\
+             expected /config/rc/<context_type>/<verb>/SXX-name.{{kai,md}}\n\
              - context_type and name must be lowercase ([a-z][a-z0-9_-]*)\n\
              - verb must be one of: {verbs}\n\
              - sort_key must be S followed by 1-3 digits (e.g. S00, S05, S100)\n\
@@ -236,8 +236,8 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj rc: {e}"));
             }
         };
-        // No capability gate on writes. `/etc/rc` is an ordinary write
-        // surface like `/etc/config` — the same file tools that can already
+        // No capability gate on writes. `/config/rc` is an ordinary write
+        // surface like `/config/kernel` — the same file tools that can already
         // write it enforce nothing of their own, so a gate here would deny
         // `kj rc add` to a caller who could achieve the identical result
         // with `builtin.file:write`.
@@ -305,9 +305,9 @@ impl KjDispatcher {
     }
 
     /// Write `content` to the rc script at `path` straight through the VFS to
-    /// the kernel-owned `/etc/rc` backend. There is no host file and no
-    /// FileDocumentCache mirror: the kernel document IS the script. Dispatch
-    /// (`load_rc_scripts`) reads the same document through the same VFS.
+    /// whatever backend is mounted at `/config/rc` — a host file in
+    /// production. No FileDocumentCache mirror sits in the way; dispatch
+    /// (`load_rc_scripts`) reads the same file through the same VFS.
     async fn write_rc_file(&self, path: &str, content: &str) -> Result<(), String> {
         use crate::vfs::VfsOps;
         self.kernel()
@@ -364,7 +364,7 @@ impl KjDispatcher {
     }
 
     /// Build the `(path, live_link, seed_status)` triple for every rc path
-    /// this kernel knows about — every live path under `/etc/rc` (`type_filter`/
+    /// this kernel knows about — every live path under `/config/rc` (`type_filter`/
     /// `verb_filter` narrow the walk, as `kj rc list` does) plus every embedded
     /// seed with nothing live at its path (reported as [`RcSeedStatus::NotInstalled`]
     /// rather than silently omitted — the anti-join `kj rc list` has always
@@ -532,7 +532,7 @@ impl KjDispatcher {
         }
     }
 
-    /// Walk the `/etc/rc` tree (`<type>/<verb>/SXX-name.ext`) and return all
+    /// Walk the `/config/rc` tree (`<type>/<verb>/SXX-name.ext`) and return all
     /// canonical script paths. A missing tree yields an empty list.
     async fn walk_rc_paths(&self) -> Result<Vec<String>, String> {
         use crate::vfs::{VfsError, VfsOps};
@@ -637,7 +637,7 @@ impl KjDispatcher {
         if !self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc rm: '{path}' not found"));
         }
-        // Delete the kernel document directly (no host file, no cache mirror).
+        // Delete the file straight through the VFS (no cache mirror).
         if let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(path)).await {
             return KjResult::Err(format!("kj rc rm: unlink '{path}': {e}"));
         }
@@ -652,10 +652,10 @@ mod tests {
     #[test]
     fn path_valid_canonical_forms() {
         for (path, expected_type, expected_verb, expected_ext) in [
-            ("/etc/rc/planner/create/S00-prompt.md", "planner", "create", "md"),
-            ("/etc/rc/coder/fork/S05-record.kai", "coder", "fork", "kai"),
-            ("/etc/rc/test_v2/attach/S100-many.md", "test_v2", "attach", "md"),
-            ("/etc/rc/long-name-here/drift/S0-noop.kai", "long-name-here", "drift", "kai"),
+            ("/config/rc/planner/create/S00-prompt.md", "planner", "create", "md"),
+            ("/config/rc/coder/fork/S05-record.kai", "coder", "fork", "kai"),
+            ("/config/rc/test_v2/attach/S100-many.md", "test_v2", "attach", "md"),
+            ("/config/rc/long-name-here/drift/S0-noop.kai", "long-name-here", "drift", "kai"),
         ] {
             let parts = parse_rc_path(path).unwrap_or_else(|e| panic!("{path}: {e}"));
             assert_eq!(parts.context_type, expected_type, "type for {path}");
@@ -666,40 +666,40 @@ mod tests {
 
     #[test]
     fn path_rejects_uppercase() {
-        assert!(parse_rc_path("/etc/rc/Planner/create/S00-foo.md").is_err());
-        assert!(parse_rc_path("/etc/rc/planner/create/S00-Foo.md").is_err());
+        assert!(parse_rc_path("/config/rc/Planner/create/S00-foo.md").is_err());
+        assert!(parse_rc_path("/config/rc/planner/create/S00-Foo.md").is_err());
     }
 
     #[test]
     fn path_rejects_unknown_verb() {
-        assert!(parse_rc_path("/etc/rc/planner/spawn/S00-foo.md").is_err());
-        assert!(parse_rc_path("/etc/rc/planner/destroy/S00-foo.kai").is_err());
+        assert!(parse_rc_path("/config/rc/planner/spawn/S00-foo.md").is_err());
+        assert!(parse_rc_path("/config/rc/planner/destroy/S00-foo.kai").is_err());
     }
 
     #[test]
     fn path_rejects_unknown_extension() {
-        assert!(parse_rc_path("/etc/rc/planner/create/S00-foo.sh").is_err());
-        assert!(parse_rc_path("/etc/rc/planner/create/S00-foo.txt").is_err());
+        assert!(parse_rc_path("/config/rc/planner/create/S00-foo.sh").is_err());
+        assert!(parse_rc_path("/config/rc/planner/create/S00-foo.txt").is_err());
     }
 
     #[test]
     fn path_rejects_missing_s_prefix() {
-        assert!(parse_rc_path("/etc/rc/planner/create/00-foo.md").is_err());
-        assert!(parse_rc_path("/etc/rc/planner/create/foo.md").is_err());
+        assert!(parse_rc_path("/config/rc/planner/create/00-foo.md").is_err());
+        assert!(parse_rc_path("/config/rc/planner/create/foo.md").is_err());
     }
 
     #[test]
     fn path_rejects_wrong_root() {
         assert!(parse_rc_path("/rc/planner/create/S00-foo.md").is_err());
-        assert!(parse_rc_path("/etc/init/planner/create/S00-foo.md").is_err());
+        assert!(parse_rc_path("/config/init/planner/create/S00-foo.md").is_err());
     }
 
     #[test]
     fn attach_and_drift_install_paths_validate() {
         // Reserved-verb scripts validate now; lifecycle dispatch will
         // no-op them until those hooks land.
-        assert!(parse_rc_path("/etc/rc/test/attach/S00-foo.md").is_ok());
-        assert!(parse_rc_path("/etc/rc/test/drift/S00-foo.kai").is_ok());
+        assert!(parse_rc_path("/config/rc/test/attach/S00-foo.md").is_ok());
+        assert!(parse_rc_path("/config/rc/test/drift/S00-foo.kai").is_ok());
     }
 
     /// The path validator and the firing gate share one verb list
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn every_canonical_verb_parses() {
         for verb in crate::kj::lifecycle::RC_VERBS {
-            let path = format!("/etc/rc/musician/{verb}/S10-x.kai");
+            let path = format!("/config/rc/musician/{verb}/S10-x.kai");
             let parts = parse_rc_path(&path)
                 .unwrap_or_else(|e| panic!("canonical verb {verb} must parse ({path}): {e}"));
             assert_eq!(&parts.verb, verb, "round-trip verb for {path}");
@@ -721,7 +721,7 @@ mod tests {
     /// reset`/`edit` on the shipped rotate script must validate.
     #[test]
     fn rotate_path_validates() {
-        assert!(parse_rc_path("/etc/rc/musician/rotate/S10-rotate.kai").is_ok());
+        assert!(parse_rc_path("/config/rc/musician/rotate/S10-rotate.kai").is_ok());
     }
 
     /// `kj rc show <path>` round-trips content from an earlier `kj rc add`
@@ -739,7 +739,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/etc/rc/showtest/create/S00-hello.kai"),
+                s("/config/rc/showtest/create/S00-hello.kai"),
                 s("--content"),
                 s("echo hi"),
             ],
@@ -752,7 +752,7 @@ mod tests {
                 &[
                     s("rc"),
                     s("show"),
-                    s("/etc/rc/showtest/create/S00-hello.kai"),
+                    s("/config/rc/showtest/create/S00-hello.kai"),
                 ],
                 &c,
             )
@@ -789,7 +789,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("show"), s("/etc/rc/none/create/S00-noop.kai")],
+                &[s("rc"), s("show"), s("/config/rc/none/create/S00-noop.kai")],
                 &c,
             )
             .await;
@@ -804,7 +804,7 @@ mod tests {
     ///
     /// **This does not pin the invalidation hook, and measurement is why.**
     /// Dropping `RcCommand::Add` from the dispatcher's `write_path` match
-    /// leaves this test passing: `/etc/rc` is host files now, so the shadow
+    /// leaves this test passing: `/config/rc` is host files now, so the shadow
     /// self-heals from the file's changed stat. The hook is belt-and-braces
     /// on this path. `rc_rm_invalidates_the_file_cache_shadow` below is the
     /// one that fails when its arm is dropped, because a removed file has no
@@ -829,7 +829,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let path = "/etc/rc/cachetest/create/S00-foo.kai";
+        let path = "/config/rc/cachetest/create/S00-foo.kai";
 
         // The kernel's own file cache, over the dispatcher's store + kernel VFS.
         let cache = d.kernel().file_cache().clone();
@@ -882,7 +882,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let path = "/etc/rc/cachetest/create/S01-gone.kai";
+        let path = "/config/rc/cachetest/create/S01-gone.kai";
         let cache = d.kernel().file_cache().clone();
 
         d.dispatch(&[s("rc"), s("add"), s(path), s("--content"), s("echo old")], &c)
@@ -915,7 +915,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/etc/rc/test/create/S00-noop.kai"),
+                s("/config/rc/test/create/S00-noop.kai"),
                 s("--content"),
                 s("true"),
             ],
@@ -926,7 +926,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/etc/rc/test/create/S01-second.kai"),
+                s("/config/rc/test/create/S01-second.kai"),
                 s("--content"),
                 s("true"),
             ],
@@ -944,11 +944,11 @@ mod tests {
                     .filter_map(|x| x.as_str())
                     .collect();
                 assert!(
-                    paths.contains(&"/etc/rc/test/create/S00-noop.kai"),
+                    paths.contains(&"/config/rc/test/create/S00-noop.kai"),
                     "missing S00 in: {paths:?}"
                 );
                 assert!(
-                    paths.contains(&"/etc/rc/test/create/S01-second.kai"),
+                    paths.contains(&"/config/rc/test/create/S01-second.kai"),
                     "missing S01 in: {paths:?}"
                 );
             }
@@ -976,7 +976,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/etc/rc/lib/create/S00-binding.kai"),
+                s("/config/rc/lib/create/S00-binding.kai"),
                 s("--content"),
                 s("kj binding allow drive"),
             ],
@@ -987,8 +987,8 @@ mod tests {
         d.kernel()
             .vfs()
             .symlink(
-                std::path::Path::new("/etc/rc/composed/create/S10-binding.kai"),
-                std::path::Path::new("/etc/rc/lib/create/S00-binding.kai"),
+                std::path::Path::new("/config/rc/composed/create/S10-binding.kai"),
+                std::path::Path::new("/config/rc/lib/create/S00-binding.kai"),
             )
             .await
             .expect("create rc symlink");
@@ -1005,12 +1005,12 @@ mod tests {
                     .filter_map(|x| x.as_str())
                     .collect();
                 assert!(
-                    paths.contains(&"/etc/rc/composed/create/S10-binding.kai"),
+                    paths.contains(&"/config/rc/composed/create/S10-binding.kai"),
                     "symlink missing from list data: {paths:?}"
                 );
                 assert!(
                     message.contains(
-                        "/etc/rc/composed/create/S10-binding.kai → /etc/rc/lib/create/S00-binding.kai"
+                        "/config/rc/composed/create/S10-binding.kai → /config/rc/lib/create/S00-binding.kai"
                     ),
                     "list message lacks arrow annotation: {message}"
                 );
@@ -1021,7 +1021,7 @@ mod tests {
         // show: reports the link target and the followed content.
         let shown = d
             .dispatch(
-                &[s("rc"), s("show"), s("/etc/rc/composed/create/S10-binding.kai")],
+                &[s("rc"), s("show"), s("/config/rc/composed/create/S10-binding.kai")],
                 &c,
             )
             .await;
@@ -1030,7 +1030,7 @@ mod tests {
                 let obj = v.as_object().expect("object");
                 assert_eq!(
                     obj["symlink"].as_str(),
-                    Some("/etc/rc/lib/create/S00-binding.kai"),
+                    Some("/config/rc/lib/create/S00-binding.kai"),
                     "show should report link target"
                 );
                 assert_eq!(
@@ -1064,7 +1064,7 @@ mod tests {
             .await;
         match result {
             KjResult::Ok { message, .. } => assert!(
-                message.contains("/etc/rc/coder/create/S00-stance.kai [in-sync]"),
+                message.contains("/config/rc/coder/create/S00-stance.kai [in-sync]"),
                 "expected in-sync marker: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
@@ -1088,7 +1088,7 @@ mod tests {
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
-        d.write_rc_file("/etc/rc/coder/create/S00-stance.kai", "# user override")
+        d.write_rc_file("/config/rc/coder/create/S00-stance.kai", "# user override")
             .await
             .expect("writing an rc script is an ordinary file write");
 
@@ -1100,7 +1100,7 @@ mod tests {
             .await;
         match result {
             KjResult::Ok { message, .. } => assert!(
-                message.contains("/etc/rc/coder/create/S00-stance.kai [differs from seed]"),
+                message.contains("/config/rc/coder/create/S00-stance.kai [differs from seed]"),
                 "expected differs marker: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
@@ -1123,7 +1123,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/etc/rc/mine/create/S00-custom.kai"),
+                s("/config/rc/mine/create/S00-custom.kai"),
                 s("--content"),
                 s("true"),
             ],
@@ -1136,7 +1136,7 @@ mod tests {
             .await;
         match result {
             KjResult::Ok { message, .. } => assert!(
-                message.contains("/etc/rc/mine/create/S00-custom.kai [no seed]"),
+                message.contains("/config/rc/mine/create/S00-custom.kai [no seed]"),
                 "expected no-seed marker: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
@@ -1164,7 +1164,7 @@ mod tests {
         match result {
             KjResult::Ok { message, .. } => assert!(
                 message.contains(
-                    "/etc/rc/default/create/S20-cache.kai → /etc/rc/lib/create/S20-cache.kai [in-sync]"
+                    "/config/rc/default/create/S20-cache.kai → /config/rc/lib/create/S20-cache.kai [in-sync]"
                 ),
                 "expected in-sync symlink marker: {message}"
             ),
@@ -1186,7 +1186,7 @@ mod tests {
         let s = |v: &str| v.to_string();
 
         d.dispatch(
-            &[s("rc"), s("rm"), s("/etc/rc/default/create/S20-cache.kai")],
+            &[s("rc"), s("rm"), s("/config/rc/default/create/S20-cache.kai")],
             &c,
         )
         .await;
@@ -1194,7 +1194,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/etc/rc/default/create/S20-cache.kai"),
+                s("/config/rc/default/create/S20-cache.kai"),
                 s("--content"),
                 s("# diverged, no longer a link"),
             ],
@@ -1211,11 +1211,11 @@ mod tests {
         match result {
             KjResult::Ok { message, .. } => {
                 assert!(
-                    message.contains("/etc/rc/default/create/S20-cache.kai [differs from seed]"),
+                    message.contains("/config/rc/default/create/S20-cache.kai [differs from seed]"),
                     "expected differs marker: {message}"
                 );
                 assert!(
-                    !message.contains("/etc/rc/default/create/S20-cache.kai →"),
+                    !message.contains("/config/rc/default/create/S20-cache.kai →"),
                     "should no longer show a symlink annotation: {message}"
                 );
             }
@@ -1256,7 +1256,7 @@ mod tests {
                 let scripts = parsed["scripts"].as_array().expect("scripts array");
                 let entry = scripts
                     .iter()
-                    .find(|e| e["path"] == "/etc/rc/coder/create/S00-stance.kai")
+                    .find(|e| e["path"] == "/config/rc/coder/create/S00-stance.kai")
                     .expect("stance entry present");
                 assert_eq!(entry["seed_status"], "in_sync");
 
@@ -1267,7 +1267,7 @@ mod tests {
                     .filter_map(|x| x.as_str())
                     .collect();
                 assert!(
-                    paths.contains(&"/etc/rc/coder/create/S00-stance.kai"),
+                    paths.contains(&"/config/rc/coder/create/S00-stance.kai"),
                     "data must stay the flat path array even under --json: {paths:?}"
                 );
             }
@@ -1290,7 +1290,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let path = "/etc/rc/coder/create/S00-stance.kai";
+        let path = "/config/rc/coder/create/S00-stance.kai";
 
         d.dispatch(&[s("rc"), s("rm"), s(path)], &c).await;
 
@@ -1334,7 +1334,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let path = "/etc/rc/coder/create/S00-stance.kai";
+        let path = "/config/rc/coder/create/S00-stance.kai";
 
         d.dispatch(&[s("rc"), s("rm"), s(path)], &c).await;
 
@@ -1374,8 +1374,8 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let target = "/etc/rc/lib/create/S20-cache.kai";
-        let link = "/etc/rc/coder/create/S20-cache.kai";
+        let target = "/config/rc/lib/create/S20-cache.kai";
+        let link = "/config/rc/coder/create/S20-cache.kai";
 
         // Precondition: the link is a real seed symlink onto the shared target.
         let before = d
@@ -1428,8 +1428,8 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let target = "/etc/rc/bassist/create/S05-chair.md";
-        let link = "/etc/rc/bassist/create/S00-stance.md";
+        let target = "/config/rc/bassist/create/S05-chair.md";
+        let link = "/config/rc/bassist/create/S00-stance.md";
 
         // Point a user-authored link at another user-authored path, then
         // remove the target out from under it.

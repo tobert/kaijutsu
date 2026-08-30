@@ -2,7 +2,7 @@
 //!
 //! Loads **bindings** from the host `bindings.toml` (app-only config). The
 //! **theme** is no longer a host file: it lives in the kernel-owned
-//! `/etc/config` (a plain file written through the file tools, see
+//! `/config/kernel` (a plain file written through the file tools, see
 //! `docs/config-ownership.md`'s superseded note) and is fetched over RPC
 //! on connect (`apply_theme_from_rpc`), so the app starts on
 //! `Theme::default()` and the real theme arrives once connected. Bindings

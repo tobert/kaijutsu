@@ -19,7 +19,7 @@ use kaijutsu_client::{EditorState, PeerConfig, ServerEvent, editor_events_channe
 
 /// A script the server seeds into rc on a fresh kernel — guaranteed to
 /// exist, so `editorOpen` binds to a real config-owned block.
-const RC_PATH: &str = "/etc/rc/coder/create/S00-stance.kai";
+const RC_PATH: &str = "/config/rc/coder/create/S00-stance.kai";
 
 /// Drain the editor push channel until a `EditorStateChanged` arrives (or fail
 /// loud on timeout — a missing push is the bug this test exists to catch).

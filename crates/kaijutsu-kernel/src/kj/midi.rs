@@ -1,7 +1,7 @@
 //! `kj midi` — read the kernel-owned MIDI device profile library.
 //!
-//! Device profiles live at `/etc/midi/devices/<name>` on the same kernel-owned
-//! backend that owns `/etc/rc` and `/etc/config`
+//! Device profiles live at `/config/midi/devices/<name>` on the same kernel-owned
+//! backend that owns `/config/rc` and `/config/kernel`
 //! (`docs/config-ownership.md`): the kernel is the sole owner, no host
 //! file, no write-through. Embedded seeds (`assets/defaults/midi/devices/*.md`,
 //! `crate::midi_seed`) bootstrap a fresh kernel once — see `docs/midi-next.md`
@@ -41,7 +41,7 @@
 //! Three deliberate stances:
 //!
 //! - **The profile is the gate; presence is not.** An unknown `<device>` (no
-//!   `/etc/midi/devices/<name>`) is a loud error — there is nothing to route
+//!   `/config/midi/devices/<name>`) is a loud error — there is nothing to route
 //!   and no honest guess. A device the presence store says is *absent* or
 //!   *unknown* is still sent, with the warning in the result: presence is a
 //!   sink's report, a sink may have connected since, and the kernel does not
@@ -86,7 +86,7 @@ use crate::flows::BlockFlow;
 #[derive(Parser, Debug)]
 #[command(
     name = "midi",
-    about = "MIDI device profiles (/etc/midi/devices/<name>) and raw emit at a named device",
+    about = "MIDI device profiles (/config/midi/devices/<name>) and raw emit at a named device",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -107,7 +107,7 @@ enum MidiCommand {
     /// Print one device's profile document.
     #[command(alias = "cat")]
     Show {
-        /// Device name (e.g. minibrute) or full /etc/midi/devices path
+        /// Device name (e.g. minibrute) or full /config/midi/devices path
         name: String,
         /// Emit a JSON object instead of a labelled view
         #[arg(long)]
@@ -118,7 +118,7 @@ enum MidiCommand {
     },
     /// Emit raw MIDI at a named device (the sink resolves the port).
     Send {
-        /// Device name — a profile key under /etc/midi/devices
+        /// Device name — a profile key under /config/midi/devices
         device: String,
         #[command(subcommand)]
         message: SendMessage,
@@ -130,7 +130,7 @@ enum MidiCommand {
     /// Ask a device what it is (universal MIDI Identity Request) and record
     /// the answer as a pulled fact in /run/midi/<device>.
     Identify {
-        /// Device name — a profile key under /etc/midi/devices
+        /// Device name — a profile key under /config/midi/devices
         device: String,
         /// How long the sink waits for the device's reply, in milliseconds
         #[arg(long, default_value_t = DEFAULT_EXCHANGE_TIMEOUT_MS)]
@@ -397,16 +397,16 @@ fn emit_result(
     KjResult::ok_typed_with_data(message, ContentType::Plain, data)
 }
 
-/// The `/etc/midi/devices` directory path.
+/// The `/config/midi/devices` directory path.
 fn devices_dir() -> String {
     format!("{MIDI_ROOT}/devices")
 }
 
-/// Canonicalize a user-supplied device arg to `/etc/midi/devices/<name>`.
+/// Canonicalize a user-supplied device arg to `/config/midi/devices/<name>`.
 /// Accepts a bare name (`minibrute`) or an already-full path. Rejects nested
 /// paths and parent escapes — the devices namespace is flat, one document per
 /// device (a future rc-style bucket widens the *reader*, not this grammar,
-/// since a bucket's files still hang directly under `/etc/midi/devices/<name>/`,
+/// since a bucket's files still hang directly under `/config/midi/devices/<name>/`,
 /// not under a per-device leaf this canonicalizer would need to parse).
 fn midi_device_canonical(name: &str) -> Result<String, String> {
     let dir = devices_dir();
@@ -438,7 +438,7 @@ fn presence_label(record: Option<&crate::midi_presence::MidiPresenceRecord>) -> 
 }
 
 /// Placeholder title rendered for a directory entry under
-/// `/etc/midi/devices` — the shape a future rc-style bucket device will take
+/// `/config/midi/devices` — the shape a future rc-style bucket device will take
 /// (`docs/midi-next.md` "The core split"). Today's reader only understands a
 /// single-file leaf profile; a bucket directory must render a visible row
 /// instead of silently vanishing from an `is_file()` filter, so a future
@@ -801,7 +801,7 @@ impl KjDispatcher {
         let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
             Ok(e) => e,
             // Absent (no mount, nothing seeded yet) reads as an empty listing,
-            // not an error — a kernel that never mounted /etc/midi still
+            // not an error — a kernel that never mounted /config/midi still
             // answers `kj midi list` truthfully with nothing.
             Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Vec::new(),
             Err(e) => return KjResult::Err(format!("kj midi list: readdir {dir}: {e}")),
@@ -998,14 +998,14 @@ mod tests {
     fn canonical_accepts_bare_and_full_rejects_nesting() {
         assert_eq!(
             midi_device_canonical("minibrute").unwrap(),
-            "/etc/midi/devices/minibrute"
+            "/config/midi/devices/minibrute"
         );
         assert_eq!(
-            midi_device_canonical("/etc/midi/devices/timidity").unwrap(),
-            "/etc/midi/devices/timidity"
+            midi_device_canonical("/config/midi/devices/timidity").unwrap(),
+            "/config/midi/devices/timidity"
         );
         assert!(midi_device_canonical("sub/device").is_err());
-        assert!(midi_device_canonical("/etc/midi/devices/a/b").is_err());
+        assert!(midi_device_canonical("/config/midi/devices/a/b").is_err());
         assert!(midi_device_canonical("").is_err());
         assert!(midi_device_canonical("..").is_err());
     }
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(doc_title("plain first line\nmore"), "plain first line");
     }
 
-    /// A fresh kernel (the real kernel-owned `/etc/midi` mount, seeded from
+    /// A fresh kernel (the real kernel-owned `/config/midi` mount, seeded from
     /// embedded defaults) already carries the shipped device profiles — no
     /// separate bootstrap step needed by callers.
     #[tokio::test]
@@ -1030,9 +1030,9 @@ mod tests {
         let names: Vec<_> = d
             .kernel()
             .vfs()
-            .readdir(std::path::Path::new("/etc/midi/devices"))
+            .readdir(std::path::Path::new("/config/midi/devices"))
             .await
-            .expect("readdir /etc/midi/devices")
+            .expect("readdir /config/midi/devices")
             .into_iter()
             .map(|e| e.name)
             .collect();
@@ -1098,7 +1098,7 @@ mod tests {
             .await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
-                assert_eq!(v["path"].as_str(), Some("/etc/midi/devices/minibrute"));
+                assert_eq!(v["path"].as_str(), Some("/config/midi/devices/minibrute"));
                 let content = v["content"].as_str().expect("content present");
                 assert!(content.contains("MiniBrute"), "content: {content}");
                 assert!(content.contains("\"device\": \"minibrute\""), "content: {content}");
@@ -1157,15 +1157,15 @@ mod tests {
         }
     }
 
-    /// A directory under `/etc/midi/devices` (the shape a future rc-style
+    /// A directory under `/config/midi/devices` (the shape a future rc-style
     /// bucket device will take, `docs/midi-next.md` "The core split") must
     /// render as a visible, clearly-labelled row — not silently vanish behind
     /// the old `is_file()` filter. Built through the real kernel-owned
-    /// `/etc/midi` mount (same fixture `fresh_kernel_seeds_midi_devices_into_the_vfs`
+    /// `/config/midi` mount (same fixture `fresh_kernel_seeds_midi_devices_into_the_vfs`
     /// uses): `ConfigDocFs` synthesizes directories from descendant paths
     /// (see `readdir_synthesizes_virtual_directories` in
     /// `runtime::config_doc_fs`), so writing a leaf file under
-    /// `/etc/midi/devices/<bucket>/...` is enough to make `<bucket>` itself
+    /// `/config/midi/devices/<bucket>/...` is enough to make `<bucket>` itself
     /// appear as a real `FileType::Directory` readdir entry — no fixture
     /// workaround needed.
     #[tokio::test]
@@ -1175,7 +1175,7 @@ mod tests {
         d.kernel()
             .vfs()
             .write_all(
-                std::path::Path::new("/etc/midi/devices/future-bucket/S00-notes.md"),
+                std::path::Path::new("/config/midi/devices/future-bucket/S00-notes.md"),
                 b"stub rc-style bucket file, not a seed",
             )
             .await
@@ -1215,7 +1215,7 @@ mod tests {
         d.kernel()
             .vfs()
             .write_all(
-                std::path::Path::new("/etc/midi/devices/future-bucket/S00-notes.md"),
+                std::path::Path::new("/config/midi/devices/future-bucket/S00-notes.md"),
                 b"stub rc-style bucket file, not a seed",
             )
             .await
@@ -2064,7 +2064,7 @@ mod tests {
         }
     }
 
-    /// `kj midi list` on a kernel with no `/etc/midi` mount at all answers
+    /// `kj midi list` on a kernel with no `/config/midi` mount at all answers
     /// truthfully with an empty listing rather than erroring — mirrors `kj
     /// config list`'s "absent mount reads as empty" contract.
     #[tokio::test]

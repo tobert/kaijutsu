@@ -223,7 +223,7 @@ design (`mount_backend.rs:264-267`), so they are straight-from-disk with no
 staleness window, and a backend error refuses to serve disk bytes rather than
 serving stale ones.
 
-So slice 1 is **one rc script**: `/etc/rc/<type>/create/S15-recall.kai` reads
+So slice 1 is **one rc script**: `/config/rc/<type>/create/S15-recall.kai` reads
 the index surfaces and injects one compact recall block carrying receipts —
 claim, date, observer — plus computed age and **the git HEAD it read**.
 Staleness becomes *visible, not absent*; that is the whole claim.

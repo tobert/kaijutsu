@@ -111,13 +111,13 @@ check_exempt() {
 check_exempt '[{"clause":"kj rc add --help"}]' true "kj rc add --help" || fails=1
 check_exempt '[{"clause":"kj ledger list --help"}]' true "kj ledger list --help" || fails=1
 check_exempt '[{"clause":"kj -h"}]' true "kj -h" || fails=1
-check_exempt '[{"clause":"kj rc rm /etc/rc/coder/create/S00.kai --help"}]' true "positional then --help" || fails=1
+check_exempt '[{"clause":"kj rc rm /config/rc/coder/create/S00.kai --help"}]' true "positional then --help" || fails=1
 check_exempt '[{"clause":"kj rc add --help"},{"clause":"kj rc rm --help"}]' true "two help clauses" || fails=1
 # The bypass. This one must stay false.
-check_exempt '[{"clause":"kj rc add /etc/rc/x --content --help"}]' false "--content --help is a WRITE, not help" || fails=1
-check_exempt '[{"clause":"kj rc rm /etc/rc/x"}]' false "a real rm" || fails=1
+check_exempt '[{"clause":"kj rc add /config/rc/x --content --help"}]' false "--content --help is a WRITE, not help" || fails=1
+check_exempt '[{"clause":"kj rc rm /config/rc/x"}]' false "a real rm" || fails=1
 check_exempt '[{"clause":"cargo test --help"}]' false "not kj, not covered" || fails=1
-check_exempt '[{"clause":"kj rc add --help"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: one real clause scores the call" || fails=1
+check_exempt '[{"clause":"kj rc add --help"},{"clause":"kj rc rm /config/rc/x"}]' false "mixed: one real clause scores the call" || fails=1
 check_exempt '[{"clause":"kj"}]' false "bare kj" || fails=1
 
 # The gate's own answer path. Every `kj ledger` verb is exempt, because the
@@ -131,7 +131,7 @@ check_exempt '[{"clause":"kj ledger allow a"},{"clause":"kj ledger deny b"}]' tr
 # and not after any first word.
 check_exempt '[{"clause":"kj ledgerfoo bar"}]' false "ledgerfoo is not ledger" || fails=1
 check_exempt '[{"clause":"notkj ledger allow x"}]' false "first word must be kj" || fails=1
-check_exempt '[{"clause":"kj ledger list"},{"clause":"kj rc rm /etc/rc/x"}]' false "mixed: a real clause scores the call" || fails=1
+check_exempt '[{"clause":"kj ledger list"},{"clause":"kj rc rm /config/rc/x"}]' false "mixed: a real clause scores the call" || fails=1
 
 if [[ "$fails" -ne 0 ]]; then
   echo "ladder check FAILED"
