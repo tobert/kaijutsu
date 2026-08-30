@@ -124,13 +124,41 @@ Two things follow.
 
 **A cleanup pass belongs in the `/config` melt** (`docs/config-namespace.md`).
 Once the other three roots melt, every document under all four roots is an
-orphan. `kernel.db` is 932 MB and nobody has measured how much of that is
-config documents nothing can reach.
+orphan.
+
+**Measured 2026-08-30, and it is not a space story.** Read-only against the
+08-29 backup copy: the 84 documents under `/etc/*` hold **under 1 MB** between
+them. The 933 MB is 2378 conversation documents — `doc_snapshots` is 859 MB of
+it, one row per document (`document_id` is the PRIMARY KEY, so there is no
+retention leak), split 669 MB of `state` to 186 MB of `content`.
+`freelist_count` is **0**, so `VACUUM` reclaims nothing. Delete the orphans
+for correctness — a stale document that shadows a live file is the hazard —
+but do not expect the database to shrink.
 
 **The general rule this is an instance of:** melting a tree off the block store
 leaves its documents behind, because the melt changes what is *mounted*, not
 what is *stored*. Whoever melts the remaining three roots must delete the
 documents in the same change or file the same entry again.
+
+## `doc_snapshots` stores the text twice — once encoded, once derived (2026-08-30)
+
+`doc_snapshots` carries both `state` (CBOR of the whole `BlockDocument`, via
+`codec::encode(&entry.doc.snapshot())` in
+`crates/kaijutsu-kernel/src/block_store.rs:1002`) and `content` (the
+concatenated plain text, `entry.content()`). The text is recoverable from the
+state, so `content` is a derived cache stored beside its own source.
+
+Measured on the 08-29 backup: `state` 669 MB, `content` 186 MB. That is ~20%
+of a 933 MB database spent on something the row already contains.
+
+Not obviously wrong — a reader that only wants the text pays no CBOR decode,
+and `KernelDb`'s snapshot read (`kernel_db.rs:2787`) hands both back together.
+The question is whether any hot path actually reads `content` without also
+needing `state`. If none does, the column is deletable; if one does, the doc
+comment should say which, because the redundancy currently looks accidental.
+
+Found while answering "how much of kernel.db is reclaimable" (answer: none —
+`freelist_count` is 0).
 
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
