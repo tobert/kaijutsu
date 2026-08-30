@@ -354,29 +354,10 @@ pub(crate) async fn spawn_llm_for_prompt(
     let context_interrupts = kernel.context_interrupts.clone();
 
     // Load the system prompt from the config tree, seeded from the embedded
-    // default while that tree is empty. The path is BUILT from
-    // `paths::config_path`, never spelled here: a literal survives a namespace
-    // move and then reads nothing, and the fallback below would hide it behind
-    // one warn line per turn. A read/UTF-8 failure falls back to the embedded
-    // default — loudly, never a silent empty prompt.
-    let system_prompt = {
-        use kaijutsu_kernel::vfs::VfsOps;
-        let system_md = kaijutsu_types::paths::config_path("system.md");
-        match kernel_arc
-            .vfs()
-            .read_all(std::path::Path::new(&system_md))
-            .await
-        {
-            Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
-                log::warn!("{system_md} is not UTF-8: {e}; using embedded default");
-                kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string()
-            }),
-            Err(e) => {
-                log::warn!("read {system_md} failed: {e}; using embedded default");
-                kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string()
-            }
-        }
-    };
+    // default while that tree is empty. One loader, shared with
+    // `kj context prompt` — two copies of it drifted once.
+    let system_prompt =
+        kaijutsu_kernel::config_seed::load_system_prompt(kernel_arc.vfs().as_ref()).await;
 
     // Read per-context model from DriftRouter (quick read, release lock).
     // Capture label/state alongside for the situational system-prompt addendum.

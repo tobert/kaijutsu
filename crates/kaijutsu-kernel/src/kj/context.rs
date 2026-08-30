@@ -973,29 +973,9 @@ impl KjDispatcher {
             None => (None, None),
         };
 
-        // base: /config/kernel/system.md, an ordinary host file under the
-        // kernel config tree (docs/config-namespace.md). Fallback mirrors
-        // llm_stream.rs's `spawn_llm_for_prompt` exactly: a read/UTF-8
-        // failure falls back to the embedded default, loudly logged, never
-        // a silent empty prompt.
-        let base = {
-            use crate::vfs::VfsOps;
-            match self
-                .kernel()
-                .vfs()
-                .read_all(std::path::Path::new("/config/kernel/system.md"))
-                .await
-            {
-                Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
-                    tracing::warn!("system.md is not UTF-8: {e}; using embedded default");
-                    crate::DEFAULT_SYSTEM_PROMPT.to_string()
-                }),
-                Err(e) => {
-                    tracing::warn!("read /config/kernel/system.md failed: {e}; using embedded default");
-                    crate::DEFAULT_SYSTEM_PROMPT.to_string()
-                }
-            }
-        };
+        // base: the same loader the turn path uses, so what `kj context
+        // prompt` reports cannot drift from what is really sent.
+        let base = crate::config_seed::load_system_prompt(self.kernel().vfs().as_ref()).await;
 
         // rc sections: the (Role::System, BlockKind::Text) blocks the rc
         // create/fork lifecycle dropped into this context's block store —

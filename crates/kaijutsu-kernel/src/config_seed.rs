@@ -147,6 +147,30 @@ pub fn config_seed_body(canonical_path: &str) -> Option<&'static str> {
         })
 }
 
+/// Read the kernel-wide system prompt from `/config/kernel/system.md`.
+///
+/// The path is built from [`kaijutsu_types::paths::config_path`], never
+/// spelled at the call site: a literal survives a namespace move and then
+/// reads nothing, and the fallback below hides that behind one `warn!` per
+/// call. A read or UTF-8 failure falls back to [`DEFAULT_SYSTEM_PROMPT`],
+/// loudly — never a silent empty prompt.
+///
+/// Every caller that needs the base system prompt calls this. Two copies of
+/// this logic drifted once; one is the fix.
+pub async fn load_system_prompt(vfs: &dyn crate::vfs::VfsOps) -> String {
+    let system_md = kaijutsu_types::paths::config_path("system.md");
+    match vfs.read_all(std::path::Path::new(&system_md)).await {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
+            tracing::warn!("{system_md} is not UTF-8: {e}; using embedded default");
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }),
+        Err(e) => {
+            tracing::warn!("read {system_md} failed: {e}; using embedded default");
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +278,59 @@ mod tests {
     fn theme_default_parses_as_toml() {
         let v: toml::Value = toml::from_str(DEFAULT_THEME).expect("theme default is valid TOML");
         assert!(v.get("bg").is_some(), "theme default carries bg");
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_loader_tests {
+    use super::*;
+    use crate::vfs::{LocalBackend, MountTable};
+    use kaijutsu_types::paths::{config_path, CONFIG_ROOT};
+    use std::sync::Arc;
+
+    /// Mount a real host directory at [`CONFIG_ROOT`] and return the dir so
+    /// the caller can write into it. Mirrors production's mount shape, so a
+    /// loader that spells its own path instead of deriving one reads the
+    /// wrong file here the moment `CONFIG_ROOT` moves.
+    async fn config_vfs() -> (Arc<MountTable>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount(CONFIG_ROOT, LocalBackend::new(dir.path())).await;
+        (vfs, dir)
+    }
+
+    /// The body on disk wins. A sentinel that shares no line with the
+    /// embedded default, so "fell back silently" and "read the file" cannot
+    /// be confused for one another.
+    #[tokio::test]
+    async fn reads_the_body_on_disk() {
+        let (vfs, dir) = config_vfs().await;
+        std::fs::write(dir.path().join("system.md"), "SENTINEL-ON-DISK").unwrap();
+
+        let got = load_system_prompt(vfs.as_ref()).await;
+        assert_eq!(got, "SENTINEL-ON-DISK", "loader must serve the file at {}", config_path("system.md"));
+        assert_ne!(got, DEFAULT_SYSTEM_PROMPT, "must not fall back when the file reads fine");
+    }
+
+    /// No file: the embedded default, never an empty prompt. The failure
+    /// mode this guards is a silently blank system prompt, which is worse
+    /// than a stale one.
+    #[tokio::test]
+    async fn falls_back_to_the_embedded_default_when_absent() {
+        let (vfs, _dir) = config_vfs().await;
+
+        let got = load_system_prompt(vfs.as_ref()).await;
+        assert_eq!(got, DEFAULT_SYSTEM_PROMPT);
+        assert!(!got.is_empty(), "the fallback must never be an empty prompt");
+    }
+
+    /// Non-UTF-8 takes the same fallback rather than panicking or serving
+    /// replacement characters into every context's system prompt.
+    #[tokio::test]
+    async fn falls_back_when_the_file_is_not_utf8() {
+        let (vfs, dir) = config_vfs().await;
+        std::fs::write(dir.path().join("system.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        assert_eq!(load_system_prompt(vfs.as_ref()).await, DEFAULT_SYSTEM_PROMPT);
     }
 }
