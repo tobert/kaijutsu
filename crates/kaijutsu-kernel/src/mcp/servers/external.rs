@@ -24,7 +24,7 @@ use rmcp::model::{
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{NotificationContext, RequestContext, RunningService};
-use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, RoleClient};
 use tokio::process::Command;
 use tokio::sync::broadcast;
@@ -70,6 +70,10 @@ pub struct McpServerConfig {
     pub cwd: Option<String>,
     pub transport: McpTransport,
     pub url: Option<String>,
+    /// Extra HTTP headers sent with every request, for `StreamableHttp` only.
+    /// Values are already resolved (`mcp/toml.rs`), so a credential reaches
+    /// here as the string to send, never as the source it came from.
+    pub headers: HashMap<String, String>,
     /// Per-server `InstancePolicy::call_timeout` override, sourced from
     /// mcp.toml's `call_timeout_ms` (component 3, `docs/external-mcp.md`). `None`
     /// means "use the kernel-wide `TimeoutPolicy::mcp_call_timeout_default`"
@@ -268,6 +272,40 @@ impl ClientHandler for BrokerClientHandler {
     }
 }
 
+/// Build the streamable-HTTP transport for one server: its URL plus any
+/// configured headers.
+///
+/// An unusable header name or value fails the connection rather than being
+/// dropped — a request that silently goes out without its credential comes
+/// back as an authentication error far from the mistake.
+fn http_transport(
+    config: &McpServerConfig,
+) -> McpResult<rmcp::transport::StreamableHttpClientTransport<reqwest::Client>> {
+    let url = config
+        .url
+        .as_deref()
+        .ok_or_else(|| McpError::Protocol("StreamableHttp transport requires url".to_string()))?;
+
+    let mut headers = HashMap::with_capacity(config.headers.len());
+    for (name, value) in &config.headers {
+        let header = http::HeaderName::try_from(name.as_str()).map_err(|e| {
+            McpError::Protocol(format!("header '{name}' is not a valid header name: {e}"))
+        })?;
+        // The error never quotes the value — it may be a credential.
+        let header_value = http::HeaderValue::try_from(value.as_str()).map_err(|_| {
+            McpError::Protocol(format!(
+                "the value configured for header '{name}' cannot be sent in an HTTP header"
+            ))
+        })?;
+        headers.insert(header, header_value);
+    }
+
+    let transport_config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
+            .custom_headers(headers);
+    Ok(rmcp::transport::StreamableHttpClientTransport::from_config(transport_config))
+}
+
 /// Propagate PATH and other essential host env vars onto the child command —
 /// matches legacy `mcp_pool::propagate_host_env`.
 fn propagate_host_env(cmd: &mut Command) {
@@ -375,10 +413,7 @@ impl ExternalMcpServer {
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
                 McpTransport::StreamableHttp => {
-                    let url = config.url.as_deref().ok_or_else(|| {
-                        McpError::Protocol("StreamableHttp transport requires url".to_string())
-                    })?;
-                    let transport = StreamableHttpClientTransport::from_uri(url);
+                    let transport = http_transport(&config)?;
                     rmcp::serve_client(handler, transport)
                         .await
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
@@ -455,10 +490,7 @@ impl ExternalMcpServer {
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
                 McpTransport::StreamableHttp => {
-                    let url = self.config.url.as_deref().ok_or_else(|| {
-                        McpError::Protocol("StreamableHttp transport requires url".to_string())
-                    })?;
-                    let transport = StreamableHttpClientTransport::from_uri(url);
+                    let transport = http_transport(&self.config)?;
                     rmcp::serve_client(handler, transport)
                         .await
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
@@ -1155,6 +1187,46 @@ mod tests {
     // `PR_SET_PDEATHSIG(SIGKILL)` in `pre_exec` (mirrors
     // `background_exec::spawn_background` — see that module's "Ownership
     // and cleanup" doc section). The test below exercises the exact same
+    #[test]
+    fn http_transport_rejects_an_unusable_header_name() {
+        let config = McpServerConfig {
+            name: "exa".into(),
+            transport: McpTransport::StreamableHttp,
+            url: Some("https://mcp.exa.ai/mcp".into()),
+            headers: HashMap::from([("x api key".to_string(), "secret".to_string())]),
+            ..Default::default()
+        };
+        let err = http_transport(&config).err().expect("a space is not a header name");
+        assert!(format!("{err:?}").contains("x api key"), "{err:?}");
+    }
+
+    /// The name is safe to print; the value is a credential and is not.
+    #[test]
+    fn an_unusable_header_value_is_reported_without_quoting_it() {
+        let config = McpServerConfig {
+            name: "exa".into(),
+            transport: McpTransport::StreamableHttp,
+            url: Some("https://mcp.exa.ai/mcp".into()),
+            // A newline cannot be sent in a header value.
+            headers: HashMap::from([("x-api-key".to_string(), "sk-leak\nX: y".to_string())]),
+            ..Default::default()
+        };
+        let err = http_transport(&config).err().expect("a newline is not a header value");
+        let rendered = format!("{err:?}");
+        assert!(rendered.contains("x-api-key"), "{rendered}");
+        assert!(!rendered.contains("sk-leak"), "the error leaked the credential: {rendered}");
+    }
+
+    #[test]
+    fn http_transport_requires_a_url() {
+        let config = McpServerConfig {
+            name: "exa".into(),
+            transport: McpTransport::StreamableHttp,
+            ..Default::default()
+        };
+        assert!(http_transport(&config).is_err());
+    }
+
     // `harden_child_command` → `TokioChildProcess::new` seam `connect()`
     // uses, without needing a real MCP handshake, and checks the ONE half
     // of that closure's effect that's observable from outside the child:

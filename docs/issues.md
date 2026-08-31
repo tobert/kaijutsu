@@ -372,14 +372,6 @@ Whichever wins, the failure contract is already set by the file and env
 sources: an unresolvable value fails that one server with a reason, never
 launches it blank, and never quotes the value into a log line.
 
-## Secrets in `mcp.toml` do not cover HTTP servers (2026-08-31)
-
-`streamable_http` entries carry a `url` and nothing else — there is no header
-or bearer-token field at all, so the only place a credential can go is inside
-the URL. The `env` source machinery does not reach them, because a
-`streamable_http` server is not a child process and never sees `env`. Nobody
-has needed it yet; note it before someone writes a token into a `url`.
-
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 
 `context_type` on `register_session` is caller-chosen free text with no

@@ -120,6 +120,8 @@ async-broadcast = "0.7"
 # MCP. "transport-io" (stdio()) is needed only by
 # src/bin/mcp_stub_server.rs — see that file's doc comment.
 rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }
+# HeaderName/HeaderValue for streamable_http custom headers (mcp.toml).
+http = { workspace = true }
 
 # JSON schema derivation for tool Params structs (Phase 1 tool redesign)
 schemars = { version = "1.0", features = ["chrono04"] }

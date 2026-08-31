@@ -83,9 +83,16 @@ someone edits `mcp.toml` is never interrupted by a reload, at the cost of a
 explicitly restarted. **There is no `kj mcp restart <name>` in this slice**
 (`docs/issues.md`).
 
-An `env` value sourced from a file or a variable (`assets/defaults/mcp.toml`,
-"Keeping a secret out of this file") resolves at load and follows the same
-rule: a rotated key reaches a server only when that server is next spawned.
+An `env` or `headers` value sourced from a file or a variable
+(`assets/defaults/mcp.toml`, "Keeping a secret out of this file") resolves at
+load and follows the same rule: a rotated key reaches a server only when that
+server is next spawned.
+
+A `streamable_http` server carries its credential in `headers`, which reach
+`StreamableHttpClientTransportConfig::custom_headers`. `env` and `headers` are
+transport-specific — `env` only reaches a child process, `headers` only an
+HTTP request — so naming the wrong one for the transport fails that entry
+rather than being dropped.
 
 The alternative — diffing `McpServerConfig` and hot-swapping a changed
 entry — is also defensible: `Broker::register` already replaces-by-id, and

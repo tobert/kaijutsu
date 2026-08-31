@@ -108,6 +108,11 @@ mod toml_types {
         #[serde(default)]
         pub env: HashMap<String, toml::Value>,
 
+        /// Extra HTTP headers, `streamable_http` only. Values follow the
+        /// same literal-or-source rule as `env`.
+        #[serde(default)]
+        pub headers: HashMap<String, toml::Value>,
+
         #[serde(default)]
         pub cwd: Option<String>,
 
@@ -187,8 +192,29 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             }
         }
 
-        let env = match resolve_env(&srv.env) {
-            Ok(env) => env,
+        // A field the chosen transport cannot use is a mistake to report, not
+        // a value to drop: `env` never reaches an HTTP request, and `headers`
+        // never reaches a child process.
+        let misplaced = match transport {
+            McpTransport::Stdio if !srv.headers.is_empty() => {
+                Some("'headers' applies to streamable_http only; a child process gets 'env'")
+            }
+            McpTransport::StreamableHttp if !srv.env.is_empty() => {
+                Some("'env' applies to stdio only; an HTTP server gets 'headers'")
+            }
+            _ => None,
+        };
+        if let Some(reason) = misplaced {
+            let reason = reason.to_string();
+            warnings.push(format!("server '{name}': {reason} — skipped"));
+            invalid.push(InvalidServer { name: name.clone(), reason });
+            continue;
+        }
+
+        let resolved = resolve_values("env", &srv.env)
+            .and_then(|env| Ok((env, resolve_values("headers", &srv.headers)?)));
+        let (env, headers) = match resolved {
+            Ok(pair) => pair,
             Err(reason) => {
                 warnings.push(format!("server '{name}': {reason} — skipped"));
                 invalid.push(InvalidServer { name: name.clone(), reason });
@@ -204,6 +230,7 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             cwd: srv.cwd.clone(),
             transport,
             url: srv.url.clone(),
+            headers,
             call_timeout: srv.call_timeout_ms.map(std::time::Duration::from_millis),
         });
     }
@@ -211,22 +238,26 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
     Ok(McpConfigLoad { servers, warnings, invalid })
 }
 
-/// Resolve every `env` value for one server, or name the first failure.
+/// Resolve every value in one `env` or `headers` table, or name the first
+/// failure.
 ///
-/// Deterministic: variables are visited in sorted order, so the same
-/// malformed file always reports the same variable.
-fn resolve_env(raw: &HashMap<String, toml::Value>) -> Result<HashMap<String, String>, String> {
+/// Deterministic: keys are visited in sorted order, so the same malformed file
+/// always reports the same key.
+fn resolve_values(
+    field: &str,
+    raw: &HashMap<String, toml::Value>,
+) -> Result<HashMap<String, String>, String> {
     let mut names: Vec<&String> = raw.keys().collect();
     names.sort();
 
     let mut resolved = HashMap::with_capacity(names.len());
-    for var in names {
-        resolved.insert(var.clone(), resolve_env_value(var, &raw[var])?);
+    for key in names {
+        resolved.insert(key.clone(), resolve_value(field, key, &raw[key])?);
     }
     Ok(resolved)
 }
 
-/// Interpret one `env` value: a literal string, or a table naming exactly one
+/// Interpret one value: a literal string, or a table naming exactly one
 /// source.
 ///
 /// ```toml
@@ -235,15 +266,15 @@ fn resolve_env(raw: &HashMap<String, toml::Value>) -> Result<HashMap<String, Str
 /// env.GITHUB_TOKEN  = { env = "GITHUB_TOKEN" }     # the kernel's own environment
 /// ```
 ///
-/// Errors name the variable and the source, never the resolved value, so they
-/// are safe to log and to show a player.
-fn resolve_env_value(var: &str, value: &toml::Value) -> Result<String, String> {
+/// Errors name the key and the source, never the resolved value, so they are
+/// safe to log and to show a player.
+fn resolve_value(field: &str, key: &str, value: &toml::Value) -> Result<String, String> {
     let table = match value {
         toml::Value::String(literal) => return Ok(literal.clone()),
         toml::Value::Table(table) => table,
         _ => {
             return Err(format!(
-                "env.{var} must be a string, or a table naming one source: \
+                "{field}.{key} must be a string, or a table naming one source: \
                  {{ file = \"…\" }} or {{ env = \"…\" }}"
             ));
         }
@@ -251,7 +282,7 @@ fn resolve_env_value(var: &str, value: &toml::Value) -> Result<String, String> {
 
     if table.is_empty() {
         return Err(format!(
-            "env.{var} is an empty table — name one source: \
+            "{field}.{key} is an empty table — name one source: \
              {{ file = \"…\" }} or {{ env = \"…\" }}"
         ));
     }
@@ -259,7 +290,7 @@ fn resolve_env_value(var: &str, value: &toml::Value) -> Result<String, String> {
         let mut named: Vec<&str> = table.keys().map(String::as_str).collect();
         named.sort();
         return Err(format!(
-            "env.{var} names {} sources ({}) — a source table takes exactly one",
+            "{field}.{key} names {} sources ({}) — a source table takes exactly one",
             table.len(),
             named.join(", ")
         ));
@@ -268,17 +299,17 @@ fn resolve_env_value(var: &str, value: &toml::Value) -> Result<String, String> {
     let (source, argument) = table.iter().next().expect("table holds exactly one key");
     let argument = argument
         .as_str()
-        .ok_or_else(|| format!("env.{var}: '{source}' must be a string"))?;
+        .ok_or_else(|| format!("{field}.{key}: '{source}' must be a string"))?;
 
     match source.as_str() {
-        "file" => read_secret_file(argument).map_err(|e| format!("env.{var}: {e}")),
-        "env" => read_secret_env(argument).map_err(|e| format!("env.{var}: {e}")),
+        "file" => read_secret_file(argument).map_err(|e| format!("{field}.{key}: {e}")),
+        "env" => read_secret_env(argument).map_err(|e| format!("{field}.{key}: {e}")),
         "command" => Err(format!(
-            "env.{var}: a command source is not implemented — use \
+            "{field}.{key}: a command source is not implemented — use \
              {{ file = \"…\" }} or {{ env = \"…\" }}"
         )),
         other => Err(format!(
-            "env.{var}: unknown source '{other}' — use file or env"
+            "{field}.{key}: unknown source '{other}' — use file or env"
         )),
     }
 }
@@ -514,6 +545,93 @@ mod tests {
             "the reason leaked the secret: {}",
             load.invalid[0].reason
         );
+    }
+
+    // ---- headers ---------------------------------------------------------
+
+    /// The exa shape: an HTTP server whose credential rides in a header and
+    /// never appears in the config file.
+    #[test]
+    fn a_header_value_resolves_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exa-key");
+        std::fs::write(&path, "exa-secret\n").unwrap();
+
+        let toml = format!(
+            r#"
+            [servers.exa]
+            transport = "streamable_http"
+            url = "https://mcp.exa.ai/mcp"
+            headers.x-api-key = {{ file = "{}" }}
+            "#,
+            path.to_str().unwrap()
+        );
+        let load = load_mcp_config_toml(&toml).unwrap();
+        assert!(load.invalid.is_empty(), "{:?}", load.invalid);
+        assert_eq!(load.servers[0].headers["x-api-key"], "exa-secret");
+        assert_eq!(load.servers[0].url.as_deref(), Some("https://mcp.exa.ai/mcp"));
+    }
+
+    #[test]
+    fn a_header_failure_names_the_headers_field_not_env() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.exa]
+            transport = "streamable_http"
+            url = "https://mcp.exa.ai/mcp"
+            headers.x-api-key = { file = "/nonexistent/exa-key" }
+            "#,
+        )
+        .unwrap();
+        let reason = &load.invalid[0].reason;
+        assert!(reason.contains("headers.x-api-key"), "{reason}");
+        assert!(!reason.contains("env."), "{reason}");
+    }
+
+    /// A field the transport cannot use is reported, never dropped: `headers`
+    /// on a child process would simply never be sent.
+    #[test]
+    fn headers_on_a_stdio_server_fail_the_entry() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            headers.x-api-key = "literal"
+            "#,
+        )
+        .unwrap();
+        assert!(load.servers.is_empty());
+        assert!(load.invalid[0].reason.contains("streamable_http only"), "{}", load.invalid[0].reason);
+    }
+
+    #[test]
+    fn env_on_an_http_server_fails_the_entry() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            transport = "streamable_http"
+            url = "https://example.invalid/mcp"
+            env.TOKEN = "literal"
+            "#,
+        )
+        .unwrap();
+        assert!(load.servers.is_empty());
+        assert!(load.invalid[0].reason.contains("stdio only"), "{}", load.invalid[0].reason);
+    }
+
+    /// A resolution failure must not be reported before the cheaper structural
+    /// check that would have rejected the entry anyway.
+    #[test]
+    fn a_misplaced_field_is_reported_before_its_value_is_resolved() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            headers.x-api-key = { file = "/nonexistent/key" }
+            "#,
+        )
+        .unwrap();
+        assert!(load.invalid[0].reason.contains("streamable_http only"), "{}", load.invalid[0].reason);
     }
 
     #[test]

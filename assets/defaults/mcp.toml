@@ -12,6 +12,8 @@
 #                     string, or a table naming one source (see below).
 #   cwd             - Working directory (stdio only)
 #   url             - Server URL (streamable_http only)
+#   headers         - Extra HTTP headers table (streamable_http only). Values
+#                     follow the same rule as env.
 #   call_timeout_ms - Per-server override for how long a single tool call may
 #                     run before timing out (default: the kernel-wide
 #                     mcp_call_timeout_default, 120000ms). A long-running
@@ -25,6 +27,20 @@
 #   env.KAIBO_API_KEY = { file = "~/.kaibo-key" }   # trimmed file contents
 #   env.GITHUB_TOKEN  = { env = "GITHUB_TOKEN" }    # the kernel's environment
 #   env.RUST_LOG      = "debug"                     # a literal, as before
+#
+# An HTTP server takes its credential in a header, the same way:
+#
+#   [servers.exa]
+#   transport = "streamable_http"
+#   url       = "https://mcp.exa.ai/mcp"
+#   headers.x-api-key = { file = "~/.exa-key" }
+#
+# `env` reaches a child process and `headers` reaches an HTTP request, so
+# naming the wrong one for the transport is reported, not quietly ignored.
+#
+# An `{ env = "..." }` source reads the KERNEL's environment. Under systemd
+# that is the service's environment, which a shell `export` never reaches — on
+# such a host, use a file source.
 #
 # A source table takes exactly one of `file` or `env`. `~` is expanded, and
 # the value is trimmed. Anything else — two sources, an unknown key, a value

@@ -6126,6 +6126,7 @@ dependencies = [
  "dunce",
  "eventsource-stream",
  "futures",
+ "http",
  "ignore",
  "include_dir",
  "kaijutsu-abc",
