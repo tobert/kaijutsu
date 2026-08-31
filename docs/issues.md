@@ -38,10 +38,11 @@ mux; `docs/ssh-shell.md` retired into it. Lanes, in order:
 6. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
    transcript: resvg raster at cell-derived pixel size, OSC 1337 emission
    (wezterm + iTerm2) with a unicode half-block fallback, in-band detection
-   only. Rules: `docs/tui.md`, "Images". Sub-lane, independently useful: an
-   SVG emitter in `kaijutsu-abc::engrave` from the `kurbo::BezPath` glyphs it
-   already builds (`BezPath::to_svg`), so `Abc` blocks reach the staff in a
-   terminal.
+   only. Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
+   `engrave::engrave_to_svg` (`engrave/svg.rs`) is complete and tested, and
+   `font.rs:230` already caches a `path_d` string per glyph, so `BezPath` is
+   not on this path. Its only callers are tests: the wiring from a
+   `ContentType::Abc` block to the rasterizer is the whole sub-lane.
 
 ## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
 

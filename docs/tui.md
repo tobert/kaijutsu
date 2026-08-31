@@ -302,10 +302,12 @@ lane; nothing new rides the wire.
   worth an evaluation pass for those parts; emission stays in our printer
   either way, because the printer owns `insert_before`.
 
-`Abc` blocks reaching the staff in a terminal need one new piece: an SVG
-emitter in `kaijutsu-abc::engrave`, which already builds `kurbo::BezPath`
-glyphs (`engrave/font.rs`) — `BezPath::to_svg` makes that emitter small. Lane
-in `docs/issues.md`.
+`Abc` blocks reach the staff through the same rasterizer, and need no new
+emitter: `engrave::engrave_to_svg` (`engrave/svg.rs`) already renders a tune
+to a self-contained SVG string, and `engrave/font.rs` caches a `path_d`
+string per glyph, so `kurbo::BezPath` is not on this path at all. Its only
+callers today are tests — a `ContentType::Abc` block reaching the terminal is
+wiring, not new engraving. Lane in `docs/issues.md`.
 
 ## Keys
 
