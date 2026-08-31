@@ -342,27 +342,43 @@ not require reconstructing a string byte-for-byte. See
   `Denied` for the same reason. Make the split **once**, as one distinction
   applied at both layers, rather than twice.
 
-## MCP server config cannot read a secret from a file or a command (2026-08-30)
+## A secret source that runs a command has no home yet (2026-08-31)
 
-`mcp.toml` carries server definitions inline, so an API key or token has to be
-written into the file as a literal. There is no way to say "read this value
-from a file" or "run this command and use its output" — which is how the
-backends table already resolves LLM credentials (file→env sources, no inline
-key; see `docs/` on credential resolution and `[[project_llm_credential_resolution]]`).
+`mcp.toml` env values now resolve from a file or a named environment variable
+(`env.TOKEN = { file = "~/.token" }`), which covers `pass`/`age`/`sops` users
+who can write the value to a file and anyone already exporting it. What is
+still missing is `{ command = "pass show gh/token" }` — the shape that needs
+no intermediate file.
 
-Amy, 2026-08-30: *"we need to look at MCP configs and add a way to get values
-like keys from a file or command."*
+It was deliberately left out because it is a **host process execution site**,
+and host exec has one owner (CLAUDE.md). `mcp/servers/external.rs` carries the
+one sanctioned exception, and that carve-out is about launching a
+config-declared server through `rmcp` — not about running arbitrary programs
+to produce config values. `resolve_env_value` rejects the key today with a
+message naming the two that work.
 
-Two shapes to bring to the design, not one: a `key_file` / `key_command` pair
-of fields per server, mirroring what the backends table does — or a general
-value-resolution syntax usable in any `mcp.toml` field. The first is smaller
-and consistent with an existing surface; the second stops the question
-recurring per-field. Decide which before building.
+Three ways in, when it is worth doing:
 
-Worth settling at the same time: whether a resolved secret is read once at
-server launch or on every reconnect, and what a failed resolution does — it
-must fail loudly rather than launch a server with an empty key.
+1. Route it through `EmbeddedKaish` (`ExternalExec` policy, `kj/context_shell.rs`),
+   where exec authority already lives. Correct, but a kernel-startup secret
+   fetch would then depend on the kaish runtime being up, and it needs a
+   decision about which seat resolves it.
+2. Widen the `external.rs` exception deliberately, on the same
+   config-declared-not-agent-supplied argument. Fastest, and a second bare
+   `Command::new` that will drift from the first.
+3. Leave it out. A file source is one `pass show … > ~/.token` away.
 
+Whichever wins, the failure contract is already set by the file and env
+sources: an unresolvable value fails that one server with a reason, never
+launches it blank, and never quotes the value into a log line.
+
+## Secrets in `mcp.toml` do not cover HTTP servers (2026-08-31)
+
+`streamable_http` entries carry a `url` and nothing else — there is no header
+or bearer-token field at all, so the only place a credential can go is inside
+the URL. The `env` source machinery does not reach them, because a
+`streamable_http` server is not a child process and never sees `env`. Nobody
+has needed it yet; note it before someone writes a token into a `url`.
 
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
 

@@ -8,7 +8,8 @@
 #   transport       - "stdio" (default) or "streamable_http"
 #   command         - Executable path (stdio only)
 #   args            - Arguments array (stdio only)
-#   env             - Environment variables table
+#   env             - Environment variables table. A value is a literal
+#                     string, or a table naming one source (see below).
 #   cwd             - Working directory (stdio only)
 #   url             - Server URL (streamable_http only)
 #   call_timeout_ms - Per-server override for how long a single tool call may
@@ -16,6 +17,29 @@
 #                     mcp_call_timeout_default, 120000ms). A long-running
 #                     consultation (e.g. kaibo) needs this raised well above
 #                     the default.
+#
+# ── Keeping a secret out of this file ───────────────────────────────────────
+#
+#   [servers.kaibo]
+#   command = "kaibo-mcp"
+#   env.KAIBO_API_KEY = { file = "~/.kaibo-key" }   # trimmed file contents
+#   env.GITHUB_TOKEN  = { env = "GITHUB_TOKEN" }    # the kernel's environment
+#   env.RUST_LOG      = "debug"                     # a literal, as before
+#
+# A source table takes exactly one of `file` or `env`. `~` is expanded, and
+# the value is trimmed. Anything else — two sources, an unknown key, a value
+# that resolves to nothing — fails that ONE server: it is skipped, reported by
+# `kj mcp list` with the reason, and never launched with a blank credential.
+# Its neighbors still start.
+#
+# Sources resolve when this file is read. `kj mcp reload` does not respawn a
+# server that is already running, so a rotated key reaches one only when it is
+# next spawned — the same rule that already governs a `command`/`args`/`env`
+# edit (docs/external-mcp.md, "The reload design fork").
+#
+# There is no `command` source yet. Host process execution has one owner in
+# kaijutsu, so running a program to fetch a secret is its own design decision
+# rather than a config field — see docs/issues.md.
 #
 # `kj mcp reload` re-reads this file and reconciles it against what's
 # actually running; `kj mcp list` shows configured-vs-running with health.

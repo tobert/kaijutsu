@@ -34,8 +34,17 @@
 //!   `[servers.X]` table must not take every other configured server down
 //!   with it, but it must never vanish silently either — callers are
 //!   expected to log every warning at error level.
+//!
+//! An `env` value that names a source it cannot resolve is the second tier:
+//! that one server is dropped with a reason, so a missing key file never
+//! launches a server with a blank credential and never takes its neighbors
+//! down. Sources resolve here, at load — a running server keeps the
+//! environment it was spawned with, exactly as it does for a literal.
+
+use std::collections::HashMap;
 
 use super::servers::external::{McpServerConfig, McpTransport};
+use crate::secret_source::{read_secret_env, read_secret_file};
 
 /// Outcome of parsing `mcp.toml`: the servers that parsed clean, plus a
 /// warning per entry that was dropped for being individually malformed.
@@ -94,8 +103,10 @@ mod toml_types {
         #[serde(default)]
         pub args: Vec<String>,
 
+        /// Raw, unresolved: a value is either a literal string or a
+        /// one-key source table. `resolve_env_value` interprets it.
         #[serde(default)]
-        pub env: HashMap<String, String>,
+        pub env: HashMap<String, toml::Value>,
 
         #[serde(default)]
         pub cwd: Option<String>,
@@ -176,11 +187,20 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             }
         }
 
+        let env = match resolve_env(&srv.env) {
+            Ok(env) => env,
+            Err(reason) => {
+                warnings.push(format!("server '{name}': {reason} — skipped"));
+                invalid.push(InvalidServer { name: name.clone(), reason });
+                continue;
+            }
+        };
+
         servers.push(McpServerConfig {
             name: name.clone(),
             command: srv.command.clone().unwrap_or_default(),
             args: srv.args.clone(),
-            env: srv.env.clone(),
+            env,
             cwd: srv.cwd.clone(),
             transport,
             url: srv.url.clone(),
@@ -189,6 +209,78 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
     }
 
     Ok(McpConfigLoad { servers, warnings, invalid })
+}
+
+/// Resolve every `env` value for one server, or name the first failure.
+///
+/// Deterministic: variables are visited in sorted order, so the same
+/// malformed file always reports the same variable.
+fn resolve_env(raw: &HashMap<String, toml::Value>) -> Result<HashMap<String, String>, String> {
+    let mut names: Vec<&String> = raw.keys().collect();
+    names.sort();
+
+    let mut resolved = HashMap::with_capacity(names.len());
+    for var in names {
+        resolved.insert(var.clone(), resolve_env_value(var, &raw[var])?);
+    }
+    Ok(resolved)
+}
+
+/// Interpret one `env` value: a literal string, or a table naming exactly one
+/// source.
+///
+/// ```toml
+/// env.RUST_LOG      = "debug"                      # literal
+/// env.KAIBO_API_KEY = { file = "~/.kaibo-key" }    # trimmed file contents
+/// env.GITHUB_TOKEN  = { env = "GITHUB_TOKEN" }     # the kernel's own environment
+/// ```
+///
+/// Errors name the variable and the source, never the resolved value, so they
+/// are safe to log and to show a player.
+fn resolve_env_value(var: &str, value: &toml::Value) -> Result<String, String> {
+    let table = match value {
+        toml::Value::String(literal) => return Ok(literal.clone()),
+        toml::Value::Table(table) => table,
+        _ => {
+            return Err(format!(
+                "env.{var} must be a string, or a table naming one source: \
+                 {{ file = \"…\" }} or {{ env = \"…\" }}"
+            ));
+        }
+    };
+
+    if table.is_empty() {
+        return Err(format!(
+            "env.{var} is an empty table — name one source: \
+             {{ file = \"…\" }} or {{ env = \"…\" }}"
+        ));
+    }
+    if table.len() > 1 {
+        let mut named: Vec<&str> = table.keys().map(String::as_str).collect();
+        named.sort();
+        return Err(format!(
+            "env.{var} names {} sources ({}) — a source table takes exactly one",
+            table.len(),
+            named.join(", ")
+        ));
+    }
+
+    let (source, argument) = table.iter().next().expect("table holds exactly one key");
+    let argument = argument
+        .as_str()
+        .ok_or_else(|| format!("env.{var}: '{source}' must be a string"))?;
+
+    match source.as_str() {
+        "file" => read_secret_file(argument).map_err(|e| format!("env.{var}: {e}")),
+        "env" => read_secret_env(argument).map_err(|e| format!("env.{var}: {e}")),
+        "command" => Err(format!(
+            "env.{var}: a command source is not implemented — use \
+             {{ file = \"…\" }} or {{ env = \"…\" }}"
+        )),
+        other => Err(format!(
+            "env.{var}: unknown source '{other}' — use file or env"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +305,214 @@ mod tests {
             "the shipped mcp.toml must configure no servers — a seeded entry \
              spawns a host process in every fresh kernel, tests included; got {:?}",
             load.servers.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- env value resolution -------------------------------------------
+
+    #[test]
+    fn a_literal_env_value_still_parses() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env = { RUST_LOG = "debug" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(load.servers[0].env["RUST_LOG"], "debug");
+        assert!(load.invalid.is_empty());
+    }
+
+    #[test]
+    fn a_file_source_is_read_and_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kaibo-key");
+        std::fs::write(&path, "  sk-from-file\n").unwrap();
+
+        let toml = format!(
+            r#"
+            [servers.kaibo]
+            command = "kaibo-mcp"
+            env.KAIBO_API_KEY = {{ file = "{}" }}
+            "#,
+            path.to_str().unwrap()
+        );
+        let load = load_mcp_config_toml(&toml).unwrap();
+        assert!(load.invalid.is_empty(), "{:?}", load.invalid);
+        assert_eq!(load.servers[0].env["KAIBO_API_KEY"], "sk-from-file");
+    }
+
+    #[test]
+    fn an_env_source_reads_the_kernels_own_environment() {
+        // SAFETY: single-threaded test; unique var name avoids cross-test races.
+        unsafe {
+            std::env::set_var("KAIJUTSU_MCP_TOML_TEST_TOKEN", "sk-from-env");
+        }
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = { env = "KAIJUTSU_MCP_TOML_TEST_TOKEN" }
+            "#,
+        )
+        .unwrap();
+        assert!(load.invalid.is_empty(), "{:?}", load.invalid);
+        assert_eq!(load.servers[0].env["TOKEN"], "sk-from-env");
+        // SAFETY: single-threaded test cleanup.
+        unsafe {
+            std::env::remove_var("KAIJUTSU_MCP_TOML_TEST_TOKEN");
+        }
+    }
+
+    /// The whole reason resolution happens here: an unresolvable secret is a
+    /// per-entry failure, so the server is FAILED and visible rather than
+    /// launched with a blank credential — and its neighbors still start.
+    #[test]
+    fn an_unresolvable_secret_fails_its_entry_not_the_file() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.broken]
+            command = "x"
+            env.TOKEN = { file = "/nonexistent/path/to/token" }
+
+            [servers.healthy]
+            command = "y"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(load.servers.len(), 1, "the healthy neighbor must still launch");
+        assert_eq!(load.servers[0].name, "healthy");
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
+        assert!(load.invalid[0].reason.contains("env.TOKEN"), "{}", load.invalid[0].reason);
+        assert!(
+            load.invalid[0].reason.contains("/nonexistent/path/to/token"),
+            "the reason must name the source: {}",
+            load.invalid[0].reason
+        );
+        assert_eq!(load.warnings.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_secret_file_is_not_an_empty_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank");
+        std::fs::write(&path, "   \n").unwrap();
+
+        let toml = format!(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = {{ file = "{}" }}
+            "#,
+            path.to_str().unwrap()
+        );
+        let load = load_mcp_config_toml(&toml).unwrap();
+        assert!(load.servers.is_empty(), "a blank credential must not launch a server");
+        assert!(load.invalid[0].reason.contains("empty after trimming"));
+    }
+
+    #[test]
+    fn an_unset_env_source_fails_the_entry() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = { env = "KAIJUTSU_MCP_TOML_TEST_DEFINITELY_UNSET" }
+            "#,
+        )
+        .unwrap();
+        assert!(load.servers.is_empty());
+        assert!(load.invalid[0].reason.contains("is not set"), "{}", load.invalid[0].reason);
+    }
+
+    /// `command` is deferred, not unknown — host process execution has one
+    /// owner, so the message says what to use instead of falling into the
+    /// generic unknown-source path.
+    #[test]
+    fn a_command_source_is_deferred_with_an_instruction() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = { command = "pass show gh/token" }
+            "#,
+        )
+        .unwrap();
+        let reason = &load.invalid[0].reason;
+        assert!(reason.contains("not implemented"), "{reason}");
+        assert!(reason.contains("file"), "the message must name the alternatives: {reason}");
+    }
+
+    #[test]
+    fn an_unknown_source_is_loud_not_ignored() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = { fil = "~/.token" }
+            "#,
+        )
+        .unwrap();
+        assert!(load.servers.is_empty(), "a typo'd source must not silently drop the value");
+        assert!(load.invalid[0].reason.contains("unknown source 'fil'"), "{}", load.invalid[0].reason);
+    }
+
+    #[test]
+    fn two_sources_in_one_value_fail_the_entry() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = { file = "~/.token", env = "TOKEN" }
+            "#,
+        )
+        .unwrap();
+        assert!(load.servers.is_empty());
+        let reason = &load.invalid[0].reason;
+        assert!(reason.contains("exactly one"), "{reason}");
+        assert!(reason.contains("env, file"), "the reason must name both: {reason}");
+    }
+
+    #[test]
+    fn a_non_string_env_value_fails_the_entry() {
+        let load = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "x"
+            env.PORT = 8080
+            "#,
+        )
+        .unwrap();
+        assert!(load.servers.is_empty());
+        assert!(load.invalid[0].reason.contains("env.PORT"), "{}", load.invalid[0].reason);
+    }
+
+    /// A failure message is logged and shown to players, so it must never
+    /// quote the value it just read.
+    #[test]
+    fn a_failure_reason_never_carries_the_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "sk-super-secret-value").unwrap();
+
+        // Resolvable file, but paired with a second source — the failure
+        // happens after the value is reachable.
+        let toml = format!(
+            r#"
+            [servers.a]
+            command = "x"
+            env.TOKEN = {{ file = "{}", env = "TOKEN" }}
+            "#,
+            path.to_str().unwrap()
+        );
+        let load = load_mcp_config_toml(&toml).unwrap();
+        assert!(
+            !load.invalid[0].reason.contains("sk-super-secret-value"),
+            "the reason leaked the secret: {}",
+            load.invalid[0].reason
         );
     }
 

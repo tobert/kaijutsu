@@ -83,6 +83,10 @@ someone edits `mcp.toml` is never interrupted by a reload, at the cost of a
 explicitly restarted. **There is no `kj mcp restart <name>` in this slice**
 (`docs/issues.md`).
 
+An `env` value sourced from a file or a variable (`assets/defaults/mcp.toml`,
+"Keeping a secret out of this file") resolves at load and follows the same
+rule: a rotated key reaches a server only when that server is next spawned.
+
 The alternative — diffing `McpServerConfig` and hot-swapping a changed
 entry — is also defensible: `Broker::register` already replaces-by-id, and
 an in-flight call holds its own `Arc` to the resolved instance (resolved
