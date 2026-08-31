@@ -907,29 +907,22 @@ impl BlockStore {
             return Ok(());
         };
 
-        let (snapshot_bytes, content, version, max_seq) = {
+        let (snapshot_bytes, version, max_seq) = {
             let entry = self
                 .get(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let snapshot = entry.doc.snapshot();
-            let content = entry.content();
             let version = entry.version() as i64;
             let max_seq = entry.next_journal_seq.load(Ordering::SeqCst);
             let snapshot_bytes = codec::encode(&snapshot)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (snapshot_bytes, content, version, max_seq)
+            (snapshot_bytes, version, max_seq)
         };
 
         {
             let mut db_guard = db.lock();
             db_guard
-                .write_snapshot_and_truncate(
-                    context_id,
-                    max_seq as i64,
-                    version,
-                    &snapshot_bytes,
-                    &content,
-                )
+                .write_snapshot_and_truncate(context_id, max_seq as i64, version, &snapshot_bytes)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
             // Flush the just-truncated oplog out of the WAL so the main file
             // stops lagging committed history. Best-effort: a busy checkpoint
@@ -962,7 +955,6 @@ impl BlockStore {
             .get(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let snapshot = entry.doc.snapshot();
-        let content = entry.content();
         let version = entry.version() as i64;
 
         let snapshot_bytes = codec::encode(&snapshot)
@@ -972,7 +964,7 @@ impl BlockStore {
 
         let mut db_guard = db.lock();
         db_guard
-            .write_snapshot_and_truncate(context_id, 0, version, &snapshot_bytes, &content)
+            .write_snapshot_and_truncate(context_id, 0, version, &snapshot_bytes)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         Ok(())
@@ -5743,18 +5735,17 @@ mod tests {
             oplog.len()
         );
 
-        // Verify the snapshot contains the right content
+        // Verify the snapshot contains the right content. The row carries
+        // only `state`, so the text comes from decoding it — which is the
+        // whole reason there is no second copy to check against.
         let snap = snap.unwrap();
-        assert!(
-            snap.content.contains("original block 1"),
-            "fork snapshot content missing block 1: {:?}",
-            snap.content
-        );
-        assert!(
-            snap.content.contains("original block 2"),
-            "fork snapshot content missing block 2: {:?}",
-            snap.content
-        );
+        let store_snapshot = codec::decode::<StoreSnapshot>(&snap.state)
+            .expect("a fork snapshot must decode");
+        let text = BlockDocument::from_snapshot(store_snapshot, PrincipalId::system())
+            .expect("a decoded fork snapshot must rebuild")
+            .full_text();
+        assert!(text.contains("original block 1"), "fork snapshot missing block 1: {text:?}");
+        assert!(text.contains("original block 2"), "fork snapshot missing block 2: {text:?}");
     }
 
     // ========================================================================

@@ -348,13 +348,17 @@ pub struct DocumentRow {
 }
 
 /// A doc_snapshots row — compaction checkpoint.
+///
+/// `state` is the whole document, so there is no separate text column: the
+/// text is what decoding `state` produces. A reader that wants only the text
+/// still decodes, which is the cost of having one copy instead of two that
+/// can disagree.
 #[derive(Debug, Clone)]
 pub struct DocSnapshotRow {
     pub document_id: ContextId,
     pub seq: i64,
     pub version: i64,
     pub state: Vec<u8>,
-    pub content: String,
     pub created_at: i64,
 }
 
@@ -681,7 +685,6 @@ CREATE TABLE IF NOT EXISTS doc_snapshots (
     seq         INTEGER NOT NULL,
     version     INTEGER NOT NULL,
     state       BLOB    NOT NULL,
-    content     TEXT    NOT NULL,
     created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
 );
@@ -1902,6 +1905,37 @@ impl KernelDb {
         Self::drop_legacy_value_enum_checks(conn)?;
         Self::migrate_well_known_lost_found(conn)?;
         Self::migrate_doc_kind_file_collapse(conn)?;
+        Self::drop_doc_snapshots_content_column(conn)?;
+        Ok(())
+    }
+
+    /// `doc_snapshots.content` held a document's plain text beside `state`,
+    /// which is the encoded whole document and already contains it. Nothing
+    /// read the column: the single reader returns the row whole and every
+    /// caller uses `state`, and a `state` that fails to decode skips the
+    /// document rather than falling back to the text — so it was never the
+    /// only readable copy. It cost about a fifth of the database.
+    ///
+    /// Guarded on `PRAGMA table_info` so a fresh database, which never had
+    /// the column, does nothing and this stays safe to call on every open.
+    /// `doc_snapshots` carries no trigger, no index and no child table, so
+    /// dropping a column needs none of the rebuild machinery the value-enum
+    /// `CHECK`s did.
+    ///
+    /// Dropping a column rewrites the table's rows but does not return pages
+    /// to the filesystem. A `VACUUM` does, and that is an operator's call:
+    /// running one at boot against a database this size would hold the kernel
+    /// off its own startup for as long as the rewrite takes.
+    fn drop_doc_snapshots_content_column(conn: &Connection) -> KernelDbResult<()> {
+        let has_column = conn
+            .prepare("PRAGMA table_info(doc_snapshots)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<String>>>()?
+            .iter()
+            .any(|name| name == "content");
+        if has_column {
+            conn.execute_batch("ALTER TABLE doc_snapshots DROP COLUMN content;")?;
+        }
         Ok(())
     }
 
@@ -2886,7 +2920,7 @@ impl KernelDb {
         document_id: ContextId,
     ) -> KernelDbResult<Option<DocSnapshotRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT document_id, seq, version, state, content, created_at
+            "SELECT document_id, seq, version, state, created_at
              FROM doc_snapshots WHERE document_id = ?1",
         )?;
         let mut rows = stmt.query(params![blob_param(document_id.as_bytes())])?;
@@ -2896,8 +2930,7 @@ impl KernelDb {
                 seq: row.get(1)?,
                 version: row.get(2)?,
                 state: row.get(3)?,
-                content: row.get(4)?,
-                created_at: row.get(5)?,
+                created_at: row.get(4)?,
             }))
         } else {
             Ok(None)
@@ -2912,19 +2945,12 @@ impl KernelDb {
         seq: i64,
         version: i64,
         state: &[u8],
-        content: &str,
     ) -> KernelDbResult<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO doc_snapshots (document_id, seq, version, state, content)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                blob_param(document_id.as_bytes()),
-                seq,
-                version,
-                state,
-                content,
-            ],
+            "INSERT OR REPLACE INTO doc_snapshots (document_id, seq, version, state)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![blob_param(document_id.as_bytes()), seq, version, state],
         )?;
         tx.execute(
             "DELETE FROM oplog WHERE document_id = ?1 AND seq <= ?2",
@@ -12684,6 +12710,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index_count, 1, "idx_roster_presence_entity must survive the rebuild");
+    }
+
+    /// A real `documents` row, because `doc_snapshots.document_id` is a
+    /// foreign key and a snapshot for a document that does not exist would
+    /// not be a case this migration ever meets.
+    fn setup_snapshot_document(db: &KernelDb) -> ContextId {
+        let ws_id = setup_test_db(db);
+        let doc_id = ContextId::new();
+        db.insert_document(&DocumentRow {
+            document_id: doc_id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: now_millis(),
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+        doc_id
+    }
+
+    /// Bring `doc_snapshots` back to the shape that carried `content`, and
+    /// seed a row through it, so the next open has something real to migrate.
+    fn put_doc_snapshots_back_with_its_content_column(conn: &Connection, doc: ContextId) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE doc_snapshots;
+             CREATE TABLE doc_snapshots (
+                 document_id BLOB    NOT NULL PRIMARY KEY,
+                 seq         INTEGER NOT NULL,
+                 version     INTEGER NOT NULL,
+                 state       BLOB    NOT NULL,
+                 content     TEXT    NOT NULL,
+                 created_at  INTEGER NOT NULL
+                     DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                 FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+             );
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO doc_snapshots (document_id, seq, version, state, content, created_at)
+             VALUES (?1, 7, 3, X'DEADBEEF', 'the derived copy', 1)",
+            params![blob_param(doc.as_bytes())],
+        )
+        .unwrap();
+    }
+
+    /// A database still carrying `doc_snapshots.content` loses the column on
+    /// the next open, and the row it held keeps every other value. The text
+    /// was recoverable from `state` all along, so dropping it loses nothing
+    /// a reader could have wanted.
+    #[test]
+    fn the_doc_snapshots_content_column_is_dropped_and_the_row_survives() {
+        let db = KernelDb::temporary().unwrap();
+        let doc = setup_snapshot_document(&db);
+        put_doc_snapshots_back_with_its_content_column(&db.conn, doc);
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        let sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'doc_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("content"), "the content column must be gone, got: {sql}");
+
+        let row = db.load_latest_snapshot(doc).unwrap().expect("the row must survive the drop");
+        assert_eq!(row.seq, 7, "seq must survive");
+        assert_eq!(row.version, 3, "version must survive");
+        assert_eq!(row.state, vec![0xDE, 0xAD, 0xBE, 0xEF], "state must survive");
+        assert_eq!(row.created_at, 1, "created_at must survive, and must not shift a column left");
+    }
+
+    /// The drop is guarded, so a second open does not re-run it — an
+    /// unguarded `ALTER TABLE ... DROP COLUMN` on a column that is already
+    /// gone is an error, not a no-op.
+    #[test]
+    fn dropping_the_doc_snapshots_content_column_is_idempotent() {
+        let db = KernelDb::temporary().unwrap();
+        let doc = setup_snapshot_document(&db);
+        put_doc_snapshots_back_with_its_content_column(&db.conn, doc);
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
     }
 
     /// Every rebuild in `rebuild_value_enum_tables` carries its table's
