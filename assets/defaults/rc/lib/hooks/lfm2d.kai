@@ -57,11 +57,13 @@ items_filter="$(cat <<'ITEMS_FILTER_EOF'
              | {stmt: $s.plan.rendered,
                 stmt_seq: $s.index,
                 cmd_seq: $i,
-                clause: (([.name] + ((.args // [])|map(.plain))) | join($sp))} ]
+                clause: (([.name] + ((.args // [])|map(.plain))) | join($sp)),
+                kj_readonly: (.kj_readonly // false)} ]
       else [{stmt: $s.plan.rendered,
              stmt_seq: $s.index,
              cmd_seq: null,
-             clause: $s.plan.rendered}]
+             clause: $s.plan.rendered,
+             kj_readonly: false}]
       end )
 ] | add // []
 ITEMS_FILTER_EOF
@@ -85,8 +87,13 @@ if [[ "$items_rc" -ne 0 ]]; then
   if test -n "${KJ_TOOL_PLAN_ERROR:-}"; then
     kj block create --kind trace --content "lfm2d-advisory: KJ_TOOL_PLAN unavailable ($KJ_TOOL_PLAN_ERROR); falling back to KJ_TOOL_ARGS.command"
   fi
+  # No `kj_readonly` on this path -- KJ_TOOL_PLAN is what carries it, and
+  # this branch runs precisely when that var is unusable. Set it false
+  # explicitly rather than leaving it absent: the read-only exemption below
+  # checks `== true`, so an absent field already fails closed, but a
+  # reader of this fallback item shouldn't have to know that to trust it.
   cmd_text="$(echo $KJ_TOOL_ARGS | jq -r '.command // empty')"
-  items="$(jq -cn --arg c $cmd_text '[{stmt: $c, clause: $c}]')"
+  items="$(jq -cn --arg c $cmd_text '[{stmt: $c, clause: $c, kj_readonly: false}]')"
 fi
 
 clauses_json="$(echo $items | jq -c '[.[].clause]')"
@@ -96,7 +103,9 @@ if [[ "$n_clauses" -eq 0 ]]; then
 fi
 
 # -- a call whose every clause is exempt proceeds without being scored.
-# Two exemptions, both narrow, both requiring `kj` as the first word.
+# Three exemptions. The first two are narrow and both require `kj` as the
+# first word; the third is a static classification kept entirely in Rust
+# (`kj::readonly::is_read_only_kj`, crates/kaijutsu-kernel/src/kj/readonly.rs).
 #
 # 1. `kj ... --help`. clap resolves help before dispatch, so the verb never
 #    runs and there is nothing for a classifier to be right or wrong about.
@@ -133,16 +142,32 @@ fi
 #    `rules`/`runs` are reads, `signal add` is what this hook itself calls,
 #    and `forget` only ever makes the gate more conservative.
 #
+# 3. `kj_readonly == true` on the clause's own item. Set only in the
+#    per-command branch of `items_filter` above, straight from
+#    `KJ_TOOL_PLAN`'s `commands[].kj_readonly` field
+#    (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN") -- itself computed by
+#    `kj::readonly::is_read_only_kj` against a static per-verb table, never
+#    derived here. That function already refuses a redirect, a background
+#    call, a heredoc, a redacted argument, and any command whose name isn't
+#    exactly `kj`, so none of those need re-checking in this filter --
+#    trusting the field is the point of keeping the classification in Rust.
+#    The KJ_TOOL_PLAN-unavailable fallback (`items_filter`'s `else` branch,
+#    and the raw-command fallback below when the whole var is unusable)
+#    always sets `kj_readonly: false`, so a call this hook can't plan at
+#    the per-command level is NEVER exempt on this path.
+#
 # A mixed call is scored in full: one real clause anywhere means the whole
 # call is scored, so nothing hides behind an exempt clause.
 dash="-"
 exempt_filter="$(cat <<'EXEMPT_FILTER_EOF'
-[ .[] | .clause | (. / $sp) as $w
+[ .[] as $it
+  | ($it.clause / $sp) as $w
   | ( ($w|length) >= 2
       and ($w[0] == $kj)
       and ( ( (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
               and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) )
-            or ($w[1] == $ledger) ) ) ] | all
+            or ($w[1] == $ledger) ) )
+    or ($it.kj_readonly == true) ] | all
 EXEMPT_FILTER_EOF
 )"
 all_exempt="$(echo $items | jq -r --arg sp $sp --arg dash $dash --arg kj kj --arg help help --arg ledger ledger $exempt_filter)"

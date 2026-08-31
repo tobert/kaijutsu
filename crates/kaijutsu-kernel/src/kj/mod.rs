@@ -42,6 +42,7 @@ pub mod play;
 pub mod policy;
 pub mod preset;
 pub mod editor;
+pub(crate) mod readonly;
 pub mod rc;
 pub mod lifecycle;
 pub mod roster;

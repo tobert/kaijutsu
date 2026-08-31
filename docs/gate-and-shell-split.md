@@ -1249,9 +1249,10 @@ needed deliberate updating.
 `shell` or `shell_write`, the `command` argument is projected with
 `kaish_kernel::ast::plan::plan_program` and the body receives
 `{"statements":[{"index":N,"plan":{"rendered":…,"statement_kind":…,
-"commands":[{"name":…,"args":[…],"redirects":[…],"background":…}],…}}]}` —
-kaish's stable plan surface (the `PlannedStatement` type is `Serialize`;
-the AST types deliberately are not). `commands[]` descends into `for`/`if`/
+"commands":[{"name":…,"args":[…],"redirects":[…],"background":…,
+"kj_readonly":…}],…}}]}` — kaish's stable plan surface (the
+`PlannedStatement` type is `Serialize`; the AST types deliberately are not)
+plus one kaijutsu-side addition. `commands[]` descends into `for`/`if`/
 `$(...)` bodies, `--confirm=<key>` literals are redacted, and nothing is
 executed or substituted, so a classifier scores per command — finer than
 clauses — without the body re-deriving statement structure. Consumers read
@@ -1263,6 +1264,22 @@ can also call it directly. Tests: `kj_tool_plan_projects_the_shell_command`
 (three statements for `a && b; c | d; for f in x; do delete $f; done`, with
 `delete` as its own command inside the loop) and
 `kj_tool_plan_error_is_set_on_parse_failure`.
+
+**`kj_readonly`** (added on top of the surface above, `broker.rs`'s
+`KJ_TOOL_PLAN` construction): a bool on every command object, `true` only
+when `kj::readonly::is_read_only_kj`
+(`crates/kaijutsu-kernel/src/kj/readonly.rs`) places that exact
+`PlannedCommand` in its static per-verb read-only table. The classification
+itself is pure Rust against the typed command — never re-derived from the
+JSON — and this field is the mechanical mirror of that decision onto the
+same-position command object. Additive: every field the surface already
+carried is unchanged. `assets/defaults/rc/lib/hooks/lfm2d.kai`'s exemption
+filter treats `kj_readonly == true` as a third exemption alongside
+`--help`/`kj ledger`, so a call built entirely of read-only `kj` commands
+skips scoring without a network round trip to the classifier. See
+`kj::readonly`'s module doc for the six conditions a command must meet to
+qualify, and for why `kj ledger` stays exempted by the hook's own rule
+rather than by this table.
 
 **The three `rpc.rs` shell paths take the hook path — PreCall today; PostCall/OnError are filed in `docs/issues.md`.** `Broker` gains two
 public methods (`shell_pre_call_hooks`/`shell_post_call_hooks`,

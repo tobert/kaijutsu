@@ -6144,6 +6144,7 @@ dependencies = [
  "kaish-help",
  "kaish-kernel",
  "kaish-tools-curl",
+ "kaish-types",
  "notify",
  "parking_lot",
  "regex",

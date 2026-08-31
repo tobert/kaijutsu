@@ -81,6 +81,10 @@ usvg = "0.46"
 # File pattern matching
 kaish-glob.workspace = true
 kaish-kernel.workspace = true
+# `PlannedCommand`/`PlannedValue` for the `kj_readonly` classifier
+# (kj/readonly.rs) — kaish-kernel re-exports only part of this crate's plan
+# vocabulary, not the command/value types this module names directly.
+kaish-types.workspace = true
 # Composable kaish guidance (see the TODO at its workspace pin) — the shell
 # tool description and the `kj kaish primer` verb compose from this instead
 # of hand-writing kaish-language prose.

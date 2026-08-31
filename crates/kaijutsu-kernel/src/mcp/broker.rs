@@ -2285,21 +2285,61 @@ impl Broker {
         // `KJ_TOOL_PLAN` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): when
         // the hooked tool is the shell, hand the body kaish's own plan
         // projection of the `command` argument — `{"statements":[{"index",
-        // "plan":{"rendered","statement_kind","commands":[{"name","args",..}]}}]}`.
-        // `commands[]` descends into control-structure and `$(...)` bodies and
-        // `--confirm=<key>` literals are redacted, so a classifier scores what
-        // was asked for without the body re-deriving clause structure. This is
-        // the stable surface; the AST types are not. Read entries by array
-        // position, never by `index`. On a parse failure the var is absent and
+        // "plan":{"rendered","statement_kind","commands":[{"name","args",
+        // ...,"kj_readonly"},...]}}]}`. `commands[]` descends into
+        // control-structure and `$(...)` bodies and `--confirm=<key>`
+        // literals are redacted, so a classifier scores what was asked for
+        // without the body re-deriving clause structure. This is the stable
+        // surface; the AST types are not. Read entries by array position,
+        // never by `index`. On a parse failure the var is absent and
         // `KJ_TOOL_PLAN_ERROR` carries the diagnostics.
+        //
+        // `kj_readonly` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): a
+        // bool on every command object, `true` only when
+        // `kj::readonly::is_read_only_kj` places that exact command in its
+        // static read-only table. A hook body can check this once instead
+        // of re-deriving verb/subcommand structure itself. Additive — every
+        // field above already existed and is unchanged.
         if matches!(params.tool.as_str(), "shell" | "shell_write") {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
                     Ok(statements) => {
-                        let json = serde_json::to_string(&serde_json::json!({
+                        let mut plan_value = serde_json::json!({
                             "statements": statements,
-                        }))
-                        .unwrap_or_else(|_| r#"{"statements":[]}"#.to_string());
+                        });
+                        // Mechanical walk: the classification decision lives
+                        // entirely in `kj::readonly::is_read_only_kj`, keyed
+                        // off the typed `PlannedCommand`s already in hand —
+                        // this loop only mirrors the result onto the JSON
+                        // twin at the same position.
+                        if let Some(stmt_json) = plan_value
+                            .get_mut("statements")
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            for (stmt, stmt_json) in statements.iter().zip(stmt_json.iter_mut()) {
+                                let Some(cmd_json) = stmt_json
+                                    .get_mut("plan")
+                                    .and_then(|p| p.get_mut("commands"))
+                                    .and_then(|c| c.as_array_mut())
+                                else {
+                                    continue;
+                                };
+                                for (cmd, cmd_json) in
+                                    stmt.plan.commands.iter().zip(cmd_json.iter_mut())
+                                {
+                                    if let Some(obj) = cmd_json.as_object_mut() {
+                                        obj.insert(
+                                            "kj_readonly".to_string(),
+                                            serde_json::Value::Bool(
+                                                crate::kj::readonly::is_read_only_kj(cmd),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let json = serde_json::to_string(&plan_value)
+                            .unwrap_or_else(|_| r#"{"statements":[]}"#.to_string());
                         vars.insert(
                             "KJ_TOOL_PLAN".into(),
                             kaish_kernel::ast::Value::String(json),
