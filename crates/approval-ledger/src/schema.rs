@@ -124,11 +124,27 @@ use rusqlite::{Connection, OptionalExtension, Result as SqliteResult};
 /// about an existing one — a widened `CHECK`, a new column, a changed
 /// default all stay invisible where the table already exists. Every such
 /// edit needs a step below (`add_rc_runs_script_count_column_if_missing`,
-/// `drop_legacy_approval_events_kind_check`) or it is a change that only
-/// works on a machine nobody has been using. There is still no
-/// migration-version table; kernel_db's ALTER-TABLE ladder
+/// `drop_legacy_value_enum_checks`) or it is a change that only works on
+/// a machine nobody has been using. There is still no migration-version
+/// table; kernel_db's ALTER-TABLE ladder
 /// (`kaijutsu-kernel/src/kernel_db.rs`) is the pattern to reach for as
 /// more of these accumulate.
+///
+/// **No column here CHECKs its value against an enumerated set in SQL.**
+/// SQLite cannot `ALTER` a `CHECK`, so the moment a set gains one more
+/// legal value, the constraint above cannot widen on a database that
+/// already ran an earlier `migrate()` — the write that needed the new
+/// value fails a constraint the new code cannot see. Every column's legal
+/// values are owned instead by the Rust type that writes it (`Origin`,
+/// `ApprovalStatus`, `ValueKind`, `VarBinding`, `SignalSourceKind`,
+/// `SignalVerdict`, `RuleScope`, `EventKind`, `RcOutcome` — all in
+/// `types.rs`), enforced at the one write path per table, where a new
+/// variant cannot be forgotten. `drop_legacy_value_enum_checks` below
+/// rebuilds every table that still carries one of these from before this
+/// rule. A `CHECK` on a fixed, non-enumerated shape is not this and
+/// stays: the plain/redacted consistency check on
+/// `approval_statement_args`/`approval_statement_redirects`, and the
+/// singleton guard on `ledger_generation`.
 const DDL: &str = r#"
 -- ── Statement documents (content-addressed, immutable, shared) ─────────
 -- A `PlannedStatement` (kaish 0.14 `plan_program` returns one per
@@ -158,7 +174,7 @@ CREATE TABLE IF NOT EXISTS approval_statements (
     -- `approval_statement_vars` on every allow-rule insert. Never
     -- recomputed after insert: the statement is immutable, so the answer
     -- can't change under it.
-    has_free_vars     INTEGER NOT NULL CHECK (has_free_vars IN (0, 1)),
+    has_free_vars     INTEGER NOT NULL,
     created_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
@@ -174,7 +190,7 @@ CREATE TABLE IF NOT EXISTS approval_statement_commands (
     statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
     cmd_seq          INTEGER NOT NULL,
     name             TEXT    NOT NULL,
-    backgrounded     INTEGER NOT NULL CHECK (backgrounded IN (0, 1)),
+    backgrounded     INTEGER NOT NULL,
     PRIMARY KEY (statement_digest, cmd_seq)
 );
 
@@ -192,7 +208,7 @@ CREATE TABLE IF NOT EXISTS approval_statement_args (
     statement_digest TEXT    NOT NULL,
     cmd_seq          INTEGER NOT NULL,
     arg_seq          INTEGER NOT NULL,
-    value_kind       TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
+    value_kind       TEXT    NOT NULL,
     value_text       TEXT,
     redact_kind      TEXT,
     fingerprint      TEXT,
@@ -221,7 +237,7 @@ CREATE TABLE IF NOT EXISTS approval_statement_redirects (
     cmd_seq          INTEGER NOT NULL,
     redir_seq        INTEGER NOT NULL,
     op               TEXT    NOT NULL,
-    value_kind       TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
+    value_kind       TEXT    NOT NULL,
     value_text       TEXT,
     redact_kind      TEXT,
     fingerprint      TEXT,
@@ -248,7 +264,7 @@ CREATE TABLE IF NOT EXISTS approval_statement_redirects (
 CREATE TABLE IF NOT EXISTS approval_statement_vars (
     statement_digest TEXT NOT NULL,
     name             TEXT NOT NULL,
-    binding          TEXT NOT NULL CHECK (binding IN ('free', 'bound')),
+    binding          TEXT NOT NULL,
     PRIMARY KEY (statement_digest, name),
     FOREIGN KEY (statement_digest) REFERENCES approval_statements(statement_digest)
 );
@@ -279,7 +295,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     request_id       TEXT    NOT NULL PRIMARY KEY,
     context_id       BLOB    NOT NULL,
     principal_id     BLOB    NOT NULL,
-    origin           TEXT    NOT NULL CHECK (origin IN ('hook', 'shell_gate', 'kj_verb')),
+    origin           TEXT    NOT NULL,
     instance         TEXT,
     tool             TEXT,
     hook_id          TEXT,
@@ -291,8 +307,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- would be a guard that can never fail, which is worse than no rule.
     authorized_label TEXT,
     rc_run_id        TEXT    REFERENCES rc_runs(run_id),
-    status           TEXT    NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'claimed', 'allowed', 'denied', 'expired', 'abandoned')),
+    status           TEXT    NOT NULL DEFAULT 'pending',
     created_at       INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     -- Nullable on purpose: whether (and how long until) an ask auto-expires
@@ -373,7 +388,7 @@ CREATE TABLE IF NOT EXISTS approval_options (
 CREATE TABLE IF NOT EXISTS approval_signals (
     request_id  TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
     seq         INTEGER NOT NULL,
-    source_kind TEXT    NOT NULL CHECK (source_kind IN ('rule', 'classifier')),
+    source_kind TEXT    NOT NULL,
     source_id   TEXT,
     model_id    TEXT,
     weight_hash TEXT,
@@ -381,7 +396,7 @@ CREATE TABLE IF NOT EXISTS approval_signals (
     cmd_seq     INTEGER,
     label       TEXT,
     score       REAL,
-    verdict     TEXT    NOT NULL CHECK (verdict IN ('escalate', 'deny', 'allow')),
+    verdict     TEXT    NOT NULL,
     PRIMARY KEY (request_id, seq)
 );
 
@@ -394,14 +409,9 @@ CREATE TABLE IF NOT EXISTS approval_signals (
 -- = 'late_decision'` is the specific row a rejected post-terminal decide()
 -- writes — never a `decided` row, because it never became the outcome.
 --
--- `kind` carries no CHECK, for the same reason `approval_refusals.reason`
--- below carries none: the set of kinds grows, and a value-enum CHECK
--- cannot be widened on a database that already ran an earlier `migrate()`
--- — `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already
--- there. The set is `EventKind` in `types.rs`, enforced in Rust at the one
--- write path (`events::append`), where a new variant cannot be forgotten.
--- `drop_legacy_approval_events_kind_check` below rebuilds a table that
--- still carries the old constraint.
+-- `kind` carries no CHECK — see the growable-value-set rule in this
+-- constant's doc comment. The set is `EventKind` in `types.rs`, enforced
+-- at the one write path (`events::append`).
 CREATE TABLE IF NOT EXISTS approval_events (
     request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
     seq            INTEGER NOT NULL,
@@ -431,9 +441,8 @@ CREATE TABLE IF NOT EXISTS approval_events (
 -- new code cannot see. A new table needs no migration machinery at all — the
 -- same reasoning `approval_redemptions` below is built on.
 --
--- `reason` carries no CHECK on purpose. The set of refusal reasons is
--- expected to grow, and a value-enum CHECK here would inherit the very
--- no-ALTER trap this table exists to route around.
+-- `reason` carries no CHECK — see the growable-value-set rule in `DDL`'s
+-- doc comment.
 CREATE TABLE IF NOT EXISTS approval_refusals (
     request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
     seq            INTEGER NOT NULL,
@@ -495,8 +504,8 @@ CREATE TABLE IF NOT EXISTS approval_rules (
     authorized_label TEXT    NOT NULL,
     context_id       BLOB,
     principal_id     BLOB,
-    scope            TEXT    NOT NULL CHECK (scope IN ('session', 'always')),
-    allow            INTEGER NOT NULL CHECK (allow IN (0, 1)),
+    scope            TEXT    NOT NULL,
+    allow            INTEGER NOT NULL,
     created_at       INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by       BLOB,
@@ -669,7 +678,7 @@ CREATE TABLE IF NOT EXISTS rc_runs (
     started_at   INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     finished_at  INTEGER,
-    outcome      TEXT CHECK (outcome IS NULL OR outcome IN ('ok', 'failed', 'abandoned')),
+    outcome      TEXT,
     script_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_rc_runs_context_started
@@ -706,55 +715,188 @@ CREATE TABLE IF NOT EXISTS script_bodies (
 "#;
 
 /// Create every table/index/trigger this crate owns, idempotently. Safe to
-/// call on every process start. Does not touch `PRAGMA foreign_keys` —
-/// that is the caller's connection-wide setting to own (see the crate
-/// docs); this crate's own invariants (guarantees 2, 3, 6) are enforced by
-/// `CHECK`s and triggers that do not depend on FK enforcement being on.
+/// call on every process start. Leaves `PRAGMA foreign_keys` (and
+/// `PRAGMA legacy_alter_table`) exactly as it found them on return — those
+/// are the caller's connection-wide settings to own (see the crate docs)
+/// — though `drop_legacy_value_enum_checks` below turns both off/on for
+/// the span of its own rebuild transaction and restores the observed
+/// values once that transaction ends, success or not; this crate's own
+/// invariants (guarantees 2, 3, 6) are enforced by `CHECK`s and triggers
+/// that do not depend on FK enforcement being on.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(DDL)?;
-    if drop_legacy_approval_events_kind_check(conn)? {
-        // The rebuild dropped `approval_events`, and SQLite drops a table's
-        // triggers with it, so `ledger_generation_bump_on_event_insert` went
-        // with it. A second `DDL` pass puts the trigger back; every other
-        // statement is `IF NOT EXISTS` and no-ops. Conditional because a
-        // normal start does not rebuild and should not pay for a second pass.
+    if drop_legacy_value_enum_checks(conn)? {
+        // A rebuilt table's indexes and triggers were dropped along with
+        // it. A second `DDL` pass puts them back; every other statement is
+        // `IF NOT EXISTS` and no-ops. Conditional because a normal start
+        // rebuilds nothing and should not pay for a second pass.
         conn.execute_batch(DDL)?;
     }
     add_rc_runs_script_count_column_if_missing(conn)
 }
 
-/// `approval_events.kind` carried a value-enum `CHECK` until `redeemed`
-/// needed to join the set. Widening it in `DDL` reaches a fresh database
-/// and no other: `CREATE TABLE IF NOT EXISTS` does nothing to a table that
-/// already exists, so an older database keeps the narrow constraint and
-/// rejects the new value — and because `redeem_ask` writes the redemption
-/// row and the event in one transaction, the rejection rolls back the
-/// redemption too and the gate can never consume an answer.
-///
-/// SQLite cannot alter a `CHECK`, so the table is rebuilt once: copy,
-/// drop, rename. Guarded on the stored DDL text so an already-rebuilt
-/// database no-ops, keeping `migrate` safe to call on every process start.
-/// Runs after `DDL` because the final `RENAME` resolves the new table's
-/// `REFERENCES approvals(request_id)` against the live schema, and fails
-/// with "no such table: main.approvals" if that table is not there yet.
-///
-/// Returns whether it rebuilt, because the caller must then re-run `DDL`
-/// to restore the trigger the `DROP` took with it.
-fn drop_legacy_approval_events_kind_check(conn: &Connection) -> SqliteResult<bool> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_events'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(sql) = existing else { return Ok(false) };
-    if !sql.contains("CHECK") {
-        return Ok(false);
-    }
-    conn.execute_batch(
-        "CREATE TABLE approval_events_rebuilt (
-            request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+/// One table `drop_legacy_value_enum_checks` rebuilds to drop a value-enum
+/// `CHECK` it shipped before the rule in `DDL`'s doc comment existed.
+/// `legacy_check` is the exact `CHECK` clause text unique to the retired
+/// shape — never the bare word `CHECK`, since `approval_statement_args`
+/// and `approval_statement_redirects` each keep a SECOND `CHECK` (the
+/// plain/redacted consistency check) that must survive untouched.
+/// `body` is the rebuilt table's full column/key/FK list, exactly what
+/// sits between the parens of its `CREATE TABLE`; `columns` is the
+/// comma-separated list shared by both shapes, used to copy every row
+/// across unchanged.
+struct ValueEnumRebuildSpec {
+    table: &'static str,
+    legacy_check: &'static str,
+    body: &'static str,
+    columns: &'static str,
+}
+
+/// Parents before children, matching the order `DDL` declares them in:
+/// `approval_statement_commands`/`_args`/`_redirects`/`_vars` reference
+/// `approval_statements`; `approvals` references `rc_runs`;
+/// `approval_signals` and `approval_events` reference `approvals`;
+/// `approval_rules` references both `approval_statements` and `approvals`.
+/// Each spec's create/copy/drop/rename cycle completes before the next one
+/// starts, so a child's `REFERENCES` target already exists, under its
+/// final name, by the time SQLite resolves it.
+const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
+    ValueEnumRebuildSpec {
+        table: "approval_statements",
+        legacy_check: "CHECK (has_free_vars IN (",
+        body: "statement_digest TEXT    NOT NULL PRIMARY KEY,
+            rendered          TEXT    NOT NULL,
+            statement_kind    TEXT    NOT NULL,
+            has_free_vars     INTEGER NOT NULL,
+            created_at        INTEGER NOT NULL
+                DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))",
+        columns: "statement_digest, rendered, statement_kind, has_free_vars, created_at",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_statement_commands",
+        legacy_check: "CHECK (backgrounded IN (",
+        body: "statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
+            cmd_seq          INTEGER NOT NULL,
+            name             TEXT    NOT NULL,
+            backgrounded     INTEGER NOT NULL,
+            PRIMARY KEY (statement_digest, cmd_seq)",
+        columns: "statement_digest, cmd_seq, name, backgrounded",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_statement_args",
+        legacy_check: "CHECK (value_kind IN (",
+        body: "statement_digest TEXT    NOT NULL,
+            cmd_seq          INTEGER NOT NULL,
+            arg_seq          INTEGER NOT NULL,
+            value_kind       TEXT    NOT NULL,
+            value_text       TEXT,
+            redact_kind      TEXT,
+            fingerprint      TEXT,
+            PRIMARY KEY (statement_digest, cmd_seq, arg_seq),
+            FOREIGN KEY (statement_digest, cmd_seq)
+                REFERENCES approval_statement_commands(statement_digest, cmd_seq),
+            CHECK (
+                (value_kind = 'plain'    AND value_text IS NOT NULL AND redact_kind IS NULL)
+                OR
+                (value_kind = 'redacted' AND value_text IS NULL     AND redact_kind IS NOT NULL)
+            )",
+        columns: "statement_digest, cmd_seq, arg_seq, value_kind, value_text, redact_kind, fingerprint",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_statement_redirects",
+        legacy_check: "CHECK (value_kind IN (",
+        body: "statement_digest TEXT    NOT NULL,
+            cmd_seq          INTEGER NOT NULL,
+            redir_seq        INTEGER NOT NULL,
+            op               TEXT    NOT NULL,
+            value_kind       TEXT    NOT NULL,
+            value_text       TEXT,
+            redact_kind      TEXT,
+            fingerprint      TEXT,
+            PRIMARY KEY (statement_digest, cmd_seq, redir_seq),
+            FOREIGN KEY (statement_digest, cmd_seq)
+                REFERENCES approval_statement_commands(statement_digest, cmd_seq),
+            CHECK (
+                (value_kind = 'plain'    AND value_text IS NOT NULL AND redact_kind IS NULL)
+                OR
+                (value_kind = 'redacted' AND value_text IS NULL     AND redact_kind IS NOT NULL)
+            )",
+        columns: "statement_digest, cmd_seq, redir_seq, op, value_kind, value_text, redact_kind, fingerprint",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_statement_vars",
+        legacy_check: "CHECK (binding IN (",
+        body: "statement_digest TEXT NOT NULL,
+            name             TEXT NOT NULL,
+            binding          TEXT NOT NULL,
+            PRIMARY KEY (statement_digest, name),
+            FOREIGN KEY (statement_digest) REFERENCES approval_statements(statement_digest)",
+        columns: "statement_digest, name, binding",
+    },
+    ValueEnumRebuildSpec {
+        table: "rc_runs",
+        legacy_check: "CHECK (outcome IS NULL OR outcome IN (",
+        body: "run_id       TEXT    NOT NULL PRIMARY KEY,
+            context_id   BLOB    NOT NULL,
+            context_type TEXT    NOT NULL,
+            verb         TEXT    NOT NULL,
+            started_at   INTEGER NOT NULL
+                DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+            finished_at  INTEGER,
+            outcome      TEXT,
+            script_count INTEGER",
+        columns: "run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count",
+    },
+    ValueEnumRebuildSpec {
+        table: "approvals",
+        legacy_check: "CHECK (origin IN (",
+        body: "request_id       TEXT    NOT NULL PRIMARY KEY,
+            context_id       BLOB    NOT NULL,
+            principal_id     BLOB    NOT NULL,
+            origin           TEXT    NOT NULL,
+            instance         TEXT,
+            tool             TEXT,
+            hook_id          TEXT,
+            description      TEXT    NOT NULL,
+            authorized_label TEXT,
+            rc_run_id        TEXT    REFERENCES rc_runs(run_id),
+            status           TEXT    NOT NULL DEFAULT 'pending',
+            created_at       INTEGER NOT NULL
+                DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+            expires_at       INTEGER,
+            claimed_at       INTEGER,
+            claimed_by       BLOB,
+            decided_at       INTEGER,
+            decided_by       BLOB,
+            decided_option   TEXT,
+            remember_scope   TEXT,
+            auto_reason      TEXT",
+        columns: "request_id, context_id, principal_id, origin, instance, tool, hook_id, description, \
+            authorized_label, rc_run_id, status, created_at, expires_at, claimed_at, claimed_by, \
+            decided_at, decided_by, decided_option, remember_scope, auto_reason",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_signals",
+        legacy_check: "CHECK (source_kind IN (",
+        body: "request_id  TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+            seq         INTEGER NOT NULL,
+            source_kind TEXT    NOT NULL,
+            source_id   TEXT,
+            model_id    TEXT,
+            weight_hash TEXT,
+            stmt_seq    INTEGER,
+            cmd_seq     INTEGER,
+            label       TEXT,
+            score       REAL,
+            verdict     TEXT    NOT NULL,
+            PRIMARY KEY (request_id, seq)",
+        columns: "request_id, seq, source_kind, source_id, model_id, weight_hash, stmt_seq, cmd_seq, \
+            label, score, verdict",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_events",
+        legacy_check: "CHECK (kind IN (",
+        body: "request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
             seq            INTEGER NOT NULL,
             kind           TEXT    NOT NULL,
             actor          BLOB,
@@ -764,16 +906,167 @@ fn drop_legacy_approval_events_kind_check(conn: &Connection) -> SqliteResult<boo
             note           TEXT,
             created_at     INTEGER NOT NULL
                 DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-            PRIMARY KEY (request_id, seq)
-        );
-        INSERT INTO approval_events_rebuilt
-            (request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at)
-        SELECT request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at
-        FROM approval_events;
-        DROP TABLE approval_events;
-        ALTER TABLE approval_events_rebuilt RENAME TO approval_events;",
-    )?;
-    Ok(true)
+            PRIMARY KEY (request_id, seq)",
+        columns: "request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at",
+    },
+    ValueEnumRebuildSpec {
+        table: "approval_rules",
+        legacy_check: "CHECK (scope IN (",
+        body: "rule_id          TEXT    NOT NULL PRIMARY KEY,
+            statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
+            authorized_label TEXT    NOT NULL,
+            context_id       BLOB,
+            principal_id     BLOB,
+            scope            TEXT    NOT NULL,
+            allow            INTEGER NOT NULL,
+            created_at       INTEGER NOT NULL
+                DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+            created_by       BLOB,
+            learned_from     TEXT    REFERENCES approvals(request_id),
+            revoked_at       INTEGER",
+        columns: "rule_id, statement_digest, authorized_label, context_id, principal_id, scope, allow, \
+            created_at, created_by, learned_from, revoked_at",
+    },
+];
+
+/// Every table `VALUE_ENUM_REBUILD_SPECS` lists, rebuilt once each to drop
+/// the value-enum `CHECK` it shipped with before the rule in `DDL`'s doc
+/// comment — see there for why the constraint is gone rather than
+/// widened. Guarded per table on that spec's `legacy_check` text inside
+/// `sqlite_master.sql`, so an already-rebuilt database, or one that never
+/// carried this particular `CHECK`, does nothing; `migrate` must stay safe
+/// to call on every process start.
+///
+/// `approvals` is the `ON DELETE CASCADE` parent of six tables
+/// (`approval_ask_statements`, `approval_options`, `approval_signals`,
+/// `approval_events`, `approval_refusals`, `approval_redemptions`).
+/// Rebuilding a table is create, copy, `DROP TABLE`, rename — and with
+/// `PRAGMA foreign_keys = ON` (the kernel's connection-wide setting,
+/// `kernel_db.rs`), `DROP TABLE` performs an implicit `DELETE FROM`, which
+/// fires every one of those cascade edges and deletes the ledger's entire
+/// approval history. So the whole set rebuilds inside ONE
+/// `foreign_keys = OFF` window: read the caller's current setting, turn it
+/// off, run every table's cycle inside a single transaction, run `PRAGMA
+/// foreign_key_check` and fail loudly — naming the offending table — if
+/// anything was left dangling, commit, then restore the setting that was
+/// read, on the error path too, so a caller checking `PRAGMA foreign_keys`
+/// afterward sees the same value it had before this ran either way.
+/// `PRAGMA foreign_keys` is a no-op inside a transaction, so it is set
+/// before `BEGIN` and restored after `COMMIT`/`ROLLBACK`, never inside
+/// either.
+///
+/// `PRAGMA legacy_alter_table` gets the same before/restore treatment,
+/// for an unrelated reason: modern SQLite's `ALTER TABLE ... RENAME TO`
+/// re-validates every OTHER trigger and view in the schema that mentions
+/// the table being renamed, not only the ones on the table itself.
+/// `approval_rules_reject_free_variable_allow_rules` (on `approval_rules`)
+/// queries `approval_statements` in its body, so renaming
+/// `approval_statements` back into place fails that validation with "no
+/// such table: main.approval_statements" — the target briefly does not
+/// exist between this rebuild's `DROP` and `RENAME` — unless
+/// `legacy_alter_table` is ON, which turns that extra validation off.
+///
+/// Returns whether anything rebuilt, because the caller must then re-run
+/// `DDL` once to restore the indexes and triggers a `DROP TABLE` takes
+/// down along with its table.
+fn drop_legacy_value_enum_checks(conn: &Connection) -> SqliteResult<bool> {
+    let mut any_needed = false;
+    for spec in VALUE_ENUM_REBUILD_SPECS {
+        if spec_still_applies(conn, spec)? {
+            any_needed = true;
+            break;
+        }
+    }
+    if !any_needed {
+        return Ok(false);
+    }
+
+    let foreign_keys_were_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    let legacy_alter_table_was_on: i64 = conn.query_row("PRAGMA legacy_alter_table", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+    let rebuilt = rebuild_all_value_enum_tables(conn);
+    let restore_sql = format!(
+        "PRAGMA foreign_keys = {}; PRAGMA legacy_alter_table = {};",
+        if foreign_keys_were_on != 0 { "ON" } else { "OFF" },
+        if legacy_alter_table_was_on != 0 { "ON" } else { "OFF" },
+    );
+    let restored = conn.execute_batch(&restore_sql);
+
+    match (rebuilt, restored) {
+        (Ok(()), Ok(())) => Ok(true),
+        (Err(e), _) => Err(e),
+        (Ok(()), Err(e)) => Err(e),
+    }
+}
+
+/// Whether `spec.table`'s stored schema still carries its legacy `CHECK`.
+/// `false` both when the table has moved past it and when the table does
+/// not exist yet — nothing to rebuild either way.
+fn spec_still_applies(conn: &Connection, spec: &ValueEnumRebuildSpec) -> SqliteResult<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [spec.table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| sql.contains(spec.legacy_check)))
+}
+
+/// Run every spec's rebuild inside one transaction — a mid-list failure
+/// must leave every table on whichever shape it already had, not half
+/// rebuilt — then refuse to commit if anything was left dangling.
+fn rebuild_all_value_enum_tables(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let outcome = (|| -> SqliteResult<()> {
+        for spec in VALUE_ENUM_REBUILD_SPECS {
+            if spec_still_applies(conn, spec)? {
+                rebuild_one_value_enum_table(conn, spec)?;
+            }
+        }
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            // `migrate` returns a plain `rusqlite::Error`, which has no
+            // general-purpose "custom message" variant without the `vtab`
+            // feature this crate does not enable — `InvalidColumnType` is
+            // the same carry-a-message idiom already used elsewhere in
+            // this crate (`ask.rs`'s `sql_err`) for the same reason.
+            return Err(rusqlite::Error::InvalidColumnType(
+                0,
+                format!("dropping a value-enum CHECK left a dangling foreign key on {table}; refusing to commit the rebuild"),
+                rusqlite::types::Type::Text,
+            ));
+        }
+        Ok(())
+    })();
+
+    match &outcome {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+    }
+    outcome
+}
+
+/// Rebuild one table: copy every row into a same-shaped table without
+/// `spec.legacy_check`, drop the original, rename the copy into its
+/// place. Foreign key enforcement and the surrounding transaction are the
+/// caller's responsibility.
+fn rebuild_one_value_enum_table(conn: &Connection, spec: &ValueEnumRebuildSpec) -> SqliteResult<()> {
+    let staging = format!("{}__check_drop", spec.table);
+    conn.execute_batch(&format!(
+        "CREATE TABLE {staging} (\n{body}\n);
+         INSERT INTO {staging} ({columns})
+             SELECT {columns} FROM {table};
+         DROP TABLE {table};
+         ALTER TABLE {staging} RENAME TO {table};",
+        body = spec.body,
+        columns = spec.columns,
+        table = spec.table,
+    ))
 }
 
 /// `rc_runs.script_count` was added to `DDL` above after real databases
@@ -896,9 +1189,8 @@ mod tests {
     /// A database carrying the old value-enum `CHECK` on
     /// `approval_events.kind` must lose it on the next `migrate()`, keep
     /// every row it already had, and accept a value the old constraint
-    /// rejected. Falsified by reverting
-    /// `drop_legacy_approval_events_kind_check` to `Ok(())`: the INSERT
-    /// then failed with "CHECK constraint failed".
+    /// rejected. Falsified by reverting `drop_legacy_value_enum_checks` to
+    /// `Ok(false)`: the INSERT then failed with "CHECK constraint failed".
     #[test]
     fn migrate_drops_a_legacy_kind_check_and_keeps_the_rows() {
         let conn = Connection::open_in_memory().unwrap();
@@ -944,8 +1236,8 @@ mod tests {
     /// The rebuild drops `approval_events`, and SQLite drops that table's
     /// triggers with it. `migrate` runs the rebuild before `DDL` so the
     /// trigger comes back; this pins that ordering. Falsified by moving
-    /// `drop_legacy_approval_events_kind_check` after `execute_batch(DDL)`,
-    /// which left the generation counter frozen at its starting value.
+    /// `drop_legacy_value_enum_checks` after `execute_batch(DDL)`, which
+    /// left the generation counter frozen at its starting value.
     #[test]
     fn the_generation_trigger_survives_the_rebuild() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1000,11 +1292,14 @@ mod tests {
         }
     }
 
-    /// A direct sanity check on the `CHECK` constraints, independent of any
-    /// Rust-level enum validation — this is what actually stops a bad
-    /// `status` from ever being written, regardless of what inserted it.
+    /// `status` (and `origin`) carry no `CHECK` on a fresh database — see
+    /// the growable-value-set rule in `DDL`'s doc comment. `ApprovalStatus`
+    /// in `types.rs` owns the value set at the one write path instead;
+    /// this pins that the schema itself no longer duplicates that job, so
+    /// a value `ApprovalStatus` has not caught yet is never silently
+    /// rejected by a constraint the Rust type doesn't know about.
     #[test]
-    fn status_check_constraint_rejects_an_unrecognized_value() {
+    fn status_column_accepts_a_value_no_check_constrains() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn.execute(
@@ -1013,10 +1308,8 @@ mod tests {
             [],
         )
         .unwrap();
-        let err = conn
-            .execute("UPDATE approvals SET status = 'sideways' WHERE request_id = 'r1'", [])
-            .unwrap_err();
-        assert!(err.to_string().contains("CHECK"), "expected a CHECK violation, got: {err}");
+        conn.execute("UPDATE approvals SET status = 'sideways' WHERE request_id = 'r1'", [])
+            .expect("no CHECK constrains status any more");
     }
 
     /// The other filed item, fixed here: a DENY rule for a free-variable
@@ -1059,5 +1352,862 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("guarantee 3"), "expected the trigger's message, got: {err}");
+    }
+
+    // ── `drop_legacy_value_enum_checks` coverage ───────────────────────
+
+    /// The pre-rule `CREATE TABLE` text for every table
+    /// `VALUE_ENUM_REBUILD_SPECS` rebuilds — what each table looked like
+    /// before its value-enum `CHECK` was dropped. Backs both
+    /// `put_table_back_on_legacy_shape` and
+    /// `rebuilt_table_schema_matches_a_fresh_migration`, which is what
+    /// actually pins `DDL` and `VALUE_ENUM_REBUILD_SPECS` together as one
+    /// source of truth instead of two that can drift apart.
+    const LEGACY_SHAPES: &[(&str, &str)] = &[
+        (
+            "approval_statements",
+            "CREATE TABLE approval_statements (
+                statement_digest TEXT    NOT NULL PRIMARY KEY,
+                rendered          TEXT    NOT NULL,
+                statement_kind    TEXT    NOT NULL,
+                has_free_vars     INTEGER NOT NULL CHECK (has_free_vars IN (0, 1)),
+                created_at        INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+            );",
+        ),
+        (
+            "approval_statement_commands",
+            "CREATE TABLE approval_statement_commands (
+                statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
+                cmd_seq          INTEGER NOT NULL,
+                name             TEXT    NOT NULL,
+                backgrounded     INTEGER NOT NULL CHECK (backgrounded IN (0, 1)),
+                PRIMARY KEY (statement_digest, cmd_seq)
+            );",
+        ),
+        (
+            "approval_statement_args",
+            "CREATE TABLE approval_statement_args (
+                statement_digest TEXT    NOT NULL,
+                cmd_seq          INTEGER NOT NULL,
+                arg_seq          INTEGER NOT NULL,
+                value_kind       TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
+                value_text       TEXT,
+                redact_kind      TEXT,
+                fingerprint      TEXT,
+                PRIMARY KEY (statement_digest, cmd_seq, arg_seq),
+                FOREIGN KEY (statement_digest, cmd_seq)
+                    REFERENCES approval_statement_commands(statement_digest, cmd_seq),
+                CHECK (
+                    (value_kind = 'plain'    AND value_text IS NOT NULL AND redact_kind IS NULL)
+                    OR
+                    (value_kind = 'redacted' AND value_text IS NULL     AND redact_kind IS NOT NULL)
+                )
+            );",
+        ),
+        (
+            "approval_statement_redirects",
+            "CREATE TABLE approval_statement_redirects (
+                statement_digest TEXT    NOT NULL,
+                cmd_seq          INTEGER NOT NULL,
+                redir_seq        INTEGER NOT NULL,
+                op               TEXT    NOT NULL,
+                value_kind       TEXT    NOT NULL CHECK (value_kind IN ('plain', 'redacted')),
+                value_text       TEXT,
+                redact_kind      TEXT,
+                fingerprint      TEXT,
+                PRIMARY KEY (statement_digest, cmd_seq, redir_seq),
+                FOREIGN KEY (statement_digest, cmd_seq)
+                    REFERENCES approval_statement_commands(statement_digest, cmd_seq),
+                CHECK (
+                    (value_kind = 'plain'    AND value_text IS NOT NULL AND redact_kind IS NULL)
+                    OR
+                    (value_kind = 'redacted' AND value_text IS NULL     AND redact_kind IS NOT NULL)
+                )
+            );",
+        ),
+        (
+            "approval_statement_vars",
+            "CREATE TABLE approval_statement_vars (
+                statement_digest TEXT NOT NULL,
+                name             TEXT NOT NULL,
+                binding          TEXT NOT NULL CHECK (binding IN ('free', 'bound')),
+                PRIMARY KEY (statement_digest, name),
+                FOREIGN KEY (statement_digest) REFERENCES approval_statements(statement_digest)
+            );",
+        ),
+        (
+            "rc_runs",
+            "CREATE TABLE rc_runs (
+                run_id       TEXT    NOT NULL PRIMARY KEY,
+                context_id   BLOB    NOT NULL,
+                context_type TEXT    NOT NULL,
+                verb         TEXT    NOT NULL,
+                started_at   INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                finished_at  INTEGER,
+                outcome      TEXT CHECK (outcome IS NULL OR outcome IN ('ok', 'failed', 'abandoned')),
+                script_count INTEGER
+            );",
+        ),
+        (
+            "approvals",
+            "CREATE TABLE approvals (
+                request_id       TEXT    NOT NULL PRIMARY KEY,
+                context_id       BLOB    NOT NULL,
+                principal_id     BLOB    NOT NULL,
+                origin           TEXT    NOT NULL CHECK (origin IN ('hook', 'shell_gate', 'kj_verb')),
+                instance         TEXT,
+                tool             TEXT,
+                hook_id          TEXT,
+                description      TEXT    NOT NULL,
+                authorized_label TEXT,
+                rc_run_id        TEXT    REFERENCES rc_runs(run_id),
+                status           TEXT    NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'claimed', 'allowed', 'denied', 'expired', 'abandoned')),
+                created_at       INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                expires_at       INTEGER,
+                claimed_at       INTEGER,
+                claimed_by       BLOB,
+                decided_at       INTEGER,
+                decided_by       BLOB,
+                decided_option   TEXT,
+                remember_scope   TEXT,
+                auto_reason      TEXT
+            );",
+        ),
+        (
+            "approval_signals",
+            "CREATE TABLE approval_signals (
+                request_id  TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+                seq         INTEGER NOT NULL,
+                source_kind TEXT    NOT NULL CHECK (source_kind IN ('rule', 'classifier')),
+                source_id   TEXT,
+                model_id    TEXT,
+                weight_hash TEXT,
+                stmt_seq    INTEGER,
+                cmd_seq     INTEGER,
+                label       TEXT,
+                score       REAL,
+                verdict     TEXT    NOT NULL CHECK (verdict IN ('escalate', 'deny', 'allow')),
+                PRIMARY KEY (request_id, seq)
+            );",
+        ),
+        (
+            "approval_events",
+            "CREATE TABLE approval_events (
+                request_id     TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+                seq            INTEGER NOT NULL,
+                kind           TEXT    NOT NULL
+                    CHECK (kind IN ('claimed', 'decided', 'expired', 'abandoned', 'late_decision')),
+                actor          BLOB,
+                decided_option TEXT,
+                remember_scope TEXT,
+                auto_reason    TEXT,
+                note           TEXT,
+                created_at     INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                PRIMARY KEY (request_id, seq)
+            );",
+        ),
+        (
+            "approval_rules",
+            "CREATE TABLE approval_rules (
+                rule_id          TEXT    NOT NULL PRIMARY KEY,
+                statement_digest TEXT    NOT NULL REFERENCES approval_statements(statement_digest),
+                authorized_label TEXT    NOT NULL,
+                context_id       BLOB,
+                principal_id     BLOB,
+                scope            TEXT    NOT NULL CHECK (scope IN ('session', 'always')),
+                allow            INTEGER NOT NULL CHECK (allow IN (0, 1)),
+                created_at       INTEGER NOT NULL
+                    DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                created_by       BLOB,
+                learned_from     TEXT    REFERENCES approvals(request_id),
+                revoked_at       INTEGER
+            );",
+        ),
+    ];
+
+    /// Force `table` back onto its pre-rule `CREATE TABLE` text from
+    /// `LEGACY_SHAPES`, on an already-migrated (current-shape) connection.
+    /// Dropping one table this way never risks a cascade on its own: FK
+    /// enforcement defaults to OFF on a bare `Connection::open_in_memory()`,
+    /// and a test that needs it ON (the cascade test below) does the swap
+    /// while the table is still empty, before any row is seeded.
+    fn put_table_back_on_legacy_shape(conn: &Connection, table: &str) {
+        let legacy_sql = LEGACY_SHAPES
+            .iter()
+            .find(|(name, _)| *name == table)
+            .unwrap_or_else(|| panic!("no LEGACY_SHAPES entry for {table}"))
+            .1;
+        conn.execute_batch(&format!("DROP TABLE {table};\n{legacy_sql}")).unwrap();
+    }
+
+    /// Strip what differs between a hand-written `CREATE TABLE` and one
+    /// SQLite wrote back after an `ALTER TABLE ... RENAME TO` for reasons
+    /// that carry no schema meaning: `--` comments (`DDL`'s column
+    /// commentary; a spec's `body` carries none), and the double-quotes
+    /// SQLite adds around the renamed identifier
+    /// (`CREATE TABLE "approval_statements"`) that `DDL`'s own text never
+    /// has. Leaves every column, key, `CHECK`, and `REFERENCES` clause
+    /// exactly as significant as it was.
+    fn normalize_schema_sql(sql: &str) -> String {
+        let mut normalized = String::new();
+        for line in sql.lines() {
+            let code = line.split("--").next().unwrap_or("").trim();
+            if !code.is_empty() {
+                normalized.push_str(code);
+                normalized.push(' ');
+            }
+        }
+        normalized.replace('"', "")
+    }
+
+    /// `VALUE_ENUM_REBUILD_SPECS` and `DDL` are two independent sources of
+    /// truth for the same table shapes; this is what catches a future edit
+    /// to one that forgets the other. For every rebuilt table, the
+    /// (comment- and quoting-normalized) schema text a fresh `migrate()`
+    /// produces must equal the schema text produced by rebuilding that
+    /// table up from its legacy shape. Falsified by dropping a column from
+    /// one spec's `body` without making the matching edit in `DDL`: the
+    /// two normalized strings then differ.
+    #[test]
+    fn rebuilt_table_schema_matches_a_fresh_migration() {
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+
+        for spec in VALUE_ENUM_REBUILD_SPECS {
+            let fresh_sql: String = fresh
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [spec.table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let rebuilt_conn = Connection::open_in_memory().unwrap();
+            migrate(&rebuilt_conn).unwrap();
+            put_table_back_on_legacy_shape(&rebuilt_conn, spec.table);
+            migrate(&rebuilt_conn).unwrap();
+            let rebuilt_sql: String = rebuilt_conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [spec.table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(
+                normalize_schema_sql(&fresh_sql),
+                normalize_schema_sql(&rebuilt_sql),
+                "{} rebuilt from its legacy shape must match a fresh migration's shape\nfresh: {fresh_sql}\nrebuilt: {rebuilt_sql}",
+                spec.table
+            );
+        }
+    }
+
+    /// The whole point of the `foreign_keys = OFF` window: `approvals` is
+    /// the `ON DELETE CASCADE` parent of six tables, and a naive rebuild
+    /// (`DROP TABLE approvals` with FK enforcement left ON) deletes every
+    /// one of their rows along with it. This seeds a row in each of the
+    /// six, puts `approvals` back on its legacy `CHECK` shape while it is
+    /// still empty (so the swap itself cannot cascade anything away),
+    /// seeds the parent and child rows, then migrates on a connection with
+    /// `foreign_keys = ON` — the kernel's real setting
+    /// (`kaijutsu-kernel/src/kernel_db.rs`) — and asserts every child row
+    /// survived. Falsified by removing the `foreign_keys = OFF`/restore
+    /// bracket from `drop_legacy_value_enum_checks`: every child table
+    /// then comes back empty.
+    #[test]
+    fn rebuilding_approvals_preserves_every_cascading_child() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn).unwrap();
+
+        // `approvals` is empty at this point, so this swap cannot cascade.
+        put_table_back_on_legacy_shape(&conn, "approvals");
+
+        conn.execute(
+            "INSERT INTO approvals (request_id, context_id, principal_id, origin, description)
+             VALUES ('r1', X'01', X'02', 'shell_gate', 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_ask_statements (request_id, stmt_seq, statement_digest)
+             VALUES ('r1', 0, 'd1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_options (request_id, seq, option_id, label, kind)
+             VALUES ('r1', 0, 'allow', 'Allow', 'allow')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_signals (request_id, seq, source_kind, verdict) VALUES ('r1', 0, 'rule', 'allow')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO approval_events (request_id, seq, kind) VALUES ('r1', 0, 'claimed')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO approval_refusals (request_id, seq, reason) VALUES ('r1', 0, 'self_approval')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO approval_redemptions (request_id) VALUES ('r1')", []).unwrap();
+
+        migrate(&conn).unwrap();
+
+        for (table, expected) in [
+            ("approval_ask_statements", 1_i64),
+            ("approval_options", 1),
+            ("approval_signals", 1),
+            ("approval_events", 1),
+            ("approval_refusals", 1),
+            ("approval_redemptions", 1),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE request_id = 'r1'"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, expected, "{table} lost its row to a cascading DROP of approvals");
+        }
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the origin/status value-enum CHECKs must be gone, got: {sql}");
+
+        conn.execute(
+            "INSERT INTO approvals (request_id, context_id, principal_id, origin, description, status)
+             VALUES ('r2', X'01', X'02', 'a brand new origin', 'x', 'sideways')",
+            [],
+        )
+        .expect("a value the old origin/status CHECKs rejected must now insert");
+
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(foreign_keys, 1, "migrate must restore the caller's foreign_keys setting");
+
+        // `approvals_decided_is_immutable` and the ledger_generation
+        // triggers live on `approvals` and are dropped along with it; both
+        // must come back via the post-rebuild `DDL` re-run.
+        conn.execute("UPDATE approvals SET status = 'denied' WHERE request_id = 'r1'", []).unwrap();
+        let err = conn
+            .execute("UPDATE approvals SET status = 'allowed' WHERE request_id = 'r1'", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("guarantee 6"), "the immutability trigger must survive the rebuild");
+
+        let generation: i64 =
+            conn.query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert!(generation > 0, "the generation triggers on approvals must survive the rebuild");
+    }
+
+    #[test]
+    fn migrate_drops_legacy_check_on_approval_statements_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statements");
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_statements'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the has_free_vars CHECK must be gone, got: {sql}");
+
+        let has_free_vars: i64 = conn
+            .query_row(
+                "SELECT has_free_vars FROM approval_statements WHERE statement_digest = 'd1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_free_vars, 1, "the rebuild must keep the existing row");
+
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d2', 'rm y', 'command', 2)",
+            [],
+        )
+        .expect("a has_free_vars value the old CHECK rejected must now insert");
+    }
+
+    #[test]
+    fn migrate_drops_legacy_check_on_approval_statement_commands_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 0)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statement_commands");
+        conn.execute(
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
+             VALUES ('d1', 0, 'rm', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_statement_commands'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the backgrounded CHECK must be gone, got: {sql}");
+
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM approval_statement_commands WHERE statement_digest = 'd1' AND cmd_seq = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "rm", "the rebuild must keep the existing row");
+
+        conn.execute(
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
+             VALUES ('d1', 1, 'ls', 2)",
+            [],
+        )
+        .expect("a backgrounded value the old CHECK rejected must now insert");
+    }
+
+    /// A third `value_kind` is not testable the way a plain enum-CHECK
+    /// drop is: the surviving plain/redacted consistency `CHECK` matches
+    /// on the literal strings `'plain'`/`'redacted'` in both of its
+    /// branches, so any other `value_kind` fails it regardless of whether
+    /// the retired enum `CHECK` is still present. This test pins the
+    /// rebuild and row preservation; the surviving `CHECK`'s own behavior
+    /// is pinned separately by
+    /// `approval_statement_args_consistency_check_survives_its_own_rebuild`.
+    #[test]
+    fn migrate_drops_legacy_value_kind_check_on_approval_statement_args_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
+             VALUES ('d1', 0, 'rm', 0)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statement_args");
+        conn.execute(
+            "INSERT INTO approval_statement_args (statement_digest, cmd_seq, arg_seq, value_kind, value_text)
+             VALUES ('d1', 0, 0, 'plain', 'x')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_statement_args'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sql.matches("CHECK").count(),
+            1,
+            "the value_kind enum CHECK must be gone but the plain/redacted consistency CHECK must survive, got: {sql}"
+        );
+
+        let value_text: String = conn
+            .query_row(
+                "SELECT value_text FROM approval_statement_args
+                 WHERE statement_digest = 'd1' AND cmd_seq = 0 AND arg_seq = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value_text, "x", "the rebuild must keep the existing row");
+    }
+
+    #[test]
+    fn migrate_drops_legacy_value_kind_check_on_approval_statement_redirects_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
+             VALUES ('d1', 0, 'rm', 0)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statement_redirects");
+        conn.execute(
+            "INSERT INTO approval_statement_redirects
+                 (statement_digest, cmd_seq, redir_seq, op, value_kind, value_text)
+             VALUES ('d1', 0, 0, '>', 'plain', 'out.txt')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_statement_redirects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sql.matches("CHECK").count(),
+            1,
+            "the value_kind enum CHECK must be gone but the plain/redacted consistency CHECK must survive, got: {sql}"
+        );
+
+        let op: String = conn
+            .query_row(
+                "SELECT op FROM approval_statement_redirects
+                 WHERE statement_digest = 'd1' AND cmd_seq = 0 AND redir_seq = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(op, ">", "the rebuild must keep the existing row");
+    }
+
+    #[test]
+    fn migrate_drops_legacy_check_on_approval_statement_vars_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm ${TARGET}', 'command', 1)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statement_vars");
+        conn.execute(
+            "INSERT INTO approval_statement_vars (statement_digest, name, binding) VALUES ('d1', 'TARGET', 'free')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_statement_vars'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the binding CHECK must be gone, got: {sql}");
+
+        let binding: String = conn
+            .query_row(
+                "SELECT binding FROM approval_statement_vars WHERE statement_digest = 'd1' AND name = 'TARGET'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding, "free", "the rebuild must keep the existing row");
+
+        conn.execute(
+            "INSERT INTO approval_statement_vars (statement_digest, name, binding)
+             VALUES ('d1', 'OTHER', 'sideways')",
+            [],
+        )
+        .expect("a binding value the old CHECK rejected must now insert");
+    }
+
+    #[test]
+    fn migrate_drops_legacy_check_on_rc_runs_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        put_table_back_on_legacy_shape(&conn, "rc_runs");
+        conn.execute(
+            "INSERT INTO rc_runs (run_id, context_id, context_type, verb, started_at, outcome)
+             VALUES ('run1', X'01', 'coder', 'create', 1000, 'ok')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rc_runs'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the outcome CHECK must be gone, got: {sql}");
+
+        let outcome: String =
+            conn.query_row("SELECT outcome FROM rc_runs WHERE run_id = 'run1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(outcome, "ok", "the rebuild must keep the existing row");
+
+        conn.execute(
+            "INSERT INTO rc_runs (run_id, context_id, context_type, verb, started_at, outcome)
+             VALUES ('run2', X'01', 'coder', 'create', 2000, 'sideways')",
+            [],
+        )
+        .expect("an outcome value the old CHECK rejected must now insert");
+
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_rc_runs_context_started'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1, "idx_rc_runs_context_started must survive the rebuild");
+    }
+
+    #[test]
+    fn migrate_drops_legacy_checks_on_approval_signals_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approvals (request_id, context_id, principal_id, origin, description)
+             VALUES ('r1', X'01', X'02', 'shell_gate', 'x')",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_signals");
+        conn.execute(
+            "INSERT INTO approval_signals (request_id, seq, source_kind, verdict) VALUES ('r1', 0, 'rule', 'allow')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_signals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the source_kind/verdict CHECKs must be gone, got: {sql}");
+
+        let verdict: String = conn
+            .query_row("SELECT verdict FROM approval_signals WHERE request_id = 'r1' AND seq = 0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(verdict, "allow", "the rebuild must keep the existing row");
+
+        conn.execute(
+            "INSERT INTO approval_signals (request_id, seq, source_kind, verdict)
+             VALUES ('r1', 1, 'oracle', 'reconsider')",
+            [],
+        )
+        .expect("a source_kind/verdict value the old CHECKs rejected must now insert");
+
+        let generation_before: i64 =
+            conn.query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO approval_signals (request_id, seq, source_kind, verdict) VALUES ('r1', 2, 'rule', 'deny')",
+            [],
+        )
+        .unwrap();
+        let generation_after: i64 =
+            conn.query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert!(
+            generation_after > generation_before,
+            "ledger_generation_bump_on_signal_insert must survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn migrate_drops_legacy_checks_on_approval_rules_and_keeps_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm ${TARGET}', 'command', 1)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_rules");
+        conn.execute(
+            "INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, scope, allow)
+             VALUES ('rule1', 'd1', 'rm target', 'always', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_rules'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("CHECK"), "the scope/allow CHECKs must be gone, got: {sql}");
+
+        let scope: String =
+            conn.query_row("SELECT scope FROM approval_rules WHERE rule_id = 'rule1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(scope, "always", "the rebuild must keep the existing row");
+
+        conn.execute(
+            "INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, scope, allow)
+             VALUES ('rule2', 'd1', 'rm target', 'forever', 0)",
+            [],
+        )
+        .expect("a scope/allow value the old CHECKs rejected must now insert");
+
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_approval_rules_active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1, "idx_approval_rules_active must survive the rebuild");
+
+        let err = conn
+            .execute(
+                "INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, scope, allow)
+                 VALUES ('rule3', 'd1', 'rm target', 'always', 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("guarantee 3"),
+            "approval_rules_reject_free_variable_allow_rules must survive the rebuild"
+        );
+
+        let generation_before: i64 =
+            conn.query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, scope, allow)
+             VALUES ('rule4', 'd1', 'rm target', 'session', 0)",
+            [],
+        )
+        .unwrap();
+        let generation_after: i64 =
+            conn.query_row("SELECT generation FROM ledger_generation WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert!(generation_after > generation_before, "ledger_generation_bump_on_rule_insert must survive the rebuild");
+    }
+
+    /// The plain/redacted consistency `CHECK` on `approval_statement_args`
+    /// is not a value-enum CHECK and must survive its own table's rebuild
+    /// untouched — a `plain` row with no `value_text` is an inconsistent
+    /// half-state regardless of whether the retired `value_kind` enum
+    /// `CHECK` is still there.
+    #[test]
+    fn approval_statement_args_consistency_check_survives_its_own_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
+             VALUES ('d1', 0, 'rm', 0)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statement_args");
+        migrate(&conn).unwrap();
+
+        let err = conn
+            .execute(
+                "INSERT INTO approval_statement_args (statement_digest, cmd_seq, arg_seq, value_kind, value_text)
+                 VALUES ('d1', 0, 0, 'plain', NULL)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK"),
+            "the plain/redacted consistency CHECK must still reject a half-state row, got: {err}"
+        );
+    }
+
+    /// A second call must not rebuild a table again once its legacy
+    /// `CHECK` is gone — asserted directly on `drop_legacy_value_enum_checks`'s
+    /// own return value rather than on the rebuilt schema staying
+    /// unchanged (a rebuild is deterministic, so a redundant one would
+    /// produce identical text and a text comparison would never catch it).
+    /// Targets `approval_statement_args` specifically: it keeps a SECOND,
+    /// surviving `CHECK` (the plain/redacted consistency check) after its
+    /// own rebuild, which is exactly the case a guard on the bare word
+    /// `"CHECK"` — instead of `spec.legacy_check`'s exact text — would get
+    /// wrong, re-triggering the rebuild forever.
+    #[test]
+    fn drop_legacy_value_enum_checks_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars)
+             VALUES ('d1', 'rm x', 'command', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_statement_commands (statement_digest, cmd_seq, name, backgrounded)
+             VALUES ('d1', 0, 'rm', 0)",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_statement_args");
+        conn.execute(
+            "INSERT INTO approval_statement_args (statement_digest, cmd_seq, arg_seq, value_kind, value_text)
+             VALUES ('d1', 0, 0, 'plain', 'x')",
+            [],
+        )
+        .unwrap();
+
+        let rebuilt_first = drop_legacy_value_enum_checks(&conn).unwrap();
+        assert!(rebuilt_first, "the legacy value_kind CHECK must trigger a rebuild the first time");
+
+        let rebuilt_second = drop_legacy_value_enum_checks(&conn).unwrap();
+        assert!(
+            !rebuilt_second,
+            "a second call must not re-rebuild a table that still carries a DIFFERENT, \
+             surviving CHECK — this is exactly what a guard on the bare word \"CHECK\" would get wrong"
+        );
     }
 }

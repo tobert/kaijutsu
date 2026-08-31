@@ -399,10 +399,9 @@ mod tests {
         db.upsert_backend(&crate::kernel_db::BackendRow {
             backend_id: BackendId::new(),
             name: "gemini".into(),
-            // 'mock' is admitted by the CHECK; parse refuses it without the
-            // feature. Under cfg(test) the feature IS on, so use a kind the
-            // CHECK admits but parse cannot know — there is none, so exercise
-            // the parse error directly instead.
+            // `mock` parses only with the test-mock feature, which cfg(test)
+            // turns on — so this row is accepted here and would not be in a
+            // production build.
             kind: "mock".into(),
             base_url: None,
             api_key_env: None,
@@ -413,9 +412,8 @@ mod tests {
             created_by: PrincipalId::system(),
         })
         .unwrap();
-        // Under cfg(test) 'mock' parses, so the registry builds; the real
-        // guard is BackendKind::parse, covered in llm/config.rs. What we pin
-        // here is that a CHECK-illegal kind never reaches the table at all.
+        // Under cfg(test) 'mock' parses, so the registry builds. What we pin
+        // here is that an unparseable kind never reaches the table at all.
         assert!(build_llm_registry(&db).is_ok());
         let err = db
             .upsert_backend(&crate::kernel_db::BackendRow {
@@ -432,8 +430,8 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("constraint"),
-            "the CHECK must reject an unknown kind at the SQL layer: {err}"
+            err.to_string().contains("gemini"),
+            "the write path must reject an unknown kind, naming it: {err}"
         );
     }
 
