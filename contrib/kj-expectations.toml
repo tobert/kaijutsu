@@ -167,6 +167,10 @@ mutates = false
 expect = "informative"
 mutates = false
 
+["block render"]
+expect = "informative"
+mutates = false
+
 ["block reproject"]
 expect = "situation-normal"
 mutates = true

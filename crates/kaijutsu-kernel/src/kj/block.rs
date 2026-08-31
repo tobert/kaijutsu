@@ -134,6 +134,29 @@ enum BlockCommand {
         #[arg(long)]
         range: Option<String>,
     },
+    /// Engrave an ABC block into a standalone SVG score and print it.
+    /// Refuses a block that is not `text/vnd.abc`, and refuses one holding
+    /// more than one tune. Nothing is stored.
+    Render {
+        /// Block id
+        block_id: String,
+        /// Context a short block id resolves against: . (default) | .parent
+        /// | <label> | <hex prefix>. Ignored for the full form, which
+        /// already names its own context.
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+        /// CSS color for every notation element. The default suits a dark
+        /// background.
+        #[arg(long, default_value = "#ffffff")]
+        color: String,
+        /// Distance between adjacent staff lines, in SVG units. Scales the
+        /// whole score, so this is the size dial.
+        #[arg(long, default_value_t = 10.0)]
+        staff_spacing: f64,
+        /// Blank margin around the whole score, in SVG units.
+        #[arg(long, default_value_t = 20.0)]
+        margin: f64,
+    },
     /// One-step blob readback: resolve a block's payload and print or save
     /// it, following the CAS reference when the block is a derived/asset
     /// sibling (e.g. an ABC→MIDI render) instead of a hand-assembled
@@ -332,6 +355,22 @@ impl KjDispatcher {
                 context.as_deref(),
                 !no_line_numbers,
                 range.as_deref(),
+                caller,
+            ),
+            BlockCommand::Render {
+                block_id,
+                context,
+                color,
+                staff_spacing,
+                margin,
+            } => self.block_render(
+                &block_id,
+                context.as_deref(),
+                &kaijutsu_abc::engrave::EngravingOptions {
+                    staff_spacing,
+                    margin,
+                    color,
+                },
                 caller,
             ),
             BlockCommand::Cat {
@@ -754,6 +793,80 @@ impl KjDispatcher {
             "content_length": snap.content.len(),
         });
         KjResult::ok_with_data(out, record)
+    }
+
+    /// Engrave an ABC block to a standalone SVG score (`kj block render`).
+    ///
+    /// The content type must be `text/vnd.abc`. The ABC parser is generous
+    /// and returns a tune for almost any input, so engraving a block that
+    /// never claimed to be notation yields a staff that looks authoritative
+    /// and means nothing — this refuses by declared type instead.
+    ///
+    /// One SVG document carries one score, so a block holding several tunes
+    /// is refused by count rather than having all but the first silently
+    /// dropped.
+    ///
+    /// The SVG is ephemeral: it is a rendering for a human's screen, and a
+    /// model asked to read a few thousand path commands learns nothing the
+    /// ABC source did not already say.
+    fn block_render(
+        &self,
+        id_str: &str,
+        ctx_ref: Option<&str>,
+        options: &kaijutsu_abc::engrave::EngravingOptions,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let block_id = match self.resolve_block_id(id_str, ctx_ref, caller) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block render: {e}")),
+        };
+        let ctx_id = block_id.context_id;
+
+        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block render: {e}")),
+        };
+        let snap = match snapshots.iter().find(|b| b.id == block_id) {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block render: block '{id_str}' not found in {}",
+                    ctx_id.to_hex()
+                ));
+            }
+        };
+
+        if snap.content_type != ContentType::Abc {
+            return KjResult::Err(format!(
+                "kj block render: block '{id_str}' is {}, not {}. Only ABC notation engraves to a score.",
+                snap.content_type.as_mime(),
+                ContentType::Abc.as_mime()
+            ));
+        }
+
+        let tunes = kaijutsu_abc::parse(&snap.content).value;
+        let tune = match tunes.as_slice() {
+            [one] => one,
+            [] => {
+                return KjResult::Err(format!(
+                    "kj block render: block '{id_str}' holds no tune to engrave"
+                ));
+            }
+            many => {
+                return KjResult::Err(format!(
+                    "kj block render: block '{id_str}' holds {} tunes and one SVG carries one score. Put each tune in its own block.",
+                    many.len()
+                ));
+            }
+        };
+
+        let svg = kaijutsu_abc::engrave::engrave_to_svg(tune, options);
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "svg_bytes": svg.len(),
+        });
+        KjResult::ok_ephemeral_with_data(svg, ContentType::Svg, record)
     }
 
     /// The CAS hash a block's content references, if it's a CAS-ref block by
@@ -1748,6 +1861,7 @@ fn first_line_trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{BlockKind, ContentType, DocKind, PrincipalId, Role as TypesRole, Status};
 
@@ -1790,6 +1904,238 @@ mod tests {
                 None,
             )
             .expect("insert_block_as")
+    }
+
+    fn insert_abc_block(
+        d: &crate::kj::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        content: &str,
+    ) -> kaijutsu_types::BlockId {
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                content,
+                Status::Done,
+                ContentType::Abc,
+                None,
+            )
+            .expect("insert_block_as")
+    }
+
+    const ONE_TUNE: &str = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEF GABc|\n";
+
+    /// The `height` attribute of an SVG document's root element.
+    fn svg_height(svg: &str) -> f64 {
+        svg.split("height=\"")
+            .nth(1)
+            .and_then(|t| t.split('"').next())
+            .expect("svg carries a height")
+            .parse::<f64>()
+            .expect("height is a number")
+    }
+
+    // ── New: block render ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_render_engraves_an_abc_block_to_svg() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_abc_block(&d, ctx, ONE_TUNE);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("render"), bid.to_key()], &c)
+            .await;
+        assert!(result.is_ok(), "render failed: {}", result.message());
+        let svg = result.message();
+        assert!(svg.starts_with("<svg"), "not an SVG document: {svg:.80}");
+        assert!(svg.contains("</svg>"), "unterminated SVG");
+        // A staff is five lines; anything less means we shipped an empty
+        // document and called it a score.
+        assert!(
+            svg.matches("<line").count() >= 5,
+            "expected at least five staff lines, got {}",
+            svg.matches("<line").count()
+        );
+    }
+
+    /// The SVG is for a screen, not for a model's context, and it must be
+    /// declared as SVG so a client renders it instead of printing markup.
+    #[tokio::test]
+    async fn block_render_output_is_ephemeral_svg() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_abc_block(&d, ctx, ONE_TUNE);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("render"), bid.to_key()], &c)
+            .await;
+        match result {
+            KjResult::Ok {
+                content_type,
+                ephemeral,
+                data: Some(data),
+                message,
+            } => {
+                assert_eq!(content_type, ContentType::Svg);
+                assert!(ephemeral, "an SVG blob must not enter LLM context");
+                assert_eq!(
+                    data["svg_bytes"].as_u64(),
+                    Some(message.len() as u64),
+                    "svg_bytes must describe the payload actually returned"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The ABC parser is generous enough to return a tune for prose, so the
+    /// declared content type is the only honest guard.
+    #[tokio::test]
+    async fn block_render_refuses_a_non_abc_block() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, ONE_TUNE);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("render"), bid.to_key()], &c)
+            .await;
+        assert!(!result.is_ok(), "plain-text block should not engrave");
+        let msg = result.message();
+        assert!(
+            msg.contains("text/plain") && msg.contains("text/vnd.abc"),
+            "error must name both the actual and the required type: {msg}"
+        );
+    }
+
+    /// One SVG document carries one score. Rendering the first of several
+    /// tunes would drop the rest without saying so.
+    #[tokio::test]
+    async fn block_render_refuses_a_block_holding_two_tunes() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let two = format!("{ONE_TUNE}\nX:2\nT:Second\nM:4/4\nL:1/8\nK:G\nGABc|\n");
+        let bid = insert_abc_block(&d, ctx, &two);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("render"), bid.to_key()], &c)
+            .await;
+        assert!(!result.is_ok(), "two tunes should not engrave to one SVG");
+        assert!(
+            result.message().contains("2 tunes"),
+            "error must name the count: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_render_forwards_the_color_flag() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_abc_block(&d, ctx, ONE_TUNE);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("render"),
+                    bid.to_key(),
+                    s("--color"),
+                    s("#ff0000"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "render failed: {}", result.message());
+        assert!(
+            result.message().contains("#ff0000"),
+            "--color never reached the engraver"
+        );
+        assert!(
+            !result.message().contains("#ffffff"),
+            "default color leaked past the override"
+        );
+    }
+
+    /// `staff_spacing` is the size dial, so a bigger value must produce a
+    /// bigger score — this is what a caller sizing to terminal cells relies
+    /// on.
+    #[tokio::test]
+    async fn block_render_staff_spacing_scales_the_score() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_abc_block(&d, ctx, ONE_TUNE);
+        let c = caller_with_context(ctx);
+
+        let mut heights = Vec::new();
+        for spacing in ["10", "20"] {
+            let r = d
+                .dispatch(
+                    &[
+                        s("block"),
+                        s("render"),
+                        bid.to_key(),
+                        s("--staff-spacing"),
+                        s(spacing),
+                    ],
+                    &c,
+                )
+                .await;
+            assert!(r.is_ok(), "render failed: {}", r.message());
+            heights.push(svg_height(r.message()));
+        }
+        let (small, large) = (heights[0], heights[1]);
+        assert!(
+            large > small,
+            "doubling staff spacing did not grow the score: {small} → {large}"
+        );
+    }
+
+    /// The clap defaults are written as literals because `default_value_t`
+    /// cannot call a non-const function. This pins them to the engraver's
+    /// own defaults so the two cannot drift apart unnoticed.
+    #[test]
+    fn block_render_defaults_match_the_engraver() {
+        let engraver = kaijutsu_abc::engrave::EngravingOptions::default();
+        let cmd = BlockArgs::command();
+        let render = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "render")
+            .expect("render subcommand");
+        let default_of = |name: &str| {
+            render
+                .get_arguments()
+                .find(|a| a.get_id() == name)
+                .expect("argument exists")
+                .get_default_values()
+                .first()
+                .expect("argument has a default")
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(default_of("color"), engraver.color);
+        assert_eq!(
+            default_of("staff_spacing").parse::<f64>().unwrap(),
+            engraver.staff_spacing
+        );
+        assert_eq!(
+            default_of("margin").parse::<f64>().unwrap(),
+            engraver.margin
+        );
     }
 
     // ── Existing behavior preserved ───────────────────────────────────

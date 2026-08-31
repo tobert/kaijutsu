@@ -99,6 +99,10 @@ pub(crate) const READ_ONLY_TABLE: &[(&str, &str)] = &[
     ("block", "read"),
     ("block", "history"),
     ("block", "diff"),
+    // `render` engraves an ABC block to SVG on stdout and stores nothing.
+    // Unlike `cat` it has no `--out`, which is the only reason `cat` is
+    // classified mutating.
+    ("block", "render"),
     // -- context: metadata reads. `switch` moves the session's active
     // context (a session-row write) and every other variant mutates a
     // context, so neither is here.
