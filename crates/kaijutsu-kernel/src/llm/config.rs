@@ -23,6 +23,8 @@
 
 use std::collections::HashMap;
 
+use crate::secret_source::read_secret_file;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -262,7 +264,7 @@ impl BackendConfig {
     /// backend with a warning (it only hard-fails on the *default* backend).
     pub fn resolve_api_key(&self) -> Option<String> {
         if let Some(path) = &self.api_key_file {
-            match read_key_file(path) {
+            match read_secret_file(path) {
                 Ok(key) => return Some(key),
                 Err(e) => tracing::warn!(
                     backend = %self.name,
@@ -310,21 +312,6 @@ impl BackendConfig {
         }
         Ok(())
     }
-}
-
-/// Read an API key from a file: expand `~`, read, trim surrounding
-/// whitespace. An empty file is an error so the caller can warn rather than
-/// register a backend with a blank key.
-fn read_key_file(path: &str) -> std::io::Result<String> {
-    let expanded = shellexpand::tilde(path);
-    let key = std::fs::read_to_string(expanded.as_ref())?.trim().to_string();
-    if key.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "key file is empty after trimming",
-        ));
-    }
-    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +568,7 @@ mod tests {
         std::fs::write(&path, "   \n\n").unwrap();
 
         // The helper rejects a whitespace-only file outright...
-        assert!(read_key_file(path.to_str().unwrap()).is_err());
+        assert!(read_secret_file(path.to_str().unwrap()).is_err());
 
         // ...and resolve_api_key falls through to an (unset) explicit env var,
         // yielding None rather than a blank key.

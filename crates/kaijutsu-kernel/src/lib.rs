@@ -40,6 +40,7 @@ pub mod peers;
 pub mod roster;
 pub mod roster_sources;
 pub mod runtime;
+pub mod secret_source;
 pub mod seed_backends;
 pub mod seed_presets;
 pub mod seed_scripts;
