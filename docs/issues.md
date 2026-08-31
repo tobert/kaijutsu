@@ -135,23 +135,6 @@ leaves its documents behind, because the melt changes what is *mounted*, not
 what is *stored*. Whoever melts the remaining three roots must delete the
 documents in the same change or file the same entry again.
 
-## `doc_snapshots` stores the text twice — once encoded, once derived (2026-08-30)
-
-`doc_snapshots` carries both `state` (CBOR of the whole `BlockDocument`, via
-`codec::encode(&entry.doc.snapshot())` in
-`crates/kaijutsu-kernel/src/block_store.rs:1002`) and `content` (the
-concatenated plain text, `entry.content()`). The text is recoverable from the
-state, so `content` is a derived cache stored beside its own source.
-
-Measured on the 08-29 backup: `state` 669 MB, `content` 186 MB. That is ~20%
-of a 933 MB database spent on something the row already contains.
-
-Not obviously wrong — a reader that only wants the text pays no CBOR decode,
-and `KernelDb`'s snapshot read (`kernel_db.rs:2787`) hands both back together.
-The question is whether any hot path actually reads `content` without also
-needing `state`. If none does, the column is deletable; if one does, the doc
-comment should say which, because the redundancy currently looks accidental.
-
 Found while answering "how much of kernel.db is reclaimable" (answer: none —
 `freelist_count` is 0).
 
