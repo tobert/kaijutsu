@@ -263,6 +263,50 @@ on `:q`. `kaijutsu-editor` drives modalkit on
 `modalkit::crossterm::event::KeyEvent`, so the app's `keyconv.rs` translation
 is the identity here.
 
+### Images
+
+Blocks already carry everything the wire needs: `ContentType::Svg` is inline
+SVG text, `ContentType::Abc` is ABC notation, and a `ContentType::Image`
+block's text is a CAS hash whose real MIME type lives in CAS sidecar metadata
+(`kaijutsu-types/src/block.rs`, `ContentType`). Images are a client rendering
+lane; nothing new rides the wire.
+
+- **Symbolic on the wire, raster at the edge.** The kernel ships SVG, ABC, or
+  a CAS hash — never pixels it rendered itself. The TUI rasterizes with
+  resvg + tiny-skia (already workspace dependencies through the app) at a
+  pixel size derived from the terminal's cell size, so the receiver renders
+  the symbolic form at its own resolution — the same doctrine as
+  tempo-not-pulses (`docs/midi.md`, "The one timebase").
+- **Protocol ladder.** v1 emits the iTerm2 inline-image protocol (OSC 1337
+  `File=`, base64 PNG); wezterm and iTerm2 both speak it, which covers both
+  seats in use today. The fallback is unicode half-blocks (`▀` with fg/bg
+  colors), which renders in any true-color terminal. Kitty's graphics
+  protocol is a later rung for kitty/ghostty; sixel is not planned.
+- **Detection is in-band, never environment.** Over `ssh -t zorak
+  kaijutsu-tui` the process runs on zorak and `TERM_PROGRAM` does not
+  propagate. Cell pixel size comes from `TIOCGWINSZ` (ssh forwards the pixel
+  fields in pty-req and window-change), with a `CSI 16 t` query as the
+  fallback; protocol support is probed with terminal queries at startup. When
+  no protocol answers, half-blocks render.
+- **Write-once emission, riding ruling 1.** An image renders when its block
+  completes and prints into scrollback: reserve N lines in the
+  `insert_before`, emit the image sized in cell units (so N is exact), and
+  never touch it again. Both target terminals keep inline images in
+  scrollback and scroll them with the text. A late edit of a printed image
+  block gets the scrollback-staleness treatment: status-line notice, no
+  redraw. There are no streaming images — a still-streaming block renders as
+  text until it completes.
+- **The presentation crate stays pure text.** Rasterization and protocol
+  emission live in the ratatui edge, beside the transcript printer. The
+  `ratatui-image` crate covers detection and encoding for every rung and is
+  worth an evaluation pass for those parts; emission stays in our printer
+  either way, because the printer owns `insert_before`.
+
+`Abc` blocks reaching the staff in a terminal need one new piece: an SVG
+emitter in `kaijutsu-abc::engrave`, which already builds `kurbo::BezPath`
+glyphs (`engrave/font.rs`) — `BezPath::to_svg` makes that emitter small. Lane
+in `docs/issues.md`.
+
 ## Keys
 
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:

@@ -35,6 +35,13 @@ mux; `docs/ssh-shell.md` retired into it. Lanes, in order:
    Consumers: the TUI status line (`docs/tui.md`, "Cache health"), the app's
    bottom-dock gauge, ACP `UsageUpdate`. Amy: *"how long since the last api
    turn; a proxy for KV health … expose the data we have."*
+6. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
+   transcript: resvg raster at cell-derived pixel size, OSC 1337 emission
+   (wezterm + iTerm2) with a unicode half-block fallback, in-band detection
+   only. Rules: `docs/tui.md`, "Images". Sub-lane, independently useful: an
+   SVG emitter in `kaijutsu-abc::engrave` from the `kurbo::BezPath` glyphs it
+   already builds (`BezPath::to_svg`), so `Abc` blocks reach the staff in a
+   terminal.
 
 ## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
 
