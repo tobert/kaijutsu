@@ -1299,9 +1299,7 @@ impl KjDispatcher {
         };
         let target_id = row.context_id;
 
-        // `archived_at` is authoritative for archived-ness per `ContextState`'s
-        // own doc comment, so check it ahead of the enum (as `kj drive` does).
-        if row.archived_at.is_some() || row.context_state == ContextState::Archived {
+        if row.is_archived() {
             return KjResult::Err(format!(
                 "kj context rebind: context {} is archived — archived contexts are \
                  retained work, inert by design; unarchive it first if it really \

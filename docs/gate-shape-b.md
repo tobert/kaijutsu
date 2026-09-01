@@ -313,9 +313,21 @@ describe.
 - `approval_redemptions.request_id` is a `PRIMARY KEY` and `redeem_ask`
   decides on the `INSERT`'s row count, so exactly-once is already structural
   and does not change.
-- `find_redeemable`'s digest set match goes; every other clause of its
-  predicate — label, context, principal, `status IN ('allowed','denied')`,
-  `auto_reason IS NULL`, not already redeemed — still holds.
+- **`find_redeemable`'s digest set match STAYS, and the plan to delete it was
+  wrong.** It is only removable for an ask that redeems by id, and the
+  subscriber does not call `find_redeemable` at all — it looks a row up
+  directly. What still uses the matcher is the RETRY path, which is every
+  origin with `exec_source: None`.
+
+  Deleting it there would reopen a bug closed on 2026-08-23. `kj cc send`
+  renders the concrete message into its statement precisely so the digest
+  varies with it (`kj/cc.rs:138`); without the digest in the predicate,
+  `find_redeemable` matches on label + context + principal, and an approval
+  read for one message would redeem a send of any other message to the same
+  target. The matcher is not the duplication Shape B set out to remove — it
+  is the authorization key for callers that still retry.
+
+  It becomes deletable when every origin executes on approval, not before.
 - `PENDING_REASON` stops saying "run the same command again". It should say
   what actually happens now: answer it, and the command runs.
 

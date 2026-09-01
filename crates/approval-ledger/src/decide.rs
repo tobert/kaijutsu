@@ -261,6 +261,37 @@ pub fn abandon_unresolved_on_restart(conn: &Connection, reason: &str) -> Result<
     Ok(swept)
 }
 
+/// Abandon every unresolved ask a context raised, because the context is
+/// archived and will never act on an answer.
+///
+/// Same shape as [`abandon_unresolved_on_restart`] and for the same reason:
+/// an ask that silently stops being answerable is worse than one honestly
+/// buried — a human would answer it, be told nothing, and nothing would
+/// happen. A cold start is one piece of good evidence that no waiter
+/// remains; an archived context is another.
+///
+/// Decided asks are left alone, exactly as the restart sweep leaves them:
+/// abandoning an `allowed` row would destroy a human's answer, and the
+/// answer stays in the audit trail whether or not anything can collect it.
+///
+/// Returns how many rows were swept.
+pub fn abandon_unresolved_for_archived_context(
+    conn: &Connection,
+    context_id: &[u8],
+    reason: &str,
+) -> Result<usize> {
+    let unresolved = crate::ask::list_unresolved_for_context(conn, context_id)?;
+    let mut swept = 0usize;
+    for row in unresolved {
+        match abandon(conn, &row.request_id, Some(reason)) {
+            Ok(_) => swept += 1,
+            Err(LedgerError::AlreadyDecided { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(swept)
+}
+
 fn transition(
     conn: &Connection,
     request_id: &str,

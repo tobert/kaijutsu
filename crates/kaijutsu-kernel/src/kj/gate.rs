@@ -456,6 +456,29 @@ pub(crate) async fn run_gate(
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
 ) -> GateOutcome {
+    // An archived context is inert — it runs nothing. This is the second of
+    // two checks; `kj ledger` refuses to ANSWER an archived context's ask,
+    // and this one refuses to act on an answer, because a context can be
+    // archived in the gap between the two. Neither check covers the other.
+    //
+    // `Unavailable`, not `Denied`: nobody decided anything here. The
+    // distinction is the one this whole lane exists to keep.
+    if let Some(context_id) = caller.context_id {
+        let archived = {
+            let db = db.lock();
+            db.get_context(context_id)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.is_archived())
+        };
+        if archived {
+            return GateOutcome::unavailable_without_row(format!(
+                "context {} is archived — archived contexts are retained work and run                  nothing; nothing was run and no ask was recorded",
+                context_id.short()
+            ));
+        }
+    }
+
     let context = caller_context_bytes(caller);
     let principal = caller.principal_id.as_bytes().to_vec();
     let digests: Vec<String> = spec
@@ -1256,6 +1279,120 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
+    }
+
+    /// An archived context runs nothing, so its gate refuses before any ask
+    /// is recorded. `Unavailable`, not `Denied` — nobody decided this, and
+    /// the two teach opposite lessons.
+    ///
+    /// Falsified by deleting the archived guard at the top of `run_gate`:
+    /// the call escalates and mints a durable ask for a context that could
+    /// never act on the answer.
+    #[tokio::test]
+    async fn an_archived_context_runs_nothing_and_records_no_ask() {
+        let d = gate_dispatcher().await;
+        let ctx_id = register_context(&d, Some("arch-gate"), None, kaijutsu_types::PrincipalId::new());
+        let caller = caller_with_context(ctx_id);
+        {
+            let db = d.kernel_db.lock();
+            db.archive_context(ctx_id).expect("archive");
+        }
+
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.verdict,
+            GateVerdict::Unavailable,
+            "an archived context is inert, and inert is not a decision"
+        );
+        assert!(!outcome.allowed(), "fails closed");
+        assert!(outcome.ask.is_none(), "nothing durable was recorded");
+        assert!(
+            outcome.reason.contains("archived"),
+            "the reason must name why: {}",
+            outcome.reason
+        );
+    }
+
+    /// Archiving a context abandons the asks it left open. They are
+    /// answerable and dead at once otherwise: a human answers, is told
+    /// nothing, and nothing happens.
+    ///
+    /// Falsified by removing the sweep from `KernelDb::archive_context`.
+    #[tokio::test]
+    async fn archiving_a_context_sweeps_the_asks_it_left_open() {
+        let d = gate_dispatcher().await;
+        let ctx_id = register_context(&d, Some("arch-sweep"), None, kaijutsu_types::PrincipalId::new());
+        let caller = caller_with_context(ctx_id);
+
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+        let request_id = outcome.ask.expect("a pending row").request_id;
+
+        {
+            let db = d.kernel_db.lock();
+            db.archive_context(ctx_id).expect("archive");
+        }
+
+        let status = {
+            let db = d.kernel_db.lock();
+            approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                .expect("read")
+                .expect("the row survives, abandoned")
+                .status
+        };
+        assert_eq!(
+            status,
+            ApprovalStatus::Abandoned,
+            "an open ask on an archived context must be buried, not left answerable"
+        );
+    }
+
+    /// A DECIDED ask is not swept — abandoning it would destroy a human's
+    /// answer, which is the same line the restart sweep holds.
+    ///
+    /// Falsified by widening the sweep's status predicate past
+    /// `pending`/`claimed`.
+    #[tokio::test]
+    async fn archiving_does_not_destroy_an_answer_already_given() {
+        let d = gate_dispatcher().await;
+        let ctx_id = register_context(&d, Some("arch-decided"), None, kaijutsu_types::PrincipalId::new());
+        let caller = caller_with_context(ctx_id);
+
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
+            .await;
+        let request_id = pending_id(&d);
+        answer(&d, &request_id, true);
+
+        {
+            let db = d.kernel_db.lock();
+            db.archive_context(ctx_id).expect("archive");
+        }
+
+        let status = {
+            let db = d.kernel_db.lock();
+            approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                .expect("read")
+                .expect("row")
+                .status
+        };
+        assert_eq!(
+            status,
+            ApprovalStatus::Allowed,
+            "a human's answer survives the archive; only unresolved asks are swept"
+        );
     }
 
     /// The cwd an ask recorded, read back off its own row.

@@ -818,6 +818,48 @@ impl KjDispatcher {
                 context: context.as_deref(),
             };
 
+            // An archived context is inert: it runs nothing and answers
+            // nothing. Checked here, BEFORE the claim, for the same reason
+            // self-approval is — nothing has committed yet, so this returns
+            // without announcing, and no claim is left stranded on an ask
+            // whose answer could never be acted on.
+            //
+            // This is the first of two checks. The second runs at execution
+            // time, because a context can be archived in the gap between an
+            // answer and the run it authorizes, and a check here alone would
+            // not see that. `docs/gate-shape-b.md`, "Archived contexts are
+            // inert".
+            match approval_ledger::ask::get_approval(conn, request_id) {
+                Ok(Some(row)) => {
+                    if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id) {
+                        // A MISSING context row reads as not-archived here,
+                        // and that is a narrow reading of the ruling rather
+                        // than an oversight: `approvals.context_id` carries
+                        // no foreign key on purpose, so an ask outliving its
+                        // context is an expected state, and refusing every
+                        // such ask would close the audit path along with the
+                        // hazard. Widening this to "no live context" is a
+                        // separate decision — see `docs/issues.md`.
+                        let archived = db
+                            .get_context(ask_ctx)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|c| c.is_archived());
+                        if archived {
+                            return KjResult::Err(format!(
+                                "kj ledger: ask {request_id} belongs to context {}, which is \
+                                 archived — an archived context runs nothing, so answering \
+                                 this would authorize work that can never happen. Unarchive \
+                                 it first if the ask still matters.",
+                                ask_ctx.short()
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => return KjResult::Err(format!("kj ledger: no such ask {request_id}")),
+                Err(e) => return KjResult::Err(format!("kj ledger: {e}")),
+            }
+
             // No self-approval, checked BEFORE the claim. `decide` enforces it
             // too, but a claim taken first would leave the ask `claimed` by the
             // one seat that may not answer it, locking out every seat that may.
@@ -1461,6 +1503,49 @@ mod tests {
         // being unable to reach one.
         assert_eq!(second.verdict, crate::kj::gate::GateVerdict::Denied);
         assert_eq!(second.ask.expect("a denied ask has a row").request_id, request_id);
+    }
+
+    /// An archived context's ask cannot be answered. Refused BEFORE the
+    /// claim, so nothing is left claimed by an answer that could never be
+    /// acted on.
+    ///
+    /// This is the first of two checks; `run_gate` refuses again at
+    /// execution time, because a context can be archived in the gap between
+    /// an answer and the run it authorizes. Neither covers the other.
+    ///
+    /// Falsified by deleting the archived check from the answer path: the
+    /// allow succeeds on a context that will never run anything.
+    #[tokio::test]
+    async fn an_archived_context_s_ask_cannot_be_answered() {
+        let d = test_dispatcher().await;
+        // A REGISTERED context, because the check reads the context row —
+        // `test_caller` mints an id that was never stored.
+        let ctx_id = crate::kj::test_helpers::register_context(
+            &d,
+            Some("arch-answer"),
+            None,
+            kaijutsu_types::PrincipalId::new(),
+        );
+        let mut c = test_caller();
+        c.context_id = Some(ctx_id);
+
+        let first = gate_once(&d, &c, spec()).await;
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+
+        {
+            let db = d.kernel_db.lock();
+            assert!(db.archive_context(ctx_id).expect("archive"), "was live before");
+        }
+
+        let refused = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat())
+            .await;
+        assert!(!refused.is_ok(), "an archived context's ask must not be answerable");
+        assert!(
+            refused.message().contains("archived"),
+            "the refusal must say why, got: {}",
+            refused.message()
+        );
     }
 
     /// A second seat, used wherever a test answers a gate it raised itself.

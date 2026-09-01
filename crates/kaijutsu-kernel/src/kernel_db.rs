@@ -21,7 +21,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use kaijutsu_types::{
     BackendId, BlockId, CastId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
@@ -155,6 +155,18 @@ pub struct ContextRow {
 }
 
 impl ContextRow {
+    /// Whether this context is archived, and therefore inert: it runs
+    /// nothing and answers nothing.
+    ///
+    /// `archived_at` is authoritative per `ContextState`'s own doc comment,
+    /// so it is checked ahead of the enum. One predicate rather than the
+    /// hand-rolled pair each caller used to write, because the two fields
+    /// can disagree and a caller that checks only one is a caller that
+    /// treats a dead context as live.
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some() || self.context_state == ContextState::Archived
+    }
+
     /// Convert to the lightweight `kaijutsu_types::Context`.
     pub fn to_context(&self) -> kaijutsu_types::Context {
         kaijutsu_types::Context {
@@ -3325,7 +3337,19 @@ impl KernelDb {
 
     /// Archive a context (soft delete). Returns true if it was active. Also
     /// clears `promoted_at` and `demoted_at` — an archived context holds no
-    /// ring seat, hand-picked or otherwise.
+    /// ring seat, hand-picked or otherwise — and abandons every unresolved
+    /// ask the context raised.
+    ///
+    /// The sweep is here rather than in the `kj` verb so every archive path
+    /// gets it. An archived context runs nothing, so an ask it left open is
+    /// answerable and dead at once: a human would answer it, be told
+    /// nothing, and nothing would happen. Decided asks are untouched —
+    /// abandoning one would destroy a human's answer, and the audit trail
+    /// keeps it whether or not anything can collect it.
+    ///
+    /// A sweep failure does not fail the archive: the context IS archived by
+    /// then, every gate refuses it, and leaving the rows is a stale queue
+    /// rather than a live hazard. It is logged rather than swallowed.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
         let now = now_millis();
         let updated = self.conn.execute(
@@ -3333,6 +3357,26 @@ impl KernelDb {
              WHERE context_id = ?2 AND archived_at IS NULL",
             params![now, blob_param(id.as_bytes())],
         )?;
+        if updated > 0 {
+            match approval_ledger::decide::abandon_unresolved_for_archived_context(
+                &self.conn,
+                id.as_bytes(),
+                "the context that raised this was archived; it runs nothing now — \
+                 nothing ran, and this ask cannot be acted on",
+            ) {
+                Ok(0) => {}
+                Ok(swept) => {
+                    info!(context = %id.short(), swept, "archived context: swept unresolved asks");
+                }
+                Err(e) => {
+                    error!(
+                        context = %id.short(),
+                        error = %e,
+                        "archived context: could not sweep its unresolved asks"
+                    );
+                }
+            }
+        }
         Ok(updated > 0)
     }
 
