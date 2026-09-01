@@ -272,7 +272,8 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason, cwd, exec_source
+                remember_scope, auto_reason, cwd, exec_source,
+                command_block_id, output_block_id
          FROM approvals WHERE request_id = ?1",
         params![request_id],
         row_to_approval,
@@ -307,6 +308,8 @@ pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalR
         auto_reason: row.get(19)?,
         cwd: row.get(20)?,
         exec_source: row.get(21)?,
+        command_block_id: row.get(22)?,
+        output_block_id: row.get(23)?,
     })
 }
 
@@ -333,7 +336,8 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason, cwd, exec_source
+                remember_scope, auto_reason, cwd, exec_source,
+                command_block_id, output_block_id
          FROM approvals WHERE status = 'pending' ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -360,11 +364,39 @@ pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason, cwd, exec_source
+                remember_scope, auto_reason, cwd, exec_source,
+                command_block_id, output_block_id
          FROM approvals WHERE status IN ('pending', 'claimed') ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Record the block pair an ask's call already authored.
+///
+/// Written by the caller AFTER the ask escalates, because the gate does not
+/// see these ids: the path that creates the pair reaches the gate through
+/// the broker's hook evaluation, which knows nothing about blocks. The
+/// caller holds both the returned ask id and its own block ids, so it is the
+/// one place where the two are in the same scope.
+///
+/// Filling an existing pair is what keeps an execution on approval from
+/// authoring a second pair beside the first and stranding it.
+pub fn link_ask_blocks(
+    conn: &Connection,
+    request_id: &str,
+    command_block_id: &str,
+    output_block_id: &str,
+) -> Result<()> {
+    let updated = conn.execute(
+        "UPDATE approvals SET command_block_id = ?2, output_block_id = ?3
+         WHERE request_id = ?1",
+        params![request_id, command_block_id, output_block_id],
+    )?;
+    if updated == 0 {
+        return Err(LedgerError::NotFound(request_id.to_string()));
+    }
+    Ok(())
 }
 
 /// Every unresolved ask raised by one context, oldest first.
@@ -380,7 +412,8 @@ pub fn list_unresolved_for_context(
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason, cwd, exec_source
+                remember_scope, auto_reason, cwd, exec_source,
+                command_block_id, output_block_id
          FROM approvals
          WHERE status IN ('pending', 'claimed') AND context_id = ?1
          ORDER BY created_at ASC",
@@ -409,7 +442,8 @@ pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason, cwd, exec_source
+                remember_scope, auto_reason, cwd, exec_source,
+                command_block_id, output_block_id
          FROM approvals WHERE status IN ('allowed', 'denied', 'expired', 'abandoned')
          ORDER BY created_at DESC LIMIT ?1",
     )?;
@@ -481,7 +515,8 @@ pub fn list_asks_filtered(conn: &Connection, filter: &AskListFilter) -> Result<(
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason, cwd, exec_source
+                remember_scope, auto_reason, cwd, exec_source,
+                command_block_id, output_block_id
          FROM approvals {where_clause} ORDER BY created_at {order} LIMIT ?"
     );
     let mut select_params = params;
@@ -1516,6 +1551,42 @@ mod tests {
     fn allow(conn: &Connection, request_id: &str) {
         crate::decide::decide(conn, request_id, crate::decide::DecideInput { allow: true, ..Default::default() })
             .unwrap();
+    }
+
+    /// An ask starts with no blocks named, and the caller fills them in
+    /// afterwards. Both halves matter: an ask raised on a path with no
+    /// blocks must stay `None` rather than pointing at something, and one
+    /// raised on a path that has them must carry both.
+    ///
+    /// Falsified by having `link_ask_blocks` write only one column.
+    #[test]
+    fn an_ask_carries_the_blocks_a_caller_links_to_it() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let before = get_approval(&conn, &request_id).unwrap().unwrap();
+        assert_eq!(before.command_block_id, None, "nothing is named at ask time");
+        assert_eq!(before.output_block_id, None);
+
+        link_ask_blocks(&conn, &request_id, "ctx_pri_1", "ctx_pri_2").unwrap();
+
+        let after = get_approval(&conn, &request_id).unwrap().unwrap();
+        assert_eq!(after.command_block_id.as_deref(), Some("ctx_pri_1"));
+        assert_eq!(after.output_block_id.as_deref(), Some("ctx_pri_2"));
+    }
+
+    /// Linking blocks to an ask that does not exist is an error, not a
+    /// silent no-op. A caller that wrote into nothing would believe an
+    /// execution on approval could find its blocks, and it could not.
+    ///
+    /// Falsified by dropping the `updated == 0` check.
+    #[test]
+    fn linking_blocks_to_an_unknown_ask_is_not_found() {
+        let conn = open_memory();
+        assert!(matches!(
+            link_ask_blocks(&conn, "no-such-ask", "a", "b"),
+            Err(LedgerError::NotFound(_))
+        ));
     }
 
     /// Pins the redemption-fast-path's whole point: an allowed, unredeemed

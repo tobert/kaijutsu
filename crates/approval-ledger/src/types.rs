@@ -476,6 +476,9 @@ pub struct ApprovalRow {
     pub auto_reason: Option<String>,
     pub cwd: Option<String>,
     pub exec_source: Option<String>,
+    /// The block pair the call already authored, `BlockId::to_key()` form.
+    pub command_block_id: Option<String>,
+    pub output_block_id: Option<String>,
 }
 
 /// One `approval_options` row.

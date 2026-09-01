@@ -1796,6 +1796,26 @@ impl KernelDb {
         )?)
     }
 
+    /// Record the block pair waiting on an ask.
+    ///
+    /// The public face of `approval_ledger::ask::link_ask_blocks`. The
+    /// caller that authored the pair is the one place its ids and the ask id
+    /// are in scope together — the gate runs inside the broker's hook
+    /// evaluation and never sees a block.
+    pub fn link_ask_blocks(
+        &self,
+        request_id: &str,
+        command_block_id: &BlockId,
+        output_block_id: &BlockId,
+    ) -> KernelDbResult<()> {
+        Ok(approval_ledger::ask::link_ask_blocks(
+            self.conn_for_ledger(),
+            request_id,
+            &command_block_id.to_key(),
+            &output_block_id.to_key(),
+        )?)
+    }
+
     /// The public face of `approval_ledger::ask::list_pending` — the asks
     /// waiting on a human right now.
     ///

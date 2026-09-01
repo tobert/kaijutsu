@@ -331,6 +331,35 @@ describe.
 - `PENDING_REASON` stops saying "run the same command again". It should say
   what actually happens now: answer it, and the command runs.
 
+## The ask has to name its blocks, and the gate cannot
+
+An execution on approval fills the command and output blocks the original
+call already authored. That needs the ask to name them, and nothing in the
+gate path can: `shellExecute` creates the pair BEFORE gating, but reaches the
+gate through `broker().shell_pre_call_hooks`, which knows nothing about
+blocks.
+
+**Ruled: the caller records the link after escalation.** `run_gate` returns
+the ask id, and `execute_shell_command` already holds both block ids, so it
+is the one scope where the three are together. `approvals` gains
+`command_block_id` and `output_block_id` (`BlockId::to_key()` form), written
+through `KernelDb::link_ask_blocks` so the ledger connection stays behind the
+kernel rather than being reached from the server.
+
+Best-effort and logged: the refusal is already correct and already returned,
+so a failed link degrades to the subscriber authoring fresh blocks, never to
+a failed call.
+
+**The MCP `shell_write` path links nothing** — it has no pair at gate time,
+and its ToolCall/ToolResult blocks are authored by the layer above it. An ask
+from that path carries `NULL`, and the subscriber authors into the ask's
+context instead.
+
+**Coverage gap, named rather than papered over.** `link_ask_blocks` is unit
+tested both ways, including that an unknown ask is an error rather than a
+silent no-op. The CALL SITE in `execute_shell_command` is not covered — it
+needs an RPC-level harness, and the subscriber work needs one anyway.
+
 ## What the ask must carry, and what it must not try to
 
 **The stability of the environment under an execution is the caller's

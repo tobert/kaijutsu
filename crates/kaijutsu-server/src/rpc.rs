@@ -8975,22 +8975,45 @@ async fn execute_shell_command(
             return Ok(Ok(command_block_id));
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            // No "denied" prefix: this arm carries three different verdicts
-            // (`Denied`, `GateUnavailable`, `GatePending`) and only one of
-            // them is a no. Labelling all three "denied" teaches a model that
-            // a pending ask is a refusal, which is the collapse
-            // `McpError::GatePending`'s doc comment exists to prevent. Each
-            // variant's own Display already names what happened.
+            // No "denied" prefix: the refusal carries three different kinds
+            // and only one of them is a no. Labelling all three "denied"
+            // teaches a model that a pending ask is a refusal, which is the
+            // collapse `RefusalKind` exists to prevent — each kind's own
+            // Display already names what happened.
             let reason = err.to_string();
-            // Same three-verdict split the message above respects, applied to
-            // the blocks: a pending ask settles them `Waiting`, not `Error`,
-            // so the pair does not read as a failed command afterwards.
+            // The same split applied to the blocks: a pending ask settles
+            // them `Waiting`, not `Error`, so the pair does not read as a
+            // failed command afterwards.
             let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, settled);
             let _ = documents.set_status(context_id, &command_block_id, settled);
+
             // A verdict rides the result; only a fault still throws.
-            return Ok(Err(refusal_or_fault(err, "shell")?));
+            let refusal = refusal_or_fault(err, "shell")?;
+
+            // Tell the ask which blocks are waiting on it. This is the one
+            // place the two are in scope together: the gate runs inside the
+            // broker's hook evaluation, which never sees a block id, and the
+            // pair above was authored before any of that. Without the link,
+            // an execution on approval would author a second pair beside
+            // this one and leave this one waiting forever.
+            //
+            // Best-effort on purpose. The refusal is already correct and
+            // already returned; failing the call because a convenience link
+            // did not write would turn a working refusal into an error.
+            // Logged, never swallowed.
+            if let Some(ask_id) = refusal.ask_id() {
+                let db = kernel.kernel_db.lock();
+                if let Err(e) =
+                    db.link_ask_blocks(ask_id, &command_block_id, &output_block_id)
+                {
+                    log::error!(
+                        "ask {ask_id}: could not record the blocks waiting on it: {e}"
+                    );
+                }
+            }
+            return Ok(Err(refusal));
         }
     }
 
