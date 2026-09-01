@@ -353,172 +353,55 @@ the natural idiom silently produces a link that resolves to nothing. Either
 `symlink` translates an in-mount absolute target to a relative one, or the
 surface has to say "relative targets only" and fail loudly on an absolute one.
 
-## Gate wiring: one defect, three symptoms (RULED 2026-08-30, unbuilt)
+## Gate wiring: symptoms 1 and 2 SHIPPED; symptom 3 is slice 5 (2026-09-01)
 
-**Amy ruled yes to all three.** Kaijutsu conflates *"the machinery failed"*
-with *"the answer is no"* in three places. They are one defect and want one
-typed distinction, not three patches.
+`docs/gate-shape-b.md` is canonical for this work. Four slices shipped
+2026-09-01 (`5966ec23`, `0b1ec146`, `4c33bca8`, `814070b1`); one remains.
 
-**The rule to build against: a verdict is a result; a fault is an error.**
+**Symptom 1 — a verdict travelled the error channel. CLOSED.** A refusal is a
+result now: `McpError::Refused(Refusal)` in the kernel, a union on the seven
+refusable RPC methods, `RpcError::Refused` → `CallError::Refused` at the
+client. A verdict cannot ride the capnp error channel at all — every
+`capnp::ErrorKind` describes a fault — so it rides the result.
 
-- **Result** (`is_error: true`, structured payload): gated/pending, denied on
-  the merits, refused by a capability. These are answers.
-- **Error**: gate unavailable with nobody listening, broker failure, mount
-  gone, transport. These mean the control is broken.
+**Symptom 2 — no identifier came back. CLOSED.** `Refusal.ask_id()` hands the
+caller the ask id as a handle. It used to exist only as prose inside a
+message, formatted from a typed `AskRef` one line away.
 
-### Symptom 1 — a refusal arrives as a transport error
+**Symptom 3 — redemption matches a resubmitted string. OPEN, and the shape
+changed.** It is no longer "present the id": **approval executes**. Amy ruled
+2026-09-01 that `kj ledger allow <id>` runs the stored source into the blocks
+already waiting on that ask, so there is no retry call and nothing to
+present. `docs/gate-shape-b.md`, "Slice 5: approval executes" carries the
+build, the two prerequisites, and the archived-context rules.
 
-A gate escalation comes back as `RPC error: Cap'n Proto error: ... remote
-exception`. But the tool dispatched, the hook fired, a verdict was reached and
-a durable row was written with an id: that is the machinery working and
-reporting bad news.
+### Three things this uncovered that were not in the original write-up
 
-The repo already draws this line and breaks it here. `mcp/servers/shell.rs`
-says a nonzero exit "is never a fault: it takes the same D-28 `is_error`
-channel", and that a model's own mistake "travels the D-28 `is_error`
-channel". A command that ran and failed is a result; a command the gate
-refused is a transport exception. The second is *less* of a fault than the
-first.
+- **The model's own shell path was never on the typed channel.** The gate
+  variants of `McpError` each required a `HookId`; the direct `shell_write`
+  gate has none, so `mcp/servers/shell.rs` reported every verdict as
+  `McpError::Protocol` — a fault variant. FIXED.
+- **A pending ask read as a crashed tool call.** `llm_stream.rs` was a
+  seventh block-settling site that derived status from an `is_error` bool and
+  never reached `settled_block_status()`, so a pending ask settled `Error`
+  and reached the model as "Execution error: …" — the retry loop that mints
+  duplicate asks, on the surface where it costs most. FIXED.
+- **A decided ask outlives its cwd pin.** Reachable today: approve, restart,
+  retry, and the approved command runs wherever the context now is. Ruled —
+  record the cwd on the ask, delete the pin map. Part of slice 5.
 
-**The damage is retry semantics.** A transport error means "I could not tell
-you what happened", so every client and model treats it as maybe-transient and
-retries. A gate escalation means the opposite. Observed 2026-08-30: probing a
-gated surface minted five asks, because each error invited a retry and each
-retry with different text minted a new row. The timeout variant is worse —
-`call timed out after 30s` leaves the caller unable to tell whether a row
-exists at all.
+### What is still true and still open
 
-**The first hard receipt, 2026-08-30.** `shell-escape-guard` was installed
-pointing at a hook body path the `/config` melt had moved out from under it.
-It could not read its own body and failed closed, denying every `shell_write`
-call in the kernel — including the `kj` verbs needed to diagnose it. What
-reached the caller was:
+**The status read must be ungated by construction.** S50's predicate exempts
+the whole `kj ledger` verb, which is a policy in an rc script rather than a
+structural guarantee. A gated poll path is not a poll path.
 
-```
-remote exception: denied by hook shell-escape-guard
-```
+**The classifier still cannot see a redirect.** It scores `clause` (name +
+args), so `kj ledger list > ~/.bashrc` reaches it as a bare `kj ledger list`.
+The exemptions now require `has_redirect != true`, so the bypass became a
+scored call with an audit trail — nothing more.
 
-A **broken control**, presented as a **verdict**, with no reason. The reason
-existed the whole time, one layer away in the journal:
-
-```
-hook.deny hook_id=hook:shell-escape-guard phase=PreCall
-  reason=kaish hook body at "/etc/rc/lib/hooks/shell-guard.kai" could not be
-         read: not found: No such file or directory (os error 2)
-```
-
-`broker.rs`'s `emit_deny_attribution` says this is deliberate — "the LLM only
-sees `McpError::Denied { by_hook }` (D-28)" — and
-`docs/gate-and-shell-split.md` already argues the collapse is wrong, on
-doctrine rather than taste: the usual reason to hide gate state is an
-adversary, and there is none inside the trust boundary. This is that argument
-with a cost attached.
-
-**Caution when building:** keep it loud. `is_error: true`, never a success
-with a status field. The reason to leave it an error was that errors are hard
-to ignore; trading a wrong channel for a silent one is the trade this repo
-refuses.
-
-### Symptom 2 — no identifier comes back, and the status read is itself gated
-
-The ask id exists only as prose inside the error string, so a caller must
-regex it. There is nowhere structured to put it *because* symptom 1 gave the
-error channel no shape — the two are the same fix.
-
-**The status read is also gateable, which makes it not a poll path.** On
-2026-08-30 `kj ledger show <id>` — the way to check on an ask — was itself
-escalated and minted a *second* ask, while `kj ledger list` passed ungated.
-That inconsistency is the tell. The read side must be **ungated by
-construction**, not merely usually-allowed.
-
-What Amy asked for: an identifier returned to the caller that can be shown to
-a human *and* polled — by kaijutsu or by the model's own loop. It only needs
-to be possible.
-
-### Symptom 3 — redemption matches a resubmitted string
-
-Today the caller re-sends the exact statement and `find_redeemable` matches on
-digest + principal + context. `statement_digest` (`kj/gate.rs:249`) is
-`format!("hook:v1:{rendered}")` — a prefix and the rendered text, no hash. So
-there are two copies of one statement and a matcher to reconcile them.
-
-**Amy:** *"the string we put in the ledger should be the one we execute, and
-the caller just has to give us the id to make that happen."*
-
-That is the same invariant as config's single source of truth: one copy cannot
-disagree with itself, and reconciliation is where the 2026-08-29 misdiagnosis
-lived. It also kills the byte-identical-retry footgun — `allow_once` keys on
-exact statement text today, so a nine-file command and a one-file command are
-different asks even when the intent is identical.
-
-**It buys a safety property resubmission cannot have.** Identical text in a
-changed world silently matches now — same string, different cwd, mounts, or
-loadout — because the ledger holds no record of what was approved beyond the
-text. Presenting an id lets the kernel compare the ask's recorded conditions
-against the caller's current ones and refuse on divergence.
-
-**The real difficulty: a statement is not self-contained.** It runs against a
-cwd, shell vars, a principal, a loadout, a mount table. If the kernel executes
-stored text later, whose environment? Gate-resume already had to pin cwd in
-memory for this reason. That splits the work into two shippable shapes:
-
-- **Shape B — the claim ticket.** Structured `{ask_id, status}` on escalation,
-  an ungated poll, and retry by presenting the id rather than the text. The
-  kernel executes the *stored* statement in the caller's live context after
-  verifying that context still matches the ask. No environment-snapshot
-  problem: the live caller supplies it.
-- **Shape A — the durable work item.** Everything in B, plus approval alone is
-  sufficient to run it, detached from the original caller. Output lands as
-  blocks in the ask's context; `approval_redemptions` still gives
-  exactly-once. Needs the environment captured at ask time and an answer for
-  staleness.
-
-**Ship B first; A is the destination.** B is a strict subset and forecloses
-nothing, and B alone removes the matcher, the retry footgun and the ask
-pileup. A is where background mode and delegated work want to end up.
-
-### Why this is on the critical path
-
-A coder running as a subagent that hits a gate needs exactly this: an id it
-can hand back up, a poll its driving loop can make, and a trigger that does
-not require reconstructing a string byte-for-byte. See
-`docs/delegated-coder.md`.
-
-### Build notes
-
-- **Scope it to the gate+capability family — 7 methods.** `docs/error-chain.md`
-  places this work: there is no general verdict facility (ruled 2026-09-01),
-  the unit is the family, and this one is `execute`, `shellExecute`,
-  `executeKj`, `callMcpTool`, `editInput`, `submitInput`, `commitCapture`.
-  That doc also carries the boundary test for what must NOT be folded in.
-  Nothing here waits on a general design.
-- **Wire change.** Permitted under the flag-day rule (wire only, never
-  storage), but capnp interface ordinals stay sequential — retiring a method
-  leaves a `retiredNN @NN ()` stub, not a hole.
-- `docs/gate-and-shell-split.md` is already splitting `GateUnavailable` out of
-  `Denied` for the same reason. Make the split **once**, as one distinction
-  applied at both layers, rather than twice.
-
-### In progress — `docs/gate-shape-b.md` is the build
-
-That document is canonical for the work and carries the wire shape (a union
-per method, because capnp rejects one declared inline in a result list), the
-slices, and three findings from the current source that change it:
-
-- **A mandatory `HookId` kept the model's own shell path off the type.** The
-  gate variants of `McpError` each required a hook id and the direct
-  `shell_write` gate has none, so it reported every verdict as
-  `McpError::Protocol` — a fault variant. Fixed: the three collapse to
-  `McpError::Refused(Refusal)`, whose subject may be empty.
-- **The ask id was born as prose** in `GateOutcome::ask_description()`, from a
-  typed `AskRef` one line above it.
-- **A decided ask outlives its cwd pin.** Reachable today: a human approves, the
-  kernel restarts (the boot sweep spares a decided ask, but the pin is a
-  process-lifetime map), the caller retries, and the approved command runs in
-  whatever directory the context is at now. **Ruled: record the cwd on the ask
-  and delete the pin map.**
-
-## Three MCP compose tools report failure as success (2026-09-01)
+## Three MCP compose tools report failure as success (2026-09-01)## Three MCP compose tools report failure as success (2026-09-01)
 
 `write_input`, `edit_input` and `submit_input` in `kaijutsu-mcp/src/lib.rs`
 (lines 2332, 2372, 2403) return a plain `String`, not a `CallToolResult`. So

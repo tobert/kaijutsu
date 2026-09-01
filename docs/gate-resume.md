@@ -56,10 +56,13 @@ Checked against the code on 2026-08-22, not recalled:
 - **The model already has an inbox.** `llm/mailbox.rs` is fed by *blocks*,
   and `BlockKind::Notification` is LLM-visible. Telling a model its ask
   resolved means authoring a block — no new channel.
-- **The error vocabulary is already right.** `McpError::GateUnavailable` is
-  distinct from `Denied` by Amy's 2026-08-17 ruling, and carries a reason
-  the model reads in full. A third state (`Pending`) joins them rather than
-  replacing either.
+- **The error vocabulary is already right.** `GateUnavailable` is distinct
+  from `Denied` by Amy's 2026-08-17 ruling, and carries a reason the model
+  reads in full — shipped 2026-09-01 as `RefusalKind::GateUnavailable` vs
+  `RefusalKind::Denied`, both cases of one `McpError::Refused(Refusal)`
+  rather than the separate `McpError` variants this was written against
+  (`docs/gate-and-shell-split.md`, Ruling 2's shipped-shape note). A third
+  state (`Pending`) joins them rather than replacing either.
 
 **Verified absent:** `create_ask` does no deduplication — every call makes a
 fresh row. And no mechanism redeems an *answered ask*; rules key on
@@ -316,8 +319,31 @@ to the current one. **`ExecuteOptions.cwd` alone does not fail closed** —
 proven by falsification: with the explicit `try_set_cwd` validation removed,
 the command ran anyway and printed its output. The check is load-bearing.
 
-The pin is in memory rather than in a table on purpose, and it is the same
-ruling twice: an ask cannot outlive the process, so neither should its pin.
+The pin was in memory on the ruling above: an ask cannot outlive the
+process, so neither should its pin.
+
+**Reversed 2026-09-01** (`docs/gate-shape-b.md`, "The cwd moves onto the
+ask"). That ruling collided with the one two paragraphs up — a decided ask
+**is** never swept at boot — and the collision is reachable: a human answers
+`allow`, the kernel restarts before the caller retries, `take_pinned_cwd`
+returns `None` on the retry because `cwd_pins` did not survive the restart,
+and the outcome comes back `Allowed` with `cwd: None`.
+`mcp/servers/shell.rs`'s own `if let Some(cwd)` guard then falls straight
+through on that `None` and the approved command runs wherever the context
+now sits — its own comment names this "the exact bug this pin exists to
+close."
+
+**Ruled: record the cwd on the `approvals` row; delete `cwd_pins`, `pin_cwd`
+and `take_pinned_cwd`.** Not yet built — `docs/gate-shape-b.md` carries the
+build record (an `ALTER TABLE ... ADD COLUMN`, following the pattern
+`add_rc_runs_script_count_column_if_missing` already uses). Redemption then
+verifies instead of shrugging: the ask's recorded cwd matching the
+context's live cwd runs there; a divergence refuses, naming both
+directories; an ask that recorded no cwd runs unpinned, the way a caller
+with no context does today. This is a small, deliberate step toward the
+restart survival this document deletes above — one column, not a claim
+protocol — because the ask has nothing to verify a cwd against unless it
+carries what it was asked under.
 
 **Quiesce covers what can be drained.** A tool call and a model turn are
 bounded by machine time, so a graceful shutdown can finish them. An ask is
@@ -371,9 +397,46 @@ is redeemable.*
 
 ## Still open
 
-**Nothing resumes an approval on its own.** An answer is redeemed on the
-caller's *next attempt*. A model that is still working comes back and gets it;
-a delegated coder whose turn already ended has nothing that retries, so the
-approval sits until something drives that context again. An in-memory
-`ledger.changed` subscriber would close this without reintroducing anything
-durable. Not built, and not yet ruled on.
+**Ruled 2026-09-01, not yet built: approval triggers execution**
+(`docs/gate-shape-b.md`, "Slice 5: approval executes"). This section used to
+say nothing resumes an approval on its own — an answer was redeemed only on
+the caller's *next attempt*, so a model still working came back and got it,
+but a delegated coder whose turn already ended had nothing that retried and
+the approval sat until something drove that context again. Amy has now
+ruled the fix: `kj ledger allow <id>` runs the stored statement itself. An
+in-memory `ledger.changed` subscriber picks up the decision, runs it, and
+fills the command and output blocks already sitting `Waiting` on that ask —
+the caller checks its own blocks' status rather than presenting anything
+back to the kernel.
+
+**Why this is available now, and not a return to the durable resume
+machinery this document deleted above.** That machinery — the
+`gate_actions` table, the claim protocol, boot recovery — existed to survive
+a *kernel* restart between ask and answer, and its worst reachable outcome
+was an approved destructive action running twice. The subscriber ruled here
+adds nothing durable: it is in-memory, the same shape as the cwd pin before
+its own reversal above, so a kernel restart between the ask and the
+subscriber's run loses the subscription outright — and the pending-ask boot
+sweep still means nothing survives a restart to be run twice. This is a
+narrower mechanism solving a narrower problem (a caller that will never
+retry, on a kernel that stayed up), not the design that was deleted.
+
+Two supporting rulings make it possible:
+
+- **The stability of the environment under an execution is the caller's
+  contract.** `cargo build` pulls in whatever it pulls in at link and run
+  time; the ledger does not try to reproduce a world, so it does not
+  snapshot one. This answers the staleness question this section used to
+  leave open.
+- **An archived context is completely inert.** Checked twice: once when an
+  ask is answered (`kj ledger allow`/`deny` fail on an archived context's
+  ask), and again at execution time, because a context can be archived in
+  the gap between the two.
+
+**Not yet built.** `docs/gate-shape-b.md` carries the build record and the
+two things it needs first: the ledger must store the submission's
+executable source beside its human-readable review rendering (this
+document's own finding above — `render_for_review` is not re-executable —
+still holds and is exactly the gap to close), and whether to refuse
+executing a stored statement that carries a free `${VAR}` is an open
+question, not yet ruled.

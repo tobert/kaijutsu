@@ -73,9 +73,10 @@ use crate::kj::KjCaller;
 /// could not do its job" are different facts, and collapsing them is its
 /// own failure family: a fault that reads as a policy decision teaches a
 /// caller the wrong lesson (*that action is refused*) about a control that
-/// was simply absent. The `shell_write` caller renders both as one error so
-/// it never noticed, but the hook path must map them to `McpError::Denied`
-/// and `McpError::GateUnavailable` respectively.
+/// was simply absent. Both paths map them to `RefusalKind::Denied` and
+/// `RefusalKind::GateUnavailable` — the `shell_write` gate included, which
+/// used to render every outcome as one error because it had no hook id to
+/// name and the refusal shapes required one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GateVerdict {
     /// A human or a rule decided yes.
@@ -144,9 +145,9 @@ pub(crate) struct GateOutcome {
 }
 
 /// What a player does about a pending ask. "waiting for a human" is
-/// deliberately absent: that fact belongs to `McpError::GatePending`, which
-/// wraps this, and stating it here made the composed message say it three
-/// times. Named rather than inline so the layering test reads the real text.
+/// deliberately absent: that fact belongs to the refusal that wraps this,
+/// and stating it here made the composed message say it three times. Named
+/// rather than inline so the layering test reads the real text.
 pub const PENDING_REASON: &str = "nothing was run. Answer with `kj ledger \
      allow <id>` or `kj ledger deny <id>`, then run the same command again — \
      an allowed ask authorizes it exactly once.";
@@ -161,9 +162,9 @@ impl GateOutcome {
     /// `"<id> (<status>)"`, or a plain statement that nothing was recorded.
     /// Callers put this in the message a model reads, so it must never
     /// render a blank where an ask id is expected.
-    /// The one-line summary the hook layers wrap: which ask, and what to do
-    /// about it. `McpError::GatePending`/`GateUnavailable` already name the
-    /// hook and the state, so this adds neither — see
+    /// The one-line summary the refusal layers wrap: which ask, and what to
+    /// do about it. `McpError::refused_gate` already names the subject and
+    /// the state, so this adds neither — see
     /// `docs/gate-and-shell-split.md`, "One fact per layer".
     pub fn ask_summary(&self) -> String {
         format!("{} — {}", self.ask_description(), self.reason)

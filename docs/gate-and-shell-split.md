@@ -147,6 +147,17 @@ issues entry: there is no `kj hook` CLI **at all** today, gated or not.
 
 ### 2. "Gate unavailable" and "denied" must be distinguishable to a model
 
+**Shipped 2026-09-01, in a narrower shape than the proposal below.** The
+three-way distinction is real and live, but it lives in one `RefusalKind`
+(`Denied` / `Pending` / `GateUnavailable`, plus three capability kinds)
+carried by a single `McpError::Refused(Refusal)` — not as three separate
+`McpError` variants each carrying its own `by_hook: HookId`, which is what
+the code below still shows. `crates/kaijutsu-kernel/src/mcp/error.rs` and
+`kaijutsu-types/src/refusal.rs` are the code; `docs/gate-shape-b.md` is the
+build record. The reasoning that follows is still correct — read
+`Denied`/`GateUnavailable`/`GatePending` as `RefusalKind::{Denied,
+GateUnavailable, Pending}` as you go.
+
 **Today's collapse.** `Broker::run_permission_ask` (`mcp/broker.rs`,
 ~1700-1820 as of this week — re-grep before trusting the line) returns
 `Option<String>` — `None` proceeds, `Some(reason)` denies — for **three**
@@ -203,6 +214,18 @@ Denied { by_hook: HookId },
 #[error("gate for {by_hook} had nothing to answer it: {reason}")]
 GateUnavailable { by_hook: HookId, reason: String },
 ```
+
+**This shape itself carried a defect that outlived it.** `Denied` above
+takes no `reason` — only `GateUnavailable` does — so a hook's deny reason had
+nowhere to go on the branch that needed it most: a real "no" reached the
+model as a bare "denied by hook shell-escape-guard", the actual cause
+sitting one layer away in the journal, invisible to the caller who most
+needed it. Fixed 2026-09-01 (`refused_gate`, `mcp/error.rs`): every
+`Refusal`, `Denied` included, carries `reason`, and `PhaseOutcome::Deny`'s
+hook-supplied reason now rides through unchanged. A comment or passage
+elsewhere claiming a denial's reason is tracing-only, or that the model sees
+only `{by_hook}` and nothing else, describes this now-fixed shape, not the
+current one.
 
 `error_to_hook_json` gets a fourth arm (`"GateUnavailable"`, carrying
 `by_hook` + `reason`) alongside the existing `Denied` one — same pattern as
@@ -602,14 +625,20 @@ reason "no subscriber attached" stops being an instant fail-closed refusal:
 the row is durable before anyone is notified, so nobody listening means
 nobody was *pushed*, not that nobody can answer.
 
-**A conflation this exposes, filed rather than fixed here.** `run_gate`
-returns `status: Denied` for its own internal failures (the rules read
-failed, `create_ask` failed, the ask row went missing) as well as for a real
-"no". `shell_write` renders both as one `McpError::Protocol`, so it has not
-mattered — but the hook path must map `Denied` and `Unavailable` to
-different `McpError`s under Ruling 2 above, which makes a DB fault
-indistinguishable from a human's refusal at exactly the seam that ruling
-exists to protect. `GateOutcome` needs to carry the distinction.
+**A conflation this section named, now fixed on the path that mattered
+most.** `run_gate` returns `status: Denied` for its own internal failures
+(the rules read failed, `create_ask` failed, the ask row went missing) as
+well as for a real "no" — `GateOutcome` already carries `GateVerdict::
+Unavailable` for the fault case (`kj/gate.rs`, the auto-decide arm's `Err`
+branch), so the distinction exists at that layer. What this paragraph
+originally found is that `shell_write` — the mandatory `HookId` on the old
+`McpError` variants meant the direct gate, which has no hook behind it,
+could not construct any of them — rendered every verdict as one
+`McpError::Protocol`, collapsing `Denied`/`Unavailable`/`Pending` alike into
+a fault variant carrying a verdict. Fixed 2026-09-01 (Ruling 2's shipped
+shape, above): `Refusal::subject` may be empty, so `shell_write` now
+produces a real `McpError::Refused` with the right `RefusalKind`, and its
+blocks settle `Waiting` for the first time instead of `Error`.
 
 ### An advisory input, shipped log-only: lfm2d risk scoring
 
@@ -677,13 +706,20 @@ tool calls return `Denied`, then confirm `kj hook remove <id>` still
 succeeds and the subsequent tool call is no longer denied — in the same
 process, no restart. No wire change.
 
-**Slice 2 — the two error shapes.** `PermissionAskOutcome` (or equivalent)
-splitting `run_permission_ask`'s three outcomes into `Proceed` /
-`Denied(reason)` / `Unavailable(reason)`; `McpError::GateUnavailable {
-by_hook, reason }`; `error_to_hook_json` gains the fourth arm. Tests: no
-subscriber attached → `GateUnavailable`, not `Denied`; subscriber attached,
-times out → `GateUnavailable`; subscriber answers no → `Denied`, unchanged.
-No wire change (the JSON shape gains a field/kind, doesn't remove one).
+**Slice 2 — the two error shapes — SHIPPED 2026-09-01, as one `Refused`
+variant, not two.** `PermissionAskOutcome` splits `run_permission_ask`'s
+three outcomes into `Proceed` / `Denied(reason)` / `Unavailable(reason)`, as
+planned. `McpError` did not gain the separate `GateUnavailable { by_hook,
+reason }` variant this paragraph called for — it collapsed all three gate
+outcomes, `Denied` included, into `McpError::Refused(Refusal)` with a
+`RefusalKind` (Ruling 2's shipped-shape note, above), which is a strictly
+stronger version of this slice's goal: one type, branch on `kind`, and a
+hookless caller (`shell_write`) can construct it too. `error_to_hook_json`
+keeps its old per-kind tags inside the one `Refused` arm rather than gaining
+a fourth top-level arm. Tests as planned: no subscriber attached → a
+`GateUnavailable`-kind refusal, not `Denied`; subscriber attached, times out
+→ same; subscriber answers no → `Denied`, unchanged. No wire change (the
+JSON shape gains a field/kind, doesn't remove one).
 
 **Slice 3 — the `shell`/`shell_write` rename.** Swap `ShellServer::new` /
 `new_read_only`'s tool-name and instance-name identities per the table
@@ -1595,13 +1631,31 @@ making.
 `Status::is_idle` exists because those three are separate questions and
 callers kept reaching for whichever one was nearest.
 
-**One mapping decides it.** `McpError::settled_block_status()` sends
-`GatePending` to `Waiting` and everything else to `Error`. `GateUnavailable`
-is the near miss: it is also not a "no", but no answer is coming for a broken
-control, so it settles `Error`. Six shell paths in `rpc.rs` settle blocks and
-all six call that one method, because the previous arrangement — each site
-choosing — is how three of them ended up saying "denied" for a verdict that
-was not one.
+**One mapping decides it.** `McpError::settled_block_status()` sends a
+pending refusal (`RefusalKind::Pending`, the successor to the standalone
+`GatePending` variant named above — see Ruling 2's shipped shape) to
+`Waiting` and everything else to `Error`. `GateUnavailable` is the near
+miss: it is also not a "no", but no answer is coming for a broken control,
+so it settles `Error`. **Four** call sites in `rpc.rs` settle blocks
+through that one method — a pre-call and a post-call gate arm in each of
+`execute_shell_command` and `execute_kj_command` — because the previous
+arrangement, each site choosing, is how three of them ended up saying
+"denied" for a verdict that was not one. (This paragraph said "six" until
+2026-09-01; the count was never checkable against the source and is now
+stated as what `grep settled_block_status` finds.)
+
+**A seventh settling site was missed, and it was the one a model actually
+uses.** The model's own LLM tool path — `crates/kaijutsu-server/src/llm_stream.rs`,
+`map_tool_dispatch_result` — derived its block status from
+an `is_error` bool instead of calling `settled_block_status()`, so a pending
+ask settled `Error` there and reached the model as `"Execution error: …"` —
+exactly the collapse this section exists to prevent, on the surface where
+it costs the most: a model reads a crash, retries, and mints a duplicate
+ask. Fixed 2026-09-01: `map_tool_dispatch_result` now returns the settled
+status alongside the error flag, because the two answer different
+questions — `is_error` is the D-28 channel a model reads and stays true for
+a refusal; `status` is what the blocks settle to and is `Waiting` for a
+pending one.
 
 **Two orders, on purpose.** The Rust declaration order is a comparison rank
 (`Pending < Running < Waiting < Done < Error`); the capnp ordinals are

@@ -26,22 +26,28 @@ McpError  ──►  settled_block_status()  ──►  Status on the block   �
    └────────►  capnp::Error::failed()  ──►  a string at the client ✗ distinction lost
 ```
 
-**1. Origin.** `McpError` (`crates/kaijutsu-kernel/src/mcp/error.rs`, 23
-variants) already draws the line, and its doc comments say so. `Denied`,
-`GatePending`, `GateUnavailable`, `CapabilityDenied`, `FacadeDenied` and
-`LoadoutDenied` are verdicts. `Io`, `Protocol`, `InstanceDown`, `Timeout`,
-`ConcurrencyCap` and `Cancelled` are faults.
+**This described the gate family before 2026-09-01, and it is kept because
+the shape recurs.** That family is fixed — see "What this means for the gate
+lane" below — and every layer named here now carries the type. Read it as the
+anatomy of the defect, not as a description of the gate today.
+
+**1. Origin.** `McpError` (`crates/kaijutsu-kernel/src/mcp/error.rs`) already
+drew the line, and its doc comments said so. Its three gate variants have
+since collapsed into one `Refused(Refusal)` whose `RefusalKind` carries the
+distinction; `CapabilityDenied`, `FacadeDenied` and `LoadoutDenied` are
+verdicts and reach the wire through `as_refusal()`. `Io`, `Protocol`,
+`InstanceDown`, `Timeout`, `ConcurrencyCap` and `Cancelled` are faults.
 
 **2. The durable projection is correct.** `settled_block_status()`
-(`error.rs:233`) maps `GatePending` to `Status::Waiting` and everything else
+(`mcp/error.rs`) maps a pending refusal to `Status::Waiting` and everything else
 to `Status::Error`. The wire enum carries the doctrine in its own comment
 (`kaijutsu.capnp`, `Status`): a call that recorded a durable ask and ran
 nothing settles `waiting` rather than `error`, *because an unanswered
 question is not a refusal*.
 
-**3. The call return collapses it.** `crates/kaijutsu-server/src/rpc.rs:8922`
-is the clearest instance, and the comment above it shows the code knows
-exactly what it is losing:
+**3. The call return collapsed it.** The clearest instance was
+`execute_shell_command`'s gate arm in `crates/kaijutsu-server/src/rpc.rs`,
+where the comment above it showed the code knew exactly what it was losing:
 
 ```rust
 // No "denied" prefix: this arm carries three different verdicts
@@ -170,12 +176,42 @@ does not invent a fifth:
   but capnp interface ordinals stay sequential — retiring a method leaves a
   `retiredNN @NN ()` stub, not a hole.
 
-### What this means for the gate lane
+### The gate lane — SHIPPED 2026-09-01
 
-`docs/issues.md`, "Gate wiring: one defect, three symptoms" asks for
-structured `{ask_id, status}` on escalation. That is the gate+capability
-shape, and it is **independently shippable** — it waits on no general design.
-Build it for the 7 methods in its family and stop at the boundary above.
+The gate+capability family is done, on all seven methods, and it did wait on
+no general design. `docs/gate-shape-b.md` is the record.
+
+The shared shape is `kaijutsu_types::Refusal` — `kind`, `reason`, `subject`,
+an optional `AskRef`, an optional `remedy` — declared once in
+`kaijutsu.capnp` and mirrored in Rust. Each of the seven methods returns a
+union of its old result and a `Refusal`, so a refusal cannot be missed by a
+caller that forgot to check a flag. Ordinals did not move; only return types
+did.
+
+**Four things the inventory did not predict, each of which mattered more than
+the plumbing:**
+
+1. **A mandatory `HookId` kept the model's own path off the type.** The gate
+   variants each required one, and the direct `shell_write` gate has no hook,
+   so it reported verdicts as `McpError::Protocol` — a fault variant. A
+   `Refusal`'s subject may be empty; that path now settles `Waiting`.
+2. **The ask id was born as prose.** It was formatted out of a typed `AskRef`
+   one line away, and every consumer carried the string. A test recovered it
+   by splitting a `kj ledger list` line.
+3. **A denial dropped its reason.** `PhaseOutcome::Deny` carried one that the
+   LLM-visible path discarded, which is why a broken hook read as a bare
+   "denied by hook shell-escape-guard".
+4. **There was a fifth layer here too, and a seventh settling site.**
+   `CallError` had to gain `Refused` or the client's actor re-flattened it —
+   the same lesson the VFS family learned. And `llm_stream.rs` derived block
+   status from an `is_error` bool, so a pending ask reached the model as
+   "Execution error" no matter how carefully the kernel had typed it.
+
+**The generalizable part is (4).** Counting the methods in a family is not
+counting the work. Both families cost most of their effort at boundaries that
+were not in the inventory, because the inventory listed RPC methods and the
+type dies wherever anything stringifies — including one hop past the wire, and
+including a consumer that derives one fact from another.
 
 ## Method inventory
 
@@ -191,10 +227,12 @@ one.
 | event/callback interfaces | 28 | 28 | 0 | 0 |
 | **total** | **152** | **99** | **33** | **20** |
 
-**Since measured, the VFS row has been resolved** (see below): 11 of its 14
-Bs were retired unused, `read` was fixed, and `write`/`create` remain. The
-open count is **21**, not 33 — and the largest remaining family is the 7 the
-gate lane already owns.
+**Two rows have since been resolved.** The VFS row: 11 of its 14 Bs were
+retired unused, `read` was fixed, `write`/`create` remain (test-only). The
+gate+capability row: all 7 shipped 2026-09-01. The open count is **14**, not
+33, and what is left is the four validation methods, the four policy ones,
+the three editor writes reaching the VFS, `invokePeer`, and the two test-only
+`Vfs` methods.
 
 **33 methods need a channel; 99 are genuinely fault-only.** The event
 interfaces are server-to-client push with void returns — there is no result
