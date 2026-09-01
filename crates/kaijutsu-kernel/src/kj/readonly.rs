@@ -44,15 +44,17 @@
 //!
 //! A redirect turns any command into a filesystem write — `kj block list >
 //! ~/.bashrc` must never classify as read-only, no matter how inert the
-//! command itself is. The existing hook exemptions (`--help`, `kj ledger`)
-//! do not check for one; this was already a narrow real hole in the hook
-//! before this module existed (see `assets/defaults/rc/lib/hooks/lfm2d.kai`'s
-//! own exemption filter — it matches on clause text alone). This module
-//! closes it for every command it accepts, but the two pre-existing
-//! exemptions are unchanged and unrelated: this module and its
-//! `kj_readonly` field are additive, and closing that pre-existing hole for
-//! `--help`/`ledger` (if ever wanted) is a change to the hook itself, not to
-//! this module.
+//! command itself is. This module refuses one in condition 2, for every
+//! command it accepts.
+//!
+//! The hook's other two exemptions (`--help`, `kj ledger`) once had the same
+//! hole and no longer do: they gate on a `has_redirect` field the hook reads
+//! from `KJ_TOOL_PLAN`'s `commands[].redirects`, which is kaish's structured
+//! field rather than a scan of clause text. One narrower case stays open by
+//! choice — the hook's fallback item, used only when `KJ_TOOL_PLAN` is
+//! unusable, cannot see redirects at all, and failing it closed would stop
+//! exempting the gate's own answer path. See that filter's comment in
+//! `assets/defaults/rc/lib/hooks/lfm2d.kai` for the trade.
 //!
 //! ## Two-level tables only — a nested subcommand is excluded wholesale
 //!

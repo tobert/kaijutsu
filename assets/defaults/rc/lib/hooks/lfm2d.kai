@@ -58,12 +58,14 @@ items_filter="$(cat <<'ITEMS_FILTER_EOF'
                 stmt_seq: $s.index,
                 cmd_seq: $i,
                 clause: (([.name] + ((.args // [])|map(.plain))) | join($sp)),
-                kj_readonly: (.kj_readonly // false)} ]
+                kj_readonly: (.kj_readonly // false),
+                has_redirect: (((.redirects // []) | length) > 0)} ]
       else [{stmt: $s.plan.rendered,
              stmt_seq: $s.index,
              cmd_seq: null,
              clause: $s.plan.rendered,
-             kj_readonly: false}]
+             kj_readonly: false,
+             has_redirect: false}]
       end )
 ] | add // []
 ITEMS_FILTER_EOF
@@ -104,8 +106,26 @@ fi
 
 # -- a call whose every clause is exempt proceeds without being scored.
 # Three exemptions. The first two are narrow and both require `kj` as the
-# first word; the third is a static classification kept entirely in Rust
-# (`kj::readonly::is_read_only_kj`, crates/kaijutsu-kernel/src/kj/readonly.rs).
+# first word AND no redirect; the third is a static classification kept
+# entirely in Rust (`kj::readonly::is_read_only_kj`,
+# crates/kaijutsu-kernel/src/kj/readonly.rs).
+#
+# `has_redirect` gates exemptions 1 and 2. A redirect turns any command
+# into a filesystem write, so `kj ledger list > ~/.bashrc` must never skip
+# scoring however inert `ledger list` is. It reads `commands[].redirects`
+# straight off `KJ_TOOL_PLAN` -- kaish's own structured field, never a scan
+# of the clause text for `>`, which would have to tell `2>&1` (no file)
+# from `&>out` (a file) by spelling. Exemption 3 needs no such check:
+# `is_read_only_kj` already refuses a redirect in Rust.
+#
+# The fallback item sets `has_redirect: false`, which keeps exemptions 1
+# and 2 working there exactly as before. That path runs only when
+# KJ_TOOL_PLAN is unusable, and it is the one place this check cannot see
+# a redirect -- a narrower version of the same hole, left open on purpose:
+# failing it closed would stop exempting `kj ledger allow` on that path,
+# and scoring the gate's own answer path is what exemption 2 exists to
+# prevent. Trading a filesystem-write hole for a gate deadlock is the
+# wrong trade.
 #
 # 1. `kj ... --help`. clap resolves help before dispatch, so the verb never
 #    runs and there is nothing for a classifier to be right or wrong about.
@@ -164,6 +184,7 @@ exempt_filter="$(cat <<'EXEMPT_FILTER_EOF'
   | ($it.clause / $sp) as $w
   | ( ($w|length) >= 2
       and ($w[0] == $kj)
+      and ($it.has_redirect != true)
       and ( ( (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
               and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) )
             or ($w[1] == $ledger) ) )

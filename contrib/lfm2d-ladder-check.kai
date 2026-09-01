@@ -1,5 +1,5 @@
 # Exercises the ordinal-ladder verdict derivation from
-# `assets/defaults/rc/lib/create/S50-lfm2d.kai` against canned /v1/models
+# `assets/defaults/rc/lib/hooks/lfm2d.kai` against canned /v1/models
 # bodies. Contacts no service, touches no kernel, and runs anywhere kaish does:
 #
 #     kaish contrib/lfm2d-ladder-check.kai     # exits 0, or 1 naming the case
@@ -65,7 +65,7 @@ check informative      escalate "$v6" kube_ordinal_v6 || fails=1
 # --- the scoring exemptions --------------------------------------------
 #
 # A call whose every clause is exempt is not scored. Two exemptions, both
-# requiring `kj` as the first word.
+# requiring `kj` as the first word AND no redirect.
 #
 #   1. `kj ... --help`. clap resolves help before dispatch, so nothing runs.
 #      The predicate is narrow on purpose and the `--content --help` case is
@@ -76,8 +76,15 @@ check informative      escalate "$v6" kube_ordinal_v6 || fails=1
 #      gate. Safe only because a seat can no longer answer its own ask
 #      (docs/gate-and-shell-split.md, "No self-approval").
 #
+# `has_redirect` gates both. A redirect makes any command a filesystem
+# write, and the clause text cannot show it: `kj ledger list` and `kj ledger
+# list > ~/.bashrc` render the SAME clause, so only the field tells them
+# apart. It comes from kaish's own `commands[].redirects`, never a scan for
+# `>`. An absent field reads as no redirect, which is what the rows below
+# that omit it rely on.
+#
 # THIS FILTER IS A COPY of the one in
-# assets/defaults/rc/lib/create/S50-lfm2d.kai. Keeping this file free of
+# assets/defaults/rc/lib/hooks/lfm2d.kai. Keeping this file free of
 # kernel, config and network is what lets another lane run it, and that is
 # worth a duplicated predicate — but the two must be changed together, or
 # this gate tests something the hook no longer does.
@@ -85,9 +92,10 @@ check informative      escalate "$v6" kube_ordinal_v6 || fails=1
 sp=" "
 dash="-"
 exempt_filter="$(cat <<'EXEMPT_FILTER_EOF'
-[ .[] | .clause | (. / $sp) as $w
+[ .[] as $it | ($it.clause / $sp) as $w
   | ( ($w|length) >= 2
       and ($w[0] == $kj)
+      and ($it.has_redirect != true)
       and ( ( (($w[-1] == ($dash + $dash + $help)) or ($w[-1] == ($dash + ($help[0:1]))))
               and (($w[1:-1] | map(select(startswith($dash))) | length) == 0) )
             or ($w[1] == $ledger) ) ) ] | all
@@ -132,6 +140,14 @@ check_exempt '[{"clause":"kj ledger allow a"},{"clause":"kj ledger deny b"}]' tr
 check_exempt '[{"clause":"kj ledgerfoo bar"}]' false "ledgerfoo is not ledger" || fails=1
 check_exempt '[{"clause":"notkj ledger allow x"}]' false "first word must be kj" || fails=1
 check_exempt '[{"clause":"kj ledger list"},{"clause":"kj rc rm /config/rc/x"}]' false "mixed: a real clause scores the call" || fails=1
+
+# A redirect makes any command a filesystem write. These clause STRINGS are
+# identical to exempt ones above — the field is the only difference, which
+# is the whole reason it exists.
+check_exempt '[{"clause":"kj ledger list","has_redirect":true}]' false "ledger list with a redirect is a write" || fails=1
+check_exempt '[{"clause":"kj ledger list","has_redirect":false}]' true "ledger list without one still exempt" || fails=1
+check_exempt '[{"clause":"kj rc add --help","has_redirect":true}]' false "help with a redirect is a write" || fails=1
+check_exempt '[{"clause":"kj ledger allow a"},{"clause":"kj ledger deny b","has_redirect":true}]' false "one redirected clause scores the call" || fails=1
 
 if [[ "$fails" -ne 0 ]]; then
   echo "ladder check FAILED"
