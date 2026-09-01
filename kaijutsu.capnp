@@ -358,6 +358,73 @@ enum VfsErrorKind {
   io @14;                # EIO, and anything with no better name
 }
 
+# Why a call was refused because of the CALLER'S STANDING — a gate verdict
+# or a capability decision, carried as a RESULT rather than thrown
+# (`docs/error-chain.md`). The transport cannot express this: capnp's error
+# kinds are failed/overloaded/disconnected/unimplemented, and none of them
+# means "denied".
+#
+# The boundary is narrow on purpose. A refusal belongs here only when it is
+# about who asked. A rejected label is about the name, a read-only mount is
+# a property of the mount, and a peer's verdict belongs to the peer; those
+# use `(success, error)`, `VfsErrorKind`, and their own types.
+enum RefusalKind {
+  # A human or a rule decided no. The same call gets the same answer.
+  denied @0;
+  # A durable ask is recorded and NOTHING RAN. The action runs when the
+  # answer lands, not when this call returned. Do other work and come back;
+  # retrying in a loop mints duplicate asks.
+  pending @1;
+  # An ask hook fired and never reached a verdict — nothing was wired to
+  # run the gate, or the ledger could not be reached. Fails closed like a
+  # denial, but it is a broken control rather than an answer.
+  gateUnavailable @2;
+  # The named tool is not in this context's capability allow-set.
+  capabilityDenied @3;
+  # The named facade is not in this context's capability allow-set.
+  facadeDenied @4;
+  # The tool exists in the broker's registry; this context's loadout does
+  # not grant it. Distinct from a name that resolves to nothing at all.
+  loadoutDenied @5;
+}
+
+# Where an ask stands. Mirrors the ledger's own status; the correspondence
+# is pinned by a kernel test.
+enum AskStatus {
+  pending @0;
+  claimed @1;
+  allowed @2;
+  denied @3;
+  expired @4;
+  abandoned @5;
+}
+
+# The durable ask a refusal belongs to. Present whenever the gate got far
+# enough to commit a row; absent on a capability refusal, which asks nobody,
+# and on the two gate faults that happen before anything durable exists.
+#
+# `requestId` is the handle a caller polls with and later presents to
+# redeem. It is never rendered into prose and parsed back out.
+struct AskRef {
+  requestId @0 :Text;
+  status @1 :AskStatus;
+}
+
+# A refusal delivered as a result.
+struct Refusal {
+  kind @0 :RefusalKind;
+  # Why, in one line. Branch on `kind`; do not match on this text.
+  reason @1 :Text;
+  # What refused, or what is missing: a hook id for a gate, a tool or facade
+  # name for a capability. Empty when there is nothing to name.
+  subject @2 :Text;
+  # Absent when no durable ask exists.
+  ask @3 :AskRef;
+  # The command that changes the answer — answering the ask, or granting the
+  # capability. Empty when nothing the caller can run would help.
+  remedy @4 :Text;
+}
+
 # How severe the error is.
 enum ErrorSeverity {
   warning @0;

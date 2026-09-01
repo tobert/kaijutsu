@@ -53,6 +53,7 @@ pub mod ids;
 pub mod kernel;
 pub mod paths;
 pub mod principal;
+pub mod refusal;
 pub mod session;
 pub mod share;
 pub mod theme;
@@ -163,6 +164,7 @@ pub use ids::{
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
 pub use kernel::Kernel;
 pub use principal::{Credential, CredentialKind, Principal};
+pub use refusal::{AskRef, AskStatus, Refusal, RefusalKind};
 pub use session::Session;
 pub use tick::{Span, Tick, TickDelta};
 pub use timeout::TimeoutPolicy;
