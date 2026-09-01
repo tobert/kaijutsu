@@ -6,6 +6,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The WAL grows without bound and never shrinks (2026-09-01)
+
+Found while vacuuming. `kernel.db-wal` was **719 MB holding zero live
+frames**: `PRAGMA wal_checkpoint(TRUNCATE)` on the cleanly stopped database
+returned `0|0|0` and removed the file. Everything in it had already been
+checkpointed into the main database; only the allocation survived.
+
+That is SQLite behaving as documented. A WAL is reused in place and is reset
+only when a checkpoint finds it larger than `journal_size_limit` — and we
+never set one, so the limit is -1 (no limit) and the high-water mark is
+permanent. The kernel is a long-lived process holding one connection, so
+nothing ever closes the database and truncates it either.
+
+**Cost is disk, not correctness.** No data was at risk and integrity was
+`ok` before and after. But 719 MB is three quarters of the database file
+again, it is invisible to anyone measuring `kernel.db`, and it grows to
+whatever the single largest write burst since the last restart demanded.
+
+Set `PRAGMA journal_size_limit` at open, next to the existing
+`PRAGMA foreign_keys = ON` (`kernel_db.rs:1858`). The value is the question:
+too small and every checkpoint pays a truncate, too large and this recurs.
+Measure a normal day's WAL high-water mark before picking one.
+
+**Do not switch to `wal_checkpoint(TRUNCATE)` on a timer as the fix** — it
+blocks writers, and the limit does the same job at checkpoint time for free.
+
 ## The terminal client — `kaijutsu-tui` (RULED 2026-08-30, unbuilt)
 
 Design: [`tui.md`](tui.md). Standalone ratatui binary on `kaijutsu-client`, the
