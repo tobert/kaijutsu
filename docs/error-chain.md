@@ -95,36 +95,87 @@ there mints a new durable ask each time.
 
 ## Direction
 
-**Do not add a fifth idiom.** Pick one of the four as the general answer for
-"the call succeeded, the answer is no", and give the throw-only methods access
-to it.
+**There is no general verdict facility, and we are not building one** (Amy,
+2026-09-01). **The unit of work is the family, not the method and not the
+surface.** Six families, four changes; the inventory below is the evidence.
 
-`ErrorPayload` (`kaijutsu.capnp`) is most of the vocabulary already —
-`category` (tool, stream, rpc, render, parse, validation, kernel), `severity`,
-a stable machine-readable `code`, and `detail`. It is currently reachable only
-on Error *blocks*, never on a call return. Generalizing it is a smaller change
-than it looks, because the shape is designed and shipped.
+A general type was the obvious move and it is wrong here for a reason the
+inventory makes concrete: the families do not want the same thing. Forcing
+them into one struct means every site translating into a lowest common
+denominator and back out, and the information that actually helps a caller
+differs per family — an ask you can answer, a capability you could grant, a
+path and a mount, a field you got wrong.
 
-**Do it once, not per method.** Per-method is 152 conversations; a shared
-result struct is one conversation and a mechanical sweep.
+| family | n | what it gets | new machinery |
+|---|---|---|---|
+| VFS permission / read-only | 14 | `errno` on the result | none — a POSIX convention |
+| validation + policy | 8 | `(success :Bool, error :Text)` | **none — 14 methods already use it** |
+| gate + capability | 7 | one shared refusal shape (below) | one, scoped |
+| `invokePeer` | 1 | split `InvocationFailed` out of `PeerError` | none |
 
-This reframes the gate work. `docs/issues.md`, "Gate wiring: one defect, three
-symptoms" asks for structured `{ask_id, status}` on escalation. Under this
-view that is not a gate feature — it is the gate being the first caller of a
-general facility. Build the general shape first; a gate-shaped special case
-would be the fifth idiom.
+**The VFS wants an errno, not our vocabulary.** It is a filesystem, POSIX
+settled this, and the SFTP and FUSE consumers on the far end already speak it.
+A kaijutsu verdict type would fit worse than the obvious domain answer. Fix
+`vfs_err_to_capnp`, which is where all 14 collapse.
 
-## What still needs deciding
+**Validation and policy need nothing invented.** `(success, error)` is already
+the repo's answer for "no, and here is why", on 14 methods. These 8 are
+finishing that, not starting something.
 
-- **Which idiom generalizes.** `ErrorPayload` is the candidate; `denied :Bool`
-  is the simplest thing that could work for the binary cases.
-- **Whether a verdict rides the success path or a typed error.** The
-  constraint from `docs/issues.md` is *keep it loud*: `is_error: true`, never
-  a success with a status field nobody reads. Trading a wrong channel for a
-  silent one is the trade this repo refuses.
-- **Flag-day scope.** Wire changes are permitted under the flag-day rule (wire
-  only, never storage), but capnp interface ordinals stay sequential —
-  retiring a method leaves a `retiredNN @NN ()` stub, not a hole.
+### The one shared shape, and where it stops
+
+Gate and capability share a refusal genuinely: *this principal, in this
+context, may not do this right now — and here is the thing to present or
+change so it can.* For a gate that is an ask id you answer; for a capability
+it is the name you would grant. Splitting them would be inventing twice for
+one idea, so they get one shape.
+
+**It stops there.** Before adding a family to it, apply the test: is the
+refusal *about the caller's standing*? If the answer is no, it does not
+belong, however much the struct would fit.
+
+- A duplicate label is not about standing — the caller may rename, they
+  named it badly. Validation.
+- A read-only mount is a property of the **mount**, not of who asked.
+  Everyone gets the same answer. VFS.
+- `invokePeer` carries a **foreign** system's verdict. We are relaying, not
+  deciding, and we should not dress another program's error as our own.
+
+Stretching this shape to cover those is how a scoped thing becomes the
+general facility we just declined.
+
+### The doctrine generalizes; the mechanism does not
+
+What is worth writing down is which idiom to reach for, so a seventh family
+does not invent a fifth:
+
+- A refusal about the caller's standing, carrying something to act on → the
+  gate/capability shape.
+- A domain with its own settled vocabulary → **use that vocabulary**
+  (errno for filesystems), not ours.
+- A plain no with a reason → `(success :Bool, error :Text)`.
+- A per-item refusal inside a bulk result → a `denied` flag on the item, as
+  `SnapshotNode` does; the call still succeeds.
+
+### Constraints on any of it
+
+- **A verdict cannot ride the capnp error channel.** `capnp::ErrorKind` is
+  `Failed`, `Overloaded`, `Disconnected`, `Unimplemented` — every variant
+  describes a fault and none means "denied". Verdicts ride results. This is
+  a property of the transport, not a choice.
+- **Keep it loud.** `docs/issues.md` sets the constraint: never a success
+  with a status field nobody reads. Trading a wrong channel for a silent one
+  is the trade this repo refuses.
+- **Flag-day scope.** Wire changes are permitted (wire only, never storage),
+  but capnp interface ordinals stay sequential — retiring a method leaves a
+  `retiredNN @NN ()` stub, not a hole.
+
+### What this means for the gate lane
+
+`docs/issues.md`, "Gate wiring: one defect, three symptoms" asks for
+structured `{ask_id, status}` on escalation. That is the gate+capability
+shape, and it is **independently shippable** — it waits on no general design.
+Build it for the 7 methods in its family and stop at the boundary above.
 
 ## Method inventory
 

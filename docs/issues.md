@@ -486,6 +486,12 @@ not require reconstructing a string byte-for-byte. See
 
 ### Build notes
 
+- **Scope it to the gate+capability family — 7 methods.** `docs/error-chain.md`
+  places this work: there is no general verdict facility (ruled 2026-09-01),
+  the unit is the family, and this one is `execute`, `shellExecute`,
+  `executeKj`, `callMcpTool`, `editInput`, `submitInput`, `commitCapture`.
+  That doc also carries the boundary test for what must NOT be folded in.
+  Nothing here waits on a general design.
 - **Wire change.** Permitted under the flag-day rule (wire only, never
   storage), but capnp interface ordinals stay sequential — retiring a method
   leaves a `retiredNN @NN ()` stub, not a hole.
