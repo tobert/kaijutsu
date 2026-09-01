@@ -193,18 +193,69 @@ It is one column, not a claim protocol.
 
 ## Slices
 
-1. **The shared types.** `kaijutsu-types::refusal` and the capnp
+1. **The shared types.** SHIPPED. `kaijutsu-types::refusal` and the capnp
    declarations. No behavior change.
-2. **`McpError` carries a `Refusal`.** Replace `by_hook: HookId` on the three
-   gate variants; give the hookless `shell_write` gate a real verdict
-   (finding 1). `settled_block_status()` keeps its one mapping.
+2. **`McpError` carries a `Refusal`.** SHIPPED. The three gate variants
+   collapsed to `McpError::Refused(Refusal)` — the kind carries what the
+   variants did — and the hookless `shell_write` gate produces a real
+   verdict for the first time (finding 1). `settled_block_status()` reads
+   the kind and keeps its one mapping.
+
+   It also closed something not in the plan: `PhaseOutcome::Deny` carried a
+   reason the LLM-visible path discarded, which is why `docs/issues.md`'s
+   first hard receipt showed a broken hook as a bare "denied by hook
+   shell-escape-guard". Denials keep their reason now — a D-28 change, and
+   the one `docs/gate-and-shell-split.md` already argued for.
 3. **The wire.** Seven result structs, the server side, the client side,
-   `RpcError::Refused` → `CallError::Refused`.
+   `RpcError::Refused` → `CallError::Refused`. Two helpers carry a refusal
+   across: `set_refusal` on the server, `refusal_from_capnp` on the client,
+   both total matches so a new kind is a build error.
 4. **The consumers.** The MCP tool result keeps `is_error: true` and gains
    the id; the ACP path already rides `Status` and is correct.
-5. **Redeem by id.** The ledger read, the divergence check, and the deletion
-   of the digest set match. `PENDING_REASON` stops saying "run the same
-   command again".
+5. **Redeem by id.** The ledger read, the divergence check, the cwd column
+   replacing the pin map, and the deletion of the digest set match.
+   `PENDING_REASON` stops saying "run the same command again".
+
+## Slice 5: presenting the id
+
+`shell_write({ask: "01a05d19-…"})` — no `command`. The kernel loads the
+stored statement, checks the context still matches the ask, and runs that
+text.
+
+**Ruled: an `ask` parameter on the gated tool**, plus `kj ledger redeem <id>`
+for a shell caller. A model calls a tool, not a `kj` verb, so a verb alone
+would leave the model's own path still retrying by text.
+
+The two rejected shapes both kept the command text in the call. Echoing it
+and ignoring it leaves an argument that looks load-bearing and is not;
+comparing it against the stored statement puts the matcher back, which is the
+thing this slice exists to delete. Amy's reason for the id is that **one copy
+cannot disagree with itself** — a second copy in the call reintroduces
+exactly the disagreement.
+
+The rest of the slice is settled:
+
+- `approvals` gains a `cwd` column through `ALTER TABLE ... ADD COLUMN`
+  guarded by `PRAGMA table_info`, following
+  `add_rc_runs_script_count_column_if_missing`. An added column rebuilds
+  nothing, so the FK-cascade hazard that table rebuilds carry does not apply.
+  This is the crate's second ALTER-TABLE step; the third is the point to
+  build the ladder its doc comment already names.
+- The statement text is recoverable from an ask id alone
+  (`ask::load_ask_statements`).
+- `approval_redemptions.request_id` is a `PRIMARY KEY` and `redeem_ask`
+  decides on the `INSERT`'s row count, so exactly-once is already structural
+  and presenting an id does not weaken it.
+- `find_redeemable`'s digest set match goes; every other clause of its
+  predicate — label, context, principal, `status IN ('allowed','denied')`,
+  `auto_reason IS NULL`, not already redeemed — still has to hold for the
+  presented id.
+- `PENDING_REASON` stops saying "run the same command again".
+- **The stranded pair.** A refused `submitInput` has already authored its
+  command and output blocks, which settle `Waiting` on the ask. Resubmitting
+  after an answer authors a second pair and leaves the first waiting forever.
+  Redeeming by id is what lets the original pair be the one that moves, so
+  this is the slice that closes it rather than a separate defect.
 
 ## Adjacent, not in scope
 

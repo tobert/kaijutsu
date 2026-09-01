@@ -518,6 +518,28 @@ slices, and three findings from the current source that change it:
   whatever directory the context is at now. **Ruled: record the cwd on the ask
   and delete the pin map.**
 
+## Three MCP compose tools report failure as success (2026-09-01)
+
+`write_input`, `edit_input` and `submit_input` in `kaijutsu-mcp/src/lib.rs`
+(lines 2332, 2372, 2403) return a plain `String`, not a `CallToolResult`. So
+every failure on that path — including a gate or capability **refusal** —
+reaches the model inside an MCP *success* envelope, as prose. There is no
+`is_error: true` to key on.
+
+This is the constraint `docs/issues.md` sets for the gate lane, inverted:
+*"keep it loud. `is_error: true`, never a success with a status field."*
+Shape B gave `submitInput` and `editInput` a typed refusal on the wire and the
+client carries it intact; these three tools are where it stops being loud, one
+layer further out.
+
+It predates the refusal work — every other error on that path has the same
+shape — and the fix is a signature change that `every_compose_tool_refuses_without_a_kernel`
+pins, so it was left rather than folded in. Worth doing on its own:
+
+1. Return `CallToolResult` with `is_error` set, matching the other tool paths.
+2. Update the local-mode test, which asserts against the `String` shape.
+3. Surface `refusal.ask_id()` while there, since the caller can now hold it.
+
 ## A secret source that runs a command has no home yet (2026-08-31)
 
 `mcp.toml` env values now resolve from a file or a named environment variable

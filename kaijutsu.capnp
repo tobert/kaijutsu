@@ -425,6 +425,86 @@ struct Refusal {
   remedy @4 :Text;
 }
 
+
+# ── Refusable results ────────────────────────────────────────────────────
+# The seven methods a gate or a capability can refuse. Each returns one of
+# these instead of a bare value, so a refusal cannot be missed by a caller
+# that forgot to check a flag: the union makes the match exhaustive.
+#
+# Method ordinals are unchanged — only the return TYPES moved.
+
+struct ExecuteOutcome {
+  union {
+    ok @0 :UInt64;          # execId
+    refused @1 :Refusal;
+  }
+}
+
+struct ShellExecuteOutcome {
+  union {
+    ok @0 :BlockId;         # commandBlockId
+    refused @1 :Refusal;
+  }
+}
+
+struct EditInputOutcome {
+  union {
+    ok @0 :UInt64;          # ackVersion
+    refused @1 :Refusal;
+  }
+}
+
+struct SubmitInputOutcome {
+  union {
+    ok @0 :BlockId;         # commandBlockId
+    refused @1 :Refusal;
+  }
+}
+
+struct CallMcpToolOutcome {
+  union {
+    ok @0 :McpToolResult;
+    refused @1 :Refusal;
+  }
+}
+
+struct CommitCaptureOutcome {
+  union {
+    ok @0 :BlockId;
+    refused @1 :Refusal;
+  }
+}
+
+struct ExecuteKjOutcome {
+  union {
+    ok :group {
+      exitCode @0 :Int32;
+      stdout @1 :Text;
+      stderr @2 :Text;
+      commandBlockId @3 :BlockId;
+      latchCommand @4 :Text;
+      latchTarget @5 :Text;
+      latchMessage @6 :Text;
+      hasLatch @7 :Bool;
+      # `KjResult`'s structured data, JSON-encoded — empty when the verb
+      # produced none. Always wired when available: there is no `--json`
+      # flag and no opt-in parameter, so the RPC does not grow the `kj`
+      # surface while keeping the typing intact across the wire, and a
+      # client can `jq` it the same way kaish can.
+      #
+      # The value is also persisted onto the OUTPUT block
+      # (`block_output_data` → `set_output`), reachable only by following
+      # the change feed and correlating — and `commandBlockId`, not the
+      # output block's id, is what this method returns. This field is the
+      # return path for a value the call already produced.
+      #
+      # Some `kj` verbs do not populate `.data` yet.
+      data @8 :Text;
+    }
+    refused @9 :Refusal;
+  }
+}
+
 # How severe the error is.
 enum ErrorSeverity {
   warning @0;
@@ -1754,7 +1834,7 @@ interface Kernel {
   # kaish execution
   # ==========================================================================
 
-  execute @2 (code :Text, trace :TraceContext) -> (execId :UInt64);
+  execute @2 (code :Text, trace :TraceContext) -> (outcome :ExecuteOutcome);
 
   interrupt @3 (execId :UInt64, trace :TraceContext);
 
@@ -1769,7 +1849,7 @@ interface Kernel {
   # ==========================================================================
 
   # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
-  shellExecute @7 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
+  shellExecute @7 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (outcome :ShellExecuteOutcome);
 
   # Shell state (kaish working directory and last result)
   getCwd @8 () -> (path :Text);
@@ -2147,14 +2227,14 @@ interface Kernel {
   # can read/write it. Submit snapshots it to a conversation block.
 
   # High-level edit: insert text at position, delete characters
-  editInput @43 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
+  editInput @43 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (outcome :EditInputOutcome);
 
   # Full state fetch for join/reconnect recovery
   getInputState @44 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
 
   # Atomic submit: read input, create block, clear input.
   # Mode is explicit — no prefix detection.
-  submitInput @45 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
+  submitInput @45 (contextId :Data, mode :InputMode, trace :TraceContext) -> (outcome :SubmitInputOutcome);
 
   # Clear the input document for a context (discard draft).
   # Emits InputCleared so all clients can reset their compose state.
@@ -2212,7 +2292,7 @@ interface Kernel {
 
   listMcpServers @57 () -> (servers :List(McpServerInfo));
 
-  callMcpTool @58 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
+  callMcpTool @58 (call :McpToolCall, trace :TraceContext) -> (outcome :CallMcpToolOutcome);
 
   # MCP Resources (push-first with caching)
   listMcpResources @59 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
@@ -2304,7 +2384,7 @@ interface Kernel {
   # today; a non-empty casHash is the reserved CAS arm, mirroring
   # RenderCue's union — rejected until the client→kernel CAS write surface
   # lands, docs/issues.md).
-  commitCapture @87 (contextId :Data, mime :Text, payload :Data, casHash :Text, trace :TraceContext) -> (blockId :BlockId);
+  commitCapture @87 (contextId :Data, mime :Text, payload :Data, casHash :Text, trace :TraceContext) -> (outcome :CommitCaptureOutcome);
 
   # One clock reference from an edge observer (docs/midi.md M3, "distribute
   # tempo, not pulses" — the reverse of the BeatSync push, third mirror in
@@ -2362,33 +2442,7 @@ interface Kernel {
   # command text from becoming an unintended general shell surface. The latch
   # fields reserve the confirmation round trip even though the first ACP
   # catalog is deliberately read-mostly.
-  executeKj @99 (contextId :Data, argv :List(Text), trace :TraceContext) -> (
-    exitCode :Int32,
-    stdout :Text,
-    stderr :Text,
-    commandBlockId :BlockId,
-    latchCommand :Text,
-    latchTarget :Text,
-    latchMessage :Text,
-    hasLatch :Bool,
-    # `KjResult`'s structured data, JSON-encoded — empty when the verb
-    # produced none. ALWAYS wired when available: no `--json` flag, no
-    # opt-in parameter (Amy, 2026-08-17: "executeKj should always wire up
-    # data even without explicit --json on the pipeline. why not?"). The
-    # RPC therefore does not grow the `kj` surface at all while keeping the
-    # typing intact across the wire, and a client can `jq` it the same way
-    # kaish already can.
-    #
-    # It was already being computed and persisted onto the *output* block
-    # (`block_output_data` → `set_output`), reachable only by following the
-    # change feed and correlating — and `commandBlockId`, not the output
-    # block's id, is what this method returns. Carrying it here is a return
-    # path for a value the call already produced.
-    #
-    # Some `kj` verbs do not populate `.data` yet; filling those in is
-    # ordinary follow-up work, not a blocker for this field.
-    data :Text
-  );
+  executeKj @99 (contextId :Data, argv :List(Text), trace :TraceContext) -> (outcome :ExecuteKjOutcome);
 
   # ACP-facing command metadata. argvPrefix is the exact kj argv represented
   # by name; clients append parsed user arguments. The server owns curation so

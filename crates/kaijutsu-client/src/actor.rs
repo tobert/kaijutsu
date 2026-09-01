@@ -159,6 +159,15 @@ pub enum CallError {
         path: String,
     },
 
+    /// A gate or a capability refused, and said why. A verdict, not a
+    /// fault: the call reached a decision and the caller must not retry
+    /// blindly (`docs/error-chain.md`, `docs/gate-shape-b.md`). Kept out of
+    /// [`CallError::Rpc`] for the same reason as `Vfs` above — branch on
+    /// `.kind` rather than matching prose, and an ask id (`.ask_id()`) is
+    /// now a handle a caller can hold instead of regexing out of a message.
+    #[error("{0}")]
+    Refused(kaijutsu_types::Refusal),
+
     /// Per-call deadline exceeded — `RPC_CALL_TIMEOUT` for most commands
     /// (`dispatch!`), or a per-call override for the few dispatched through
     /// `dispatch_deadline!` instead (today: `ExecuteTool`, `CallMcpTool`
@@ -1925,19 +1934,38 @@ where
 {
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(val)) => Ok(val),
+        Ok(Err(e)) => Err(classify_rpc_error(e, close_tx)),
+        Err(_) => Err(CallError::Timeout(deadline)),
+    }
+}
+
+/// Turn an `RpcError` into a `CallError`, signalling `close_tx` when the
+/// failure is a disconnect.
+///
+/// **One copy.** A verdict that keeps its type on one dispatch path must
+/// keep it on every one, and a second hand-written match is where that stops
+/// being true — the arms below are ordered so a typed result is rescued
+/// before anything can stringify it. A method that is not refusable today
+/// still routes through here, so it inherits the rescue if it becomes one
+/// rather than silently flattening the day it does.
+fn classify_rpc_error(e: crate::RpcError, close_tx: &mpsc::Sender<CloseCause>) -> CallError {
+    match e {
         // A VFS verdict travels typed. It is never a disconnect, so it also
         // skips the close-cause check below.
-        Ok(Err(crate::RpcError::Vfs { kind, path })) => Err(CallError::Vfs { kind, path }),
-        Ok(Err(e)) => {
+        crate::RpcError::Vfs { kind, path } => CallError::Vfs { kind, path },
+        // A gate/capability refusal is the same story: a verdict the
+        // machinery reached, never a disconnect, so it must not fall into
+        // the generic `Rpc(String)` arm and lose its `Refusal`.
+        crate::RpcError::Refused(refusal) => CallError::Refused(refusal),
+        e => {
             let msg = e.to_string();
             if is_disconnect_error(&msg) {
                 // Coalesce: first close wins; subsequent in-flight failures
                 // discover the actor is already Closing and just log.
                 let _ = close_tx.try_send(CloseCause::RpcError(msg.clone()));
             }
-            Err(CallError::Rpc(msg))
+            CallError::Rpc(msg)
         }
-        Err(_) => Err(CallError::Timeout(deadline)),
     }
 }
 
@@ -3754,16 +3782,7 @@ async fn dispatch_kernel_command(
             .await
             {
                 Ok(Ok(r)) => Ok(r),
-                // As above: a VFS verdict keeps its type and is not a
-                // disconnect.
-                Ok(Err(crate::RpcError::Vfs { kind, path })) => Err(CallError::Vfs { kind, path }),
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
-                    if is_disconnect_error(&msg) {
-                        let _ = close_tx.try_send(CloseCause::RpcError(msg.clone()));
-                    }
-                    Err(CallError::Rpc(msg))
-                }
+                Ok(Err(e)) => Err(classify_rpc_error(e, &close_tx)),
                 Err(_) => Err(CallError::Timeout(RPC_CALL_TIMEOUT)),
             };
             let _ = reply.send(result);
@@ -4042,6 +4061,52 @@ mod tests {
                 "backoff {d} outside [{floor}, {envelope}]"
             );
         }
+    }
+
+    /// A verdict must survive the one place every dispatch path funnels
+    /// through, and must not be mistaken for a lost connection. Both were
+    /// live defects: a `Refusal` flattened here became a retryable-looking
+    /// string, and each retry minted another durable ask.
+    ///
+    /// Falsified by moving either typed arm below the catch-all in
+    /// `classify_rpc_error`, or by deleting it.
+    #[test]
+    fn a_verdict_keeps_its_type_and_never_reads_as_a_disconnect() {
+        let (close_tx, mut close_rx) = mpsc::channel(4);
+
+        let refusal = kaijutsu_types::Refusal {
+            kind: kaijutsu_types::RefusalKind::Pending,
+            reason: "the approval gate is waiting on a human".to_string(),
+            subject: "shell_write".to_string(),
+            ask: Some(kaijutsu_types::AskRef {
+                request_id: "01a05d19-0000-7000-8000-000000000000".to_string(),
+                status: kaijutsu_types::AskStatus::Pending,
+            }),
+            remedy: None,
+        };
+        match classify_rpc_error(crate::RpcError::Refused(refusal), &close_tx) {
+            CallError::Refused(r) => {
+                assert_eq!(r.ask_id(), Some("01a05d19-0000-7000-8000-000000000000"));
+                assert_eq!(r.kind, kaijutsu_types::RefusalKind::Pending);
+            }
+            other => panic!("a refusal must stay a refusal, got {other:?}"),
+        }
+
+        match classify_rpc_error(
+            crate::RpcError::Vfs {
+                kind: kaijutsu_types::VfsErrorKind::NotFound,
+                path: "/v/missing".to_string(),
+            },
+            &close_tx,
+        ) {
+            CallError::Vfs { kind, .. } => assert!(kind.is_absent()),
+            other => panic!("a VFS verdict must stay typed, got {other:?}"),
+        }
+
+        assert!(
+            close_rx.try_recv().is_err(),
+            "a verdict is not a lost connection and must not tear one down",
+        );
     }
 
     #[test]

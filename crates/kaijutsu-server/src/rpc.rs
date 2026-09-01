@@ -3006,10 +3006,11 @@ impl kernel::Server for KernelImpl {
                             ));
                         }
                         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-                            // "execute:", not "denied by hook": this arm
-                            // carries `GatePending` and `GateUnavailable` as
-                            // well, and neither is a refusal.
-                            return Err(capnp::Error::failed(format!("execute: {err}")));
+                            // A verdict rides the result; only a fault still throws.
+                            let refusal = refusal_or_fault(err, "execute")?;
+                            let mut b = results.get().init_outcome().init_refused();
+                            set_refusal(&mut b, &refusal);
+                            return Ok(());
                         }
                     }
                 }
@@ -3043,7 +3044,7 @@ impl kernel::Server for KernelImpl {
                 };
 
                 // Return exec_id to the caller immediately.
-                results.get().set_exec_id(exec_id);
+                results.get().init_outcome().set_ok(exec_id);
 
                 // Spawn background execution — Rc<EmbeddedKaish> is fine on LocalSet.
                 let connection_bg = connection.clone();
@@ -4703,11 +4704,20 @@ impl kernel::Server for KernelImpl {
                     kernel.kernel.id(),
                 ),
             };
-            let exec = kernel
+            let exec = match kernel
                 .kernel
                 .dispatch_tool_via_broker(&tool_name, &arguments, &exec_ctx)
                 .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            {
+                Ok(exec) => exec,
+                Err(e) => {
+                    // A verdict rides the result; only a fault still throws.
+                    let refusal = refusal_or_fault(e, "call_mcp_tool")?;
+                    let mut b = results.get().init_outcome().init_refused();
+                    set_refusal(&mut b, &refusal);
+                    return Ok(());
+                }
+            };
             // `ExecResult::failure` puts its message in `stderr` and leaves
             // `stdout` empty (`execution.rs`) — a bare `exec.stdout` here
             // silently dropped every failure's message on this wire method,
@@ -4718,7 +4728,7 @@ impl kernel::Server for KernelImpl {
             // to `stderr` on failure; this brings `call_mcp_tool` in line
             // with that established convention instead of being the one
             // silent exception.
-            let mut out = results.get().init_result();
+            let mut out = results.get().init_outcome().init_ok();
             let content = if exec.success || exec.stderr.is_empty() {
                 &exec.stdout
             } else {
@@ -4769,14 +4779,21 @@ impl kernel::Server for KernelImpl {
                 // (MCP) both reach shell execution through this RPC, so the
                 // allow-set is enforced here for everyone, keyed on the context
                 // binding — not on which client called.
-                kernel
+                if let Err(e) = kernel
                     .kernel
                     .broker()
                     .check_facade(&context_id, "shell")
                     .await
-                    .map_err(|e| capnp::Error::failed(format!("shell denied: {e}")))?;
+                {
+                    // A capability decision is a refusal, not a transport
+                    // failure — it travels the same channel as the gate's.
+                    let refusal = refusal_or_fault(e, "shell")?;
+                    let mut b = results.get().init_outcome().init_refused();
+                    set_refusal(&mut b, &refusal);
+                    return Ok(());
+                }
 
-                let command_block_id = execute_shell_command(
+                match execute_shell_command(
                     &code,
                     context_id,
                     user_principal_id,
@@ -4784,10 +4801,17 @@ impl kernel::Server for KernelImpl {
                     &kernel,
                     &connection,
                 )
-                .await?;
-
-                let mut block_id_builder = results.get().init_command_block_id();
-                set_block_id_builder(&mut block_id_builder, &command_block_id);
+                .await?
+                {
+                    Ok(command_block_id) => {
+                        let mut b = results.get().init_outcome().init_ok();
+                        set_block_id_builder(&mut b, &command_block_id);
+                    }
+                    Err(refusal) => {
+                        let mut b = results.get().init_outcome().init_refused();
+                        set_refusal(&mut b, &refusal);
+                    }
+                }
                 Ok(())
             }
             .instrument(trace_span),
@@ -4924,35 +4948,42 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
         let principal = self.connection.borrow().principal.id;
         Promise::from_future(async move {
-            let executed = execute_kj_command(context_id, principal, &argv, &kernel, &connection).await?;
-            let mut out = results.get();
-            out.set_exit_code(executed.exit_code);
-            out.set_stdout(&executed.stdout);
-            out.set_stderr(&executed.stderr);
-            set_block_id_builder(&mut out.reborrow().init_command_block_id(), &executed.command_block_id);
-            if let Some(latch) = executed.latch {
-                out.set_latch_command(&latch.command);
-                out.set_latch_target(&latch.target);
-                out.set_latch_message(&latch.message);
-                out.set_has_latch(true);
-            } else {
-                out.set_latch_command("");
-                out.set_latch_target("");
-                out.set_latch_message("");
-                out.set_has_latch(false);
+            match execute_kj_command(context_id, principal, &argv, &kernel, &connection).await? {
+                Ok(executed) => {
+                    let mut out = results.get().init_outcome().init_ok();
+                    out.set_exit_code(executed.exit_code);
+                    out.set_stdout(&executed.stdout);
+                    out.set_stderr(&executed.stderr);
+                    set_block_id_builder(&mut out.reborrow().init_command_block_id(), &executed.command_block_id);
+                    if let Some(latch) = executed.latch {
+                        out.set_latch_command(&latch.command);
+                        out.set_latch_target(&latch.target);
+                        out.set_latch_message(&latch.message);
+                        out.set_has_latch(true);
+                    } else {
+                        out.set_latch_command("");
+                        out.set_latch_target("");
+                        out.set_latch_message("");
+                        out.set_has_latch(false);
+                    }
+                    // `KjResult::Ok`'s structured data, JSON-encoded — empty string
+                    // when the verb produced none. A `serde_json::Value` never
+                    // itself serializes to the empty string, so this is unambiguous
+                    // and no separate `hasData` bool is needed (see kaijutsu.capnp's
+                    // comment on `executeKj`). `serde_json::to_string` on a `Value`
+                    // we built ourselves cannot fail (its `Number` type structurally
+                    // excludes NaN/Infinity) — `expect` rather than a silent
+                    // fallback to empty string, which would corrupt "none".
+                    let data_json = executed.data.as_ref().map(|v| {
+                        serde_json::to_string(v).expect("serde_json::Value always serializes")
+                    }).unwrap_or_default();
+                    out.set_data(&data_json);
+                }
+                Err(refusal) => {
+                    let mut b = results.get().init_outcome().init_refused();
+                    set_refusal(&mut b, &refusal);
+                }
             }
-            // `KjResult::Ok`'s structured data, JSON-encoded — empty string
-            // when the verb produced none. A `serde_json::Value` never
-            // itself serializes to the empty string, so this is unambiguous
-            // and no separate `hasData` bool is needed (see kaijutsu.capnp's
-            // comment on `executeKj`). `serde_json::to_string` on a `Value`
-            // we built ourselves cannot fail (its `Number` type structurally
-            // excludes NaN/Infinity) — `expect` rather than a silent
-            // fallback to empty string, which would corrupt "none".
-            let data_json = executed.data.as_ref().map(|v| {
-                serde_json::to_string(v).expect("serde_json::Value always serializes")
-            }).unwrap_or_default();
-            out.set_data(&data_json);
             Ok(())
         }.instrument(trace_span))
     }
@@ -6329,12 +6360,19 @@ impl kernel::Server for KernelImpl {
                 // Shared facade gate — both live compose typing (app) and the
                 // MCP write_input/edit_input handlers reach the draft through
                 // this RPC, so the allow-set is enforced here for everyone.
-                kernel
+                if let Err(e) = kernel
                     .kernel
                     .broker()
                     .check_facade(&context_id, "edit_input")
                     .await
-                    .map_err(|e| capnp::Error::failed(format!("edit_input denied: {e}")))?;
+                {
+                    // A capability decision is a refusal, not a transport
+                    // failure — it travels the same channel as the gate's.
+                    let refusal = refusal_or_fault(e, "edit_input")?;
+                    let mut b = results.get().init_outcome().init_refused();
+                    set_refusal(&mut b, &refusal);
+                    return Ok(());
+                }
 
                 match kernel
                     .documents
@@ -6346,7 +6384,7 @@ impl kernel::Server for KernelImpl {
                         // feed speak. Best-effort: a failure to read it back must
                         // not fail an edit that already landed.
                         let version = kernel.documents.version(context_id).unwrap_or(0);
-                        results.get().set_ack_version(version);
+                        results.get().init_outcome().set_ok(version);
                         Ok(())
                     }
                     Err(e) => Err(capnp::Error::failed(format!("edit_input failed: {}", e))),
@@ -6418,12 +6456,19 @@ impl kernel::Server for KernelImpl {
             async move {
                 // Shared facade gate (deny-by-default): submit is reachable by
                 // both the app (Enter in compose) and the MCP submit_input tool.
-                kernel
+                if let Err(e) = kernel
                     .kernel
                     .broker()
                     .check_facade(&context_id, "submit_input")
                     .await
-                    .map_err(|e| capnp::Error::failed(format!("submit_input denied: {e}")))?;
+                {
+                    // A capability decision is a refusal, not a transport
+                    // failure — it travels the same channel as the gate's.
+                    let refusal = refusal_or_fault(e, "submit_input")?;
+                    let mut b = results.get().init_outcome().init_refused();
+                    set_refusal(&mut b, &refusal);
+                    return Ok(());
+                }
 
                 let documents = kernel.documents.clone();
 
@@ -6444,7 +6489,7 @@ impl kernel::Server for KernelImpl {
                         return Err(capnp::Error::failed("input is empty".into()));
                     }
 
-                    let command_block_id = execute_shell_command(
+                    match execute_shell_command(
                         &text,
                         context_id,
                         user_principal_id,
@@ -6452,15 +6497,32 @@ impl kernel::Server for KernelImpl {
                         &kernel,
                         &connection,
                     )
-                    .await?;
+                    .await?
+                    {
+                        Ok(command_block_id) => {
+                            // The command exists durably; the draft has done its job.
+                            documents
+                                .clear_draft(context_id, user_principal_id)
+                                .map_err(|e| capnp::Error::failed(format!("clear draft: {}", e)))?;
 
-                    // The command exists durably; the draft has done its job.
-                    documents
-                        .clear_draft(context_id, user_principal_id)
-                        .map_err(|e| capnp::Error::failed(format!("clear draft: {}", e)))?;
-
-                    let mut block_id_builder = results.get().init_command_block_id();
-                    set_block_id_builder(&mut block_id_builder, &command_block_id);
+                            let mut b = results.get().init_outcome().init_ok();
+                            set_block_id_builder(&mut b, &command_block_id);
+                        }
+                        Err(refusal) => {
+                            // Refused, so nothing ran and the player still needs
+                            // the text — the draft stays where they left it.
+                            //
+                            // Not the same case as the failures above, which
+                            // happen before any block exists: the command block
+                            // was already authored and is sitting `Waiting` on
+                            // the ask. Resubmitting after an answer therefore
+                            // authors a SECOND pair and strands the first. That
+                            // is what redeeming by ask id fixes — see
+                            // `docs/gate-shape-b.md`.
+                            let mut b = results.get().init_outcome().init_refused();
+                            set_refusal(&mut b, &refusal);
+                        }
+                    }
                 } else {
                     // Chat prompt — the draft IS the user message. Submitting is
                     // a status transition on the block they typed into, so the
@@ -6512,8 +6574,8 @@ impl kernel::Server for KernelImpl {
                     )
                     .await?;
 
-                    let mut block_id_builder = results.get().init_command_block_id();
-                    set_block_id_builder(&mut block_id_builder, &user_block_id);
+                    let mut b = results.get().init_outcome().init_ok();
+                    set_block_id_builder(&mut b, &user_block_id);
                 }
 
                 Ok(())
@@ -7747,12 +7809,19 @@ impl kernel::Server for KernelImpl {
             // loadout. Broad seats carry `facade:*` (lib binding) so the
             // ambient ear works from any coder/default/mcp context; narrow
             // seats (musician, toolie) stay capture-mute by construction.
-            kernel
+            if let Err(e) = kernel
                 .kernel
                 .broker()
                 .check_facade(&context_id, "commit_capture")
                 .await
-                .map_err(|e| capnp::Error::failed(format!("commitCapture denied: {e}")))?;
+            {
+                // A capability decision is a refusal, not a transport
+                // failure — it travels the same channel as the gate's.
+                let refusal = refusal_or_fault(e, "commit_capture")?;
+                let mut b = results.get().init_outcome().init_refused();
+                set_refusal(&mut b, &refusal);
+                return Ok(());
+            }
 
             if !cas_hash.is_empty() {
                 return Err(capnp::Error::failed(
@@ -7783,7 +7852,7 @@ impl kernel::Server for KernelImpl {
                 context_id.short(),
                 block_id
             );
-            let mut b = results.get().init_block_id();
+            let mut b = results.get().init_outcome().init_ok();
             set_block_id_builder(&mut b, &block_id);
             Ok(())
         })
@@ -8789,7 +8858,7 @@ async fn execute_shell_command(
     user_initiated: bool,
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
-) -> Result<kaijutsu_types::BlockId, capnp::Error> {
+) -> Result<Result<kaijutsu_types::BlockId, kaijutsu_types::Refusal>, capnp::Error> {
     // Materialize a single-use context shell seeded from L1 (durable env + cwd).
     // No caching: transient scope evaporates when this instance drops, so the
     // context's durable state only ever changes through `kj context set`.
@@ -8903,7 +8972,7 @@ async fn execute_shell_command(
             };
             let _ = documents.set_status(context_id, &output_block_id, status);
             let _ = documents.set_status(context_id, &command_block_id, status);
-            return Ok(command_block_id);
+            return Ok(Ok(command_block_id));
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
             // No "denied" prefix: this arm carries three different verdicts
@@ -8920,7 +8989,8 @@ async fn execute_shell_command(
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, settled);
             let _ = documents.set_status(context_id, &command_block_id, settled);
-            return Err(capnp::Error::failed(reason));
+            // A verdict rides the result; only a fault still throws.
+            return Ok(Err(refusal_or_fault(err, "shell")?));
         }
     }
 
@@ -9240,7 +9310,7 @@ async fn execute_shell_command(
         }
     });
 
-    Ok(command_block_id)
+    Ok(Ok(command_block_id))
 }
 
 struct KjCatalogEntry {
@@ -9498,7 +9568,7 @@ async fn execute_kj_command(
     argv: &[String],
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
-) -> Result<ExecutedKj, capnp::Error> {
+) -> Result<Result<ExecutedKj, kaijutsu_types::Refusal>, capnp::Error> {
     require_context_exists(kernel, context_id)?;
     let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
     let documents = kernel.documents.clone();
@@ -9541,9 +9611,9 @@ async fn execute_kj_command(
             let _ = documents.set_status(context_id, &output_block_id, status);
             let _ = documents.set_status(context_id, &command_block_id, status);
             let exit_code = if sc_result.is_error { 1 } else { 0 };
-            return Ok(ExecutedKj {
+            return Ok(Ok(ExecutedKj {
                 exit_code, stdout: text, stderr: String::new(), command_block_id, latch: None, data: None,
-            });
+            }));
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
             // No "denied" prefix, for the reason the shell path states at the
@@ -9555,7 +9625,8 @@ async fn execute_kj_command(
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, settled);
             let _ = documents.set_status(context_id, &command_block_id, settled);
-            return Err(capnp::Error::failed(reason));
+            // A verdict rides the result; only a fault still throws.
+            return Ok(Err(refusal_or_fault(err, "kj")?));
         }
     }
 
@@ -9594,14 +9665,14 @@ async fn execute_kj_command(
                 let _ = documents.set_status(context_id, &output_block_id, status);
                 let _ = documents.set_status(context_id, &command_block_id, status);
                 let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
-                return Ok(ExecutedKj {
+                return Ok(Ok(ExecutedKj {
                     exit_code: sc_exit_code, stdout: text, stderr: String::new(),
                     command_block_id, latch: None, data: None,
-                });
+                }));
             }
-            return Ok(ExecutedKj {
+            return Ok(Ok(ExecutedKj {
                 exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None, data: None,
-            });
+            }));
         }
     };
     // kj's confirmation gate rides kaish's opaque `baggage` channel as of
@@ -9680,7 +9751,7 @@ async fn execute_kj_command(
         .await
     {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {
-            Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch, data })
+            Ok(Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch, data }))
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
             let text = shell_hook_result_text(&sc_result);
@@ -9691,22 +9762,25 @@ async fn execute_kj_command(
             let _ = documents.set_status(context_id, &output_block_id, status);
             let _ = documents.set_status(context_id, &command_block_id, status);
             let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
-            Ok(ExecutedKj {
+            Ok(Ok(ExecutedKj {
                 exit_code: sc_exit_code, stdout: text, stderr: String::new(),
                 command_block_id, latch: None, data: None,
-            })
+            }))
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
             // "on ...", not "denied by ...": see the shell path's twin.
+            //
+            // This arm used to dress the refusal as a synthetic success
+            // (`ExecutedKj { exit_code: 1, .. }`) — a caller checking only
+            // the exit code could never tell a denial from a command that
+            // legitimately failed. It now rides the same `refused` arm
+            // every other verdict here does.
             let reason = format!("on kj command result: {err}");
             let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, settled);
             let _ = documents.set_status(context_id, &command_block_id, settled);
-            Ok(ExecutedKj {
-                exit_code: 1, stdout: String::new(), stderr: reason,
-                command_block_id, latch: None, data: None,
-            })
+            Ok(Err(refusal_or_fault(err, "kj")?))
         }
     }
 }
@@ -11361,6 +11435,60 @@ fn vfs_kind_to_capnp(kind: kaijutsu_types::VfsErrorKind) -> VfsErrorKind {
         K::Disconnected => VfsErrorKind::Disconnected,
         K::TimedOut => VfsErrorKind::TimedOut,
         K::Io => VfsErrorKind::Io,
+    }
+}
+
+/// Project a refusal onto the wire.
+///
+/// Both matches are total, so a new [`kaijutsu_types::RefusalKind`] or
+/// [`kaijutsu_types::AskStatus`] variant fails to compile here rather than
+/// silently arriving as a neighbouring one.
+///
+/// An absent `ask` is left uninitialized so `hasAsk` reads false — a
+/// capability refusal asks nobody, and writing an empty id where a handle
+/// belongs is what the structured shape exists to stop.
+fn set_refusal(
+    builder: &mut crate::kaijutsu_capnp::refusal::Builder<'_>,
+    refusal: &kaijutsu_types::Refusal,
+) {
+    use kaijutsu_types::AskStatus as S;
+    use kaijutsu_types::RefusalKind as K;
+    builder.set_kind(match refusal.kind {
+        K::Denied => RefusalKind::Denied,
+        K::Pending => RefusalKind::Pending,
+        K::GateUnavailable => RefusalKind::GateUnavailable,
+        K::CapabilityDenied => RefusalKind::CapabilityDenied,
+        K::FacadeDenied => RefusalKind::FacadeDenied,
+        K::LoadoutDenied => RefusalKind::LoadoutDenied,
+    });
+    builder.set_reason(&refusal.reason);
+    builder.set_subject(&refusal.subject);
+    builder.set_remedy(refusal.remedy.as_deref().unwrap_or(""));
+    if let Some(ask) = &refusal.ask {
+        let mut a = builder.reborrow().init_ask();
+        a.set_request_id(&ask.request_id);
+        a.set_status(match ask.status {
+            S::Pending => AskStatus::Pending,
+            S::Claimed => AskStatus::Claimed,
+            S::Allowed => AskStatus::Allowed,
+            S::Denied => AskStatus::Denied,
+            S::Expired => AskStatus::Expired,
+            S::Abandoned => AskStatus::Abandoned,
+        });
+    }
+}
+
+/// Split a broker error into the refusal it carries or the fault it is.
+///
+/// A refusal rides the result; a fault throws. `context` names the call for
+/// the thrown message only — a refusal already says what refused.
+fn refusal_or_fault(
+    e: kaijutsu_kernel::mcp::McpError,
+    context: &str,
+) -> Result<kaijutsu_types::Refusal, capnp::Error> {
+    match e.as_refusal() {
+        Some(r) => Ok(r),
+        None => Err(capnp::Error::failed(format!("{context}: {e}"))),
     }
 }
 

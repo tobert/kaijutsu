@@ -861,7 +861,12 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        Ok(response.get()?.get_exec_id())
+        match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::execute_outcome::Ok(exec_id) => Ok(exec_id),
+            crate::kaijutsu_capnp::execute_outcome::Refused(r) => {
+                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+            }
+        }
     }
 
     /// Execute shell command with block output (kaish REPL mode)
@@ -887,8 +892,14 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let block_id = response.get()?.get_command_block_id()?;
-        parse_block_id(&block_id)
+        match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::shell_execute_outcome::Ok(block_id) => {
+                parse_block_id(&block_id?)
+            }
+            crate::kaijutsu_capnp::shell_execute_outcome::Refused(r) => {
+                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+            }
+        }
     }
 
     /// Toggle block exclusion from conversation hydration.
@@ -1449,12 +1460,18 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let result = response.get()?.get_result()?;
-
-        Ok(McpToolResult {
-            content: result.get_content()?.to_string()?,
-            is_error: result.get_is_error(),
-        })
+        match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::call_mcp_tool_outcome::Ok(result) => {
+                let result = result?;
+                Ok(McpToolResult {
+                    content: result.get_content()?.to_string()?,
+                    is_error: result.get_is_error(),
+                })
+            }
+            crate::kaijutsu_capnp::call_mcp_tool_outcome::Refused(r) => {
+                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+            }
+        }
     }
 
     // =========================================================================
@@ -2305,7 +2322,12 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let result = response.get()?;
+        let result = match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::execute_kj_outcome::Ok(ok) => ok,
+            crate::kaijutsu_capnp::execute_kj_outcome::Refused(r) => {
+                return Err(RpcError::Refused(refusal_from_capnp(r?)?));
+            }
+        };
         let latch = if result.get_has_latch() {
             Some(KjLatch {
                 command: result.get_latch_command()?.to_string()?,
@@ -2476,7 +2498,12 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        Ok(response.get()?.get_ack_version())
+        match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::edit_input_outcome::Ok(ack_version) => Ok(ack_version),
+            crate::kaijutsu_capnp::edit_input_outcome::Refused(r) => {
+                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+            }
+        }
     }
 
     /// Get the full input document state for a context.
@@ -2528,9 +2555,14 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let result = response.get()?;
-        let block_id = parse_block_id(&result.get_command_block_id()?)?;
-        Ok(SubmitResult { block_id })
+        match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::submit_input_outcome::Ok(block_id) => Ok(SubmitResult {
+                block_id: parse_block_id(&block_id?)?,
+            }),
+            crate::kaijutsu_capnp::submit_input_outcome::Refused(r) => {
+                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+            }
+        }
     }
 
     /// Commit a captured-MIDI batch (`docs/midi.md` M2 — the ear's push half,
@@ -2559,8 +2591,14 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let result = response.get()?;
-        parse_block_id(&result.get_block_id()?)
+        match response.get()?.get_outcome()?.which()? {
+            crate::kaijutsu_capnp::commit_capture_outcome::Ok(block_id) => {
+                parse_block_id(&block_id?)
+            }
+            crate::kaijutsu_capnp::commit_capture_outcome::Refused(r) => {
+                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+            }
+        }
     }
 
     /// Ship one clock reference from the local observer (`docs/midi.md` M3
@@ -4351,6 +4389,61 @@ fn vfs_error_kind_from_capnp(
     })
 }
 
+/// Read a gate/capability verdict off the wire (`docs/gate-shape-b.md`). A
+/// total match over both enums, so a new `RefusalKind` or `AskStatus`
+/// variant fails to compile here rather than silently reading as its
+/// neighbour.
+fn refusal_from_capnp(
+    r: crate::kaijutsu_capnp::refusal::Reader<'_>,
+) -> Result<kaijutsu_types::Refusal, RpcError> {
+    use crate::kaijutsu_capnp::AskStatus as WAskStatus;
+    use crate::kaijutsu_capnp::RefusalKind as WKind;
+    use kaijutsu_types::{AskRef, AskStatus, Refusal, RefusalKind};
+
+    let kind = match r.get_kind()? {
+        WKind::Denied => RefusalKind::Denied,
+        WKind::Pending => RefusalKind::Pending,
+        WKind::GateUnavailable => RefusalKind::GateUnavailable,
+        WKind::CapabilityDenied => RefusalKind::CapabilityDenied,
+        WKind::FacadeDenied => RefusalKind::FacadeDenied,
+        WKind::LoadoutDenied => RefusalKind::LoadoutDenied,
+    };
+    let reason = r.get_reason()?.to_string()?;
+    let subject = r.get_subject()?.to_string()?;
+    // Present only when the gate got far enough to commit a durable row —
+    // never synthesize an id when the wire left this pointer null.
+    let ask = if r.has_ask() {
+        let a = r.get_ask()?;
+        let status = match a.get_status()? {
+            WAskStatus::Pending => AskStatus::Pending,
+            WAskStatus::Claimed => AskStatus::Claimed,
+            WAskStatus::Allowed => AskStatus::Allowed,
+            WAskStatus::Denied => AskStatus::Denied,
+            WAskStatus::Expired => AskStatus::Expired,
+            WAskStatus::Abandoned => AskStatus::Abandoned,
+        };
+        Some(AskRef {
+            request_id: a.get_request_id()?.to_string()?,
+            status,
+        })
+    } else {
+        None
+    };
+    // Empty string on the wire means "nothing the caller can run would help".
+    let remedy = match r.get_remedy()?.to_string()? {
+        s if s.is_empty() => None,
+        s => Some(s),
+    };
+
+    Ok(Refusal {
+        kind,
+        reason,
+        subject,
+        ask,
+        remedy,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("Cap'n Proto error: {0}")]
@@ -4372,6 +4465,11 @@ pub enum RpcError {
         kind: kaijutsu_types::VfsErrorKind,
         path: String,
     },
+    /// A gate or a capability refused one of the seven gate-shape-B calls,
+    /// and said why. A verdict, not a fault — branch on `.kind` rather than
+    /// reading this message (`docs/gate-shape-b.md`).
+    #[error("{0}")]
+    Refused(kaijutsu_types::Refusal),
     #[error("{0}")]
     Other(String),
 }
