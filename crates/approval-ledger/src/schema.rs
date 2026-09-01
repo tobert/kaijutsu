@@ -322,7 +322,19 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_by       BLOB,
     decided_option   TEXT,
     remember_scope   TEXT,
-    auto_reason      TEXT
+    auto_reason      TEXT,
+    -- The context's cwd when this ask escalated. An approval authorizes the
+    -- operation it was asked about, not a similar one run wherever the
+    -- context has since moved to, so the directory has to travel with the
+    -- ask rather than with the process that raised it. NULL when the caller
+    -- had no persisted cwd to protect.
+    cwd              TEXT,
+    -- The text to run if this ask is allowed, verbatim. NOT
+    -- `authorized_label` and NOT a statement's `rendered`: the first means
+    -- different things per origin and the second is a rendering built for a
+    -- human to read. NULL means this ask cannot be executed on approval and
+    -- its caller must retry instead. docs/gate-shape-b.md.
+    exec_source      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status_created
     ON approvals(status, created_at);
@@ -725,6 +737,10 @@ CREATE TABLE IF NOT EXISTS script_bodies (
 /// that do not depend on FK enforcement being on.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(DDL)?;
+    // Before the rebuild, not after: a rebuild spec copies a named column
+    // list, so any column an old database is missing has to exist before
+    // that copy runs or the SELECT names a column that is not there.
+    add_approvals_columns_if_missing(conn)?;
     if drop_legacy_value_enum_checks(conn)? {
         // A rebuilt table's indexes and triggers were dropped along with
         // it. A second `DDL` pass puts them back; every other statement is
@@ -733,6 +749,33 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         conn.execute_batch(DDL)?;
     }
     add_rc_runs_script_count_column_if_missing(conn)
+}
+
+/// Columns `approvals` gained after it shipped. Same shape and the same
+/// reason as [`add_rc_runs_script_count_column_if_missing`]: `DDL` gives a
+/// fresh database the columns already, and an existing one needs an
+/// `ALTER TABLE`, guarded by `PRAGMA table_info` so `migrate` stays safe to
+/// call on every process start.
+///
+/// `ALTER TABLE ... ADD COLUMN` does not rebuild the table, so none of the
+/// `ON DELETE CASCADE` hazard that a rebuild carries applies here —
+/// `approvals` has six cascading children and a rebuild would fire every one
+/// of them under `PRAGMA foreign_keys = ON`.
+///
+/// This is the crate's second ALTER-TABLE step. A third is the point to
+/// build the ladder `kaijutsu-kernel/src/kernel_db.rs` already has rather
+/// than adding a fourth one-off function here.
+fn add_approvals_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(approvals)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<SqliteResult<Vec<String>>>()?;
+    for column in ["cwd", "exec_source"] {
+        if !existing.iter().any(|name| name == column) {
+            conn.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {column} TEXT"))?;
+        }
+    }
+    Ok(())
 }
 
 /// One table `drop_legacy_value_enum_checks` rebuilds to drop a value-enum
@@ -870,10 +913,12 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             decided_by       BLOB,
             decided_option   TEXT,
             remember_scope   TEXT,
-            auto_reason      TEXT",
+            auto_reason      TEXT,
+            cwd              TEXT,
+            exec_source      TEXT",
         columns: "request_id, context_id, principal_id, origin, instance, tool, hook_id, description, \
             authorized_label, rc_run_id, status, created_at, expires_at, claimed_at, claimed_by, \
-            decided_at, decided_by, decided_option, remember_scope, auto_reason",
+            decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source",
     },
     ValueEnumRebuildSpec {
         table: "approval_signals",
@@ -1620,6 +1665,50 @@ mod tests {
     /// survived. Falsified by removing the `foreign_keys = OFF`/restore
     /// bracket from `drop_legacy_value_enum_checks`: every child table
     /// then comes back empty.
+    /// A rebuild spec restates a shape `DDL` already holds, so the two can
+    /// drift — and a spec that is missing a column does not fail, it
+    /// silently rebuilds the table without it and throws that column's data
+    /// away.
+    ///
+    /// This compares a rebuilt table against a freshly-created one, column
+    /// for column, which is the only check that catches an omission rather
+    /// than a typo. Falsified by deleting `cwd` or `exec_source` from the
+    /// `approvals` spec's `body` and `columns`.
+    #[test]
+    fn a_rebuilt_table_has_the_same_columns_as_a_fresh_one() {
+        fn columns_of(conn: &Connection, table: &str) -> Vec<(String, String)> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let mut cols: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            cols.sort();
+            cols
+        }
+
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+
+        for spec in VALUE_ENUM_REBUILD_SPECS {
+            let rebuilt = Connection::open_in_memory().unwrap();
+            migrate(&rebuilt).unwrap();
+            // Put the legacy shape back so `migrate`'s rebuild fires on it.
+            put_table_back_on_legacy_shape(&rebuilt, spec.table);
+            migrate(&rebuilt).unwrap();
+
+            assert_eq!(
+                columns_of(&rebuilt, spec.table),
+                columns_of(&fresh, spec.table),
+                "{}'s rebuild spec has drifted from DDL — a rebuild would drop \
+                 the columns it does not name",
+                spec.table,
+            );
+        }
+    }
+
     #[test]
     fn rebuilding_approvals_preserves_every_cascading_child() {
         let conn = Connection::open_in_memory().unwrap();

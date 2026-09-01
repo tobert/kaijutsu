@@ -100,8 +100,8 @@ fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
     tx.execute(
         "INSERT INTO approvals (
             request_id, context_id, principal_id, origin, instance, tool, hook_id,
-            description, authorized_label, rc_run_id, expires_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            description, authorized_label, rc_run_id, expires_at, cwd, exec_source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             request_id,
             req.context_id,
@@ -114,6 +114,8 @@ fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
             req.authorized_label,
             req.rc_run_id,
             req.expires_at,
+            req.cwd,
+            req.exec_source,
         ],
     )?;
 
@@ -270,7 +272,7 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason
+                remember_scope, auto_reason, cwd, exec_source
          FROM approvals WHERE request_id = ?1",
         params![request_id],
         row_to_approval,
@@ -303,6 +305,8 @@ pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalR
         decided_option: row.get(17)?,
         remember_scope: row.get(18)?,
         auto_reason: row.get(19)?,
+        cwd: row.get(20)?,
+        exec_source: row.get(21)?,
     })
 }
 
@@ -329,7 +333,7 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason
+                remember_scope, auto_reason, cwd, exec_source
          FROM approvals WHERE status = 'pending' ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -356,7 +360,7 @@ pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason
+                remember_scope, auto_reason, cwd, exec_source
          FROM approvals WHERE status IN ('pending', 'claimed') ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -381,7 +385,7 @@ pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason
+                remember_scope, auto_reason, cwd, exec_source
          FROM approvals WHERE status IN ('allowed', 'denied', 'expired', 'abandoned')
          ORDER BY created_at DESC LIMIT ?1",
     )?;
@@ -453,7 +457,7 @@ pub fn list_asks_filtered(conn: &Connection, filter: &AskListFilter) -> Result<(
         "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
-                remember_scope, auto_reason
+                remember_scope, auto_reason, cwd, exec_source
          FROM approvals {where_clause} ORDER BY created_at {order} LIMIT ?"
     );
     let mut select_params = params;

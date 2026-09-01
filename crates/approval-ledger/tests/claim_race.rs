@@ -30,6 +30,8 @@ fn minimal_ask() -> NewAsk {
         expires_at: None,
         options: vec![NewOption { option_id: "allow_once".into(), label: "Allow once".into(), kind: "allow_once".into() }],
         signals: vec![],
+        cwd: None,
+        exec_source: None,
     }
 }
 

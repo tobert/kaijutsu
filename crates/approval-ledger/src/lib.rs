@@ -167,6 +167,8 @@ pub(crate) mod fixtures {
                 NewOption { option_id: "deny".into(), label: "Deny".into(), kind: "deny".into() },
             ],
             signals: vec![],
+            cwd: None,
+            exec_source: None,
         }
     }
 

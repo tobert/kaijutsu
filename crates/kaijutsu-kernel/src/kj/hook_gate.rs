@@ -79,5 +79,9 @@ pub(crate) fn build_hook_gate_spec(
             // No source program, so no position within one.
             source_index: None,
         }],
+        // A hooked tool call, not source text. The hook's own call is what
+        // would resume, and nothing here reconstructs it, so an answer to
+        // this ask still means the caller retries.
+        exec_source: None,
     }
 }

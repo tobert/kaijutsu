@@ -191,6 +191,10 @@ fn gate_spec_for_send(
             "send a cross-session message to Claude Code session {target:?}{resolution}: {preview}"
         ),
         authorized_label: target.to_string(),
+        // A `kj` verb, not kaish source. Answering this ask still means the
+        // caller retries; wiring a verb origin to execute on approval is
+        // separate work.
+        exec_source: None,
         statements: vec![crate::kj::gate::GatedStatement {
             rendered: format!("kj cc send {target:?} {message:?}"),
             statement_kind: "kj_verb".into(),

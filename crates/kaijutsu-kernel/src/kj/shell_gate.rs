@@ -158,6 +158,11 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
         hook_id: None,
         description,
         authorized_label: label,
+        // The submitted source, which for `shell_write` is exactly what
+        // `authorized_label` holds — but recorded in its own field, because
+        // that coincidence is this origin's alone and a reader must not
+        // generalize it.
+        exec_source: Some(source.trim().to_string()),
         statements,
     })
 }

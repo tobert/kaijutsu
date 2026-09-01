@@ -1253,6 +1253,11 @@ impl KjDispatcher {
                 expires_at: None,
                 options: vec![],
                 signals: vec![sig],
+                // An auto-allowed advisory record, not a question anyone
+                // answers, so there is nothing to run later and no
+                // directory to run it in.
+                cwd: None,
+                exec_source: None,
             };
             let result = {
                 let db = self.kernel_db.lock();
@@ -1366,6 +1371,7 @@ mod tests {
                 ],
                 source_index: None,
             }],
+            exec_source: None,
         }
     }
 
@@ -1390,6 +1396,7 @@ mod tests {
                 vars: vec![],
                 source_index: Some(0),
             }],
+            exec_source: None,
         }
     }
 
@@ -2603,6 +2610,8 @@ mod tests {
                     expires_at: None,
                     options: vec![],
                     signals: vec![],
+                    cwd: None,
+                    exec_source: None,
                 };
                 let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
                 conn.execute(
@@ -2900,6 +2909,8 @@ mod tests {
                     expires_at: None,
                     options: vec![],
                     signals: vec![],
+                    cwd: None,
+                    exec_source: None,
                 };
                 let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
                 approval_ledger::decide::decide(

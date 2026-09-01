@@ -52,9 +52,8 @@
 //! wins, losers read a loud `AlreadyDecided`/claim failure, never a silent
 //! no-op.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use approval_ledger::types::{
     ApprovalStatus, AskCoverage, AskVerdict, NewAsk, NewOption, NewPlanCommand, NewPlanStatement,
@@ -137,7 +136,7 @@ pub(crate) struct GateOutcome {
     /// exactly once — on the redemption that spends the answer and turns
     /// `Allowed`. An approval authorizes the operation it was asked about,
     /// not a similar one run wherever the context's cwd has since moved to
-    /// (see [`pin_cwd`]). `None` on every other outcome: a rule-matched
+    /// (see [`caller_cwd`]). `None` on every other outcome: a rule-matched
     /// auto-allow never escalated, so nothing was pinned; a denial does not
     /// need a directory to run in; and a caller with no `context_id` had
     /// nothing to pin in the first place.
@@ -242,6 +241,19 @@ pub(crate) struct GateSpec {
     /// IS the whole statement.
     pub authorized_label: String,
     pub statements: Vec<GatedStatement>,
+    /// The text to run if this ask is allowed, verbatim.
+    ///
+    /// Not `authorized_label` and not a statement's `rendered`. The first
+    /// means different things per origin — the submitted source for a
+    /// `ShellGate` ask, a target session name for a `KjVerb` one — and the
+    /// second is a rendering built for a human to read, carrying `NOTE:`
+    /// lines that would run as commands. Reaching for either is a
+    /// per-origin rule a fourth origin gets silently wrong.
+    ///
+    /// `None` means this ask cannot be executed when it is answered and its
+    /// caller must retry instead. That is not a silent fallback: the
+    /// refusal's remedy says which of the two the caller is getting.
+    pub exec_source: Option<String>,
 }
 
 /// Statement digest: the ledger keys statements by an opaque
@@ -272,62 +284,26 @@ fn caller_context_bytes(caller: &KjCaller) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// The cwd an escalated ask was asked in, keyed by `request_id` and living
-/// for exactly the process's lifetime — not a table, and not durable.
+/// The caller's persisted cwd, read the same way
+/// `EmbeddedKaish::restore_cwd_from_db` reads it so an ask records the
+/// directory a human sees echoed in `kj ledger show`.
 ///
-/// A pending ask is swept to `abandoned` at kernel boot (nothing durable
-/// carries a pending ask across a restart), so a pin tied to an ask's
-/// lifetime can never outlive it either: a `HashMap` behind a `Mutex` is
-/// exactly the right shape, with no persistence layer to keep coherent with
-/// the ledger. `request_id` is a UUID, so entries from different kernels
-/// sharing one test process cannot collide.
-fn cwd_pins() -> &'static Mutex<HashMap<String, PathBuf>> {
-    static PINS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
-    PINS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Lock the pin map, recovering from poisoning rather than propagating it
-/// forever. `insert`/`remove`/`get` on a `HashMap` have no cross-entry
-/// invariant a panic partway through could leave broken, so a panic
-/// elsewhere while this lock was held costs at most the one pin in flight —
-/// not every `shell_write` gate for the rest of this kernel process's life.
-/// A lost pin is already a handled case (`GateOutcome::cwd` is `None`,
-/// unpinned, same as before this mechanism existed), so recovering here
-/// degrades to that, never to a wrong directory.
-fn lock_pins() -> std::sync::MutexGuard<'static, HashMap<String, PathBuf>> {
-    cwd_pins().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Capture the caller's persisted cwd under `request_id` at the moment its
-/// ask escalates — read the same way `EmbeddedKaish::restore_cwd_from_db`
-/// reads it, so the pin matches what a human sees echoed in `kj ledger
-/// show`. An approval given later must run in this directory, not wherever
-/// the context has `cd`ed to by the time a human answers.
+/// This goes on the `approvals` row rather than into a process-lifetime
+/// map. A DECIDED ask is never swept at boot, so it outlives the process
+/// that raised it; a pin that did not would be absent exactly when a
+/// restart separated the answer from its execution, and the approved
+/// command would run in whatever directory the context had reached by then.
+/// `docs/gate-shape-b.md`, "The cwd moves onto the ask".
 ///
-/// A caller with no `context_id` (a synthetic or internal caller) has no
-/// persisted cwd to protect, so nothing is pinned; its later redemption
-/// runs without a directory override, same as before this pin existed.
-fn pin_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller, request_id: &str) {
-    let Some(context_id) = caller.context_id else {
-        return;
-    };
-    let cwd = {
-        let db = db.lock();
-        db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
-    };
-    if let Some(cwd) = cwd {
-        lock_pins().insert(request_id.to_string(), PathBuf::from(cwd));
-    }
+/// `None` for a caller with no `context_id` — a synthetic or internal
+/// caller has no persisted cwd to protect.
+fn caller_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller) -> Option<String> {
+    let context_id = caller.context_id?;
+    let db = db.lock();
+    db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
 }
 
-/// Take (remove) the cwd pinned for `request_id`, if any. Single-use like
-/// the answer it belongs to: a second call for the same `request_id`
-/// returns `None`, never the stale value.
-fn take_pinned_cwd(request_id: &str) -> Option<PathBuf> {
-    lock_pins().remove(request_id)
-}
-
-fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
+fn build_ask(caller: &KjCaller, spec: &GateSpec, cwd: Option<String>) -> NewAsk {
     NewAsk {
         context_id: caller_context_bytes(caller),
         principal_id: caller.principal_id.as_bytes().to_vec(),
@@ -368,6 +344,8 @@ fn build_ask(caller: &KjCaller, spec: &GateSpec) -> NewAsk {
             })
             .collect(),
         authorized_label: Some(spec.authorized_label.clone()),
+        cwd,
+        exec_source: spec.exec_source.clone(),
         rc_run_id: None,
         expires_at: None,
         options: vec![
@@ -553,11 +531,20 @@ pub(crate) async fn run_gate(
             Ok(Some((request_id, status))) => {
                 announce_ledger_change(db, ledger_flows);
                 let allowed = status.is_allowed();
-                // Take the pin unconditionally — it is single-use like the
-                // answer it belongs to, spent whether the answer was yes or
-                // no — but surface it only on an allow; a denial runs
-                // nothing, so it has no directory to run in.
-                let cwd = take_pinned_cwd(&request_id).filter(|_| allowed);
+                // The directory this ask was raised in, read back off the
+                // row that has outlived whatever process raised it.
+                // Surfaced only on an allow: a denial runs nothing, so it
+                // has no directory to run in.
+                let cwd = allowed
+                    .then(|| {
+                        let db = db.lock();
+                        approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| row.cwd)
+                            .map(PathBuf::from)
+                    })
+                    .flatten();
                 return GateOutcome {
                     verdict: if allowed { GateVerdict::Allowed } else { GateVerdict::Denied },
                     ask: Some(ask_ref(request_id, status)),
@@ -584,7 +571,9 @@ pub(crate) async fn run_gate(
         }
     }
 
-    let ask = build_ask(caller, &spec);
+    // Read before the row commits, so the directory recorded is the one the
+    // ask was raised in rather than one a later `cd` moved to.
+    let ask = build_ask(caller, &spec, caller_cwd(db, caller));
 
     // 3. Durable before asked — the row commits before anyone is told.
     let request_id = {
@@ -655,10 +644,6 @@ pub(crate) async fn run_gate(
     //    client learns an answer is wanted the moment the row commits — an
     //    ask nothing points at is answerable and undiscoverable at once.
     announce_ledger_change(db, ledger_flows);
-    // Pin the cwd this ask was asked in — before anyone can answer it, so
-    // there is no window where an answer could redeem against a pin that
-    // was never taken. See `pin_cwd` for what happens with no `context_id`.
-    pin_cwd(db, caller, &request_id);
     // The waiter can vanish without warning, and tuning budgets will never
     // stop that: a harness kills its hook on its own schedule (Claude Code
     // at five seconds, Codex at three for `SessionEnd`), a user interrupts,
@@ -751,6 +736,7 @@ mod tests {
                 ],
                 source_index: None,
             }],
+            exec_source: None,
         }
     }
 
@@ -779,6 +765,7 @@ mod tests {
                     source_index: Some(second_index),
                 },
             ],
+            exec_source: None,
         }
     }
     async fn gate_dispatcher() -> crate::kj::KjDispatcher {
@@ -1121,6 +1108,8 @@ mod tests {
             expires_at: None,
             options: vec![],
             signals: vec![],
+            cwd: None,
+            exec_source: None,
         };
         let db = db.lock();
         let conn = db.conn_for_ledger();
@@ -1269,16 +1258,23 @@ mod tests {
             .unwrap();
     }
 
-    /// An escalating gate records a pin for its `request_id` — the fact
-    /// [`pin_cwd`] exists to establish. Read back through the same
-    /// process-local map `run_gate` writes, since that map (not a durable
-    /// row) is the pin's only home.
+    /// The cwd an ask recorded, read back off its own row.
+    fn ask_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, request_id: &str) -> Option<String> {
+        let db = db.lock();
+        approval_ledger::ask::get_approval(db.conn_for_ledger(), request_id)
+            .expect("ledger read")
+            .expect("the ask exists")
+            .cwd
+    }
+
+    /// An escalating gate records its cwd on the ask row, which is where it
+    /// has to live: a decided ask is never swept at boot, so it outlives the
+    /// process that raised it, and a process-lifetime pin would be absent
+    /// exactly when a restart separated the answer from its execution.
     ///
-    /// Falsified by commenting out the `pin_cwd(db, caller, &request_id)`
-    /// call in the escalate tail: `take_pinned_cwd` returned `None` instead
-    /// of the seeded directory. Reverted.
+    /// Falsified by passing `None` for `build_ask`'s cwd argument.
     #[tokio::test]
-    async fn an_escalating_gate_records_a_pin_for_its_request_id() {
+    async fn an_escalating_gate_records_its_cwd_on_the_ask_row() {
         let d = gate_dispatcher().await;
         let ctx_id = register_context(&d, Some("pin-capture"), None, kaijutsu_types::PrincipalId::new());
         seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
@@ -1294,15 +1290,10 @@ mod tests {
         assert_eq!(outcome.verdict, GateVerdict::Pending);
         let request_id = outcome.ask.expect("an escalated ask has a row").request_id;
 
-        // Read the pin into an owned value BEFORE asserting — an assert
-        // that panics while still holding the guard would poison this
-        // process-global lock for every OTHER test sharing the process, an
-        // unrelated cascade this test must not risk causing.
-        let pinned = lock_pins().get(&request_id).cloned();
         assert_eq!(
-            pinned,
-            Some(PathBuf::from("/original/dir")),
-            "the ask's cwd must be pinned under its own request_id the moment it escalates"
+            ask_cwd(&d.kernel_db, &request_id).as_deref(),
+            Some("/original/dir"),
+            "the ask must carry the directory it was raised in, on its own row"
         );
     }
 
@@ -1356,17 +1347,20 @@ mod tests {
         );
     }
 
-    /// The pin is single-use: once a redemption has taken it, a second take
-    /// for the same `request_id` gets nothing — never the same directory
-    /// twice, and never silently stale.
+    /// The recorded cwd is NOT consumed by redemption. It was, while it
+    /// lived in a process-lifetime map that a redemption drained; on the
+    /// row it is a durable fact about what was asked, and reading it twice
+    /// gives the same answer.
     ///
-    /// Falsified by making `take_pinned_cwd` peek (`get` + `clone`) instead
-    /// of remove: the second `take_pinned_cwd` call returned
-    /// `Some("/original/dir")` again instead of `None`. Reverted.
+    /// Exactly-once does not depend on it and never did — that is
+    /// `approval_redemptions.request_id`, a `PRIMARY KEY` whose `INSERT`
+    /// row count decides the race.
+    ///
+    /// Falsified by clearing the column on redemption.
     #[tokio::test]
-    async fn the_pin_is_single_use() {
+    async fn the_recorded_cwd_survives_its_own_redemption() {
         let d = gate_dispatcher().await;
-        let ctx_id = register_context(&d, Some("pin-single-use"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_id = register_context(&d, Some("cwd-survives"), None, kaijutsu_types::PrincipalId::new());
         seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
         let caller = caller_with_context(ctx_id);
 
@@ -1375,24 +1369,29 @@ mod tests {
         let request_id = pending_id(&d);
         answer(&d, &request_id, true);
 
-        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
-            .await;
+        let redeemed = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(redeemed.verdict, GateVerdict::Allowed);
 
         assert_eq!(
-            take_pinned_cwd(&request_id),
-            None,
-            "the redemption above must already have taken (removed) this pin; a second \
-             take must find nothing, not a stale directory"
+            ask_cwd(&d.kernel_db, &request_id).as_deref(),
+            Some("/original/dir"),
+            "the row still records what was asked after the answer was spent"
         );
     }
 
-    /// A caller with no `context_id` has nothing to pin — documented
-    /// behavior for the synthetic/internal-caller case, not a gap. Its
-    /// escalation still leaves a normal pending row; only the pin is
-    /// absent, so its later redemption runs with no cwd override (unchanged
-    /// from before this pin existed).
+    /// A caller with no `context_id` has no persisted cwd to record —
+    /// documented behavior for the synthetic/internal-caller case, not a
+    /// gap. Its escalation still leaves a normal pending row; only the
+    /// directory is absent, so its later redemption runs with no cwd
+    /// override.
     #[tokio::test]
-    async fn a_caller_with_no_context_id_pins_nothing() {
+    async fn a_caller_with_no_context_id_records_no_cwd() {
         let d = gate_dispatcher().await;
         let mut caller = test_caller();
         caller.context_id = None;
@@ -1407,7 +1406,10 @@ mod tests {
         assert_eq!(outcome.verdict, GateVerdict::Pending);
         let request_id = outcome.ask.expect("still a normal escalation").request_id;
 
-        let pinned = lock_pins().get(&request_id).cloned();
-        assert_eq!(pinned, None, "a caller with no context_id has no persisted cwd to pin");
+        assert_eq!(
+            ask_cwd(&d.kernel_db, &request_id),
+            None,
+            "a caller with no context_id has no persisted cwd to record"
+        );
     }
 }

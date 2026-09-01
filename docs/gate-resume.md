@@ -333,14 +333,15 @@ through on that `None` and the approved command runs wherever the context
 now sits — its own comment names this "the exact bug this pin exists to
 close."
 
-**Ruled: record the cwd on the `approvals` row; delete `cwd_pins`, `pin_cwd`
-and `take_pinned_cwd`.** Not yet built — `docs/gate-shape-b.md` carries the
-build record (an `ALTER TABLE ... ADD COLUMN`, following the pattern
-`add_rc_runs_script_count_column_if_missing` already uses). Redemption then
-verifies instead of shrugging: the ask's recorded cwd matching the
-context's live cwd runs there; a divergence refuses, naming both
-directories; an ask that recorded no cwd runs unpinned, the way a caller
-with no context does today. This is a small, deliberate step toward the
+**Ruled and SHIPPED 2026-09-01: the cwd is recorded on the `approvals` row,
+and `cwd_pins`, `pin_cwd` and `take_pinned_cwd` are deleted.** The column
+arrived through an `ALTER TABLE ... ADD COLUMN` guarded by `PRAGMA
+table_info`, the pattern `add_rc_runs_script_count_column_if_missing`
+already uses — an added column rebuilds nothing, so none of the
+`ON DELETE CASCADE` hazard a rebuild carries applies, which matters because
+`approvals` has six cascading children. `run_gate` reads the cwd back off
+the row on redemption; an ask that recorded none runs unpinned, the way a
+caller with no context does. This is a small, deliberate step toward the
 restart survival this document deletes above — one column, not a claim
 protocol — because the ask has nothing to verify a cwd against unless it
 carries what it was asked under.

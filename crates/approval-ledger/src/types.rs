@@ -433,6 +433,15 @@ pub struct NewAsk {
     pub expires_at: Option<i64>,
     pub options: Vec<NewOption>,
     pub signals: Vec<NewSignal>,
+    /// The caller's cwd when this ask escalated. An approval authorizes the
+    /// operation it was asked about, not a similar one run wherever the
+    /// context has since moved to. `None` when the caller had no persisted
+    /// cwd to protect.
+    pub cwd: Option<String>,
+    /// The text to run if this ask is allowed, verbatim. `None` means this
+    /// ask cannot be executed on approval and its caller must retry —
+    /// `docs/gate-shape-b.md`.
+    pub exec_source: Option<String>,
 }
 
 // ============================================================================
@@ -465,6 +474,8 @@ pub struct ApprovalRow {
     pub decided_option: Option<String>,
     pub remember_scope: Option<String>,
     pub auto_reason: Option<String>,
+    pub cwd: Option<String>,
+    pub exec_source: Option<String>,
 }
 
 /// One `approval_options` row.
