@@ -61,6 +61,8 @@ use approval_ledger::types::{
     NewPlanVar, NewPlannedValue, Origin, StatementVerdict, VarBinding,
 };
 
+use kaijutsu_types::{AskRef, AskStatus};
+
 use crate::flows::SharedLedgerFlowBus;
 use crate::kernel_db::KernelDb;
 use crate::kj::KjCaller;
@@ -96,18 +98,26 @@ pub(crate) enum GateVerdict {
     Pending,
 }
 
-/// The durable ask an outcome belongs to. Present whenever the gate got far
-/// enough to commit a row; absent only on the two faults that happen BEFORE
-/// anything durable exists (the rule read failed, or `create_ask` failed).
+/// Translate the ledger's status into the one the wire carries.
 ///
-/// A pair rather than two `Option` fields because the id and the status are
-/// the same fact — a row either exists with both, or does not exist at all,
-/// and two independent `Option`s could express a third state that cannot
-/// happen.
-#[derive(Debug, Clone)]
-pub(crate) struct AskRef {
-    pub request_id: String,
-    pub status: ApprovalStatus,
+/// The two enums are separate because `approval-ledger` and
+/// `kaijutsu-types` are independent leaves. This is the single crossing
+/// point, and `ask_status_covers_every_ledger_status` below is what keeps a
+/// new ledger variant from arriving on the wire as something else.
+pub(crate) fn ask_status(status: ApprovalStatus) -> AskStatus {
+    match status {
+        ApprovalStatus::Pending => AskStatus::Pending,
+        ApprovalStatus::Claimed => AskStatus::Claimed,
+        ApprovalStatus::Allowed => AskStatus::Allowed,
+        ApprovalStatus::Denied => AskStatus::Denied,
+        ApprovalStatus::Expired => AskStatus::Expired,
+        ApprovalStatus::Abandoned => AskStatus::Abandoned,
+    }
+}
+
+/// Build the durable-ask reference an outcome carries.
+pub(crate) fn ask_ref(request_id: String, status: ApprovalStatus) -> AskRef {
+    AskRef { request_id, status: ask_status(status) }
 }
 
 /// How a gate wait ended.
@@ -549,7 +559,7 @@ pub(crate) async fn run_gate(
                 let cwd = take_pinned_cwd(&request_id).filter(|_| allowed);
                 return GateOutcome {
                     verdict: if allowed { GateVerdict::Allowed } else { GateVerdict::Denied },
-                    ask: Some(AskRef { request_id, status }),
+                    ask: Some(ask_ref(request_id, status)),
                     cwd,
                     reason: if allowed {
                         "an approval was already given for this exact request; \
@@ -621,7 +631,7 @@ pub(crate) async fn run_gate(
                 } else {
                     GateVerdict::Denied
                 },
-                ask: Some(AskRef { request_id, status: row.status }),
+                ask: Some(ask_ref(request_id, row.status)),
                 cwd: None,
                 reason: auto_reason.to_string(),
             },
@@ -630,7 +640,7 @@ pub(crate) async fn run_gate(
             // `kj ledger` can still be pointed at.
             Err(e) => GateOutcome {
                 verdict: GateVerdict::Unavailable,
-                ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
+                ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
                 cwd: None,
                 reason: format!(
                     "approval gate could not record the rule decision: {e} (fail-closed — \
@@ -663,7 +673,7 @@ pub(crate) async fn run_gate(
     // and this catches the ones nobody has thought of yet.
     GateOutcome {
         verdict: GateVerdict::Pending,
-        ask: Some(AskRef { request_id, status: ApprovalStatus::Pending }),
+        ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
         cwd: None,
         reason: PENDING_REASON.to_string(),
     }
@@ -671,6 +681,51 @@ pub(crate) async fn run_gate(
 
 #[cfg(test)]
 mod tests {
+
+    /// `AskStatus` mirrors `ApprovalStatus` across a crate boundary, so the
+    /// two can drift. Two things stop that, and only one of them is this
+    /// test: `ask_status`'s match has no catch-all arm, so a NEW ledger
+    /// variant fails the build rather than mapping to something wrong. What
+    /// a compiler cannot catch is a SWAPPED pair — both arms exist and both
+    /// typecheck — and that is what comparing the rendered names catches.
+    ///
+    /// Falsified by exchanging any two arms of `ask_status`.
+    #[test]
+    fn ask_status_matches_the_ledger_status_it_mirrors() {
+        for status in [
+            ApprovalStatus::Pending,
+            ApprovalStatus::Claimed,
+            ApprovalStatus::Allowed,
+            ApprovalStatus::Denied,
+            ApprovalStatus::Expired,
+            ApprovalStatus::Abandoned,
+        ] {
+            assert_eq!(
+                ask_status(status).as_str(),
+                status.as_str(),
+                "{status} crosses to the wire as a different state",
+            );
+        }
+    }
+
+    /// The ledger's two live states are the wire's two open states. A poll
+    /// stops on everything else, so a mistake here loops forever or gives up
+    /// on an answerable ask.
+    #[test]
+    fn the_open_ask_states_are_the_ledger_s_live_ones() {
+        for status in [ApprovalStatus::Pending, ApprovalStatus::Claimed] {
+            assert!(ask_status(status).is_open(), "{status} should still be answerable");
+        }
+        for status in [
+            ApprovalStatus::Allowed,
+            ApprovalStatus::Denied,
+            ApprovalStatus::Expired,
+            ApprovalStatus::Abandoned,
+        ] {
+            assert!(!ask_status(status).is_open(), "{status} is terminal");
+            assert!(status.is_terminal(), "the ledger agrees {status} is terminal");
+        }
+    }
     use super::*;
     use crate::kernel_db::ContextShellRow;
     use crate::kj::test_helpers::{
@@ -792,7 +847,7 @@ mod tests {
              question is simply open"
         );
         let ask = outcome.ask.as_ref().expect("an escalated ask has a row");
-        assert_eq!(ask.status, ApprovalStatus::Pending);
+        assert_eq!(ask.status, AskStatus::Pending);
         assert!(!ask.request_id.is_empty());
         assert!(outcome.reason.contains("kj ledger allow"));
 
@@ -841,7 +896,7 @@ mod tests {
         assert!(second.allowed(), "the answer already given must open the gate");
         assert_eq!(second.verdict, GateVerdict::Allowed);
         let ask = second.ask.expect("a redeemed ask has a row");
-        assert_eq!(ask.status, ApprovalStatus::Allowed);
+        assert_eq!(ask.status, AskStatus::Allowed);
         assert_eq!(
             ask.request_id, request_id,
             "the second attempt must redeem the SAME ask a human answered, not mint one"
@@ -927,7 +982,7 @@ mod tests {
             GateVerdict::Denied,
             "a human said no, and the caller must be told that rather than asked to wait"
         );
-        assert_eq!(second.ask.as_ref().unwrap().status, ApprovalStatus::Denied);
+        assert_eq!(second.ask.as_ref().unwrap().status, AskStatus::Denied);
         assert_eq!(second.ask.as_ref().unwrap().request_id, request_id);
 
         let third =
@@ -1121,7 +1176,7 @@ mod tests {
         // A standing DENY rule is a decision someone made earlier, so this
         // is a verdict — the rule path and the human path agree.
         assert_eq!(outcome.verdict, GateVerdict::Denied);
-        assert_eq!(outcome.ask.as_ref().unwrap().status, ApprovalStatus::Denied);
+        assert_eq!(outcome.ask.as_ref().unwrap().status, AskStatus::Denied);
         assert!(
             outcome.reason.contains("#2") && outcome.reason.contains("rm -rf foo"),
             "reason must name the ACTUAL denied statement (#2, `rm -rf foo`): {}",
@@ -1152,7 +1207,7 @@ mod tests {
 
         assert!(!outcome.allowed());
         assert_eq!(outcome.verdict, GateVerdict::Pending);
-        assert_eq!(outcome.ask.as_ref().unwrap().status, ApprovalStatus::Pending);
+        assert_eq!(outcome.ask.as_ref().unwrap().status, AskStatus::Pending);
     }
 
     /// The fault/verdict split, asserted at the seam it exists to protect.

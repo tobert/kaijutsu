@@ -382,7 +382,7 @@ mod tests {
     use super::super::super::policy::InstancePolicy;
     use super::super::super::types::KernelCallParams;
     use async_trait::async_trait;
-    use kaijutsu_types::{ContextId, PrincipalId};
+    use kaijutsu_types::{ContextId, PrincipalId, RefusalKind};
     use tokio::sync::broadcast;
 
     /// Minimal target mock that advertises a couple of tools and nothing
@@ -862,7 +862,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, McpError::Denied { .. }),
+            err.is_refusal(RefusalKind::Denied),
             "expected Denied, got {err:?}",
         );
 

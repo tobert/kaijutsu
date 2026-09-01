@@ -51,6 +51,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use kaijutsu_types::RefusalKind;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult, ToolContent};
 
@@ -489,24 +490,27 @@ impl McpServerLike for ShellServer {
             )
             .await;
             if !outcome.allowed() {
-                // Every non-allowed outcome fails closed and all of them
-                // surface as `Protocol` here — the gate variants of
-                // `McpError` carry a `HookId` and this gate has no hook
-                // behind it. The distinction a model needs arrives in the
-                // words: a pending ask says it is waiting and how to answer,
-                // a ledger fault says it is broken, and neither is dressed
-                // up as somebody's decision.
-                let headline = match outcome.verdict {
-                    crate::kj::gate::GateVerdict::Pending => {
-                        "shell_write: waiting for approval"
-                    }
-                    _ => "shell_write: approval gate refused",
+                // Every non-allowed outcome fails closed, and each carries
+                // its own kind: a pending ask is waiting, a ledger fault is
+                // broken, and a denial is somebody's decision. This gate has
+                // no hook behind it, so the tool it guards is the subject.
+                let kind = match outcome.verdict {
+                    crate::kj::gate::GateVerdict::Pending => RefusalKind::Pending,
+                    crate::kj::gate::GateVerdict::Unavailable => RefusalKind::GateUnavailable,
+                    crate::kj::gate::GateVerdict::Denied => RefusalKind::Denied,
+                    // Guarded by `!outcome.allowed()` directly above. Reaching
+                    // here means `allowed()` and this match disagree about
+                    // which verdict lets a call through.
+                    crate::kj::gate::GateVerdict::Allowed => unreachable!(
+                        "an allowed gate outcome reached the refusal path"
+                    ),
                 };
-                return Err(McpError::Protocol(format!(
-                    "{headline} [{}]: {} — nothing was run",
-                    outcome.ask_description(),
-                    outcome.reason
-                )));
+                return Err(McpError::refused_gate(
+                    kind,
+                    Self::TOOL_WRITE,
+                    outcome.ask.clone(),
+                    &outcome.reason,
+                ));
             }
             // An approval authorizes THAT operation, not a similar one run
             // wherever the context's cwd has drifted to since the ask was
@@ -899,13 +903,14 @@ mod tests {
             .await
             .expect_err("an uncovered shell_write submission must escalate and return \
                          immediately, nothing run");
-        match pending {
-            McpError::Protocol(ref msg) => assert!(
-                msg.contains("waiting for approval"),
-                "expected the pending headline, got: {msg}"
-            ),
-            other => panic!("expected a Protocol pending refusal, got {other:?}"),
-        }
+        assert!(
+            pending.is_refusal(RefusalKind::Pending),
+            "an open ask is a pending verdict, not a fault: {pending:?}"
+        );
+        assert!(
+            pending.as_refusal().and_then(|r| r.ask_id().map(str::to_owned)).is_some(),
+            "the caller gets the ask id as a handle, not as prose: {pending:?}"
+        );
 
         answer_pending_ask(d.kernel_db().clone(), true);
 
@@ -1068,13 +1073,10 @@ mod tests {
             .call_tool(call_write("echo nobody-answers"), &cc, CancellationToken::new())
             .await
             .expect_err("an unanswered gate must refuse immediately, never hang or silently run");
-        match err {
-            McpError::Protocol(msg) => assert!(
-                msg.contains("waiting for approval"),
-                "an unanswered gate must say it is waiting, distinguishably from a hard denial: {msg}"
-            ),
-            other => panic!("expected a Protocol refusal, got {other:?}"),
-        }
+        assert!(
+            err.is_refusal(RefusalKind::Pending),
+            "an unanswered gate is waiting, distinguishably from a hard denial: {err:?}"
+        );
     }
 
     /// **Slice 1 spec test.** A multi-statement `shell_write` submission a
@@ -1106,8 +1108,8 @@ mod tests {
             .await
             .expect_err("an uncovered submission must escalate and return immediately, nothing run");
         assert!(
-            matches!(pending, McpError::Protocol(ref msg) if msg.contains("waiting for approval")),
-            "expected the pending headline, got {pending:?}"
+            pending.is_refusal(RefusalKind::Pending),
+            "expected a pending verdict, got {pending:?}"
         );
 
         answer_pending_ask(d.kernel_db().clone(), false);
@@ -1120,13 +1122,10 @@ mod tests {
             )
             .await
             .expect_err("a denied gate must refuse the whole submission, not run any of it");
-        match err {
-            McpError::Protocol(msg) => assert!(
-                msg.to_lowercase().contains("denied"),
-                "refusal must say WHY (denied, not merely unavailable): {msg}"
-            ),
-            other => panic!("expected a Protocol refusal, got {other:?}"),
-        }
+        assert!(
+            err.is_refusal(RefusalKind::Denied),
+            "a human's no is a denial, never merely unavailable: {err:?}"
+        );
     }
 
     /// **Slice 1 spec test — required.** `kj ledger` (the SAME verb `kj cc
@@ -1153,7 +1152,13 @@ mod tests {
             )
             .await
             .expect_err("an uncovered submission must escalate and return immediately, nothing run");
-        assert!(matches!(pending, McpError::Protocol(_)));
+        // The id comes back on the refusal itself. Recovering it by
+        // splitting a `kj ledger list` line — which this test used to do —
+        // is the symptom the refusal shape exists to remove.
+        let request_id = pending
+            .as_refusal()
+            .and_then(|r| r.ask_id().map(str::to_owned))
+            .expect("a pending gate hands the caller its ask id");
 
         let ledger_caller = test_caller();
         let listing = d
@@ -1164,13 +1169,11 @@ mod tests {
             "kj ledger list must show the shell_write ask: {}",
             listing.message()
         );
-        let request_id = listing
-            .message()
-            .lines()
-            .find(|l| l.contains("shell_gate"))
-            .and_then(|l| l.split_whitespace().next())
-            .expect("request id is the first column")
-            .to_string();
+        assert!(
+            listing.message().contains(&request_id),
+            "the id the caller was handed must be the id the ledger lists: {}",
+            listing.message()
+        );
 
         let allow = d
             .dispatch(
@@ -1233,7 +1236,10 @@ mod tests {
             .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
             .await
             .expect_err("an uncovered submission must escalate and return immediately, nothing run");
-        assert!(matches!(pending, McpError::Protocol(_)));
+        assert!(
+            pending.is_refusal(RefusalKind::Pending),
+            "an uncovered submission escalates to an open ask: {pending:?}"
+        );
 
         answer_pending_ask(d.kernel_db().clone(), true);
 
@@ -1679,7 +1685,10 @@ mod tests {
             .call_tool(call_write("id"), &cc, CancellationToken::new())
             .await
             .expect_err("an uncovered submission must escalate and return immediately, nothing run");
-        assert!(matches!(pending, McpError::Protocol(_)));
+        assert!(
+            pending.is_refusal(RefusalKind::Pending),
+            "an uncovered submission escalates to an open ask: {pending:?}"
+        );
 
         answer_pending_ask(d.kernel_db().clone(), true);
 

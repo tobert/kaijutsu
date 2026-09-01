@@ -499,6 +499,25 @@ not require reconstructing a string byte-for-byte. See
   `Denied` for the same reason. Make the split **once**, as one distinction
   applied at both layers, rather than twice.
 
+### In progress — `docs/gate-shape-b.md` is the build
+
+That document is canonical for the work and carries the wire shape (a union
+per method, because capnp rejects one declared inline in a result list), the
+slices, and three findings from the current source that change it:
+
+- **A mandatory `HookId` kept the model's own shell path off the type.** The
+  gate variants of `McpError` each required a hook id and the direct
+  `shell_write` gate has none, so it reported every verdict as
+  `McpError::Protocol` — a fault variant. Fixed: the three collapse to
+  `McpError::Refused(Refusal)`, whose subject may be empty.
+- **The ask id was born as prose** in `GateOutcome::ask_description()`, from a
+  typed `AskRef` one line above it.
+- **A decided ask outlives its cwd pin.** Reachable today: a human approves, the
+  kernel restarts (the boot sweep spares a decided ask, but the pin is a
+  process-lifetime map), the caller retries, and the approved command runs in
+  whatever directory the context is at now. **Ruled: record the cwd on the ask
+  and delete the pin map.**
+
 ## A secret source that runs a command has no home yet (2026-08-31)
 
 `mcp.toml` env values now resolve from a file or a named environment variable

@@ -19,10 +19,10 @@
 //!   the convention for synthetic tool names; no real instance should
 //!   advertise tools in that namespace.
 //!
-//! `HookAction::Deny(String)` carries a reason message; the broker
-//! discards the message content in the LLM-visible path and returns
-//! `McpError::Denied { by_hook: <id> }` (D-28 channel discipline). The
-//! reason lands only in tracing events.
+//! `HookAction::Deny(String)` carries a reason message, and the broker
+//! puts it on the refusal the model reads as well as in the journal. A
+//! refusal that names no reason is indistinguishable from a control that
+//! broke — see `docs/gate-and-shell-split.md`.
 //!
 //! `HookAction::Log(LogSpec)` emits a `tracing::event!`, NOT a
 //! Notification block (D-48). LLM-visible audit is achieved by an
@@ -45,9 +45,9 @@
 //! `Origin::Hook`) — see `docs/gate-and-shell-split.md`, "The shared seam".
 //! Like `Kaish`, `ListTools` rejects `Ask` at `hook_add` (D-56): a
 //! list-filter can't block-wait per tool. A real "no" terminates as
-//! `McpError::Denied`; a gate with no `KjDispatcher` wired or nobody
-//! answering in time terminates as `McpError::GateUnavailable` instead — a
-//! broken control, not a verdict. Both still fail closed.
+//! `McpError::denied_by_hook`; a gate with no `KjDispatcher` wired or
+//! nobody answering in time terminates as `McpError::gate_unavailable`
+//! instead — a broken control, not a verdict. Both still fail closed.
 
 use std::sync::Arc;
 
@@ -142,16 +142,15 @@ pub struct AskSpec {
 /// an error, block on a permission ask, or observe and continue (§4.3).
 ///
 /// `Deny` carries a `String` reason rather than `McpError`. The broker
-/// converts denials uniformly to `McpError::Denied { by_hook }` at the
-/// LLM boundary (D-28); the reason string is tracing-only.
+/// converts denials uniformly to one refusal shape at the LLM boundary
+/// (D-28), carrying the reason with them.
 ///
-/// `Ask` terminates as `McpError::Denied` when a subscriber actually
+/// `Ask` terminates as `McpError::denied_by_hook` when a subscriber actually
 /// answers "no" — a real verdict, same D-28 channel as `Deny`. When the
 /// fail-closed default fires instead (no subscriber attached, or nobody
-/// answered in time), it terminates as `McpError::GateUnavailable` —
-/// distinct on purpose (Amy, 2026-08-17, `docs/gate-and-shell-split.md`):
-/// both refuse the call, but only one of them is a decision. See
-/// `super::permission` (D-57).
+/// answered in time), it terminates as `McpError::gate_unavailable` —
+/// distinct on purpose: both refuse the call, but only one of them is a
+/// decision. See `super::permission` (D-57).
 #[derive(Clone, Debug)]
 pub enum HookAction {
     Invoke(HookBody),

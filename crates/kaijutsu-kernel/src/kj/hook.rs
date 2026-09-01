@@ -630,9 +630,9 @@ mod tests {
     use super::*;
     use crate::kj::test_helpers;
     use crate::mcp::context::CallContext;
-    use crate::mcp::error::McpError;
     use crate::mcp::types::KernelCallParams;
     use crate::mcp::InstanceId;
+    use kaijutsu_types::RefusalKind;
     use tokio_util::sync::CancellationToken;
 
     fn s(x: &str) -> String {
@@ -730,7 +730,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, McpError::Denied { by_hook } if by_hook.0 == "lockout"),
+            err.is_refusal_from(RefusalKind::Denied, "lockout"),
             "expected the MCP path to be locked out before recovery, got {err:?}",
         );
 

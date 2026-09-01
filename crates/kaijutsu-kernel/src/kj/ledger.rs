@@ -2183,7 +2183,7 @@ mod tests {
             third.reason
         );
         let ask3 = third.ask.expect("an auto-decided ask still gets a durable row");
-        assert_eq!(ask3.status, approval_ledger::types::ApprovalStatus::Allowed);
+        assert_eq!(ask3.status, kaijutsu_types::AskStatus::Allowed);
     }
 
     /// A `kj cc send`-shaped ask has a free `MESSAGE` variable, so

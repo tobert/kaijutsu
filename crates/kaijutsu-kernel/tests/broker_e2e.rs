@@ -27,7 +27,7 @@ use kaijutsu_kernel::mcp::{
 use kaijutsu_kernel::Kernel;
 use kaijutsu_types::{
     now_millis, BlockFilter, BlockKind, ContextId, KernelId, NotificationKind, PrincipalId,
-    SessionId,
+    RefusalKind, SessionId,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -1721,7 +1721,7 @@ async fn hooks_persist_across_kernel_restart() {
         .await
         .expect_err("PreCall Deny should block the call");
     assert!(
-        matches!(&err_a, McpError::Denied { by_hook } if by_hook.0 == "no-block-tools"),
+        err_a.is_refusal_from(RefusalKind::Denied, "no-block-tools"),
         "kernel A should Deny with by_hook=no-block-tools, got {err_a:?}",
     );
 
@@ -1784,7 +1784,7 @@ async fn hooks_persist_across_kernel_restart() {
         .await
         .expect_err("hook should have survived restart");
     assert!(
-        matches!(&err_b, McpError::Denied { by_hook } if by_hook.0 == "no-block-tools"),
+        err_b.is_refusal_from(RefusalKind::Denied, "no-block-tools"),
         "kernel B should Deny with by_hook=no-block-tools after hydrate, got {err_b:?}",
     );
 

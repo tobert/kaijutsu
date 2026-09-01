@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use std::collections::HashSet;
 
-use kaijutsu_types::{BlockId, ContextId, NotificationPayload, ResourcePayload};
+use kaijutsu_types::{AskRef, BlockId, ContextId, NotificationPayload, RefusalKind, ResourcePayload};
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -208,18 +208,21 @@ enum PermissionAskOutcome {
     /// A durable ask is recorded and nobody has answered yet. Nothing ran,
     /// and nothing is waiting — the call returns now and the action runs
     /// when the answer lands. Distinct from `Denied` and `Unavailable`
-    /// because the three teach a model three different next moves.
-    Pending(String),
+    /// because the three teach a model three different next moves. `ask`
+    /// is the durable row this outcome belongs to.
+    Pending { reason: String, ask: Option<AskRef> },
     /// The gate resolved `Allowed`. The call proceeds.
     Proceed,
     /// The gate resolved `Denied` — a real verdict. `reason` is
     /// tracing/hook-visible prose, not shown to the model directly.
-    Denied(String),
+    Denied { reason: String, ask: Option<AskRef> },
     /// The gate resolved `Unavailable`, or no `KjDispatcher` was wired at
     /// all. Both mean "the gate could not do its job" to a caller deciding
     /// what to do next, so they collapse to one variant here; `reason`
-    /// keeps the specific flavor for tracing.
-    Unavailable(String),
+    /// keeps the specific flavor for tracing. `ask` is `None` when the
+    /// fault happened before anything durable existed (no dispatcher at
+    /// all).
+    Unavailable { reason: String, ask: Option<AskRef> },
 }
 
 /// What `run_kaish_hook` decided from one `HookBody::Kaish` run. Amy's
@@ -312,6 +315,7 @@ fn unreadable_hook_body_outcome(
     PhaseOutcome::Deny {
         hook_id: hook_id.clone(),
         reason: format!("kaish hook body at {path:?} could not be read: {err}"),
+        ask: None,
     }
 }
 
@@ -327,8 +331,8 @@ pub enum ShellHookVerdict {
     /// A hook produced a synthetic result in lieu of the real command —
     /// the caller must use this instead of running/having run anything.
     ShortCircuit(KernelToolResult),
-    /// A real "no" (`McpError::Denied`) or a broken control
-    /// (`McpError::GateUnavailable`) — same distinction `call_tool` makes.
+    /// A real "no" (`RefusalKind::Denied`) or a broken control
+    /// (`RefusalKind::GateUnavailable`) — same distinction `call_tool` makes.
     Denied(McpError),
 }
 
@@ -1548,7 +1552,7 @@ impl Broker {
     /// pinch points: `PreCall` before the server call, `PostCall` on success,
     /// `OnError` on failure. ShortCircuit in any phase bypasses the server
     /// (or converts an error to a success in OnError). Deny terminates with
-    /// `McpError::Denied { by_hook }`.
+    /// `McpError::denied_by_hook`.
     ///
     /// Outer wrapper installs the per-task `HOOK_DEPTH` scope on first
     /// entry, reuses it on recursive re-entry from hook bodies so the depth
@@ -1672,31 +1676,31 @@ impl Broker {
                         emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
                         Ok(r2)
                     }
-                    PhaseOutcome::Deny { hook_id, reason } => {
+                    PhaseOutcome::Deny { hook_id, reason, ask } => {
                         emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                        Err(McpError::Denied { by_hook: hook_id })
+                        Err(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason))
                     }
-                    PhaseOutcome::GateUnavailable { hook_id, reason } => {
+                    PhaseOutcome::GateUnavailable { hook_id, reason, ask } => {
                         emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                        Err(McpError::GateUnavailable { by_hook: hook_id, reason })
+                        Err(McpError::gate_unavailable(Some(hook_id), ask, reason))
                     }
-                    PhaseOutcome::GatePending { hook_id, reason } => {
+                    PhaseOutcome::GatePending { hook_id, reason, ask } => {
                         emit_gate_pending_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                        Err(McpError::GatePending { by_hook: hook_id, reason })
+                        Err(McpError::gate_pending(Some(hook_id), ask, reason))
                     }
                 };
             }
-            PhaseOutcome::Deny { hook_id, reason } => {
+            PhaseOutcome::Deny { hook_id, reason, ask } => {
                 emit_deny_attribution(McpHookPhase::PreCall, &hook_id, &reason);
-                return Err(McpError::Denied { by_hook: hook_id });
+                return Err(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason));
             }
-            PhaseOutcome::GateUnavailable { hook_id, reason } => {
+            PhaseOutcome::GateUnavailable { hook_id, reason, ask } => {
                 emit_gate_unavailable_attribution(McpHookPhase::PreCall, &hook_id, &reason);
-                return Err(McpError::GateUnavailable { by_hook: hook_id, reason });
+                return Err(McpError::gate_unavailable(Some(hook_id), ask, reason));
             }
-            PhaseOutcome::GatePending { hook_id, reason } => {
+            PhaseOutcome::GatePending { hook_id, reason, ask } => {
                 emit_gate_pending_attribution(McpHookPhase::PreCall, &hook_id, &reason);
-                return Err(McpError::GatePending { by_hook: hook_id, reason });
+                return Err(McpError::gate_pending(Some(hook_id), ask, reason));
             }
         }
 
@@ -1755,17 +1759,17 @@ impl Broker {
                         emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
                         Ok(r2)
                     }
-                    PhaseOutcome::Deny { hook_id, reason } => {
+                    PhaseOutcome::Deny { hook_id, reason, ask } => {
                         emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                        Err(McpError::Denied { by_hook: hook_id })
+                        Err(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason))
                     }
-                    PhaseOutcome::GateUnavailable { hook_id, reason } => {
+                    PhaseOutcome::GateUnavailable { hook_id, reason, ask } => {
                         emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                        Err(McpError::GateUnavailable { by_hook: hook_id, reason })
+                        Err(McpError::gate_unavailable(Some(hook_id), ask, reason))
                     }
-                    PhaseOutcome::GatePending { hook_id, reason } => {
+                    PhaseOutcome::GatePending { hook_id, reason, ask } => {
                         emit_gate_pending_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                        Err(McpError::GatePending { by_hook: hook_id, reason })
+                        Err(McpError::gate_pending(Some(hook_id), ask, reason))
                     }
                 }
             }
@@ -1782,9 +1786,9 @@ impl Broker {
 
     /// Run `OnError` and return either a short-circuited success (converting
     /// the error) or the original error. `Deny` on the error path still
-    /// returns `McpError::Denied { by_hook }` — a denial overrides the
+    /// returns `McpError::denied_by_hook` — a denial overrides the
     /// original error in the attribution channel. An `Ask` that never
-    /// reached a verdict overrides it with `McpError::GateUnavailable`
+    /// reached a verdict overrides it with `McpError::gate_unavailable`
     /// instead, same override, honest reason.
     async fn run_on_error_then_err(
         &self,
@@ -1801,17 +1805,17 @@ impl Broker {
                 emit_short_circuit_attribution(McpHookPhase::OnError, &hook_id);
                 Ok(result)
             }
-            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+            Ok(PhaseOutcome::Deny { hook_id, reason, ask }) => {
                 emit_deny_attribution(McpHookPhase::OnError, &hook_id, &reason);
-                Err(McpError::Denied { by_hook: hook_id })
+                Err(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason))
             }
-            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::OnError, &hook_id, &reason);
-                Err(McpError::GateUnavailable { by_hook: hook_id, reason })
+                Err(McpError::gate_unavailable(Some(hook_id), ask, reason))
             }
-            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+            Ok(PhaseOutcome::GatePending { hook_id, reason, ask }) => {
                 emit_gate_pending_attribution(McpHookPhase::OnError, &hook_id, &reason);
-                Err(McpError::GatePending { by_hook: hook_id, reason })
+                Err(McpError::gate_pending(Some(hook_id), ask, reason))
             }
             Err(eval_err) => {
                 tracing::warn!(
@@ -1932,6 +1936,7 @@ impl Broker {
                     return Ok(PhaseOutcome::Deny {
                         hook_id: entry.id,
                         reason,
+                        ask: None,
                     });
                 }
                 HookAction::ShortCircuit(result) => {
@@ -1943,22 +1948,25 @@ impl Broker {
                 HookAction::Ask(spec) => {
                     match self.run_permission_ask(&entry.id, &spec, params, ctx).await {
                         PermissionAskOutcome::Proceed => {}
-                        PermissionAskOutcome::Denied(reason) => {
+                        PermissionAskOutcome::Denied { reason, ask } => {
                             return Ok(PhaseOutcome::Deny {
                                 hook_id: entry.id,
                                 reason,
+                                ask,
                             });
                         }
-                        PermissionAskOutcome::Unavailable(reason) => {
+                        PermissionAskOutcome::Unavailable { reason, ask } => {
                             return Ok(PhaseOutcome::GateUnavailable {
                                 hook_id: entry.id,
                                 reason,
+                                ask,
                             });
                         }
-                        PermissionAskOutcome::Pending(reason) => {
+                        PermissionAskOutcome::Pending { reason, ask } => {
                             return Ok(PhaseOutcome::GatePending {
                                 hook_id: entry.id,
                                 reason,
+                                ask,
                             });
                         }
                     }
@@ -1974,6 +1982,7 @@ impl Broker {
                                 reason: format!(
                                     "hook body `{name}` returned error: {e}"
                                 ),
+                                ask: None,
                             });
                         }
                     }
@@ -2034,13 +2043,13 @@ impl Broker {
     /// ledger's `claim` + `decide` transaction, exactly one answerer wins.
     ///
     /// Returns `PermissionAskOutcome::Proceed` when the gate resolves
-    /// `Allowed`; `Denied(reason)` when it resolves `Denied` — a real
-    /// verdict; and `Unavailable(reason)` when it resolves `Unavailable`
-    /// (Amy's ruling, 2026-08-17: "gate unavailable" and "denied" must be
-    /// distinguishable to a model — see `McpError::GateUnavailable`) or
-    /// when no `KjDispatcher` is wired at all (a bare `Broker::new()` in a
-    /// unit test, or a bootstrap ordering bug — there is nowhere to run
-    /// the gate, so this fails the same way an expired/faulted gate does).
+    /// `Allowed`; `Denied` when it resolves `Denied` — a real verdict; and
+    /// `Unavailable` when it resolves `Unavailable` (gate unavailable and
+    /// denied must stay distinguishable to a model — see
+    /// `McpError::gate_unavailable`) or when no `KjDispatcher` is wired at
+    /// all (a bare `Broker::new()` in a unit test, or a bootstrap ordering
+    /// bug — there is nowhere to run the gate, so this fails the same way
+    /// an expired/faulted gate does).
     ///
     /// **"Nobody was notified" is no longer the same as "nobody can
     /// answer."** The old no-subscriber fail-closed default refused
@@ -2079,9 +2088,11 @@ impl Broker {
                 "permission ask fired with no KjDispatcher wired (Broker::set_kj_dispatcher never \
                  called, or a bare Broker::new() in a test); refusing (fail-closed, gate unavailable)",
             );
-            return PermissionAskOutcome::Unavailable(
-                "permission ask: no kj dispatcher wired (fail-closed, gate unavailable)".into(),
-            );
+            return PermissionAskOutcome::Unavailable {
+                reason: "permission ask: no kj dispatcher wired (fail-closed, gate unavailable)"
+                    .into(),
+                ask: None,
+            };
         };
 
         let caller = crate::kj::KjCaller {
@@ -2124,11 +2135,14 @@ impl Broker {
                     ask = %outcome.ask_description(),
                     "permission ask denied",
                 );
-                PermissionAskOutcome::Denied(format!(
-                    "permission ask: denied [{}]: {}",
-                    outcome.ask_description(),
-                    outcome.reason
-                ))
+                PermissionAskOutcome::Denied {
+                    reason: format!(
+                        "permission ask: denied [{}]: {}",
+                        outcome.ask_description(),
+                        outcome.reason
+                    ),
+                    ask: outcome.ask.clone(),
+                }
             }
             crate::kj::gate::GateVerdict::Unavailable => {
                 tracing::warn!(
@@ -2141,9 +2155,12 @@ impl Broker {
                     reason = %outcome.reason,
                     "permission ask gate unavailable; refusing (fail-closed)",
                 );
-                // Same layering as Pending below: `McpError::GateUnavailable`
+                // Same layering as Pending below: `McpError::gate_unavailable`
                 // already says the control was broken and names the hook.
-                PermissionAskOutcome::Unavailable(outcome.ask_summary())
+                PermissionAskOutcome::Unavailable {
+                    reason: outcome.ask_summary(),
+                    ask: outcome.ask.clone(),
+                }
             }
             crate::kj::gate::GateVerdict::Pending => {
                 tracing::debug!(
@@ -2156,10 +2173,13 @@ impl Broker {
                     "permission ask recorded; waiting for a human (nothing ran)",
                 );
                 // Each layer adds what the one outside it does not have.
-                // `McpError::GatePending` already says a human is being
+                // `McpError::gate_pending` already says a human is being
                 // waited on and names the hook; this layer's new information
                 // is WHICH ask, and the reason carries what to do about it.
-                PermissionAskOutcome::Pending(outcome.ask_summary())
+                PermissionAskOutcome::Pending {
+                    reason: outcome.ask_summary(),
+                    ask: outcome.ask.clone(),
+                }
             }
         }
     }
@@ -2206,7 +2226,7 @@ impl Broker {
                 // rather than deny. `run_permission_ask` below performs the
                 // same `kj_dispatcher()` lookup and, finding nothing either,
                 // resolves this to `PermissionAskOutcome::Unavailable` →
-                // `McpError::GateUnavailable` — never `Denied`.
+                // `McpError::gate_unavailable` — never `denied_by_hook`.
                 return KaishHookOutcome::Escalate(
                     "kaish hook requires Broker::set_kj_dispatcher; not wired".to_string(),
                 );
@@ -2417,21 +2437,23 @@ impl Broker {
     ) -> Option<PhaseOutcome> {
         match outcome {
             KaishHookOutcome::Continue => None,
-            KaishHookOutcome::Deny(reason) => Some(PhaseOutcome::Deny { hook_id, reason }),
+            KaishHookOutcome::Deny(reason) => {
+                Some(PhaseOutcome::Deny { hook_id, reason, ask: None })
+            }
             KaishHookOutcome::Escalate(description) => {
                 let ask_spec = AskSpec {
                     description: Some(description),
                 };
                 match self.run_permission_ask(&hook_id, &ask_spec, params, ctx).await {
                     PermissionAskOutcome::Proceed => None,
-                    PermissionAskOutcome::Denied(reason) => {
-                        Some(PhaseOutcome::Deny { hook_id, reason })
+                    PermissionAskOutcome::Denied { reason, ask } => {
+                        Some(PhaseOutcome::Deny { hook_id, reason, ask })
                     }
-                    PermissionAskOutcome::Unavailable(reason) => {
-                        Some(PhaseOutcome::GateUnavailable { hook_id, reason })
+                    PermissionAskOutcome::Unavailable { reason, ask } => {
+                        Some(PhaseOutcome::GateUnavailable { hook_id, reason, ask })
                     }
-                    PermissionAskOutcome::Pending(reason) => {
-                        Some(PhaseOutcome::GatePending { hook_id, reason })
+                    PermissionAskOutcome::Pending { reason, ask } => {
+                        Some(PhaseOutcome::GatePending { hook_id, reason, ask })
                     }
                 }
             }
@@ -2479,7 +2501,7 @@ impl Broker {
     /// `Proceed` runs the command normally, `ShortCircuit` substitutes the
     /// synthetic result and never runs the command, `Denied` refuses the
     /// call outright (a real "no" or a broken control — see
-    /// `McpError::Denied` vs `McpError::GateUnavailable`).
+    /// `RefusalKind::Denied` vs `RefusalKind::GateUnavailable`).
     pub async fn shell_pre_call_hooks(
         &self,
         command: &str,
@@ -2495,17 +2517,17 @@ impl Broker {
                 emit_short_circuit_attribution(McpHookPhase::PreCall, &hook_id);
                 ShellHookVerdict::ShortCircuit(result)
             }
-            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+            Ok(PhaseOutcome::Deny { hook_id, reason, ask }) => {
                 emit_deny_attribution(McpHookPhase::PreCall, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::Denied { by_hook: hook_id })
+                ShellHookVerdict::Denied(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason))
             }
-            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::PreCall, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+                ShellHookVerdict::Denied(McpError::gate_unavailable(Some(hook_id), ask, reason))
             }
-            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+            Ok(PhaseOutcome::GatePending { hook_id, reason, ask }) => {
                 emit_gate_pending_attribution(McpHookPhase::PreCall, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::GatePending { by_hook: hook_id, reason })
+                ShellHookVerdict::Denied(McpError::gate_pending(Some(hook_id), ask, reason))
             }
             Err(e) => ShellHookVerdict::Denied(e),
         }
@@ -2536,17 +2558,17 @@ impl Broker {
                 emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
                 ShellHookVerdict::ShortCircuit(result)
             }
-            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+            Ok(PhaseOutcome::Deny { hook_id, reason, ask }) => {
                 emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::Denied { by_hook: hook_id })
+                ShellHookVerdict::Denied(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason))
             }
-            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+                ShellHookVerdict::Denied(McpError::gate_unavailable(Some(hook_id), ask, reason))
             }
-            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+            Ok(PhaseOutcome::GatePending { hook_id, reason, ask }) => {
                 emit_gate_pending_attribution(McpHookPhase::PostCall, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::GatePending { by_hook: hook_id, reason })
+                ShellHookVerdict::Denied(McpError::gate_pending(Some(hook_id), ask, reason))
             }
             Err(e) => ShellHookVerdict::Denied(e),
         }
@@ -2582,17 +2604,17 @@ impl Broker {
                 emit_short_circuit_attribution(McpHookPhase::OnError, &hook_id);
                 ShellHookVerdict::ShortCircuit(result)
             }
-            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+            Ok(PhaseOutcome::Deny { hook_id, reason, ask }) => {
                 emit_deny_attribution(McpHookPhase::OnError, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::Denied { by_hook: hook_id })
+                ShellHookVerdict::Denied(McpError::refused_gate(RefusalKind::Denied, &hook_id.0, ask, &reason))
             }
-            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::OnError, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::GateUnavailable { by_hook: hook_id, reason })
+                ShellHookVerdict::Denied(McpError::gate_unavailable(Some(hook_id), ask, reason))
             }
-            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+            Ok(PhaseOutcome::GatePending { hook_id, reason, ask }) => {
                 emit_gate_pending_attribution(McpHookPhase::OnError, &hook_id, &reason);
-                ShellHookVerdict::Denied(McpError::GatePending { by_hook: hook_id, reason })
+                ShellHookVerdict::Denied(McpError::gate_pending(Some(hook_id), ask, reason))
             }
             Err(e) => ShellHookVerdict::Denied(e),
         }
@@ -2830,15 +2852,15 @@ impl Broker {
                 emit_short_circuit_attribution(McpHookPhase::OnNotification, &hook_id);
                 return;
             }
-            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+            Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
                 emit_deny_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
                 return;
             }
-            Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
                 emit_gate_unavailable_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
                 return;
             }
-            Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+            Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
                 emit_gate_pending_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
                 return;
             }
@@ -2970,22 +2992,40 @@ enum PhaseOutcome {
         result: KernelToolResult,
     },
     /// A `Deny` hook matched, or an `Ask` hook's subscriber answered "no".
-    /// `reason` is tracing-only; the LLM-visible error is
-    /// `McpError::Denied { by_hook }` (D-28 channel discipline).
-    Deny { hook_id: HookId, reason: String },
+    /// `reason` reaches the model on the refusal: a verdict delivered
+    /// without one reads exactly like a broken control, and there is no
+    /// adversary inside the trust boundary to withhold it from
+    /// (`docs/gate-and-shell-split.md`). `ask` is the durable ask this deny
+    /// came from, and `None` for a hook body that denied outright with no
+    /// gate involved.
+    Deny {
+        hook_id: HookId,
+        reason: String,
+        ask: Option<AskRef>,
+    },
     /// An `Ask` hook fired but never reached a verdict — no subscriber
     /// attached, or nobody answered in time. Distinct from `Deny` so the
-    /// LLM-visible error is `McpError::GateUnavailable`, not
-    /// `McpError::Denied` (Amy, 2026-08-17: "gate unavailable" and "denied"
-    /// must be distinguishable to a model — `docs/gate-and-shell-split.md`).
-    /// `reason` is tracing-only, same discipline as `Deny`.
-    GateUnavailable { hook_id: HookId, reason: String },
+    /// LLM-visible error is built by `McpError::gate_unavailable`, not
+    /// `McpError::denied_by_hook` — gate unavailable and denied must stay
+    /// distinguishable to a model (`docs/gate-and-shell-split.md`).
+    /// `reason` reaches the model, same as `Deny`; `ask` is the durable
+    /// row, when the gate got far enough to record one.
+    GateUnavailable {
+        hook_id: HookId,
+        reason: String,
+        ask: Option<AskRef>,
+    },
     /// An `Ask` hook fired, its ask committed, and nobody has answered yet.
     /// Nothing ran and nothing waited — the gate does not block. Distinct
     /// from both neighbours because the three answer different questions:
     /// somebody said no, the control is broken, the question is open.
-    /// LLM-visible as `McpError::GatePending`; `reason` is tracing-only.
-    GatePending { hook_id: HookId, reason: String },
+    /// LLM-visible via `McpError::gate_pending`, carrying `reason` and the
+    /// `ask` naming the durable row a human answers.
+    GatePending {
+        hook_id: HookId,
+        reason: String,
+        ask: Option<AskRef>,
+    },
 }
 
 /// Per-phase payload for hook evaluation. Carries the data a phase observes
@@ -3062,18 +3102,32 @@ fn error_to_hook_json(e: &McpError) -> String {
         McpError::Protocol(_) => ("Protocol", serde_json::Value::Null),
         McpError::Io(_) => ("Io", serde_json::Value::Null),
         McpError::Cancelled => ("Cancelled", serde_json::Value::Null),
-        McpError::Denied { by_hook } => (
-            "Denied",
-            serde_json::json!({"by_hook": by_hook.to_string()}),
-        ),
-        McpError::GateUnavailable { by_hook, reason } => (
-            "GateUnavailable",
-            serde_json::json!({"by_hook": by_hook.to_string(), "reason": reason}),
-        ),
-        McpError::GatePending { by_hook, reason } => (
-            "GatePending",
-            serde_json::json!({"by_hook": by_hook.to_string(), "reason": reason}),
-        ),
+        McpError::Refused(r) => {
+            // Every `McpError::Refused` is composed by `refused_gate`, so
+            // only the gate's three kinds reach this arm today. The
+            // capability kinds are named anyway: the match is exhaustive
+            // over `RefusalKind`, which is what makes a new kind a compile
+            // error here rather than a silently mistagged log line.
+            //
+            // The tags keep their old spelling so a consumer reading these
+            // journal entries still sees the same three-way split.
+            let kind = match r.kind {
+                RefusalKind::Denied => "Denied",
+                RefusalKind::Pending => "GatePending",
+                RefusalKind::GateUnavailable => "GateUnavailable",
+                RefusalKind::CapabilityDenied => "CapabilityDenied",
+                RefusalKind::FacadeDenied => "FacadeDenied",
+                RefusalKind::LoadoutDenied => "LoadoutDenied",
+            };
+            (
+                kind,
+                serde_json::json!({
+                    "subject": r.subject,
+                    "reason": r.reason,
+                    "ask_id": r.ask_id(),
+                }),
+            )
+        }
         McpError::CapabilityDenied { instance, tool } => (
             "CapabilityDenied",
             serde_json::json!({"instance": instance.as_str(), "tool": tool}),
@@ -3224,8 +3278,8 @@ fn emit_short_circuit_attribution(phase: McpHookPhase, hook_id: &HookId) {
     );
 }
 
-/// Tracing attribution for a `Deny` result. The inner `reason` is recorded
-/// here; the LLM only sees `McpError::Denied { by_hook }` (D-28).
+/// Tracing attribution for a `Deny` result. The journal keeps the full
+/// record; the model gets the same `reason` on the refusal itself.
 fn emit_deny_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
     tracing::info!(
         hook_id = %format!("hook:{hook_id}"),
@@ -3501,7 +3555,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
-                    Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                    Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
                         emit_deny_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
@@ -3509,7 +3563,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
-                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
                         emit_gate_unavailable_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
@@ -3517,7 +3571,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
-                    Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                    Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
                         emit_gate_pending_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
@@ -3587,7 +3641,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
-                    Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                    Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
                         emit_deny_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
@@ -3595,7 +3649,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
-                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason }) => {
+                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
                         emit_gate_unavailable_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
@@ -3603,7 +3657,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                         );
                         continue;
                     }
-                    Ok(PhaseOutcome::GatePending { hook_id, reason }) => {
+                    Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
                         emit_gate_pending_attribution(
                             McpHookPhase::OnNotification,
                             &hook_id,
@@ -5882,7 +5936,8 @@ mod tests {
     }
 
     /// Exit #2: a PreCall Deny blocks a call end-to-end — the server is
-    /// never invoked and the caller sees `McpError::Denied { by_hook }`.
+    /// never invoked and the caller sees a `RefusalKind::Denied` refusal
+    /// naming the hook.
     #[tokio::test]
     async fn pre_call_deny_blocks_call() {
         let broker = Arc::new(Broker::new());
@@ -5924,7 +5979,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "deny-all"),
+            err.is_refusal_from(RefusalKind::Denied, "deny-all"),
             "expected Denied(by_hook=deny-all), got {err:?}",
         );
         assert!(
@@ -6191,7 +6246,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(foo_err, McpError::Denied { ref by_hook } if by_hook.0 == "foo-only"),
+            foo_err.is_refusal_from(RefusalKind::Denied, "foo-only"),
             "glob.test/foo should match; got {foo_err:?}"
         );
 
@@ -6234,7 +6289,7 @@ mod tests {
             .call_tool(params("svc", "t"), &matching, CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, McpError::Denied { .. }));
+        assert!(err.is_refusal(RefusalKind::Denied));
 
         let other = CallContext::test();
         let ok = broker
@@ -6288,7 +6343,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "high"),
+            err.is_refusal_from(RefusalKind::Denied, "high"),
             "priority=-1 must fire before priority=0; got {err:?}",
         );
     }
@@ -6697,9 +6752,9 @@ mod tests {
 
         // The inner recursion hits HookRecursionLimit; the middle Invoke
         // converts it to a Deny (per evaluate_phase semantics). The outer
-        // caller sees McpError::Denied.
+        // caller sees a `RefusalKind::Denied` refusal.
         assert!(
-            matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "recur"),
+            err.is_refusal_from(RefusalKind::Denied, "recur"),
             "expected recursion to surface as Denied(by_hook=recur); got {err:?}",
         );
     }
@@ -6805,9 +6860,9 @@ mod tests {
     }
 
     /// A `HookBody::Kaish` pre_call hook that exits 0 lets the call
-    /// proceed; one that exits non-zero produces `McpError::Denied`.
-    /// Exercises end-to-end: kernel + broker wired, kaish hook fires,
-    /// exit code → outcome.
+    /// proceed; one that exits non-zero produces a `RefusalKind::Denied`
+    /// refusal. Exercises end-to-end: kernel + broker wired, kaish hook
+    /// fires, exit code → outcome.
     #[tokio::test]
     async fn kaish_pre_call_hook_allows_and_denies() {
         // Hooks materialize their shell through the `kj` dispatcher, so wire one.
@@ -6863,7 +6918,7 @@ mod tests {
             .await
             .expect_err("kaish exit 1 hook must deny");
         assert!(
-            matches!(err, McpError::Denied { .. }),
+            err.is_refusal(RefusalKind::Denied),
             "expected Denied, got {err:?}"
         );
     }
@@ -6905,7 +6960,7 @@ mod tests {
             .await
             .expect_err("an exit-3 escalation must return immediately with nothing run");
         assert!(
-            matches!(pending, McpError::GatePending { .. }),
+            pending.is_refusal(RefusalKind::Pending),
             "expected GatePending, got {pending:?}"
         );
 
@@ -6919,9 +6974,9 @@ mod tests {
     }
 
     /// Same escalation, answered `deny` — a REAL verdict this time
-    /// (`McpError::Denied`, not `GateUnavailable`), because a human actually
-    /// looked at it and said no. Same "call, answer, call again" shape as
-    /// the allow case above.
+    /// (`RefusalKind::Denied`, not `GateUnavailable`), because a human
+    /// actually looked at it and said no. Same "call, answer, call again"
+    /// shape as the allow case above.
     #[tokio::test]
     async fn kaish_hook_exit_3_escalates_and_deny_answer_denies() {
         let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-exit3-deny").await;
@@ -6949,7 +7004,7 @@ mod tests {
             .await
             .expect_err("an exit-3 escalation must return immediately with nothing run");
         assert!(
-            matches!(pending, McpError::GatePending { .. }),
+            pending.is_refusal(RefusalKind::Pending),
             "expected GatePending, got {pending:?}"
         );
 
@@ -6960,7 +7015,7 @@ mod tests {
             .await
             .expect_err("a denied escalation must deny the call");
         assert!(
-            matches!(err, McpError::Denied { .. }),
+            err.is_refusal(RefusalKind::Denied),
             "expected Denied, got {err:?}"
         );
     }
@@ -7027,7 +7082,7 @@ mod tests {
             .await
             .expect_err("the edited body (now exit 1) must deny the call");
         assert!(
-            matches!(err, McpError::Denied { .. }),
+            err.is_refusal(RefusalKind::Denied),
             "expected Denied, got {err:?}"
         );
     }
@@ -7036,8 +7091,8 @@ mod tests {
     /// `HookBody::KaishPath` whose file cannot be read is a `Deny` — the
     /// opposite of `HookBody::Kaish`'s fault handling, which escalates
     /// instead (see `unreadable_hook_body_outcome`). Calls `evaluate_phase`
-    /// directly so the tracing-only deny reason (never carried by
-    /// `McpError::Denied`) is observable to assert it names the path.
+    /// directly so the deny reason is observable to assert it names the
+    /// path.
     #[tokio::test]
     async fn kaish_path_hook_unreadable_path_denies_naming_the_path() {
         let (broker, _kernel, _kj) = wired_kaish_broker("kaish-path-unreadable").await;
@@ -7125,8 +7180,8 @@ mod tests {
     /// covers for `HookAction::Ask` — must ALSO escalate rather than deny.
     /// Since escalating calls `run_permission_ask`, which performs the same
     /// dispatcher lookup and finds nothing either, this resolves to
-    /// `McpError::GateUnavailable`: a broken control, never indistinguishable
-    /// from a real "no". Before this ruling this hit `McpError::Denied`.
+    /// `McpError::gate_unavailable`: a broken control, never indistinguishable
+    /// from a real "no". Before this ruling this hit `McpError::denied_by_hook`.
     #[tokio::test]
     async fn kaish_hook_fault_with_no_dispatcher_wired_is_gate_unavailable_not_denied() {
         let broker = Arc::new(Broker::new());
@@ -7153,7 +7208,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, McpError::GateUnavailable { .. }),
+            err.is_refusal(RefusalKind::GateUnavailable),
             "expected GateUnavailable (a fault, not a verdict), got {err:?}"
         );
     }
@@ -7406,7 +7461,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(err, McpError::Denied { .. }),
+                err.is_refusal(RefusalKind::Denied),
                 "expected the guard to deny {cmd:?}, got {err:?}"
             );
         }
@@ -8548,8 +8603,8 @@ mod tests {
             )
             .await;
         match verdict {
-            ShellHookVerdict::Denied(McpError::Denied { by_hook }) => {
-                assert_eq!(by_hook, hook_id("shell-post-call-always-fails"));
+            ShellHookVerdict::Denied(McpError::Refused(r)) if r.kind == RefusalKind::Denied => {
+                assert_eq!(r.subject, "shell-post-call-always-fails");
             }
             other => panic!(
                 "a failing PostCall hook body must surface as an explicit Denied verdict; \
@@ -8805,7 +8860,7 @@ mod tests {
             .await
             .expect_err("an uncovered ask must escalate and return immediately, nothing run");
         assert!(
-            matches!(pending, McpError::GatePending { .. }),
+            pending.is_refusal(RefusalKind::Pending),
             "expected GatePending, got {pending:?}"
         );
 
@@ -8819,8 +8874,9 @@ mod tests {
     }
 
     /// A hook `Ask` answered **deny** through the ledger blocks the call
-    /// as `McpError::Denied` — a real verdict, not `GateUnavailable`. Same
-    /// "call, answer, call again" shape as the allow case above.
+    /// as a `RefusalKind::Denied` refusal — a real verdict, not
+    /// `GateUnavailable`. Same "call, answer, call again" shape as the
+    /// allow case above.
     #[tokio::test]
     async fn a_hook_ask_answered_deny_blocks_the_call_as_denied() {
         let (broker, d) =
@@ -8844,7 +8900,7 @@ mod tests {
             .await
             .expect_err("an uncovered ask must escalate and return immediately, nothing run");
         assert!(
-            matches!(pending, McpError::GatePending { .. }),
+            pending.is_refusal(RefusalKind::Pending),
             "expected GatePending, got {pending:?}"
         );
 
@@ -8854,15 +8910,15 @@ mod tests {
             .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "ask-deny"));
+        assert!(err.is_refusal_from(RefusalKind::Denied, "ask-deny"));
     }
 
-    /// Nobody answers — the call returns immediately as
-    /// `McpError::GatePending`, distinguishable from both a human's
-    /// `Denied` and a broken control's `GateUnavailable` (Amy's ruling,
-    /// 2026-08-22, `docs/gate-resume.md`): the question is open and
-    /// nothing ran. There is nothing left to time out — `run_gate` never
-    /// waits — so this is a rename of the old
+    /// Nobody answers — the call returns immediately as a
+    /// `McpError::gate_pending` refusal, distinguishable from both a
+    /// human's `Denied` and a broken control's `GateUnavailable`
+    /// (`docs/gate-resume.md`): the question is open and nothing ran.
+    /// There is nothing left to time out — `run_gate` never waits — so
+    /// this is a rename of the old
     /// `an_unanswered_hook_ask_expires_as_gate_unavailable`, not a new
     /// behavior.
     #[tokio::test]
@@ -8890,7 +8946,9 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            McpError::GatePending { by_hook, .. } => assert_eq!(by_hook.0, "ask-pending"),
+            McpError::Refused(r) if r.kind == RefusalKind::Pending => {
+                assert_eq!(r.subject, "ask-pending")
+            }
             other => panic!("expected GatePending, got {other:?}"),
         }
     }
@@ -8930,7 +8988,7 @@ mod tests {
             .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
             .await
             .expect_err("an uncovered ask must escalate and return immediately, nothing run");
-        assert!(matches!(pending, McpError::GatePending { .. }));
+        assert!(pending.is_refusal(RefusalKind::Pending));
 
         let db = d.kernel_db().clone();
         let request_id = {
@@ -8988,8 +9046,9 @@ mod tests {
     /// The misconfiguration case: no `KjDispatcher` wired at all (a bare
     /// `Broker::new()`, same as every other broker.rs test in this file
     /// that doesn't call `set_kj_dispatcher`) — there is nowhere to run
-    /// the gate. Refused as `GateUnavailable`, never `Denied`: nobody
-    /// rendered a verdict, the control itself was missing.
+    /// the gate. Refused as `RefusalKind::GateUnavailable`, never
+    /// `RefusalKind::Denied`: nobody rendered a verdict, the control
+    /// itself was missing.
     #[tokio::test]
     async fn a_hook_ask_with_no_dispatcher_wired_is_gate_unavailable_not_denied() {
         let broker = Arc::new(Broker::new());
@@ -9011,7 +9070,9 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            McpError::GateUnavailable { by_hook, .. } => assert_eq!(by_hook.0, "ask-no-dispatcher"),
+            McpError::Refused(r) if r.kind == RefusalKind::GateUnavailable => {
+                assert_eq!(r.subject, "ask-no-dispatcher")
+            }
             other => panic!("expected GateUnavailable (misconfiguration), not Denied: {other:?}"),
         }
     }

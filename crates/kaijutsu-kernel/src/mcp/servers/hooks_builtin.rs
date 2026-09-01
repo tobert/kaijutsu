@@ -62,9 +62,9 @@ pub enum HookActionWire {
     ///   called) — ALSO escalates, exactly like exit 3, rather than
     ///   denying. A runtime/DB fault is never a verdict: escalating routes
     ///   it through the same ask machinery, which itself resolves to
-    ///   `McpError::GateUnavailable` (not `Denied`) when there is nowhere
-    ///   to run the gate — so a fault stays distinguishable from a real
-    ///   "no" all the way to the model, the same distinction Ruling 2
+    ///   `McpError::gate_unavailable` (not `denied_by_hook`) when there is
+    ///   nowhere to run the gate — so a fault stays distinguishable from a
+    ///   real "no" all the way to the model, the same distinction Ruling 2
     ///   makes for `HookAction::Ask`.
     Kaish { body: String },
     /// Reference to a stored shared script in the `hook_scripts` table.
@@ -91,7 +91,7 @@ pub enum HookActionWire {
         result_text: String,
         is_error: Option<bool>,
     },
-    /// Terminate the phase with `McpError::Denied { by_hook }`. The
+    /// Terminate the phase with what `McpError::denied_by_hook` builds. The
     /// `reason` is observable in tracing only.
     Deny { reason: String },
     /// Observability-only: emit a `tracing::event!` at the given level.
@@ -104,8 +104,8 @@ pub enum HookActionWire {
     /// "The shared seam"). `description` overrides the auto-generated
     /// `"{instance}.{tool}"` shown to whoever answers it. No `KjDispatcher`
     /// wired, or no answer within the gate's timeout, both fail closed as
-    /// `McpError::GateUnavailable` — not `McpError::Denied`, which is
-    /// reserved for a real "no" — see `Broker::run_permission_ask`.
+    /// `McpError::gate_unavailable` — not `McpError::denied_by_hook`, which
+    /// is reserved for a real "no" — see `Broker::run_permission_ask`.
     Ask { description: Option<String> },
 }
 
@@ -818,6 +818,7 @@ fn phase_table_mut(
 mod tests {
     use super::*;
     use super::super::super::policy::InstancePolicy;
+    use kaijutsu_types::RefusalKind;
 
     fn call_params(tool: &str, args: serde_json::Value) -> KernelCallParams {
         KernelCallParams {
@@ -1404,7 +1405,7 @@ mod tests {
         // bypassing the admin surface. This simulates the user-locked-out
         // state before retirement would have been recoverable only via
         // the carve-out. After retirement, `hook_list` on `builtin.hooks`
-        // must return `McpError::Denied`.
+        // must return a `RefusalKind::Denied` refusal.
         {
             let mut hooks = broker.hooks().write().await;
             hooks.pre_call.entries.push(HookEntry {
@@ -1429,7 +1430,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, McpError::Denied { by_hook } if by_hook.0 == "lockout"),
+            err.is_refusal_from(RefusalKind::Denied, "lockout"),
             "expected Denied(lockout) after D-51 retirement, got {err:?}",
         );
     }
