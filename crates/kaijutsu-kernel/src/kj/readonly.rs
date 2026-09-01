@@ -2,8 +2,13 @@
 //!
 //! `lfm2d-advisory` (`assets/defaults/rc/lib/hooks/lfm2d.kai`) scores every
 //! `shell_write` clause through a classifier that over-escalates on ordinary
-//! reads — `kj mcp tools exa` scored 0.385 and asked a human about a
-//! read-only command. This module is Amy's fix: a static pass list for
+//! reads. Measured against the live v10 scorer, 2026-09-01: `kj block read
+//! <id>` lands `situation-normal` 0.791 and `kj rc show <path>` 0.675, and
+//! anything but `informative` escalates — so a verb named `read` asked a
+//! human for permission to read. The escalation is not uniform, which is why
+//! a pass list beats tuning: `kj block list` (`informative` 0.897) and
+//! `kj context list` (0.960) sail through, so neighbouring reads on the same
+//! noun disagree. This module is Amy's fix: a static pass list for
 //! read-only `kj` verbs, consulted before the classifier ever runs, so a
 //! call this module accepts skips scoring entirely (`KJ_TOOL_PLAN`'s
 //! `kj_readonly` field, wired in `mcp/broker.rs`).
