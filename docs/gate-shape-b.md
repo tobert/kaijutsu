@@ -210,8 +210,26 @@ It is one column, not a claim protocol.
    `RpcError::Refused` → `CallError::Refused`. Two helpers carry a refusal
    across: `set_refusal` on the server, `refusal_from_capnp` on the client,
    both total matches so a new kind is a build error.
-4. **The consumers.** The MCP tool result keeps `is_error: true` and gains
-   the id; the ACP path already rides `Status` and is correct.
+4. **The consumers.** SHIPPED, and larger than expected. The client wrappers
+   kept their signatures, so app/mcp/acp needed no changes and their existing
+   error rendering picked up the structured `Display` — reason, ask id and
+   remedy — for free.
+
+   What did need work was **the model's own tool path**, a seventh
+   block-settling site that never reached `settled_block_status()`.
+   `llm_stream.rs` derived `final_status` from `is_error`, so a pending ask
+   settled its ToolCall/ToolResult pair `Error` and reached the model as
+   `"Execution error: …"`. That is the collapse this lane exists to remove,
+   on the surface where it costs the most: a model reads a crash, retries,
+   and mints another ask. `map_tool_dispatch_result` now returns the settled
+   status beside the error flag, because the two answer different questions —
+   `is_error` is the D-28 channel and is always true for a refusal; `status`
+   is what the blocks settle to and is `Waiting` for a pending one.
+
+   Each kind also carries a stable `ErrorPayload.code` (`gate.pending`,
+   `gate.denied`, `gate.unavailable`, `capability.*`), following
+   `tool.timeout`'s precedent, so a consumer branches on a code rather than
+   on prose.
 5. **Redeem by id.** The ledger read, the divergence check, the cwd column
    replacing the pin map, and the deletion of the digest set match.
    `PENDING_REASON` stops saying "run the same command again".

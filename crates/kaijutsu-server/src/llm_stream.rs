@@ -948,14 +948,30 @@ mod context_window_warning_tests {
 /// `tokio::time::timeout` wrapper used to produce (see
 /// `dispatch_and_map_tool_result`'s doc for why that wrapper is gone) so any
 /// existing consumer matching on `code == "tool.timeout"` keeps working.
+/// What one tool dispatch produced, for the conversation and for the blocks.
+///
+/// `status` is separate from `is_error` because they answer different
+/// questions. `is_error` is the D-28 channel the model reads: a refusal is
+/// loud, always. `status` is what the ToolCall/ToolResult pair settles to,
+/// and a gate that recorded a durable ask settles `Waiting` — an unanswered
+/// question is not a refusal, and a block left `Error` says it was.
+/// Deriving one from the other is what left this path settling a pending ask
+/// as a failed tool call.
+struct ToolDispatch {
+    content: String,
+    is_error: bool,
+    status: Status,
+    payload: Option<kaijutsu_types::ErrorPayload>,
+}
+
 fn map_tool_dispatch_result(
     tool_name: &str,
     result: Result<kaijutsu_kernel::ExecResult, McpError>,
-) -> (String, bool, Option<kaijutsu_types::ErrorPayload>) {
+) -> ToolDispatch {
     match result {
         Ok(r) if r.success => {
             log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
-            (r.stdout, false, None)
+            ToolDispatch { content: r.stdout, is_error: false, status: Status::Done, payload: None }
         }
         Ok(r) => {
             log::warn!("Tool {} failed: {}", tool_name, r.stderr);
@@ -967,7 +983,47 @@ fn map_tool_dispatch_result(
                 span: None,
                 source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
             };
-            (format!("Error: {}", r.stderr), true, Some(payload))
+            ToolDispatch {
+                content: format!("Error: {}", r.stderr),
+                is_error: true,
+                status: Status::Error,
+                payload: Some(payload),
+            }
+        }
+        // A refusal is a verdict the machinery reached, not an execution
+        // failure — "Execution error" below would teach a model that an
+        // unanswered ask was a crash, and the retry that follows mints
+        // another durable ask. The kind carries a stable code, and
+        // `settled_block_status` decides the blocks the same way every
+        // shell path does.
+        Err(e) if e.as_refusal().is_some() => {
+            let status = e.settled_block_status();
+            let refusal = e.as_refusal().expect("guarded by the arm above");
+            log::info!("Tool {} refused: {}", tool_name, refusal);
+            let code = match refusal.kind {
+                kaijutsu_types::RefusalKind::Denied => "gate.denied",
+                kaijutsu_types::RefusalKind::Pending => "gate.pending",
+                kaijutsu_types::RefusalKind::GateUnavailable => "gate.unavailable",
+                kaijutsu_types::RefusalKind::CapabilityDenied => "capability.denied",
+                kaijutsu_types::RefusalKind::FacadeDenied => "capability.facade",
+                kaijutsu_types::RefusalKind::LoadoutDenied => "capability.loadout",
+            };
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Tool,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: Some(code.into()),
+                detail: Some(refusal.to_string()),
+                span: None,
+                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+            };
+            // The refusal's own text names the state, the ask and the
+            // remedy; a prefix here would restate one of them.
+            ToolDispatch {
+                content: refusal.to_string(),
+                is_error: true,
+                status,
+                payload: Some(payload),
+            }
         }
         Err(McpError::Policy(PolicyError::Timeout { timeout_ms, .. })) => {
             log::error!(
@@ -984,11 +1040,12 @@ fn map_tool_dispatch_result(
                 span: None,
                 source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
             };
-            (
-                format!("Error: tool '{}' timed out after {:.1}s", tool_name, secs),
-                true,
-                Some(payload),
-            )
+            ToolDispatch {
+                content: format!("Error: tool '{}' timed out after {:.1}s", tool_name, secs),
+                is_error: true,
+                status: Status::Error,
+                payload: Some(payload),
+            }
         }
         Err(e) => {
             log::error!("Tool {} execution error: {}", tool_name, e);
@@ -1000,7 +1057,12 @@ fn map_tool_dispatch_result(
                 span: None,
                 source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
             };
-            (format!("Execution error: {}", e), true, Some(payload))
+            ToolDispatch {
+                content: format!("Execution error: {}", e),
+                is_error: true,
+                status: Status::Error,
+                payload: Some(payload),
+            }
         }
     }
 }
@@ -1028,7 +1090,7 @@ async fn dispatch_and_map_tool_result(
     params: &str,
     tool_ctx: &kaijutsu_kernel::ExecContext,
     cancel: tokio_util::sync::CancellationToken,
-) -> (String, bool, Option<kaijutsu_types::ErrorPayload>) {
+) -> ToolDispatch {
     let result = kernel
         .dispatch_tool_via_broker_with_cancel(tool_name, params, tool_ctx, cancel)
         .await;
@@ -1121,7 +1183,8 @@ async fn dispatch_inline_tool_result(
     // Let the client observe the running ToolResult before it completes.
     tokio::task::yield_now().await;
 
-    let (content, is_error, error_payload) = dispatch_and_map_tool_result(
+    let ToolDispatch { content, is_error, status: settled_status, payload: error_payload } =
+        dispatch_and_map_tool_result(
         kernel,
         tool_name,
         &input.to_string(),
@@ -1139,7 +1202,6 @@ async fn dispatch_inline_tool_result(
         None => content,
     };
 
-    let final_status = if is_error { Status::Error } else { Status::Done };
     if let Some(result_block_id) = result_block_id {
         if !content.is_empty()
             && let Err(error) = documents.edit_text_as(
@@ -1163,7 +1225,7 @@ async fn dispatch_inline_tool_result(
                 raw.as_bytes(),
             );
         }
-        let _ = documents.set_status(context_id, &result_block_id, final_status);
+        let _ = documents.set_status(context_id, &result_block_id, settled_status);
         if let Some(payload) = error_payload
             && let Err(error) = documents.insert_error_block_as(
                 context_id,
@@ -1177,7 +1239,7 @@ async fn dispatch_inline_tool_result(
         }
         *last_block_id = result_block_id;
     }
-    let _ = documents.set_status(context_id, &tool_call_block_id, final_status);
+    let _ = documents.set_status(context_id, &tool_call_block_id, settled_status);
 
     InlineToolResult { content, is_error }
 }
@@ -2257,7 +2319,12 @@ async fn process_llm_stream(
                     // so a hard interrupt aborts in-flight work promptly —
                     // no outer timeout wrapper needed here; see
                     // `dispatch_and_map_tool_result`'s doc for why.
-                    let (result_content, is_error, error_payload) = dispatch_and_map_tool_result(
+                    let ToolDispatch {
+                        content: result_content,
+                        is_error,
+                        status: settled_status,
+                        payload: error_payload,
+                    } = dispatch_and_map_tool_result(
                         &kernel,
                         &tool_name,
                         &params,
@@ -2305,21 +2372,15 @@ async fn process_llm_stream(
                             );
                         }
 
-                        // Step 6: Set final status on result and call blocks
-                        let final_status = if is_error {
-                            Status::Error
-                        } else {
-                            Status::Done
-                        };
-                        let _ = documents.set_status(context_id, rb_id, final_status);
+                        // Step 6: Set final status on result and call blocks.
+                        // `settled_status` rather than `is_error`: a gate
+                        // that recorded a durable ask settles `Waiting`, and
+                        // deriving the status from the error flag is what
+                        // used to make a pending ask read as a failed call.
+                        let _ = documents.set_status(context_id, rb_id, settled_status);
                     }
                     if let Some(ref tcb_id) = tool_call_block_id {
-                        let final_status = if is_error {
-                            Status::Error
-                        } else {
-                            Status::Done
-                        };
-                        let _ = documents.set_status(context_id, tcb_id, final_status);
+                        let _ = documents.set_status(context_id, tcb_id, settled_status);
                     }
 
                     // Step 6b: Emit structured Error child block if tool failed
@@ -3044,7 +3105,7 @@ mod tool_dispatch_timeout_tests {
 
     #[test]
     fn map_success_passes_stdout_through() {
-        let (content, is_error, payload) =
+        let ToolDispatch { content, is_error, payload, .. } =
             map_tool_dispatch_result("echo", Ok(kaijutsu_kernel::ExecResult::success("hi")));
         assert_eq!(content, "hi");
         assert!(!is_error);
@@ -3053,7 +3114,7 @@ mod tool_dispatch_timeout_tests {
 
     #[test]
     fn map_tool_failure_sets_generic_error_no_code() {
-        let (content, is_error, payload) = map_tool_dispatch_result(
+        let ToolDispatch { content, is_error, payload, .. } = map_tool_dispatch_result(
             "grep",
             Ok(kaijutsu_kernel::ExecResult::failure(1, "no matches")),
         );
@@ -3069,7 +3130,7 @@ mod tool_dispatch_timeout_tests {
             instance: InstanceId::new("x"),
             tool: "y".to_string(),
         };
-        let (content, is_error, payload) = map_tool_dispatch_result("y", Err(err));
+        let ToolDispatch { content, is_error, payload, .. } = map_tool_dispatch_result("y", Err(err));
         assert!(is_error);
         assert!(content.starts_with("Execution error:"));
         let payload = payload.expect("execution error carries a payload");
@@ -3089,7 +3150,7 @@ mod tool_dispatch_timeout_tests {
             instance: InstanceId::new("builtin.shell"),
             timeout_ms: 4242,
         });
-        let (content, is_error, payload) = map_tool_dispatch_result("shell", Err(err));
+        let ToolDispatch { content, is_error, payload, .. } = map_tool_dispatch_result("shell", Err(err));
         assert!(is_error);
         assert!(
             content.contains("shell") && content.contains("timed out"),
@@ -3114,6 +3175,65 @@ mod tool_dispatch_timeout_tests {
         );
     }
 
+    /// A gate refusal reaching the model's own tool path is a verdict, and
+    /// the three kinds settle their blocks differently. Before this, every
+    /// refusal fell into the generic arm: content prefixed "Execution
+    /// error", no code, and `Status::Error` derived from `is_error` — so a
+    /// pending ask read as a failed tool call to the model, to the context
+    /// list, and to ACP.
+    ///
+    /// Falsified by deriving `status` from `is_error` again, or by letting
+    /// a refusal fall through to the generic arm.
+    #[test]
+    fn a_pending_gate_stays_loud_but_does_not_settle_as_a_failure() {
+        let err = McpError::refused_gate(
+            kaijutsu_types::RefusalKind::Pending,
+            "shell_write",
+            Some(kaijutsu_types::AskRef {
+                request_id: "01a05d19-0000-7000-8000-000000000000".to_string(),
+                status: kaijutsu_types::AskStatus::Pending,
+            }),
+            "nothing was run",
+        );
+        let out = map_tool_dispatch_result("shell_write", Err(err));
+
+        assert!(out.is_error, "a refusal is never a quiet success");
+        assert_eq!(
+            out.status,
+            Status::Waiting,
+            "an unanswered question is not a refusal; the blocks must not say it was",
+        );
+        assert!(
+            !out.content.contains("Execution error"),
+            "a verdict is not a crash: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("01a05d19-0000-7000-8000-000000000000"),
+            "the model must be handed the ask id: {}",
+            out.content
+        );
+        let payload = out.payload.expect("a refusal carries a payload");
+        assert_eq!(payload.code.as_deref(), Some("gate.pending"));
+    }
+
+    /// The neighbouring kinds settle `Error` — nothing is coming back for a
+    /// denial or a broken control, and a block left `Waiting` would name a
+    /// question no one is composing.
+    #[test]
+    fn a_denial_and_a_broken_gate_settle_as_errors() {
+        for (kind, code) in [
+            (kaijutsu_types::RefusalKind::Denied, "gate.denied"),
+            (kaijutsu_types::RefusalKind::GateUnavailable, "gate.unavailable"),
+        ] {
+            let err = McpError::refused_gate(kind, "shell_write", None, "no");
+            let out = map_tool_dispatch_result("shell_write", Err(err));
+            assert!(out.is_error);
+            assert_eq!(out.status, Status::Error, "{kind} has no answer coming");
+            assert_eq!(out.payload.expect("payload").code.as_deref(), Some(code));
+        }
+    }
+
     #[test]
     fn map_other_policy_errors_are_not_mistaken_for_timeout() {
         // Only PolicyError::Timeout gets the tool.timeout code — a
@@ -3123,7 +3243,7 @@ mod tool_dispatch_timeout_tests {
             instance: InstanceId::new("builtin.shell"),
             max: 4,
         });
-        let (_content, is_error, payload) = map_tool_dispatch_result("shell", Err(err));
+        let ToolDispatch { is_error, payload, .. } = map_tool_dispatch_result("shell", Err(err));
         assert!(is_error);
         let payload = payload.expect("payload present");
         assert!(payload.code.is_none());
@@ -3228,7 +3348,7 @@ mod tool_dispatch_timeout_tests {
             kernel_with_sleepy_tool("timeout-low", Duration::from_secs(5), Duration::from_millis(50))
                 .await;
 
-        let (content, is_error, payload) = dispatch_and_map_tool_result(
+        let ToolDispatch { content, is_error, payload, .. } = dispatch_and_map_tool_result(
             &kernel,
             "sleep",
             "{}",
@@ -3257,7 +3377,7 @@ mod tool_dispatch_timeout_tests {
         )
         .await;
 
-        let (content, is_error, payload) = dispatch_and_map_tool_result(
+        let ToolDispatch { content, is_error, payload, .. } = dispatch_and_map_tool_result(
             &kernel,
             "sleep",
             "{}",
@@ -3292,7 +3412,7 @@ mod tool_dispatch_timeout_tests {
             .await
             .unwrap();
 
-        let (content, is_error, _payload) = dispatch_and_map_tool_result(
+        let ToolDispatch { content, is_error, .. } = dispatch_and_map_tool_result(
             &kernel,
             "sleep",
             "{}",
