@@ -6,6 +6,79 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The scorer cannot see a redirect, only the exemption can (2026-09-01)
+
+Closing the `--help`/`ledger` redirect hole (`9f426c9c`) stopped those
+exemptions from waving a redirect through, and that much is verified live:
+`kj ledger list > <path>` now reaches the classifier instead of skipping it,
+and leaves ask `01a05d22` behind where before it left nothing at all.
+
+**It is then auto-allowed, because the classifier never sees the redirect.**
+The hook scores `clause`, built in `items_filter` as `name` plus `args` — a
+per-command projection that deliberately excludes redirects, which is the
+same reason the exemption needed a structured `has_redirect` field instead of
+reading the text. So the scorer was handed a bare `kj ledger list`, read it as
+benign, and allowed it. The ask's `description` is the *statement* and does
+carry the redirect, so the durable record is honest even though the input to
+the score was not.
+
+What the fix actually bought, stated plainly: a blanket bypass became a
+scored call with an audit trail. It did not make a redirect risky in the
+classifier's eyes. A `kj block list > ~/.bashrc` still auto-allows, on a
+clause that reads `kj block list`.
+
+Three ways to close the rest, in increasing cost:
+
+1. **Append redirects to the scored clause.** Cheapest, and it puts the
+   danger in front of the model that judges it. Risk: it changes every
+   clause's text, so the corpus and the measured escalation rates move
+   with it — re-run `contrib/kj-corpus.json` expectations and the probe
+   family before trusting the new numbers.
+2. **A standing rule on redirect targets.** Precise about the thing that
+   matters (writing outside a workspace) and invisible to classifier
+   churn, but it is a second policy surface next to the score.
+3. **Refuse the exemption AND the auto-allow band for any redirect**, i.e.
+   treat `has_redirect` as escalate-worthy on its own. Safest, and it
+   would prompt on `kj block list > out.txt`, which is ordinary. Probably
+   too blunt without (1) to inform it.
+
+Not urgent: every path here is a *write the caller asked for out loud*, and
+`is_read_only_kj` already refuses a redirect for the table it governs, so the
+exposure is `--help` and `kj ledger` only.
+
+## Codex app-server: attach to the shared daemon over stdio (2026-09-01)
+
+From the hold-swarm-help-peer session, whose bridge work covers the same
+protocol. Two findings that change what our experimental client could reach,
+neither requiring us to break the no-`Command::new` rule in
+`llm/codex/mod.rs`:
+
+- **`codex app-server proxy` pipes stdio to a managed daemon's control
+  socket.** That is shared-daemon access over plain newline-delimited stdio,
+  so `StdioJsonl`/`JsonlTransport` takes it unmodified and the spawn stays
+  outside the protocol module where our policy wants it. No WebSocket client
+  needed. Caveat they verified: the control socket exists only for a daemon
+  started as `codex app-server daemon start` — a hand-started one has none.
+- **A shared app-server is already running on zorak** — `--listen
+  ws://127.0.0.1:4500`, up since 2026-08-14. It answers `initialize` and
+  returns real `thread/list` data.
+
+Why it matters here: our client always calls `thread/start` and works only in
+the thread it created. It cannot see a thread it did not make, which rules out
+attaching to a session a human is driving.
+
+Also worth knowing if we revisit the "locally-owned JSON shapes" choice: they
+measured `codex-codes` (types-only, `default-features = false`) as pulling in
+nothing past serde/serde_json/thiserror, modeling `thread/list`,
+`thread/loaded/list`, `turn/steer`, `turn/started`, `turn/completed`, and
+shipping a schema-drift scorecard against `generate-json-schema` output. That
+is a real answer to the protocol-churn objection our module doc raises. Their
+clients are not reusable — all three hardcode `--listen stdio://` and spawn.
+
+And `AdditionalContextEntry.kind` is an enum of `untrusted | application`:
+the protocol has a first-class untrusted-context kind, which is the right
+place for peer or tool text entering a Codex turn.
+
 ## Synthesis re-embeds the whole context on every block write (2026-09-01)
 
 **Automatic synthesis is disabled** as of this entry — `spawn_index_watcher`
