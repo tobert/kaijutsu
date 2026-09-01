@@ -146,6 +146,19 @@ pub enum CallError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
+    /// The VFS refused, and said why. A verdict, not a fault: the call
+    /// reached the filesystem and got an answer.
+    ///
+    /// Kept out of [`CallError::Rpc`] so callers branch on `kind` instead
+    /// of matching prose — the collapse `docs/error-chain.md` names. The
+    /// roster poll is the first caller: an absent roster and an unreadable
+    /// one must never render the same.
+    #[error("{path}: {kind:?}")]
+    Vfs {
+        kind: kaijutsu_types::VfsErrorKind,
+        path: String,
+    },
+
     /// Per-call deadline exceeded — `RPC_CALL_TIMEOUT` for most commands
     /// (`dispatch!`), or a per-call override for the few dispatched through
     /// `dispatch_deadline!` instead (today: `ExecuteTool`, `CallMcpTool`
@@ -1902,17 +1915,19 @@ fn is_disconnect_error(msg: &str) -> bool {
 /// blocking on `kj::gate::run_gate` — can override the deadline without
 /// touching every other command's behavior. See [`dispatch_deadline!`] and
 /// `kaijutsu_types::timeout::gate`.
-async fn run_rpc_call_with_deadline<T, F, E>(
+async fn run_rpc_call_with_deadline<T, F>(
     fut: F,
     close_tx: &mpsc::Sender<CloseCause>,
     deadline: Duration,
 ) -> Result<T, CallError>
 where
-    F: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
+    F: std::future::Future<Output = Result<T, crate::RpcError>>,
 {
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(val)) => Ok(val),
+        // A VFS verdict travels typed. It is never a disconnect, so it also
+        // skips the close-cause check below.
+        Ok(Err(crate::RpcError::Vfs { kind, path })) => Err(CallError::Vfs { kind, path }),
         Ok(Err(e)) => {
             let msg = e.to_string();
             if is_disconnect_error(&msg) {
@@ -1929,13 +1944,12 @@ where
 /// Run a single RPC call with the global per-call deadline ([`RPC_CALL_TIMEOUT`]),
 /// mapping the outcome into `CallError`. On disconnect-class errors, signals
 /// `close_tx` so the actor can transition to Closing.
-async fn run_rpc_call<T, F, E>(
+async fn run_rpc_call<T, F>(
     fut: F,
     close_tx: &mpsc::Sender<CloseCause>,
 ) -> Result<T, CallError>
 where
-    F: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
+    F: std::future::Future<Output = Result<T, crate::RpcError>>,
 {
     run_rpc_call_with_deadline(fut, close_tx, RPC_CALL_TIMEOUT).await
 }
@@ -3740,6 +3754,9 @@ async fn dispatch_kernel_command(
             .await
             {
                 Ok(Ok(r)) => Ok(r),
+                // As above: a VFS verdict keeps its type and is not a
+                // disconnect.
+                Ok(Err(crate::RpcError::Vfs { kind, path })) => Err(CallError::Vfs { kind, path }),
                 Ok(Err(e)) => {
                     let msg = e.to_string();
                     if is_disconnect_error(&msg) {

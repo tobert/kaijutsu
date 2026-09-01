@@ -147,7 +147,7 @@ pub use block::{
     ErrorSeverity, ErrorSpan, KIND_NAMES, LogLevel, MAX_DAG_DEPTH, NotificationKind,
     NotificationPayload, ROLE_NAMES, STATUS_NAMES,
     ProvenanceTag, ResourcePayload, Role, Status, StyleAttrs, StyleColor, StyleSpan, TaskStatus,
-    ToolKind, ERROR_DETAIL_HYDRATION_BUDGET,
+    ToolKind, VfsErrorKind, ERROR_DETAIL_HYDRATION_BUDGET,
     NOTIFICATION_DETAIL_HYDRATION_BUDGET, RESOURCE_CONTENT_HYDRATION_BUDGET,
     TOOL_CONTENT_HYDRATION_BUDGET, format_error_for_llm, format_notification_for_llm,
     format_resource_for_llm, format_task_for_llm, format_tool_content_envelope,

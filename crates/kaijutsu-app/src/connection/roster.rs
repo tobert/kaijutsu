@@ -47,7 +47,7 @@
 
 use bevy::prelude::*;
 
-use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
+use crate::connection::{RosterReadError, RpcActor, RpcResultChannel, RpcResultMessage};
 
 /// The kernel's roster index — the filtered view (rows the kernel considers
 /// "around"). `index-all` exists beside it for the unfiltered set; the panel
@@ -457,9 +457,15 @@ fn poll_roster_index(
             let result = match handle.vfs_read_all(ROSTER_INDEX_PATH.as_str()).await {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(body) => Ok(body),
-                    Err(e) => Err(format!("{}: not UTF-8: {e}", ROSTER_INDEX_PATH.as_str())),
+                    Err(e) => Err(RosterReadError {
+                        detail: format!("{}: not UTF-8: {e}", ROSTER_INDEX_PATH.as_str()),
+                        absent: false,
+                    }),
                 },
-                Err(e) => Err(format!("{e}")),
+                Err(e) => Err(RosterReadError {
+                    detail: format!("{e}"),
+                    absent: read_failure_is_absent(&e),
+                }),
             };
             let _ = tx.send(RpcResultMessage::RosterIndexReceived { result });
         })
@@ -467,13 +473,17 @@ fn poll_roster_index(
 }
 
 /// Whether a read failure means "this kernel has no roster" rather than
-/// "something went wrong". Matched on the error text because that is all the
-/// wire carries — `VfsError`'s variants collapse to a message string at the
-/// capnp boundary. Deliberately narrow: anything unrecognized stays an
-/// error, so a genuine fault is never dressed up as a missing feature.
-fn reads_as_absent(detail: &str) -> bool {
-    let d = detail.to_ascii_lowercase();
-    d.contains("not found") || d.contains("no mount point")
+/// "something went wrong".
+///
+/// Reads the typed verdict the VFS now returns. Every other error — a
+/// transport fault, a timeout, a permission denial — stays an error, so a
+/// genuine fault is never dressed up as a missing feature.
+///
+/// This matched on lowercased error prose until `Vfs.read` grew a real
+/// verdict channel; the old version could not tell a refused read from an
+/// absent one except by the words the kernel happened to choose.
+fn read_failure_is_absent(e: &kaijutsu_client::CallError) -> bool {
+    matches!(e, kaijutsu_client::CallError::Vfs { kind, .. } if kind.is_absent())
 }
 
 /// Drain a fetched index into [`RosterFeed`].
@@ -521,15 +531,15 @@ fn drain_roster_index(
                     }
                 }
             }
-            Err(detail) => {
-                let state = if reads_as_absent(detail) {
+            Err(err) => {
+                let state = if err.absent {
                     RosterFetch::NoRoster {
-                        detail: detail.clone(),
+                        detail: err.detail.clone(),
                     }
                 } else {
-                    warn!("roster: read failed: {detail}");
+                    warn!("roster: read failed: {}", err.detail);
                     RosterFetch::Error {
-                        detail: detail.clone(),
+                        detail: err.detail.clone(),
                     }
                 };
                 if feed.state != state {
@@ -727,33 +737,39 @@ mod tests {
     /// Only a "there is nothing here" answer may read as no-roster. A real
     /// fault must never be dressed up as a missing feature.
     ///
-    /// The wrapped forms matter more than the bare ones: what the drain
-    /// actually sees is a `CallError`, whose `Rpc` arm formats as `"RPC
-    /// error: {0}"` around the capnp message that itself wraps `VfsError`'s
-    /// Display. Testing only the inner text would pass while the real thing
-    /// fell through to `Error`.
+    /// The interesting case is `PermissionDenied`: a refused read and an
+    /// absent one are both failures to produce bytes, and conflating them
+    /// would render "this kernel has no roster" over a mount we simply may
+    /// not look at. `Vfs.read` carries the kind so the two never merge.
     #[test]
     fn absence_is_recognised_narrowly() {
-        // Bare `VfsError` Display.
-        assert!(reads_as_absent("not found: /run/roster/index"));
-        assert!(reads_as_absent("no mount point for path: /run/roster/index"));
-        // The shape `CallError::Rpc` actually produces.
-        assert!(reads_as_absent(
-            "RPC error: remote exception: not found: /run/roster/index"
-        ));
-        assert!(reads_as_absent(
-            "RPC error: no mount point for path: /run/roster/index"
-        ));
+        use kaijutsu_client::CallError;
+        use kaijutsu_types::VfsErrorKind;
 
-        assert!(!reads_as_absent("permission denied: /run/roster/index"));
-        assert!(!reads_as_absent("connection reset"));
-        assert!(!reads_as_absent(
-            "RPC error: permission denied: /run/roster/index"
-        ));
-        // A disconnect must NOT read as "this kernel has no roster".
-        assert!(!reads_as_absent("not ready: connecting (attempt 3)"));
-        assert!(!reads_as_absent("actor shut down"));
-        assert!(!reads_as_absent("call timed out after 10s"));
+        let vfs = |kind| CallError::Vfs {
+            kind,
+            path: "/run/roster/index".to_string(),
+        };
+
+        assert!(read_failure_is_absent(&vfs(VfsErrorKind::NotFound)));
+
+        // Every other verdict is a real answer about a roster that exists,
+        // or might.
+        assert!(!read_failure_is_absent(&vfs(VfsErrorKind::PermissionDenied)));
+        assert!(!read_failure_is_absent(&vfs(VfsErrorKind::ReadOnly)));
+        assert!(!read_failure_is_absent(&vfs(VfsErrorKind::IsADirectory)));
+        assert!(!read_failure_is_absent(&vfs(VfsErrorKind::Io)));
+        // A vanished `/r` share is a disconnect, not an absent roster.
+        assert!(!read_failure_is_absent(&vfs(VfsErrorKind::Disconnected)));
+        assert!(!read_failure_is_absent(&vfs(VfsErrorKind::TimedOut)));
+
+        // And a fault that never reached the VFS at all stays a fault --
+        // the case the old prose-matching version was most at risk of
+        // getting wrong, because "not found" can appear in any message.
+        assert!(!read_failure_is_absent(&CallError::NotReady(
+            kaijutsu_client::NotReadyReason::Connecting { attempt: 3 }
+        )));
+        assert!(!read_failure_is_absent(&CallError::Rpc("not found: something else entirely".to_string())));
     }
 
     /// A dropped connection stops the poll without ever delivering an

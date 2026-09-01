@@ -333,6 +333,31 @@ enum ErrorCategory {
   kernel @6;
 }
 
+# Why a VFS operation refused, carried as a RESULT rather than thrown
+# (`docs/error-chain.md`). POSIX semantics with a stable wire encoding: a
+# raw errno cannot cross this wire, because the numbers differ by platform
+# (ENOTEMPTY is 39 on Linux and 66 on macOS) and a macOS client talks to a
+# Linux kernel. Each side maps this to its own platform's numbers.
+enum VfsErrorKind {
+  ok @0;                 # no error; the only value that means success
+  notFound @1;           # ENOENT — also "no mount point for this path"
+  permissionDenied @2;   # EACCES — includes a path that escapes its mount root
+  readOnly @3;           # EROFS — a property of the mount, not of the caller
+  notADirectory @4;      # ENOTDIR
+  isADirectory @5;       # EISDIR
+  notEmpty @6;           # ENOTEMPTY
+  alreadyExists @7;      # EEXIST
+  invalidPath @8;        # EINVAL — also "not a symbolic link"
+  crossDevice @9;        # EXDEV
+  tooManySymlinks @10;   # ELOOP
+  nameTooLong @11;       # ENAMETOOLONG
+  # A `/r` client share's session is gone — somebody's laptop went away
+  # (`docs/slash-r.md`). Distinct from `io`: the mount itself vanished.
+  disconnected @12;      # ENOTCONN
+  timedOut @13;          # ETIMEDOUT — the session may live; this op did not answer
+  io @14;                # EIO, and anything with no better name
+}
+
 # How severe the error is.
 enum ErrorSeverity {
   warning @0;
@@ -1176,29 +1201,38 @@ interface Vfs {
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
-  # Reading
-  getattr @0 (path :Text) -> (attr :FileAttr);
-  readdir @1 (path :Text) -> (entries :List(DirEntry));
-  read @2 (path :Text, offset :UInt64, size :UInt32) -> (data :Data);
-  readlink @3 (path :Text) -> (target :Text);
+  # Thirteen methods retired: general filesystem access over this interface
+  # was superseded by SFTP (`docs/sftp.md`), which is how every remote
+  # filesystem consumer reaches the VFS now. They had no caller. The four
+  # that remain are the ones the app actually uses.
+  retired0 @0 ();
+  retired1 @1 ();
+
+  # `error` is `ok` on success. A refused read is a RESULT, not a transport
+  # fault: a read-only mount or an unreadable directory is the filesystem
+  # answering, and the caller must be able to tell it from a broken
+  # connection without reading prose (`docs/error-chain.md`).
+  #
+  # Zero-length `data` with `error = ok` is EOF, unchanged. A short read is
+  # not EOF — the next request resumes at the advanced offset.
+  read @2 (path :Text, offset :UInt64, size :UInt32)
+      -> (data :Data, error :VfsErrorKind);
+
+  retired3 @3 ();
 
   # Writing
   write @4 (path :Text, offset :UInt64, data :Data) -> (written :UInt32);
   create @5 (path :Text, mode :UInt32) -> (attr :FileAttr);
-  mkdir @6 (path :Text, mode :UInt32) -> (attr :FileAttr);
-  unlink @7 (path :Text);
-  rmdir @8 (path :Text);
-  rename @9 (from :Text, to :Text);
-  truncate @10 (path :Text, size :UInt64);
-  setattr @11 (path :Text, attr :SetAttr) -> (newAttr :FileAttr);
-  symlink @12 (path :Text, target :Text) -> (attr :FileAttr);
-
-  # Metadata
-  readOnly @13 () -> (readOnly :Bool);
-  statfs @14 () -> (stat :StatFs);
-
-  # Path resolution
-  realPath @15 (path :Text) -> (realPath :Text);
+  retired6 @6 ();
+  retired7 @7 ();
+  retired8 @8 ();
+  retired9 @9 ();
+  retired10 @10 ();
+  retired11 @11 ();
+  retired12 @12 ();
+  retired13 @13 ();
+  retired14 @14 ();
+  retired15 @15 ();
 
   # FSN world stage-0/1 plumbing (docs/scenes/vfs.md). Recursive listing walk
   # with generation stamps, VFS-mediated (never touches the host filesystem

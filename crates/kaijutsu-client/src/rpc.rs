@@ -2715,7 +2715,18 @@ impl KernelHandle {
                 p.set_size(VFS_READ_CHUNK);
             }
             let response = request.send().promise.await?;
-            let chunk = response.get()?.get_data()?;
+            let reply = response.get()?;
+            // Check the verdict before the data: on a refusal `data` is
+            // empty, which would otherwise read as EOF and hand the caller
+            // a successful empty file (`docs/error-chain.md`).
+            let kind = vfs_error_kind_from_capnp(reply.get_error()?);
+            if let Some(kind) = kind {
+                return Err(RpcError::Vfs {
+                    kind,
+                    path: path.to_owned(),
+                });
+            }
+            let chunk = reply.get_data()?;
             if chunk.is_empty() {
                 // Zero-length read is EOF (the VfsOps read contract). A SHORT
                 // read is not: the next request just resumes at the advanced
@@ -4313,6 +4324,33 @@ pub struct McpResource {
 // Errors
 // ============================================================================
 
+/// Read a VFS verdict off the wire. `None` means the call succeeded — `ok`
+/// is the only value that is not an error, so a caller must branch on this
+/// before trusting the payload.
+fn vfs_error_kind_from_capnp(
+    kind: crate::kaijutsu_capnp::VfsErrorKind,
+) -> Option<kaijutsu_types::VfsErrorKind> {
+    use crate::kaijutsu_capnp::VfsErrorKind as W;
+    use kaijutsu_types::VfsErrorKind as K;
+    Some(match kind {
+        W::Ok => return None,
+        W::NotFound => K::NotFound,
+        W::PermissionDenied => K::PermissionDenied,
+        W::ReadOnly => K::ReadOnly,
+        W::NotADirectory => K::NotADirectory,
+        W::IsADirectory => K::IsADirectory,
+        W::NotEmpty => K::NotEmpty,
+        W::AlreadyExists => K::AlreadyExists,
+        W::InvalidPath => K::InvalidPath,
+        W::CrossDevice => K::CrossDevice,
+        W::TooManySymlinks => K::TooManySymlinks,
+        W::NameTooLong => K::NameTooLong,
+        W::Disconnected => K::Disconnected,
+        W::TimedOut => K::TimedOut,
+        W::Io => K::Io,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("Cap'n Proto error: {0}")]
@@ -4327,6 +4365,13 @@ pub enum RpcError {
     CapabilityLost,
     #[error("Server error: {0}")]
     ServerError(String),
+    /// The VFS refused, and said why. A verdict, not a fault — branch on
+    /// the kind rather than reading this message (`docs/error-chain.md`).
+    #[error("{path}: {kind:?}")]
+    Vfs {
+        kind: kaijutsu_types::VfsErrorKind,
+        path: String,
+    },
     #[error("{0}")]
     Other(String),
 }

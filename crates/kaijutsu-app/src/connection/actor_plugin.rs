@@ -214,6 +214,20 @@ pub struct ConnectionStatusMessage(pub kaijutsu_client::ConnectionStatus);
 /// Not `Clone`: `ContextJoined`/`ContextRehydrated` carry a live
 /// `mpsc::Receiver<FeedEvent>` (the change feed, docs/change-feed.md), and a
 /// receiver cannot be duplicated.
+/// Why a roster read failed, classified where the type still exists.
+///
+/// `absent` is decided at the RPC boundary from `RpcError::Vfs`'s typed
+/// kind, not re-derived from `detail` further down. An empty roster and an
+/// unreadable one must never render the same, and matching prose to tell
+/// them apart is how that guarantee rots (`docs/error-chain.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterReadError {
+    /// Shown to a human. Never parsed.
+    pub detail: String,
+    /// This kernel has no roster, as opposed to something going wrong.
+    pub absent: bool,
+}
+
 #[derive(Message, Debug)]
 #[allow(dead_code)]
 pub enum RpcResultMessage {
@@ -261,7 +275,7 @@ pub enum RpcResultMessage {
     /// render the same ("unknown, never absent", `kaijutsu-kernel`'s
     /// `roster` module doc).
     RosterIndexReceived {
-        result: Result<String, String>,
+        result: Result<String, RosterReadError>,
     },
     /// Semantic clusters received (time-well band-2 poll). Drained into
     /// `TimeWellState.clusters` to drive the haystack's cluster-grouped angle.

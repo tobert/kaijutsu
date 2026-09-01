@@ -11328,9 +11328,40 @@ impl VfsImpl {
     }
 }
 
-/// Convert VfsError to capnp Error
+/// Convert VfsError to capnp Error.
+///
+/// This discards the variant and keeps only its `Display` text, which is
+/// the collapse `docs/error-chain.md` names: a caller is left grepping
+/// prose to tell a refusal from a fault. `read` no longer uses it — it
+/// carries [`VfsErrorKind`] on the result instead. The remaining callers
+/// (`write`, `create`, `snapshot`) still do; they are the rest of this
+/// lane, not an endorsement.
 fn vfs_err_to_capnp(e: kaijutsu_kernel::VfsError) -> capnp::Error {
     capnp::Error::failed(format!("{}", e))
+}
+
+/// Project the kernel's VFS error classification onto the wire enum.
+///
+/// A total match, so a new [`kaijutsu_types::VfsErrorKind`] variant fails
+/// to compile here rather than silently becoming `io`.
+fn vfs_kind_to_capnp(kind: kaijutsu_types::VfsErrorKind) -> VfsErrorKind {
+    use kaijutsu_types::VfsErrorKind as K;
+    match kind {
+        K::NotFound => VfsErrorKind::NotFound,
+        K::PermissionDenied => VfsErrorKind::PermissionDenied,
+        K::ReadOnly => VfsErrorKind::ReadOnly,
+        K::NotADirectory => VfsErrorKind::NotADirectory,
+        K::IsADirectory => VfsErrorKind::IsADirectory,
+        K::NotEmpty => VfsErrorKind::NotEmpty,
+        K::AlreadyExists => VfsErrorKind::AlreadyExists,
+        K::InvalidPath => VfsErrorKind::InvalidPath,
+        K::CrossDevice => VfsErrorKind::CrossDevice,
+        K::TooManySymlinks => VfsErrorKind::TooManySymlinks,
+        K::NameTooLong => VfsErrorKind::NameTooLong,
+        K::Disconnected => VfsErrorKind::Disconnected,
+        K::TimedOut => VfsErrorKind::TimedOut,
+        K::Io => VfsErrorKind::Io,
+    }
 }
 
 /// Helper to extract path string from capnp text reader
@@ -11363,66 +11394,6 @@ fn set_file_attr(
 }
 
 impl vfs::Server for VfsImpl {
-    fn getattr(
-        self: Rc<Self>,
-        params: vfs::GetattrParams,
-        mut results: vfs::GetattrResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()) {
-            Ok(p) => match p.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let attr = kernel
-                .getattr(Path::new(&path))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            let mut builder = results.get().init_attr();
-            set_file_attr(&mut builder, &attr);
-            Ok(())
-        })
-    }
-
-    fn readdir(
-        self: Rc<Self>,
-        params: vfs::ReaddirParams,
-        mut results: vfs::ReaddirResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()) {
-            Ok(p) => match p.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let entries = kernel
-                .readdir(Path::new(&path))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            let mut builder = results.get().init_entries(entries.len() as u32);
-            for (i, entry) in entries.iter().enumerate() {
-                let mut e = builder.reborrow().get(i as u32);
-                e.set_name(&entry.name);
-                e.set_kind(match entry.kind {
-                    kaijutsu_kernel::FileType::File => crate::kaijutsu_capnp::FileType::File,
-                    kaijutsu_kernel::FileType::Directory => {
-                        crate::kaijutsu_capnp::FileType::Directory
-                    }
-                    kaijutsu_kernel::FileType::Symlink => crate::kaijutsu_capnp::FileType::Symlink,
-                });
-            }
-            Ok(())
-        })
-    }
-
     fn read(
         self: Rc<Self>,
         params: vfs::ReadParams,
@@ -11441,35 +11412,18 @@ impl vfs::Server for VfsImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let data = kernel
-                .read(Path::new(&path), offset, size)
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            results.get().set_data(&data);
-            Ok(())
-        })
-    }
-
-    fn readlink(
-        self: Rc<Self>,
-        params: vfs::ReadlinkParams,
-        mut results: vfs::ReadlinkResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()) {
-            Ok(p) => match p.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let target = kernel
-                .readlink(Path::new(&path))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            results.get().set_target(target.to_string_lossy());
+            // A refused read is a result, not a transport fault
+            // (`docs/error-chain.md`). Only a genuine fault throws from here,
+            // and reaching a verdict is not one.
+            match kernel.read(Path::new(&path), offset, size).await {
+                Ok(data) => {
+                    results.get().set_data(&data);
+                    results.get().set_error(VfsErrorKind::Ok);
+                }
+                Err(e) => {
+                    results.get().set_error(vfs_kind_to_capnp(e.kind()));
+                }
+            }
             Ok(())
         })
     }
@@ -11528,278 +11482,6 @@ impl vfs::Server for VfsImpl {
             let mut builder = results.get().init_attr();
             set_file_attr(&mut builder, &attr);
             Ok(())
-        })
-    }
-
-    fn mkdir(
-        self: Rc<Self>,
-        params: vfs::MkdirParams,
-        mut results: vfs::MkdirResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let path = match params.get_path().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let mode = params.get_mode();
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let attr = kernel
-                .mkdir(Path::new(&path), mode)
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            let mut builder = results.get().init_attr();
-            set_file_attr(&mut builder, &attr);
-            Ok(())
-        })
-    }
-
-    fn unlink(
-        self: Rc<Self>,
-        params: vfs::UnlinkParams,
-        _results: vfs::UnlinkResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()) {
-            Ok(p) => match p.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            kernel
-                .unlink(Path::new(&path))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            Ok(())
-        })
-    }
-
-    fn rmdir(
-        self: Rc<Self>,
-        params: vfs::RmdirParams,
-        _results: vfs::RmdirResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()) {
-            Ok(p) => match p.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            kernel
-                .rmdir(Path::new(&path))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            Ok(())
-        })
-    }
-
-    fn rename(
-        self: Rc<Self>,
-        params: vfs::RenameParams,
-        _results: vfs::RenameResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let from = match params.get_from().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let to = match params.get_to().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            kernel
-                .rename(Path::new(&from), Path::new(&to))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            Ok(())
-        })
-    }
-
-    fn truncate(
-        self: Rc<Self>,
-        params: vfs::TruncateParams,
-        _results: vfs::TruncateResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let path = match params.get_path().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let size = params.get_size();
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            kernel
-                .truncate(Path::new(&path), size)
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            Ok(())
-        })
-    }
-
-    fn setattr(
-        self: Rc<Self>,
-        params: vfs::SetattrParams,
-        mut results: vfs::SetattrResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let path = match params.get_path().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let attr_reader = match params.get_attr() {
-            Ok(a) => a,
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-
-        // Convert to kernel SetAttr
-        let set_attr = kaijutsu_kernel::SetAttr {
-            size: if attr_reader.get_has_size() {
-                Some(attr_reader.get_size())
-            } else {
-                None
-            },
-            perm: if attr_reader.get_has_perm() {
-                Some(attr_reader.get_perm())
-            } else {
-                None
-            },
-            mtime: if attr_reader.get_has_mtime() {
-                Some(
-                    std::time::UNIX_EPOCH
-                        + std::time::Duration::from_secs(attr_reader.get_mtime_secs()),
-                )
-            } else {
-                None
-            },
-            atime: None, // Not in capnp schema
-            uid: None,   // Not in capnp schema
-            gid: None,   // Not in capnp schema
-        };
-
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let attr = kernel
-                .setattr(Path::new(&path), set_attr)
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            let mut builder = results.get().init_new_attr();
-            set_file_attr(&mut builder, &attr);
-            Ok(())
-        })
-    }
-
-    fn symlink(
-        self: Rc<Self>,
-        params: vfs::SymlinkParams,
-        mut results: vfs::SymlinkResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let path = match params.get_path().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let target = match params.get_target().and_then(|p| get_path_str(p)) {
-            Ok(s) => s.to_owned(),
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let attr = kernel
-                .symlink(Path::new(&path), Path::new(&target))
-                .await
-                .map_err(vfs_err_to_capnp)?;
-            let mut builder = results.get().init_attr();
-            set_file_attr(&mut builder, &attr);
-            Ok(())
-        })
-    }
-
-    fn read_only(
-        self: Rc<Self>,
-        _params: vfs::ReadOnlyParams,
-        mut results: vfs::ReadOnlyResults,
-    ) -> Promise<(), capnp::Error> {
-        results.get().set_read_only(self.kernel.vfs().read_only());
-        Promise::ok(())
-    }
-
-    fn statfs(
-        self: Rc<Self>,
-        _params: vfs::StatfsParams,
-        mut results: vfs::StatfsResults,
-    ) -> Promise<(), capnp::Error> {
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let stat = kernel.statfs().await.map_err(vfs_err_to_capnp)?;
-            let mut builder = results.get().init_stat();
-            builder.set_blocks(stat.blocks);
-            builder.set_bfree(stat.bfree);
-            builder.set_bavail(stat.bavail);
-            builder.set_files(stat.files);
-            builder.set_ffree(stat.ffree);
-            builder.set_bsize(stat.bsize);
-            builder.set_namelen(stat.namelen);
-            Ok(())
-        })
-    }
-
-    fn real_path(
-        self: Rc<Self>,
-        params: vfs::RealPathParams,
-        mut results: vfs::RealPathResults,
-    ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()) {
-            Ok(p) => match p.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
-        };
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            match kernel.real_path(Path::new(&path)).await {
-                Ok(Some(real)) => {
-                    results.get().set_real_path(real.to_string_lossy());
-                    Ok(())
-                }
-                Ok(None) => {
-                    // Virtual backend (MemoryBackend) - return empty string
-                    results.get().set_real_path("");
-                    Ok(())
-                }
-                Err(e) => Err(vfs_err_to_capnp(e)),
-            }
         })
     }
 

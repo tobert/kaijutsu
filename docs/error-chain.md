@@ -191,6 +191,11 @@ one.
 | event/callback interfaces | 28 | 28 | 0 | 0 |
 | **total** | **152** | **99** | **33** | **20** |
 
+**Since measured, the VFS row has been resolved** (see below): 11 of its 14
+Bs were retired unused, `read` was fixed, and `write`/`create` remain. The
+open count is **21**, not 33 — and the largest remaining family is the 7 the
+gate lane already owns.
+
 **33 methods need a channel; 99 are genuinely fault-only.** The event
 interfaces are server-to-client push with void returns — there is no result
 slot for a verdict and a failed call can only mean delivery broke.
@@ -210,22 +215,61 @@ declining is already carried as ordinary data in
 | capability / facade denial | 3 | `editInput`, `submitInput`, `commitCapture` |
 | a foreign verdict | 1 | `invokePeer` — the *peer's* handler said no |
 
-**Start with the VFS: 14 of 33 collapse in three lines.** Every `Vfs` method
-ends in `.map_err(vfs_err_to_capnp)`, and that function
-(`crates/kaijutsu-server/src/rpc.rs`, `fn vfs_err_to_capnp`) is:
+### The VFS family — done, and smaller than the count suggested
+
+**Counting methods that *can* produce a verdict is not the same as counting
+work.** Of 17 `Vfs` wire methods, **four had a caller**: `read` and `snapshot`
+in production, `create` and `write` for one e2e test. The other 13 had none —
+general filesystem access over this interface was superseded by SFTP, which is
+how every remote consumer reaches the VFS now.
+
+So the 14 became: **13 retired** to `retiredNN @NN ()` stubs, and **one fixed**.
+`Vfs.read` now returns `error :VfsErrorKind` beside its data, and `snapshot`
+already modelled it with `denied :Bool`. `write` and `create` still throw;
+they are test-only and can follow whenever.
+
+**A raw errno could not cross this wire.** The doc above says "errno", and the
+domain vocabulary is right, but the *encoding* cannot be a platform number:
+`ENOTEMPTY` is 39 on Linux and 66 on macOS, and a macOS client talks to a
+Linux kernel. `VfsErrorKind` carries POSIX semantics with a stable wire
+encoding, and each side maps to its own numbers.
+
+### The chain had a fifth layer nobody had named
+
+Fixing capnp was not enough. The client's own actor repeated the same collapse
+one hop later: `CallError::Rpc(String)` flattened the freshly-typed
+`RpcError::Vfs` back into prose, immediately after we had rescued it. The full
+path is five layers, not four:
+
+```text
+VfsError → capnp → RpcError → CallError → the app
+```
+
+**Every boundary that stringifies is a place the type dies**, and a fix that
+stops at the wire buys nothing. `CallError` now carries `Vfs { kind, path }`
+too.
+
+The receipt for why this matters was already in the tree, written by its own
+victim. `roster.rs` had:
 
 ```rust
-fn vfs_err_to_capnp(e: kaijutsu_kernel::VfsError) -> capnp::Error {
-    capnp::Error::failed(format!("{}", e))
+/// Matched on the error text because that is all the wire carries —
+/// `VfsError`'s variants collapse to a message string at the capnp boundary.
+fn reads_as_absent(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("not found") || d.contains("no mount point")
 }
 ```
 
-`VfsError` already carries `ReadOnly`, `PermissionDenied` and
-`PathEscapesRoot` as distinct variants; this discards the variant and keeps
-the `Display` string. A read-only mount refusing a write is the textbook
-verdict, and `Vfs.snapshot` — the one `Vfs` method classed C — already models
-it correctly with `denied :Bool`. So the fix has a worked example *inside the
-same interface*.
+A client lowercasing kernel prose to recover a distinction the kernel had as
+a typed enum and threw away — with a test pinning the exact wording, including
+the `"RPC error: remote exception: "` prefix. It is now a match on
+`VfsErrorKind::is_absent()`.
+
+**There is a second string-matching classifier still in there.**
+`is_disconnect_error(msg)` decides whether to tear down the connection by
+searching the error text for `"Disconnected"`. Same defect, different
+consequence, not yet fixed.
 
 ### Two findings outside the error question
 

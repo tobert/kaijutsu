@@ -119,6 +119,45 @@ impl VfsError {
         }
     }
 
+    /// The wire-safe classification of this error.
+    ///
+    /// Every variant maps to something a caller can act on, so this is a
+    /// total match with no catch-all: adding a `VfsError` variant should
+    /// fail to compile here rather than silently become [`Io`].
+    ///
+    /// [`Io`]: kaijutsu_types::VfsErrorKind::Io
+    pub fn kind(&self) -> kaijutsu_types::VfsErrorKind {
+        use kaijutsu_types::VfsErrorKind as K;
+        match self {
+            // A path with no mount point is absent in the only sense the
+            // caller can act on, so it joins NotFound rather than getting
+            // a kind nobody would branch on.
+            VfsError::NotFound(_) | VfsError::NoMountPoint(_) => K::NotFound,
+            // An escaping path is refused, not missing — saying NotFound
+            // would invite the caller to create it.
+            VfsError::PermissionDenied(_) | VfsError::PathEscapesRoot(_) => K::PermissionDenied,
+            VfsError::ReadOnly => K::ReadOnly,
+            VfsError::NotADirectory(_) => K::NotADirectory,
+            VfsError::IsADirectory(_) => K::IsADirectory,
+            VfsError::DirectoryNotEmpty(_) => K::NotEmpty,
+            VfsError::AlreadyExists(_) => K::AlreadyExists,
+            VfsError::InvalidPath(_) | VfsError::NotASymlink(_) => K::InvalidPath,
+            VfsError::CrossDeviceLink => K::CrossDevice,
+            VfsError::TooManySymlinks => K::TooManySymlinks,
+            VfsError::NameTooLong => K::NameTooLong,
+            VfsError::ShareDisconnected(_) => K::Disconnected,
+            VfsError::ShareTimeout(_) => K::TimedOut,
+            // A host error carries its own meaning; recover the two that
+            // matter rather than flattening every `Io` to `Io`.
+            VfsError::Io(e) => match e.kind() {
+                io::ErrorKind::NotFound => K::NotFound,
+                io::ErrorKind::PermissionDenied => K::PermissionDenied,
+                _ => K::Io,
+            },
+            VfsError::Other(_) => K::Io,
+        }
+    }
+
     /// Create a NotFound error.
     pub fn not_found(path: impl Into<String>) -> Self {
         Self::NotFound(path.into())

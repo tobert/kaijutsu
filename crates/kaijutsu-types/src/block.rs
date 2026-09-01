@@ -399,6 +399,62 @@ impl std::fmt::Display for ContentType {
 // Error Payload Types
 // ============================================================================
 
+/// Why a VFS operation refused.
+///
+/// POSIX semantics with a platform-independent encoding. A raw errno cannot
+/// cross the wire — the numbers differ by platform (`ENOTEMPTY` is 39 on
+/// Linux and 66 on macOS) and a macOS client talks to a Linux kernel — so
+/// each side maps this to its own numbers instead.
+///
+/// A refusal here is a result, not a transport fault: a read-only mount is
+/// the filesystem answering. `docs/error-chain.md` has the rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VfsErrorKind {
+    /// `ENOENT`, and a path with no mount point.
+    NotFound,
+    /// `EACCES`, including a path that escapes its mount root.
+    PermissionDenied,
+    /// `EROFS`. A property of the mount, not of the caller — everyone
+    /// asking gets this answer.
+    ReadOnly,
+    /// `ENOTDIR`.
+    NotADirectory,
+    /// `EISDIR`.
+    IsADirectory,
+    /// `ENOTEMPTY`.
+    NotEmpty,
+    /// `EEXIST`.
+    AlreadyExists,
+    /// `EINVAL`, and "not a symbolic link".
+    InvalidPath,
+    /// `EXDEV`.
+    CrossDevice,
+    /// `ELOOP`.
+    TooManySymlinks,
+    /// `ENAMETOOLONG`.
+    NameTooLong,
+    /// `ENOTCONN` — a `/r` client share's session is gone
+    /// (`docs/slash-r.md`). The mount itself vanished.
+    Disconnected,
+    /// `ETIMEDOUT` — the share may still live; this operation did not
+    /// answer in time.
+    TimedOut,
+    /// `EIO`, and anything with no better name.
+    Io,
+}
+
+impl VfsErrorKind {
+    /// Whether this means "there is no such entry" — the check a caller
+    /// makes when absence is an ordinary outcome rather than a failure.
+    ///
+    /// `NotFound` covers a missing mount point too, because a path under an
+    /// unmounted tree is absent in the only sense a caller can act on.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, VfsErrorKind::NotFound)
+    }
+}
+
 /// What system produced the error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
