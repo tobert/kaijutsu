@@ -2399,42 +2399,22 @@ pub async fn create_shared_kernel(
                             sub: block_flows_for_index.subscribe("block.status"),
                         };
 
-                        // Build synthesis callback — runs Rhai after each indexing.
-                        // Must spawn_blocking: Rhai eval + ONNX embed are CPU-bound.
-                        let synth_idx = idx.clone();
-                        let synth_blocks: Arc<dyn kaijutsu_index::BlockSource> =
-                            Arc::new(BlockStoreSource(documents.clone()));
-                        let on_indexed: kaijutsu_index::watcher::OnIndexed =
-                            Arc::new(move |ctx_id| {
-                                let idx_clone = synth_idx.clone();
-                                let blocks_clone = synth_blocks.clone();
-                                let handle = tokio::task::spawn_blocking(move || {
-                                    kaijutsu_kernel::runtime::synthesis::run_synthesis_and_cache(
-                                        ctx_id,
-                                        idx_clone.embedder_arc(),
-                                        blocks_clone,
-                                        &idx_clone,
-                                    );
-                                });
-                                // run_synthesis_and_cache logs its own errors,
-                                // but a panic on the blocking thread (poisoned
-                                // lock, OOM mid-embed) would otherwise vanish
-                                // with the dropped JoinHandle.
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle.await {
-                                        log::error!(
-                                            "synthesis task panicked for context {}: {e}",
-                                            ctx_id.short()
-                                        );
-                                    }
-                                });
-                            });
-
+                        // Automatic synthesis is off: `run_synthesis` embeds
+                        // every text block in a context on each call, so one
+                        // appended block costs an embed of the whole history.
+                        // Re-enable by passing a callback here once synthesis
+                        // is incremental — `docs/issues.md`, "Synthesis
+                        // re-embeds the whole context on every block write".
+                        // `kj synth <ctx>` still runs it on demand.
                         kaijutsu_index::watcher::spawn_index_watcher(
                             idx.clone(),
                             block_source,
                             Box::new(status_receiver),
-                            Some(on_indexed),
+                            None,
+                        );
+                        log::warn!(
+                            "automatic synthesis is disabled; indexing still runs. \
+                             Use `kj synth <context>` to synthesize on demand."
                         );
                         log::info!(
                             "Semantic index initialized with {}",

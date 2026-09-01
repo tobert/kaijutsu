@@ -6,6 +6,67 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Synthesis re-embeds the whole context on every block write (2026-09-01)
+
+**Automatic synthesis is disabled** as of this entry — `spawn_index_watcher`
+gets `None` for `on_indexed` (`kaijutsu-server/src/rpc.rs`) and the kernel
+says so at startup. Indexing still runs; `kj synth <ctx>` still synthesizes
+on demand. Re-enable by passing a callback again once the work below lands.
+
+`run_synthesis` (`kaijutsu-kernel/src/runtime/synthesis.rs:60-68`) embeds
+**every text block in the context** on each call, then embeds again at
+sentence granularity for the gist, then a third time over 50 n-gram
+candidates. The watcher called it on every terminal block-status batch. So
+appending one block to a context with N blocks cost an embed of all N — the
+per-write cost grew with the length of the conversation it was written to.
+
+Measured on zorak, 2026-09-01: 16 `rten-*` threads pegged at 72–99% each for
+~17 minutes from kernel start, ~10 core-equivalents, load average 25+ on a
+16-core box. Only **four** contexts were indexed in that window; the cost was
+entirely per-event, not per-count. It then plateaued to zero, which is what
+identified it as bulk work draining rather than a spin or a repeating timer.
+
+### Fix 1 — incremental synthesis
+
+The design question first: a document centroid is defined over all blocks, so
+"incremental" needs an answer for what it means to update one without
+recomputing it. A running centroid plus the new block's embedding is exact for
+the mean; the parts that are not obviously incremental are the per-block
+cosine ranking (cheap — the embeddings are already stored in the HNSW graph
+and can be read back rather than recomputed) and the n-gram candidate set.
+
+**Store the embeddings once and stop recomputing what is already durable.**
+`index_context` has already embedded these blocks and put them in the graph;
+synthesis embeds them a second time to build a centroid. That is the whole
+defect in one sentence.
+
+**`SynthesisCache` cannot help until the hash is real.** `get(ctx, hash)`
+(`kaijutsu-index/src/synthesis.rs:173-187`) exists and is called only by
+tests, and `run_synthesis` stamps every result `content_hash: String::new()`
+(`synthesis.rs:113`, `:126`, `:152`), so the key is empty and a hit is
+impossible. `extract_context_content` already computes a usable hash for
+`index_context` — reuse it rather than inventing a second one.
+
+Also unconditional on the `kj` side: `synth_all` and `synth_context`
+(`kaijutsu-kernel/src/runtime/kj_builtin.rs:253`, `:353`) call `run_synthesis`
+regardless of `was_indexed`, which they compute and use only for a counter. A
+forced full re-synthesis is a legitimate thing to want, so that wants an
+explicit flag rather than being the only behavior.
+
+### Fix 2 (longer term) — get the models out of the kernel process
+
+Amy, 2026-09-01: swap the built-in ONNX models for the **lfm2d service, or
+another tokenizer/embedding service**. The kernel currently runs bge-small
+in-process through `rten`, which is why a background pass can take the whole
+machine: `RTEN_NUM_THREADS` is unset, so rten's pool defaults to every
+physical core (16 here) and competes with tokio, kaish, and everything else
+on the box. lfm2d is already a separate service we run and already carries
+the gate classifier, so the seam exists.
+
+This subsumes the cheap mitigation rather than replacing it. If the models
+stay in-process for a while, bound the pool deliberately — but a bound is a
+smaller, worse version of moving the work out.
+
 ## The WAL grows without bound and never shrinks (2026-09-01)
 
 Found while vacuuming. `kernel.db-wal` was **719 MB holding zero live
