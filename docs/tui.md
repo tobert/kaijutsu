@@ -76,6 +76,30 @@ clean. Role dividers and the status line are the only ruled lines, and
 neither is something you paste. (Amy, 2026-08-30: *"copy/paste can just
 work, there's no borders around stuff I commonly want to grab."*)
 
+**How a surface is specified.** Every surface section below follows one
+grammar, and a new surface arrives in the same shape:
+
+- **Entry gesture in the heading** (`Ctrl+Z`, `Ctrl+A "`). Ambient surfaces
+  (conversation, status line) have none.
+- **One figure, and the figure is the spec** — "the example is the rule"
+  applied to UI. Because every grown view renders its own key line ("Keys"),
+  the figure's last line documents the surface's keys for free.
+- **"Rules the figure carries"** — bullets for the semantics the picture
+  cannot show.
+- **The machinery, named** — the wire or `kj` path behind the surface
+  (`shell_execute`, `subscribeLedgerEvents`, `edit_input`). A surface that
+  cannot name its kernel path is not designed yet.
+- **Exactly one viewport claim**, from a closed set of three: *flows to
+  scrollback* (conversation), *grows the viewport* and shrinks on dismiss
+  (picker, ledger, asks), or *takes the alternate screen* (vi and diff only,
+  ruling 1). There is no fourth mode.
+
+Two sanctioned deviations: compose's figure is the `❯` line inside the
+conversation figure — it is part of that frame, not a grown view — and
+editor/diff has no figure because its look is vim's, specified by
+`EditorState` rather than by this document. Cache health and Images are
+rendering concerns that ride other surfaces, not surfaces of their own.
+
 ### Conversation
 
 The transcript is `insert_before` output: a block that completes is printed
@@ -156,6 +180,8 @@ The well, flattened. The viewport grows to hold it and shrinks on dismiss.
   ▮ bass         120 bpm   17.3  ●○○○      ▯ click       120 bpm   17.3  ○●○○
 ```
 
+Rules the figure carries:
+
 - `j`/`k` move, `Tab` hops sections, `Enter` switches, `p d z a c` are the
   placement verbs unchanged, `/` filters, `h` opens the horizon as a filtered
   list. Digits address the ACTIVE seats, as in the well.
@@ -196,6 +222,8 @@ answers, backed by `kj ledger list` / `show` / `allow` / `deny` and the
     01a04e77  09:02   kaish      allow always   amy   redeemed ×3      cargo test -p kaish-kernel
   a allow once  A allow always  d deny  Enter show  j/k move  / filter  Esc back
 ```
+
+Rules the figure carries:
 
 - The status line carries the pending count as `!n` next to the rank, so an
   ask in a context you are not looking at is visible from anywhere; the seat
