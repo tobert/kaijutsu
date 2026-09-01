@@ -1090,19 +1090,37 @@ mod tests {
              version predating the fix. Got: {fixed}"
         );
 
-        // Quiet-hours arithmetic: `date '+%H'` is zero-padded, and bare numeric
-        // tokens lose their leading zero in `case`, so the scripts use numeric
-        // comparison. Pins the 08/09 would-be-octal boundary too.
+        // Quiet-hours arithmetic on the UNPADDED hour the script now asks
+        // for (`date '+%-H'`). Pins the 8/9 would-be-octal boundary.
         let hours = run(
-            r#"for h in "03" "08" "14" "22"; do q=0; if [[ "$h" -ge 22 ]] || [[ "$h" -lt 6 ]]; then q=1; fi; echo "$h=$q"; done"#,
+            r#"for h in "3" "8" "14" "22"; do q=0; if [[ "$h" -ge 22 ]] || [[ "$h" -lt 6 ]]; then q=1; fi; echo "$h=$q"; done"#,
         )
         .await;
-        for expected in ["03=1", "08=0", "14=0", "22=1"] {
+        for expected in ["3=1", "8=0", "14=0", "22=1"] {
             assert!(
                 hours.contains(expected),
                 "quiet-hours comparison wrong: expected {expected} in {hours}"
             );
         }
+
+        // The other half, and the reason the script asks for `%-H`: kaish
+        // reads no octal and refuses a zero-padded hour as a number rather
+        // than guessing. `date '+%H'` into this comparison is a hard error
+        // every hour before 10:00. If this stops erroring, kaish changed
+        // its numeric parsing — revisit `%-H` in the rc scripts before
+        // relaxing anything.
+        let padded = kaish
+            .execute_with_options(
+                r#"h="03"; if [[ "$h" -lt 6 ]]; then echo "quiet"; fi"#,
+                ExecuteOptions::default(),
+            )
+            .await;
+        let err = padded.expect_err("a zero-padded hour must not compare numerically");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("leading zero"),
+            "expected kaish's leading-zero type error, got: {msg}"
+        );
     }
 
     /// The external-exec policy end to end: `Allow` + a Local-mounted cwd runs

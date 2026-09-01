@@ -358,9 +358,12 @@ const MUTATING_NO_SUBCOMMAND: &[&str] = &["cp", "play", "attach", "fork", "drive
 ///    classifier's control by the time anyone could act on its answer.
 /// 4. `cmd.heredocs` is empty. A heredoc body is data the command consumes,
 ///    outside the argv this function inspects at all.
-/// 5. Every argument is [`PlannedValue::Plain`]. A [`PlannedValue::Redacted`]
-///    argument means kaish's own confirm-key convention judged something
-///    here a credential — never something to wave through unscored.
+/// 5. Every argument is [`PlannedValue::Plain`]. kaish carries no redaction
+///    of its own, so today this holds for everything it plans — the check
+///    is a fail-closed guard on `PlannedValue`'s `#[non_exhaustive]` seam,
+///    which kaish names as where an embedder-side redaction pass would add
+///    its variant. A value this module cannot read as plain text is never
+///    something to wave through unscored.
 /// 6. The plain arguments resolve, verb then subcommand, to a pair this
 ///    module's tables cover: either a no-subcommand verb in
 ///    [`READ_ONLY_NO_SUBCOMMAND`], or a `(command, subcommand)` pair in
@@ -387,7 +390,7 @@ pub(crate) fn is_read_only_kj(cmd: &PlannedCommand) -> bool {
     for arg in &cmd.args {
         match arg {
             PlannedValue::Plain(s) => plain_args.push(s.as_str()),
-            // `Redacted`, and any variant added later: never read-only.
+            // Any variant kaish adds to its redaction seam: never read-only.
             _ => return false,
         }
     }
@@ -539,17 +542,32 @@ mod tests {
         assert!(!is_read_only_kj(&cmd));
     }
 
-    // -- condition 5: a redacted argument refuses --------------------------
+    // -- condition 5: the plain-value seam ---------------------------------
 
+    /// `--confirm=<token>` used to refuse a read here, because kaish planned
+    /// it as a redacted value. kaish removed the confirmation latch the flag
+    /// guarded, and with it the plan-side redaction, so the flag is now an
+    /// ordinary argument and `PlannedValue` carries only `Plain`.
+    ///
+    /// Nothing is waved through that was not already a read: the flag sits
+    /// after the subcommand, resolution reads only the verb and subcommand
+    /// positions, and `kj block list` is in the table on its own merits.
     #[test]
-    fn a_presented_confirm_key_refuses() {
+    fn a_confirm_flag_is_an_ordinary_argument_and_does_not_refuse_a_read() {
         let cmd = plan_one("kj block list --confirm=deadbeef");
         assert!(
-            cmd.args.iter().any(|a| a.is_redacted()),
-            "test setup: expected kaish to redact the confirm key"
+            cmd.args.iter().all(|a| matches!(a, PlannedValue::Plain(_))),
+            "kaish plans every value as Plain; a new variant means condition 5 \
+             has real work to do again and this test should be revisited"
         );
-        assert!(!is_read_only_kj(&cmd));
+        assert!(is_read_only_kj(&cmd));
     }
+
+    // Condition 5's catch-all arm has no test on purpose: `PlannedValue` is
+    // `#[non_exhaustive]` with `Plain` as its only variant, so no caller
+    // outside kaish can build a value that reaches it. The arm is a
+    // fail-closed guard for a variant kaish has not added yet, and the
+    // assertion in the test above fires when it does.
 
     // -- condition 6: table resolution, and the dash-before-subcommand
     // guard specifically -------------------------------------------------

@@ -80,10 +80,10 @@ claude-code-peer = { path = "crates/claude-code-peer" }
 # Re-linking to a worktree is legitimate when we need to consume kaish work
 # before it releases. If you do it, treat it as temporary, record the rev, and
 # put the crates.io line back the moment the release lands.
-kaish-kernel = { version = "0.16", features = ["subprocess"] }
-kaish-glob = { version = "0.16" }
-kaish-types = { version = "0.16" }
-kaish-help = { version = "0.16" }
+kaish-kernel = { version = "0.17", features = ["subprocess"] }
+kaish-glob = { version = "0.17" }
+kaish-types = { version = "0.17" }
+kaish-help = { version = "0.17" }
 
 # Cap'n Proto
 capnp = "0.25"

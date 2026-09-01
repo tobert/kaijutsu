@@ -24,11 +24,15 @@
 #      Revisit only once a kaish release carrying the fix is the pinned
 #      dependency. (`if x="$(cmd)"; then` is still not an escape hatch — that
 #      remains a parse error.)
-#   2. Bare numeric tokens lose their leading zero in `case`/`for`, so
-#      `case "$hour" in 00|01)` cannot match `date '+%H'` output. Quoting
-#      fixes it, but numeric comparison says what we mean and has no
-#      leading-zero hazard at all — including the classic 08/09 octal trap,
-#      which `-lt` handles correctly here.
+#   2. A zero-padded hour cannot be compared numerically. kaish 0.17 reads
+#      no octal and refuses `03` as a number outright ("expected a number,
+#      got `03`, which is text (leading zero)"), so `date '+%H'` into
+#      `[[ "$hour" -lt 6 ]]` is a hard error every hour before 10:00 — the
+#      quiet window, where nobody is watching it fail. `date '+%-H'` asks
+#      for the unpadded hour and sidesteps it: the comparison stays
+#      numeric, which is what we mean. Bare numeric tokens also lose a
+#      leading zero in `case`/`for`, so `case "$hour" in 00|01)` cannot
+#      match a padded hour either; unpadded plus numeric avoids both.
 #   3. `kj context list --json` is an array of plain STRINGS (label where one
 #      exists, id where not), not objects — `.[].label` is a jq runtime error.
 #
@@ -44,7 +48,7 @@ set -e
 
 # -- clock, read fresh this turn (the writer-stamps rule applies to us too)
 now="$(date '+%Y-%m-%d %H:%M %Z')"
-hour="$(date '+%H')"
+hour="$(date '+%-H')"
 echo "tick at $now"
 
 # -- quiet hours gate OUTBOUND duties only; quiet work continues. Trap 2.
