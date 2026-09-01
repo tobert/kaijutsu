@@ -3006,9 +3006,10 @@ impl kernel::Server for KernelImpl {
                             ));
                         }
                         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-                            return Err(capnp::Error::failed(format!(
-                                "execute: denied by hook: {err}"
-                            )));
+                            // "execute:", not "denied by hook": this arm
+                            // carries `GatePending` and `GateUnavailable` as
+                            // well, and neither is a refusal.
+                            return Err(capnp::Error::failed(format!("execute: {err}")));
                         }
                     }
                 }
@@ -9171,7 +9172,10 @@ async fn execute_shell_command(
                         let _ = documents_clone.set_status(context_id, &command_block_id_clone, status);
                     }
                     kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-                        let reason = format!("shell command result denied by hook: {err}");
+                        // "on ...", not "denied by ...": the next line asks
+                        // for a settled status precisely because this carries
+                        // `GatePending` too, and a pending ask is not a no.
+                        let reason = format!("on shell command result: {err}");
                         let settled = err.settled_block_status();
                         let _ = documents_clone.set_stderr(context_id, &output_block_id_clone, Some(reason));
                         let _ = documents_clone.set_status(context_id, &output_block_id_clone, settled);
@@ -9542,7 +9546,11 @@ async fn execute_kj_command(
             });
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            let reason = format!("kj command denied: {err}");
+            // No "denied" prefix, for the reason the shell path states at the
+            // sibling arm: this carries `Denied`, `GateUnavailable` and
+            // `GatePending`, and only the first is a no. Each variant's
+            // Display already names what happened.
+            let reason = err.to_string();
             let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, settled);
@@ -9689,7 +9697,8 @@ async fn execute_kj_command(
             })
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            let reason = format!("kj command result denied by hook: {err}");
+            // "on ...", not "denied by ...": see the shell path's twin.
+            let reason = format!("on kj command result: {err}");
             let settled = err.settled_block_status();
             let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
             let _ = documents.set_status(context_id, &output_block_id, settled);
