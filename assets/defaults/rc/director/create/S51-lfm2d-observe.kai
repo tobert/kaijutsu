@@ -1,0 +1,8 @@
+# director is the operator's own console: there is no second seat to answer
+# an escalation raised against it, so S50's default `escalate` mode would
+# have nowhere to go. Score the shell the same as any exec-granting seat, but
+# override the mode to `log` -- the signal lands on the ledger, the hook
+# never asks or denies here. Sorts after S50, so it runs after and wins.
+set -e
+
+kj context set . --env LFM2D_MODE=log

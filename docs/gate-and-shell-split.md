@@ -670,17 +670,24 @@ on `kj ledger list`/`show` makes the attached rows visible.
 
 The score comes from a per-`context_type` rc script, not kernel code, per
 the design this paragraph always argued for: `assets/defaults/rc/coder/
-create/S50-lfm2d.kai` exports `LFM2D_MODE=log` / `LFM2D_URL` as durable env
-and installs a `pre_call` hook (`hook_id lfm2d-advisory`, `match_tool
+create/S50-lfm2d.kai` exports `LFM2D_MODE=escalate` / `LFM2D_URL` as durable
+env and installs a `pre_call` hook (`hook_id lfm2d-advisory`, `match_tool
 shell_write`) that scores the command through `/v1/cascade`, reads the
 severity ladder from `/v1/models` at fire time (never a hard-coded label —
 lfm2d's checkpoints change their label vocabulary between releases), and
-degrades to a `Trace` block plus `exit 0` whenever `kaish-tools-curl` isn't
-registered — which is every context today, since that lane hasn't landed
-yet. **Still open, and still blocking anything past log-only:** the
-re-measurement `docs/issues.md` calls out (one sample is not a
-distribution) — enforce mode is not scheduled, and this paragraph is not
-where that decision gets made.
+degrades to a `Trace` block plus `exit 0` whenever the scorer is
+unreachable, unparseable, or missing a field — every skip path leaves the
+baseline controls (S45, the human) as they were and says so in a trace. The
+hook exits 0 (proceed) or 3 (ask); it never exits 1, because the classifier
+cannot tell a true positive from a false one well enough to deny.
+
+Every exec-granting seat scores its shell; the mode differs by seat (Amy,
+2026-09-02). `coder`, `default`, `mcp`, and `toolie` link `S50-lfm2d.kai`
+unmodified and run in `escalate`. `director` also links `S50-lfm2d.kai`, then
+`S51-lfm2d-observe.kai` overrides the mode to `log` — a director is the
+operator's own console, and an escalation raised against it has no second
+seat to answer it, so scoring there records the signal on the ledger without
+ever asking or denying.
 
 ## Slices
 

@@ -777,15 +777,12 @@ mod tests {
     /// and `S50-lfm2d.kai`. A binding that grants exec but skips them is a
     /// seat where a shell command runs with no advisory scoring at all.
     ///
-    /// `director` is excluded: it grants exec (host operational reach) but
-    /// is the operator's own console, not an agent-driven seat, and closing
-    /// that gap is tracked separately (`docs/issues.md`, "`register_session`
-    /// lets a caller pick an ungated seat"). Widen this list only alongside
-    /// that follow-up, never to silence a new failure here.
+    /// No seat is excluded: `director` scores its shell like every other
+    /// exec-granting seat, in `log` mode (`S51-lfm2d-observe.kai`, checked
+    /// below) rather than `escalate` — it is the operator's own console, and
+    /// an escalation raised against it has no second seat to answer it.
     #[test]
     fn every_exec_granting_seat_ships_the_shell_scoring_scripts() {
-        const DEFERRED_SEATS: [&str; 1] = ["director"];
-
         let seeds = seed_files();
         let by_path: std::collections::HashMap<&str, &str> =
             seeds.iter().map(|(p, b)| (p.as_str(), *b)).collect();
@@ -798,7 +795,7 @@ mod tests {
             .iter()
             .filter_map(|(p, _)| rc_relpath(p))
             .filter_map(|rel| rel.split('/').next())
-            .filter(|t| *t != "lib" && !DEFERRED_SEATS.contains(t))
+            .filter(|t| *t != "lib")
             .collect();
         types.sort_unstable();
         types.dedup();
@@ -839,6 +836,47 @@ mod tests {
         assert!(
             missing.is_empty(),
             "exec-granting seats missing shell-scoring scripts: {missing:#?}"
+        );
+    }
+
+    /// `director` scores its shell in `log` mode, never `escalate`: it is
+    /// the operator's own console, and an escalation raised against it has
+    /// no second seat to answer it (S50 exports the seat default,
+    /// `escalate`; `S51-lfm2d-observe.kai` overrides it). The override must
+    /// sort after S50 or it has nothing to override — this pins both the
+    /// mode and the ordering, so a rename or reorder fails loudly instead of
+    /// silently putting director back into `escalate`.
+    #[test]
+    fn director_overrides_lfm2d_to_log_mode_after_s50() {
+        let seeds = seed_files();
+        let by_path: std::collections::HashMap<&str, &str> =
+            seeds.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+
+        let s50 = format!("{RC_VFS_ROOT}/director/create/S50-lfm2d.kai");
+        assert!(
+            by_path.contains_key(s50.as_str()),
+            "director must ship S50-lfm2d.kai like every exec-granting seat"
+        );
+
+        let prefix = format!("{RC_VFS_ROOT}/director/create/S5");
+        let mut observe_scripts: Vec<&str> = by_path
+            .keys()
+            .copied()
+            .filter(|p| p.starts_with(&prefix) && *p != s50.as_str())
+            .collect();
+        observe_scripts.sort_unstable();
+
+        let overriding = observe_scripts.into_iter().find(|p| *p > s50.as_str());
+        let Some(path) = overriding else {
+            panic!(
+                "director ships no script sorting after S50-lfm2d.kai to override its \
+                 `escalate` default to `log`"
+            );
+        };
+        let body = by_path[path];
+        assert!(
+            body.contains("LFM2D_MODE=log"),
+            "{path} sorts after S50-lfm2d.kai but does not set LFM2D_MODE=log: {body}"
         );
     }
 }
