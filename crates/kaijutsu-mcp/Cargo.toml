@@ -19,10 +19,6 @@ kaijutsu-types.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-agent-tools.workspace = true
 kaijutsu-telemetry.workspace = true
-# The advisory scorer plans Bash commands with the SAME kaish the kernel
-# links, in process. An out-of-process `kaish` binary on PATH can change
-# version under a running session; a linked crate cannot.
-kaish-kernel.workspace = true
 tokio.workspace = true
 futures.workspace = true
 anyhow.workspace = true
@@ -51,10 +47,6 @@ tracing-subscriber = { workspace = true }
 
 # Search
 regex = { workspace = true }
-
-# POSTing advisory clause batches to lfm2d's /v1/cascade. Same version
-# kaijutsu-kernel already pins.
-reqwest = { version = "0.13", features = ["json"] }
 
 # Per-process subscription instance (mcp_peer_instance)
 uuid = { workspace = true }

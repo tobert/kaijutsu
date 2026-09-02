@@ -405,30 +405,28 @@ values the human sees on the ask — and each command carries a rendered
 2. **Read `clause` instead of rebuilding it in jq.** Same rule, one
    implementation, in `kj::plan_clauses`.
 
-## Advisory scoring moves into kaijutsu-mcp; the ledger is the next stop (2026-09-02)
+## The Claude Code advisory hook forwards to the kernel (2026-09-02, plan awaiting Amy)
 
 Amy: *"move the hook to kaijutsu instead of messing with the repl … let's
 use kaish as a library which mcp already does so there's no way to have
-version skew. the kaish repl is more of a demo than serious tool."* And:
-the lfm2d path is for learning and must never block Claude Code.
+version skew."* A first cut put a scorer INSIDE kaijutsu-mcp — its own
+HTTP client, its own JSONL — and was reverted the same morning: *"my
+intention was not to put the scorer in the mcp … my intention was to feed
+the hook into the mcp and have the mcp forward it to the kernel."* The
+kernel already has the scorer: `S50-lfm2d.kai` curls lfm2d through kaish
+and records a signal in the ledger. What survives from the first cut is
+kernel-side: `kj::plan_clauses` and the `clause` field on `KJ_TOOL_PLAN`.
 
-Slice 1 (lane C, in flight): the `HookListener` handles `tool.before` for
-Bash — reply allow at once, plan in process with the lockfile's
-kaish-kernel, score against lfm2d in a background task, append a row to
-`~/.cache/claude-hooks/kaijutsu-advisory.jsonl` in the Python hook's row
-shape. Runs beside the Python hook until the two agree row for row; then
-the PreToolUse entry in `~/.claude/settings.json` flips (Amy's file).
-Measured motivation: one Python-hook row cost Claude Code 2.3 s scoring
-14 clauses synchronously, and the `kaish` under it moved 0.16→0.17
-unpinned on 2026-09-01 09:35.
-
-Slice 2, designed not built: the row goes to the kernel's ledger as
-`approval_signals` on an auto-allowed ask for the cc-* context, instead of
-a file. Needs an advisory-only phase evaluation (score and record, never
-deny) and fail-open when the kernel is down — the Stop hook's known
-kernel-unreachable block must not be inherited. Amy on the volume
-(~1.2k rows/day here): *"good load test :) yeah that sounds fine and we
-should work through it."*
+The plan, not built: `tool.before` for Bash reaches the `HookListener`
+today and is dropped. The listener forwards the command to the kernel over
+a new chatty RPC (an observe-only shell evaluation for the cc context) and
+replies allow at once — the lfm2d path is for learning and must never
+block Claude Code. The kernel runs the PreCall hook phase for that context
+in an observe mode (`KJ_HOOK_MODE=observe` handed to hook bodies) where a
+would-deny or would-ask is RECORDED as a signal on an auto-allowed ask row
+and never enforced. One renderer, one scorer, one store; the corpus
+builders read the ledger. Fail-open when the kernel is down. Volume
+(~1.2k rows/day here) is a load test Amy welcomed.
 
 ## Three MCP compose tools report failure as success (2026-09-01)
 
