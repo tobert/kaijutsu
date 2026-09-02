@@ -535,6 +535,11 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<Vec<crate::rpc::KjCommandInfo>, CallError>>,
     },
+    ShellDryRun {
+        context_id: ContextId,
+        command: String,
+        reply: oneshot::Sender<Result<crate::rpc::ShellDryRunReport, CallError>>,
+    },
 
     // ── Shell Variables ──────────────────────────────────────────────────
     GetShellVar {
@@ -812,6 +817,7 @@ impl RpcCommand {
             Self::SetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteKj { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetKjCommandCatalog { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ShellDryRun { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -896,7 +902,48 @@ pub struct ActorHandle {
     ledger_tx: broadcast::Sender<i64>,
 }
 
+/// The receiving end of a [`ActorHandle::never_answers_for_test`] handle's
+/// command channel. Hold it for the life of the test: dropping it closes the
+/// channel, and every call on the handle then fails fast instead of waiting.
+#[doc(hidden)]
+pub struct UnansweredCommands(mpsc::Receiver<ChannelCmd>);
+
+impl UnansweredCommands {
+    /// Take one issued command off the channel without answering it. The
+    /// returned value owns the reply channel, so holding it keeps the
+    /// caller waiting and dropping it ends the wait with `Shutdown`.
+    pub async fn recv(&mut self) -> Option<impl Send + use<>> {
+        self.0.recv().await
+    }
+}
+
 impl ActorHandle {
+    /// A handle whose kernel accepts every command and answers none.
+    ///
+    /// Returned alongside the receiving end of its command channel: hold
+    /// that receiver and never read it, and every call on the handle sends
+    /// successfully and then waits forever. A closed channel or a refused
+    /// connection would fail fast instead, which is useless for proving that
+    /// a caller does not wait on this handle — the failure has to be slow to
+    /// be a real test of that.
+    #[doc(hidden)]
+    pub fn never_answers_for_test() -> (Self, UnansweredCommands) {
+        let (tx, rx) = mpsc::channel::<ChannelCmd>(CHANNEL_CAPACITY);
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
+        let (_status_watch_tx, status_watch_rx) = watch::channel(ConnectionStatus::Idle);
+        let (ledger_tx, _) = broadcast::channel::<i64>(LEDGER_BROADCAST_CAPACITY);
+        let handle = Self {
+            tx,
+            event_tx,
+            status_tx,
+            status_watch_rx,
+            midi_exchange: crate::midi_exchange::MidiExchangeSlot::new(),
+            ledger_tx,
+        };
+        (handle, UnansweredCommands(rx))
+    }
+
     /// Generic send helper — creates a oneshot, sends the command, awaits reply.
     async fn send<T: Send + 'static>(
         &self,
@@ -1435,6 +1482,21 @@ impl ActorHandle {
         context_id: ContextId,
     ) -> Result<Vec<crate::rpc::KjCommandInfo>, CallError> {
         self.send(|reply| RpcCommand::GetKjCommandCatalog { context_id, reply }).await
+    }
+
+    /// What the kernel's PreCall hooks would have decided about `command`.
+    ///
+    /// The command is never run, no gate is opened, and nothing here can
+    /// refuse anything — see `RpcClient::shell_dry_run`. Callers that mirror
+    /// another harness's commands should not await this on their reply path:
+    /// a slow or absent kernel must not delay the harness.
+    #[tracing::instrument(skip(self, command))]
+    pub async fn shell_dry_run(
+        &self,
+        context_id: ContextId,
+        command: String,
+    ) -> Result<crate::rpc::ShellDryRunReport, CallError> {
+        self.send(|reply| RpcCommand::ShellDryRun { context_id, command, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -3533,6 +3595,11 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetKjCommandCatalog { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_kj_command_catalog(context_id));
+        }
+        // Plain `dispatch!`, not `dispatch_deadline!`: a dry run opens no
+        // gate and waits on no human, so it is an ordinary short call.
+        RpcCommand::ShellDryRun { context_id, command, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.shell_dry_run(context_id, &command));
         }
 
         // ── Shell Variables ──

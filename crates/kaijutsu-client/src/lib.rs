@@ -21,14 +21,15 @@ pub mod kaijutsu_capnp {
 
 pub use actor::{
     ActorHandle, CallError, NotReadyReason, PeerAttachResult, PeerConfig, PeerInvocation,
-    spawn_actor,
+    UnansweredCommands, spawn_actor,
 };
 pub use rpc::{
     AuthorBlock, Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PeerInfo, PresetInfo,
-    RpcClient, RpcError, ShellValue, SimilarContext, SnapshotNode, SnapshotResult, StagedDriftInfo,
-    SubmitResult, ToolResult, ToolSchema, TrackInfo, VersionSnapshot, VfsActivityEntry, VfsFileType,
+    RpcClient, RpcError, ShellDryRunOutcome, ShellDryRunReport, ShellValue, SimilarContext,
+    SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, TrackInfo,
+    VersionSnapshot, VfsActivityEntry, VfsFileType,
 };
 pub use context_feed::{
     ContextChange, ContextDelivery, ContextMirror, FeedEvent, MirrorError, VersionedChange,

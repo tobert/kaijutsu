@@ -425,6 +425,33 @@ struct Refusal {
   remedy @4 :Text;
 }
 
+# What the PreCall hook phase WOULD have decided about a command that was
+# never run. See `shellDryRun` and docs/gate-and-shell-split.md, "Dry-run
+# mode".
+enum ShellDryRunOutcome {
+  # Every matching hook let the call through.
+  wouldProceed @0;
+  # A hook denied outright, with no gate involved.
+  wouldDeny @1;
+  # A gate would have opened and a human would have been asked.
+  wouldAsk @2;
+  # A hook would have substituted a synthetic result for the command.
+  wouldShortCircuit @3;
+}
+
+# The result of one dry-run PreCall evaluation.
+struct ShellDryRunReport {
+  outcome @0 :ShellDryRunOutcome;
+  # The hook that reached the terminal outcome. Empty for `wouldProceed`.
+  hookId @1 :Text;
+  # Why, in one line. Empty for `wouldProceed`.
+  reason @2 :Text;
+  # The durable row this evaluation recorded, always `abandoned`: it records
+  # a question, never an answer to one. Absent when nothing was recorded —
+  # `wouldProceed`, `wouldShortCircuit`, or a ledger fault.
+  ask @3 :AskRef;
+}
+
 
 # ── Refusable results ────────────────────────────────────────────────────
 # The seven methods a gate or a capability can refuse. Each returns one of
@@ -2448,4 +2475,23 @@ interface Kernel {
   # by name; clients append parsed user arguments. The server owns curation so
   # every frontend observes the same loadout-aware surface.
   getKjCommandCatalog @100 (contextId :Data, trace :TraceContext) -> (commands :List(KjCommand));
+
+  # ==========================================================================
+  # Dry-run hook evaluation
+  # ==========================================================================
+
+  # Run the PreCall hook phase against `command` as `shell_write` and report
+  # what it would have decided. For a player whose commands run somewhere
+  # else — a Claude Code PreToolUse hook forwarded through kaijutsu-mcp —
+  # so the kernel's hooks can score them and the ledger can learn.
+  #
+  # Hook bodies really run, and see `KJ_HOOK_MODE=dryrun` alongside the
+  # variables the enforcing path sets. Four things never happen: the command
+  # is never executed, no pending ask is ever minted, no context is woken,
+  # and no answer a human already gave is spent. A would-deny or would-ask
+  # is recorded as an abandoned ask row and returned in the report; the
+  # caller is free to ignore it, and nothing here can block anyone.
+  #
+  # docs/gate-and-shell-split.md, "Dry-run mode".
+  shellDryRun @103 (contextId :Data, command :Text, trace :TraceContext) -> (report :ShellDryRunReport);
 }

@@ -619,7 +619,20 @@ impl HookListener {
                 }
             }
 
-            // tool.before — no block
+            "tool.before" => {
+                // No block: the pair is authored on `tool.after`, which
+                // carries the output too. What happens here instead is the
+                // dry run — the kernel's PreCall hooks score a command that
+                // is about to run in ANOTHER harness, so the ledger learns
+                // from it (`docs/gate-and-shell-split.md`, "Dry-run mode").
+                //
+                // Detached and never awaited. This path must not add
+                // latency to the harness's own reply, and must not fail it:
+                // a kernel that is down, slow, or refusing changes nothing
+                // about the response below.
+                self.spawn_shell_dry_run(event);
+            }
+
             _ => {}
         }
 
@@ -639,6 +652,52 @@ impl HookListener {
             }
             None => response,
         }
+    }
+
+    /// The Bash command a `tool.before` event carries, or `None`.
+    ///
+    /// Narrow on purpose: `Bash` by exact name, and a `command` that is
+    /// really a string. Every other tool the harness runs (a file edit, a
+    /// search) is not a shell submission and has no clause for the kernel's
+    /// hooks to score.
+    fn bash_command(event: &HookEvent) -> Option<&str> {
+        let tool = event.tool.as_ref()?;
+        if tool.name != "Bash" {
+            return None;
+        }
+        tool.input.get("command")?.as_str()
+    }
+
+    /// Send one `tool.before` Bash command to the kernel for a dry-run
+    /// PreCall evaluation, and return immediately.
+    ///
+    /// Detached by construction: the reply this listener is about to write
+    /// must never wait on the kernel. Every failure — no connection, no
+    /// joined context, a kernel that is down, an RPC that errors — is a
+    /// `debug!` and nothing more, because a scoring path that could break
+    /// the harness it observes would be worse than one that goes quiet.
+    fn spawn_shell_dry_run(&self, event: &HookEvent) {
+        let Some(command) = Self::bash_command(event) else {
+            return;
+        };
+        let Some(remote) = self.remote.as_ref() else {
+            return;
+        };
+        let Some(context_id) = self.context_id() else {
+            return;
+        };
+        let actor = remote.actor.clone();
+        let command = command.to_string();
+        tokio::spawn(async move {
+            match actor.shell_dry_run(context_id, command).await {
+                Ok(report) => tracing::debug!(
+                    outcome = ?report.outcome,
+                    hook_id = ?report.hook_id,
+                    "shell dry run reported"
+                ),
+                Err(e) => tracing::debug!("shell dry run did not complete: {e}"),
+            }
+        });
     }
 
     // -- Block insertion helpers --
@@ -1388,6 +1447,114 @@ mod tests {
             agent_type: None,
             trigger: None,
         }
+    }
+
+    // -- tool.before: the dry run must never be on the reply path --
+
+    fn bash_before(command: &str) -> HookEvent {
+        let mut event = empty_hook_event("tool.before");
+        event.tool = Some(ToolInfo {
+            name: "Bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            output: None,
+            error: None,
+            duration_ms: None,
+        });
+        event
+    }
+
+    /// Only a Bash call with a real `command` string is a shell submission
+    /// the kernel's hooks have anything to say about.
+    #[test]
+    fn only_a_bash_command_is_forwarded_for_a_dry_run() {
+        assert_eq!(
+            HookListener::bash_command(&bash_before("ls -la")),
+            Some("ls -la")
+        );
+
+        let mut no_command = bash_before("x");
+        no_command.tool.as_mut().unwrap().input = serde_json::json!({ "description": "no cmd" });
+        assert_eq!(HookListener::bash_command(&no_command), None);
+
+        let mut not_a_string = bash_before("x");
+        not_a_string.tool.as_mut().unwrap().input = serde_json::json!({ "command": 7 });
+        assert_eq!(HookListener::bash_command(&not_a_string), None);
+
+        let mut other_tool = bash_before("ls");
+        other_tool.tool.as_mut().unwrap().name = "Edit".to_string();
+        assert_eq!(HookListener::bash_command(&other_tool), None);
+
+        assert_eq!(HookListener::bash_command(&empty_hook_event("tool.before")), None);
+    }
+
+    /// A remote listener whose kernel accepts every call and answers none.
+    /// The returned receiver has to be held: dropping it closes the channel
+    /// and every call fails fast, which would make the timing assertions
+    /// below vacuous.
+    fn listener_with_a_kernel_that_never_answers(
+    ) -> (HookListener, ContextId, kaijutsu_client::UnansweredCommands) {
+        let (actor, held) = kaijutsu_client::ActorHandle::never_answers_for_test();
+        let context_id = ContextId::new();
+        let shared_context_id = Arc::new(Mutex::new(Some(context_id)));
+        let (change, _change_rx) = tokio::sync::watch::channel(0u64);
+        let remote = crate::RemoteState {
+            kernel_id: kaijutsu_types::KernelId::new(),
+            actor,
+            change,
+            joined: Arc::new(tokio::sync::RwLock::new(None)),
+            shared_context_id: shared_context_id.clone(),
+        };
+        let listener = HookListener::remote(
+            remote,
+            shared_context_id,
+            Arc::new(Mutex::new(None)),
+            None,
+        );
+        (listener, context_id, held)
+    }
+
+    /// The reverted first cut's lesson: the dry run is issued and NOT
+    /// awaited. Against a kernel that accepts the call and never answers,
+    /// the listener returns anyway, and the call really did go out — a
+    /// refused connection would return just as fast while proving nothing.
+    ///
+    /// `process_event` as a whole is not the subject here: it already awaits
+    /// the kernel for drift, and `with_hook_budget` is what bounds that.
+    /// What this pins is that the dry run adds no second wait beside it.
+    #[tokio::test]
+    async fn a_tool_before_dry_run_is_issued_and_never_awaited() {
+        let (listener, _context_id, mut held) = listener_with_a_kernel_that_never_answers();
+        let event = bash_before("cargo build --release");
+
+        let returned = tokio::time::timeout(Duration::from_millis(500), async {
+            listener.spawn_shell_dry_run(&event);
+        })
+        .await;
+        assert!(
+            returned.is_ok(),
+            "the listener must not wait on the kernel for a dry run"
+        );
+
+        // Non-vacuity: the call was really issued, and is still unanswered —
+        // holding the command keeps its reply channel open.
+        let issued = tokio::time::timeout(Duration::from_secs(5), held.recv())
+            .await
+            .expect("the dry run must reach the kernel, not be dropped");
+        assert!(
+            issued.is_some(),
+            "the command channel must still be open; a closed one proves nothing"
+        );
+    }
+
+    /// A listener with no kernel connection at all issues nothing and still
+    /// returns — local mode is the ordinary case for a `tool.before` event
+    /// there, not an error.
+    #[tokio::test]
+    async fn a_local_listener_issues_no_dry_run() {
+        let (listener, _store, _ctx_id) = local_listener_with_context();
+        let event = bash_before("ls");
+        let response = listener.process_event(&event).await;
+        assert_eq!(response.block, "allow");
     }
 
     #[test]

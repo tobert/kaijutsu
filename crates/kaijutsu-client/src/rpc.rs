@@ -511,6 +511,33 @@ pub struct KjLatch {
     pub message: String,
 }
 
+/// What the kernel's PreCall hook phase would have decided about a command
+/// that was never run (`shellDryRun`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellDryRunOutcome {
+    WouldProceed,
+    WouldDeny,
+    WouldAsk,
+    WouldShortCircuit,
+}
+
+/// One dry-run PreCall report. Advisory in the strongest sense: there is no
+/// verdict here to honor, because the command this describes runs somewhere
+/// the kernel does not control. See `docs/gate-and-shell-split.md`, "Dry-run
+/// mode".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellDryRunReport {
+    pub outcome: ShellDryRunOutcome,
+    /// The hook that reached the terminal outcome. `None` for
+    /// `WouldProceed`.
+    pub hook_id: Option<String>,
+    /// Why, in one line. `None` for `WouldProceed`.
+    pub reason: Option<String>,
+    /// The durable row the evaluation recorded, always `Abandoned`. `None`
+    /// when nothing was recorded.
+    pub ask: Option<kaijutsu_types::AskRef>,
+}
+
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
 /// beat scheduler's in-memory truth via `listTracks`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2385,6 +2412,67 @@ impl KernelHandle {
                     .map(|s| Ok(s?.to_string()?)).collect::<Result<Vec<_>, RpcError>>()?,
             })
         }).collect()
+    }
+
+    /// Ask the kernel what its PreCall hooks would have decided about
+    /// `command`, without running it.
+    ///
+    /// For a client whose commands run somewhere the kernel does not
+    /// control. Nothing here can refuse anything: the return is a report,
+    /// not a verdict, and the kernel neither runs the command, opens a gate,
+    /// nor wakes a context (`docs/gate-and-shell-split.md`, "Dry-run mode").
+    #[tracing::instrument(skip(self, command), name = "rpc_client.shell_dry_run")]
+    pub async fn shell_dry_run(
+        &self,
+        context_id: ContextId,
+        command: &str,
+    ) -> Result<ShellDryRunReport, RpcError> {
+        use crate::kaijutsu_capnp::AskStatus as WAskStatus;
+        use crate::kaijutsu_capnp::ShellDryRunOutcome as WOutcome;
+        use kaijutsu_types::{AskRef, AskStatus};
+
+        let mut request = self.kernel.shell_dry_run_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_command(command);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let report = response.get()?.get_report()?;
+        let outcome = match report.get_outcome()? {
+            WOutcome::WouldProceed => ShellDryRunOutcome::WouldProceed,
+            WOutcome::WouldDeny => ShellDryRunOutcome::WouldDeny,
+            WOutcome::WouldAsk => ShellDryRunOutcome::WouldAsk,
+            WOutcome::WouldShortCircuit => ShellDryRunOutcome::WouldShortCircuit,
+        };
+        let non_empty = |s: String| if s.is_empty() { None } else { Some(s) };
+        // Present only when the evaluation committed a durable row — never
+        // synthesize an id when the wire left this pointer null.
+        let ask = if report.has_ask() {
+            let a = report.get_ask()?;
+            Some(AskRef {
+                request_id: a.get_request_id()?.to_string()?,
+                status: match a.get_status()? {
+                    WAskStatus::Pending => AskStatus::Pending,
+                    WAskStatus::Claimed => AskStatus::Claimed,
+                    WAskStatus::Allowed => AskStatus::Allowed,
+                    WAskStatus::Denied => AskStatus::Denied,
+                    WAskStatus::Expired => AskStatus::Expired,
+                    WAskStatus::Abandoned => AskStatus::Abandoned,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(ShellDryRunReport {
+            outcome,
+            hook_id: non_empty(report.get_hook_id()?.to_string()?),
+            reason: non_empty(report.get_reason()?.to_string()?),
+            ask,
+        })
     }
 
     /// Get a shell variable by name.

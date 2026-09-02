@@ -5487,6 +5487,80 @@ impl kernel::Server for KernelImpl {
         }.instrument(trace_span))
     }
 
+    /// Report what the PreCall hook phase would have decided about
+    /// `command`, without running it, asking anyone, or waking anything.
+    ///
+    /// Context/principal resolution mirrors `execute_shell_command`'s, so a
+    /// hook matched on context or principal sees the same call site it would
+    /// see on the enforcing path. See `docs/gate-and-shell-split.md`,
+    /// "Dry-run mode".
+    fn shell_dry_run(
+        self: Rc<Self>,
+        params: kernel::ShellDryRunParams,
+        mut results: kernel::ShellDryRunResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "shell_dry_run");
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let command = pry!(pry!(p.get_command()).to_str()).to_owned();
+        let kernel = self.kernel.clone();
+        let (principal_id, session_id) = {
+            let conn = self.connection.borrow();
+            (conn.principal.id, conn.session_id)
+        };
+        Promise::from_future(
+            async move {
+                require_context_exists(&kernel, context_id)?;
+                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
+                    principal_id,
+                    context_id,
+                    session_id,
+                    kernel.id,
+                );
+                let report = kernel
+                    .kernel
+                    .broker()
+                    .shell_pre_call_hooks_dry_run(&command, &call_ctx)
+                    .await
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("dry-run hook evaluation failed: {e}"))
+                    })?;
+                let mut b = results.get().init_report();
+                b.set_outcome(match report.outcome {
+                    kaijutsu_kernel::mcp::DryRunOutcome::WouldProceed => {
+                        ShellDryRunOutcome::WouldProceed
+                    }
+                    kaijutsu_kernel::mcp::DryRunOutcome::WouldDeny => {
+                        ShellDryRunOutcome::WouldDeny
+                    }
+                    kaijutsu_kernel::mcp::DryRunOutcome::WouldAsk => ShellDryRunOutcome::WouldAsk,
+                    kaijutsu_kernel::mcp::DryRunOutcome::WouldShortCircuit => {
+                        ShellDryRunOutcome::WouldShortCircuit
+                    }
+                });
+                b.set_hook_id(report.hook_id.as_deref().unwrap_or(""));
+                b.set_reason(report.reason.as_deref().unwrap_or(""));
+                if let Some(ask) = &report.ask {
+                    let mut a = b.reborrow().init_ask();
+                    a.set_request_id(&ask.request_id);
+                    a.set_status(match ask.status {
+                        kaijutsu_types::AskStatus::Pending => AskStatus::Pending,
+                        kaijutsu_types::AskStatus::Claimed => AskStatus::Claimed,
+                        kaijutsu_types::AskStatus::Allowed => AskStatus::Allowed,
+                        kaijutsu_types::AskStatus::Denied => AskStatus::Denied,
+                        kaijutsu_types::AskStatus::Expired => AskStatus::Expired,
+                        kaijutsu_types::AskStatus::Abandoned => AskStatus::Abandoned,
+                    });
+                }
+                Ok(())
+            }
+            .instrument(trace_span),
+        )
+    }
+
     fn get_last_result(
         self: Rc<Self>,
         _params: kernel::GetLastResultParams,

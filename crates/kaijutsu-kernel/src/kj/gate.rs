@@ -759,6 +759,67 @@ pub(crate) async fn run_gate(
     }
 }
 
+/// Record the ask [`run_gate`] would have raised, and ask nobody.
+///
+/// The row carries everything a real ask carries — statements, the
+/// free-variable snapshot, the cwd — and is then abandoned in the same
+/// call. Abandoned is the only status that records a question without
+/// asserting an answer to it, and it is inert in all three directions that
+/// matter: `list_pending_asks` never offers it to a human who could not act
+/// on it, `find_redeemable` admits `allowed`/`denied` only so it can never
+/// authorize a later call, and `undelivered_answers` shares that predicate
+/// so no context is ever woken for it.
+///
+/// Rules are deliberately not consulted. Redeeming an answer is a mutation
+/// that spends it, so this path must not read the other half of the gate's
+/// memory either — reporting "a rule would have allowed it" while being
+/// unable to check whether an answer is already waiting is worse than
+/// reporting what the hook itself decided.
+///
+/// Nothing here runs the gated action. See `docs/gate-and-shell-split.md`,
+/// "Dry-run mode".
+pub(crate) async fn record_dry_run_ask(
+    db: &Arc<parking_lot::Mutex<KernelDb>>,
+    caller: &KjCaller,
+    spec: GateSpec,
+    ledger_flows: &SharedLedgerFlowBus,
+    reason: &str,
+) -> Option<AskRef> {
+    let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
+    let request_id = {
+        let db = db.lock();
+        match approval_ledger::ask::create_ask(db.conn_for_ledger(), &ask) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    "dry run could not record the ask it would have raised: {e} \
+                     (nothing ran and nothing was asked either way)"
+                );
+                return None;
+            }
+        }
+    };
+    let status = {
+        let db = db.lock();
+        match approval_ledger::decide::abandon(db.conn_for_ledger(), &request_id, Some(reason)) {
+            Ok(row) => row.status,
+            Err(e) => {
+                // The row committed and the abandonment did not, so it is
+                // still pending — the one shape this function exists to
+                // avoid. Say so loudly; `kj ledger` can be pointed at it.
+                tracing::error!(
+                    request_id = %request_id,
+                    "dry run left a PENDING ask it could not abandon: {e} — \
+                     nobody is waiting on it and answering it runs nothing"
+                );
+                ApprovalStatus::Pending
+            }
+        }
+    };
+    announce_ledger_change(db, ledger_flows);
+    Some(ask_ref(request_id, status))
+}
+
 #[cfg(test)]
 mod tests {
 

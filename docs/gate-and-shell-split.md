@@ -1345,6 +1345,15 @@ approves, never a second, potentially different, read of `context_env`.
 Additive: `statements` is unchanged. Test:
 `kj_tool_plan_carries_the_free_variable_env_snapshot`.
 
+**`KJ_HOOK_MODE`** (`broker.rs::run_kaish_hook`): present with the value
+`dryrun` when nothing this body decides will be honored, and **absent**
+otherwise. A body that never reads it still cannot block a dry run — the
+evaluator converts every terminal outcome — so the variable exists for a
+body that wants to say something different, or count differently, when it
+is being measured rather than obeyed. See "Dry-run mode" below. Test:
+`kj_hook_mode_says_dryrun_only_in_a_dry_run`, one hook body run through
+both modes with opposite outcomes.
+
 **The three `rpc.rs` shell paths take the hook path — PreCall today; PostCall/OnError are filed in `docs/issues.md`.** `Broker` gains two
 public methods (`shell_pre_call_hooks`/`shell_post_call_hooks`,
 `mcp/broker.rs`) that run the same `PreCall`/`PostCall` phases a real
@@ -1701,3 +1710,52 @@ questions were still live.
 An answered ask authorizes a retry and the model authors a new block; nothing
 transitions out of `Waiting`. Adding the state now is what gives that lane
 somewhere to resume *from* — `docs/gate-resume.md`.
+
+
+## Dry-run mode
+
+`kj ledger list` stays empty and the command runs anyway. That is the whole
+contract. `shellDryRun @103` hands the kernel a command that is about to run
+somewhere else — a Claude Code `PreToolUse` hook, forwarded by
+kaijutsu-mcp's `tool.before` arm — runs the `PreCall` phase against it as
+`builtin.shell_write`, and answers with what those hooks *would* have
+decided. The caller is not offered a verdict, because there is nothing here
+it could honor: by the time the report lands, the harness on the other side
+has already made its own decision. The point is the learning corpus, not
+control. Hook bodies really run, so lfm2d scores the clause and writes its
+signals exactly as it does on the enforcing path, and they see
+`KJ_HOOK_MODE=dryrun` beside every variable the enforcing path sets. Four
+things never happen, and each is structural rather than a policy a hook
+could opt out of: the command is never executed (the dry-run path calls no
+tool), no pending ask is minted (the `Ask` branch never reaches
+`run_permission_ask`), no context is woken, and no answer a human already
+gave is spent (`find_redeemable` is a mutation — redeeming spends an answer
+— so this path never calls it, and never consults approval rules either;
+reading half the gate's memory would report "would proceed" for a crossing
+that might still escalate). The conversion lives in the phase evaluator
+(`Broker::evaluate_phase_with_mode`, `mcp/broker.rs`), not in any hook: a
+`PhaseMode::DryRun` evaluation returns a `DryRunReport` and has no shape in
+which to return a `Deny`, so a hook that knows nothing about the mode is
+still unable to block.
+
+What is recorded is one **abandoned** ask row per would-deny and per
+would-ask, built by `kj::gate::record_dry_run_ask` from the same `GateSpec`
+a real crossing would build — statements, the free-variable env snapshot,
+the cwd — and abandoned in the same call. Abandoned is the only status that
+records a question without asserting an answer to it, and it is inert in the
+three directions that matter: `list_pending_asks` never offers it to a human
+who could not act on it anyway, `find_redeemable` admits `allowed`/`denied`
+only so it can never authorize a later real call, and `undelivered_answers`
+shares that predicate so the gate-resume driver in `rpc.rs` never wakes
+anything for it. An auto-decided `allowed` row would have been inert too —
+both queries also require `auto_reason IS NULL` — but it would read as
+permission granted for a command nobody permitted, and `kj ledger` renders
+that status to a human. A would-proceed and a would-short-circuit record
+nothing at all: no gate was crossed, so there is no question to file. The
+report names the hook, the reason, and the row (`ShellDryRunReport`), and a
+recording failure is logged and reported as an absent `ask` rather than
+raised — a dry run that cannot write its row has still changed nothing, and
+the path must never be able to break the harness it observes. That last rule
+governs the client side too: kaijutsu-mcp's `tool.before` arm issues the call
+detached and replies immediately, and a kernel that is down, slow, or
+erroring changes nothing about the reply.
