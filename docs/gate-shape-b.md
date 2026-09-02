@@ -388,10 +388,15 @@ context instead.
 **Coverage.** `link_ask_blocks` is unit tested both ways, including that an
 unknown ask is an error rather than a silent no-op. The executor is covered
 by `kaijutsu-server/tests/gate_executes_wire.rs` over the real surfaces —
-`shell_write` mints the ask, `kj ledger allow|deny` answers it from a second
-context — with the block link synthesized, because no shipped path is both
-executable and linked (see slice 5). The CALL SITE in
-`execute_shell_command` is exercised only once the hook gate carries source.
+`kj ledger allow|deny` answers from a second context — from both origins.
+The `shell_write` cases mint the ask over MCP and synthesize the block link,
+which isolates the subscriber from the gate. The `shell_box_*` cases drive
+the shipped path whole: `shellExecute` authors the pair, a PreCall `Ask`
+hook on `shell_write` refuses it with the command as `exec_source` (the
+hook gate plans a shell-shaped call the way `shell_gate` does) and the
+pair linked, and the allow fills that same pair with no second pair and no
+seed block; the deny settles it `Error`. Dropping the link call in
+`execute_shell_command` fails the allow case.
 
 ## What the ask must carry, and what it must not try to
 

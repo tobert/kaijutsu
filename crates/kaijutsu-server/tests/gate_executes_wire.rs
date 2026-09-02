@@ -14,15 +14,18 @@
 //!     `kj ledger` refuses the seat that raised the ask, so every test here
 //!     answers from a second context.
 //!
-//! The one thing not driven through a production surface is the block LINK.
-//! No shipped path yet produces an ask that is BOTH executable and linked to
-//! a pair: `shellExecute` links its pair but gates only through hooks
-//! (`exec_source: None`), and `shell_write` carries the source but has no
-//! pair at gate time. So the tests that need a linked pair author the pair
-//! with the same block-store calls `execute_shell_command` uses and record
-//! it with `KernelDb::link_ask_blocks` — the same call `execute_shell_command`
-//! makes. That is the subscriber's input, and the subscriber is what these
-//! tests cover.
+//! Two origins produce an executable ask, and both are driven here:
+//!
+//!   * `shell_write` carries the source but has no pair at gate time, so
+//!     the subscriber-focused tests author the pair with the same
+//!     block-store calls `execute_shell_command` uses and record it with
+//!     `KernelDb::link_ask_blocks` — the same call `execute_shell_command`
+//!     makes. That isolates the subscriber from the gate.
+//!   * `shellExecute` — the shell box — authors its pair BEFORE gating, and
+//!     a PreCall `Ask` hook on `shell_write` refuses it with the command as
+//!     `exec_source` and the pair linked to the ask. The `shell_box_*` tests
+//!     drive that whole shipped path: the pair the human watched go
+//!     `Waiting` is the one that fills.
 
 mod common;
 
@@ -30,9 +33,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{connect_client, run_local, start_server_with_kernel_handle};
-use kaijutsu_client::{KernelHandle, RpcClient};
+use kaijutsu_client::{KernelHandle, RpcClient, RpcError};
+use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_server::SharedKernel;
-use kaijutsu_types::{BlockId, ContextId, PrincipalId, Status, ToolKind};
+use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, Status, ToolKind};
 
 /// Poll until `check` returns true, or fail loudly. Every wait in this file
 /// is on work a background driver does, so a timeout IS the bug.
@@ -224,6 +228,69 @@ impl Seats {
 
     fn worker_blocks(&self) -> Vec<kaijutsu_types::BlockSnapshot> {
         self.kernel.documents.block_snapshots(self.worker).unwrap()
+    }
+
+    /// Make every shell submission from the worker seat ask a human, the
+    /// way the lfm2d hook does for a seat that scores its shell. Scoped to
+    /// the worker context so the approver's `kj ledger` answers, which
+    /// take the same `shell_execute` path, are not gated by it.
+    async fn install_ask_hook_on_worker(&self) {
+        self.kernel
+            .kernel
+            .broker()
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(HookEntry {
+                id: HookId("wire-ask-worker".into()),
+                match_instance: None,
+                match_tool: Some(GlobPattern("shell_write".into())),
+                match_context: Some(self.worker),
+                match_principal: None,
+                action: HookAction::Ask(AskSpec {
+                    description: Some("the wire test wants a human".into()),
+                }),
+                priority: 0,
+                kaish_script_id: None,
+            });
+    }
+
+    /// Submit `code` from the shell box — `shell_execute`, the path a human
+    /// typing at the interactive shell takes. With the ask hook installed
+    /// it refuses `Pending`; this returns that ask's id and the pair the
+    /// refusal left `Waiting` in the worker context.
+    async fn submit_from_shell_box(&self, code: &str) -> (String, BlockId, BlockId) {
+        let kj = &self.kj;
+        kj.join_context(self.worker, "gate-exec-worker").await.unwrap();
+        let refusal = match kj.shell_execute(code, self.worker, true).await {
+            Err(RpcError::Refused(refusal)) => refusal,
+            other => panic!("a gated shell_execute must refuse with a Refusal: {other:?}"),
+        };
+        assert!(refusal.is_pending(), "the refusal must be a pending ask: {refusal:?}");
+        let ask = refusal.ask_id().expect("a pending refusal names its ask").to_string();
+
+        // The ToolCall block renders its input as JSON, so a multi-line
+        // command carries an escaped newline there; the first line is a
+        // safe substring of it.
+        let first_line = code.trim().lines().next().unwrap_or_default();
+        let blocks = self.worker_blocks();
+        let at = blocks
+            .iter()
+            .position(|b| {
+                b.kind == BlockKind::ToolCall
+                    && b.status == Status::Waiting
+                    && b.content.contains(first_line)
+            })
+            .expect("the refused command's ToolCall block, left Waiting");
+        let command_block_id = blocks[at].id.clone();
+        let output = blocks
+            .get(at + 1)
+            .filter(|b| b.kind == BlockKind::ToolResult)
+            .expect("the ToolResult block right after the refused command");
+        assert_eq!(output.status, Status::Waiting, "a pending ask leaves its pair Waiting");
+        (ask, command_block_id, output.id.clone())
     }
 }
 
@@ -599,5 +666,117 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
             s.undelivered(&ask),
             "an answer nothing acted on stays uncollected rather than being spent"
         );
+    });
+}
+
+/// The shipped path, whole: a command typed at the shell box is refused by
+/// an asking hook, its ask carries the command as `exec_source` and names
+/// the pair the refusal left `Waiting`, and the human's allow fills THAT
+/// pair — no second pair beside it, and no seed block, because the player
+/// who typed it is watching the block they typed into.
+///
+/// Falsified by dropping the `link_ask_blocks` call in
+/// `execute_shell_command` (the driver authors a fresh pair and the typed
+/// one stays `Waiting` forever), or by `hook_gate` losing `exec_source`
+/// for a shell-shaped call (the answer becomes a wake and nothing runs).
+#[test]
+fn shell_box_pair_fills_when_its_own_ask_is_allowed() {
+    run_local(async {
+        let scratch = Scratch::new("shellbox-allow");
+        let s = seats().await;
+        s.install_ask_hook_on_worker().await;
+        let marker = scratch.marker();
+        let code = format!(
+            "echo shell-box-ran >> {}\ncat {}",
+            marker.display(),
+            marker.display()
+        );
+
+        let (ask, command_block_id, output_block_id) = s.submit_from_shell_box(&code).await;
+        assert!(!marker.exists(), "a refused submission must not have run");
+
+        let row = s
+            .kernel
+            .kernel_db
+            .lock()
+            .get_approval(&ask)
+            .unwrap()
+            .expect("the ask row");
+        assert_eq!(
+            row.exec_source.as_deref(),
+            Some(code.trim()),
+            "a shell-box ask carries the typed command as its exec_source"
+        );
+        assert_eq!(
+            row.command_block_id.as_deref(),
+            Some(command_block_id.to_key().as_str()),
+            "the ask names the command block waiting on it"
+        );
+        assert_eq!(
+            row.output_block_id.as_deref(),
+            Some(output_block_id.to_key().as_str()),
+            "the ask names the output block waiting on it"
+        );
+
+        let blocks_before = s.worker_blocks().len();
+        s.answer(&ask, true).await;
+
+        wait_for("the shell box's own output block to settle", || {
+            s.block(&output_block_id).status != Status::Waiting
+        })
+        .await;
+
+        assert_eq!(s.block(&output_block_id).status, Status::Done);
+        assert_eq!(s.block(&command_block_id).status, Status::Done);
+        assert!(
+            s.block(&output_block_id).content.contains("shell-box-ran"),
+            "the typed pair's output block must hold the stdout, got {:?}",
+            s.block(&output_block_id).content
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "shell-box-ran\n");
+        assert!(!s.undelivered(&ask), "an executed ask is redeemed");
+
+        // Give a seed or a second pair time to appear if the driver were
+        // going to author one; then insist it did not.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let blocks = s.worker_blocks();
+        assert_eq!(
+            blocks.len(),
+            blocks_before,
+            "a run into the pair the caller authored must author nothing else"
+        );
+        assert!(
+            !blocks.iter().any(|b| b.content.contains("It has already run")),
+            "a run into a caller-authored pair tells nobody"
+        );
+    });
+}
+
+/// The denied half of the same path: the pair the shell box left `Waiting`
+/// settles `Error`, and nothing runs.
+///
+/// Falsified by settling only the output block, or by running the command
+/// before reading the answer.
+#[test]
+fn shell_box_pair_settles_error_when_its_own_ask_is_denied() {
+    run_local(async {
+        let scratch = Scratch::new("shellbox-deny");
+        let s = seats().await;
+        s.install_ask_hook_on_worker().await;
+        let marker = scratch.marker();
+        let code = format!("echo shell-box-ran >> {}", marker.display());
+
+        let (ask, command_block_id, output_block_id) = s.submit_from_shell_box(&code).await;
+        s.answer(&ask, false).await;
+
+        wait_for("the denied pair to settle", || {
+            s.block(&output_block_id).status != Status::Waiting
+        })
+        .await;
+
+        assert_eq!(s.block(&output_block_id).status, Status::Error);
+        assert_eq!(s.block(&command_block_id).status, Status::Error);
+        assert!(!marker.exists(), "a denied submission must not run");
+        assert!(!s.undelivered(&ask), "a denial delivered into its pair is redeemed");
     });
 }
