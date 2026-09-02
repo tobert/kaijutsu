@@ -544,28 +544,21 @@ impl KjDispatcher {
     /// Walk the `/config/rc` tree (`<type>/<verb>/SXX-name.ext`) and return all
     /// canonical script paths. A missing tree yields an empty list.
     async fn walk_rc_paths(&self) -> Result<Vec<String>, String> {
-        use crate::vfs::{VfsError, VfsOps};
-        use std::path::Path;
-
         let vfs = self.kernel().vfs();
-        // readdir, mapping "directory absent" to an empty listing.
-        async fn entries(
-            vfs: &crate::vfs::MountTable,
-            dir: &str,
-        ) -> Result<Vec<crate::vfs::DirEntry>, String> {
-            match vfs.readdir(Path::new(dir)).await {
-                Ok(e) => Ok(e),
-                Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Ok(Vec::new()),
-                Err(e) => Err(format!("readdir {dir}: {e}")),
-            }
-        }
-
         let mut out = Vec::new();
-        for type_e in entries(vfs, paths::RC_ROOT).await?.into_iter().filter(|e| e.kind.is_dir()) {
+        for type_e in rc_readdir_tolerant(vfs, paths::RC_ROOT)
+            .await?
+            .into_iter()
+            .filter(|e| e.kind.is_dir())
+        {
             let type_dir = format!("{}/{}", paths::RC_ROOT, type_e.name);
-            for verb_e in entries(vfs, &type_dir).await?.into_iter().filter(|e| e.kind.is_dir()) {
+            for verb_e in rc_readdir_tolerant(vfs, &type_dir)
+                .await?
+                .into_iter()
+                .filter(|e| e.kind.is_dir())
+            {
                 let verb_dir = paths::rc_dir(&type_e.name, &verb_e.name);
-                for file_e in entries(vfs, &verb_dir)
+                for file_e in rc_readdir_tolerant(vfs, &verb_dir)
                     .await?
                     .into_iter()
                     // Include symlinks: init.d-style composed scripts are links.
@@ -652,6 +645,57 @@ impl KjDispatcher {
         }
         KjResult::ok(format!("removed rc script '{path}'"))
     }
+}
+
+/// Read a directory's entries, treating "the tree isn't mounted" or "the
+/// directory doesn't exist" as an empty listing rather than an error — an rc
+/// tree that hasn't been seeded yet is a valid state, not a fault.
+async fn rc_readdir_tolerant(
+    vfs: &crate::vfs::MountTable,
+    dir: &str,
+) -> Result<Vec<crate::vfs::DirEntry>, String> {
+    use crate::vfs::{VfsError, VfsOps};
+    match vfs.readdir(std::path::Path::new(dir)).await {
+        Ok(e) => Ok(e),
+        Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Ok(Vec::new()),
+        Err(e) => Err(format!("readdir {dir}: {e}")),
+    }
+}
+
+/// The context types with an rc bucket under `/config/rc` — the directory
+/// names one level below `RC_ROOT`, sorted. `lib` holds shared scripts
+/// composed into other types by symlink; it is not a seat a context can be
+/// created with, so it is excluded here.
+pub async fn known_context_types(vfs: &crate::vfs::MountTable) -> Result<Vec<String>, String> {
+    let mut types: Vec<String> = rc_readdir_tolerant(vfs, paths::RC_ROOT)
+        .await?
+        .into_iter()
+        .filter(|e| e.kind.is_dir())
+        .map(|e| e.name)
+        .filter(|name| name != "lib")
+        .collect();
+    types.sort();
+    Ok(types)
+}
+
+/// Refuse a `context_type` with no rc bucket to create a context from.
+///
+/// When the rc tree lists no types at all — nothing mounted, or an empty
+/// tree — every type is accepted: there is nothing to validate against, and
+/// a kernel with no rc tree is a legitimate shape (the test harness is
+/// one). Once the tree lists at least one type, an unlisted type is refused
+/// by name, so a typo'd `--type` never silently creates a context with no
+/// rc to run.
+pub async fn check_context_type(vfs: &crate::vfs::MountTable, context_type: &str) -> Result<(), String> {
+    let known = known_context_types(vfs).await?;
+    if known.is_empty() || known.iter().any(|t| t == context_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown context type '{context_type}': no rc bucket at {}/{context_type}; known types: {}",
+        paths::RC_ROOT,
+        known.join(", "),
+    ))
 }
 
 #[cfg(test)]
@@ -1489,4 +1533,52 @@ mod tests {
         }
     }
 
+    // ── known_context_types / check_context_type ───────────────────────
+
+    /// A kernel with `/config/rc` mounted over a tempdir holding `coder/`
+    /// and `mcp/` subdirectories — no full seed, just the two type buckets
+    /// these tests validate against.
+    async fn kernel_with_two_rc_types() -> (crate::kernel::Kernel, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::create_dir_all(dir.path().join("coder/create")).expect("coder dir");
+        std::fs::create_dir_all(dir.path().join("mcp/create")).expect("mcp dir");
+        let kernel = crate::kernel::Kernel::new_ephemeral("test").await;
+        kernel.mount(paths::RC_ROOT, crate::vfs::LocalBackend::new(dir.path())).await;
+        (kernel, dir)
+    }
+
+    #[tokio::test]
+    async fn known_context_types_lists_rc_bucket_dirs() {
+        let (kernel, _dir) = kernel_with_two_rc_types().await;
+        let types = known_context_types(kernel.vfs()).await.expect("readdir ok");
+        assert_eq!(types, vec!["coder".to_string(), "mcp".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn check_context_type_accepts_a_known_type() {
+        let (kernel, _dir) = kernel_with_two_rc_types().await;
+        assert!(check_context_type(kernel.vfs(), "coder").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_context_type_refuses_an_unknown_type_naming_the_known_ones() {
+        let (kernel, _dir) = kernel_with_two_rc_types().await;
+        let err = check_context_type(kernel.vfs(), "codr")
+            .await
+            .expect_err("codr has no rc bucket");
+        assert!(err.contains("codr"), "error should name the rejected type: {err}");
+        assert!(err.contains("coder"), "error should list known types: {err}");
+        assert!(err.contains("mcp"), "error should list known types: {err}");
+    }
+
+    /// An empty rc tree validates against nothing, so every type is
+    /// accepted — a kernel with no rc mounted (the general test harness) is
+    /// a legitimate shape, not a fault.
+    #[tokio::test]
+    async fn check_context_type_accepts_anything_when_the_rc_tree_is_empty() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let kernel = crate::kernel::Kernel::new_ephemeral("test").await;
+        kernel.mount(paths::RC_ROOT, crate::vfs::LocalBackend::new(dir.path())).await;
+        assert!(check_context_type(kernel.vfs(), "anything-goes").await.is_ok());
+    }
 }

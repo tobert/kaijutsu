@@ -5020,6 +5020,15 @@ impl kernel::Server for KernelImpl {
         );
 
         Promise::from_future(async move {
+            // Refuse an unlisted type before any row exists — a typo'd
+            // context_type must not silently create a context with no rc
+            // bucket to run.
+            if let Err(e) =
+                kaijutsu_kernel::kj::rc::check_context_type(kernel.kernel.vfs(), &context_type)
+                    .await
+            {
+                return Err(capnp::Error::failed(e));
+            }
             let context_id = ContextId::new();
             let created_by = connection.borrow().principal.id;
             let label_ref = if label.is_empty() {

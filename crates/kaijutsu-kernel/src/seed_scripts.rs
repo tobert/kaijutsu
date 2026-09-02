@@ -770,4 +770,75 @@ mod tests {
              so each would silently become a file containing a path string: {broken:#?}"
         );
     }
+
+    /// Every seat whose `create/S10-binding.kai` grants exec-capable
+    /// authority — `"*"`, `"exec"`, or `"facade:shell"` — also ships the two
+    /// scripts that score a shell command before it runs: `S45-shell-guard.kai`
+    /// and `S50-lfm2d.kai`. A binding that grants exec but skips them is a
+    /// seat where a shell command runs with no advisory scoring at all.
+    ///
+    /// `director` is excluded: it grants exec (host operational reach) but
+    /// is the operator's own console, not an agent-driven seat, and closing
+    /// that gap is tracked separately (`docs/issues.md`, "`register_session`
+    /// lets a caller pick an ungated seat"). Widen this list only alongside
+    /// that follow-up, never to silence a new failure here.
+    #[test]
+    fn every_exec_granting_seat_ships_the_shell_scoring_scripts() {
+        const DEFERRED_SEATS: [&str; 1] = ["director"];
+
+        let seeds = seed_files();
+        let by_path: std::collections::HashMap<&str, &str> =
+            seeds.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let known: std::collections::HashSet<String> =
+            seeds.iter().map(|(p, _)| p.clone()).collect();
+
+        // Every type directory named in the seed set, one level below
+        // RC_ROOT, excluding `lib` (a shared script library, not a seat).
+        let mut types: Vec<&str> = seeds
+            .iter()
+            .filter_map(|(p, _)| rc_relpath(p))
+            .filter_map(|rel| rel.split('/').next())
+            .filter(|t| *t != "lib" && !DEFERRED_SEATS.contains(t))
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+
+        const EXEC_GRANTS: [&str; 3] = ["\"*\"", "\"exec\"", "\"facade:shell\""];
+
+        let mut missing = Vec::new();
+        for ty in types {
+            let binding_path = format!("{RC_VFS_ROOT}/{ty}/create/S10-binding.kai");
+            let Some(&body) = by_path.get(binding_path.as_str()) else {
+                continue; // no binding at all: no grant, nothing to score
+            };
+            // Follow one level of link — the init.d composition every
+            // per-type binding actually uses — to the body that carries the
+            // real grants.
+            let resolved = match seed_link_target(&binding_path, body, &known) {
+                Some(target) => {
+                    let canonical = canonical_link_target(&binding_path, &target);
+                    match by_path.get(canonical.as_str()) {
+                        Some(&b) => b,
+                        None => continue, // dangling link: covered elsewhere
+                    }
+                }
+                None => body,
+            };
+            let grants_exec = EXEC_GRANTS.iter().any(|g| resolved.contains(g));
+            if !grants_exec {
+                continue;
+            }
+            for required in ["S45-shell-guard.kai", "S50-lfm2d.kai"] {
+                let want = format!("{RC_VFS_ROOT}/{ty}/create/{required}");
+                if !by_path.contains_key(want.as_str()) {
+                    missing.push(want);
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "exec-granting seats missing shell-scoring scripts: {missing:#?}"
+        );
+    }
 }

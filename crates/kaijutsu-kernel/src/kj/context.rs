@@ -1128,6 +1128,12 @@ impl KjDispatcher {
         // /config/rc/default/<verb>/.
         let context_type = cfg.type_spec.take().unwrap_or_else(|| "default".to_string());
 
+        // Refuse an unlisted type before any mutation — a typo'd --type must
+        // not silently create a context with no rc bucket to run.
+        if let Err(e) = super::rc::check_context_type(self.kernel().vfs(), &context_type).await {
+            return KjResult::Err(format!("kj context create: {e}"));
+        }
+
         // The beat is no longer a Rust special-case here: arming a musician is an
         // rc step (`musician/create/S20-arm.kai` runs `kj transport arm`), so a
         // context_type is a beat participant exactly when its `create/` rc arms it
@@ -2283,6 +2289,38 @@ mod tests {
             contexts
                 .iter()
                 .any(|r| r.label.as_deref() == Some("child-ctx"))
+        );
+    }
+
+    /// `--type` with no matching rc bucket is refused before any row lands
+    /// — `test_dispatcher()`'s rc tree is the full embedded seed, so
+    /// "codr" (a typo of "coder") has no bucket to run.
+    #[tokio::test]
+    async fn context_create_refuses_an_unknown_type() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(
+                &[s("context"), s("create"), s("--type"), s("codr"), s("x")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "expected error, got: {}", result.message());
+        assert!(
+            result.message().contains("codr"),
+            "error should name the rejected type: {}",
+            result.message()
+        );
+
+        // No orphan row left behind.
+        let db = d.kernel_db().lock();
+        let contexts = db.list_active_contexts().unwrap();
+        assert!(
+            !contexts.iter().any(|r| r.label.as_deref() == Some("x")),
+            "a refused create must not leave a row"
         );
     }
 
